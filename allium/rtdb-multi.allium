@@ -514,6 +514,12 @@ contract LogService {
         -- A reader that loses a read's outcome releases it by invocation identity, and that release settles once the invocation can no longer be admitted.
         -- Mutations keep exact retry through their original receipts.
 
+    @invariant InstalledWorkerHoldExpiryFollowsItsServingLease
+        -- A worker admits each read within its journal-issued serving lease.
+        -- The journal accepts expiry disposal from the administrator or custodian for a withdrawn enrollment once the last lease end plus the clock drift bound is at or before the chosen decision time.
+        -- A withdrawn enrollment that never held a lease is immediately eligible for expiry disposal.
+        -- The disposal decision releases the holds of that exact enrollment.
+
     @invariant QuorumsCountDistinctJournals
         -- Each loglet slot names a distinct durable journal.
         -- The client verifies the journal on each session before sending a journal operation.

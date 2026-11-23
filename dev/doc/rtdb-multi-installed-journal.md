@@ -99,7 +99,19 @@ A prefix written before grant records were introduced has no `~grant` object and
 Local tests exercise this path end to end.
 The S3 operations are covered by an HTTP fixture and, when `RTDB_S3_ENDPOINT` names a local S3 service, by a version-enabled bucket test; neither qualifies a deployed provider's IAM policy or lifecycle rules.
 
-A disconnected worker can leave holds behind. Do not withdraw a worker merely because a gateway stopped reaching it. Once operations confirms the exact enrollment's running processes and effect scope have permanently shut down, use `logkeeper ordered withdraw` followed by `logkeeper ordered dispose-worker` with the retained external disposition digest. Keep that evidence with the deployment's custody records.
+Read and recovery holds left by a disconnected worker can delay trim.
+Do not withdraw a worker merely because a gateway stopped reaching it.
+When retiring the worker, withdraw its exact enrollment with `logkeeper ordered withdraw CONTROL_JSON WORKER_UUID SERIAL`.
+Use the same administrator control manifest to release its remaining holds by expiry.
+
+```sh
+rtdb-multi ordered-dispose-expired-worker --manifest CONTROL_JSON --worker WORKER_UUID --serial SERIAL
+```
+
+The journal permits expiry disposal when its decision time reaches the enrollment's last lease end plus `clock_drift`, or immediately after withdrawal if the enrollment never held a lease.
+If the command reports `Unavailable`, rerun it after the deadline.
+The custodian can advance trim on a subsequent maintenance pass once all overlapping holds have been released.
+For earlier disposal, use `logkeeper ordered dispose-worker` only after verifying that the exact enrollment's processes and effect scope have permanently shut down, and keep the external disposition digest with the deployment's custody records.
 
 ## Repair the voter cohort
 

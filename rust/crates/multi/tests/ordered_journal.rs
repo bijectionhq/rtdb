@@ -494,6 +494,178 @@ async fn reconcile(client: &Client, grant: Grant, original: Request) -> AppendRe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_withdrawn_worker_disposal_releases_the_read_that_blocks_trim() {
+    let mut authority = Authority::new(Uuid::new_v4(), 4096, 1024, 1);
+    authority.group_spec["limits"]["serving_lease"] = json!(3_000);
+    authority.group_spec["limits"]["clock_drift"] = json!(5_000);
+    let cohort = authority.start("disposal").await;
+    let administrator = authority.administrator.client(&cohort.route);
+    let custodian = authority.custodian.client(&cohort.route);
+    let worker = authority.workers[0].client(&cohort.route);
+    let enrollment = authority.enrollments[0];
+    let principal = Principal::Worker(enrollment);
+    let (grant, recovery) = grant(&worker, enrollment).await;
+    release(&worker, recovery).await;
+
+    let payload = Bytes::from_static(b"pinned by a withdrawn reader");
+    let record = execute(
+        &worker,
+        append(route(&worker).await, grant, AppendClass::Data, payload),
+    )
+    .await;
+    let Outcome::Appended(record) = record.receipt.outcome.unwrap() else {
+        panic!("the test record was not appended");
+    };
+    let read = execute(
+        &worker,
+        request(route(&worker).await, principal, Command::Barrier { grant }),
+    )
+    .await;
+    let Outcome::Barrier { read, .. } = read.receipt.outcome.unwrap() else {
+        panic!("the worker did not acquire a read hold");
+    };
+    assert_eq!(read.owner, enrollment);
+    assert_eq!(read.through, record.cut);
+
+    let initial = route(&custodian).await;
+    let selected = Checkpoint {
+        cut: record.cut,
+        root: [19; 32],
+        manifest: [23; 32],
+        custody: Custody {
+            allocation: Uuid::new_v4(),
+            revision: 2,
+            provider: [29; 32],
+        },
+    };
+    let preparation = CheckpointPreparation {
+        checkpoint: selected.cut,
+        root: selected.root,
+        source: grant,
+        base: initial.checkpoint,
+        custody: selected.custody,
+        usable_bytes: 64 << 20,
+        descriptor: [31; 32],
+    };
+    let custody = async |command| {
+        execute(
+            &custodian,
+            request(route(&custodian).await, Principal::Custodian, command),
+        )
+        .await
+        .receipt
+        .outcome
+    };
+    assert_eq!(
+        custody(Command::PrepareCheckpoint { preparation }).await,
+        Ok(Outcome::CheckpointPrepared(preparation)),
+    );
+    assert_eq!(
+        custody(Command::Publish {
+            checkpoint: selected
+        })
+        .await,
+        Ok(Outcome::Published(selected)),
+    );
+    assert_eq!(
+        custody(Command::DisposeExpired { enrollment }).await,
+        Err(Refusal::Stale),
+    );
+
+    let lease = execute(
+        &worker,
+        request(route(&worker).await, principal, Command::Lease { grant }),
+    )
+    .await;
+    let Outcome::Leased { lease_end, .. } = lease.receipt.outcome.unwrap() else {
+        panic!("the worker did not acquire its serving lease");
+    };
+    assert_eq!(
+        execute(
+            &administrator,
+            request(
+                route(&administrator).await,
+                Principal::Administrator,
+                Command::Withdraw { enrollment },
+            ),
+        )
+        .await
+        .receipt
+        .outcome,
+        Ok(Outcome::Withdrawn),
+    );
+    let trim = Command::Trim {
+        selected,
+        through: selected.cut,
+    };
+    assert_eq!(custody(trim.clone()).await, Err(Refusal::Unavailable));
+
+    let deadline = lease_end + initial.clock_drift;
+    let wait_until = async |time: u64| {
+        tokio::time::sleep(Duration::from_millis(
+            time.saturating_sub(now_ms().try_into().unwrap()),
+        ))
+        .await;
+    };
+    wait_until(lease_end).await;
+    assert_eq!(
+        custody(Command::DisposeExpired { enrollment }).await,
+        Err(Refusal::Unavailable),
+    );
+    let during_drift = route(&custodian).await;
+    assert!((lease_end..deadline).contains(&during_drift.time));
+    assert_eq!(during_drift.floor, initial.floor);
+
+    wait_until(deadline).await;
+    assert_eq!(custody(trim.clone()).await, Err(Refusal::Unavailable));
+    assert!(route(&custodian).await.time >= deadline);
+
+    let control = authority.data.path().join("dispose-control.json");
+    write_json(
+        &control,
+        &json!({
+            "route": cohort.route,
+            "credentials": authority.administrator.credentials,
+        }),
+    );
+    let disposed = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rtdb-multi"))
+            .arg("ordered-dispose-expired-worker")
+            .arg("--manifest")
+            .arg(control)
+            .args([
+                "--worker",
+                &enrollment.worker.to_string(),
+                "--serial",
+                &enrollment.serial.to_string(),
+            ])
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        disposed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disposed.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Enrollment>(&disposed.stdout).unwrap(),
+        enrollment
+    );
+    assert_eq!(
+        custody(trim).await,
+        Ok(Outcome::Trimmed(TrimResult {
+            from: initial.floor,
+            through: selected.cut,
+            ordinary_bytes: record.byte_end - record.byte_start,
+            maintenance_bytes: 0,
+        })),
+    );
+    assert_eq!(route(&custodian).await.floor, selected.cut);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_trim_and_repair() {
     const ORDINARY: u64 = 4096;
     let authority = Authority::new(Uuid::new_v4(), ORDINARY, 1024, 1);

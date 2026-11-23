@@ -24,6 +24,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
+       rtdb-multi ordered-dispose-expired-worker --manifest CONTROL_JSON --worker UUID --serial N\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
@@ -395,6 +396,29 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             } else {
                 manifest.run(cancellation).await.map_err(failure)
             }
+        }
+        "ordered-dispose-expired-worker" => {
+            use ordered_logkeeper::ordered::{Command, Enrollment, Outcome, daemon::ControlManifest};
+
+            let failure = |message| Anomaly::fault("rtdb.multi/ordered-dispose-expired-worker", message);
+            let path = std::path::Path::new(arguments.required("manifest")?);
+            let enrollment = Enrollment {
+                worker: required_uuid(&arguments, "worker")?,
+                serial: arguments
+                    .required("serial")?
+                    .parse()
+                    .map_err(|_| usage("--serial must be an enrollment serial".into()))?,
+            };
+            let outcome = ControlManifest::execute(path, Command::DisposeExpired { enrollment })
+                .await
+                .map_err(|error| failure(error.to_string()))?;
+            if outcome != Outcome::WorkerDisposed(enrollment) {
+                return Err(failure("The journal returned a different disposal result".into()));
+            }
+            let json = serde_json::to_string(&enrollment)
+                .map_err(|error| io(std::io::Error::other(error)))?;
+            println!("{json}");
+            Ok(())
         }
         "ordered-archive-identity" => {
             let storage = CellStorage::parse(arguments.required("archive-root")?)?;
