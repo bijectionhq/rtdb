@@ -13,6 +13,16 @@ pub async fn run(directory: &dyn Directory) {
     let created = directory.create_deployment(DeploymentRecord::new(&name, "acme", vec![], 0)).await.expect("create");
     assert_eq!(created.version, 1, "a new deployment starts at version 1");
     assert!(directory.create_deployment(DeploymentRecord::new(&name, "acme", vec![], 0)).await.is_err(), "names are unique");
+    let installed = DeploymentRecord::new(format!("{name}-installed"), "acme", vec![], 0);
+    let id = installed.id.parse().unwrap();
+    directory.reserve_installed_journal(id).await.unwrap();
+    directory.reserve_installed_journal(id).await.unwrap();
+    assert_eq!(directory.create_deployment(installed.clone()).await.unwrap_err().code, "rtdb.directory/exists");
+    assert!(matches!(directory.replace_deployment(installed.clone(), 1).await.unwrap(), Cas::Conflict(None)));
+    assert!(directory.deployment(&installed.id).await.unwrap().is_none());
+    assert!(directory.deployment_by_name(&installed.name).await.unwrap().is_none());
+    assert!(directory.deployments().await.unwrap().iter().all(|record| record.id != installed.id));
+    assert_eq!(directory.reserve_installed_journal(created.id.parse().unwrap()).await.unwrap_err().code, "rtdb.directory/exists");
 
     assert_eq!(directory.deployment(&created.id).await.unwrap().as_ref(), Some(&created));
     assert_eq!(directory.deployment_by_name(&name).await.unwrap().as_ref(), Some(&created));

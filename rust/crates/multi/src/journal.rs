@@ -120,7 +120,7 @@ impl InstalledJournal {
     }
 
     pub fn binds(&self, record: &DeploymentRecord) -> bool {
-        Uuid::parse_str(&record.id).ok() == Some(self.deployment())
+        record.id == self.deployment().to_string()
             && record.incarnation == self.incarnation
             && record.log_epoch == self.log_epoch.0
     }

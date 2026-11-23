@@ -14,7 +14,7 @@ use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use aws_sdk_dynamodbstreams::types::{AttributeValue, ShardIteratorType};
 use rtdb_types::{Anomaly, Result};
 
-use super::{EPOCH, ID, NAME, RECORD, VERSION, decode_deployment, parked, sdk_anomaly};
+use super::{EPOCH, ID, NAME, RECORD, VERSION, deployment_record, parked, sdk_anomaly};
 use crate::{ChangeFeed, DeploymentRecord};
 
 /// How long an idle follower waits before reading its shards again; a shard allows five reads a second.
@@ -98,7 +98,7 @@ impl Follower {
         while self.changes.upgrade().is_some_and(|feed| feed.has_broadcast_receivers()) {
             let Some(page) = pages.next().await else { break };
             for item in page.map_err(|error| sdk_anomaly("Scan", error))?.items() {
-                if let Ok(record) = decode_deployment(item) { self.publish(record); }
+                if let Ok(Some(record)) = deployment_record(Some(item)) { self.publish(record); }
             }
         }
         Ok(())

@@ -330,19 +330,21 @@ impl NodeAgent {
         Ok(self.directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect())
     }
 
+    fn require_directory_route(&self, name: &str) -> Result<()> {
+        if self.ordered.by_name(name).is_some() {
+            return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An installed journal uses its own placement decisions"));
+        }
+        Ok(())
+    }
+
     async fn record(&self, name: &str) -> Result<DeploymentRecord> {
+        self.require_directory_route(name)?;
         self.directory.deployment_by_name(name).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))
     }
 
     pub async fn activate(&self, name: &str) -> Result<Response> { self.activate_holding(name, None).await }
 
     async fn activate_holding(&self, name: &str, moving: Option<&MoveTicket>) -> Result<Response> {
-        if let Some(placement) = self.ordered.by_name(name) {
-            if moving.is_some() {
-                return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An installed journal uses its own placement decisions"));
-            }
-            return self.activate_ordered(name, placement, None).await;
-        }
         let turn = self.turn(name);
         let me = self.member();
         let mut attempted_relief = false;
@@ -423,7 +425,7 @@ impl NodeAgent {
         &self,
         name: &str,
         placement: &crate::journal::hosted::Placement,
-        predecessor: Option<crate::control::OrderedPredecessor>,
+        predecessor: crate::control::OrderedPredecessor,
     ) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
@@ -445,24 +447,17 @@ impl NodeAgent {
         let crate::journal::Authority::Worker { enrollment } = placement.worker.authority() else {
             return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "This node has no ordered worker credential"));
         };
-        if let Some(grant) = route.writer.grant {
-            if grant.enrollment == enrollment {
-                let mut holdings = self.holdings.lock();
-                if let Some(current) = holdings.get_mut(name).filter(|holding| {
-                    matches!(&holding.authority, HoldingAuthority::Journal(admission) if admission.grant == grant)
-                    && holding.database.upgrade().is_some_and(|database| matches!(database.status().role, DriverRole::Leading(_)))
-                }) {
-                    current.last_touch = Instant::now();
-                    return Ok(Response::Held { epoch: grant.epoch, address: self.address.clone() });
-                }
-            } else if predecessor.is_none() {
-                let endpoint = placement.endpoint(grant.enrollment).ok_or_else(|| Anomaly::incorrect(
-                    "rtdb.multi/ordered-route", "The installed writer has no authenticated worker route",
-                ))?;
-                return Ok(Response::Redirect { holder: grant.enrollment.worker.to_string(), address: endpoint.pgwire.clone() });
+        if let Some(grant) = route.writer.grant.filter(|grant| grant.enrollment == enrollment) {
+            let mut holdings = self.holdings.lock();
+            if let Some(current) = holdings.get_mut(name).filter(|holding| {
+                matches!(&holding.authority, HoldingAuthority::Journal(admission) if admission.grant == grant)
+                && holding.database.upgrade().is_some_and(|database| matches!(database.status().role, DriverRole::Leading(_)))
+            }) {
+                current.last_touch = Instant::now();
+                return Ok(Response::Held { epoch: grant.epoch, address: self.address.clone() });
             }
         }
-        if predecessor.is_some_and(|expected| expected != observed) {
+        if predecessor != observed {
             return Err(Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, "The installed journal chose another writer"));
         }
         if self.execution_memory_pressured() {
@@ -517,7 +512,7 @@ impl NodeAgent {
         if !activation.takeover && activation.predecessor.enrollment != Some(activation.target) {
             return Err(unavailable());
         }
-        let response = self.activate_ordered(name, placement, Some(activation.predecessor)).await?;
+        let response = self.activate_ordered(name, placement, activation.predecessor).await?;
         if let Response::Held { epoch, address } = response {
             let proof = secret.sign_route(&activation.reply_binding(scope, epoch, &address));
             Ok(Response::OrderedHeld { epoch, address, proof })
@@ -817,6 +812,7 @@ impl NodeAgent {
         &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
         capture: uuid::Uuid, cutoff: SuffixCut<'_>, expires_at_ms: i64,
     ) -> Result<(uuid::Uuid, CheckpointSuffixPin)> {
+        self.require_directory_route(name)?;
         const MAX_PIN_MS: i64 = 60_000;
         const MAX_PINS: usize = 32;
         let custody = match &cutoff {
@@ -1181,7 +1177,8 @@ impl NodeAgent {
         let budget = self.node.memory();
         let target = budget.limit_bytes() - budget.limit_bytes() / 4;
         let mut candidates: Vec<_> = self.holdings.lock().iter()
-            .filter(|(name, holding)| Some(name.as_str()) != protected && holding.opened.elapsed() >= self.options.min_residency)
+            .filter(|(name, holding)| matches!(&holding.authority, HoldingAuthority::Directory { .. })
+                && Some(name.as_str()) != protected && holding.opened.elapsed() >= self.options.min_residency)
             .map(|(name, holding)| (holding.last_touch, name.clone(), holding.id.clone(), holding.epoch))
             .collect();
         candidates.sort_unstable();
@@ -1260,6 +1257,7 @@ impl NodeAgent {
     }
 
     async fn scan_fragment_payload(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<rtdb_query::FragmentBytes> {
+        self.require_directory_route(name)?;
         if fragment.database() != name { return Err(Anomaly::incorrect("rtdb.multi/fragment-database", format!("A fragment of {} was sent as one of {name}", fragment.database()))); }
         // A reader without the deployment open refuses at once, so its coordinator reads the slice itself rather than wait on an open; it opens a replica on its next pass, for the scans after.
         let open = self.node.catalog().database(name).is_ok() && (self.holdings.lock().contains_key(name) || self.subscriptions.lock().get(name).is_some_and(|subscription| !matches!(subscription.role, Role::Snapshot(_))));
@@ -1317,6 +1315,7 @@ impl NodeAgent {
     /// Publishes a worker's compaction as the deployment's holder.
     pub async fn publish_compaction(&self, name: &str, notification: &[u8]) -> Result<Response> {
         use prost::Message;
+        self.require_directory_route(name)?;
         if !self.holdings.lock().contains_key(name) { return Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node does not hold {name}"))); }
         let notification = rtdb_format::log::proto::TriesAdded::decode(notification).map_err(|error| Anomaly::incorrect("rtdb.multi/compaction", error.to_string()))?;
         let position = self.node.catalog().database(name)?.publish_compaction(notification, &CancellationToken::new()).await?;
@@ -1410,6 +1409,7 @@ impl NodeAgent {
         let workers: Vec<&MemberRecord> = members.values().filter(|member| member.pool == rtdb_directory::MemberPool::Compaction && member.is_live(now)).collect();
         let me = self.member();
         let assigned_here = |record: &DeploymentRecord| {
+            if self.ordered.by_name(&record.name).is_some() { return false; }
             if record.lifecycle != Lifecycle::Live || record.move_from.is_some() || effective_holder(record, &members, now).is_none() { return false; }
             let compatible: Vec<_> = workers.iter().copied().filter(|member| record.permits_engine(member)).collect();
             let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &compatible, |member| member.id.as_str());
@@ -1709,7 +1709,10 @@ impl Handler for NodeAgent {
             Request::Activate { name } => self.activate(&name).await,
             Request::ActivateOrdered { name, activation } => self.authenticated_ordered_activation(&name, activation).await,
             Request::ActivateForMove { name, ticket } => self.activate_holding(&name, Some(&ticket)).await,
-            Request::Park { name } => self.park(&name).await,
+            Request::Park { name } => match self.require_directory_route(&name) {
+                Ok(()) => self.park(&name).await,
+                Err(error) => Err(error),
+            },
             Request::ParkForMove { name, epoch, ticket } => self.park_holding(&name, Some((epoch, &ticket))).await,
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Ping => Ok(Response::Done),
@@ -1721,7 +1724,10 @@ impl Handler for NodeAgent {
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::SubscribeFresh { name } => self.subscribe_for(&name, SubscriptionUse::FreshQuery).await,
             Request::Snapshot { name } => self.snapshot(&name).await,
-            Request::Flush { name } => self.flush(&name).await,
+            Request::Flush { name } => match self.require_directory_route(&name) {
+                Ok(()) => self.flush(&name).await,
+                Err(error) => Err(error),
+            },
             Request::PinCheckpointSuffix { name, deployment, lease, capture, basis, expires_at_ms } =>
                 self.pin_checkpoint_suffix(&name, deployment, lease, capture, basis, expires_at_ms).await,
             Request::PublishCompaction { name, notification, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.publish_compaction(&name, &notification).await, Err(error) => Err(error) }

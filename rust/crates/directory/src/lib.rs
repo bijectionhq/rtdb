@@ -1,6 +1,6 @@
 //! The cell directory (`allium/rtdb-multi.allium`, contract `Directory`).
 //!
-//! The directory is the authority for every deployment's placement, writer epoch and lifecycle, and for every member's liveness.
+//! The directory owns placement, writer epochs and lifecycle for directory deployments, and member liveness for the cell.
 //! Every change is a replace conditional on the record's version, so a writer that has been superseded can change nothing.
 //! It is never on the commit path: a placed holder commits and serves reads while the directory is unavailable.
 
@@ -1155,6 +1155,8 @@ pub trait AudienceSeatClaim: Send + Sync {
 
 #[async_trait]
 pub trait Directory: Send + Sync {
+    /// Permanently excludes an installed journal's deployment ID from directory admission.
+    async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()>;
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
     /// Reserves the child ID before hosted fork preparation can write its objects or logs.
@@ -1249,6 +1251,11 @@ pub trait Directory: Send + Sync {
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as i64).unwrap_or(0)
+}
+
+fn installed_journal_id(id: uuid::Uuid) -> Result<String> {
+    if id.is_nil() { return Err(Anomaly::incorrect("rtdb.directory/installed-journal-id", "An installed journal needs a nonzero deployment ID")); }
+    Ok(id.to_string())
 }
 
 pub fn exists(what: &str, key: &str) -> Anomaly {
@@ -1577,6 +1584,8 @@ pub struct MemoryDirectory {
 struct MemoryState {
     deployments: BTreeMap<String, Box<DeploymentRecord>>,
     names: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    installed_journals: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     reference_revisions: BTreeMap<String, StoredLineage>,
     #[serde(skip)]
@@ -1658,7 +1667,9 @@ impl MemoryDirectory {
         lineage: Option<(String, LineageState)>, stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
         if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
-        if stage_version.is_none() && state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
+        if state.installed_journals.contains(&record.id) || (stage_version.is_none() && state.deployments.contains_key(&record.id)) {
+            return Err(exists("Deployment", &record.id));
+        }
         if record.hosted_fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         if let Some((lineage, next)) = lineage {
             let stored = next.legacy_revision().map_or_else(|| StoredLineage::Current(next), StoredLineage::Legacy);
@@ -1678,6 +1689,13 @@ impl MemoryDirectory {
 
 #[async_trait]
 impl Directory for MemoryDirectory {
+    async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
+        let id = installed_journal_id(id)?;
+        let mut state = self.state()?;
+        if state.deployments.contains_key(&id) { return Err(exists("Deployment", &id)); }
+        if state.installed_journals.insert(id) { self.persist(&mut state)?; }
+        Ok(())
+    }
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         if record.hosted_fork_stage.is_some() { return Err(fork_stage_changed()); }
         let mut state = self.state()?;
@@ -1882,6 +1900,23 @@ mod tests {
     #[tokio::test]
     async fn memory_directory_meets_the_contract() {
         contract::run(MemoryDirectory::new().as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn an_installed_journal_reservation_survives_directory_restart() {
+        let root = std::env::temp_dir().join(format!("rtdb-installed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        MemoryDirectory::initialize(&root).unwrap();
+        let attempted = DeploymentRecord::new("installed", "acme", vec![], 0);
+        let directory = MemoryDirectory::open(&root).unwrap();
+        directory.reserve_installed_journal(attempted.id.parse().unwrap()).await.unwrap();
+        drop(directory);
+
+        let directory = MemoryDirectory::open(&root).unwrap();
+        assert_eq!(directory.create_deployment(attempted).await.unwrap_err().code, "rtdb.directory/exists");
+        assert!(directory.deployments().await.unwrap().is_empty());
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

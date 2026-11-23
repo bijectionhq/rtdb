@@ -73,6 +73,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         Some(path) => crate::journal::hosted::Routes::read(path, &settings.agent.storage)?,
         None => crate::journal::hosted::Routes::default(),
     });
+    ordered.reserve_deployments(directory.as_ref()).await?;
     let audience = settings.configuration.flight_sql.as_ref().and_then(|flight| flight.audience);
     if audience.is_some() != settings.agent.audience_journal_port.is_some() || settings.agent.audience_journal_port == Some(0) {
         return Err(Anomaly::incorrect("rtdb.multi/audience-authority",

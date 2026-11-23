@@ -36,7 +36,7 @@ use rtdb_multi::deployment::CellStorage;
 use rtdb_multi::gateway::{self, GatewayOptions};
 use rtdb_multi::journal::hosted::{GatewayRoutes, archive_identity};
 use rtdb_multi::keys::{KeyService, LocalKeyService};
-use rtdb_multi::{admin, flight_gateway, process};
+use rtdb_multi::{admin, control, flight_gateway, process};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -997,6 +997,9 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
     let routing = authority.router.client(&cohort.route);
     let installed: ApplicationRoute = serde_json::from_value(cohort.route.clone()).unwrap();
     let directory: Arc<dyn Directory> = MemoryDirectory::new();
+    if prepare_before_loss {
+        directory.create_deployment(DeploymentRecord::new("legacy", "acceptance", Vec::new(), now_ms())).await.unwrap();
+    }
     let keys = Arc::new(LocalKeyService::new(authority.data.path().join("keys")).unwrap());
     keys.key(&record.key_id()).await.unwrap();
     let serving_root = authority.data.path().join("serving");
@@ -1069,6 +1072,9 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         let mut agent = AgentOptions::new(storage.clone());
         agent.installed_journal_manifest = Some(path);
         agent.watch_interval = Duration::from_millis(50);
+        if prepare_before_loss {
+            agent.min_residency = Duration::ZERO;
+        }
         let settings = process::NodeSettings {
             configuration,
             allocation_limit_bytes: 1 << 30,
@@ -1092,7 +1098,7 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         } else {
             drop(control);
             drop(pgwire);
-            let node = process::start_node(MemoryDirectory::new(), settings)
+            let node = process::start_node(Arc::clone(&directory), settings)
                 .await
                 .unwrap();
             nodes.push(Some(node));
@@ -1145,6 +1151,38 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         .iter()
         .position(|&worker| worker == incumbent.enrollment)
         .unwrap();
+
+    if prepare_before_loss {
+        assert_eq!(admin::set_read_width(directory.as_ref(), "legacy", 2).await.unwrap().read_width, 2);
+        assert_eq!(directory.create_deployment(record.clone()).await.unwrap_err().code, "rtdb.directory/exists");
+        let node = nodes[incumbent_index].as_ref().unwrap();
+        let name = || "shop".to_owned();
+        let key = control::ControlKey(Some(common::secret()));
+        for request in [
+            control::Request::Activate { name: name() },
+            control::Request::Subscribe { name: name() },
+            control::Request::SubscribeFresh { name: name() },
+            control::Request::Snapshot { name: name() },
+            control::Request::Flush { name: name() },
+            control::Request::Park { name: name() },
+            control::Request::PinCheckpointSuffix {
+                name: name(), deployment, lease: Uuid::new_v4(), capture: Uuid::new_v4(),
+                basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(1), system_time: rtdb_types::Timestamp(1) },
+                expires_at_ms: now_ms() + 30_000,
+            },
+            control::Request::PublishCompaction { name: name(), notification: Vec::new(), grant: common::secret().node_grant("shop") },
+        ] {
+            let response = control::call(&node.control_address.to_string(), &request, DEADLINE, &key).await.unwrap();
+            assert!(matches!(response, control::Response::Refused { ref code, .. } if code == "rtdb.multi/ordered-placement"), "{request:?}: {response:?}");
+        }
+        let memory = node.server.node().memory();
+        let target = memory.limit_bytes() - memory.limit_bytes() / 10;
+        let pressure = memory.reserve(target.saturating_sub(memory.used_bytes())).unwrap();
+        node.agent.reconcile().await;
+        assert_eq!(node.agent.held().get("shop"), Some(&incumbent.epoch));
+        drop(pressure);
+        assert_eq!(route(&routing).await.writer.grant, Some(incumbent));
+    }
 
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = proxy.local_addr().unwrap();
@@ -1298,7 +1336,7 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         drop(pgwire);
         drop(control);
         nodes[1] = Some(
-            process::start_node(MemoryDirectory::new(), settings)
+            process::start_node(Arc::clone(&directory), settings)
                 .await
                 .unwrap(),
         );
@@ -1335,7 +1373,9 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         authority.enrollments[1 - incumbent_index]
     );
     assert!(elected.epoch > incumbent.epoch);
-    assert!(directory.deployments().await.unwrap().is_empty());
+    let remaining = directory.deployments().await.unwrap();
+    assert_eq!(remaining.len(), prepare_before_loss as usize);
+    assert!(remaining.iter().all(|record| record.name == "legacy"));
 
     if let Some(pending) = pending {
         assert_eq!(published.checkpoint.cut, pending.checkpoint);

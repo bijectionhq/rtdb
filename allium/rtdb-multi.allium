@@ -13,7 +13,9 @@
 --
 -- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.
 -- A deployment is one RTDB database belonging to one customer application.
--- Every cost a deployment imposes is proportional to its activity and its stored bytes; a deployment nobody is using is a directory record and objects in storage.
+-- Every cost a deployment imposes is proportional to its activity and its stored bytes.
+-- An idle directory deployment has only its directory record and objects in storage.
+-- Directory rules apply to directory deployments, and installed-journal obligations have their own authority invariants.
 --
 -- Status: target design, ahead of the implementation.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
@@ -29,7 +31,7 @@
 --
 -- Includes:
 --   - cells, and the map from deployment to cell;
---   - the directory, the authority for every deployment's placement, epoch and checkpoint;
+--   - the directory, the authority for directory deployments' placement, epoch and checkpoint;
 --   - node membership and liveness;
 --   - the deployment log, its loglets and the log servers that hold them;
 --   - the single-writer fence, at every surface where a writer has effect;
@@ -57,13 +59,13 @@
 --   At most one member's writes take effect per epoch, and epochs only rise.
 --
 -- - EPOCH -- the writer fence.
---   Allocated by the directory, one claimant per value, and checked at every surface where a writer has effect: the log, the directory, object storage.
+--   For directory deployments, the directory allocates one claimant per epoch and the log, directory and object storage check that epoch at their effect surfaces.
 --
 -- - LOGLET -- one epoch's segment of a deployment's log, held by an ensemble of log servers.
 --   A deployment's log is the chain of its loglets.
 --
--- - CHECKPOINT -- the directory's pointer to a deployment's last published manifest, and the log position it covers.
---   Everything at or below it is in object storage; everything above it is the tail.
+-- - CHECKPOINT -- the current authority's pointer to a deployment's last published manifest and the log position it covers.
+--   Everything at or below it is in object storage, and everything above it is the tail.
 --
 -- - TAIL -- the committed log records above the checkpoint.
 --   Short by construction: flushing keeps it under a replay budget.
@@ -470,6 +472,14 @@ contract LogService {
     @invariant WriterReplacementRetainsInstalledJournals
         -- A worker opening an installed deployment uses its installed journal ensemble.
         -- A separate durability-placement decision authorises a change of journals.
+
+    @invariant InstalledJournalIdentityExcludesDirectoryAdmission
+        -- A cutover provisions a fresh deployment identity for the installed journal.
+        -- A mixed cell permanently reserves the installed identity before sharing its media with directory administration.
+        -- The reservation occupies the identity without supplying a directory deployment record, epoch or version.
+        -- Directory creation and staging require an unreserved identity, and effects on an existing directory deployment require its versioned record.
+        -- A worker sends a configured installed name through authenticated journal activation and uses directory control only for its directory deployments.
+        -- The installed grant and custody decisions authorize serving, recovery, checkpoint publication, trim and retirement of journal-owned media.
 
     @invariant InstalledJournalOwnsWriterAndRecovery
         -- The installed journal chooses a replacement grant against its exact observed predecessor and the candidate's current enrollment.

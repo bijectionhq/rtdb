@@ -395,6 +395,29 @@ mod tests {
     use rtdb_directory::MemoryDirectory;
 
     #[tokio::test]
+    async fn hosted_retirement_cannot_create_a_tombstone_for_an_installed_journal() {
+        let directory = MemoryDirectory::new();
+        let token = "a".repeat(TOKEN_LENGTH);
+        let installer = Installer {
+            install: Token::new(&token).unwrap(),
+            disposal: Some(Token::new(&token).unwrap()),
+            org: "cell".into(),
+            replicas: 3,
+        };
+        let installed = Uuid::new_v4();
+        directory.reserve_installed_journal(installed).await.unwrap();
+        let schedule = |authority| serde_json::json!({
+            "operation": "schedule_disposal", "token": token, "name": "tenant", "authority": authority, "incarnation": 1
+        }).to_string();
+
+        assert!(matches!(installer.handle(directory.as_ref(), &schedule(installed)).await, Reply::Refused));
+        assert!(directory.deployments().await.unwrap().is_empty());
+        let legacy = Uuid::new_v4();
+        assert!(matches!(installer.handle(directory.as_ref(), &schedule(legacy)).await,
+            Reply::Scheduled { authority, epoch: 1, .. } if authority == legacy));
+    }
+
+    #[tokio::test]
     async fn retirement_credentials_fence_the_exact_vacant_installation() {
         let directory = MemoryDirectory::new();
         let install = "a".repeat(TOKEN_LENGTH);

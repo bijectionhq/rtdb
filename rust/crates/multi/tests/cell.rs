@@ -151,6 +151,7 @@ impl ObservedDirectory {
 
 #[async_trait::async_trait]
 impl Directory for ObservedDirectory {
+    async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> { self.inner.reserve_installed_journal(id).await }
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
     async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: rtdb_directory::ForkPreparation) -> Result<DeploymentRecord> {
         self.inner.stage_hosted_fork(child, preparation).await

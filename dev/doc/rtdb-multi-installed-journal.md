@@ -19,16 +19,28 @@ Use a fresh deployment ID and Logkeeper placement for a cutover. The ordered app
 
 5. Enroll each worker using `logkeeper ordered enroll CONTROL_JSON WORKER_UUID`. The control JSON contains the public `route` emitted above and the administrator's `credentials` paths. Record the returned worker UUID and serial in the voter client pin, the worker's route credential and each gateway endpoint. Roll the new client pins onto the existing voter media. Enrollment chooses a new serial in the journal and the certificate pin binds it to the intended worker.
 6. Initialize the serving storage and vault using `rtdb-multi init-storage`. Use scoped S3 writes for the serving store. Provision a separate, enrolled terminal S3 namespace for checkpoint custody. It must preserve conditional-create semantics and its unversioned state for the lifetime of the installation. Qualify and enroll the archive using the existing terminal-storage procedure, then grant the custodian conditional replacement for terminal tombstones. Application copy credentials should permit only conditional creation. Bucket policy and lifecycle must preserve these tombstones. [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) · [Bucket policy enforcement](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html) For a local archive, initialize the archive volume with its own storage namespace. Read its physical provider fingerprint with `rtdb-multi ordered-archive-identity --archive-root ARCHIVE --archive-prefix PREFIX`.
-7. Prepare the RTDB identity and install the serving key. The command prints one `DeploymentRecord` for use in the node manifest.
+7. Prepare the RTDB identity and install the serving key.
+   The command prints one `DeploymentRecord` for use in the node manifest.
+   In a mixed cell, supply `--directory DIR` to reserve the installed UUID before provisioning the key.
+   The reservation is permanent, is invisible to deployment lookup and placement, and refuses a UUID already used by a directory deployment.
 
    ```sh
    rtdb-multi prepare-ordered-deployment --route /run/rtdb/public-route.json \
-     --name DATABASE --org ORGANIZATION --keys KEY_VAULT
+     --name DATABASE --org ORGANIZATION --keys KEY_VAULT --directory DIR
    ```
+
+   Omit `--directory` for an installed-only cell with no shared directory.
 
 ## Install node and gateway routes
 
 Set `--installed-journals /run/rtdb/node-placements.json` on each node and `--installed-journals /run/rtdb/gateway-placements.json` on the gateway. The hosted entrypoint also accepts the absolute mount path in `RTDB_INSTALLED_JOURNALS_FILE`. Continue to supply the cell secret used for RTDB control and gateway capabilities. A cell serving only installed journal placements can omit `--directory`. In a mixed cell, installed names are resolved from the authenticated journal and remaining names use the directory.
+
+Upgrade directory readers before reserving IDs in a shared directory.
+For an existing installed-only placement joining a mixed cell, rerun preparation with its exact route, coordinates and `--directory` before sharing the media with directory administration.
+The node and the gateway's hosted installer also reserve their configured installed UUIDs before serving.
+Configure the same directory for the nodes and for any controller, reaper or recovery service with access to the cell's serving media and keys.
+The reservation carries no grant, checkpoint or retirement authority.
+The [installed-journal bypass audit](../../verification/redesign/installed-journal-bypass.md) traces those authorities.
 
 The manifests contain arrays. A node entry includes:
 

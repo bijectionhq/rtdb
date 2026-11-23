@@ -97,6 +97,7 @@ mod tests {
 
     #[async_trait]
     impl Directory for Scripted {
+        async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> { self.inner.reserve_installed_journal(id).await }
         async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
         async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: crate::ForkPreparation) -> Result<DeploymentRecord> {
             self.inner.stage_hosted_fork(child, preparation).await

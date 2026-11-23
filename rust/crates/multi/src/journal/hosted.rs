@@ -69,7 +69,6 @@ pub(crate) struct Placement {
     archive: crate::deployment::CellStorage,
     archive_prefix: ObjectKey,
     journal_window_bytes: Option<u64>,
-    endpoints: BTreeMap<Enrollment, WorkerEndpoint>,
     nomination: tokio::sync::Mutex<Option<Request>>,
     checkpoint_reservations: BTreeMap<u64, Reservation>,
     publication: tokio::sync::Mutex<Option<(Checkpoint, Cut)>>,
@@ -128,6 +127,13 @@ impl GatewayRoutes {
 
     pub(crate) fn by_name(&self, name: &str) -> Option<&GatewayPlacement> {
         self.0.get(name)
+    }
+
+    pub async fn reserve_deployments(&self, directory: &dyn rtdb_directory::Directory) -> Result<()> {
+        for placement in self.0.values() {
+            directory.reserve_installed_journal(placement.deployment).await?;
+        }
+        Ok(())
     }
 }
 
@@ -216,7 +222,6 @@ impl Routes {
                 archive: entry.archive,
                 archive_prefix: ObjectKey::new(entry.archive_prefix)?,
                 journal_window_bytes: entry.journal_window_bytes,
-                endpoints,
                 nomination: Default::default(),
                 checkpoint_reservations,
                 publication: Default::default(),
@@ -230,6 +235,13 @@ impl Routes {
 
     pub fn by_name(&self, name: &str) -> Option<&Arc<Placement>> {
         self.0.get(name)
+    }
+
+    pub(crate) async fn reserve_deployments(&self, directory: &dyn rtdb_directory::Directory) -> Result<()> {
+        for placement in self.0.values() {
+            directory.reserve_installed_journal(placement.worker.deployment()).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn custody_placements(&self) -> impl Iterator<Item = (&str, &Placement)> {
@@ -623,10 +635,6 @@ impl Placement {
             .request(&route, Command::ProtectRoot { source })?;
         Held::acquire(&self.worker, request, tasks).await
     }
-    pub fn endpoint(&self, enrollment: Enrollment) -> Option<&WorkerEndpoint> {
-        self.endpoints.get(&enrollment)
-    }
-
     pub async fn nominate(&self, route: &Route) -> Result<WriterAdmission> {
         let mut pending = self.nomination.lock().await;
         let request = match pending.as_ref() {

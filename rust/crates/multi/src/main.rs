@@ -25,7 +25,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
-       rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH\n\
+       rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
        rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
@@ -421,6 +421,9 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             record.incarnation = incarnation;
             record.log_epoch = log_epoch;
             record.linearizable_reads = true;
+            if let Some(spec) = arguments.optional("directory") {
+                directory(spec).await?.reserve_installed_journal(route.placement.deployment).await?;
+            }
             key_service(arguments.required("keys")?).await?.key(&record.key_id()).await?;
             println!("{}", serde_json::to_string_pretty(&record).map_err(|error| io(std::io::Error::other(error)))?);
             Ok(())
@@ -570,6 +573,9 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 }
             };
             if arguments.present("install-listen") {
+                if let Some(routes) = &options.installed_journals {
+                    routes.reserve_deployments(directory.as_ref()).await?;
+                }
                 let tls = tls.ok_or_else(|| usage("The installation listener requires a TLS configuration".into()))?;
                 let installer = rtdb_multi::install::Installer::from_file(
                     std::path::Path::new(arguments.required("install-token-file")?),

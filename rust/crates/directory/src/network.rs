@@ -37,6 +37,7 @@ enum Op {
     SettleOwnedVersion { id: String, expected: Version, retirement: LineageRetirement },
     SettleReferenceDisposal { permit: ReferenceDisposal, record: DeploymentRecord, expected: Version },
     ChangeLineage { lineage: String, change: LineageChange },
+    ReserveInstalledJournal { id: uuid::Uuid },
     Deployment { id: String },
     DeploymentByName { name: String },
     Deployments,
@@ -58,6 +59,7 @@ impl Op {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Reply {
+    InstalledJournalReserved,
     Deployment(DeploymentRecord),
     OptionalDeployment(Option<DeploymentRecord>),
     Deployments(Vec<DeploymentRecord>),
@@ -101,6 +103,10 @@ struct Response { id: u64, result: std::result::Result<Reply, Anomaly> }
 
 async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
     Ok(match op {
+        Op::ReserveInstalledJournal { id } => {
+            directory.reserve_installed_journal(id).await?;
+            Reply::InstalledJournalReserved
+        }
         Op::CreateDeployment { record } => Reply::Deployment(directory.create_deployment(record).await?),
         Op::StageHostedFork { child, preparation } => Reply::Deployment(directory.stage_hosted_fork(child, preparation).await?),
         Op::CreateFork { child, expected_parent, preparation } => Reply::Deployment(directory.publish_fork(child, expected_parent, preparation).await?),
@@ -436,6 +442,12 @@ fn protocol(reply: Reply) -> Anomaly {
 
 #[async_trait]
 impl Directory for RemoteDirectory {
+    async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
+        match self.call(Op::ReserveInstalledJournal { id }).await? {
+            Reply::InstalledJournalReserved => Ok(()),
+            other => Err(protocol(other)),
+        }
+    }
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         match self.call(Op::CreateDeployment { record }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }

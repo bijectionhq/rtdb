@@ -30,7 +30,7 @@ use audience_seat::{SeatCondition, SeatPredecessor, SeatRevision, acquire_condit
 use crate::{
     CheckpointTransferActivation, CheckpointTransferBootstrap, CheckpointTransferFence, CheckpointTransferReplica, CheckpointTransferSelection, CheckpointTransferTerminal, ForkPreparation, fork_stage_changed,
     fork_stage_version, prepare_checkpoint_transfer, prepare_checkpoint_transfer_activation, prepare_checkpoint_transfer_bootstrap, prepare_checkpoint_transfer_replica, prepare_checkpoint_transfer_terminal, require_fork_stage_update,
-    require_transfer_update, stage_hosted_fork_record, transfer_changed,
+    installed_journal_id, require_transfer_update, stage_hosted_fork_record, transfer_changed,
 };
 
 mod audience_seat;
@@ -46,6 +46,7 @@ const VERSION: &str = "version";
 const EPOCH: &str = "epoch";
 const HOLDER: &str = "holder";
 const RECORD: &str = "record";
+const INSTALLED_JOURNAL: &str = "installed_journal";
 const LINEAGE_VERSION: &str = "lineage_version";
 const CHECKPOINT_TRANSFER_FENCE: &str = "checkpoint_transfer_fence";
 const HOSTED_FORK_STAGE: &str = "hosted_fork_stage";
@@ -390,6 +391,14 @@ fn decode_deployment(item: &Item) -> Result<DeploymentRecord> {
     }
 }
 
+fn is_installed_journal(item: &Item) -> bool {
+    item.get(INSTALLED_JOURNAL) == Some(&AttributeValue::Bool(true))
+}
+
+fn deployment_record(item: Option<&Item>) -> Result<Option<DeploymentRecord>> {
+    item.filter(|item| !is_installed_journal(item)).map(decode_deployment).transpose()
+}
+
 fn decode_member(item: &Item) -> Result<MemberRecord> { decode(item, |record: &mut MemberRecord, version| record.version = version) }
 
 fn deployment_item(record: &DeploymentRecord, pack_parked: bool) -> Result<Item> {
@@ -528,6 +537,22 @@ impl DynamoDirectory {
 
 #[async_trait]
 impl Directory for DynamoDirectory {
+    async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
+        let id = installed_journal_id(id)?;
+        // The reservation occupies the deployment key without a version that could pass a deployment CAS.
+        let reservation = Item::from([
+            (ID.to_owned(), AttributeValue::S(id.clone())),
+            (INSTALLED_JOURNAL.to_owned(), AttributeValue::Bool(true)),
+        ]);
+        let table = &self.tables.deployments;
+        if self.put_new(table, reservation).await?
+            || self.get(table, ID, &id).await?.as_ref().is_some_and(is_installed_journal)
+        {
+            return Ok(());
+        }
+        Err(exists("Deployment", &id))
+    }
+
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         if record.hosted_fork_stage.is_some() { return Err(fork_stage_changed()); }
         self.insert_deployment(record, Vec::new(), None).await
@@ -661,10 +686,10 @@ impl Directory for DynamoDirectory {
         let reader = self.audience_reader.as_ref().ok_or_else(|| Anomaly::unsupported(
             "rtdb.directory/audience-transport", "The audience read transport was not installed",
         ))?;
-        let Some(record) = get_item(reader, &self.tables.deployments, ID, id).await? else {
+        let item = get_item(reader, &self.tables.deployments, ID, id).await?;
+        let Some(record) = deployment_record(item.as_ref())? else {
             return Ok(None);
         };
-        let record = decode_deployment(&record)?;
         let Some(holder) = &record.holder else { return Ok(None) };
         let member = get_item(reader, &self.tables.members, ID, holder.as_str()).await?;
         Ok(member.as_ref().map(decode_member).transpose()?.map(|member| (record, member)))
@@ -678,7 +703,7 @@ impl Directory for DynamoDirectory {
             get_item(reader, &self.tables.deployments, ID, id),
             get_item(reader, &self.tables.members, ID, member.as_str()),
         )?;
-        let record = record.as_ref().map(decode_deployment).transpose()?;
+        let record = deployment_record(record.as_ref())?;
         let member = member.as_ref().map(decode_member).transpose()?;
         Ok(record.zip(member))
     }
@@ -724,7 +749,7 @@ impl Directory for DynamoDirectory {
     }
 
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
-        self.get(&self.tables.deployments, ID, id).await?.as_ref().map(decode_deployment).transpose()
+        deployment_record(self.get(&self.tables.deployments, ID, id).await?.as_ref())
     }
 
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
@@ -734,7 +759,7 @@ impl Directory for DynamoDirectory {
     }
 
     async fn deployments(&self) -> Result<Vec<DeploymentRecord>> {
-        self.scan(&self.tables.deployments).await?.iter().map(decode_deployment).collect()
+        self.scan(&self.tables.deployments).await?.iter().filter(|item| !is_installed_journal(item)).map(decode_deployment).collect()
     }
 
     /// The index lags writes, so a deployment claimed a moment ago may be missing; every hit is re-read strongly, so none is stale.
@@ -873,7 +898,7 @@ impl Directory for DynamoDirectory {
             Ok(()) => Ok(Cas::Applied(record)),
             Err(None) => Ok(Cas::Conflict(None)),
             Err(Some(current)) => {
-                let current = decode_deployment(&current)?;
+                let Some(current) = deployment_record(Some(&current))? else { return Ok(Cas::Conflict(None)); };
                 if current.version == expected && current.name != name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
                 if current.version == expected {
                     require_fork_stage_update(&current, &record)?;
