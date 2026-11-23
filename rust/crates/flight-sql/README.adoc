@@ -279,6 +279,7 @@ Each session uses its own buffer pool on the audience cache budget from initial 
 Audience queries use local scans. The holder requires an uncached view of the live writer's exact S3 storage attachment for the installed source.
 That view shares the attachment's object mapping, custody and serving key and bypasses the ordinary SSD cache and its fill queue.
 Provider object reads use a distinct S3 HTTP client, including when retained I/O outlives its caller. A remote store without that client refuses the scoped read.
+Whole objects read into the buffer pool must match the reserved length. The reservation remains held while admitted provider work drains after cancellation.
 Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
 A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
 The audience handshake and subsequent actions use the reserved admission.

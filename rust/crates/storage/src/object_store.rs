@@ -50,13 +50,13 @@ pub struct ObjectObservation<T> {
 
 pub struct ReadReservation {
     length: usize,
-    retention: Box<dyn Send + Sync>,
+    retention: Arc<dyn Send + Sync>,
 }
 
 impl ReadReservation {
     /// `retention` must hold the memory charge for `length` bytes until it is dropped.
     pub fn new<T: Send + Sync + 'static>(length: usize, retention: T) -> Self {
-        Self { length, retention: Box::new(retention) }
+        Self { length, retention: Arc::new(retention) }
     }
 
     pub fn length(&self) -> usize { self.length }
@@ -68,6 +68,11 @@ impl ReadReservation {
         Ok(())
     }
 
+    /// Keeps the underlying charge alive in provider tasks admitted while polling this read.
+    pub async fn retaining_io<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        crate::IoRegion::retaining(Arc::clone(&self.retention), work).await
+    }
+
     /// Transfers the charge to the completed allocation; mismatched byte counts are rejected.
     pub fn finish(self, bytes: Bytes) -> Result<RetainedBytes> {
         if bytes.len() != self.length { return Err(Error::Task("reserved read returned a different byte count".into())); }
@@ -77,7 +82,7 @@ impl ReadReservation {
 
 pub struct RetainedBytes {
     bytes: Bytes,
-    _retention: Box<dyn Send + Sync>,
+    _retention: Arc<dyn Send + Sync>,
 }
 
 impl RetainedBytes {
@@ -178,6 +183,10 @@ pub trait ObjectStore: Send + Sync {
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
         reservation.finish(self.get_range(key, range).await?)
+    }
+    /// Reads a whole immutable object of the reserved length.
+    async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> Result<RetainedBytes> {
+        self.get_reserved_range(key, 0..reservation.length() as u64, reservation).await
     }
     /// Reads part of an object without filling a whole-object disk cache on a miss.
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {

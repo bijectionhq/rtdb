@@ -361,7 +361,10 @@ impl BufferPool {
         match self.get(key).await {
             Err(Error::MemoryLimit { .. }) => {
                 let size = self.store.head(key).await?.size;
-                self.fetch(key, 0..size, |length| reserve_from(fallback, length)).await
+                let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
+                let reservation = ReadReservation::new(size, reserve_from(fallback, size)?);
+                let allocation = Arc::new(self.store.get_reserved_object(key, reservation).await?);
+                Ok(CacheLease { allocation, range: 0..size })
             }
             fetched => fetched,
         }
@@ -389,7 +392,7 @@ impl BufferPool {
                     let size = self.store.head(key).await?.size;
                     let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
                     let reservation = ReadReservation::new(size, self.reserve(size)?);
-                    let allocation = Arc::new(self.store.get_reserved_range(key, 0..size as u64, reservation).await?);
+                    let allocation = Arc::new(self.store.get_reserved_object(key, reservation).await?);
                     *slot = Some(allocation.clone());
                     allocation
                 }

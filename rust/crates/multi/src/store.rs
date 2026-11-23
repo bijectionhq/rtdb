@@ -18,7 +18,7 @@ use prost_types::Any;
 use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
 use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES}};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -971,6 +971,10 @@ impl ObjectStore for AudienceObjectStore {
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         IoRegion::audience_object_read(self.0.get_range(key, range)).await
+    }
+    async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
+        let observed = reservation.retaining_io(self.observe_fresh_exact(key, reservation.length())).await?;
+        reservation.finish(observed.value)
     }
     fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { false }
     async fn put(&self, _: &ObjectKey, _: Bytes) -> rtdb_storage::Result<()> { Err(audience_read_only()) }
@@ -2124,7 +2128,8 @@ mod tests {
         let bytes = Bytes::from_static(b"catalog");
         EncryptingStore::new(uncached.clone(), &material).unwrap().put(&object, bytes.clone()).await.unwrap();
         assert!(matches!(stores.ordinary.get(&object).await, Err(Error::MissingObject(_))));
-        assert_eq!(audience.store.get(&object).await.unwrap(), bytes);
+        assert_eq!(audience.store.get_reserved_object(&object, ReadReservation::new(bytes.len(), ())).await.unwrap().as_slice(), bytes.as_ref());
+        assert!(audience.store.get_reserved_object(&object, ReadReservation::new(bytes.len() - 1, ())).await.is_err());
 
         let stale = factory.wrap_stores(&configuration(Some(1)), cached, uncached).await.unwrap();
         assert!(stale.audience.is_none());
