@@ -418,11 +418,7 @@ impl ObjectStore for CapturedObjects {
     }
 
     async fn head(&self, name: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        let size = self
-            .object(name)?
-            .bytes
-            .checked_sub(crate::cipher::SEALED_OVERHEAD as u64)
-            .ok_or_else(|| Error::ConflictingObject(name.to_string()))?;
+        let size = crate::cipher::object::plaintext_size(name, self.object(name)?.bytes)?;
         Ok(StoredObject {
             key: name.clone(),
             size,
@@ -431,7 +427,7 @@ impl ObjectStore for CapturedObjects {
 
     async fn get(&self, name: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         let sealed = read_object(&self.files, name, self.object(name)?).await?;
-        self.cipher.open(name.as_str(), &sealed)
+        self.cipher.open_object(name, &sealed)
     }
 
     async fn get_range(&self, name: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
@@ -496,6 +492,7 @@ mod tests {
             name: name.to_string(),
             bytes: sealed.len() as u64,
             sha256: super::super::digest(&sealed),
+            frame_header_sha256: None,
         };
         let store = CapturedObjects {
             files,

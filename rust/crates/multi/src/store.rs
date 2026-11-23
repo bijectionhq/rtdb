@@ -18,14 +18,14 @@ use prost_types::Any;
 use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
 use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES}};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, WholeObjectAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, ObjectReadAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-use crate::cipher::{Cipher, SEALED_OVERHEAD as OVERHEAD};
+use crate::cipher::{Cipher, object};
 use crate::catalog_readers::CatalogReaders;
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
@@ -55,7 +55,6 @@ pub(crate) fn stays_in_source_residence(name: &str) -> bool {
             .is_some_and(|record| record.starts_with('/') && record.ends_with(TRIE_RETIREMENT_RELEASE))
 }
 
-const SEALED_OVERHEAD: u64 = OVERHEAD as u64;
 
 /// The deployment store a node opens, carried in its `DatabaseConfig`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -950,7 +949,7 @@ impl ObjectStore for FencedStore {
 /// The scheduled reader only follows exact keys in its pinned catalog.
 struct AudienceObjectStore(EncryptingStore);
 
-fn audience_read_only() -> Error { Error::Closed("The audience object view requires reserved whole-object reads".into()) }
+fn audience_read_only() -> Error { Error::Closed("The audience object view requires a reserved read".into()) }
 
 #[async_trait]
 impl ObjectStore for AudienceObjectStore {
@@ -974,24 +973,31 @@ impl ObjectStore for AudienceObjectStore {
     }
     async fn get(&self, _: &ObjectKey) -> rtdb_storage::Result<Bytes> { Err(audience_read_only()) }
     async fn get_range(&self, _: &ObjectKey, _: Range<u64>) -> rtdb_storage::Result<Bytes> { Err(audience_read_only()) }
-    fn whole_object_allocation(&self, length: usize) -> rtdb_storage::Result<WholeObjectAllocation> {
+    fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
         let overflow = || Error::Task("Audience object allocation size overflow".into());
-        let sealed = length.checked_add(OVERHEAD).ok_or_else(overflow)?;
+        let sealed = object::sealed_size(key, length)?;
         // A held archive can hold the original ciphertext, the decrypted body and its
         // resealed serving copy at once. Budget all three until provider I/O drains.
         let scratch_bytes = sealed.checked_mul(3).ok_or_else(overflow)?;
-        Ok(WholeObjectAllocation { retained_bytes: sealed, scratch_bytes })
+        Ok(ObjectReadAllocation { retained_bytes: sealed, scratch_bytes })
     }
     async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
         let length = reservation.length();
-        if !reservation.covers(&self.whole_object_allocation(length)?) {
+        if !reservation.covers(&self.whole_object_allocation(key, length)?) {
             return Err(audience_read_only());
         }
         let read = IoRegion::audience_object_read(self.0.observe_fresh_exact(key, length));
         let observed = reservation.retaining_io(read).await?;
         reservation.finish(observed.value)
     }
-    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { false }
+    fn scan_range_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        self.0.scan_range_allocation(key, length)
+    }
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
+        if !object::framed(key) { return Err(audience_read_only()); }
+        IoRegion::audience_object_read(self.0.get_reserved_scan_range(key, range, reservation)).await
+    }
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { object::framed(key) }
     async fn put(&self, _: &ObjectKey, _: Bytes) -> rtdb_storage::Result<()> { Err(audience_read_only()) }
     async fn put_file(&self, _: &ObjectKey, _: &Path) -> rtdb_storage::Result<()> { Err(audience_read_only()) }
     async fn list(&self, _: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { Err(audience_read_only()) }
@@ -1002,11 +1008,35 @@ pub struct EncryptingStore { inner: Arc<dyn ObjectStore>, cipher: Cipher }
 
 impl EncryptingStore {
     pub fn new(inner: Arc<dyn ObjectStore>, key: &[u8]) -> Result<Self> { Ok(Self { inner, cipher: Cipher::new(key)? }) }
-    fn seal(&self, key: &ObjectKey, plaintext: &[u8]) -> rtdb_storage::Result<Bytes> { self.cipher.seal_deterministic(key.as_str(), plaintext) }
-    fn open(&self, key: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes> { self.cipher.open(key.as_str(), &sealed) }
+    fn seal(&self, key: &ObjectKey, plaintext: &[u8]) -> rtdb_storage::Result<Bytes> { self.cipher.seal_object(key, plaintext) }
+    fn open(&self, key: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes> { self.cipher.open_object(key, &sealed) }
+
+    async fn read_frames(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+        use object::{FRAME_BYTES, FramedObject, SEALED_HEADER_BYTES, sealed_size};
+
+        let head = self.inner.observe_head(key).await?;
+        let header = self.inner.observe_range(key, 0..SEALED_HEADER_BYTES as u64).await?;
+        let layout = FramedObject::open_header(&self.cipher, key, &header.value)?;
+        if header.version != head.version || head.value.size != sealed_size(key, layout.length())? as u64 {
+            return Err(Error::ConflictingObject(key.to_string()));
+        }
+        let frames = layout.covering_frames(key, &range)?;
+        if frames.is_empty() { return Ok(Bytes::new()); }
+        let sealed = self.inner.observe_range(key, layout.physical_range(&frames)).await?;
+        if sealed.version != header.version {
+            return Err(Error::ConflictingObject(key.to_string()));
+        }
+        let plaintext = layout.open_frames(&self.cipher, key, frames, &sealed.value)?;
+        let start = range.start as usize % FRAME_BYTES;
+        let end = start + (range.end - range.start) as usize;
+        let bytes = plaintext.get(start..end).ok_or_else(|| Error::ConflictingObject(key.to_string()))?;
+        Ok(Bytes::copy_from_slice(bytes))
+    }
 }
 
-fn plain(object: StoredObject) -> StoredObject { StoredObject { size: object.size.saturating_sub(SEALED_OVERHEAD), ..object } }
+fn plain(stored: StoredObject) -> rtdb_storage::Result<StoredObject> {
+    Ok(StoredObject { size: object::plaintext_size(&stored.key, stored.size)?, ..stored })
+}
 
 #[async_trait]
 impl ObjectStore for EncryptingStore {
@@ -1024,15 +1054,15 @@ impl ObjectStore for EncryptingStore {
         }
         self.inner.release_trie_files(receipt, contents).await
     }
-    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
-    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.and_then(plain) }
+    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.and_then(plain) }
     async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         let observed = self.inner.observe_head(key).await?;
-        Ok(ObjectObservation { value: plain(observed.value), version: observed.version })
+        Ok(ObjectObservation { value: plain(observed.value)?, version: observed.version })
     }
     async fn observe_heads(&self, keys: &[ObjectKey]) -> rtdb_storage::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
         let mut observed = self.inner.observe_heads(keys).await?;
-        for head in observed.values_mut() { head.value.size = head.value.size.saturating_sub(SEALED_OVERHEAD); }
+        for head in observed.values_mut() { head.value.size = object::plaintext_size(&head.value.key, head.value.size)?; }
         Ok(observed)
     }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
@@ -1042,24 +1072,44 @@ impl ObjectStore for EncryptingStore {
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         self.open(key, self.inner.get_fresh(key).await?)
     }
+    async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
+        let plaintext = reservation.retaining_io(self.get(key)).await?;
+        reservation.finish(plaintext)
+    }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
-        let exact = length.checked_add(SEALED_OVERHEAD as usize)
-            .ok_or_else(|| Error::Task("Encrypted object length overflow".into()))?;
+        let exact = object::sealed_size(key, length)?;
         self.open(key, self.inner.get_fresh_exact(key, exact).await?)
     }
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
-        let exact = length.checked_add(SEALED_OVERHEAD as usize)
-            .ok_or_else(|| Error::Task("Encrypted object length overflow".into()))?;
+        let exact = object::sealed_size(key, length)?;
         let observed = self.inner.observe_fresh_exact(key, exact).await?;
         Ok(ObjectObservation { value: self.open(key, observed.value)?, version: observed.version })
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+        if object::framed(key) { return self.read_frames(key, range).await; }
         let plaintext = self.get(key).await?;
         let length = plaintext.len() as u64;
         if range.start > range.end || range.end > length { return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length }); }
         Ok(plaintext.slice(range.start as usize..range.end as usize))
     }
-    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { false }
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { object::framed(key) }
+    fn scan_range_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        let overflow = || Error::Task("Encrypted range allocation size overflow".into());
+        if !object::framed(key) { return Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes: 0 }); }
+        // Round both edges outwards and allow coexisting provider, decoded and
+        // resealed archive buffers. The retained value owns just the requested bytes.
+        let expanded = length.checked_add(2 * (object::FRAME_BYTES - 1)).ok_or_else(overflow)?;
+        let scratch_bytes = object::sealed_size(key, expanded)?.checked_mul(4).ok_or_else(overflow)?;
+        Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes })
+    }
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
+        reservation.check_range(&range)?;
+        if !reservation.covers(&self.scan_range_allocation(key, reservation.length())?) {
+            return Err(Error::Closed("Encrypted scan range has no scratch reservation".into()));
+        }
+        let plaintext = reservation.retaining_io(self.get_range(key, range)).await?;
+        reservation.finish(plaintext)
+    }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         // An immutable put retried with identical content is a completed retry; sealing twice gives different bytes, so the retry is recognised before sealing.
         if let Ok(existing) = self.get_fresh(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
@@ -1080,7 +1130,7 @@ impl ObjectStore for EncryptingStore {
         self.put_with_publication(key, Bytes::from(bytes)).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
-        Ok(self.inner.list(directory).await?.into_iter().map(plain).collect())
+        self.inner.list(directory).await?.into_iter().map(plain).collect()
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
     async fn forget(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.forget(key).await }
@@ -1221,6 +1271,9 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
 
 #[async_trait]
 impl ObjectStore for GarbageStore {
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        self.inner.observe_range(key, range).await
+    }
     async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         self.inner.observe_head(key).await
     }
@@ -2144,7 +2197,7 @@ mod tests {
         let bytes = Bytes::from_static(b"catalog");
         EncryptingStore::new(uncached.clone(), &material).unwrap().put(&object, bytes.clone()).await.unwrap();
         assert!(matches!(stores.ordinary.get(&object).await, Err(Error::MissingObject(_))));
-        let allocation = audience.store.whole_object_allocation(bytes.len()).unwrap();
+        let allocation = audience.store.whole_object_allocation(&object, bytes.len()).unwrap();
         let peak = allocation.retained_bytes + allocation.scratch_bytes;
         let too_small = rtdb_storage::cache::BufferPool::new(audience.store.clone(), peak - 1);
         assert!(matches!(too_small.get(&object).await, Err(Error::MemoryLimit { .. })));

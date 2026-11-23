@@ -707,6 +707,7 @@ mod tests {
                             name: key.to_string(),
                             bytes: bytes.len() as u64,
                             sha256: digest(&bytes),
+                            frame_header_sha256: None,
                         },
                     )
                 })

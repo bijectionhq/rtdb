@@ -2,6 +2,9 @@
 //! Each sealed value is a nonce, the ciphertext and the tag, bound to an associated name so a value cannot be passed off as another's.
 //! A log payload's nonce is random; an object's is derived from its name and contents, so the same object sealed twice is the same bytes, and put-if-absent takes a second upload of it, by a deposed holder and its successor say, as the first.
 
+#[path = "object_cipher.rs"]
+pub(crate) mod object;
+
 use bytes::Bytes;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};

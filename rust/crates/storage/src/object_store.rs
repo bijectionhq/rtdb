@@ -48,8 +48,8 @@ pub struct ObjectObservation<T> {
     pub version: Option<rtdb_types::PhysicalObjectVersion>,
 }
 
-/// The bytes owned by a whole-object read, excluding provider transport metadata.
-pub struct WholeObjectAllocation {
+/// The retained and temporary buffers of an object read, excluding provider transport metadata.
+pub struct ObjectReadAllocation {
     pub retained_bytes: usize,
     pub scratch_bytes: usize,
 }
@@ -67,19 +67,19 @@ impl ReadReservation {
         Self { length, retention: Arc::new(retention), retained_bytes: 0, scratch: None }
     }
 
-    pub(crate) fn whole(length: usize, retained: Arc<rtdb_types::MemoryReservation>, scratch: Option<Arc<rtdb_types::MemoryReservation>>) -> Self {
+    pub(crate) fn funded(length: usize, retained: Arc<rtdb_types::MemoryReservation>, scratch: Option<Arc<rtdb_types::MemoryReservation>>) -> Self {
         let retained_bytes = retained.bytes();
         Self { length, retention: retained, retained_bytes, scratch }
     }
 
-    pub fn covers(&self, allocation: &WholeObjectAllocation) -> bool {
+    pub fn covers(&self, allocation: &ObjectReadAllocation) -> bool {
         self.retained_bytes >= allocation.retained_bytes
             && self.scratch.as_ref().map_or(0, |scratch| scratch.bytes()) >= allocation.scratch_bytes
     }
 
     pub fn length(&self) -> usize { self.length }
 
-    pub(crate) fn check_range(&self, range: &Range<u64>) -> Result<()> {
+    pub fn check_range(&self, range: &Range<u64>) -> Result<()> {
         if range.end.checked_sub(range.start) != Some(self.length as u64) {
             return Err(Error::Task("reserved read range does not match its allocation reservation".into()));
         }
@@ -207,12 +207,16 @@ pub trait ObjectStore: Send + Sync {
         reservation.finish(self.get_range(key, range).await?)
     }
     /// How much storage the pool must admit before reading the object body.
-    fn whole_object_allocation(&self, length: usize) -> Result<WholeObjectAllocation> {
-        Ok(WholeObjectAllocation { retained_bytes: length, scratch_bytes: 0 })
+    fn whole_object_allocation(&self, _key: &ObjectKey, length: usize) -> Result<ObjectReadAllocation> {
+        Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes: 0 })
     }
     /// Reads a whole immutable object of the reserved length.
     async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> Result<RetainedBytes> {
         self.get_reserved_range(key, 0..reservation.length() as u64, reservation).await
+    }
+    /// Charges any expanded storage window needed for a scan's requested plaintext bytes.
+    fn scan_range_allocation(&self, _key: &ObjectKey, length: usize) -> Result<ObjectReadAllocation> {
+        Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes: 0 })
     }
     /// Reads part of an object without filling a whole-object disk cache on a miss.
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {

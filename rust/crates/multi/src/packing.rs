@@ -471,6 +471,13 @@ impl ObjectStore for PackingStore {
         if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Range(range)).await.map(|read| read.value); }
         self.inner.get_range(object, range).await
     }
+    async fn observe_range(&self, object: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        if let Some(location) = self.locate(object).await? {
+            return self.read_packed(object, location, PackRead::Range(range)).await;
+        }
+        self.inner.observe_range(object, range).await
+    }
+
     async fn put(&self, object: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         if held_back(object.as_str()) {
             let full = {

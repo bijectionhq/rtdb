@@ -436,13 +436,9 @@ async fn copy_checkpoint(
     for object in &capture.objects {
         let name = key(&object.name)?;
         let ciphertext = read_object(&source, &name, object).await?;
-        let plaintext = source_cipher.open(name.as_str(), &ciphertext)?;
-        let resealed = target_cipher.seal_deterministic(name.as_str(), &plaintext)?;
-        let staged = ArchivedObject {
-            name: object.name.clone(),
-            bytes: resealed.len() as u64,
-            sha256: digest(&resealed),
-        };
+        let plaintext = source_cipher.open_object(&name, &ciphertext)?;
+        let resealed = target_cipher.seal_object(&name, &plaintext)?;
+        let staged = ArchivedObject::from_sealed(&name, &resealed)?;
         put_exact(&destination, &name, resealed).await?;
         expected.insert(name);
         objects.push(staged);

@@ -1,4 +1,4 @@
-use crate::{Error, ObjectKey, ObjectStore, Result, object_store::{ReadReservation, RetainedBytes}};
+use crate::{Error, ObjectKey, ObjectStore, Result, object_store::{ReadReservation, RetainedBytes, ObjectReadAllocation}};
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use std::any::Any;
@@ -211,6 +211,12 @@ impl Drop for EmptyEntryCleanup<'_> {
     }
 }
 
+fn reserve_read(length: usize, allocation: ObjectReadAllocation, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<ReadReservation> {
+    let retained = reserve(allocation.retained_bytes)?;
+    let scratch = (allocation.scratch_bytes > 0).then(|| reserve(allocation.scratch_bytes)).transpose()?;
+    Ok(ReadReservation::funded(length, retained, scratch))
+}
+
 fn reserve_from(memory: &Arc<MemoryBudget>, bytes: usize) -> Result<Arc<MemoryReservation>> {
     memory.reserve(bytes).map_err(|_| Error::MemoryLimit { requested: bytes, limit: memory.limit_bytes(), retained: memory.used_bytes() })
 }
@@ -351,16 +357,15 @@ impl BufferPool {
         if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
         let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
             .ok_or_else(|| Error::Task("Scan range is inverted or exceeds addressable memory".into()))?;
-        let reservation = ReadReservation::new(length, self.reserve(length).or_else(|_| reserve_from(fallback, length))?);
+        let allocation = self.store.scan_range_allocation(key, length)?;
+        let reservation = reserve_read(length, allocation, |bytes| self.reserve(bytes).or_else(|_| reserve_from(fallback, bytes)))?;
         let allocation = Arc::new(self.store.get_reserved_scan_range(key, range, reservation).await?);
         Ok(CacheLease { allocation, range: 0..length })
     }
 
     async fn fetch_whole(&self, key: &ObjectKey, length: usize, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<RetainedBytes>> {
-        let allocation = self.store.whole_object_allocation(length)?;
-        let retained = reserve(allocation.retained_bytes)?;
-        let scratch = (allocation.scratch_bytes > 0).then(|| reserve(allocation.scratch_bytes)).transpose()?;
-        let reservation = ReadReservation::whole(length, retained, scratch);
+        let allocation = self.store.whole_object_allocation(key, length)?;
+        let reservation = reserve_read(length, allocation, reserve)?;
         Ok(Arc::new(self.store.get_reserved_object(key, reservation).await?))
     }
 

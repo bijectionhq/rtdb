@@ -146,7 +146,7 @@ async fn read_object(
         return Err(Error::ConflictingObject(name.to_string()));
     }
     let ciphertext = files.get_range(name, 0..object.bytes).await?;
-    if ciphertext.len() as u64 != object.bytes || digest(&ciphertext) != object.sha256 {
+    if !object.matches_sealed(name, &ciphertext) {
         return Err(Error::ConflictingObject(name.to_string()));
     }
     Ok(ciphertext)
@@ -159,7 +159,7 @@ async fn observe_archive_object(
 ) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
     let length = usize::try_from(object.bytes).map_err(|_| Error::ConflictingObject(name.to_string()))?;
     let ciphertext = files.observe_fresh_exact(name, length).await?;
-    if ciphertext.value.len() != length || digest(&ciphertext.value) != object.sha256 {
+    if !object.matches_sealed(name, &ciphertext.value) {
         return Err(Error::ConflictingObject(name.to_string()));
     }
     Ok(ciphertext)
@@ -269,12 +269,39 @@ impl ArchivedCheckpoint {
 
     async fn read_plaintext(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
         let ciphertext = read_object(&self.files, name, object).await?;
-        self.archive_cipher.open(name.as_str(), &ciphertext)
+        self.archive_cipher.open_object(name, &ciphertext)
     }
 
     async fn seal_for_serving(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
         let plaintext = self.read_plaintext(name, object).await?;
-        self.serving_cipher.seal_deterministic(name.as_str(), &plaintext)
+        self.serving_cipher.seal_object(name, &plaintext)
+    }
+
+    async fn observe_frame_range(&self, name: &ObjectKey, object: &ArchivedObject, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        use crate::cipher::object::{FramedObject, SEALED_HEADER_BYTES, sealed_size};
+
+        let header_range = 0..SEALED_HEADER_BYTES as u64;
+        let header = self.files.observe_range(name, header_range.clone()).await?;
+        if object.frame_header_sha256.as_ref().is_none_or(|expected| *expected != digest(&header.value)) {
+            return Err(Error::ConflictingObject(name.to_string()));
+        }
+        let layout = FramedObject::open_header(&self.archive_cipher, name, &header.value)?;
+        if sealed_size(name, layout.length())? as u64 != object.bytes {
+            return Err(Error::ConflictingObject(name.to_string()));
+        }
+        if range == header_range {
+            return Ok(ObjectObservation { value: layout.seal_header(&self.serving_cipher, name)?, version: header.version });
+        }
+
+        let frames = layout.selected_frames(name, &range)?;
+        let archived = self.files.observe_range(name, range.clone()).await?;
+        if archived.version != header.version {
+            return Err(Error::ConflictingObject(name.to_string()));
+        }
+        let plaintext = layout.open_frames(&self.archive_cipher, name, frames.clone(), &archived.value)?;
+        let mut value = Vec::with_capacity(archived.value.len());
+        layout.seal_frames(&self.serving_cipher, name, frames.start, &plaintext, &mut value)?;
+        Ok(ObjectObservation { value: value.into(), version: archived.version })
     }
 
     pub(crate) fn with_serving(self, serving: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
@@ -308,12 +335,12 @@ impl ArchivedCheckpoint {
         for (name, object) in &self.objects {
             let plaintext = self.read_plaintext(name, object).await?;
             match serving.get(name).await {
-                Ok(bytes) if self.serving_cipher.open(name.as_str(), &bytes)? == plaintext => continue,
+                Ok(bytes) if self.serving_cipher.open_object(name, &bytes)? == plaintext => continue,
                 Ok(_) => return Err(Error::ConflictingObject(name.to_string()).into()),
                 Err(Error::MissingObject(_)) => {},
                 Err(error) => return Err(error.into()),
             }
-            let ciphertext = self.serving_cipher.seal_deterministic(name.as_str(), &plaintext)?;
+            let ciphertext = self.serving_cipher.seal_object(name, &plaintext)?;
             if name.as_str().starts_with("blocks/") && rtdb_format::keys::block_index_from_key(name.as_str()).is_ok() {
                 roots.push((name, ciphertext));
             } else {
@@ -413,9 +440,20 @@ impl ObjectStore for CheckpointStore {
             return Err(Error::ConflictingObject(key.to_string()));
         }
         let observed = observe_archive_object(&self.archive.files, key, object).await?;
-        let plaintext = self.archive.archive_cipher.open(key.as_str(), &observed.value)?;
-        let value = self.archive.serving_cipher.seal_deterministic(key.as_str(), &plaintext)?;
+        let plaintext = self.archive.archive_cipher.open_object(key, &observed.value)?;
+        let value = self.archive.serving_cipher.seal_object(key, &plaintext)?;
         Ok(ObjectObservation { value, version: observed.version })
+    }
+
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        let Some(object) = self.archive.objects.get(key) else {
+            return self.serving.observe_range(key, range).await;
+        };
+        if crate::cipher::object::framed(key) {
+            self.archive.observe_frame_range(key, object, range).await
+        } else {
+            Ok(ObjectObservation { value: self.get_range(key, range).await?, version: None })
+        }
     }
 
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
@@ -533,6 +571,25 @@ pub struct ArchivedObject {
     pub name: String,
     pub bytes: u64,
     pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_header_sha256: Option<String>,
+}
+
+impl ArchivedObject {
+    fn from_sealed(name: &ObjectKey, sealed: &[u8]) -> rtdb_storage::Result<Self> {
+        let frame_header_sha256 = if crate::cipher::object::framed(name) {
+            let header = sealed.get(..crate::cipher::object::SEALED_HEADER_BYTES)
+                .ok_or_else(|| Error::ConflictingObject(name.to_string()))?;
+            Some(digest(header))
+        } else {
+            None
+        };
+        Ok(Self { name: name.to_string(), bytes: sealed.len() as u64, sha256: digest(sealed), frame_header_sha256 })
+    }
+
+    fn matches_sealed(&self, name: &ObjectKey, sealed: &[u8]) -> bool {
+        Self::from_sealed(name, sealed).is_ok_and(|observed| observed == *self)
+    }
 }
 
 fn primary_contents(contents: &CheckpointContents) -> bool { *contents == CheckpointContents::Primary }
@@ -578,7 +635,7 @@ impl Capture {
         let cipher = Cipher::new(material)?;
         for (name, object) in objects {
             let ciphertext = read_object(files.as_ref(), &name, object).await?;
-            let bytes = cipher.open(name.as_str(), &ciphertext)?;
+            let bytes = cipher.open_object(&name, &ciphertext)?;
             require_bound_metadata(closure[&name], &bytes)?;
         }
         Ok(())
@@ -1011,8 +1068,9 @@ async fn plan_checkpoint_copy(
         if batch.is_empty() { break; }
         for source in observe_checkpoint_batch(store, batch).await? {
             if let Some(remaining) = &mut archive_budget {
+                let sealed = crate::cipher::object::sealed_size(&source.name, source.logical_bytes)?;
                 *remaining = crate::checkpoint_copy_budget::remaining_after_sealing(
-                    *remaining, source.logical_bytes as u64, crate::cipher::SEALED_OVERHEAD as u64,
+                    *remaining, source.logical_bytes as u64, (sealed - source.logical_bytes) as u64,
                 ).ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
             }
             sources.push(source);
@@ -1090,9 +1148,9 @@ pub(crate) async fn copy_fork_checkpoint(
     let cipher = Cipher::new(child_key)?;
     for source in sources {
         let content = source.read(&plaintext).await?;
-        packed.put(&source.name, cipher.seal_deterministic(source.name.as_str(), &content)?).await?;
+        packed.put(&source.name, cipher.seal_object(&source.name, &content)?).await?;
     }
-    packed.put(&catalog_key, cipher.seal_deterministic(catalog_key.as_str(), &catalog_bytes)?).await?;
+    packed.put(&catalog_key, cipher.seal_object(&catalog_key, &catalog_bytes)?).await?;
     Ok(())
 }
 
@@ -1404,17 +1462,12 @@ async fn capture_registered(
     for source in sources {
         let content = source.read(&plaintext).await?;
         let object = source.name;
-        let ciphertext = archive_cipher.seal_deterministic(object.as_str(), &content)?;
-        let ciphertext_size = ciphertext.len() as u64;
-        let digest = digest(&ciphertext);
+        let ciphertext = archive_cipher.seal_object(&object, &content)?;
+        let archived = ArchivedObject::from_sealed(&object, &ciphertext)?;
         archive
             .put(&key(&format!("objects/{}", object.as_str()))?, ciphertext)
             .await?;
-        objects.push(ArchivedObject {
-            name: object.to_string(),
-            bytes: ciphertext_size,
-            sha256: digest,
-        });
+        objects.push(archived);
     }
     let capture = Capture { point, objects, format };
     let encoded = encode(&capture)?;
@@ -2113,8 +2166,8 @@ mod tests {
         let cipher = Cipher::new(&material)?;
         let mut objects = Vec::new();
         for (name, bytes) in &fixture.files {
-            let ciphertext = cipher.seal_deterministic(name.as_str(), bytes)?;
-            objects.push(ArchivedObject { name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext) });
+            let ciphertext = cipher.seal_object(name, bytes)?;
+            objects.push(ArchivedObject::from_sealed(name, &ciphertext)?);
             files.put(name, ciphertext).await?;
         }
         let capture = Capture { point: fixture.point, format: CheckpointContents::Replay, objects };
@@ -2202,6 +2255,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_archive_serves_an_authenticated_trie_range_with_its_manifest() -> Result<()> {
+        use crate::cipher::object::FRAME_BYTES;
+
+        let raw: Arc<dyn ObjectStore> = Arc::new(crate::packing::tests::VersionedPacks::default());
+        let name = key("tables/orders/data/l00-rc-b00.arrow")?;
+        let plaintext = vec![5; FRAME_BYTES * 4 + 19];
+        let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
+        let material = [7; crate::keys::KEY_BYTES];
+        let sealed = archive_cipher.seal_object(&name, &plaintext)?;
+        let files = PrefixedStore::new(Arc::clone(&raw), "capture/objects");
+        files.put(&name, sealed.clone()).await?;
+        let archived = ArchivedObject::from_sealed(&name, &sealed)?;
+        let read = |object| -> Result<EncryptingStore> {
+            let archive = ArchivedCheckpoint {
+                files: PrefixedStore::new(Arc::clone(&raw), "capture/objects"),
+                audience_transport: true,
+                objects: BTreeMap::from([(name.clone(), object)]),
+                archive_cipher: Cipher::new(&[3; crate::keys::KEY_BYTES])?,
+                serving_cipher: Cipher::new(&material)?,
+            };
+            EncryptingStore::new(archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default())), &material)
+        };
+        let range = FRAME_BYTES - 11..FRAME_BYTES + 17;
+        let store = read(archived.clone())?;
+        let received = store.get_range(&name, range.start as u64..range.end as u64).await?;
+        assert_eq!(received.as_ref(), &plaintext[range.clone()]);
+
+        let substituted = ArchivedObject { frame_header_sha256: Some("different".into()), ..archived };
+        let store = read(substituted)?;
+        assert!(matches!(store.get_range(&name, range.start as u64..range.end as u64).await,
+            Err(Error::ConflictingObject(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn checkpoint_copy_plans_from_the_repair_archive_custody() -> Result<()> {
         let raw: Arc<dyn ObjectStore> = Arc::new(crate::packing::tests::VersionedPacks::default());
         let files = PrefixedStore::new(raw, "accepted-archive/objects");
@@ -2215,7 +2303,7 @@ mod tests {
             files,
             audience_transport: false,
             objects: BTreeMap::from([(name.clone(), ArchivedObject {
-                name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext),
+                name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext), frame_header_sha256: None,
             })]),
             archive_cipher,
             serving_cipher: Cipher::new(&material)?,
@@ -2380,7 +2468,7 @@ mod tests {
             files,
             audience_transport: false,
             objects: [(covered.clone(), ArchivedObject {
-                name: covered.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext),
+                name: covered.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext), frame_header_sha256: None,
             })].into(),
             archive_cipher,
             serving_cipher,

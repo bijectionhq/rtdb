@@ -270,7 +270,7 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v16` on the audience gateway during its handshake.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v17` on the audience gateway during its handshake.
 The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
 The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
 The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
@@ -281,7 +281,9 @@ That view shares the attachment's object mapping, custody and serving key and by
 Provider object reads use a distinct S3 HTTP client and credential cache, including when retained I/O outlives its caller.
 The configured source and its attached archive open that client with their own credential provider. A remote store without the client refuses the scoped read.
 Whole objects read into the buffer pool must match the reserved length. The pool funds the retained bytes and the temporary ciphertext and archive buffers before fetching the body.
-The reservations remain held while admitted provider work drains after cancellation. The read view refuses bodies requested outside a whole-object reservation.
+The reservations remain held while admitted provider work drains after cancellation. The read view requires a whole-object or scan-range reservation for every body.
+Native trie data uses 64 KiB plaintext frames. A point scan can read its footer and pages without decrypting the rest of the file. The object header authenticates the length and content identity, and every selected frame authenticates its key, identity and position.
+Retained archives bind the encrypted frame header in their manifest and authenticate only the requested frames before resealing them for the serving key. Native trie data and retained archives must be written in this format.
 The holder refuses the handshake if the opened residence needs per-read registration for a legacy object reference or serves a retained archive from a local volume. An admitted S3 archive uses the custody hold acquired when the attachment opened.
 The installed source holder loads pack locations before accepting a session. Its own block publications register their locations before the catalog can be captured. A scheduled object lookup never searches for more packs or adopts a relocated pack.
 Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
