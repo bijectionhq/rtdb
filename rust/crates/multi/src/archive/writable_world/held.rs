@@ -20,7 +20,7 @@ pub(crate) struct WorldArchive {
 
 #[async_trait::async_trait]
 impl rtdb_node::WorldConstraintArchive for WorldArchive {
-    async fn check_capacity(&self, check: rtdb_node::ArchivedCapacityCheck<'_>) -> Result<()> {
+    async fn check(&self, check: rtdb_node::ArchivedWorldConstraints<'_>) -> Result<()> {
         let unavailable = OwnedWorld::unavailable;
         let installed = self.directory.deployment_by_name(check.database).await?.ok_or_else(unavailable)?;
         if PlacedAttemptScope::new(&installed.stream("replica"), installed.epoch)? != check.placement {

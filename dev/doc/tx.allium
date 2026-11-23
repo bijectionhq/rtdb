@@ -126,6 +126,8 @@
 -- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.
 -- A local tombstone or replacement masks the archived member with the same identity.
 -- A growth beyond the current maximum aborts the world writes and accompanying effects.
+-- A world unique claim checks final local occupancy and the exact archived occupant for its path and key.
+-- A final local shadow can withdraw an inherited occupant and transfer the unique key in the same ordered write.
 -- Acceptance-valid writes in a Held world start at the logical clock that the world publishes with them and have an open end.
 -- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.

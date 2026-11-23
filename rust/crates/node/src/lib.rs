@@ -29,7 +29,7 @@ pub use placed_receipts::{AwaitAuthority, ClosedEpochRecovery, PlacedReceiptCode
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
-pub use rtdb_tx::{ArchivedCapacityCheck, HostedControlWrite, WorldConstraintArchive};
+pub use rtdb_tx::{ArchivedWorldConstraints, HostedControlWrite, WorldConstraintArchive};
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityPage, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
 pub use node::{AppliedOwnedPoint, AppliedReadFloor};
