@@ -2681,6 +2681,7 @@ rule RefineKeyForLargeDeployments {
     -- The router and the executor each check that identity against their own authority.
     -- The executor holds the captured snapshot until admitted provider reads have completed.
     -- The coordinator sends a bounded Arrow IPC literal page after the reader confirms support on the same connection.
+    -- The peers select the newest literal page version they both support.
     -- The JSON request carries the expression shape.
     -- The reader restores literal expressions in their original positions.
     -- The coordinator applies its original predicates to the returned rows.

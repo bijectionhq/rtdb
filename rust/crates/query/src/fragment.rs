@@ -532,6 +532,8 @@ mod tests {
         let page = read.pages()[0].batch();
         assert_eq!(page.column(1).data_type(), &arrow_schema::DataType::Utf8);
         assert_eq!(page.column(2).data_type(), &arrow_schema::DataType::Boolean);
+        let recipe = page.column(page.num_columns() - 1).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+        assert_eq!(recipe.column_by_name("pattern").unwrap().data_type(), &arrow_schema::DataType::Null);
         let record = page.column(3).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
         let vector = record.column(0).as_any().downcast_ref::<ListArray>().unwrap();
         let components = vector.values().as_any().downcast_ref::<UnionArray>().unwrap();
@@ -544,6 +546,83 @@ mod tests {
         assert!(value.field("embedding").unwrap().list_view().unwrap().is_float());
         drop((wire, bytes, charge, read));
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn wide_scalar_literals_keep_their_original_bits_and_type_in_typed_columns() {
+        use arrow_array::{Array, BinaryArray, Int64Array, StringArray, StructArray, UInt16Array};
+        use rtdb_types::{DecimalValue, TimeUnit};
+
+        let original = fragment(vec![
+            rtdb_plan::Expr::Literal(Value::Time { value: i64::MIN, unit: TimeUnit::Millisecond, bit_width: 32 }),
+            rtdb_plan::Expr::Literal(Value::Decimal(DecimalValue {
+                unscaled: vec![0x80, 0x00, 0xff], precision: 999, scale: -200, bit_width: 24,
+            })),
+            rtdb_plan::Expr::Literal(Value::Uri("bad uri".into())),
+        ]);
+        let memory = MemoryBudget::new(4 << 20);
+        let (mut wire, bytes) = original.for_wire(&memory).unwrap();
+        let read = rtdb_format::ipc::OwnedStream::read(bytes.as_slice(), &memory).unwrap();
+        let page = read.pages()[0].batch();
+        let time = page.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let value = time.column_by_name("value").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(value.value(0), i64::MIN);
+        let decimal = page.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+        let width = decimal.column_by_name("bit_width").unwrap().as_any().downcast_ref::<UInt16Array>().unwrap();
+        let coefficient = decimal.column_by_name("unscaled").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(width.value(0), 24);
+        assert_eq!(coefficient.value(0), &[0x80, 0x00, 0xff]);
+        let uri = page.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(uri.value(0), "bad uri");
+        let _reservation = wire.bind_wire_literals(bytes.as_slice(), &memory).unwrap();
+        assert_eq!(wire, original);
+
+        let (mut wire, bytes) = original.for_wire_v1(&memory).unwrap();
+        let read = rtdb_format::ipc::OwnedStream::read(bytes.as_slice(), &memory).unwrap();
+        assert!(read.pages()[0].batch().columns().iter().all(|column| column.as_any().is::<BinaryArray>()));
+        let _reservation = wire.bind_wire_literals(bytes.as_slice(), &memory).unwrap();
+        assert_eq!(wire, original);
+    }
+
+    #[test]
+    fn regex_literal_arguments_use_arrow_and_raw_forms_preserve_their_syntax() {
+        use arrow_array::{BinaryArray, Int64Array, StringArray, StructArray};
+        use rtdb_plan::{Expr, RegexFormBuilder, RegexReplacement};
+
+        let source = Expr::Literal(Value::Utf8("txt".into()));
+        let mut builder = RegexFormBuilder::new_untracked();
+        builder.begin_literal().unwrap();
+        builder.value_text("p.*").unwrap();
+        builder.end().unwrap();
+        let pattern = builder.finish().unwrap();
+        let mut builder = RegexFormBuilder::new_untracked();
+        builder.begin_literal().unwrap();
+        builder.value_leaf(&Value::I64(i64::MAX)).unwrap();
+        builder.end().unwrap();
+        let start = builder.finish().unwrap();
+        let mut builder = RegexFormBuilder::new_untracked();
+        builder.symbol("raw-pattern").unwrap();
+        let symbol = builder.finish().unwrap();
+        let original = fragment(vec![
+            Expr::regex_replace(source.clone(), RegexReplacement { pattern, start, ..Default::default() }),
+            Expr::regex_replace(source, RegexReplacement { pattern: symbol, ..Default::default() }),
+        ]);
+        let memory = MemoryBudget::new(4 << 20);
+        let (mut wire, bytes) = original.for_wire(&memory).unwrap();
+        let read = rtdb_format::ipc::OwnedStream::read(bytes.as_slice(), &memory).unwrap();
+        let page = read.pages()[0].batch();
+        let recipe = page.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+        let pattern = recipe.column_by_name("pattern").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let start = recipe.column_by_name("start").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(pattern.value(0), "p.*");
+        assert_eq!(start.value(0), i64::MAX);
+        assert!(page.column(3).as_any().is::<BinaryArray>());
+        let _reservation = wire.bind_wire_literals(bytes.as_slice(), &memory).unwrap();
+        assert_eq!(wire, original);
+
+        let (mut wire, bytes) = original.for_wire_v1(&memory).unwrap();
+        let _reservation = wire.bind_wire_literals(bytes.as_slice(), &memory).unwrap();
+        assert_eq!(wire, original);
     }
 
     #[test]
@@ -582,7 +661,10 @@ mod tests {
         encode_batch(&batch, &memory, &mut bytes).unwrap();
         let batches = decode_batches(bytes.as_slice(), &memory).unwrap();
         let [frame] = batches.as_slice() else { panic!("one fixed-width IPC frame") };
-        let Column::Arrow { array, .. } = &frame.columns[0] else { panic!("decoded physical IPC array") };
+        let Column::Selected(selection) = &frame.columns[0] else { panic!("decoded Arrow-backed selection") };
+        let mut sources = selection.source_layouts();
+        let (array, _, _) = sources.next().unwrap();
+        assert!(sources.next().is_none());
         let array = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert!(array.is_null(1));
         assert!(array.values().as_any().is::<UnionArray>());

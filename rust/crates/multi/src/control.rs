@@ -225,8 +225,9 @@ impl std::fmt::Debug for ControlKey {
 
 const CONTROL_SCOPE: &str = "~control";
 
+const FRAGMENT_LITERAL_VERSION: u8 = 2;
+const LEGACY_FRAGMENT_LITERAL_VERSION: u8 = 1;
 /// The longest request a node reads.
-const FRAGMENT_LITERAL_VERSION: u8 = 1;
 const MAXIMUM_REQUEST_BYTES: u64 = 1 << 20;
 /// The longest response a caller reads: a fragment's rows, in base64, are the largest.
 pub const MAXIMUM_RESPONSE_BYTES: u64 = 96 << 20;
@@ -253,6 +254,8 @@ struct Envelope {
     fragment_arguments: Option<FragmentArguments>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fragment_literal_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fragment_literal_version: Option<u8>,
     #[serde(flatten)]
     request: Request,
 }
@@ -389,8 +392,13 @@ async fn read_negotiated_request(stream: &mut TcpStream, key: &ControlKey) -> Re
         return Ok(request);
     }
     // An older agent sees a normal Ping and closes its connection. A positive reply upgrades only this socket.
+    let version = if request.0.fragment_literal_version == Some(FRAGMENT_LITERAL_VERSION) {
+        FRAGMENT_LITERAL_VERSION
+    } else {
+        LEGACY_FRAGMENT_LITERAL_VERSION
+    };
     write_message(stream, &Reply { startup_probe_overflows: None,
-        fragment_literal_version: Some(FRAGMENT_LITERAL_VERSION), response: Response::Done }).await.map_err(io)?;
+        fragment_literal_version: Some(version), response: Response::Done }).await.map_err(io)?;
     tokio::time::timeout(Duration::from_secs(5), read_request(stream, key, true)).await
         .map_err(|_| Anomaly::incorrect("rtdb.multi/control-request", "Fragment request frame timed out"))?
 }
@@ -442,7 +450,8 @@ async fn read_arguments(reader: &mut (impl tokio::io::AsyncRead + Unpin), length
 async fn exchange(address: &str, request: Request, timeout: Duration, key: &ControlKey) -> Result<(TcpStream, Reply)> {
     let transfer = async {
         let mut stream = TcpStream::connect(address).await.map_err(io)?;
-        write_message(&mut stream, &Envelope { control_grant: key.grant(), fragment_ipc: None, fragment_arguments: None, fragment_literal_bytes: None, request }).await.map_err(io)?;
+        write_message(&mut stream, &Envelope { control_grant: key.grant(), fragment_ipc: None, fragment_arguments: None,
+            fragment_literal_bytes: None, fragment_literal_version: None, request }).await.map_err(io)?;
         let response = read_reply(&mut BufReader::new(&mut stream), address).await?;
         Ok((stream, response))
     };
@@ -465,11 +474,17 @@ pub(crate) async fn start_fragment(
         let mut arguments = None;
         if let Request::ScanFragment { fragment, .. } = &mut request {
             write_message(&mut stream, &Envelope { control_grant: key.grant(), fragment_ipc: Some(true),
-                fragment_arguments: None, fragment_literal_bytes: None, request: Request::Ping }).await.map_err(io)?;
+                fragment_arguments: None, fragment_literal_bytes: None, fragment_literal_version: Some(FRAGMENT_LITERAL_VERSION),
+                request: Request::Ping }).await.map_err(io)?;
             let reply = read_reply(&mut BufReader::new(&mut stream), address).await?;
             match reply {
                 Reply { response: Response::Done, fragment_literal_version: Some(FRAGMENT_LITERAL_VERSION), .. } => {
                     let (encoded, bytes) = fragment.for_wire(memory)?;
+                    *fragment = encoded;
+                    arguments = Some(bytes);
+                }
+                Reply { response: Response::Done, fragment_literal_version: Some(LEGACY_FRAGMENT_LITERAL_VERSION), .. } => {
+                    let (encoded, bytes) = fragment.for_wire_v1(memory)?;
                     *fragment = encoded;
                     arguments = Some(bytes);
                 }
@@ -481,7 +496,8 @@ pub(crate) async fn start_fragment(
             }
         }
         let mut header = serde_json::to_vec(&Envelope { control_grant: key.grant(), fragment_ipc: Some(true),
-            fragment_arguments: None, fragment_literal_bytes: arguments.as_ref().map(|bytes| bytes.as_slice().len()), request })
+            fragment_arguments: None, fragment_literal_bytes: arguments.as_ref().map(|bytes| bytes.as_slice().len()),
+            fragment_literal_version: None, request })
             .map_err(|error| Anomaly::fault("rtdb.multi/control-request", error.to_string()))?;
         header.push(b'\n');
         let payload = arguments.as_ref().map_or(&[][..], FragmentBytes::as_slice);
@@ -650,7 +666,10 @@ mod tests {
                 table: TableBinding { name: QualifiedTable { database: "db".into(), table: TableRef::new("public", "docs") },
                     oid: None, columns: Default::default() },
                 columns: Vec::new(), valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-                clamp_valid_time: false, iids: None, predicates: vec![Expr::Literal(Value::Utf8("literal-on-arrow".into()))],
+                clamp_valid_time: false, iids: None, predicates: vec![
+                    Expr::Literal(Value::Utf8("literal-on-arrow".into())),
+                    Expr::Literal(Value::Time { value: i64::MAX, unit: rtdb_types::TimeUnit::Millisecond, bit_width: 32 }),
+                ],
                 top_k: None, ordered_top_k: None, matches: Vec::new(),
             },
             prefix: rtdb_query::TriePrefix::new(Vec::new()).unwrap(),
@@ -696,12 +715,60 @@ mod tests {
         assert_eq!(STANDARD.decode(batches).unwrap(), answer.as_slice());
 
         let mut socket = TcpStream::connect(&address).await.unwrap();
+        write_message(&mut socket, &Envelope { control_grant: None, fragment_ipc: Some(true), fragment_arguments: None,
+            fragment_literal_bytes: None, fragment_literal_version: None, request: Request::Ping }).await.unwrap();
+        let reply = read_reply(&mut BufReader::new(&mut socket), &address).await.unwrap();
+        assert_eq!(reply.fragment_literal_version, Some(1));
+        let Request::ScanFragment { name, fragment, grant } = literal_fragment() else { unreachable!() };
+        let (fragment, body) = fragment.for_wire_v1(&memory).unwrap();
+        write_message(&mut socket, &Envelope { control_grant: None, fragment_ipc: Some(true), fragment_arguments: None,
+            fragment_literal_bytes: Some(body.as_slice().len()), fragment_literal_version: None,
+            request: Request::ScanFragment { name, fragment, grant } }).await.unwrap();
+        socket.write_all(body.as_slice()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let v1 = receive_fragment(socket, &address, deadline, &memory).await.unwrap();
+        assert_eq!(v1.as_slice(), answer.as_slice());
+
+        let mut socket = TcpStream::connect(&address).await.unwrap();
         write_message(&mut socket, &Envelope { control_grant: None, fragment_ipc: Some(true),
-            fragment_arguments: None, fragment_literal_bytes: Some(0), request: literal_fragment() }).await.unwrap();
+            fragment_arguments: None, fragment_literal_bytes: Some(0), fragment_literal_version: None, request: literal_fragment() }).await.unwrap();
         let refused = read_reply(&mut BufReader::new(socket), &address).await.unwrap();
         assert!(matches!(refused.response, Response::Refused { code, .. } if code == "rtdb.multi/control-request"));
         stop.cancel();
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_v1_agent_receives_a_v1_literal_page_on_the_negotiated_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = String::new();
+            BufReader::new(&mut stream).read_line(&mut header).await.unwrap();
+            let probe = serde_json::from_str::<Envelope>(&header).unwrap();
+            assert_eq!(probe.request, Request::Ping);
+            assert_eq!(probe.fragment_literal_version, Some(2));
+            write_message(&mut stream, &Reply { startup_probe_overflows: None, fragment_literal_version: Some(1),
+                response: Response::Done }).await.unwrap();
+
+            let mut reader = BufReader::new(&mut stream);
+            header.clear();
+            reader.read_line(&mut header).await.unwrap();
+            let request = serde_json::from_str::<Envelope>(&header).unwrap();
+            let Request::ScanFragment { name, fragment, grant } = literal_fragment() else { unreachable!() };
+            let (fragment, expected) = fragment.for_wire_v1(&MemoryBudget::new(1 << 20)).unwrap();
+            assert_eq!(request.request, Request::ScanFragment { name, fragment, grant });
+            assert_eq!(request.fragment_literal_bytes, Some(expected.as_slice().len()));
+            let body = read_arguments(&mut reader, expected.as_slice().len(), &MemoryBudget::new(1 << 20)).await.unwrap();
+            assert_eq!(body.as_slice(), expected.as_slice());
+            write_message(&mut stream, &Response::FragmentIpc { bytes: 1 }).await.unwrap();
+            stream.write_all(&[0xff]).await.unwrap();
+        });
+        let memory = MemoryBudget::new(1 << 20);
+        let answer = call_fragment(&address, literal_fragment(), Duration::from_secs(5), &ControlKey::default(), &memory).await.unwrap();
+        assert_eq!(answer.as_slice(), &[0xff]);
+        server.await.unwrap();
     }
 
     #[tokio::test]

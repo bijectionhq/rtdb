@@ -2134,6 +2134,9 @@ surface QueryAccess {
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
         -- A delegated reader restores literal expressions from the fragment's Arrow argument page.
+        -- The literal page preserves full-width time values, decimal coefficients and their declared types until expression evaluation.
+        -- The literal page preserves URI text until expression evaluation admits it.
+        -- A regex recipe of text, integer, Boolean and null literals retains each argument's literal kind in the page.
         -- Packed vector literals borrow the page's typed child buffers.
 }
 

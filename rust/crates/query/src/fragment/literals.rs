@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, ListArray, RecordBatch, StructArray, cast::AsArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Int32Array, Int64Array, ListArray,
+    RecordBatch, StringArray, StructArray, UInt8Array, UInt16Array, UInt32Array, cast::AsArray};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation};
-use rtdb_plan::{Expr, Scan, TemporalFilter};
-use rtdb_types::{CalendarDate, CivilDate, DateUnit, ListValue, LogicalType, Result, ScalarType, Value};
+use rtdb_plan::{Expr, RegexForm, RegexFormBuilder, RegexFormKind, RegexLiteralKind, RegexReplacement, Scan, TemporalFilter};
+use rtdb_types::{CalendarDate, CivilDate, DateUnit, DecimalValue, ListValue, LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use super::{FragmentBytes, ScanFragment, invalid, numeric_literal, portable};
 
@@ -15,14 +16,25 @@ const REGEX: &str = "\0rtdb.fragment.regex";
 
 impl ScanFragment {
     pub fn for_wire(&self, memory: &Arc<MemoryBudget>) -> Result<(Self, FragmentBytes)> {
+        self.encode_wire_literals(memory, false)
+    }
+
+    pub fn for_wire_v1(&self, memory: &Arc<MemoryBudget>) -> Result<(Self, FragmentBytes)> {
+        self.encode_wire_literals(memory, true)
+    }
+
+    fn encode_wire_literals(&self, memory: &Arc<MemoryBudget>, legacy: bool) -> Result<(Self, FragmentBytes)> {
         let mut fragment = self.clone();
         let mut builder = BatchBuilder::new(4096, memory)?;
         let mut fields = Vec::new();
         let mut columns = Vec::new();
-        let mut add = |value: &Value, kind: Option<&str>| {
+        let mut add = |size, make: &mut dyn FnMut(&str) -> Result<(Field, ArrayRef)>| {
             let name = format!("?{}", columns.len());
-            let (field, array) = encode_literal(&name, value, &mut builder)?;
-            fields.push(match kind { Some(kind) => tagged(field, kind), None => field });
+            let array = builder.column(size, || {
+                let (field, array) = make(&name)?;
+                fields.push(field);
+                Ok(array)
+            })?;
             columns.push(array);
             Ok::<_, rtdb_types::Anomaly>(columns.len() - 1)
         };
@@ -38,27 +50,37 @@ impl ScanFragment {
                     result = (|| {
                         match expr {
                             Expr::Literal(value) => {
-                                let index = add(value, None)?;
+                                let index = add(encode_bound(value)?, &mut |name| literal_column(name, value, legacy))?;
                                 *expr = placeholder(index, value.logical_type());
                             }
                             Expr::DurationLiteral(duration) => {
                                 let (seconds, nanos) = (*duration).into();
-                                let value = Value::Struct(rtdb_types::StructFields::from([
-                                    ("seconds".into(), Value::I64(seconds)),
-                                    ("nanos".into(), Value::U32(nanos)),
-                                ]));
-                                *expr = placeholder(add(&value, Some("duration"))?, expr.data_type());
+                                let index = add(4096, &mut |name| typed_struct(name, "duration", [
+                                    ("seconds", Arc::new(Int64Array::from(vec![seconds]))),
+                                    ("nanos", Arc::new(UInt32Array::from(vec![nanos]))),
+                                ]))?;
+                                *expr = placeholder(index, expr.data_type());
                             }
                             Expr::RegexReplace { source, recipe, return_type } => {
                                 let scratch = recipe.retained_bytes()?.checked_mul(4)
                                     .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(malformed)?;
-                                let _scratch = memory.reserve(scratch)?;
-                                let encoded = serde_json::to_vec(recipe).map_err(encode_error)?;
-                                let index = add(&Value::Binary(encoded), Some("regex"))?;
+                                let index = if !legacy && let Some(recipe) = regex_atoms(recipe) {
+                                    add(scratch, &mut |name| typed_struct(name, "regex-fields", recipe.map(|(name, atom)| (name, atom.array()))))?
+                                } else {
+                                    let _scratch = memory.reserve(scratch)?;
+                                    let encoded = serde_json::to_vec(recipe).map_err(encode_error)?;
+                                    let bound = encoded.capacity().checked_mul(4).and_then(|size| size.checked_add(4096)).ok_or_else(malformed)?;
+                                    add(bound, &mut |name| Ok(binary_literal(name, "regex", &encoded)))?
+                                };
                                 let source = std::mem::replace(source.as_mut(), Expr::Literal(Value::Null));
+                                let recipe = if legacy {
+                                    placeholder(index, LogicalType::Scalar(ScalarType::Binary))
+                                } else {
+                                    Expr::Parameter { index, data_type: LogicalType::Nothing }
+                                };
                                 *expr = Expr::Call {
                                     name: REGEX.into(),
-                                    args: vec![source, placeholder(index, LogicalType::Scalar(ScalarType::Binary))],
+                                    args: vec![source, recipe],
                                     return_type: return_type.clone(),
                                 };
                             }
@@ -143,17 +165,6 @@ fn tagged(field: Field, kind: &str) -> Field {
     field.with_metadata(metadata)
 }
 
-fn encode_literal(name: &str, value: &Value, builder: &mut BatchBuilder) -> Result<(Field, ArrayRef)> {
-    let size = encode_bound(value)?;
-    let mut field = None;
-    let array = builder.column(size, || {
-        let (literal, array) = literal_column(name, value)?;
-        field = Some(literal);
-        Ok(array)
-    })?;
-    Ok((field.expect("literal column carries its field"), array))
-}
-
 fn children_bound<'a>(mut values: impl Iterator<Item = &'a Value>) -> Result<usize> {
     values.try_fold(4096usize, |bytes, value| bytes.checked_add(encode_bound(value)?).ok_or_else(malformed))
 }
@@ -174,7 +185,7 @@ fn encode_bound(value: &Value) -> Result<usize> {
     }
 }
 
-fn literal_column(name: &str, value: &Value) -> Result<(Field, ArrayRef)> {
+fn literal_column(name: &str, value: &Value, legacy: bool) -> Result<(Field, ArrayRef)> {
     if let Value::List(list) | Value::FixedSizeList(list) = value
         && let Some((field, child)) = list.packed_column()
     {
@@ -191,15 +202,15 @@ fn literal_column(name: &str, value: &Value) -> Result<(Field, ArrayRef)> {
 
     match value {
         // A literal collection can contain records with different fields and distinguish an absent field from an explicit null.
-        Value::Struct(fields) => literal_struct(name, "record", fields.iter().map(|(name, value)| (name.clone(), value))),
+        Value::Struct(fields) => literal_struct(name, "record", fields.iter().map(|(name, value)| (name.clone(), value)), legacy),
         Value::List(items) | Value::FixedSizeList(items) => {
             let kind = if matches!(value, Value::List(_)) { "list" } else { "fixed-list" };
             let items = items.scalar_values().expect("unpacked literal");
-            literal_struct(name, kind, items.iter().enumerate().map(|(index, value)| (index.to_string(), value)))
+            literal_struct(name, kind, items.iter().enumerate().map(|(index, value)| (index.to_string(), value)), legacy)
         }
-        Value::Set(items) => literal_struct(name, "set", items.iter().enumerate().map(|(index, value)| (index.to_string(), value))),
+        Value::Set(items) => literal_struct(name, "set", items.iter().enumerate().map(|(index, value)| (index.to_string(), value)), legacy),
         Value::Map { entries, sorted } => literal_struct(name, if *sorted { "sorted-map" } else { "map" },
-            entries.iter().flat_map(|(key, value)| [key, value]).enumerate().map(|(index, value)| (index.to_string(), value))),
+            entries.iter().flat_map(|(key, value)| [key, value]).enumerate().map(|(index, value)| (index.to_string(), value)), legacy),
         Value::Undefined => Ok((tagged(Field::new(name, DataType::Null, true), "undefined"), Arc::new(arrow_array::NullArray::new(1)))),
         Value::Date(date) => {
             let kind = match date.unit() { DateUnit::Day => "calendar-day", DateUnit::Millisecond => "calendar-milli" };
@@ -211,22 +222,92 @@ fn literal_column(name: &str, value: &Value) -> Result<(Field, ArrayRef)> {
             let typed = rtdb_columnar::to_field(name, &ty).and_then(|field| {
                 rtdb_columnar::copy_array(&ty, std::slice::from_ref(value)).map(|array| (field, array))
             });
-            if let Ok(typed) = typed { return Ok(typed); }
-            // Row literals can represent primitives outside their physical Arrow type, such as an overflowing Time32.
-            let raw = serde_json::to_vec(value).map_err(encode_error)?;
-            let field = tagged(Field::new(name, DataType::Binary, false), "raw-scalar");
-            Ok((field, Arc::new(BinaryArray::from_vec(vec![&raw]))))
+            match typed {
+                Ok(typed) => Ok(typed),
+                Err(_) if legacy => Ok(binary_literal(name, "raw-scalar", &serde_json::to_vec(value).map_err(encode_error)?)),
+                Err(error) => wide_scalar(name, value).unwrap_or(Err(error)),
+            }
         }
     }
 }
 
 fn literal_struct<'a>(
-    name: &str, kind: &str, children: impl Iterator<Item = (String, &'a Value)>,
+    name: &str, kind: &str, children: impl Iterator<Item = (String, &'a Value)>, legacy: bool,
 ) -> Result<(Field, ArrayRef)> {
-    let (fields, columns): (Vec<_>, Vec<_>) = children.map(|(name, value)| literal_column(&name, value))
+    let (fields, columns): (Vec<_>, Vec<_>) = children.map(|(name, value)| literal_column(&name, value, legacy))
         .collect::<Result<Vec<_>>>()?.into_iter().unzip();
     let array = StructArray::try_new_with_length(fields.into(), columns, None, 1).map_err(encode_error)?;
     Ok((tagged(Field::new(name, array.data_type().clone(), false), kind), Arc::new(array)))
+}
+
+fn typed_struct<const N: usize>(name: &str, kind: &str, children: [(&str, ArrayRef); N]) -> Result<(Field, ArrayRef)> {
+    let (fields, arrays): (Vec<_>, Vec<_>) = children.into_iter().map(|(name, array)| {
+        (Field::new(name, array.data_type().clone(), array.is_nullable()), array)
+    }).unzip();
+    let array = StructArray::try_new_with_length(fields.into(), arrays, None, 1).map_err(encode_error)?;
+    Ok((tagged(Field::new(name, array.data_type().clone(), false), kind), Arc::new(array)))
+}
+
+fn binary_literal(name: &str, kind: &str, bytes: &[u8]) -> (Field, ArrayRef) {
+    (tagged(Field::new(name, DataType::Binary, false), kind), Arc::new(BinaryArray::from_vec(vec![bytes])))
+}
+
+fn wide_scalar(name: &str, value: &Value) -> Option<Result<(Field, ArrayRef)>> {
+    // Admission belongs to the evaluator. The wire must carry the unadmitted value exactly.
+    Some(match value {
+        Value::Time { value, unit, bit_width } => {
+            let unit = match unit { TimeUnit::Second => 0, TimeUnit::Millisecond => 1, TimeUnit::Microsecond => 2, TimeUnit::Nanosecond => 3 };
+            typed_struct(name, "wide-time", [
+                ("value", Arc::new(Int64Array::from(vec![*value]))),
+                ("unit", Arc::new(UInt8Array::from(vec![unit]))),
+                ("bit_width", Arc::new(UInt8Array::from(vec![*bit_width]))),
+            ])
+        }
+        Value::Decimal(decimal) => typed_struct(name, "wide-decimal", [
+            ("unscaled", Arc::new(BinaryArray::from_vec(vec![&decimal.unscaled]))),
+            ("precision", Arc::new(Int32Array::from(vec![decimal.precision]))),
+            ("scale", Arc::new(Int32Array::from(vec![decimal.scale]))),
+            ("bit_width", Arc::new(UInt16Array::from(vec![decimal.bit_width]))),
+        ]),
+        Value::Uri(text) => Ok((tagged(Field::new(name, DataType::Utf8, false), "raw-uri"),
+            Arc::new(StringArray::from(vec![text.as_str()])))),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum RegexAtom<'a> { Null, Text(&'a str), Integer(i64), Boolean(bool) }
+
+impl RegexAtom<'_> {
+    fn array(self) -> ArrayRef {
+        match self {
+            Self::Null => Arc::new(arrow_array::NullArray::new(1)),
+            Self::Text(text) => Arc::new(StringArray::from(vec![text])),
+            Self::Integer(value) => Arc::new(Int64Array::from(vec![value])),
+            Self::Boolean(value) => Arc::new(arrow_array::BooleanArray::from(vec![value])),
+        }
+    }
+}
+
+fn regex_atoms(recipe: &RegexReplacement) -> Option<[(&'static str, RegexAtom<'_>); 5]> {
+    fn atom(form: &RegexForm) -> Option<RegexAtom<'_>> {
+        let RegexFormKind::Literal(literal) = form.view().kind() else { return None; };
+        match literal.kind() {
+            RegexLiteralKind::Text(text) => Some(RegexAtom::Text(text)),
+            RegexLiteralKind::Leaf(leaf) => match leaf.value().as_ref() {
+                Value::Null => Some(RegexAtom::Null),
+                Value::I64(value) => Some(RegexAtom::Integer(*value)),
+                Value::Bool(value) => Some(RegexAtom::Boolean(*value)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    Some([
+        ("pattern", atom(&recipe.pattern)?), ("replacement", atom(&recipe.replacement)?),
+        ("start", atom(&recipe.start)?), ("occurrence", atom(&recipe.occurrence)?),
+        ("flags", atom(&recipe.flags)?),
+    ])
 }
 
 fn decode_bound(field: &Field, array: &dyn Array) -> Result<usize> {
@@ -238,7 +319,9 @@ fn decode_bound(field: &Field, array: &dyn Array) -> Result<usize> {
                 bytes.checked_add(decode_bound(field, column.as_ref())?).ok_or_else(malformed)
             })?
         }
-        Some("raw-scalar" | "regex") => array.get_buffer_memory_size().checked_mul(32).ok_or_else(malformed)?,
+        Some(kind @ ("raw-scalar" | "regex" | "regex-fields")) => array.get_buffer_memory_size().checked_mul(32)
+            .and_then(|size| size.checked_add(if kind == "regex-fields" { 16 << 10 } else { 0 }))
+            .ok_or_else(malformed)?,
         _ => rtdb_columnar::estimate_read_value_bytes(field, array, 0)?,
     };
     field.size().checked_mul(4).and_then(|size| size.checked_add(extra)).ok_or_else(malformed)
@@ -261,32 +344,80 @@ fn restore_expression(expr: &mut Expr, batch: Option<&RecordBatch>, unused: &mut
     };
     if name == REGEX {
         let [source, recipe] = args.as_mut_slice() else { return Err(malformed()); };
-        let Expr::Literal(Value::Binary(recipe)) = recipe else { return Err(malformed()); };
-        let recipe = serde_json::from_slice(recipe).map_err(|_| malformed())?;
+        let recipe = match recipe {
+            Expr::Literal(Value::Binary(bytes)) => serde_json::from_slice(bytes).map_err(|_| malformed())?,
+            _ => {
+                let (field, array, slot) = literal_slot(std::slice::from_ref(recipe), batch, unused)?;
+                let recipe = decode_regex(field, array)?;
+                *slot = false;
+                recipe
+            }
+        };
         let source = Box::new(std::mem::replace(source, Expr::Literal(Value::Null)));
         *expr = Expr::RegexReplace { source, recipe, return_type: return_type.clone() };
         return Ok(());
     }
     if name != SLOT { return Ok(()); }
-    let [Expr::Parameter { index, data_type: LogicalType::Nothing }] = args.as_slice() else { return Err(malformed()); };
-    let batch = batch.ok_or_else(malformed)?;
-    let slot = unused.get_mut(*index).ok_or_else(malformed)?;
-    if !std::mem::take(slot) { return Err(malformed()); }
-    let field = batch.schema_ref().field(*index);
-    if field.name() != &format!("?{index}") { return Err(malformed()); }
-    let array = batch.column(*index).as_ref();
-    let decoded = if field.metadata().get(KIND).is_some_and(|kind| kind == "duration") {
-        let value = rtdb_columnar::read_value(field, array, 0)?;
-        let (Some(Value::I64(seconds)), Some(Value::U32(nanos))) = (value.field("seconds"), value.field("nanos")) else {
-            return Err(malformed());
-        };
-        Expr::DurationLiteral((*seconds, *nanos).try_into().map_err(|_| malformed())?)
-    } else {
-        Expr::Literal(decode_literal(field, array)?)
+    let (field, array, slot) = literal_slot(args, batch, unused)?;
+    let decoded = match field.metadata().get(KIND).map(String::as_str) {
+        Some("regex-fields") => return Err(malformed()),
+        Some("duration") => {
+            let array = non_null::<StructArray>(array)?;
+            let seconds = struct_child::<Int64Array>(array, "seconds")?.value(0);
+            let nanos = struct_child::<UInt32Array>(array, "nanos")?.value(0);
+            Expr::DurationLiteral((seconds, nanos).try_into().map_err(|_| malformed())?)
+        }
+        _ => Expr::Literal(decode_literal(field, array)?),
     };
     if decoded.data_type() != *return_type { return Err(malformed()); }
+    *slot = false;
     *expr = decoded;
     Ok(())
+}
+
+fn literal_slot<'page, 'slots>(args: &[Expr], batch: Option<&'page RecordBatch>, unused: &'slots mut [bool])
+    -> Result<(&'page Field, &'page dyn Array, &'slots mut bool)> {
+    let [Expr::Parameter { index, data_type: LogicalType::Nothing }] = args else { return Err(malformed()); };
+    let batch = batch.ok_or_else(malformed)?;
+    let slot = unused.get_mut(*index).filter(|slot| **slot).ok_or_else(malformed)?;
+    let field = batch.schema_ref().field(*index);
+    if field.name() != &format!("?{index}") { return Err(malformed()); }
+    Ok((field, batch.column(*index).as_ref(), slot))
+}
+
+fn non_null<T: 'static>(array: &dyn Array) -> Result<&T> {
+    if array.is_empty() || array.is_null(0) { return Err(malformed()); }
+    array.as_any().downcast_ref().ok_or_else(malformed)
+}
+
+fn struct_child<'a, T: 'static>(array: &'a StructArray, name: &str) -> Result<&'a T> {
+    non_null(array.column_by_name(name).ok_or_else(malformed)?.as_ref())
+}
+
+fn decode_regex(field: &Field, array: &dyn Array) -> Result<RegexReplacement> {
+    match field.metadata().get(KIND).map(String::as_str) {
+        Some("regex") => serde_json::from_slice(non_null::<BinaryArray>(array)?.value(0)).map_err(|_| malformed()),
+        Some("regex-fields") => {
+            let array = non_null::<StructArray>(array)?;
+            let form = |name| {
+                let child = array.column_by_name(name).ok_or_else(malformed)?.as_ref();
+                if child.data_type() == &DataType::Null { return Ok(RegexForm::default()); }
+                let mut builder = RegexFormBuilder::new_untracked();
+                builder.begin_literal()?;
+                match child.data_type() {
+                    DataType::Utf8 => builder.value_text(non_null::<StringArray>(child)?.value(0))?,
+                    DataType::Int64 => builder.value_leaf(&Value::I64(non_null::<Int64Array>(child)?.value(0)))?,
+                    DataType::Boolean => builder.value_leaf(&Value::Bool(non_null::<arrow_array::BooleanArray>(child)?.value(0)))?,
+                    _ => return Err(malformed()),
+                }
+                builder.end()?;
+                builder.finish()
+            };
+            Ok(RegexReplacement { pattern: form("pattern")?, replacement: form("replacement")?,
+                start: form("start")?, occurrence: form("occurrence")?, flags: form("flags")? })
+        }
+        _ => Err(malformed()),
+    }
 }
 
 fn decode_literal(field: &Field, array: &dyn Array) -> Result<Value> {
@@ -331,9 +462,27 @@ fn decode_literal(field: &Field, array: &dyn Array) -> Result<Value> {
             Ok(Value::Date(CalendarDate::new(CivilDate::from_epoch_day(day)?, unit)))
         }
         Some("raw-scalar") => {
-            let array = array.as_binary_opt::<i32>().ok_or_else(malformed)?;
-            serde_json::from_slice(array.value(0)).map_err(|_| malformed())
+            serde_json::from_slice(non_null::<BinaryArray>(array)?.value(0)).map_err(|_| malformed())
         }
+        Some("wide-time") => {
+            let array = non_null::<StructArray>(array)?;
+            let unit = match struct_child::<UInt8Array>(array, "unit")?.value(0) {
+                0 => TimeUnit::Second, 1 => TimeUnit::Millisecond, 2 => TimeUnit::Microsecond, 3 => TimeUnit::Nanosecond,
+                _ => return Err(malformed()),
+            };
+            Ok(Value::Time { value: struct_child::<Int64Array>(array, "value")?.value(0), unit,
+                bit_width: struct_child::<UInt8Array>(array, "bit_width")?.value(0) })
+        }
+        Some("wide-decimal") => {
+            let array = non_null::<StructArray>(array)?;
+            Ok(Value::Decimal(DecimalValue {
+                unscaled: struct_child::<BinaryArray>(array, "unscaled")?.value(0).to_vec(),
+                precision: struct_child::<Int32Array>(array, "precision")?.value(0),
+                scale: struct_child::<Int32Array>(array, "scale")?.value(0),
+                bit_width: struct_child::<UInt16Array>(array, "bit_width")?.value(0),
+            }))
+        }
+        Some("raw-uri") => Ok(Value::Uri(non_null::<StringArray>(array)?.value(0).to_owned())),
         Some("undefined") if field.data_type() == &DataType::Null => Ok(Value::Undefined),
         _ => rtdb_columnar::read_value(field, array, 0),
     }
