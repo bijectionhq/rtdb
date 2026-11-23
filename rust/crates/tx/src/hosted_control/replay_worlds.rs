@@ -79,6 +79,7 @@ impl ArchivedWorld {
         };
         let schemas = serde_json::to_vec(&self.parent.schemas).map_err(|_| invalid())?;
         let world = OwnedWorld {
+            ancestor: None,
             id: Iid(self.id),
             pin: Iid(self.pin),
             capture: Iid(self.parent.capture),

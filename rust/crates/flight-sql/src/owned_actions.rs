@@ -223,6 +223,7 @@ pub(crate) const HELD_WORLD_AT_PREFLIGHT_V1: &str = "rtdb.owned.PreflightHeldWor
 pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
+pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V1: &str = "rtdb.owned.PublishHeldWorldRetention.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
@@ -751,7 +752,7 @@ impl Service {
                 return Err(invalid("Invalid or repeated hosted world read"));
             }
             let (nonces, tail) = tail.split_at_checked(count * 16).ok_or_else(|| invalid("Truncated held world witnesses"))?;
-            let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+            let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
             let (witnesses, reservation) = held.conditions(call, held.world, nonces)?;
             worlds.push(HostedWorldRead { held, witnesses, _reservation: reservation });
             body = tail;
@@ -2444,7 +2445,7 @@ impl Service {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
-        let reply_charge = call.reserve(64)?;
+        let reply_charge = call.reserve(96)?;
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
@@ -2461,11 +2462,17 @@ impl Service {
         reply.extend_from_slice(&parent.system_time.0.to_be_bytes());
         reply.extend_from_slice(&snapshot.application_clock().unwrap_or(Timestamp::MIN).0.to_be_bytes());
         reply.extend_from_slice(&snapshot.initial_clock().0.to_be_bytes());
-        reply.push(match snapshot.clock_mode() {
-            rtdb_types::WorldClockMode::Retained => 0,
-            rtdb_types::WorldClockMode::Held { .. } => 1,
-            rtdb_types::WorldClockMode::Proposal => 2,
-        });
+        if let Some((world, ancestor)) = snapshot.ancestor() {
+            reply.push(3);
+            reply.extend_from_slice(&world.0);
+            reply.extend_from_slice(&ancestor.system_time.0.to_be_bytes());
+        } else {
+            reply.push(match snapshot.clock_mode() {
+                rtdb_types::WorldClockMode::Retained => 0,
+                rtdb_types::WorldClockMode::Held { .. } => 1,
+                rtdb_types::WorldClockMode::Proposal => 2,
+            });
+        }
         let held = Arc::new(OwnedWorldReadResource {
             snapshot, world, conditions: Mutex::new(BTreeMap::new()),
             owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
@@ -2476,6 +2483,14 @@ impl Service {
     }
 
     fn owned_world_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedWorldReadResource>, Status> {
+        let entry = self.owned_world_resource(call, handle)?;
+        if entry.snapshot.ancestor().is_some() {
+            return Err(Status::unimplemented("This retained world admits exact points only"));
+        }
+        Ok(entry)
+    }
+
+    fn owned_world_resource(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedWorldReadResource>, Status> {
         let entry = found(self.0.owned_world_reads.lookup(handle, false), "owned world read")?;
         if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
             return Err(Status::not_found("unknown owned world read"));
@@ -2556,7 +2571,7 @@ impl Service {
     pub(crate) async fn held_world_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
@@ -2702,7 +2717,7 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         if body.len() != 16 { return Err(invalid("Owned world read close requires one held handle")); }
         let handle = Bytes::copy_from_slice(body);
-        self.owned_world_read(call, &handle)?;
+        self.owned_world_resource(call, &handle)?;
         let entry = found(self.0.owned_world_reads.take(&handle), "owned world read")?;
         entry.close();
         Ok(())
@@ -2743,6 +2758,56 @@ impl Service {
         } else {
             self.owned_point_reply(&Schema::empty().with_metadata(metadata), None, result.present, valid_at, None)
         }
+    }
+
+    pub(crate) async fn publish_held_world_retention_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires its original hold"))?;
+        let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Retaining a Held publication requires its physical revision"))?;
+        let (child, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires a minted child"))?;
+        let (until, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no expiry"))?;
+        let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no commit deadline"))?;
+        let (attempt, body) = body.split_first_chunk::<22>().ok_or_else(|| invalid("The retained child has no attempt identity"))?;
+        let (fingerprint, body) = body.split_first_chunk::<32>().ok_or_else(|| invalid("The retained child has no fingerprint"))?;
+        let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid retained child attempt"))?;
+        if child == &[0; 16] || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+            return Err(invalid("Invalid retained child identity or attempt"));
+        }
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let scope = self.hosted_control_scope(call).await?;
+        let cut = held.snapshot.prepare_overlay_cut(scope, Timestamp(i64::from_be_bytes(*system))).await.map_err(status)?;
+        let policy = self.hosted_control_policy(call)?;
+        let groups = owned_groups(body, true, false)?;
+        hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 3;
+        let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+        if controls.is_empty() || controls.iter().any(|control| !control.is_check()) {
+            return Err(invalid("Retaining a Held publication requires checked hosted ownership"));
+        }
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let charge = call.reserve(64)?;
+        let child = rtdb_types::Iid(*child);
+        let deadline = Timestamp(i64::from_be_bytes(*deadline)).min(cut.until());
+        let (registered, key) = host.fork_world_checked(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            Uuid::nil(), None, Timestamp(i64::from_be_bytes(*until)),
+            rtdb_node::OwnedWorldFork {
+                world: child, pin: child, previous: None, sibling: None, cut,
+                requested: rtdb_node::WorldClockRequest::Retained,
+                deadline, attempt: attempt.to_owned(), fingerprint: *fingerprint, controls, root: None,
+            },
+        ).await.map_err(status)?;
+        if *registered.as_bytes() != child.0 { return Err(unsupported()); }
+        let mut reply = Vec::with_capacity(32);
+        reply.extend_from_slice(registered.as_bytes());
+        reply.extend_from_slice(&key.tx_id.0.to_be_bytes());
+        reply.extend_from_slice(&key.system_time.0.to_be_bytes());
+        Ok(ActionResult { body: wire::retain(reply, charge) })
     }
 
     pub(crate) async fn publish_world_cut_action(&self, call: &Call, body: &[u8], publish_root: bool) -> Result<ActionResult, Status> {
@@ -2984,7 +3049,10 @@ impl Service {
             }
             let ([kind], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world publication effect"))?;
             rows_left = rows_left.checked_sub(count * 2 + 2).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
-            let resource = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+            let resource = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
+            if resource.snapshot.ancestor().is_some() && *kind != 2 {
+                return Err(unsupported());
+            }
             let (checks, charge) = resource.conditions(call, world, nonces)?;
             reservations.push(charge);
             let parent_basis = resource.snapshot.parent_basis();
@@ -3187,7 +3255,7 @@ impl Service {
         }
         let (nonces, groups) = rest.split_at_checked(count * 16)
             .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (checks, _condition_charge) = held.conditions(call, world, nonces)?;
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let policy = self.hosted_control_policy(call)?;

@@ -1206,7 +1206,7 @@ impl OwnedReadSession {
         Ok(cut)
     }
 
-    /// Certifies an exact local Held publication for archive preparation only.
+    /// Certifies the original Held publication for an independently retained fork.
     pub async fn fork_overlay_cut(
         &self, scope: rtdb_types::PlacedAttemptScope, world: &rtdb_types::OwnedWorld, system: Timestamp,
     ) -> Result<OwnedForkCut> {
@@ -2618,8 +2618,15 @@ impl NativeSession {
             .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
             .saturating_add(fork.root.as_ref().and_then(|section| section.publication.as_ref()).map_or(0, |root| root.writes.len() + 1))
             .saturating_add(3 + usize::from(requires_tip));
-        if fork.cut.overlay().is_some()
-            || record.id != fork.world || record.pin != fork.pin || !fork.cut.matches_basis(record.basis)
+        let archive_basis = match (&record.ancestor, fork.cut.overlay()) {
+            (None, None) => record.basis,
+            (Some(ancestor), Some((world, pin, clock))) if ancestor.world == world.0
+                && ancestor.pin == pin.0 && ancestor.logical == clock
+                && root == OwnedForkRoot::None && fork.previous.is_none() && fork.sibling.is_none()
+                && requested == rtdb_types::WorldClockMode::Retained => ancestor.basis,
+            _ => return Err(rtdb_types::OwnedWorld::unavailable()),
+        };
+        if record.id != fork.world || record.pin != fork.pin || !fork.cut.matches_basis(archive_basis)
             || ((fork.previous.is_none() || fork.sibling.is_some()) != (record.pin == record.id)) || fork.controls.is_empty()
             || fork.previous.is_some_and(|pin| pin == record.pin || (record.mode.is_writable() && !proposal_hold))
             || record.mode != requested
