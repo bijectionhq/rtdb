@@ -57,6 +57,12 @@ Copy(journal) ==
     /\ journal \in (Active \cap s.online) \ (s.copied \cup s.staged)
     /\ s' = [s EXCEPT !.copied = @ \cup {journal}]
 
+RecoverOrdinary ==
+    /\ s.phase = "sealed" /\ s.admission = "ordinary"
+    /\ s.staged \cap s.sealed # {} /\ ~s.certified
+    /\ Quorum(s.sealed \cap s.online, Old)
+    /\ s' = [s EXCEPT !.staged = @ \cup (s.sealed \cap s.online)]
+
 Evidence ==
     IF s.admission = "guarded"
     THEN (s.timely \cap s.observed \cap s.online)
@@ -180,7 +186,7 @@ Next ==
     \/ (s.writer /\ s' = [s EXCEPT !.writer = FALSE])
     \/ (~s.expired /\ s' = [s EXCEPT !.expired = TRUE])
     \/ \E route \in {"old", "new"} : Begin(route)
-    \/ Certify \/ Acknowledge \/ Exclude \/ Prepare \/ Activate \/ Select \/ Protect \/ Apply \/ Serve \/ LoseHold
+    \/ RecoverOrdinary \/ Certify \/ Acknowledge \/ Exclude \/ Prepare \/ Activate \/ Select \/ Protect \/ Apply \/ Serve \/ LoseHold
 
 Spec == Init /\ [][Next]_s
 

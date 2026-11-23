@@ -121,6 +121,8 @@ Goal: every successful acknowledgement names an admitted, applied batch that rec
 
 **Already in place:** Verus checks replica admission, system-time assignment (including the bound by the log clock) and the first-required-offset rule; compiler controls reject forging the admission witness; TLC compares serialized, validated and blind resolution.
 
+The current logkeeper implementation distinguishes payload staging, durable decision installation and visible replay. Its scoped position still relies on the single-writer prefix invariant and the existing physical-journal transport boundary. Read repair currently installs only where the journal already has the selected bytes. The target portable certificate and its exact digest and handoff correspondence remain open. The installed ordered-journal provider still admits its protected barrier under a writer grant.
+
 **Start from:** `replication/src/{admission,admission_step,driver,appender}.rs`, `tx/src/{resolver,system_time}.rs`; Verus areas `replica_admission`, `system_time`.
 
 **Open obligations:**

@@ -2114,6 +2114,8 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "ack_payload"'), "StableCutCovered"),
     ("ActiveLogletReadIndex", "read-index-single-install",
      ('Mutation = "none"', 'Mutation = "single_install"'), "ReadStabilized"),
+    ("ActiveLogletReadIndex", "read-index-successive-read-inversion",
+     ('Mutation = "none"', 'Mutation = "single_install"'), "ReadReadMonotone"),
     ("ActiveLogletReadIndex", "read-index-unbound-digest",
      ('Mutation = "none"', 'Mutation = "wrong_digest"'), "ExactDecision"),
     ("ActiveLogletReadIndex", "read-index-skips-apply",
@@ -3303,6 +3305,11 @@ def verify_tla(args, scratch):
         config = clone_file(Path(f"verification/tla/{config_name}.cfg"), directory)
         if mutation:
             replace_once(config, *mutation)
+            if module == "ActiveLogletReadIndex" and mutation[0] == 'Mutation = "none"':
+                # Each fault is judged against its own law, even if it can
+                # also cause an earlier failure of a different invariant.
+                baseline = next(line for line in config.read_text().splitlines() if line.startswith("INVARIANTS "))
+                replace_once(config, baseline, f"INVARIANT {invariant}")
         with tempfile.TemporaryDirectory(prefix="states-", dir=directory) as metadir:
             log = run_case(
                 [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
