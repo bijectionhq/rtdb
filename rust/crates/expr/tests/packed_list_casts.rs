@@ -111,10 +111,22 @@ fn packed_text_and_temporal_casts_match_scalar_cells_and_arrow_layout() {
         assert_eq!(actual.to_data(), expected.to_data());
         let direct = rtdb_expr::cast_target(&source, &target, "UTC").unwrap();
         assert_eq!(direct, expected_scalar);
-        if !direct.has_calendar_object() {
-            assert!(matches!(direct.list_view(), Some(rtdb_types::ListView::Scalars(_))));
-        }
+        assert!(matches!(direct.list_view(), Some(rtdb_types::ListView::Scalars(_))));
     }
+}
+
+#[test]
+fn date_list_cast_keeps_wide_calendar_values_until_expression_admission() {
+    let date = rtdb_types::CivilDate::from_epoch_day(i64::from(i32::MAX) + 1).unwrap();
+    let input = V::list(vec![V::Utf8(date.to_string())]);
+    let target = CastTarget::List(Box::new(CastTarget::Fixed(L::Scalar(S::DateDay))));
+    let value = rtdb_expr::cast_target(&input, &target, "UTC").unwrap();
+    assert_eq!(value, V::list(vec![V::calendar_date(date, rtdb_types::DateUnit::Day)]));
+    assert!(value.has_calendar_object());
+
+    let expr = Expr::Cast { expr: Box::new(Expr::Literal(input)), target };
+    let error = evaluate(&expr, &Schema::default(), &[], &EvalContext::default()).unwrap_err();
+    assert_eq!(error.code, "xtdb.expression/overflow-error");
 }
 
 #[test]

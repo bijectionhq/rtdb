@@ -81,12 +81,6 @@ pub(crate) fn cast_list(
     if !is_temporal(&ty) || !cells.all(|cell| supports_temporal(cell, &ty, temporal, current_time)) {
         return Ok(None);
     }
-    // The standalone scalar cast returns calendar objects before Arrow date admission.
-    if current_time.is_none() && matches!(ty, ScalarType::DateDay | ScalarType::DateMilli)
-        && !cells.all(|cell| matches!(cell, Cell::Null) || matches!(cell, Cell::Temporal(_, source) if source == ty))
-    {
-        return Ok(None);
-    }
     let logical = LogicalType::Scalar(ty.clone());
     if rtdb_columnar::to_field("value", &logical).is_err() {
         return Ok(None);
