@@ -176,6 +176,7 @@ rule SearchJobRuns {
     -- The lane downloads the owner's data files, in bucket order for a group.
     -- Both paths read one page at a time under that page's memory reservation.
     -- They read event headers and borrow compatible indexed text cells from the page's Arrow vectors for tokenization.
+    -- The analyzer writes token bytes and offsets directly into Arrow string builders and offers a term visitor for consumers of ordered tokens.
     -- An on-demand build reads its input directly from the retained data-file cache lease.
     -- Both reserve the segment's indexing heap up front in proportion to the input size, build the segment on disk, and stream the bundle to the object store.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.

@@ -2,6 +2,7 @@
 //! Behavioural spec: dev/doc/fts.allium.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::sync::Arc;
 use arrow_array::{Array, StringArray, builder::StringBuilder};
 
@@ -13,29 +14,85 @@ pub const ANALYZER_VERSION: i32 = 2;
 /// The maximum UTF-8 byte length of one token for this analyzer version.
 pub const MAX_TOKEN_BYTES: usize = 65_530;
 
-fn visit_tokens(text: &str, mut append: impl FnMut(String)) {
-    for word in text.split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()) {
-        let word = word.to_lowercase();
-        if word.len() <= MAX_TOKEN_BYTES { append(word); continue; }
-        let mut piece = String::new();
-        for character in word.chars() {
-            if piece.len() + character.len_utf8() > MAX_TOKEN_BYTES { append(std::mem::take(&mut piece)); }
-            piece.push(character);
+fn tokenize(text: &str, mut output: impl TokenOutput) {
+    let words = text.split(|character: char| !character.is_alphanumeric()).filter(|word| !word.is_empty());
+    for word in words {
+        if word.is_ascii() {
+            for token in word.as_bytes().chunks(MAX_TOKEN_BYTES) {
+                let mut lowered = [0; 256];
+                for chunk in token.chunks(lowered.len()) {
+                    for (lower, byte) in lowered.iter_mut().zip(chunk) { *lower = byte.to_ascii_lowercase(); }
+                    output.write_str(std::str::from_utf8(&lowered[..chunk.len()]).expect("ASCII word")).unwrap();
+                }
+                output.end_token();
+            }
+            continue;
         }
-        append(piece);
+
+        // Lowercasing capital sigma depends on the surrounding characters in the original word.
+        let mut length = 0;
+        let mut append = |character: char| {
+            if length + character.len_utf8() > MAX_TOKEN_BYTES {
+                output.end_token();
+                length = 0;
+            }
+            output.write_char(character).unwrap();
+            length += character.len_utf8();
+        };
+        if word.contains('Σ') {
+            word.to_lowercase().chars().for_each(append);
+        } else {
+            word.chars().flat_map(char::to_lowercase).for_each(&mut append);
+        }
+        output.end_token();
     }
+}
+
+trait TokenOutput: Write {
+    fn end_token(&mut self);
+}
+
+impl TokenOutput for &mut StringBuilder {
+    fn end_token(&mut self) { self.append_value(""); }
+}
+
+struct TokenVisitor<F> {
+    token: String,
+    visit: F,
+}
+
+impl<F> Write for TokenVisitor<F> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.token.push_str(text);
+        Ok(())
+    }
+}
+
+impl<F: FnMut(&str)> TokenOutput for TokenVisitor<F> {
+    fn end_token(&mut self) {
+        (self.visit)(&self.token);
+        self.token.clear();
+    }
+}
+
+pub fn visit_tokens(text: &str, visit: impl FnMut(&str)) {
+    tokenize(text, TokenVisitor { token: String::new(), visit });
 }
 
 pub fn tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    visit_tokens(text, |word| tokens.push(word));
+    visit_tokens(text, |word| tokens.push(word.to_owned()));
     tokens
+}
+
+pub fn append_tokens(text: &str, builder: &mut StringBuilder) {
+    tokenize(text, builder);
 }
 
 /// Analyzes a document into an Arrow string vector in token order.
 pub fn analyze(text: &str) -> StringArray {
     let mut tokens = StringBuilder::new();
-    visit_tokens(text, |word| tokens.append_value(word));
+    append_tokens(text, &mut tokens);
     tokens.finish()
 }
 
@@ -239,6 +296,28 @@ mod tests {
         assert!(found.iter().all(|token| token.len() <= MAX_TOKEN_BYTES && !token.is_empty()));
         assert_eq!(found[1..3].concat(), word);
         assert!(Query::parse(&word).matches(&found), "the word still matches itself");
+    }
+
+    #[test]
+    fn both_token_sinks_preserve_contextual_case_and_token_boundaries() {
+        let mut input = format!("AΑΣ ΑΣΑ ΑΣ1Σ İI ß Å {}{} ", "Z".repeat(MAX_TOKEN_BYTES + 1), "É");
+        input.push_str(&"İ".repeat(MAX_TOKEN_BYTES / 3 + 2));
+        let mut expected = Vec::new();
+        for word in input.split(|character: char| !character.is_alphanumeric()).filter(|word| !word.is_empty()) {
+            let mut token = String::new();
+            for ch in word.to_lowercase().chars() {
+                if token.len() + ch.len_utf8() > MAX_TOKEN_BYTES { expected.push(std::mem::take(&mut token)); }
+                token.push(ch);
+            }
+            expected.push(token);
+        }
+        assert_eq!(tokens(&input), expected);
+        let mut builder = StringBuilder::new();
+        builder.append_value("before");
+        append_tokens(&input, &mut builder);
+        append_tokens("AFTER", &mut builder);
+        let array = builder.finish();
+        assert!(array.iter().flatten().eq(["before"].into_iter().chain(expected.iter().map(String::as_str)).chain(["after"])));
     }
 
     #[test]
