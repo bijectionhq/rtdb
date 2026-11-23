@@ -418,6 +418,8 @@ It emits typed ordinals and reuses typed columns for integer series and range bi
 Numeric list slicing, floating-point list equality and ordering, float list group and set keys, and cosine evaluation can work from typed Arrow children.
 Decimals round directly to binary64, including signed underflow and ties to even.
 Direct correlated arguments and delegated numeric predicate parameters retain their Arrow cells until a scalar consumer needs one.
+Mixed batch gathers pack evaluated cells independently of nested Arrow payloads selected by position.
+COALESCE over compatible vector columns selects the first present vector using Arrow validity and retains its physical layout.
 
 Pgwire emits standard SQL arrays and streams Transit containers from Arrow fields.
 The embedded Transit result cursor writes the same typed row format one Arrow row at a time.
@@ -425,10 +427,20 @@ The PostgreSQL source decodes fixed-type primitive inputs and supported arrays d
 Kafka's numeric arrays feed typed list builders during conversion.
 Result conformance can synthesize absent nullable fields in Arrow.
 
-Generic row plans and the per-cell evaluator still handle expressions and operator shapes outside the supported Arrow paths.
-Generic layout conformance, mixed document conversion, value-dependent connector decoders, and unsupported owned-write layouts still use scalar values.
-Those cases remain open for an end-to-end Arrow implementation.
-PostgreSQL DataRow framing, requested text and opaque terms, compatibility wire formats, durable envelopes, typed buffer ownership, and native index state retain their contracts.
+The following paths still cross into scalar values inside the engine or its adapters.
+
+| Remaining path | When it occurs | Audit entries |
+| --- | --- | --- |
+| Expression and list evaluation | Computed literals, list constructors and casts can append one evaluated value at a time. Noncanonical child layouts still use logical readers. Scalar subqueries, generic comparisons, and unsupported predicates and projections can materialize cells. | 1–7, 16, 17 |
+| Relational operators and spill | General join, aggregate, window, and Apply plans can use row cursors. Generic ordered or distinct aggregates and row spill can pack cells into IPC and read them back as values. | 9, 16–18 |
+| Validation and layout evolution | Incompatible Arrow layouts can rebuild affected cells at argument admission, in event assembly and statistics, and at result conformance. | 6, 8, 10, 14, 15, 19 |
+| Document operations | Mixed and unsupported owned-write layouts can decode documents or fields before coalescing, replay, and temporal patch. Receipt and argument handling still have row routes. | 11–15, 26 |
+| Frontend arguments | Pgwire Bind still builds a row of argument values. Compatibility Transit inputs and SQL control statements still use scalar arguments. | 15, 20, 21 |
+| Connectors and diagnostics | Value-dependent PostgreSQL decoding, some Kafka coercions, and generic text encoders and inspection routes still traverse values. | 21–23 |
+| Distributed fragments | Unsupported predicate values still travel in JSON. A fragment that uses one of the generic operators above can pack computed values for its Arrow reply. | 25 |
+
+PostgreSQL DataRow framing, requested text and opaque terms, legacy compatibility formats, and durable log and archive envelopes retain their existing formats.
+Buffer copies for ownership and native sidecar or ANN state are covered separately in the inventory above.
 
 The native library and release benchmark built on the candidate based on RTDB main `c28482fa90`.
 The eight focused Rust regressions and seven workspace doctests passed.

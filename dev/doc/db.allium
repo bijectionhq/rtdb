@@ -2017,6 +2017,9 @@ surface QueryAccess {
 
     @guarantee ColumnarScanProjection
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
+        -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
+        -- It emits a null where every operand is null.
+        -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.
         -- A scan can read compatible leaf counts, bounds, and Bloom bytes directly from metadata arrays.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.

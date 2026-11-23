@@ -287,8 +287,10 @@ impl Column {
                 let cells = column.cells.capacity().checked_mul(std::mem::size_of::<(usize, usize)>()).ok_or_else(size_error)?;
                 let sources = column.sources.capacity().checked_mul(std::mem::size_of::<Option<StoredVector>>()).ok_or_else(size_error)?;
                 let base = cells.checked_add(sources).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
-                column.sources.iter().flatten().filter_map(|(_, _, logical, _)| logical.as_ref()).try_fold(base, |bytes, logical| {
-                    bytes.checked_add(logical.retained_bytes()?).ok_or_else(size_error)
+                column.sources.iter().flatten().try_fold(base, |bytes, (array, _, logical, owner)| {
+                    let owned = if owner.is_none() { array.get_array_memory_size() } else { 0 };
+                    let metadata = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?;
+                    bytes.checked_add(owned).and_then(|bytes| bytes.checked_add(metadata)).ok_or_else(size_error)
                 })
             }
             Self::Values(values) => values.iter().try_fold(values.capacity().saturating_mul(std::mem::size_of::<Value>()), |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)),
@@ -551,14 +553,12 @@ impl ColumnBatch {
         })?;
         let _scratch = memory.reserve(sources.checked_mul(64).ok_or_else(size_error)?)?;
         let mut allocations = HashSet::new();
-        let mut arrays = HashSet::new();
         let mut bytes = self.charged();
         for selected in selections {
-            for (array, _, _, owner) in selected.sources.iter().flatten() {
+            for (_, _, _, owner) in selected.sources.iter().flatten() {
                 let held = match owner {
                     Some(owner) if Arc::ptr_eq(owner, &self.reservation) || self.appended.iter().any(|lease| Arc::ptr_eq(owner, lease)) => 0,
                     Some(owner) if allocations.insert(Arc::as_ptr(owner)) => owner.bytes(),
-                    None if arrays.insert(Arc::as_ptr(array)) => array.get_array_memory_size(),
                     _ => 0,
                 };
                 bytes = bytes.checked_add(held).ok_or_else(size_error)?;
@@ -988,33 +988,88 @@ fn dense_partition_keys_release_an_attached_page_reservation() {
     assert_eq!(keys.columns[0].value(0).unwrap(), Value::I64(20));
 }
 
+#[test]
+fn mixed_gather_retains_arrow_payloads_alongside_evaluated_cells() {
+    let memory = MemoryBudget::new(1 << 20);
+    let embedding = Value::list(vec![Value::F32(-0.0), Value::F32(2.0)]);
+    let logical = embedding.logical_type();
+    let field = Arc::new(rtdb_columnar::to_field("value", &logical).unwrap());
+    let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&embedding)).unwrap();
+    let arrow = Column::Arrow { array: Arc::clone(&array), field, logical: Some(logical) };
+    let evaluated = Column::Values(vec![Value::I64(3)]);
+    let batches = [arrow, evaluated].map(|column| {
+        ColumnBatch::settled(vec![column], 1, memory.reserve(4096).unwrap()).unwrap()
+    });
+    let picks = [Some((1, 0)), Some((0, 0)), None, Some((0, 0))];
+    let (column, _charge) = gather_column_cells(|index| &batches[index], picks.into_iter(), picks.len(), 0, true, &memory).unwrap();
+    drop(batches);
+    assert_eq!(column.value(0).unwrap(), Value::I64(3));
+    assert_eq!(column.value(2).unwrap(), Value::Null);
+    for row in [1, 3] {
+        let (retained, _, _, offset) = column.arrow_cell(row).unwrap().unwrap();
+        assert!(std::ptr::eq(retained, array.as_ref()));
+        assert_eq!(offset, 0);
+        assert_eq!(column.value(row).unwrap(), embedding);
+    }
+}
+
+#[test]
+fn a_gather_retains_the_batch_reservation_for_a_repeated_vector() {
+    let memory = MemoryBudget::new(1 << 20);
+    let vector = Value::list((0..4096).map(|n| Value::F32(n as f32)).collect());
+    let column = repeat_cell(&vector, 2).unwrap();
+    let (array, ..) = column.arrow_cell(0).unwrap().unwrap();
+    let bytes = array.get_array_memory_size();
+    let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(bytes * 2).unwrap()).unwrap();
+    assert!(batch.column_reservation(0).bytes() >= bytes);
+    let input = Arc::downgrade(batch.column_reservation(0));
+    let (column, charge) = gather_column_rows(|_| &batch, &[(0, 1)], 0, &memory).unwrap();
+    drop(batch);
+    assert!(input.upgrade().is_some());
+    assert_eq!(column.value(0).unwrap(), vector);
+    drop((column, charge));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
 fn gather_column_cells<'a>(
     source: impl Fn(usize) -> &'a ColumnBatch, rows: impl Iterator<Item = Option<(usize, usize)>> + Clone, count: usize,
     position: usize, retain_sources: bool, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
-    if rows.clone().flatten().any(|(batch, _)| matches!(source(batch).columns[position], Column::Values(_))) {
-        let bytes = rows.clone().try_fold(4096usize, |bound, cell| {
-            let bytes = match cell {
-                Some((batch, row)) => source(batch).columns[position].bound(row)?.saturating_mul(4),
-                None => std::mem::size_of::<Value>(),
-            };
-            bound.checked_add(bytes).ok_or_else(size_error)
+    let source = |index| {
+        let batch = source(index);
+        (&batch.columns[position], batch.column_reservation(position))
+    };
+    let evaluated = rows.clone().flatten().filter(|&(index, _)| matches!(source(index).0, Column::Values(_)));
+    let converted = if evaluated.clone().next().is_some() {
+        let (len, bytes) = evaluated.clone().try_fold((0usize, 4096usize), |(len, bound), (index, row)| {
+            let bytes = source(index).0.bound(row)?;
+            Ok::<_, rtdb_types::Anomaly>((len.checked_add(1).ok_or_else(size_error)?, bound.checked_add(bytes).ok_or_else(size_error)?))
         })?;
         let scratch = memory.reserve(bytes)?;
-        let values = rows.map(|cell| match cell {
-            Some((batch, row)) => source(batch).columns[position].value(row),
-            None => Ok(Value::Null),
-        }).collect::<Result<Vec<_>>>()?;
+        let mut values = Vec::with_capacity(len);
+        for (index, row) in evaluated { values.push(source(index).0.value(row)?); }
         let packed = pack_evaluated_column(&values, memory)?;
         drop((values, scratch));
-        return Ok(packed);
-    }
-    take_arrow_rows(source, rows, count, position, retain_sources, memory)
+        Some(packed)
+    } else { None };
+    let mut next_evaluated = 0;
+    let picks = rows.map(|cell| cell.map(|(index, row)| {
+        let (column, charge) = source(index);
+        if matches!(column, Column::Values(_)) {
+            let (column, charge) = converted.as_ref().expect("Evaluated gather cells were packed");
+            let row = next_evaluated;
+            next_evaluated += 1;
+            (column, charge, row)
+        } else {
+            (column, charge, row)
+        }
+    }));
+    take_arrow_rows(picks, count, retain_sources, memory)
 }
 
 fn take_arrow_rows<'a>(
-    batch: impl Fn(usize) -> &'a ColumnBatch, rows: impl Iterator<Item = Option<(usize, usize)>>, count: usize,
-    position: usize, retain_sources: bool, memory: &Arc<MemoryBudget>,
+    rows: impl Iterator<Item = Option<(&'a Column, &'a Arc<MemoryReservation>, usize)>>, count: usize,
+    retain_sources: bool, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
     let base = count.checked_mul(std::mem::size_of::<(usize, usize)>())
         .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
@@ -1027,7 +1082,7 @@ fn take_arrow_rows<'a>(
     let mut name = "";
     let mut missing = None;
     for cell in rows {
-        let Some((batch_index, row)) = cell else {
+        let Some((column, reservation, row)) = cell else {
             let index = *missing.get_or_insert_with(|| {
                 let index = sources.len();
                 sources.push(None);
@@ -1036,8 +1091,7 @@ fn take_arrow_rows<'a>(
             cells.push((index, 0));
             continue;
         };
-        let batch = batch(batch_index);
-        let (source, offset, vector, custody) = match &batch.columns[position] {
+        let (source, offset, vector, custody) = match column {
             Column::Arrow { array, field, logical } => {
                 name = field.name();
                 let null = array.data_type() == &DataType::Null;
@@ -1047,7 +1101,7 @@ fn take_arrow_rows<'a>(
                     keep_selection |= flat_copy_bytes(field, array.as_ref(), row)? != 0;
                 }
                 let vector = (!absent).then_some((array, field, logical));
-                (0, row, vector, Some(batch.column_reservation(position)))
+                (0, row, vector, Some(reservation))
             }
             Column::Selected(column) => {
                 keep_selection = true;
@@ -1055,11 +1109,11 @@ fn take_arrow_rows<'a>(
                 let stored = column.sources[source].as_ref();
                 let vector = stored.map(|(array, field, logical, _)| (array, field, logical));
                 if let Some((_, field, _)) = vector { name = field.name(); }
-                (source, offset, vector, stored.and_then(|(_, _, _, owner)| owner.as_ref()))
+                (source, offset, vector, stored.map(|(_, _, _, owner)| owner.as_ref().unwrap_or(reservation)))
             }
             Column::Values(_) => unreachable!("An Arrow gather reads only Arrow columns"),
         };
-        let key = (batch_index, source);
+        let key = (std::ptr::from_ref(column), source);
         let input = if let Some(&input) = positions.get(&key) {
             input
         } else {
@@ -3225,6 +3279,12 @@ impl BatchCursor for BatchExpressions {
                 columns.push(column);
                 continue;
             }
+            if let Some((column, mut charge)) = projection::coalesce_vectors(kernel, &self.schema, &batch, &self.execution.context.memory)? {
+                let lease = Arc::get_mut(&mut reservation).expect("Batch projection owns its reservation");
+                lease.absorb(Arc::get_mut(&mut charge).expect("A vector selection owns its reservation"))?;
+                columns.push(column);
+                continue;
+            }
             // An ordinal such as 0::BIGINT is shared by every row of a probe.
             if batch.len != 0 && matches!(expression, rtdb_plan::Expr::Cast { expr, .. } if matches!(expr.as_ref(), rtdb_plan::Expr::Literal(_))) {
                 let scope = self.execution.scope()?;
@@ -3446,7 +3506,7 @@ pub(crate) mod projection {
     use arrow_schema::{DataType, Field as ArrowField};
     use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema};
     use rtdb_types::{LogicalType, Result, ScalarType, StructFields, Value};
-    use super::{Column, ColumnBatch};
+    use super::{Column, ColumnBatch, MemoryBudget, MemoryReservation};
 
     #[derive(Clone, Copy)]
     enum Number { Int(i64), Float(f64) }
@@ -3769,6 +3829,61 @@ pub(crate) mod projection {
         (arrays.first()?.data_type() == child.data_type()).then_some((arrays, logical))
     }
 
+    pub(crate) fn coalesce_vectors(
+        expr: &Expr, schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        let args = match expr {
+            Expr::Coalesce(args) => args,
+            Expr::Call { name, args, .. } if name == "coalesce" => args,
+            _ => return Ok(None),
+        };
+        if batch.len == 0 { return Ok(None); }
+        let bytes = args.len().checked_mul(64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(super::size_error)?;
+        let Ok(_inputs) = memory.reserve(bytes) else { return Ok(None); };
+        let mut inputs = Vec::with_capacity(args.len());
+        let layout = |field: &ArrowField, logical: Option<&LogicalType>| {
+            if !logical.is_some_and(|logical| super::stable_read_layout(logical, field)) { return false; }
+            match field.data_type() {
+                DataType::Null => field.is_nullable(),
+                DataType::List(child) | DataType::FixedSizeList(child, _) if field.metadata().is_empty() && child.metadata().is_empty() => {
+                    matches!(child.data_type(), DataType::Float32 | DataType::Float64)
+                        || rtdb_types::ListValue::supports_float_union(child.data_type())
+                }
+                _ => false,
+            }
+        };
+        for arg in args {
+            let position = match arg {
+                Expr::Literal(Value::Null | Value::Undefined) => continue,
+                Expr::Column { id, .. } => match schema.position(*id) { Some(position) => position, None => return Ok(None) },
+                _ => return Ok(None),
+            };
+            let column = &batch.columns[position];
+            let compatible = match column {
+                Column::Arrow { field, logical, .. } => layout(field, logical.as_ref()),
+                Column::Selected(column) => column.source_layouts().all(|(_, field, logical)| layout(field, logical)),
+                Column::Values(_) => false,
+            };
+            if !compatible { return Ok(None); }
+            inputs.push((column, batch.column_reservation(position)));
+        }
+        if inputs.is_empty() { return Ok(None); }
+        let picks = (0..batch.len).map(|row| inputs.iter().find_map(|&(column, charge)| {
+            let (array, field, _, offset) = column.arrow_cell(row)??;
+            (super::arrow_cell_is_null(field, array, offset) == Some(false)).then_some((column, charge, row))
+        }));
+        let selection = super::take_arrow_rows(picks, batch.len, true, memory).and_then(|(column, mut charge)| {
+            let bytes = column.retained_bytes()?;
+            let lease = Arc::get_mut(&mut charge).expect("A vector selection owns its reservation");
+            if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+            Ok((column, charge))
+        });
+        match selection {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            result => result.map(Some),
+        }
+    }
+
     /// The first non-null argument per row. An argument the kernels can't compute, or one that raises an error the
     /// evaluator might never reach, leaves the whole call to the evaluator.
     fn coalesce(args: &[Expr], schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Result<Option<Column>> {
@@ -3879,4 +3994,35 @@ pub(crate) mod projection {
         }
         Ok(Some(Column::Values(values)))
     }
+}
+
+#[test]
+fn vector_coalesce_uses_arrow_validity_and_retains_both_layouts() {
+    let memory = MemoryBudget::new(1 << 20);
+    let left = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into());
+    let right = Value::list(vec![Value::F64(1.0)]);
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    for (id, name, value, cells) in [
+        (0, "left", &left, [left.clone(), Value::Null, Value::Null]),
+        (1, "right", &right, [right.clone(), right.clone(), Value::Null]),
+    ] {
+        let logical = value.logical_type().maybe();
+        let field = Arc::new(rtdb_columnar::to_field(name, &logical).unwrap());
+        let array = rtdb_columnar::copy_array(&logical, &cells).unwrap();
+        columns.push(Column::Arrow { array, field, logical: Some(logical.clone()) });
+        fields.push(Field { id: rtdb_plan::ColumnId(id), name: name.into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: logical });
+    }
+    let expr = rtdb_plan::Expr::Coalesce(fields.iter().map(Field::expression).collect());
+    let schema = rtdb_plan::Schema::new(fields).unwrap();
+    let batch = ColumnBatch::settled(columns, 3, memory.reserve(4096).unwrap()).unwrap();
+    let (column, _charge) = projection::coalesce_vectors(&expr, &schema, &batch, &memory).unwrap().unwrap();
+    for (row, expected) in [left, right].into_iter().enumerate() {
+        let (input, ..) = batch.columns[row].arrow_cell(row).unwrap().unwrap();
+        let (retained, ..) = column.arrow_cell(row).unwrap().unwrap();
+        assert!(std::ptr::eq(retained, input));
+        assert_eq!(column.value(row).unwrap(), expected);
+    }
+    assert_eq!(column.value(2).unwrap(), Value::Null);
 }
