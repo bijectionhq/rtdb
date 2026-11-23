@@ -248,6 +248,8 @@ jobs:
 
       - name: Test native Flight transport
         if: ${{ !cancelled() && steps.native-library.outcome == 'success' }}
+        env:
+          RUST_MIN_STACK: "16777216"
         run: cargo +1.94.1 test --manifest-path rust/Cargo.toml --locked -p rtdb-flight-sql --test flight
 
   slt-1:
