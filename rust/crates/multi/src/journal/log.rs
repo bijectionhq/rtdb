@@ -560,6 +560,15 @@ impl Log for JournalLog {
         true
     }
 
+    fn fences_writer_terms(&self) -> bool {
+        true
+    }
+
+    async fn holds_writer_grant(&self) -> Result<bool> {
+        let grant = self.writer.lock().await.grant;
+        Ok(self.reads.route().await?.writer.grant == Some(grant))
+    }
+
     fn retains_synced_history(&self) -> bool {
         true
     }

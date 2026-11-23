@@ -525,7 +525,7 @@ impl ReplicationDriver {
                         TailPoll::Prepared(Some(head)) => self.replica_head = Some(head),
                         TailPoll::Legacy(records) if !records.is_empty() => self.replica_batch.extend(records),
                         TailPoll::Prepared(None) | TailPoll::Legacy(_) => {
-                            if !self.cancellation.is_cancelled() { self.start_claim()?; }
+                            if !self.cancellation.is_cancelled() { self.lead_after_empty_read().await?; }
                         }
                     }
                 }
@@ -708,7 +708,20 @@ impl ReplicationDriver {
             }
         }
     }
+    /// A journal that fences writer terms promotes its grant holder only after an empty read, so every record of
+    /// an earlier term has been admitted before the new term's sequence-zero record can open it.
+    async fn lead_after_empty_read(&mut self) -> Result<()> {
+        if !self.logs.fences_writer_terms() { return self.start_claim(); }
+        if !self.config.may_lead || self.leader.is_some() || !self.logs.holds_writer_grant().await? { return Ok(()); }
+        let term = self.fence.claim_term()?;
+        if let Err(error) = self.promote_term(term).await {
+            self.promotion_failed(error).await?;
+        } else { self.status.send_modify(|status| status.promotion_failure = None); }
+        Ok(())
+    }
     fn start_claim(&mut self) -> Result<()> {
+        // Promotion waits for the next empty read instead of appending a claim.
+        if self.logs.fences_writer_terms() { return Ok(()); }
         if !self.config.may_lead || self.leader.is_some() || self.claim.is_some() || self.claiming.is_some() { return Ok(()); }
         let term = self.fence.claim_term()?;
         let envelope = ReplicaEnvelope { term, term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
@@ -744,8 +757,8 @@ impl ReplicationDriver {
         self.status.send_modify(|status| status.promotion_failure = Some(error));
         Ok(())
     }
-    async fn promote(&mut self) -> Result<()> {
-        let term = self.fence.highest_term();
+    async fn promote(&mut self) -> Result<()> { self.promote_term(self.fence.highest_term()).await }
+    async fn promote_term(&mut self, term: Term) -> Result<()> {
         let progress = self.progress.current();
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
         self.flush_timer = FlushTimer::new((self.clock)(), persisted, self.config.flush_timeout)?;
@@ -754,6 +767,8 @@ impl ReplicationDriver {
         let source_tail = if self.pending_block.is_some() || self.waiting_for_checkpoint() { None } else { Some(self.logs.source_tail(progress.source_position).await?) };
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
+        // Without a claim, the term's first appended record opens it.
+        let pump = if self.logs.fences_writer_terms() { pump.starting_at(TermSequence(0)) } else { pump };
         let pump = match self.resolve.execution_observer.clone() {
             Some(observer) => pump.with_durable_commit_observer(move |basis, lag| match basis {
                 CommitLagBasis::Ordered => observer.record_durable_commit_lag(lag),

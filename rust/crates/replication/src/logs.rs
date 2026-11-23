@@ -75,6 +75,8 @@ impl PartitionLogs {
         crate::BlockStore::new(Arc::clone(&self.store), Arc::clone(&self.cache), Arc::clone(&self.memory), file_size_target)
     }
     pub(crate) fn requires_checkpoint_digest(&self) -> bool { self.replica.requires_checkpoint_digest() }
+    pub(crate) fn fences_writer_terms(&self) -> bool { self.replica.fences_writer_terms() }
+    pub(crate) async fn holds_writer_grant(&self) -> Result<bool> { Ok(self.replica.holds_writer_grant().await?) }
     pub(crate) fn retains_recovery_history(&self) -> bool {
         self.source.retains_synced_history() && self.replica.retains_synced_history() && self.store.syncs_checkpoints()
     }
@@ -182,9 +184,11 @@ impl PartitionLogs {
         let now = clock();
         // Only the term's initial claim and the block close can consume reserved journal space.
         // Keep that class when a large block upload is represented by an offload reference.
+        // A journal that fences writer terms has no claims, so its sequence-zero no-op is ordinary data.
         let maintenance = match &envelope.message {
             ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,
-            ReplicaBody::NoOp(message) => envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none(),
+            ReplicaBody::NoOp(message) => !self.fences_writer_terms()
+                && envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none(),
             _ => false,
         };
         let enqueue = |payload| async move {

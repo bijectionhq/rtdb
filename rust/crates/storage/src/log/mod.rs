@@ -203,6 +203,12 @@ pub struct AppendCapacity {
 pub trait Log: Send + Sync {
     /// This replica log requires accepted uploads to bind the exact catalog bytes.
     fn requires_checkpoint_digest(&self) -> bool { false }
+    /// The journal admits appends only under its current writer grant and makes a new grant holder replay
+    /// through the granted cut, so a replica term needs no claim record.
+    fn fences_writer_terms(&self) -> bool { false }
+    /// Whether this process still holds the journal's current writer grant.
+    /// Only a log that fences writer terms can answer false.
+    async fn holds_writer_grant(&self) -> Result<bool> { Ok(true) }
     /// The reopened journal retains its synced prefix, and reads expose only that durable history.
     fn retains_synced_history(&self) -> bool { false }
     /// The provider's fixed size limit for one append, before any provider-specific wrapping.

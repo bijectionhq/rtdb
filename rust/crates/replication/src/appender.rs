@@ -115,6 +115,7 @@ impl ReplicaAppender {
         (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true, durable_commit_observer: None })
     }
     pub fn with_heartbeat(mut self, heartbeat: bool) -> Self { self.heartbeat = heartbeat; self }
+    pub fn starting_at(mut self, sequence: TermSequence) -> Self { self.sequence = sequence; self }
     pub fn with_durable_commit_observer(mut self, observer: impl Fn(CommitLagBasis, Option<Duration>) + Send + Sync + 'static) -> Self {
         self.durable_commit_observer = Some(Arc::new(observer));
         self

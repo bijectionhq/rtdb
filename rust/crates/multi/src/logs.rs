@@ -444,6 +444,8 @@ fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Res
 #[async_trait]
 impl Log for SealedLog {
     fn requires_checkpoint_digest(&self) -> bool { self.inner.requires_checkpoint_digest() }
+    fn fences_writer_terms(&self) -> bool { self.inner.fences_writer_terms() }
+    async fn holds_writer_grant(&self) -> rtdb_storage::Result<bool> { self.inner.holds_writer_grant().await }
     fn maximum_append_bytes(&self) -> Option<usize> {
         self.inner.maximum_append_bytes()?.checked_sub(SEALED_OVERHEAD)
     }

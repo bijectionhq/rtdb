@@ -2845,3 +2845,100 @@ async fn stale_and_foreign_bodies_contribute_only_an_oversized_payload() {
     let tail = tail_dependencies(replay_base(&replayed.checkpoint), [stale, &foreign], replayed.blocks.as_ref()).await.unwrap();
     assert_eq!(tail, BTreeSet::from([replayed.stale_payload.clone()]));
 }
+
+/// A journal that fences writer terms, counting what it charges to the maintenance lane.
+struct FencedTermLog {
+    log: Arc<MemoryLog>,
+    holds_grant: std::sync::atomic::AtomicBool,
+    maintenance: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Log for FencedTermLog {
+    fn fences_writer_terms(&self) -> bool { true }
+    async fn holds_writer_grant(&self) -> rtdb_storage::Result<bool> {
+        Ok(self.holds_grant.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<rtdb_storage::log::AppendReceipt> {
+        self.log.enqueue(payload, timestamp).await
+    }
+    async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<rtdb_storage::log::AppendReceipt> {
+        self.maintenance.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.log.enqueue_maintenance(payload, timestamp).await
+    }
+    fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
+    async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogTail>> { self.log.tail(after).await }
+    async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogRange>> { self.log.range(from, to).await }
+    async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
+}
+
+async fn fenced_term_fixture(holds_grant: bool) -> (Fixture, Arc<FencedTermLog>) {
+    let fenced = std::sync::Mutex::new(None);
+    let fixture = fixture_with_replica(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27, None, |log| {
+        let log = Arc::new(FencedTermLog { log, holds_grant: holds_grant.into(), maintenance: 0.into() });
+        *fenced.lock().unwrap() = Some(Arc::clone(&log));
+        log
+    }).await;
+    let fenced = fenced.into_inner().unwrap().unwrap();
+    (fixture, fenced)
+}
+
+fn leading_config() -> ReplicationConfig {
+    ReplicationConfig { assertion_interval: Duration::from_millis(1), claim_wait: Some(Duration::from_millis(1)), ..Default::default() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journal_fenced_term_opens_without_a_claim_or_maintenance_record_across_replacements() {
+    let (fixture, fenced) = fenced_term_fixture(true).await;
+    let mut terms = Vec::new();
+    for _ in 0..6 {
+        let (handle, driver) = reopen_memory_checkpoint_with_config(&fixture, leading_config()).await;
+        let mut status = handle.watch_status();
+        let running = tokio::spawn(driver.run());
+        let term = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Role::Leading(term) = status.borrow_and_update().role { break term; }
+                status.changed().await.unwrap();
+            }
+        }).await.unwrap();
+        let written = fixture.replica.latest().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.replica.latest().unwrap() <= written { tokio::time::sleep(Duration::from_millis(1)).await; }
+        }).await.unwrap();
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap().unwrap();
+        assert!(handle.progress().fault().is_none());
+        terms.push(term);
+    }
+    assert!(terms.windows(2).all(|pair| pair[0] < pair[1]), "each replacement opens a later term: {terms:?}");
+    assert_eq!(fenced.maintenance.load(std::sync::atomic::Ordering::SeqCst), 0,
+        "replacements without block progress charge nothing to the maintenance lane");
+
+    // Each term begins at sequence zero, and a follower admits every term without voiding one.
+    let records = fixture.replica.read_range(LogOffset(0), LogOffset(fixture.replica.latest().unwrap().0 + 1)).await.unwrap();
+    let mut fence = crate::TermFence::from_boundary(Term(0), None).unwrap();
+    let mut opened = Vec::new();
+    for record in records {
+        let envelope = ReplicaEnvelope::decode(&record.payload).unwrap().unwrap();
+        let admission = fence.admit(envelope.term, envelope.term_sequence).unwrap();
+        assert_ne!(admission.verdict, crate::Verdict::Voided);
+        if admission.opens_term() {
+            assert_eq!(envelope.term_sequence, Some(TermSequence(0)));
+            opened.push(envelope.term);
+        }
+    }
+    assert_eq!(opened, terms);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_without_the_current_grant_never_leads_a_journal_fenced_term() {
+    let (fixture, fenced) = fenced_term_fixture(false).await;
+    let (handle, driver) = reopen_memory_checkpoint_with_config(&fixture, leading_config()).await;
+    let running = tokio::spawn(driver.run());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(handle.status().role, Role::Following);
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
+    handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap().unwrap();
+    assert_eq!(fenced.maintenance.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
