@@ -90,12 +90,13 @@ pub(crate) fn clock_slot_time(
 pub(crate) enum SourceTime {
     Automatic,
     ExactSystem { requested: i64, require_current_append: bool },
-    ObservedAppend(i64),
+    ExactOwnedPublication(i64),
 }
 
 #[cfg(not(verus_keep_ghost))]
 pub(crate) enum TimeRejection {
     BehindHistory(i64),
+    RepeatedOwnedPublication(i64),
     AheadOfAppend(i64),
     BehindAppend(i64),
 }
@@ -117,9 +118,12 @@ impl SourceTime {
                 require_append_bound(requested, appended, require_current_append)?;
                 Ok(requested)
             }
-            Self::ObservedAppend(requested) => {
-                require_append_bound(requested, appended, true)?;
-                Ok(automatic)
+            Self::ExactOwnedPublication(requested) => {
+                require_append_bound(requested, appended, false)?;
+                if !advances(previous, requested) {
+                    return Err(TimeRejection::RepeatedOwnedPublication(requested));
+                }
+                Ok(requested)
             }
         }
     }

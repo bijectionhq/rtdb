@@ -803,7 +803,7 @@ async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_
 }
 
 #[tokio::test]
-async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_projection_advances() {
+async fn explicit_owned_time_keeps_its_append_bound_and_does_not_manufacture_a_successor() {
     use rtdb_format::envelope::{ReplicaBody, SourceMessage};
     use rtdb_types::{OwnedRelation, TxId};
 
@@ -827,10 +827,11 @@ async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_proje
     for (position, sample) in [(0, 100), (1, 100), (2, 99)] {
         let snapshot = state.snapshot();
         let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(position), Timestamp(sample), owned(sample, position), &context).await.unwrap();
-        assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+        assert_eq!(resolved.result().committed(), position == 0);
+        if position != 0 { assert_eq!(resolved.result().error().unwrap().code, "invalid-system-time"); }
         let key = resolved.result().tx_key();
         assert_eq!(key.tx_id, TxId(position));
-        assert_eq!(key.system_time, Timestamp(100 + position));
+        if position == 0 { assert_eq!(key.system_time, Timestamp(sample)); }
         let body = resolved.to_replica_body(&context.memory).unwrap();
         let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("resolved transaction"); };
         let replay = decode_replica(body, None, snapshot.block_index(), &context.memory).unwrap();
@@ -839,8 +840,8 @@ async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_proje
         assert!(matches!(row["source_log_time"], Value::Timestamp { value, .. } if value == sample));
         state.apply(resolver.take_head().unwrap().writes()).unwrap();
     }
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(98), owned(97, 3), &context).await.unwrap();
-    assert_eq!(refused.result().error().unwrap().code, "rtdb/ordered-system-time");
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(98), owned(99, 3), &context).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb/future-system-time");
 }
 
 #[tokio::test]

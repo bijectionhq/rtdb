@@ -339,7 +339,7 @@ impl TxResolver {
         }).transpose();
         let clock_request = match request.options.system_time {
             None => SourceTime::Automatic,
-            Some(requested) if has_owned_operations => SourceTime::ObservedAppend(requested.0),
+            Some(requested) if has_owned_operations => SourceTime::ExactOwnedPublication(requested.0),
             Some(requested) => SourceTime::ExactSystem {
                 requested: requested.0,
                 require_current_append: request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time),
@@ -409,6 +409,9 @@ impl TxResolver {
                 TimeRejection::BehindHistory(requested) => (requested,
                     Anomaly::incorrect("invalid-system-time", "specified system-time precedes the current history")
                         .with_context("latest-completed-tx", tx_key_context(self.resolved_head.expect("a nonadvancing time has a predecessor"))?)),
+                TimeRejection::RepeatedOwnedPublication(requested) => (requested,
+                    Anomaly::incorrect("invalid-system-time", "An owned publication requires a distinct history coordinate")
+                        .with_context("latest-completed-tx", tx_key_context(self.resolved_head.expect("an existing coordinate has a predecessor"))?)),
                 TimeRejection::AheadOfAppend(requested) => (requested,
                     Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
                         .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?)),
