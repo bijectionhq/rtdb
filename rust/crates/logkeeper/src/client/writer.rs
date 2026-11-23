@@ -231,27 +231,38 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
     Ok(synced)
 }
 
+fn sealed_history(replies: &[(usize, Sealed)]) -> (usize, Holding) {
+    let sealed: Vec<Sealed> = replies.iter().map(|(_, sealed)| sealed.clone()).collect();
+    let (source, winning) = &replies[winner(&sealed)];
+    (*source, Holding::from(winning))
+}
+
 impl Writer {
     pub async fn open(ensemble: Arc<Ensemble>, epoch: u64) -> Result<Arc<Self>> {
         let replies = seal_quorum(&ensemble, epoch).await?;
-        let sealed: Vec<Sealed> = replies.iter().map(|(_, sealed)| sealed.clone()).collect();
-        let (source, winning) = &replies[winner(&sealed)];
-        let history = Holding::from(winning);
-        let recovered = Recovered { source: (&ensemble, *source), start: history.trim + 1, history };
+        let (source, history) = sealed_history(&replies);
+        let recovered = Recovered { source: (&ensemble, source), start: history.trim + 1, history };
         Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
+    }
+
+    pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<i64> {
+        let replies = seal_quorum(ensemble, epoch).await?;
+        let (source, history) = sealed_history(&replies);
+        let last = history.last;
+        let recovered = Recovered { source: (ensemble, source), start: history.trim + 1, history };
+        sync_quorum(ensemble, epoch, &replies, &recovered, last).await?;
+        Ok(last)
     }
 
     /// Recovers the same history used by a local ensemble move and by a
     /// copy to a different physical stream.
     async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
         let previous_replies = seal_quorum(previous, epoch).await?;
-        let sealed: Vec<Sealed> = previous_replies.iter().map(|(_, sealed)| sealed.clone()).collect();
-        let (source, winning) = &previous_replies[winner(&sealed)];
-        let history = Holding::from(winning);
+        let (source, history) = sealed_history(&previous_replies);
         let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
-        let in_place = Recovered { source: (previous, *source), start: history.trim + 1, history: history.clone() };
+        let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone() };
         sync_quorum(previous, epoch, &previous_replies, &in_place, start - 1).await?;
-        Ok(Recovered { source: (previous, *source), history, start })
+        Ok(Recovered { source: (previous, source), history, start })
     }
 
     /// Copies the recovered suffix into another ensemble and opens its writer.

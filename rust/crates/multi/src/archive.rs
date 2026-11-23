@@ -1427,7 +1427,7 @@ pub(crate) async fn seal_checkpoint_transfer(
     }
     await_storage_drain(directory, storage, keys, &source).await?;
     let stream = administration_stream(directory, &source, 4 << 20).await?;
-    let sealed = rtdb_logkeeper::seal(&stream, fence.fenced_writer_epoch).await?.0;
+    let sealed = rtdb_logkeeper::seal_recover_committed(&stream, fence.fenced_writer_epoch).await?.0;
     let entries_count = sealed.checked_sub(stage.checkpoint.boundary)
         .filter(|count| (0..=replica_suffix::MAX_SUFFIX_ENTRIES as i64).contains(count))
         .ok_or_else(|| unavailable("The sealed source tail exceeds the transfer replay bound"))?;
