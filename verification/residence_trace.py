@@ -132,11 +132,16 @@ def verify_native(events, *, verify_catalog_history=True):
                         "ordered confirmation has no selected recovery closure")
             elif kind == "publish-checkpoint":
                 require(digest(event["root"]) and digest(event["manifest"]), "checkpoint lacks its root or manifest digest")
-            elif kind in {"admit-recovery", "finish-recovery"}:
+            elif kind in {"admit-recovery", "finish-recovery", "read-retained-payload"}:
                 key = scope(event, ("installation", "stream", "epoch"))
                 if kind == "admit-recovery":
-                    require(event["first_required"] >= 0 and holds.setdefault(event["hold"], key) == key,
+                    require(0 <= event["first_required"] <= event["through"] and holds.setdefault(event["hold"], key) == key,
                             "invalid replay hold")
+                elif kind == "read-retained-payload":
+                    require(event["position"] >= 0 and event["key"].startswith(event["residence"] + "/"),
+                            "retained payload crosses its read residence")
+                    if event["hold"] in holds:
+                        require(holds[event["hold"]] == key, "payload read names another replay scope")
                 elif event["hold"] in holds:
                     require(holds[event["hold"]] == key, "release names another replay scope")
             elif kind == "attempt-outcome":
@@ -167,7 +172,7 @@ def verify_joined(captures):
     for events in captures:
         verify_native(events, verify_catalog_history=False)
     events = [event for capture in captures for event in capture]
-    published, catalogs, installed_trims, dependencies = {}, {}, {}, {}
+    published, catalogs, installed_trims, dependencies, replay_holds, exclusions = {}, {}, {}, {}, {}, {}
     for event in events:
         kind = event["event"]
         if kind == "publish-checkpoint":
@@ -179,11 +184,17 @@ def verify_joined(captures):
             key = (*replica_scope(event), event["through"], tuple(event["anchor"]), frozenset(event["journals"]))
             revision = event["settled_revision"]
             installed_trims[key] = min(revision, installed_trims.get(key, revision))
+        elif kind == "admit-recovery":
+            key = (*replica_scope(event), event["residence"], event["hold"])
+            hold = scope(event, ("first_required", "through", "revision"))
+            require(replay_holds.setdefault(key, hold) == hold, "replay hold changed its admitted range")
         elif kind == "retirement-recovery-dependency":
             key = physical_retirement(event)
             dependency = (*replica_scope(event), event["position"], tuple(event["frame"]))
             require(dependencies.setdefault(key, dependency) == dependency,
                     "retirement changed its certified replica dependency")
+            publication = (*replica_scope(event), event["key"], key[-1])
+            exclusions[publication] = min(event["revision"], exclusions.get(publication, event["revision"]))
     verify_catalogs(catalogs)
     joined = 0
     for event in events:
@@ -199,6 +210,18 @@ def verify_joined(captures):
             trim = (*replica_scope(event), event["trim_through"], tuple(event["anchor"]), frozenset(event["journals"]))
             require(trim in installed_trims and installed_trims[trim] <= event["revision"],
                     "dependent retirement lacks the exact installed recovery exclusion")
+            joined += 1
+            continue
+        elif kind == "read-retained-payload":
+            hold = (*replica_scope(event), event["residence"], event["hold"])
+            require(hold in replay_holds, "payload read lacks its exact replay hold")
+            first, through, revision = replay_holds[hold]
+            require(first <= event["position"] <= through and revision <= event["revision"],
+                    "payload read is outside its admitted replay interval")
+            if event["publication"] is not None:
+                publication = (*replica_scope(event), event["key"], json.dumps(event["publication"], sort_keys=True))
+                require(publication not in exclusions or event["revision"] < exclusions[publication],
+                        "payload read follows its installed recovery exclusion")
             joined += 1
             continue
         elif kind == "remove-version" and "/oversized/" in event["key"]:

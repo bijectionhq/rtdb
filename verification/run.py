@@ -5030,6 +5030,45 @@ def verify_native_recovery_trace(args, source):
         raise ValueError(f"{label}: native residence validator accepted another journal epoch")
 
     validate_recovery_revisions(args, label, trace)
+    verify_native_payload_replay(args, source)
+
+
+def verify_native_payload_replay(args, source):
+    import copy
+
+    label = "rust-retained-payload-replay"
+    fixture = "recovery_holds::tests::a_payload_read_spends_its_directory_replay_hold"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", fixture, "--", "--exact"]
+    with tempfile.TemporaryDirectory(prefix="rtdb-retained-payload-replay-") as temporary:
+        path = Path(temporary) / "residence.jsonl"
+        env = os.environ | {
+            "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_TEST_DEBUG": "0",
+            "CARGO_INCREMENTAL": "0",
+            "RTDB_RESIDENCE_TRACE_PATH": str(path),
+        }
+        result = run_case(command, source / "rust", args.evidence, label, env)
+        if result.returncode or f"{fixture} ... ok" not in result.stdout:
+            raise ValueError(f"{label}: the native broker did not produce its payload trace")
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        shutil.copyfile(path, args.evidence / f"{label}.jsonl")
+    read = next(event for event in events if event["event"] == "read-retained-payload")
+    directory = [event for event in events if event["event"] != "read-retained-payload"]
+    verify_joined([directory, [read]])
+    for field, changed, expected in (
+        ("hold", "another-ticket", "payload read lacks its exact replay hold"),
+        ("position", read["position"] + 1, "payload read is outside its admitted replay interval"),
+    ):
+        corrupted = copy.deepcopy(read)
+        corrupted[field] = changed
+        try:
+            verify_joined([directory, [corrupted]])
+        except ValueError as error:
+            if expected not in str(error):
+                raise
+        else:
+            raise ValueError(f"{label}: accepted a substituted {field}")
 
 
 def capture_native_recovery(args, source, label, trace, observations):

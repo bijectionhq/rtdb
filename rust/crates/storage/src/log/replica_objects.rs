@@ -83,6 +83,8 @@ impl ReplicaObjectCustody {
     }
 
     pub fn position(&self) -> LogOffset { self.position }
+    pub fn object(&self) -> &ObjectKey { &self.key }
+    pub fn publication(&self) -> Option<&PhysicalObjectVersion> { self.publication.as_ref() }
 
     pub async fn redeem(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
         let view = HeldView::recovery(Arc::new(self.clone()));

@@ -175,7 +175,8 @@ impl RecoveryAdmission {
             if let Cas::Applied(stored) = self.holds.directory.replace_deployment(record, version).await.map_err(|error| self.directory_error(error))? {
                 crate::residence_trace::record("admit-recovery", || serde_json::json!({
                     "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation, "revision": stored.version,
-                    "stream": self.stream, "epoch": self.log_epoch, "hold": id, "first_required": first_required, "through": through.0,
+                    "stream": self.stream, "epoch": self.log_epoch, "hold": id, "residence": stored.storage_prefix(),
+                    "first_required": first_required, "through": through.0,
                 }));
                 return Ok(stored.storage_prefix());
             }
@@ -224,7 +225,7 @@ impl ReplicaPayloadBroker for DirectoryPayloadBroker {
         let material = owner.holds.keys.existing(&key_id).await.map_err(|error| owner.directory_error(error))?;
         let root = crate::archive::checkpoint_storage_root().map_err(|error| owner.directory_error(error))?;
         let prefix = format!("{}/{root}", self.residence);
-        let files = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix));
+        let files = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix.clone()));
         let marker = ObjectKey::new(crate::store::ROOT_MARKER)?;
         if files.get_fresh_exact(&marker, record.id.len()).await?.as_ref() != record.id.as_bytes() {
             return Err(closed());
@@ -237,17 +238,78 @@ impl ReplicaPayloadBroker for DirectoryPayloadBroker {
                 && stage.source_log_epoch == record.log_epoch
                 && position > stage.checkpoint.boundary && position <= terminal.replica_through
         });
-        if detached {
-            custody.read_transferred_copy(&store, memory).await
+        let payload = if detached {
+            custody.read_transferred_copy(&store, memory).await?
         } else {
-            custody.read_from(&store, memory).await
-        }
+            custody.read_from(&store, memory).await?
+        };
+        crate::residence_trace::record("read-retained-payload", || serde_json::json!({
+            "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation,
+            "revision": record.version, "stream": owner.stream, "epoch": record.log_epoch,
+            "hold": self.ticket, "residence": self.residence, "position": position,
+            "key": format!("{prefix}/{}", custody.object()),
+            "publication": if detached { None } else { custody.publication() },
+        }));
+        Ok(payload)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_payload_read_spends_its_directory_replay_hold() {
+        use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto::NoOp};
+        use rtdb_types::{BlockIndex, Term, TermSequence};
+
+        let root = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.lifecycle = Lifecycle::Live;
+        let record = directory.create_deployment(record).await.unwrap();
+        let holds = Arc::new(RecoveryHolds {
+            directory: directory.clone(),
+            keys: Arc::new(crate::keys::LocalKeyService::new(vault.path()).unwrap()),
+            custody: ReplayCustody::Local,
+            storage: CellStorage::Local { root: root.path().to_owned() },
+            tasks: TaskTracker::new(),
+        });
+        let admission = RecoveryAdmission {
+            holds: holds.clone(), deployment: record.id.clone(), stream: record.stream("replica"),
+            log_epoch: record.log_epoch, writer_epoch: record.epoch,
+        };
+        let io = IoRegion::new();
+        let bucket = holds.storage.bucket(io.clone()).await.unwrap();
+        let root = crate::archive::checkpoint_storage_root().unwrap();
+        let files = Arc::new(crate::reference::PrefixedStore::new(bucket, format!("{}/{root}", record.storage_prefix())));
+        files.put(&ObjectKey::new(crate::store::ROOT_MARKER).unwrap(), Bytes::copy_from_slice(record.id.as_bytes())).await.unwrap();
+        let media_key = holds.keys.key(&record.key_id()).await.unwrap();
+        let store = crate::store::EncryptingStore::new(files, &media_key).unwrap();
+        let envelope = ReplicaEnvelope {
+            term: Term(1), term_sequence: Some(TermSequence(0)),
+            message: ReplicaBody::NoOp(NoOp::default()),
+        };
+        let payload = Bytes::from(envelope.encode());
+        let epoch = StorageEpoch(0);
+        let frame = envelope.offloaded(CURRENT_STORAGE_VERSION, epoch, BlockIndex(0), Uuid::new_v4().to_string(), &payload);
+        let name = ObjectKey::new(frame.oversized_payload(CURRENT_STORAGE_VERSION, epoch).unwrap().unwrap()).unwrap();
+        store.put(&name, payload.clone()).await.unwrap();
+        let hold = Arc::new(admission.hold(LogOffset(0), LogOffset(2)).await.unwrap().unwrap());
+        let proof = ReplicaObjectCustody::from_brokered_delivery(
+            hold.broker.clone(), LogOffset(2), &frame.encode(), CURRENT_STORAGE_VERSION, epoch, hold.clone(),
+        ).unwrap().unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        assert_eq!(proof.redeem(&store, &memory).await.unwrap().as_ref(), payload.as_ref());
+
+        crate::store::release_region(directory.as_ref(), &record.id, hold.broker.ticket, false).await.unwrap();
+        assert!(matches!(proof.redeem(&store, &memory).await, Err(Error::Closed(_))));
+        drop((proof, hold));
+        holds.tasks.close();
+        holds.tasks.wait().await;
+        io.close_and_wait().await;
+    }
 
     #[tokio::test]
     async fn a_delivered_reference_keeps_its_replay_hold_through_provider_drain() {
