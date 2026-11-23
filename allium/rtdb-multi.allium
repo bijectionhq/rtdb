@@ -1364,6 +1364,8 @@ rule ConsumeIntake {
 -- That Proposal has no initial local overlay. Root writes, when present, advance the Root head in the same transaction and leave the Proposal parent at the original publication.
 -- A hosted bounded-period Proposal assertion carries the original complete-entity point at its finite valid start and a local timeline frontier for the same world relation and pin.
 -- The ordered resolver admits one assertion or tombstone per complete entity key under the inherited bounded-period schema and settles its existing hosted controls with the overlay.
+-- A reviewed Proposal landing checks the exact Root and Proposal points, writes the Root effects, and retires the Proposal in one ordered transaction.
+-- The same order advances the Root head and the public table frontiers carried by the placed writer, and settles the replay head, landing receipt, and proof locator.
 -- The placed owner may select the existing certified archive from its Directory and reopens it to compare the held transaction or its exact application publication before ordering.
 -- A fork of the held application publication compares the same Root head in the ordered source transaction.
 -- Archive admission precedes ordering, and the registration, Root head, writes, control replacements and one immutable attempt marker become visible at one transaction key.

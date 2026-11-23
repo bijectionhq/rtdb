@@ -667,6 +667,58 @@ mod retained_release_tests {
         assert_eq!(hosted_proposal_overlay(&operations), None);
         Ok(())
     }
+
+    #[test]
+    fn proposal_landing_orders_frontiers_with_the_fact_and_both_receipt_locators() -> Result<()> {
+        let scope = PlacedAttemptScope::new("proposal-landing", 1)?;
+        let world = Iid([1; 16]);
+        let pin = Iid([2; 16]);
+        let relation = OwnedRelation::new("facts")?;
+        let local = relation.in_world(world)?;
+        let admission = OwnedRelation::new("bj_fact_root_admission")?;
+        let publications = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let row = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let id = EntityId::String("key".into());
+        let control = |slot, expected| {
+            HostedControlWrite::new(admission.clone(), scope, expected, row(slot)).map(TxOp::HostedControl)
+        };
+        let frontier = |id| Ok::<_, Anomaly>(TxOp::OwnedReplaceDocs {
+            relation: publications.clone(), documents: crate::Documents::new(vec![row(id)], &memory)?,
+            valid_from: Some(Timestamp::MIN), valid_to: None,
+        });
+        let mut operations = [
+            TxOp::HostedControl(HostedControlWrite::check(admission.clone(), scope, Some(Timestamp(1)), row("installed"))?),
+            control(&format!("root_proposal_head:{}", "a".repeat(64)), Some(Timestamp(2)))?,
+            control(&format!("root_proposal_landing:{}", "b".repeat(64)), None)?,
+            TxOp::OwnedCheck { relation: relation.clone(), id: id.clone(), valid_at: Timestamp(4), expected: None },
+            TxOp::OwnedInsertDocs {
+                relation, documents: crate::Documents::new(vec![row("key")], &memory)?,
+                valid_from: None, valid_to: None,
+            },
+            TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
+            TxOp::OwnedCheck { relation: local, id, valid_at: Timestamp(4), expected: Some(Timestamp(3)) },
+            TxOp::OwnedPublishWorld {
+                world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                expected: Some(Timestamp(3)), advance_to: None, drop_world: true,
+                settlement_pin: None, delete_root: None, land_root: Some(pin),
+            },
+        ].into_iter().map(Operation::Public).collect::<Vec<_>>();
+        assert_eq!(hosted_proposal_land(&operations), None);
+        operations.push(Operation::Public(control(&format!("root_proposal_landing_proof:{}", "c".repeat(64)), None)?));
+
+        let marker = frontier("public_fact_head:AAAAAAAAAAAAAAAAAAAAAA")?;
+        assert!(is_proposal_landing_frontier(&marker));
+        operations.push(Operation::Public(marker));
+        assert_eq!(hosted_proposal_land(&operations), Some((world, pin, false)));
+
+        operations.push(Operation::Public(frontier("public_fact_head:BAAAAAAAAAAAAAAAAAAAAA")?));
+        assert_eq!(hosted_proposal_land(&operations), None);
+        operations.pop();
+        operations.push(Operation::Public(frontier("head")?));
+        assert_eq!(hosted_proposal_land(&operations), None);
+        Ok(())
+    }
 }
 
 /// Proposal content settlements may also replace their exact generation row.
@@ -772,21 +824,34 @@ pub(crate) fn proposal_overlay_write(
     })
 }
 
-/// A landing settles its existing owner and one new immutable receipt.
+/// A landing settles its replay head, receipt, and proof locator together.
 pub fn proposal_land_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
     let mut checks = 0;
-    let mut replacements = 0;
-    let mut receipts = 0;
+    let mut head = false;
+    let mut receipt = false;
+    let mut proof = false;
     for control in controls {
         if control.is_check() {
             checks += 1;
-        } else if control.expected().is_some() {
-            replacements += 1;
-        } else {
-            receipts += 1;
+            continue;
         }
+        let EntityId::String(id) = control.id() else { return false; };
+        if control.name() != "bj_fact_root_admission" { return false; }
+        let slot = match control.expected() {
+            Some(_) if landing_control_id(id, "root_proposal_head:") => &mut head,
+            None if landing_control_id(id, "root_proposal_landing:") => &mut receipt,
+            None if landing_control_id(id, "root_proposal_landing_proof:") => &mut proof,
+            _ => return false,
+        };
+        if std::mem::replace(slot, true) { return false; }
     }
-    checks > 0 && replacements == 1 && receipts == 1
+    checks > 0 && head && receipt && proof
+}
+
+fn landing_control_id(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix).is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Last-holder closure replaces the exact census, owner, and quota, and writes a receipt.
@@ -808,6 +873,41 @@ pub fn proposal_close_controls<'a>(controls: impl IntoIterator<Item = &'a Hosted
 
 pub const MAX_PROPOSAL_LAND_ROWS: usize = 16;
 
+pub(crate) fn public_fact_frontier(id: &str) -> bool {
+    let Some(encoded) = id.strip_prefix("public_fact_head:") else { return false; };
+    let Some((tail, digits)) = encoded.as_bytes().split_last() else { return false; };
+    encoded.len() == 22
+        && matches!(*tail, b'A' | b'Q' | b'g' | b'w')
+        && digits.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+}
+
+fn proposal_frontier_rows(
+    relation: &OwnedRelation, documents: &crate::Documents, from: Option<Timestamp>, to: Option<Timestamp>,
+) -> bool {
+    relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+        && from == Some(Timestamp::MIN) && to.is_none_or(|to| to == Timestamp::MAX)
+        && documents.has_exact_presence()
+        && (1..=MAX_PROPOSAL_LAND_ROWS).contains(&documents.rows().len())
+        && documents.rows().iter().all(|row| {
+            row.len() == 1 && matches!(row.get("_id"), Some(Value::Utf8(id)) if public_fact_frontier(id))
+        })
+}
+
+pub fn is_proposal_landing_frontier(op: &crate::TxOp) -> bool {
+    matches!(op, crate::TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
+        if proposal_frontier_rows(relation, documents, *valid_from, *valid_to))
+}
+
+pub(crate) fn proposal_landing_frontier_rows(op: &crate::source::Operation) -> Option<&crate::Documents> {
+    use crate::{TxOp, source::Operation};
+    match op {
+        Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
+        | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. }
+            if proposal_frontier_rows(relation, documents, *valid_from, *valid_to) => Some(documents),
+        _ => None,
+    }
+}
+
 /// One exact Proposal terminal effect and its matching witnessed Root writes.
 pub(crate) fn hosted_proposal_land(
     operations: &[crate::source::Operation],
@@ -818,7 +918,15 @@ pub(crate) fn hosted_proposal_land(
     let mut close = false;
     let mut insert = false;
     let mut controls = Vec::new();
+    let mut frontiers = std::collections::BTreeSet::new();
     for op in operations {
+        if let Some(documents) = proposal_landing_frontier_rows(op) {
+            for row in documents.rows() {
+                let Value::Utf8(id) = row.get("_id")? else { return None; };
+                if !frontiers.insert(id) { return None; }
+            }
+            continue;
+        }
         match op {
             Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }
@@ -854,7 +962,9 @@ pub(crate) fn hosted_proposal_land(
         }
     }
     let (world, pin, expected_clock) = landing?;
-    if replacements.is_empty() { return None; }
+    if replacements.is_empty() || frontiers.len() > replacements.len() || close && !frontiers.is_empty() {
+        return None;
+    }
     if operations.iter().filter_map(Operation::owned_relation)
         .any(|relation| relation.is_world_catalog() || relation.world().is_some_and(|other| other != world))
     {

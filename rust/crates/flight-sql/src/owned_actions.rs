@@ -2335,6 +2335,8 @@ impl Service {
             match &operation {
                 TxOp::OwnedCheck { relation, .. } if relation.world().is_none() && !relation.is_world_catalog() =>
                     root.checks.push(operation),
+                _ if proposal_land && rtdb_tx::is_proposal_landing_frontier(&operation) =>
+                    root_writes.push(operation),
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                 | TxOp::OwnedDelete { relation, .. } if root_attempt.is_some() && relation.is_root_data() =>
                     root_writes.push(operation),
@@ -2376,7 +2378,7 @@ impl Service {
             return Err(invalid("A Proposal holder close requires checked custody settlement"));
         }
         if proposal_land && !rtdb_tx::proposal_land_controls(&controls) {
-            return Err(invalid("A Proposal landing requires an owner replacement and new receipt"));
+            return Err(invalid("A Proposal landing requires its replay head, receipt and proof"));
         }
         if delete_root && !rtdb_tx::retained_delete_controls(&controls) {
             return Err(invalid("A Root delete with retained drop requires checked owner settlement"));

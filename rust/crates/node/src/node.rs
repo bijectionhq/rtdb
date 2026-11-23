@@ -2194,13 +2194,15 @@ impl NativeSession {
                 sections[0].1.expected_clock.is_none()
                     || root.publication.as_ref().is_none_or(|root| {
                         if root.attempt != sections[0].1.attempt { return true; }
-                        if matches!(&root.writes[..], [TxOp::OwnedInsertDocs {
+                        let mut facts = root.writes.iter().filter(|op| !rtdb_tx::is_proposal_landing_frontier(op));
+                        if matches!(facts.clone().next(), Some(TxOp::OwnedInsertDocs {
                             relation, documents, valid_from: None, valid_to: None,
-                        }] if relation.is_root_data() && documents.rows().len() == 1) {
+                        }) if relation.is_root_data() && documents.rows().len() == 1)
+                            && facts.clone().count() == 1 {
                             return false;
                         }
                         let mut rows = 0usize;
-                        root.writes.iter().any(|op| match op {
+                        facts.any(|op| match op {
                             TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }
                                 if relation.is_root_data() && !documents.rows().is_empty() => {
                                     rows = rows.saturating_add(documents.rows().len());

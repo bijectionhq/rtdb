@@ -80,7 +80,13 @@ impl Kind {
 
 pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
     let mut selected = BTreeMap::<Iid, BTreeSet<&str>>::new();
+    let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
     for operation in operations {
+        if matches!(proposal_land, Some((_, _, false)))
+            && crate::hosted_control::proposal_landing_frontier_rows(operation).is_some()
+        {
+            continue;
+        }
         match operation {
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
             | Operation::OwnedWriteIids { relation, documents, .. } if !documents.rows().is_empty() => {
@@ -93,7 +99,6 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         }
     }
     let retained_release = crate::hosted_control::retained_release_world(operations);
-    let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
     let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
     operations.iter().filter_map(|operation| match operation {
         Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, root, .. }) => Some(
@@ -227,6 +232,7 @@ pub(super) fn verify(
         expected_data.insert(OWNED_ROOT_PUBLICATION_RELATION);
     }
     let mut root_head = false;
+    let mut publication_frontiers = BTreeSet::new();
     let mut landed_rows = 0usize;
     let mut data = BTreeSet::new();
     let mut journals = BTreeSet::new();
@@ -323,14 +329,22 @@ pub(super) fn verify(
             }
             if is_data {
                 if relation == OWNED_ROOT_PUBLICATION_RELATION {
-                    if !has_root || batch.len() != 1 { return Err(mismatch()); }
-                    records(batch, key, memory, |row| {
-                        if row.len() != 1 || !matches!(row.get("_id"), Some(Value::Utf8(id)) if id == "head") {
+                    if !has_root { return Err(mismatch()); }
+                    let limit = if landed { crate::MAX_PROPOSAL_LAND_ROWS + 1 } else { 1 };
+                    records_with_limit(batch, key, memory, limit, |row| {
+                        let Some(Value::Utf8(id)) = row.get("_id") else { return Err(mismatch()); };
+                        if row.len() != 1 {
+                            return Err(mismatch());
+                        }
+                        if id == "head" && !root_head {
+                            root_head = true;
+                        } else if !landed || !crate::hosted_control::public_fact_frontier(id)
+                            || !publication_frontiers.insert(id.clone())
+                        {
                             return Err(mismatch());
                         }
                         Ok(())
                     })?;
-                    root_head = true;
                 }
                 data.insert(relation);
             } else if table.is_owned_change_journal() {
@@ -350,7 +364,8 @@ pub(super) fn verify(
             event_headers(batch, key, allows_delete && !root_holder_replace && !landed)?;
         }
     }
-    if (landed && landed_rows == 0) || !attempts.is_empty() || root_head != has_root || data != expected_data
+    if (landed && (landed_rows == 0 || publication_frontiers.len() > landed_rows))
+        || !attempts.is_empty() || root_head != has_root || data != expected_data
         || !journals.remove(OWNED_ATTEMPT_RELATION) || journals != expected_data
         || worlds.iter().any(|(world, kind)| match kind {
             Kind::Root | Kind::ProposalSettlement => false,
@@ -390,9 +405,16 @@ fn event_headers(batch: &IndexBatch, key: TransactionKey, allows_delete: bool) -
 
 fn records(
     batch: &IndexBatch, key: TransactionKey, memory: &Arc<MemoryBudget>,
+    inspect: impl FnMut(&StructFields<Value>) -> Result<()>,
+) -> Result<()> {
+    records_with_limit(batch, key, memory, 9, inspect)
+}
+
+fn records_with_limit(
+    batch: &IndexBatch, key: TransactionKey, memory: &Arc<MemoryBudget>, maximum: usize,
     mut inspect: impl FnMut(&StructFields<Value>) -> Result<()>,
 ) -> Result<()> {
-    if batch.len() > 9 { return Err(mismatch()); }
+    if batch.len() > maximum { return Err(mismatch()); }
     let bound = batch.arrow().get_array_memory_size().checked_mul(4)
         .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(mismatch)?;
     let _decode = memory.reserve(bound)?;

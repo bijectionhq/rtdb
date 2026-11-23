@@ -103,8 +103,8 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved Proposal close lacks its bounded custody and receipt effects")),
                     worlds::HostedEffects::ProposalLanding if controls.iter()
-                        .filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>() != 2 =>
-                        return Err(invalid("Resolved Proposal landing requires its two owner rows")),
+                        .filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>() != 3 =>
+                        return Err(invalid("Resolved Proposal landing requires its replay head, receipt and proof")),
                     worlds::HostedEffects::RequiredReplacements if controls.is_empty() =>
                         return Err(invalid("Resolved control-only retained fork has no hosted replacements")),
                     worlds::HostedEffects::RetainedRelease if !(1..=2).contains(
