@@ -291,7 +291,7 @@ impl TxResolver {
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
         let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
-            && context.owned_witness_scope.is_some() && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
+            && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
         let placement = if selected_time.is_ok() {
             request.place_owned_periods(key.system_time, placed_periods)
         } else {
