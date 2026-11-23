@@ -239,11 +239,14 @@ Active files remain pending when the journal lacks complete root and tail refere
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
 |Catalog holds bind pool residence and physical cut through queries, compaction and stored artefact builds.
 Checkpoint discovery at startup and coordinated Classic checkpoint loads carry their existing recovery holds into provider drain.
-Revocable stores opt out of shared plaintext and decoded-page caching. Unit-key-backed cursors require bounded delivery grants, including PostgreSQL portals, COPY and Flight statement answers.
+Local, remote, disk-cache and S3 inventory reads bind the opened provider and exact target at I/O admission.
+PostgreSQL rows and COPY, Flight statements and materialized Flight actions carry delivery grants for the originating unit, deployment or archive keys.
+Local vault locks retain exact custody through delivery, and remote key providers drain bounded grants after fencing.
+Held-world replies carry the original replay dependencies across the archive worker.
 Hosted PostgreSQL feedback follows the exact published recovery root.
 The bounded replay includes quorum publication before acknowledgement and recovery exclusion before deletion.
-Native replay joins checkpoint publication and trim to dependent version removal, and checks observed catalog reachability against exact retirement candidates.
-Universal low-level coverage, archive and deployment-key delivery, the production T1 certificate-to-answer and complete T2 recovery-exclusion handoffs, and execution evidence remain open.
+Native replay joins checkpoint publication and trim to dependent version removal, checks observed catalog reachability, and correlates installed receipt removal with the exact journal fence.
+An independent transport-time bound for remote grants, complete T1 and T2 handoff replay, and execution evidence remain open.
 |===
 
 == Placed serving and search
