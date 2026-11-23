@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ArchivedObject, CellStorage, Cipher, KeyService, PrefixedStore, archive_witness,
+    ArchiveKey, ArchivedObject, CellStorage, KeyService, PrefixedStore, archive_witness,
     capture_receipt, inconsistent, key, read, read_object, replica_suffix, require_capture_open, stage,
     read_archive_lifetime_floors, unavailable, verified_archive,
 };
@@ -273,7 +273,7 @@ where
                         "The archive belongs to another captured checkpoint",
                     ));
                 }
-                let (manifest, material) =
+                let (manifest, cipher) =
                     verified_archive(bucket.clone(), &capture, selected.manifest, keys).await?;
                 let store: Arc<dyn ObjectStore> = Arc::new(CapturedObjects {
                     files: PrefixedStore::new(
@@ -288,7 +288,7 @@ where
                         .into_iter()
                         .map(|object| Ok((key(&object.name)?, object)))
                         .collect::<Result<_>>()?,
-                    cipher: Cipher::new(&material)?,
+                    cipher: Arc::clone(&cipher),
                 });
                 let memory = resources.node.query.query_memory(resources.memory);
                 let storage = Arc::new(BufferPool::with_metadata_budget(
@@ -347,7 +347,7 @@ where
                 match (selected.suffix, suffix) {
                     (Some(suffix), Some(pin)) => {
                         replica_suffix::apply_archived(
-                            bucket.as_ref(), selected.deployment, suffix, record.stream("replica"), &pin, &material,
+                            bucket.as_ref(), selected.deployment, suffix, record.stream("replica"), &pin, Arc::clone(&cipher),
                             &mut recovered, &memory,
                         ).await?;
                     }
@@ -390,10 +390,10 @@ where
 }
 
 /// The accepted inventory is the only source of bytes for a world read.
-struct CapturedObjects {
-    files: PrefixedStore,
-    objects: BTreeMap<ObjectKey, ArchivedObject>,
-    cipher: Cipher,
+pub(super) struct CapturedObjects {
+    pub(super) files: PrefixedStore,
+    pub(super) objects: BTreeMap<ObjectKey, ArchivedObject>,
+    pub(super) cipher: Arc<dyn ArchiveKey>,
 }
 
 impl CapturedObjects {
@@ -431,7 +431,7 @@ impl ObjectStore for CapturedObjects {
 
     async fn get(&self, name: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         let sealed = read_object(&self.files, name, self.object(name)?).await?;
-        self.cipher.open(name.as_str(), &sealed)
+        self.cipher.open(name.as_str(), sealed).await
     }
 
     async fn get_range(&self, name: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
@@ -488,8 +488,8 @@ mod tests {
         let material = [9; crate::keys::KEY_BYTES];
         let bytes = Bytes::from_static(b"checkpoint object");
         let files = PrefixedStore::new(archive.clone(), "world/objects");
-        let cipher = Cipher::new(&material)?;
-        let sealed = cipher.seal_deterministic(name.as_str(), &bytes)?;
+        let cipher = crate::keys::legacy_archive_key(&material)?;
+        let sealed = cipher.seal(name.as_str(), bytes.clone()).await?;
         files.put(&name, sealed.clone()).await?;
         files.put(&other, sealed.clone()).await?;
         let object = ArchivedObject {
@@ -514,7 +514,7 @@ mod tests {
         let reopened = CapturedObjects {
             files: PrefixedStore::new(archive, "world/objects"),
             objects: store.objects,
-            cipher: Cipher::new(&material)?,
+            cipher: crate::keys::legacy_archive_key(&material)?,
         };
         assert_eq!(reopened.get(&name).await?, bytes);
         Ok(())

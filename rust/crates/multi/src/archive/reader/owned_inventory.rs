@@ -343,7 +343,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 let last = next - 1;
                 // Preserve the source transaction IDs and term sequences under
                 // the target's own seal.
-                artifact.reseal(&scope, &mut entries)?;
+                artifact.reseal(&scope, &mut entries).await?;
                 rtdb_logkeeper::bootstrap_committed_page(
                     &stream, epoch, checkpoint, LogOffset(first), &entries, last == through,
                 ).await?;

@@ -61,7 +61,7 @@ use crate::{
     admin::{administration_stream, await_storage_drain, update_installation},
     cipher::Cipher,
     deployment::CellStorage,
-    keys::KeyService,
+    keys::{ArchiveKey, KeyService},
     packing::PackDiscovery,
     reference::{PrefixedStore, key},
     store::{
@@ -85,7 +85,7 @@ pub(crate) use writable_world::retain_replayed_checkpoint_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::{WorldFact, WorldPoint};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
-pub(crate) use retirement::{capture_retirement_receipt, prepare_capture_retirement, finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, retire_world_suffix};
+pub(crate) use retirement::{capture_retirement_receipt, commit_capture_revocation, prepare_capture_retirement, finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, retire_world_suffix};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, StageSelector, inspect_staged_owned_relations, stream_staged_owned_event_files, tunnel_staged_checkpoint};
 
@@ -165,7 +165,7 @@ async fn observe_archive_object(
 pub(crate) struct ArchivedCheckpoint {
     files: PrefixedStore,
     objects: BTreeMap<ObjectKey, ArchivedObject>,
-    archive_cipher: Cipher,
+    archive_cipher: Arc<dyn ArchiveKey>,
     serving_cipher: Cipher,
 }
 
@@ -216,7 +216,7 @@ impl ArchivedCheckpoint {
         Ok(Some(Self {
             files: PrefixedStore::new(bucket, format!("{prefix}/objects")),
             objects,
-            archive_cipher: Cipher::new(&archive_key(keys, &capture.point).await?)?,
+            archive_cipher: archive_key(keys, &capture.point).await?,
             serving_cipher: Cipher::new(&keys.existing_key(&record.key_id()).await?
                 .ok_or_else(|| unavailable("The current installation key is unavailable"))?)?,
         }))
@@ -224,7 +224,7 @@ impl ArchivedCheckpoint {
 
     async fn read_plaintext(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
         let ciphertext = read_object(&self.files, name, object).await?;
-        self.archive_cipher.open(name.as_str(), &ciphertext)
+        self.archive_cipher.open(name.as_str(), ciphertext).await
     }
 
     async fn seal_for_serving(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
@@ -368,7 +368,7 @@ impl ObjectStore for CheckpointStore {
             return Err(Error::ConflictingObject(key.to_string()));
         }
         let observed = observe_archive_object(&self.archive.files, key, object).await?;
-        let plaintext = self.archive.archive_cipher.open(key.as_str(), &observed.value)?;
+        let plaintext = self.archive.archive_cipher.open(key.as_str(), observed.value).await?;
         let value = self.archive.serving_cipher.seal_deterministic(key.as_str(), &plaintext)?;
         Ok(ObjectObservation { value, version: observed.version })
     }
@@ -511,11 +511,8 @@ impl Capture {
         &self,
         bucket: Arc<dyn ObjectStore>,
         prefix: &str,
-        material: &[u8; crate::keys::KEY_BYTES],
+        cipher: &Arc<dyn ArchiveKey>,
     ) -> Result<()> {
-        let files = Arc::new(PrefixedStore::new(bucket, format!("{prefix}/objects")));
-        let plaintext = EncryptingStore::new(files.clone(), material)?;
-        let closure = checkpoint_objects(&plaintext, &self.point, self.format).await?;
         let mut bytes = 0u64;
         let objects = self.objects.iter()
             .map(|object| {
@@ -525,16 +522,20 @@ impl Capture {
                 Ok((key(&object.name)?, object))
             })
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let plaintext = read_world::CapturedObjects {
+            files: PrefixedStore::new(bucket, format!("{prefix}/objects")),
+            objects: objects.iter().map(|(name, object)| (name.clone(), (*object).clone())).collect(),
+            cipher: Arc::clone(cipher),
+        };
+        let closure = checkpoint_objects(&plaintext, &self.point, self.format).await?;
         if objects.len() != self.objects.len() || objects.keys().ne(closure.keys()) {
             return Err(inconsistent(
                 "The archive object list differs from the checkpoint closure",
             ));
         }
-        let cipher = Cipher::new(material)?;
-        for (name, object) in objects {
-            let ciphertext = read_object(files.as_ref(), &name, object).await?;
-            let bytes = cipher.open(name.as_str(), &ciphertext)?;
-            require_bound_metadata(closure[&name], &bytes)?;
+        for name in objects.keys() {
+            let bytes = plaintext.get(name).await?;
+            require_bound_metadata(closure[name], &bytes)?;
         }
         Ok(())
     }
@@ -697,7 +698,7 @@ async fn verified_archive(
     point: &CapturePoint,
     manifest: &str,
     keys: &dyn KeyService,
-) -> Result<(Capture, [u8; crate::keys::KEY_BYTES])> {
+) -> Result<(Capture, Arc<dyn ArchiveKey>)> {
     let prefix = format!("checkpoint-captures/{}/{}", point.deployment, point.operation);
     let metadata = PrefixedStore::new(bucket.clone(), &prefix);
     let capture = read::<Capture>(&metadata, &key("capture.json")?).await?
@@ -708,18 +709,17 @@ async fn verified_archive(
     {
         return Err(inconsistent("The archive differs from its accepted capture"));
     }
-    let material = archive_key(keys, point).await?;
-    capture.verify(bucket, &prefix, &material).await?;
-    Ok((capture, material))
+    let cipher = archive_key(keys, point).await?;
+    capture.verify(bucket, &prefix, &cipher).await?;
+    Ok((capture, cipher))
 }
 
 fn archive_key_id(point: &CapturePoint) -> String {
     format!("checkpoint-{}-{}-{}", point.deployment, point.incarnation, point.operation)
 }
 
-async fn archive_key(keys: &dyn KeyService, point: &CapturePoint) -> Result<[u8; crate::keys::KEY_BYTES]> {
-    keys.existing_key(&archive_key_id(point)).await?
-        .ok_or_else(|| unavailable("The checkpoint archive key is unavailable"))
+async fn archive_key(keys: &dyn KeyService, point: &CapturePoint) -> Result<Arc<dyn ArchiveKey>> {
+    keys.archive_key(&archive_key_id(point), false).await
 }
 
 async fn require_archive_key_authority(keys: &dyn KeyService, registered: &CheckpointCapture) -> Result<()> {
@@ -1255,8 +1255,7 @@ async fn capture_registered(
 
     let serving_material = keys.existing_key(&record.key_id()).await?
         .ok_or_else(|| unavailable("The source key is unavailable"))?;
-    let archive_material = keys.key(&archive_key_id(&point)).await?;
-    let archive_cipher = Cipher::new(&archive_material)?;
+    let archive_cipher = keys.archive_key(&archive_key_id(&point), true).await?;
     let recovery = ArchivedCheckpoint::load(record, keys, region, io.clone()).await?;
     // A local sweep and this source read share the maintenance witness. The
     // provider keeps its clone during a read even if this copy is cancelled.
@@ -1286,7 +1285,7 @@ async fn capture_registered(
     for source in sources {
         let content = source.read(&plaintext).await?;
         let object = source.name;
-        let ciphertext = archive_cipher.seal_deterministic(object.as_str(), &content)?;
+        let ciphertext = archive_cipher.seal(object.as_str(), content).await?;
         let ciphertext_size = ciphertext.len() as u64;
         let digest = digest(&ciphertext);
         archive
@@ -1305,7 +1304,7 @@ async fn capture_registered(
             "Checkpoint exceeds the archive metadata budget",
         ));
     }
-    capture.verify(archive_bucket, &prefix, &archive_material).await?;
+    capture.verify(archive_bucket, &prefix, &archive_cipher).await?;
     if !directory
         .deployment(&deployment.to_string())
         .await?
@@ -1917,7 +1916,7 @@ pub async fn finish_retirement(
         if registration.media_bound && !record.checkpoint_capture_retirements.get(&operation)
             .is_some_and(|release| release.observed_empty_at_ms.is_some()) {
             let point = capture_point(&record, deployment, operation, &registration.archive)?;
-            keys.destroy(&archive_key_id(&point)).await?;
+            keys.withdraw_archive_key(&archive_key_id(&point)).await?;
         }
     }
 
@@ -2005,14 +2004,15 @@ mod tests {
             files.put(name, ciphertext).await?;
         }
         let capture = Capture { point: fixture.point, format: CheckpointContents::Replay, objects };
-        capture.verify(bucket.clone(), "capture", &material).await?;
+        let archive_key = crate::keys::legacy_archive_key(&material)?;
+        capture.verify(bucket.clone(), "capture", &archive_key).await?;
         let mut omitted = capture.clone();
         omitted.objects.retain(|object| object.name != fixture.artefact.as_str());
-        let error = omitted.verify(bucket.clone(), "capture", &material).await.err();
+        let error = omitted.verify(bucket.clone(), "capture", &archive_key).await.err();
         assert_eq!(error.and_then(|error| error.message).as_deref(), Some("The archive object list differs from the checkpoint closure"),
             "a replay manifest must name the shared artefact");
         files.delete(&fixture.artefact).await?;
-        let error = capture.verify(bucket.clone(), "capture", &material).await.unwrap_err();
+        let error = capture.verify(bucket.clone(), "capture", &archive_key).await.unwrap_err();
         assert_eq!(error.code, "rtdb.storage/missing-object");
 
         let mut primary = omitted;
@@ -2022,7 +2022,7 @@ mod tests {
         assert!(serde_json::from_slice::<serde_json::Value>(&legacy).unwrap().get("format").is_none());
         let reopened: Capture = serde_json::from_slice(&legacy).unwrap();
         assert_eq!(encode(&reopened)?, legacy);
-        reopened.verify(bucket, "capture", &material).await?;
+        reopened.verify(bucket, "capture", &archive_key).await?;
         Ok(())
     }
 
@@ -2094,9 +2094,9 @@ mod tests {
         let files = PrefixedStore::new(raw, "accepted-archive/objects");
         let name = key("covered")?;
         let material = [7; crate::keys::KEY_BYTES];
-        let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
+        let archive_cipher = crate::keys::legacy_archive_key(&[3; crate::keys::KEY_BYTES])?;
         let bytes = Bytes::from_static(b"accepted");
-        let ciphertext = archive_cipher.seal_deterministic(name.as_str(), &bytes)?;
+        let ciphertext = archive_cipher.seal(name.as_str(), bytes.clone()).await?;
         files.put(&name, ciphertext.clone()).await?;
         let archive = ArchivedCheckpoint {
             files,
@@ -2175,7 +2175,7 @@ mod tests {
         let key_root = tempfile::tempdir().unwrap();
         let storage = CellStorage::Local { root: serving.path().to_owned() };
         let archive = CellStorage::Local { root: archived.path().to_owned() };
-        let keys = crate::keys::LocalKeyService::new(key_root.path())?;
+        let keys = crate::keys::LocalKeyService::with_archive_broker(key_root.path())?;
         let directory = rtdb_directory::MemoryDirectory::new();
         let mut record = DeploymentRecord::new("captured", "acme", Vec::new(), 0);
         let deployment = record.id.parse::<Uuid>().unwrap();
@@ -2189,7 +2189,7 @@ mod tests {
         let operation = Uuid::new_v4();
         record.checkpoint_captures.insert(operation, CheckpointCapture {
             archive: archive_binding(&archive)?,
-            key_namespace: None,
+            key_namespace: Some(keys.namespace_id().await?),
             incarnation: record.incarnation,
             log_epoch: record.log_epoch,
             checkpoint,
@@ -2246,6 +2246,53 @@ mod tests {
                 "a local capture must share the source maintenance authority");
         }
         assert!(directory.deployment(&id).await?.unwrap().storage_regions.is_empty());
+
+        let key_id = archive_key_id(&completed.point);
+        let broker_grant = archive_key(&keys, &completed.point).await?;
+        assert!(keys.existing_key(&key_id).await.is_err());
+        assert!(keys.key(&key_id).await.is_err());
+        assert!(keys.install(&key_id, [7; crate::keys::KEY_BYTES]).await.is_err());
+        assert!(keys.copy(&key_id, "exported").await.is_err());
+        assert!(keys.key(&format!(".archive-vault/{key_id}")).await.is_err());
+        assert!(crate::keys::LocalKeyService::new(key_root.path().join(".archive-vault")).is_err());
+        let archived = archive.bucket(IoRegion::new()).await?;
+        let files = PrefixedStore::new(archived, format!("checkpoint-captures/{deployment}/{operation}/objects"));
+        let root_object = completed.objects.iter().find(|object| object.name == fixture.root.as_str()).unwrap();
+        let ciphertext = read_object(&files, &fixture.root, root_object).await?;
+        assert_eq!(broker_grant.open(fixture.root.as_str(), ciphertext.clone()).await?, fixture.files[&fixture.root]);
+
+        let reader = Uuid::new_v4();
+        let witness = keys.hold_local_storage_region(reader)?.unwrap();
+        let current = update_installation(directory.as_ref(), &id, |record| {
+            record.storage_regions.insert(reader, rtdb_directory::StorageRegion::Local {
+                archive: Some(operation), checkpoint_suffix: None, repair_archive: None,
+                tracks_ordered_index_pages: false,
+                checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            });
+            Ok(())
+        }).await?;
+        let manifest = completed.manifest_sha256()?;
+        let prepared = prepare_capture_retirement(directory.as_ref(), &current, &archive, operation, Some(&manifest)).await?;
+        assert!(prepared.operation_revoked_at_ms.is_none());
+        assert!(commit_capture_revocation(directory.as_ref(), &storage, &keys, &id, operation).await.is_err());
+        assert_eq!(broker_grant.open(fixture.root.as_str(), ciphertext.clone()).await?, fixture.files[&fixture.root]);
+        drop(witness);
+
+        let committed = commit_capture_revocation(directory.as_ref(), &storage, &keys, &id, operation).await?;
+        assert_eq!(committed.operation_revoked_at_ms, committed.key_withdrawn_at_ms);
+        assert!(committed.operation_revoked_at_ms.is_some());
+        assert!(committed.observed_empty_at_ms.is_none());
+        assert_eq!(files.get(&fixture.root).await?, ciphertext);
+        assert!(broker_grant.open(fixture.root.as_str(), ciphertext).await.is_err());
+
+        let reopened = crate::keys::LocalKeyService::new(key_root.path())?;
+        assert!(archive_key(&reopened, &completed.point).await.is_err());
+        assert_eq!(commit_capture_revocation(directory.as_ref(), &storage, &reopened, &id, operation).await?, committed);
+        assert_eq!(source.get(&fixture.root).await?, fixture.files[&fixture.root]);
+        let settled = finish_capture_retirement(directory.as_ref(), &storage, &reopened, &id, operation).await?;
+        assert_eq!(settled.operation_revoked_at_ms, committed.operation_revoked_at_ms);
+        assert!(settled.observed_empty_at_ms.is_some());
+        assert!(files.list(None).await?.is_empty());
         Ok(())
     }
 
@@ -2256,9 +2303,9 @@ mod tests {
         let serving = Arc::new(rtdb_storage::MemoryStore::default());
         let covered = key("covered")?;
         let newer = key("newer")?;
-        let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
+        let archive_cipher = crate::keys::legacy_archive_key(&[3; crate::keys::KEY_BYTES])?;
         let serving_cipher = Cipher::new(&[7; crate::keys::KEY_BYTES])?;
-        let ciphertext = archive_cipher.seal_deterministic(covered.as_str(), b"accepted")?;
+        let ciphertext = archive_cipher.seal(covered.as_str(), Bytes::from_static(b"accepted")).await?;
         let want = serving_cipher.seal_deterministic(covered.as_str(), b"accepted")?;
         files.put(&covered, ciphertext.clone()).await?;
         serving.put(&covered, Bytes::from_static(b"rewritten")).await?;

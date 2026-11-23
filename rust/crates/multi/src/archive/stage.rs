@@ -419,10 +419,9 @@ async fn copy_checkpoint(
         "checkpoint-captures/{}/{}",
         point.deployment, point.operation
     );
-    let (capture, material) = verified_archive(bucket.clone(), point, manifest, keys).await?;
-    let source_cipher = Cipher::new(&material)?;
+    let (capture, source_cipher) = verified_archive(bucket.clone(), point, manifest, keys).await?;
     let media_key = keys.key(&target.key_id()).await?;
-    if media_key == material {
+    if source_cipher.matches(media_key).await? {
         return Err(inconsistent(
             "The staged installation must have its own media key",
         ));
@@ -440,7 +439,7 @@ async fn copy_checkpoint(
     for object in &capture.objects {
         let name = key(&object.name)?;
         let ciphertext = read_object(&source, &name, object).await?;
-        let plaintext = source_cipher.open(name.as_str(), &ciphertext)?;
+        let plaintext = source_cipher.open(name.as_str(), ciphertext).await?;
         let resealed = target_cipher.seal_deterministic(name.as_str(), &plaintext)?;
         let staged = ArchivedObject {
             name: object.name.clone(),

@@ -48,6 +48,20 @@ Search artefacts do not supply ambient statistics.
 Two-argument scores therefore depend only on the resolved row and query.
 Corpus-relative queries derive their statistics from the applicable admitted rows or receive them explicitly.
 
+## Operation-only capture revocation
+
+The local archive broker gives checkpoint readers and exporters key operations under the original capture authority.
+The same key protects the captured root and its archived replica suffix.
+An independent stage reseals the verified plaintext with its own installation key.
+The broker orders irreversible vault closure against every active cryptographic operation.
+The directory publishes the revocation observation after that closure has completed.
+A previously issued handle cannot decrypt another object after the observation, including ciphertext already retained by the handle's owner.
+The source capture and its copies are distinct custody domains only after a completed independent re-encryption.
+The authenticated preparation first closes new archive admissions, and the revocation commit waits for outstanding regions and provider operations.
+Preparation can take an unbounded time.
+The contract excludes plaintext already returned and depends on keeping vault material outside recoverable backups and older material-exporting binaries.
+Serving history and existing exported keys still require a separately qualified deadline authority.
+
 ## Verification
 
 `ErasureCustody.tla` models adoption of a successor, a same-domain key copy with an unresolved provider outcome, a dependent fork, an independent export and a held old view.
@@ -56,6 +70,10 @@ It abstracts the provider, the clock and all cache invalidation.
 Certification also needs a native replay of copy-completed-with-lost-reply, cross-domain export, and revoke-after-recovery with a surviving row and an admitted reader.
 Check the provider's actual key versions and cache grants when verifying a completion receipt.
 Physical history collection and metadata retention are separate acceptance checks.
+
+[CaptureKeyRevocation](../tla/CaptureKeyRevocation.tla) checks the local capture broker's prepare, provider closure, durable observation and inventory settlement.
+A lost-reply witness recovers and settles a closed key while a separately keyed copy remains readable.
+Controls expose stale-handle decryption, undrained active operations, raw material export, early publication, early inventory settlement and destination-key aliasing.
 
 [RecoveryCustodyHandoff](../lean/RecoveryCustodyHandoff.lean) proves joint safety for arbitrary unit identities and finite schedules of confirmation, independent copy admission, erasure commit, revocation, and physical retirement.
 The replacement cut covers the acknowledged upstream position, and its declared primary and replay units are readable and disjoint from the retiring custody set.

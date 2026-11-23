@@ -64,6 +64,9 @@ enum Action {
     CheckpointCaptureDiscardStatus {
         manifest_sha256: Option<String>,
     },
+    CommitCheckpointCaptureRevocation {
+        manifest_sha256: String,
+    },
     SettleCheckpointCaptureDiscard {
         manifest_sha256: Option<String>,
     },
@@ -158,6 +161,14 @@ enum Reply {
         manifest_sha256: Option<String>,
         authorized_at_ms: i64,
         key_withdrawn_at_ms: Option<i64>,
+    },
+    CaptureRevocationCommitted {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        manifest_sha256: String,
+        authorized_at_ms: i64,
+        operation_revoked_at_ms: i64,
     },
     CaptureDiscardDeadlineUnsupported,
     CaptureDiscarded {
@@ -305,18 +316,6 @@ impl RecoveryService {
         };
         let discard = matches!(request.action, Action::DiscardCheckpointStage { .. });
         let transfer_only = matches!(request.action, Action::StageCheckpointTransfer { .. });
-        let capture_discard = match &request.action {
-            Action::DiscardCheckpointCapture { manifest_sha256 }
-            | Action::PrepareCheckpointCaptureDiscard { manifest_sha256, .. }
-            | Action::CheckpointCaptureDiscardStatus { manifest_sha256 }
-            | Action::SettleCheckpointCaptureDiscard { manifest_sha256 } => Some(manifest_sha256.as_deref()),
-            _ => None,
-        };
-        if let Some(manifest) = capture_discard
-            && (manifest.is_some_and(|value| !valid_manifest(value)) || installation.checkpoint_stage.is_some())
-        {
-            return Ok(Reply::Refused);
-        }
         match request.action {
             Action::CaptureCheckpoint => {
                 let retained = archive::capture_receipt(
@@ -410,37 +409,11 @@ impl RecoveryService {
                     observation,
                 })
             }
-            Action::DiscardCheckpointCapture { manifest_sha256 } => {
-                let release = archive::retire_capture(
-                    directory.as_ref(), &installation, &self.storage, &self.archive,
-                    self.keys.as_ref(), request.capture, manifest_sha256.as_deref(),
-                ).await?;
-                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
-            }
-            Action::PrepareCheckpointCaptureDiscard { manifest_sha256, deadline_ms } => {
-                if deadline_ms.is_some() {
-                    return Ok(Reply::CaptureDiscardDeadlineUnsupported);
-                }
-                let release = archive::prepare_capture_retirement(
-                    directory.as_ref(), &installation, &self.archive, request.capture, manifest_sha256.as_deref(),
-                ).await?;
-                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
-            }
-            Action::CheckpointCaptureDiscardStatus { manifest_sha256 } => {
-                let release = archive::capture_retirement_receipt(
-                    &installation, &self.archive, request.capture, manifest_sha256.as_deref(),
-                )?;
-                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
-            }
-            Action::SettleCheckpointCaptureDiscard { manifest_sha256 } => {
-                archive::capture_retirement_receipt(
-                    &installation, &self.archive, request.capture, manifest_sha256.as_deref(),
-                )?;
-                let release = archive::finish_capture_retirement(
-                    directory.as_ref(), &self.storage, self.keys.as_ref(), &installation.id, request.capture,
-                ).await?;
-                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
-            }
+            Action::DiscardCheckpointCapture { .. }
+            | Action::PrepareCheckpointCaptureDiscard { .. }
+            | Action::CheckpointCaptureDiscardStatus { .. }
+            | Action::CommitCheckpointCaptureRevocation { .. }
+            | Action::SettleCheckpointCaptureDiscard { .. } => unreachable!("dispatched separately"),
             Action::RecoverCheckpoint { manifest_sha256 } => {
                 if !valid_manifest(&manifest_sha256) {
                     return Ok(Reply::Refused);
@@ -732,6 +705,78 @@ impl RecoveryService {
         }
     }
 
+    async fn dispatch_capture_discard(&self, directory: Arc<dyn Directory>, request: Request) -> Result<Reply> {
+        let Some(installation) = self.authorize(directory.as_ref(), &request).await? else {
+            return Ok(Reply::Refused);
+        };
+        let capture_discard = match &request.action {
+            Action::DiscardCheckpointCapture { manifest_sha256 }
+            | Action::PrepareCheckpointCaptureDiscard { manifest_sha256, .. }
+            | Action::CheckpointCaptureDiscardStatus { manifest_sha256 }
+            | Action::SettleCheckpointCaptureDiscard { manifest_sha256 } => Some(manifest_sha256.as_deref()),
+            Action::CommitCheckpointCaptureRevocation { manifest_sha256 } => Some(Some(manifest_sha256.as_str())),
+            _ => None,
+        };
+        if let Some(manifest) = capture_discard
+            && (manifest.is_some_and(|value| !valid_manifest(value)) || installation.checkpoint_stage.is_some())
+        {
+            return Ok(Reply::Refused);
+        }
+        match request.action {
+            Action::DiscardCheckpointCapture { manifest_sha256 } => {
+                let release = archive::retire_capture(
+                    directory.as_ref(), &installation, &self.storage, &self.archive,
+                    self.keys.as_ref(), request.capture, manifest_sha256.as_deref(),
+                ).await?;
+                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
+            }
+            Action::PrepareCheckpointCaptureDiscard { manifest_sha256, deadline_ms } => {
+                if deadline_ms.is_some() {
+                    return Ok(Reply::CaptureDiscardDeadlineUnsupported);
+                }
+                let release = archive::prepare_capture_retirement(
+                    directory.as_ref(), &installation, &self.archive, request.capture, manifest_sha256.as_deref(),
+                ).await?;
+                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
+            }
+            Action::CheckpointCaptureDiscardStatus { manifest_sha256 } => {
+                let release = archive::capture_retirement_receipt(
+                    &installation, &self.archive, request.capture, manifest_sha256.as_deref(),
+                )?;
+                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
+            }
+            Action::CommitCheckpointCaptureRevocation { manifest_sha256 } => {
+                archive::capture_retirement_receipt(
+                    &installation, &self.archive, request.capture, Some(&manifest_sha256),
+                )?;
+                let release = archive::commit_capture_revocation(
+                    directory.as_ref(), &self.storage, self.keys.as_ref(), &installation.id, request.capture,
+                ).await?;
+                let operation_revoked_at_ms = release.operation_revoked_at_ms.ok_or_else(|| {
+                    Anomaly::fault("rtdb.multi/archive-vault", "The operation-only revocation has no receipt")
+                })?;
+                Ok(Reply::CaptureRevocationCommitted {
+                    name: installation.name,
+                    authority: request.authority,
+                    capture: request.capture,
+                    manifest_sha256,
+                    authorized_at_ms: release.authorized_at_ms,
+                    operation_revoked_at_ms,
+                })
+            }
+            Action::SettleCheckpointCaptureDiscard { manifest_sha256 } => {
+                archive::capture_retirement_receipt(
+                    &installation, &self.archive, request.capture, manifest_sha256.as_deref(),
+                )?;
+                let release = archive::finish_capture_retirement(
+                    directory.as_ref(), &self.storage, self.keys.as_ref(), &installation.id, request.capture,
+                ).await?;
+                Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
+            }
+            _ => unreachable!("only capture retirement actions are routed here"),
+        }
+    }
+
     fn capture_discard_reply(
         &self, name: String, authority: Uuid, capture: Uuid, release: CheckpointCaptureRetirement,
     ) -> Reply {
@@ -759,7 +804,15 @@ impl RecoveryService {
     }
 
     async fn handle(&self, directory: Arc<dyn Directory>, request: Request) -> Reply {
-        match self.dispatch(directory, request).await {
+        let result = match request.action {
+            Action::DiscardCheckpointCapture { .. }
+            | Action::PrepareCheckpointCaptureDiscard { .. }
+            | Action::CheckpointCaptureDiscardStatus { .. }
+            | Action::CommitCheckpointCaptureRevocation { .. }
+            | Action::SettleCheckpointCaptureDiscard { .. } => self.dispatch_capture_discard(directory, request).await,
+            _ => Box::pin(self.dispatch(directory, request)).await,
+        };
+        match result {
             Ok(reply) => reply,
             Err(error)
                 if matches!(
@@ -981,6 +1034,7 @@ mod tests {
             log_epoch: installation.log_epoch,
             checkpoint: point,
             automatic_fork: false,
+            world_replay: None,
             media_bound: true,
             manifest_sha256: Some(manifest.clone()),
             remote_disposal: None,

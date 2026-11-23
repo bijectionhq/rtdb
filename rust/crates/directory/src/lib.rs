@@ -631,6 +631,8 @@ pub struct CheckpointCaptureRetirement {
     pub authorized_at_ms: i64,
     pub key_withdrawn_at_ms: Option<i64>,
     pub observed_empty_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_revoked_at_ms: Option<i64>,
 }
 
 /// An exact provider upload, admitted before it received payload bytes.

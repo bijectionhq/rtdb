@@ -66,7 +66,7 @@ DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables n
 Use dynamodb+packed:PREFIX to write packed parked rows after all readers have upgraded.\n\
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
 DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n\
-For --keys, use a private directory, a dynamodb:TABLE locator, or s3://BUCKET?region=REGION for a never-versioned key vault.\n";
+For --keys, use a private directory, local-broker:PATH, a dynamodb:TABLE locator, or s3://BUCKET?region=REGION for a never-versioned key vault.\n";
 
 fn main() {
     let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
@@ -940,6 +940,9 @@ fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capabilit
 }
 
 async fn key_service(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    if let Some(path) = specification.strip_prefix("local-broker:") {
+        return Ok(Arc::new(rtdb_multi::keys::LocalKeyService::with_archive_broker(path)?));
+    }
     if let Some(table) = specification.strip_prefix("dynamodb:") {
         return dynamo_keys(table).await;
     }

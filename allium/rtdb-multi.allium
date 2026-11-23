@@ -2705,7 +2705,7 @@ rule PrepareCheckpointCaptureDiscard {
     -- A preparation names one capture in its original archive authority.
     -- It closes further admission while admitted storage regions retain provider access through drain.
     -- The capture and its dependent suffixes share one archived media key.
-    when: AuthenticatedCaptureDiscard(authority, capture)
+    when: AuthenticatedCaptureDiscard(operator, authority, capture)
 
     requires: OriginalArchiveAuthority(authority, capture)
               and NoRetainedWorldOrRepairDependsOn(capture)
@@ -2714,6 +2714,21 @@ rule PrepareCheckpointCaptureDiscard {
     ensures:
         CommitCaptureAdmissionFence(capture)
         RetainCaptureDiscardPreparation(capture)
+}
+
+rule CommitCheckpointCaptureRevocation {
+    -- A brokered handle invokes the original authority every time it opens or seals protected bytes.
+    -- Revocation serializes with broker operations and fences later calls through already issued handles.
+    -- The directory can publish the observation after the authority durably closes the key.
+    when: AuthenticatedCaptureRevocationContinued(operator, authority, capture)
+
+    requires: CaptureAdmissionFenced(capture)
+              and AdmittedCaptureRegionsDrained(capture)
+              and ExactOriginalOperationOnlyKeyAuthority(authority, capture)
+
+    ensures:
+        IrrevocablyCloseCaptureKey(capture)
+        ObserveCaptureOperationRevocation(capture)
 }
 
 rule SettleCheckpointCaptureDiscard {
@@ -3256,6 +3271,18 @@ surface StorageAccess {
 
     @guarantee ZombiesCannotDamageStorage
         -- A deposed holder can create only orphans under its own epoch's prefix until its credential expires, and can delete nothing.
+}
+
+surface CheckpointArchiveDisposal {
+    facing operator: Operator
+
+    provides:
+        AuthenticatedCaptureDiscard(operator, authority, capture)
+        AuthenticatedCaptureRevocationContinued(operator, authority, capture)
+        CheckpointCaptureDiscardContinued(capture)
+
+    contracts:
+        demands Directory
 }
 
 surface TerminalStorageEnrollment {

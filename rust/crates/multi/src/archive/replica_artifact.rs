@@ -12,8 +12,8 @@ use crate::{
     archive::{
         checkpoint_transfer_prefix, encode, inconsistent, replica_suffix, sha256, unavailable,
     },
-    cipher::{Cipher, SEALED_OVERHEAD},
-    keys::KeyService,
+    cipher::SEALED_OVERHEAD,
+    keys::{ArchiveKey, KeyService, legacy_archive_key},
     reference::key,
 };
 
@@ -46,7 +46,7 @@ impl PayloadBytes {
 
 pub(super) struct ReplicaArtifact<'a> {
     store: &'a dyn ObjectStore,
-    cipher: Cipher,
+    cipher: Arc<dyn ArchiveKey>,
     prefix: String,
     receipt: Bytes,
     chain_domain: &'static [u8],
@@ -92,7 +92,7 @@ impl<'a> ReplicaArtifact<'a> {
             .ok_or_else(|| unavailable("The original target media key is unavailable"))?;
         Self::new(
             store,
-            &material,
+            legacy_archive_key(&material)?,
             checkpoint_transfer_prefix(record, terminal.fence.destination.intent.operation),
             receipt,
             b"RTDB checkpoint transfer segments v2\0",
@@ -101,7 +101,7 @@ impl<'a> ReplicaArtifact<'a> {
 
     pub(super) fn new(
         store: &'a dyn ObjectStore,
-        key: &[u8],
+        cipher: Arc<dyn ArchiveKey>,
         prefix: String,
         receipt: Bytes,
         chain_domain: &'static [u8],
@@ -113,7 +113,7 @@ impl<'a> ReplicaArtifact<'a> {
         }
         Ok(Self {
             store,
-            cipher: Cipher::new(key)?,
+            cipher,
             prefix,
             receipt,
             chain_domain,
@@ -130,7 +130,7 @@ impl<'a> ReplicaArtifact<'a> {
             Ok(head) if head.size == manifest_len as u64 => {
                 let sealed = self.store.observe_fresh_exact(&manifest, manifest_len).await?.value;
                 if sha256(&sealed) == expected {
-                    return Ok(OrderedTransfer::Segments(self.open_manifest(&manifest, &sealed)?));
+                    return Ok(OrderedTransfer::Segments(self.open_manifest(&manifest, sealed).await?));
                 }
             }
             Ok(_) | Err(rtdb_storage::Error::MissingObject(_)) => (),
@@ -144,7 +144,7 @@ impl<'a> ReplicaArtifact<'a> {
         let reservation = memory.reserve(size.checked_mul(6).ok_or_else(bad_segment)?)?;
         let sealed = self.store.observe_fresh_exact(&legacy, size).await?.value;
         if sha256(&sealed) != expected { return Err(bad_segment()); }
-        let opened = self.cipher.open(legacy.as_str(), &sealed)?;
+        let opened = self.cipher.open(legacy.as_str(), sealed).await?;
         let receipt_len = self.receipt.len();
         if opened.get(..4) != Some((receipt_len as u32).to_be_bytes().as_slice())
             || opened.get(4..4 + receipt_len) != Some(self.receipt.as_ref())
@@ -193,7 +193,7 @@ impl<'a> ReplicaArtifact<'a> {
         let sealed = self
             .read(&object, replica_suffix::MAX_SEGMENT_BYTES + SEALED_OVERHEAD)
             .await?;
-        let entries = replica_suffix::decode(self.cipher.open(object.as_str(), &sealed)?)?;
+        let entries = replica_suffix::decode(self.cipher.open(object.as_str(), sealed.clone()).await?)?;
         let through = require_dense(&entries, first, terminal)?;
         extend_chain(chain, first, through, &sha256(&sealed));
         Ok(entries)
@@ -222,7 +222,7 @@ impl<'a> ReplicaArtifact<'a> {
         let object = self.payload(offset)?;
         let mut body = PayloadBytes::read(self.store, &object, memory).await?;
         extend_payload(chain, offset, &sha256(&body.bytes));
-        body.bytes = self.cipher.open(object.as_str(), &body.bytes)?;
+        body.bytes = self.cipher.open(object.as_str(), body.bytes).await?;
         Ok(body)
     }
 
@@ -244,11 +244,11 @@ impl<'a> ReplicaArtifact<'a> {
                 "The replica archive differs from its ordered digest",
             ));
         }
-        self.open_manifest(&object, &sealed)
+        self.open_manifest(&object, sealed).await
     }
 
-    fn open_manifest(&self, object: &ObjectKey, sealed: &[u8]) -> Result<[u8; 32]> {
-        let opened = self.cipher.open(object.as_str(), sealed)?;
+    async fn open_manifest(&self, object: &ObjectKey, sealed: Bytes) -> Result<[u8; 32]> {
+        let opened = self.cipher.open(object.as_str(), sealed).await?;
         if opened.get(32..) != Some(self.receipt.as_ref()) {
             return Err(inconsistent(
                 "The replica archive names another exact receipt",
@@ -257,9 +257,9 @@ impl<'a> ReplicaArtifact<'a> {
         opened[..32].try_into().map_err(|_| bad_segment())
     }
 
-    pub(super) fn reseal(&self, scope: &str, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
+    pub(super) async fn reseal(&self, scope: &str, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
         for entry in entries {
-            entry.payload = self.cipher.seal_deterministic(scope, &entry.payload)?;
+            entry.payload = self.cipher.seal(scope, entry.payload.clone()).await?;
         }
         Ok(())
     }
@@ -277,7 +277,7 @@ impl<'a> ReplicaArtifact<'a> {
     }
 
     async fn put(&self, object: &ObjectKey, plaintext: &[u8]) -> Result<[u8; 32]> {
-        let sealed = self.cipher.seal_deterministic(object.as_str(), plaintext)?;
+        let sealed = self.cipher.seal(object.as_str(), Bytes::copy_from_slice(plaintext)).await?;
         match self.store.head_fresh(object).await {
             Ok(prior) if prior.size == sealed.len() as u64 => (),
             Ok(_) => return Err(bad_segment()),

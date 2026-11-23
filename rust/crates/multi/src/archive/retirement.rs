@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::{archive_binding, archive_key_id, capture_point, inconsistent, key, require_archive_key_authority, unavailable};
 use crate::{
-    admin::update_installation, deployment::CellStorage, keys::KeyService,
+    admin::update_installation, deployment::CellStorage, keys::{ArchiveKeyWithdrawal, KeyService},
     store::reconcile_storage_regions,
 };
 
@@ -222,6 +222,7 @@ async fn prepare_capture_retirement_with_intent(
                 manifest_sha256: retained.map(str::to_owned),
                 authorized_at_ms: sampled_at,
                 key_withdrawn_at_ms: None,
+                operation_revoked_at_ms: None,
                 observed_empty_at_ms: None,
             },
         );
@@ -274,60 +275,16 @@ pub(crate) async fn finish_capture_retirement(
     id: &str,
     capture: Uuid,
 ) -> Result<CheckpointCaptureRetirement> {
-    let mut record = directory
-        .deployment(id)
-        .await?
-        .ok_or_else(|| unavailable("The original capture owner is unavailable"))?;
-    let accepted = record
-        .checkpoint_capture_retirements
-        .get(&capture)
-        .ok_or_else(|| inconsistent("The checkpoint capture has no release authority"))?
-        .clone();
-    if accepted.observed_empty_at_ms.is_some() {
-        return Ok(accepted);
-    }
-    let pending = |record: &DeploymentRecord| {
-        record.storage_regions.values().any(|region| region.holds_archive(capture))
-    };
-    if pending(&record) {
-        reconcile_storage_regions(directory, storage, keys, &record).await?;
-        record = directory
-            .deployment(id)
-            .await?
-            .ok_or_else(|| unavailable("The original capture owner is unavailable"))?;
-        if pending(&record) {
-            return Err(unavailable("The capture still has admitted archive I/O"));
-        }
-    }
-    let withdrawn_at = if let Some(withdrawn) = accepted.key_withdrawn_at_ms {
-        withdrawn
-    } else {
-        if let Some(registration) = record.checkpoint_captures.get(&capture).filter(|value| value.media_bound) {
-            require_archive_key_authority(keys, registration).await?;
-            let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
-            let point = capture_point(&record, deployment, capture, &accepted.archive)?;
-            keys.destroy(&archive_key_id(&point)).await?;
-        }
-        let withdrawn = now_ms().max(accepted.authorized_at_ms);
-        let current = update_installation(directory, id, |current| {
-            if pending(current)
-                || current.checkpoint_captures.get(&capture) != record.checkpoint_captures.get(&capture)
-            {
-                return Err(inconsistent("The closed capture changed before recording vault withdrawal"));
-            }
-            let retirement = checked_retirement(current, capture, &accepted)?;
-            retirement.key_withdrawn_at_ms.get_or_insert(withdrawn);
-            Ok(())
-        }).await?;
-        current.checkpoint_capture_retirements[&capture].key_withdrawn_at_ms
-            .expect("the accepted retirement records withdrawal")
-    };
+    let accepted = withdraw_capture_key(directory, storage, keys, id, capture, false).await?;
+    if accepted.observed_empty_at_ms.is_some() { return Ok(accepted); }
+    let withdrawn_at = accepted.key_withdrawn_at_ms
+        .ok_or_else(|| inconsistent("The archive key withdrawal was not recorded"))?;
     let archive: CellStorage = serde_json::from_str(&accepted.archive)
         .map_err(|_| inconsistent("Invalid retained capture custody"))?;
     let prefix = key(&format!("checkpoint-captures/{id}/{capture}"))?;
     purge_archive_prefix(&archive, &prefix).await?;
     let settled = update_installation(directory, id, |current| {
-        if pending(current) {
+        if has_capture_region(current, capture) {
             return Err(inconsistent(
                 "The closed capture admitted another archive region",
             ));
@@ -347,6 +304,95 @@ pub(crate) async fn finish_capture_retirement(
         .get(&capture)
         .cloned()
         .ok_or_else(|| inconsistent("The capture lost its physical release receipt"))
+}
+
+pub(crate) async fn commit_capture_revocation(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    id: &str,
+    capture: Uuid,
+) -> Result<CheckpointCaptureRetirement> {
+    withdraw_capture_key(directory, storage, keys, id, capture, true).await
+}
+
+fn has_capture_region(record: &DeploymentRecord, capture: Uuid) -> bool {
+    record.storage_regions.values().any(|region| region.holds_archive(capture))
+}
+
+async fn withdraw_capture_key(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    id: &str,
+    capture: Uuid,
+    require_operation_authority: bool,
+) -> Result<CheckpointCaptureRetirement> {
+    let load = || async {
+        directory.deployment(id).await?
+            .ok_or_else(|| unavailable("The original capture owner is unavailable"))
+    };
+    let mut record = load().await?;
+    let accepted = record.checkpoint_capture_retirements.get(&capture)
+        .ok_or_else(|| inconsistent("The checkpoint capture has no release authority"))?.clone();
+    if accepted.key_withdrawn_at_ms.is_some() {
+        if require_operation_authority && accepted.operation_revoked_at_ms.is_none() {
+            return Err(inconsistent("The capture was withdrawn by an exporting archive vault"));
+        }
+        return Ok(accepted);
+    }
+    let registered = record.checkpoint_captures.get(&capture).filter(|value| value.media_bound).cloned();
+    let key = if let Some(registration) = &registered {
+        require_archive_key_authority(keys, registration).await?;
+        let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
+        Some(archive_key_id(&capture_point(&record, deployment, capture, &accepted.archive)?))
+    } else {
+        None
+    };
+    let enrolled = registered.as_ref().is_some_and(|value| value.key_namespace.is_some())
+        && matches!(serde_json::from_str::<CellStorage>(&accepted.archive), Ok(CellStorage::Local { .. }));
+    if require_operation_authority {
+        let Some(key) = &key else {
+            return Err(inconsistent("The capture has no enrolled archive key"));
+        };
+        if !enrolled || !keys.archive_key_is_operation_only(key).await?
+        {
+            return Err(inconsistent("The capture has no enrolled operation-only key authority"));
+        }
+    }
+    if has_capture_region(&record, capture) {
+        reconcile_storage_regions(directory, storage, keys, &record).await?;
+        record = load().await?;
+        if has_capture_region(&record, capture) {
+            return Err(unavailable("The capture still has admitted archive I/O"));
+        }
+        checked_retirement(&mut record, capture, &accepted)?;
+        if record.checkpoint_captures.get(&capture).filter(|value| value.media_bound) != registered.as_ref() {
+            return Err(inconsistent("The closed capture changed while draining its archive I/O"));
+        }
+    }
+    let operation_only = match key {
+        Some(key) => keys.withdraw_archive_key(&key).await? == ArchiveKeyWithdrawal::OperationAuthority,
+        None => false,
+    };
+    if require_operation_authority && !operation_only {
+        return Err(inconsistent("The authority returned an exporting-vault withdrawal"));
+    }
+    let withdrawal_observed_at = now_ms().max(accepted.authorized_at_ms);
+    let current = update_installation(directory, id, |current| {
+        if has_capture_region(current, capture)
+            || current.checkpoint_captures.get(&capture).filter(|value| value.media_bound) != registered.as_ref()
+        {
+            return Err(inconsistent("The closed capture changed before recording vault withdrawal"));
+        }
+        let retirement = checked_retirement(current, capture, &accepted)?;
+        let withdrawn_at = *retirement.key_withdrawn_at_ms.get_or_insert(withdrawal_observed_at);
+        if operation_only && enrolled {
+            retirement.operation_revoked_at_ms.get_or_insert(withdrawn_at);
+        }
+        Ok(())
+    }).await?;
+    Ok(current.checkpoint_capture_retirements[&capture].clone())
 }
 
 fn checked_retirement<'a>(

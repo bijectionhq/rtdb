@@ -193,6 +193,18 @@ Settlement checks that identity before withdrawing the capture key.
 The recorded vault withdrawal is an observation of that vault's tombstone.
 A capture used by the current repair still belongs to the serving closure and cannot be discarded independently.
 
+For a local checkpoint archive, the optional `--keys local-broker:PATH` authority creates new capture keys in operation-only custody.
+A capture and its archived replica suffixes use opaque handles for sealing and opening under that authority.
+An independent stage copy re-encrypts its verified plaintext under the destination installation key.
+A captured handle must reenter the broker on each operation and becomes unusable after revocation even when it has retained ciphertext.
+All processes handling an enrolled archive must use a broker-aware binary and the original vault.
+Vault custody assumes the vault directory has exclusive access and that retained backups cannot recover its withdrawn material.
+After preparation, `commit_checkpoint_capture_revocation` requires the exact manifest and reports a pending operation until admitted regions drain.
+The vault commits withdrawal before the service records `capture_revocation_committed`; a lost response can be recovered from the same vault and exact preparation.
+Physical cleanup then settles independently.
+This contract covers the enrolled archive's ability to decrypt, which is revoked by the time the commitment is recorded.
+The capture protocol's deadline request requires a qualified provider and active-reader policy, and remains unavailable with these providers.
+
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
 The reaper settles each registered local archive after confirming its

@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use super::{
-    CapturePoint, URL_SAFE_NO_PAD, capture_receipt, checkpoint_storage_root, encode, inconsistent, read_object, require_capture_open,
+    ArchiveKey, CapturePoint, URL_SAFE_NO_PAD, capture_receipt, checkpoint_storage_root, encode, inconsistent, read_object, require_capture_open,
     unavailable, verified_archive, verify_cut,
 };
 use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, require_chain};
@@ -90,16 +90,16 @@ impl<'a> ServingPayloads<'a> {
 
 pub(super) async fn read_base_catalog(
     bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService,
-) -> Result<(BlockCatalog, [u8; crate::keys::KEY_BYTES])> {
-    let (base, material) = verified_archive(bucket.clone(), point, manifest, keys).await?;
+) -> Result<(BlockCatalog, Arc<dyn ArchiveKey>)> {
+    let (base, cipher) = verified_archive(bucket.clone(), point, manifest, keys).await?;
     let root = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
     let root_object = base.objects.iter().find(|object| object.name == root.as_str())
         .ok_or_else(|| inconsistent("The suffix capture omitted its root catalog"))?;
     let files = PrefixedStore::new(bucket, format!("checkpoint-captures/{}/{}/objects", point.deployment, point.operation));
     let root_bytes = read_object(&files, &root, root_object).await?;
-    let catalog = BlockCatalog::decode(&Cipher::new(&material)?.open(root.as_str(), &root_bytes)?)?;
+    let catalog = BlockCatalog::decode(&cipher.open(root.as_str(), root_bytes).await?)?;
     verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
-    Ok((catalog, material))
+    Ok((catalog, cipher))
 }
 
 /// Resolve the original accepted publication to its complete transaction and
@@ -168,9 +168,9 @@ pub(crate) async fn capture(
             async move {
                 let (point, pin) = admit(&record, archive, deployment, pin_id, selected)?;
                 let bucket = archive.bucket(Arc::clone(&io)).await?;
-                let (catalog, material) = read_base_catalog(Arc::clone(&bucket), &point, &pin.manifest_sha256, keys).await?;
+                let (catalog, cipher) = read_base_catalog(Arc::clone(&bucket), &point, &pin.manifest_sha256, keys).await?;
                 let stream_name = record.stream("replica");
-                let artifact = suffix_artifact(bucket.as_ref(), &material, deployment, pin_id, pin, &stream_name)?;
+                let artifact = suffix_artifact(bucket.as_ref(), cipher, deployment, pin_id, pin, &stream_name)?;
 
                 let digest = if let Some(expected) = &pin.archive_sha256 {
                     artifact.read_manifest(archive_digest(expected)?).await?;
@@ -264,11 +264,11 @@ fn admits_custody(record: &DeploymentRecord, suffix: Uuid, pin: &CheckpointSuffi
 
 pub(super) async fn apply_archived(
     bucket: &dyn ObjectStore, deployment: Uuid, suffix: Uuid, stream: String,
-    pin: &CheckpointSuffixPin, material: &[u8; crate::keys::KEY_BYTES],
+    pin: &CheckpointSuffixPin, cipher: Arc<dyn ArchiveKey>,
     recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
 ) -> Result<()> {
     let expected = pin.archive_sha256.as_deref().ok_or_else(suffix_unavailable)?;
-    let artifact = suffix_artifact(bucket, material, deployment, suffix, pin, &stream)?;
+    let artifact = suffix_artifact(bucket, cipher, deployment, suffix, pin, &stream)?;
     let expected = artifact.read_manifest(archive_digest(expected)?).await?;
     let catalog = recovered.block.as_ref().ok_or_else(suffix_unavailable)?;
     let mut progress = SuffixProgress::new(pin, catalog)?;
@@ -303,7 +303,7 @@ pub(super) async fn apply_archived(
 }
 
 fn suffix_artifact<'a>(
-    bucket: &'a dyn ObjectStore, material: &[u8], deployment: Uuid, suffix: Uuid,
+    bucket: &'a dyn ObjectStore, cipher: Arc<dyn ArchiveKey>, deployment: Uuid, suffix: Uuid,
     pin: &CheckpointSuffixPin, stream: &str,
 ) -> Result<ReplicaArtifact<'a>> {
     let mut identity = pin.clone();
@@ -313,7 +313,7 @@ fn suffix_artifact<'a>(
     identity.writer_epoch = 0;
     identity.archive_sha256 = None;
     ReplicaArtifact::new(
-        bucket, material, format!("{}/v2", archive_prefix(deployment, suffix, pin)),
+        bucket, cipher, format!("{}/v2", archive_prefix(deployment, suffix, pin)),
         encode(&(stream, identity))?, b"RTDB checkpoint suffix segments v2\0",
     )
 }
