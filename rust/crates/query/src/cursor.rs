@@ -758,8 +758,9 @@ impl QueryCursor {
     }
 
     /// Rechecks the units behind batches retained by a caller after a pull or encoding.
-    pub async fn delivery_grant(&self) -> Result<rtdb_storage::sealing::PlaintextDelivery> {
-        self.context.delivery_grant().await
+    pub fn delivery_grant(&self) -> impl Future<Output = Result<rtdb_storage::sealing::PlaintextDelivery>> + Send + use<> {
+        let context = Arc::clone(&self.context);
+        async move { context.delivery_grant().await }
     }
 
     pub async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
