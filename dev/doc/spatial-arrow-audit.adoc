@@ -119,6 +119,16 @@ The geometry kernel consumes the geometry carrier for coverings and exact predic
 Bijection converts application values at its API boundary and preserves their canonical images for document semantics.
 Owned action headers carry authorization, framing, and held-read controls.
 
+== Remaining control-plane conversions
+
+Bijection's `schema_predecessor` and `open_root_facts` read the installed owner, schema digest, and relation inventory over PostgreSQL before staging or opening deploy hooks.
+`read_accepted_layouts` receives row records and decodes each declaration body in that transaction.
+The Arrow hosted-control point action can read one declared key at a held cut.
+The preparation path still needs a held Arrow inventory that returns all active declarations under the same owner and program observation.
+
+The schema preparation caller also encodes the analyzed successor schema as JSON before the native runtime decodes it to compare table definitions.
+The persisted program schema and its digest already use those exact bytes.
+
 == Bijection and RTDB Flight integration tests
 
 `rust/conformance/run_hosted_spatial_pair.py` starts isolated standalone and placed RTDB databases and uses a loopback TLS relay for the Bijection client.
