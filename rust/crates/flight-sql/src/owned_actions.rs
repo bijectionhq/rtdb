@@ -645,7 +645,7 @@ fn audience_point_admitted(
     relation == projection
         || (recovering && relation.name() == "fact_layout_readiness")
         || (relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
-            && matches!(id, EntityId::String(id) if id == "head" || id == "sync_receipt_head"
+            && matches!(id, EntityId::String(id) if id == "sync_receipt_head"
                 || id.strip_prefix("fact_partition_head:") == Some(projection.name())))
 }
 
@@ -4806,6 +4806,7 @@ mod audience_projection_tests {
         assert!(audience_point_admitted(&visible, &visible, &id("doc"), false));
         assert!(!audience_point_admitted(&visible, &hidden, &id("doc"), false));
         assert!(audience_point_admitted(&visible, &markers, &id("fact_partition_head:visible"), false));
+        assert!(!audience_point_admitted(&visible, &markers, &id("head"), false));
         assert!(!audience_point_admitted(&visible, &markers, &id("fact_partition_head:hidden"), false));
         assert!(!audience_point_admitted(&visible, &readiness, &id("layout"), false));
         assert!(audience_point_admitted(&visible, &readiness, &id("layout"), true));

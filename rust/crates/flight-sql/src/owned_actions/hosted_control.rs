@@ -2,6 +2,20 @@ use super::*;
 
 pub(crate) const READ_HELD_HOSTED_CONTROL_V2: &str = "rtdb.owned.ReadHeldHostedControl.v2";
 
+pub(super) fn require_audience_control(
+    session: &crate::state::Session, relation: &str, id: &str,
+) -> Result<(), Status> {
+    if session.audience_source().is_some() && !audience_control_admitted(relation, id) {
+        return Err(Status::permission_denied("The control is outside the prepared audience"));
+    }
+    Ok(())
+}
+
+fn audience_control_admitted(relation: &str, id: &str) -> bool {
+    // Provider discovery belongs to the ordinary authentication path.
+    (relation, id) != ("bj_fact_root_admission", "provider_issuers")
+}
+
 impl Service {
     pub(super) fn hosted_control_policy(
         &self,
@@ -70,6 +84,7 @@ impl Service {
             return Err(invalid("Hosted control point ID exceeds its bound"));
         }
         let _key = call.reserve(id.len() * 4 + 1024)?;
+        require_audience_control(&call.session, table.name(), id)?;
         let scope = self.hosted_control_scope(call).await?;
         let target = rtdb_tx::HostedControlWrite::check(
             table,
@@ -139,4 +154,15 @@ pub(super) fn admit_control_targets<'a>(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    #[test]
+    fn provider_discovery_is_outside_audience_control_admission() {
+        assert!(!audience_control_admitted("bj_fact_root_admission", "provider_issuers"));
+        assert!(audience_control_admitted("bj_fact_root_admission", "application"));
+    }
 }

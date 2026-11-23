@@ -3413,6 +3413,9 @@ actor Gateway {
     -- Close and expiry end session admission, while the seat stays charged until the session and its retained I/O drain.
     -- A displaced session authorizes cleanup on its original holder.
     -- Every new data action checks current placement standing.
+    -- An audience placement must recover its commissioning checkpoint before it serves.
+    -- Each prepared capture checks its catalog pin and projected transaction floor while standing is fenced by the current holder and writer epoch.
+    -- Audience actions exclude the whole-Root publication head and the provider-issuer control.
     -- An audience historical Root page scans at most five forward nominations under the prepared read, at equal valid and system coordinates less than 60 seconds before the hold.
     -- A detached audience operation polls with the same action and turn allowances as its admitting call.
     -- Each provider attempt spends its work charge from the action allowance and from the shared turn allowance when present.

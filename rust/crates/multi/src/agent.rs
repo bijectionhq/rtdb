@@ -648,14 +648,26 @@ impl NodeAgent {
                 return Err(unavailable());
             }
         }
-        require_recovered_checkpoint(&record, database)?;
         match check {
-            HostedReadCheck::Ordinary => self.confirm_holder(name, &id, None).await?,
+            HostedReadCheck::Ordinary => {
+                require_recovered_checkpoint(&record, database)?;
+                self.confirm_holder(name, &id, None).await?;
+            },
             HostedReadCheck::AudienceRoute => {}
             HostedReadCheck::AudienceCapture => {
                 let port = self.options.audience_journal_port.ok_or_else(unavailable)?;
                 self.confirm_holder(name, &id, Some(port)).await?;
             }
+        }
+        // The holder recovers its commissioning checkpoint before it is
+        // installed. Audience captures prove their own pinned catalog and
+        // projected floor, even as the directory's maintenance cut advances.
+        if !matches!(check, HostedReadCheck::Ordinary)
+            && !self.holdings.lock().get(name).is_some_and(|holding|
+                holding.epoch == epoch && holding.linearizable
+                    && std::ptr::eq(holding.database.as_ptr(), database))
+        {
+            return Err(unavailable());
         }
         Ok(id)
     }
