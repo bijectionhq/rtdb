@@ -525,7 +525,7 @@ impl Node {
                     AppliedCatalogAdmission::PrepareAudience(storage) =>
                         storage.hold_catalog(Some(cut)).await?,
                     AppliedCatalogAdmission::Ordinary =>
-                        database.storage.hold_catalog(Some(cut)).await?,
+                        database.storage.hold_catalog_with_primary(Some(cut), snapshot.compacted_primary_paths()).await?,
                 };
                 if !permit.is_registered() { return Err(applied_catalog_unretained()); }
                 let history = match admission {

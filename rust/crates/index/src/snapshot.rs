@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, OwnedRelation, Result, TableRef, Timestamp, TransactionKey};
 
-use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
+use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, TrieState, absent_type};
 
 #[derive(Clone)]
 struct CatalogRead { permit: Arc<dyn std::any::Any + Send + Sync> }
@@ -61,6 +61,28 @@ impl Snapshot {
     /// Returns the conservative installed prefix captured with this physical catalog.
     /// Callers must also bind the opened database and residence before comparing cuts across nodes.
     pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
+    /// Complete paths for compacted primary tries in this captured catalog.
+    /// An oversized inventory must retain the conservative scope.
+    pub fn compacted_primary_paths(&self) -> Option<Arc<[String]>> {
+        let mut paths = Vec::new();
+        let mut bytes = 0usize;
+        for table in self.trie_catalog.tables() {
+            let entry = self.table_catalog.entry(table)?;
+            for trie in self.trie_catalog.iter_tries(table).filter(|trie| trie.key.level() > 0 && trie.state == TrieState::Live) {
+                for path in [entry.slug.data_key(&trie.key), entry.slug.metadata_key(&trie.key)] {
+                    bytes = bytes.checked_add(path.len().checked_mul(6)?.checked_add(16)?)?;
+                    if bytes > rtdb_types::CATALOG_PRIMARY_PATH_BYTES {
+                        return None;
+                    }
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        Some(paths.into())
+    }
+
     /// Transfers the store's captured catalog registration into this snapshot and its clones.
     pub fn with_catalog_read(mut self, permit: Arc<dyn std::any::Any + Send + Sync>) -> Self {
         self.catalog_read = Some(CatalogRead { permit });

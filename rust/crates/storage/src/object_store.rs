@@ -161,6 +161,11 @@ pub trait ObjectStore: Send + Sync {
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
+    /// Registers complete paths for the compacted primary files in this captured catalog.
+    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, _paths: Arc<[String]>)
+        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        self.retain_catalog(cut).await
+    }
     /// Whether physical trie retirement belongs to a coordinated storage authority.
     fn defers_trie_releases(&self) -> bool { false }
     /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.

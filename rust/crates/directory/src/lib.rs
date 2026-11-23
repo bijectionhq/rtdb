@@ -416,6 +416,9 @@ pub struct CatalogReader {
     pub replica_epoch: i32,
     /// Exact and restored captures can have no installed replica cut.
     pub cut: Option<rtdb_types::CatalogCut>,
+    /// Complete for compacted primary paths within this captured catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_primary_paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

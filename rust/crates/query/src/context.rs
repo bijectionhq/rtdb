@@ -22,12 +22,13 @@ pub async fn retain_catalog_snapshot(snapshot: Snapshot, storage: &BufferPool) -
 
 async fn hold_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Arc<HeldCatalogRead>> {
     let cut = snapshot.catalog_cut();
+    let paths = cut.and_then(|_| snapshot.compacted_primary_paths());
     if let Some(hold) = snapshot.catalog_read_permit::<HeldCatalogRead>()
-        && storage.holds_catalog(&hold, cut)
+        && storage.holds_catalog_with_primary(&hold, cut, paths.as_deref())
     {
         return Ok(hold);
     }
-    storage.hold_catalog(cut).await
+    storage.hold_catalog_with_primary(cut, paths).await
 }
 
 #[derive(Clone, Debug)]

@@ -1205,7 +1205,10 @@ fn remember_release(released: &mut BTreeMap<ObjectKey, Vec<PhysicalObjectVersion
 }
 
 fn is_collected_trie_file(key: &str) -> bool {
-    if rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) { return true; }
+    rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) || is_compacted_primary_file(key)
+}
+
+fn is_compacted_primary_file(key: &str) -> bool {
     let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
     name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
         .and_then(|file| file.strip_suffix(".arrow"))
@@ -1213,7 +1216,7 @@ fn is_collected_trie_file(key: &str) -> bool {
         .is_some_and(|trie| trie.level() > 0)
 }
 
-fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord) -> bool {
+fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord, exact: bool) -> bool {
     if release.key.starts_with("oversized/") { return false; }
     let Some(required) = &release.trie_floor else {
         return record.storage_namespaces.is_none() || !is_collected_trie_file(&release.key);
@@ -1226,6 +1229,8 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
         && store == format!("{residence}/{root}")
         && record.storage_namespaces.is_some_and(|value| value.objects == required.object_namespace)
         && cut.replica_epoch.0 == record.log_epoch
+        && crate::catalog_readers::readers_allow(record, &root, cut,
+            (exact && is_compacted_primary_file(&release.key)).then_some(release.key.as_str()))
         && record.catalog_admission_floors.get(&root).is_some_and(|floor| {
             floor.residence == required.residence && floor.object_namespace == required.object_namespace
                 && floor.cut.storage_version == cut.storage_version && floor.cut.storage_epoch == cut.storage_epoch
@@ -1258,6 +1263,11 @@ impl ObjectStore for GarbageStore {
         let Some(readers) = &self.catalog_readers else { return Ok(None); };
         readers.retain(cut).await.map(Some)
     }
+    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
+        -> Result<Option<Arc<dyn Send + Sync>>> {
+        let Some(readers) = &self.catalog_readers else { return Ok(None); };
+        readers.retain_with_primary(cut, Some(paths)).await.map(Some)
+    }
     fn defers_trie_releases(&self) -> bool { self.catalog_readers.is_some() }
     fn releases_receipt_l0(&self) -> bool { self.catalog_readers.is_some() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
@@ -1268,14 +1278,19 @@ impl ObjectStore for GarbageStore {
         let readers = self.catalog_readers.as_ref().ok_or_else(|| Anomaly::unsupported(
             "rtdb.multi/trie-release", "This store has no coordinated catalog floor"))?;
         let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
-        let Some(floor) = readers.admit_trie_release(installed.cut()).await? else { return Ok(false); };
         let mut files: Vec<_> = installed.files().iter().collect();
         files.sort_by_key(|file| file.release_order());
-        for file in files {
+        let paths = files.iter().map(|file| {
+            let exact = file.terminal_publication.is_some() || file.matches_publication && file.version.is_some();
+            (exact && is_compacted_primary_file(&file.key)).then_some(file.key.as_str())
+        }).collect::<Vec<_>>();
+        let (floor, allowed) = readers.close_admission(installed.cut(), &paths).await?;
+        for (file, allowed) in files.into_iter().zip(&allowed) {
+            if !allowed { continue; }
             let version = file.version.as_ref().filter(|_| file.matches_publication);
             self.write_release_record(&ObjectKey::new(&file.key)?, Some(floor.clone()), version, None, file.terminal_publication.as_ref()).await?;
         }
-        Ok(true)
+        Ok(allowed.into_iter().all(|allowed| allowed))
     }
     async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
@@ -1454,7 +1469,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 StoredRelease::Replica { .. } => { reaped.waiting += 1; continue; }
                 StoredRelease::Path(record) => record,
             };
-            if !permits_release(record, &store, &released) || !recovery_covers_release(record, &released)
+            if !permits_release(record, &store, &released, false) || !recovery_covers_release(record, &released)
                 || !oversized_payload_collectable(record, &released.key, now_ms)
                 || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
                 .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))

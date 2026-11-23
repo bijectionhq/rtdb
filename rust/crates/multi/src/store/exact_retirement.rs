@@ -49,7 +49,7 @@ impl ReleaseWitness {
         if let Some(replica) = &self.replica {
             return self.version.as_ref().is_some_and(|version| replica.permits(owner, store, version));
         }
-        permits_release(owner, store, &self.record) && recovery_covers_release(owner, &self.record)
+        permits_release(owner, store, &self.record, self.pack.is_none() && (self.version.is_some() || self.terminal.is_some())) && recovery_covers_release(owner, &self.record)
             && super::oversized_payload_collectable(owner, &self.record.key, rtdb_directory::now_ms())
     }
 }

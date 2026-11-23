@@ -174,7 +174,8 @@ Query and fragment admission on coordinated storage uses the catalog hold withou
 Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
 The coordinated collector submits the installed receipt to the storage owner, which owns the pending decision and the deletion grant.
 The approved reachability contract replaces the cutoff for deletion.
-The coordinated receipt path still uses the conservative cutoff pending implementation of complete dependency claims.
+For hosted loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
+Complete claims for other file kinds, classic storage, and all recovery roots remain open.
 Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
 
 |5
