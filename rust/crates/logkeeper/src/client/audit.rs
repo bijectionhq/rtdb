@@ -36,7 +36,9 @@ pub async fn certify_observed_entry(
     let ensemble = Ensemble::new(config.clone());
     let mut responses = (0..ensemble.len()).map(|server| {
         let ensemble = &ensemble;
-        async move { (server, ensemble.digest_page(server, offset, offset, None).await) }
+        async move {
+            (server, ensemble.digest_page(server, offset, offset, None).await.map_err(Anomaly::from))
+        }
     }).collect::<FuturesUnordered<_>>();
     let mut agreed = None;
     let mut agreeing = 0;
