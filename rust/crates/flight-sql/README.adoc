@@ -257,7 +257,7 @@ Relations without a declaration continue to infer their schema.
 === Holding one owned read cut
 
 Use `rtdb.owned.OpenRead.v3` with an empty body to reserve one present and retain its exact applied catalog.
-The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
+The result has 16 opaque handle bytes followed by three signed big-endian i64 fields for the SQL system time in Unix microseconds, the ordered transaction ID, and the receiver clock observation in Unix microseconds.
 `rtdb.owned.OpenAppliedRead.v5` requests an already-applied hosted catalog from the current recovered holder.
 Its input is the 16-byte source installation UUID, a one-byte count from one to four, and that many exact transaction keys.
 Each key is a signed big-endian i64 transaction ID followed by a signed big-endian i64 ordered microsecond time.

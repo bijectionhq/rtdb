@@ -36,6 +36,7 @@ mod system;
 mod inspection;
 mod trace;
 mod settings;
+pub use settings::{SnapshotAdmission, SnapshotTokenIssuer, SqlSnapshotView};
 mod pages;
 mod analysis;
 mod batch_join;

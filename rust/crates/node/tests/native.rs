@@ -75,6 +75,8 @@ async fn a_replicated_query_without_a_current_catalog_lease_is_refused_before_ev
         let basis = QueryBasis {
             snapshot: node.snapshot_basis().unwrap(),
             replica_capture: None,
+            resume_token: None,
+            has_await_floor: false,
             snapshot_time: None,
             current_time: node.query_instant(),
             timezone: "UTC".into(),
@@ -138,7 +140,6 @@ async fn an_implicit_basis_checks_the_replica_index_before_capturing_applied_his
     config.membership = Membership::Placed;
     let (node, driver) = running(config, NodeServices { resources: providers, ..services() }).await;
     let database = node.database_or_attach("shop".into(), DatabaseConfig { mode: Some(1), ..Default::default() }).await.unwrap().unwrap();
-    let historical_basis = node.snapshot_basis().unwrap();
     let mut session = node.session("shop", Arc::new(Authority)).unwrap();
     assert_eq!(session.state_mut().read_basis().await.unwrap_err().code, REPLICA_BEHIND);
 
@@ -161,16 +162,6 @@ async fn an_implicit_basis_checks_the_replica_index_before_capturing_applied_his
     let basis = tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap().unwrap();
     assert_eq!(basis.snapshot.databases["shop"], [Some(system_time.into())]);
     assert_eq!(session.state_mut().read_basis().await.unwrap(), basis);
-    let mut historical = node.session("shop", Arc::new(Authority)).unwrap();
-    historical.state_mut().begin_with(TransactionSettings {
-        access: Some(AccessSettings::ReadOnly(ReadOnlySettings {
-            snapshot_token: OptionUpdate::Set(rtdb_format::basis::encode_time_basis(&historical_basis)),
-            ..Default::default()
-        })),
-        ..Default::default()
-    }).unwrap();
-    let explicit = tokio::time::timeout(Duration::from_secs(5), historical.state_mut().read_basis()).await.unwrap().unwrap();
-    assert_eq!(explicit.snapshot, historical_basis);
     stop(&node, driver).await;
 }
 
@@ -194,7 +185,7 @@ async fn a_placed_query_refuses_a_database_detached_or_replaced_while_checking_i
         let (node, driver) = running(config, services).await;
         node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
         let basis = QueryBasis {
-            snapshot: node.snapshot_basis().unwrap(), replica_capture: None, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into(),
+            snapshot: node.snapshot_basis().unwrap(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into(),
         };
         let request_node = node.clone();
         let query = tokio::spawn(async move {
@@ -1535,6 +1526,31 @@ async fn cancelled_sleep_in_begin_options_does_not_publish_a_partial_transaction
     drop(session.execute_control(&statement, &[], &token).await.unwrap());
     assert_eq!(session.state().status(), TransactionStatus::Pending);
     session.state_mut().rollback_tx().unwrap();
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn sql_snapshot_tokens_reopen_original_position_and_query_clock() {
+    let (node, driver) = running(options(), services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    writer.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap();
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let original = rows(reader.query_sql("SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    let Value::Utf8(token) = original[0][2].clone() else { panic!("expected a snapshot token"); };
+    writer.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap();
+    let live = rows(reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await;
+    assert_eq!(live, [vec![Value::I64(20)]]);
+    let reopened = rows(reader.query_sql(
+        "SETTING SNAPSHOT_TOKEN=? SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME",
+        vec![Value::Utf8(token.clone())],
+    ).await.unwrap()).await;
+    assert_eq!(reopened, original);
+    reader.state_mut().begin_with(TransactionSettings {
+        access: Some(AccessSettings::ReadOnly(ReadOnlySettings { snapshot_token: OptionUpdate::Set(token), ..Default::default() })),
+        ..Default::default()
+    }).unwrap();
+    let reopened = rows(reader.query_sql("SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    assert_eq!(reopened, original);
     stop(&node, driver).await;
 }
 
@@ -3306,7 +3322,7 @@ async fn caller_or_node_cancellation_drops_inflight_identity_refresh_before_quer
             let request = {
                 let node = node.clone(); let identity = Arc::clone(&identity); let cancellation = cancellation.clone();
                 tokio::spawn(async move {
-                    let basis = QueryBasis { snapshot: node.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
+                    let basis = QueryBasis { snapshot: node.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
                     node.query_context("xtdb", &basis, identity.as_ref(), &cancellation).await
                 })
             };
@@ -3323,7 +3339,7 @@ async fn caller_or_node_cancellation_drops_inflight_identity_refresh_before_quer
 async fn node_shutdown_cancels_direct_query_contexts_with_independent_caller_tokens() {
     let (node, driver) = running(options(), services()).await;
     let cancellation = CancellationToken::new();
-    let basis = QueryBasis { snapshot: node.snapshot_basis().unwrap(), replica_capture: None, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
+    let basis = QueryBasis { snapshot: node.snapshot_basis().unwrap(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
     let context = node.query_context("xtdb", &basis, &Authority, &cancellation).await.unwrap();
     let prepared = PreparedSql::prepare("SELECT 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
     let mut cursor = prepared.open_query(context, Vec::new()).await.unwrap();
@@ -3628,6 +3644,8 @@ async fn a_read_basis_after_the_latest_completed_tx_names_both_instants() {
     let basis_at = |micros: i64| QueryBasis {
         snapshot: rtdb_types::TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![Some(rtdb_types::Instant::from(Timestamp(micros)))])]) },
         replica_capture: None,
+        resume_token: None,
+        has_await_floor: false,
         snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
     let error = node.query_context("xtdb", &basis_at(1_577_836_800_000_000), &Authority, &cancellation).await.err().unwrap();
     assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb/unindexed-tx", Some("system-time (2020-01-01T00:00:00Z) is after the latest completed tx (nil)")));

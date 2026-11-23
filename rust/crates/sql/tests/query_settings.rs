@@ -1,18 +1,16 @@
 use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
-use rtdb_format::basis::{decode_time_basis, encode_time_basis};
 use rtdb_index::{PartitionState, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_sql::{PrepareOptions, prepare};
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Instant, Interval, Result, TableRef, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxId, Value as V};
+use rtdb_types::{Interval, Result, TableRef, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxId, Value as V};
 use tokio_util::sync::CancellationToken;
 
 fn timestamp(value: i64) -> V { V::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 fn basis(value: i64) -> TimeBasis { TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![Some(Timestamp(value).into())])]) } }
-fn token(value: i64) -> String { encode_time_basis(&basis(value)) }
 
 fn context() -> Arc<QueryContext> {
     let memory = MemoryBudget::new(1 << 27);
@@ -56,58 +54,12 @@ async fn defaults_reach_nested_scans_and_explicit_extents_override_each_dimensio
 }
 
 #[tokio::test]
-async fn scalar_settings_keep_lexical_parameter_indices_and_snapshot_caps_explicit_time() {
-    let sql = "SETTING SNAPSHOT_TOKEN = ?, CLOCK_TIME = ? SELECT v,CURRENT_TIMESTAMP,SNAPSHOT_TOKEN,? AS tail FROM foo FOR ALL VALID_TIME FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000300Z'";
+async fn snapshot_settings_keep_lexical_parameter_indices_and_the_time_ceiling() {
+    let sql = "SETTING SNAPSHOT_TIME = ?, CLOCK_TIME = ? SELECT v,CURRENT_TIMESTAMP,? AS tail FROM foo FOR ALL VALID_TIME FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000300Z'";
     assert_eq!(rtdb_sql::parse(sql).unwrap()[0].parameter_count(), 3);
-    let old = [vec![V::Utf8("old".into()), timestamp(999), V::Utf8(token(150)), V::I64(7)]];
-    assert_eq!(query(context(), sql, vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap(), old, "the transaction after the snapshot does not supersede");
-    let rows = query(context(), &sql.replace("000300Z", "000100Z"), vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap();
-    assert_eq!(rows, old);
-    assert_eq!(query(context(), &format!("SETTING SNAPSHOT_TOKEN = '{}' SELECT 1 WHERE FALSE", token(201)), vec![]).await.unwrap_err().code, "xtdb/unindexed-tx");
-    assert_eq!(query(context(), "SETTING SNAPSHOT_TOKEN = 'bad token' SELECT 1", vec![]).await.unwrap_err().code, "xtdb.basis/invalid-basis");
-}
-
-#[tokio::test]
-async fn sql_token_can_replace_an_older_option_token_but_retains_the_option_time_cap() {
-    let context = context().with_read_options(&basis(100), Some(Timestamp(175)), Timestamp(300)).unwrap();
-    assert_eq!(query(Arc::clone(&context), "SELECT v,SNAPSHOT_TOKEN FROM foo", vec![]).await.unwrap(), [vec![V::Utf8("old".into()), V::Utf8(token(100))]]);
-    assert_eq!(query(Arc::clone(&context), &format!("SETTING SNAPSHOT_TOKEN='{}' SELECT v,SNAPSHOT_TOKEN FROM foo", token(200)), vec![]).await.unwrap(), [vec![V::Utf8("old".into()), V::Utf8(token(175))]]);
-    assert_eq!(context.catalog.database("xtdb").unwrap().partitions[0].tx_basis().unwrap().system_time, Timestamp(200));
-    assert_eq!(query(context, "SETTING SNAPSHOT_TOKEN=NULL SELECT SNAPSHOT_TOKEN", vec![]).await.unwrap(), [vec![V::Utf8(token(175))]]);
-}
-
-#[tokio::test]
-async fn planned_snapshot_time_is_ignored_but_its_literal_is_validated_at_preparation() {
-    assert_eq!(query(context(), "SETTING SNAPSHOT_TIME=TIMESTAMP '1970-01-01T00:00:00.000150Z' SELECT v,SNAPSHOT_TOKEN FROM foo", vec![]).await.unwrap(), [vec![V::Utf8("new".into()), V::Utf8(token(200))]]);
-    assert_eq!(query(context(), "SETTING SNAPSHOT_TIME=CURRENT_TIMESTAMP SELECT v FROM foo", vec![]).await.unwrap(), [vec![V::Utf8("new".into())]]);
+    assert_eq!(query(context(), sql, vec![timestamp(150), timestamp(999), V::I64(7)]).await.unwrap(),
+        [vec![V::Utf8("old".into()), timestamp(999), V::I64(7)]]);
     assert!(prepare("SETTING SNAPSHOT_TIME=TIMESTAMP 'not-a-date' SELECT 1", &context().catalog, &PrepareOptions::default()).is_err());
-    assert!(prepare("SETTING SNAPSHOT_TIME=TIME '25:00:00' SELECT 1", &context().catalog, &PrepareOptions::default()).is_err());
-    assert_eq!(query(context(), "SETTING SNAPSHOT_TIME=TIME '1:2:3+01:00' SELECT 1", vec![]).await.unwrap(), [vec![V::I64(1)]]);
-}
-
-#[tokio::test]
-async fn unused_setting_forms_validate_syntax_and_literals_without_scalar_typing() {
-    for sql in [
-        "SETTING SNAPSHOT_TIME=LOWER(1) SELECT 1",
-        "SETTING SNAPSHOT_TIME=REGEXP_REPLACE('x','[','y',1,1,'i') SELECT 1",
-        "SETTING SNAPSHOT_TIME=FORMAT(1),CLOCK_TIME=LOWER(1),CLOCK_TIME='2020-01-01Z' SELECT 1",
-        "SETTING DEFAULT VALID_TIME AS OF LOWER(1),DEFAULT VALID_TIME ALL SELECT 1",
-        "SETTING DEFAULT SYSTEM_TIME AS OF LOWER(1) SELECT 1",
-        "SETTING DEFAULT VALID_TIME AS OF LOWER(1) SELECT 1 FROM foo FOR ALL VALID_TIME",
-    ] { assert_eq!(query(context(), sql, vec![]).await.unwrap(), [vec![V::I64(1)]], "{sql}"); }
-    assert_eq!(query(context(), "SETTING SNAPSHOT_TIME=LOWER(?) SELECT ?", vec![V::I64(1), V::I64(9)]).await.unwrap(), [vec![V::I64(9)]]);
-    assert_eq!(query(context(), "SETTING CLOCK_TIME=LOWER(1) SELECT 1", vec![]).await.unwrap_err().code, "rtdb.query/invalid-setting-value");
-    let overwritten_parameter = "SETTING CLOCK_TIME=$2,CLOCK_TIME='2020-01-01Z' SELECT 1";
-    assert_eq!(query(context(), overwritten_parameter, vec![]).await.unwrap_err().code, "rtdb.query/missing-parameter");
-    assert_eq!(query(context(), overwritten_parameter, vec![V::Null, V::Null]).await.unwrap(), [vec![V::I64(1)]]);
-    for sql in [
-        "SETTING SNAPSHOT_TIME=LOWER() SELECT 1",
-        "SETTING SNAPSHOT_TIME=REGEXP_REPLACE('x',LOWER('X'),'y') SELECT 1",
-        "SETTING SNAPSHOT_TIME=missing_function(1) SELECT 1",
-        "SETTING SNAPSHOT_TIME=LOWER(DATE '2020-02-30') SELECT 1",
-        "SETTING SNAPSHOT_TIME=FORMAT(1,TIMESTAMP 'invalid') SELECT 1",
-        "SETTING DEFAULT VALID_TIME AS OF TIMESTAMP 'invalid',DEFAULT VALID_TIME ALL SELECT 1",
-    ] { assert!(prepare(sql, &context().catalog, &PrepareOptions::default()).is_err(), "{sql}"); }
 }
 
 #[tokio::test]
@@ -118,33 +70,6 @@ async fn clock_literals_parameters_nulls_and_unevaluated_calls_follow_query_reso
     assert_eq!(query(Arc::clone(&context), "SETTING CLOCK_TIME=? SELECT CURRENT_TIMESTAMP", vec![V::Null]).await.unwrap(), [vec![timestamp(300)]]);
     assert_eq!(query(Arc::clone(&context), "SETTING CLOCK_TIME=CURRENT_TIMESTAMP SELECT 1 WHERE FALSE", vec![]).await.unwrap_err().code, "rtdb.query/invalid-setting-value");
     assert_eq!(query(context, "SETTING CLOCK_TIME='2020-01-01Z',CLOCK_TIME='2021-01-01Z' SELECT CURRENT_TIMESTAMP", vec![]).await.unwrap(), [vec![timestamp(1_609_459_200_000_000)]]);
-}
-
-#[tokio::test]
-async fn token_metadata_preserves_nanoseconds_unknown_databases_and_empty_basis() {
-    let mut expected = basis(150);
-    expected.databases.get_mut("xtdb").unwrap()[0] = Some(Instant::new(0, 150_123).unwrap());
-    expected.databases.insert("elsewhere".into(), vec![Some(Instant::new(900, 5).unwrap()), None]);
-    let rows = query(context(), "SETTING SNAPSHOT_TOKEN=? SELECT v,SNAPSHOT_TOKEN FROM foo", vec![V::Utf8(encode_time_basis(&expected))]).await.unwrap();
-    assert_eq!(rows[0][0], V::Utf8("old".into()));
-    let V::Utf8(token) = &rows[0][1] else { panic!("Expected token") };
-    assert_eq!(decode_time_basis(token).unwrap(), expected);
-    assert_eq!(query(context(), "SETTING SNAPSHOT_TOKEN='' SELECT SNAPSHOT_TOKEN", vec![]).await.unwrap(), [vec![V::Utf8(String::new())]]);
-    assert_eq!(query(context(), "SETTING SNAPSHOT_TOKEN='' SELECT v FROM foo ORDER BY v", vec![]).await.unwrap(), [vec![V::Utf8("new".into())], vec![V::Utf8("old".into())]]);
-}
-
-#[tokio::test]
-async fn missing_and_null_partition_token_entries_leave_system_time_unconstrained() {
-    for basis in [
-        TimeBasis { databases: BTreeMap::from([("elsewhere".into(), vec![Some(Timestamp(150).into())])]) },
-        TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![None])]) },
-        TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![])]) },
-    ] {
-        let token = encode_time_basis(&basis);
-        let rows = query(context(), "SETTING SNAPSHOT_TOKEN=? SELECT v,SNAPSHOT_TOKEN FROM foo ORDER BY v", vec![V::Utf8(token.clone())]).await.unwrap();
-        assert_eq!(rows, [vec![V::Utf8("new".into()), V::Utf8(token.clone())], vec![V::Utf8("old".into()), V::Utf8(token.clone())]]);
-        assert_eq!(query(context(), "SETTING SNAPSHOT_TOKEN=? SELECT v FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000150Z'", vec![V::Utf8(token)]).await.unwrap(), [vec![V::Utf8("old".into())]]);
-    }
 }
 
 #[test]

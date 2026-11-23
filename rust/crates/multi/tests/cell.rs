@@ -4093,7 +4093,7 @@ async fn a_held_reader_keeps_the_cut_of_its_captured_catalog() {
     client.simple_query("INSERT INTO docs (_id, v) VALUES (1, 17)").await.unwrap();
     let holder = cell.holder("shop").await.unwrap();
     let node = cell.node(holder).server.node();
-    let basis = rtdb_node::QueryBasis { snapshot: node.snapshot_basis().unwrap(), replica_capture: None, snapshot_time: None,
+    let basis = rtdb_node::QueryBasis { snapshot: node.snapshot_basis().unwrap(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None,
         current_time: node.query_instant(), timezone: "UTC".into() };
     let cancellation = tokio_util::sync::CancellationToken::new();
     let capture = node.query_context("shop", &basis, &Reader, &cancellation).await.unwrap();

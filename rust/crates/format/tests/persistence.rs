@@ -7,7 +7,7 @@ use prost::Message;
 use rtdb_format::{basis, columns, data::{EventBatch, StoredEvent, StoredOperation, build_event_batch}, envelope::SourceMessage, ipc, keys::*};
 use rtdb_format::catalog::{BlockCatalog, FIRST_TABLE_OID, TableBlock};
 use rtdb_format::generated::xtdb::{block::proto::Block, log::proto as pb};
-use rtdb_types::{BlockIndex, EventOp, Iid, Instant, Interval, ListKind, LogicalType, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, TimeBasis, Timestamp, TxBasis, TxId, Value};
+use rtdb_types::{BlockIndex, EventOp, Iid, Interval, ListKind, LogicalType, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp, TxBasis, TxId, Value};
 
 #[test]
 fn partition_roots_preserve_the_single_partition_namespace() {
@@ -174,13 +174,9 @@ fn legacy_block_names_allocate_oids_in_name_order() {
 }
 
 #[test]
-fn basis_tokens_keep_partition_order_and_nanoseconds() {
+fn await_tokens_keep_partition_order() {
     let tx = TxBasis { databases: BTreeMap::from([("xtdb".into(), vec![TxId(0), TxId(42)])]) };
     assert_eq!(basis::decode_tx_basis(&basis::encode_tx_basis(&tx)).unwrap(), tx);
-    let time = TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![None, Some(Instant::new(-1, 999_999_999).unwrap()), Some(Instant::new(1, 1).unwrap())])]) };
-    assert_eq!(basis::decode_time_basis(&basis::encode_time_basis(&time)).unwrap(), time);
-    let epoch = TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![Some(Instant::new(0, 0).unwrap())])]) };
-    assert_eq!(basis::decode_time_basis(&basis::encode_time_basis(&epoch)).unwrap().databases["xtdb"], [None]);
     assert!(basis::decode_tx_basis("invalid%%").is_err());
 }
 

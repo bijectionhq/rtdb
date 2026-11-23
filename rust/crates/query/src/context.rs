@@ -224,6 +224,8 @@ pub struct QueryContext {
     pub(crate) application_name: Option<(Arc<str>, Arc<rtdb_columnar::MemoryReservation>)>,
     pub(crate) operator_root: Option<Arc<Self>>,
     pub(crate) read_basis: Option<Arc<crate::settings::ReadBasis>>,
+    pub(crate) snapshot_admission: Option<Arc<dyn crate::settings::SnapshotAdmission>>,
+    pub(crate) snapshot_tokens: Option<Arc<crate::settings::SnapshotTokenIssuer>>,
     pub(crate) accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>,
     pub(crate) query_cpu: Option<Arc<crate::QueryCpu>>,
     plaintext: Option<Arc<PlaintextView>>,
@@ -240,7 +242,7 @@ impl QueryContext {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None }))
     }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
     pub fn with_observer(mut self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {

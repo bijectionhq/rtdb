@@ -156,6 +156,7 @@ pub struct Node {
     read_fence: Option<Arc<dyn ReadFence>>,
     scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
     placement_slots: Option<Arc<Semaphore>>,
+    sql_snapshots: Arc<crate::sql_snapshots::SqlSnapshots>,
 }
 
 pub struct NodeDriver {
@@ -241,7 +242,9 @@ impl Node {
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, placement_slots };
+        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, placement_slots,
+            sql_snapshots: Arc::default() };
+        node.sql_snapshots.start(node.cancellation.clone());
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -594,6 +597,8 @@ impl Node {
         let applied_basis = applied.map(|selected| QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(selected.system_time.into())])]) },
             replica_capture: None,
+            resume_token: None,
+            has_await_floor: false,
             snapshot_time: Some(selected.system_time),
             current_time: basis.current_time,
             timezone: basis.timezone.clone(),
@@ -728,7 +733,7 @@ impl Node {
 
     /// The committed outcome visible to the retry when its duplicate guard ran.
     async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
@@ -758,7 +763,7 @@ impl Node {
         Ok(None)
     }
     async fn placed_outcome(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<PlacedDecision>> {
-        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let sql = "SELECT tx_id, tx_system_time, committed FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
@@ -789,7 +794,7 @@ impl Node {
     }
 
     async fn check_placed_receipt_window(&self, database: &str, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<()> {
-        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let installed_time = match &self.factory.decision_clock {
             Some(clock) => {
@@ -881,7 +886,7 @@ impl Node {
             }
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let mut cursor = prepare_query("SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
@@ -947,7 +952,7 @@ impl Node {
     async fn read_bounded_outcome(&self, database: &str, retry: TxId, original: TransactionKey, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
         let invalid = || Anomaly::fault("rtdb.node/bounded-retry-outcome", "The bounded retry has no matching original outcome");
         if original.tx_id >= retry { return Err(invalid()); }
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions {
             parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]),
@@ -3585,6 +3590,8 @@ impl NativeSession {
         let basis = QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![selected.map(Into::into)])]) },
             replica_capture,
+            resume_token: None,
+            has_await_floor: false,
             snapshot_time: selected,
             current_time: observed.into(),
             timezone: self.state.session_timezone().to_owned(),
@@ -3634,7 +3641,8 @@ impl NativeSession {
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        prepare_query(sql, &context, &options)?.execute_column_rows(context, arguments, None).await
+        let (prepared, context) = crate::statement::prepare_query_at_snapshot(sql, context, &options, &arguments).await?;
+        prepared.execute_column_rows(context, arguments, None).await
     }
     pub async fn query_xtql(&mut self, source: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
@@ -3718,7 +3726,30 @@ impl NativeSessionService {
     }
 
     pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
-        self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation).await
+        let registry = &self.node.sql_snapshots;
+        let context = match &basis.resume_token {
+            Some(token) => {
+                let retained = registry.select(token, self.user(), database)?;
+                self.node.admit_retained_catalog(&retained.view.catalog, self.identity.as_ref(), cancellation).await?;
+                if basis.timezone != retained.view.timezone {
+                    return Err(crate::sql_snapshots::unretained());
+                }
+                let catalog = retained.view.catalog.clone().with_runtime(Arc::new(
+                    crate::runtime::NodeCatalogRuntime::new(self.node.clone(), cancellation.clone())
+                ));
+                QueryContext::with_owner(catalog, self.node.query_memory(), retained.view.current_time,
+                    retained.view.timezone.clone(), self.node.factory.options.query.clone(), cancellation,
+                    &self.node.cancellation)?.with_exact_snapshot_token(token.clone())?
+            }
+            None => self.node.query_context_in_placement(
+                database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation,
+            ).await?,
+        };
+        let admission = Arc::new(crate::sql_snapshots::SqlSnapshotAdmission {
+            node: self.node.clone(), registry: Arc::clone(registry), identity: Arc::clone(&self.identity),
+        });
+        let context = registry.with_issuer(context, self.user(), self.node.memory());
+        Ok(if basis.has_await_floor { context } else { context.with_snapshot_admission(admission) })
     }
 
     pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<HostedSourceReceipt>> {
