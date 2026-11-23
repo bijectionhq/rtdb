@@ -266,7 +266,7 @@ impl TxResolver {
         let clock = tx.observe_retention_clock(log_time).await?;
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
-        tx.write_result(&result, None, log_time, receipt_time)?;
+        tx.write_result(&result, None, Some(log_time), receipt_time)?;
         if let Some(attempt) = attempt {
             tx.retire_placed_outcomes(clock).await?;
             tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new(), false)?;
@@ -549,7 +549,7 @@ impl TxResolver {
         };
         let clock = tx.observe_retention_clock(now).await?;
         tx.retire_expired_receipts(clock).await?;
-        tx.write_result(&result, metadata.as_ref(), now, clock.time)?;
+        tx.write_result(&result, metadata.as_ref(), None, clock.time)?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(self.source_position), token, None, context)
     }
@@ -568,7 +568,7 @@ impl TxResolver {
         let clock = tx.observe_retention_clock(log_time).await?;
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
-        tx.write_result(&result, None, log_time, receipt_time)?;
+        tx.write_result(&result, None, Some(log_time), receipt_time)?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
     }
@@ -689,7 +689,7 @@ impl<'a> OpenTransaction<'a> {
         clock: retention::RetentionClock, selected: &[Operation],
     ) -> Result<ResolvedTx> {
         let options = self.options;
-        self.write_result(&result, options.user_metadata.as_ref(), log_time, clock.time)?;
+        self.write_result(&result, options.user_metadata.as_ref(), Some(log_time), clock.time)?;
         if let ResolvedInput::Placed { attempt, .. } = input {
             let controls = selected.iter().filter_map(|operation| match operation {
                 Operation::Public(TxOp::HostedControl(control)) if result.committed() && !control.is_check() => Some(control.name()),
@@ -3125,7 +3125,7 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(replay_table(), document, interval(replay.submitted_at(), replay.expires_at())?)
     }
 
-    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>, appended: Timestamp, observed: Timestamp) -> Result<()> {
+    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>, appended: Option<Timestamp>, observed: Timestamp) -> Result<()> {
         let key = result.tx_key();
         let error = result.encoded_error()?;
         let bound = error.as_ref().map_or(0, |error| error.as_slice().len()).checked_add(metadata.map(|value| value.value().retained_bytes()).transpose()?.unwrap_or(0)).and_then(|bytes| bytes.checked_add(16_384)).ok_or_else(overflow)?;
@@ -3147,7 +3147,7 @@ impl<'a> OpenTransaction<'a> {
         }
         let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
-            ("source_log_time".into(), time_value(appended)),
+            ("source_log_time".into(), appended.map(time_value).unwrap_or(Value::Null)),
             ("receipt_time".into(), time_value(observed)),
             ("committed".into(), Value::Bool(result.committed())),
             (metadata_column.clone(), Value::Null),

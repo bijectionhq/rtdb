@@ -129,12 +129,14 @@ The installed successor retires the covered compacted files through ordinary tri
 Replay checkpoints exclude covered receipt L0 files, and a compactor reset starts from the installed primary closure.
 An admitted suffix still requires the original objects for records it replays before that checkpoint.
 Placed intake releases the installed source prefix without waiting for later submissions.
+Native skip diagnostics keep the operation bytes and omit user metadata, retry guards, and the placed attempt seed.
+The original source still supplies the skipped attempt's ordered abort.
 
 In the hosted directory path, new receipt L0 data and metadata are loose objects with their own publication identities.
 Deployments enrolled in exact replica payload reclamation can settle those objects through the existing versioned reaper.
 The reaper requires an authenticated successor, an installed catalog floor, released recovery references, and a trim receipt through the removal from every known journal.
 
-M1 remains open for durable source and replica copies outside the settled trim, receipt L0 on other storage profiles, previously packed inputs, older checkpoints and archives with live recovery rights, and skipped payloads.
+M1 remains open for durable source and replica copies outside the settled trim, receipt L0 on other storage profiles, previously packed inputs, older checkpoints and archives with live recovery rights, and previously archived or legacy skipped payloads.
 Closure needs exact custodian settlement after the successor and all such references are released.
 A quiet history still needs ordered receipt-clock progress to trigger collection.
 Early erasure for metadata naming an application unit still requires an explicit association and custody contract.

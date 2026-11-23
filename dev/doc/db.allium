@@ -2090,7 +2090,9 @@ open question "Which node-local caller failures during committed database-operat
     -- The pinned JVM follower does so after applying the transaction, while LeaderLogProcessor applies the database operation before the transaction and propagates the fault.
 
 open question "How should operator-selected skipped transactions be represented in this processing model?"
-    -- The pinned resolver persists the source payload under skipped-txs before staging an aborted xt.txs row carrying xtdb/skipped-tx.
+    -- The resolver persists diagnostic operations under skipped-txs before staging an aborted xt.txs row carrying xtdb/skipped-tx.
+    -- For a native transaction envelope the diagnostic copy omits user metadata, retry guards and the placed attempt seed.
+    -- The resolver establishes the original placed outcome from the unmodified source record.
     -- Each ordered source transaction carries the raw append observation and the greatest such observation through its predecessor.
     -- The receipt clock advances atomically with the transaction outcome in the replica record and is restored at checkpoint recovery.
     -- New transaction metadata is stored in finite-lived rows outside durable transaction-result history.

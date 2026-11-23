@@ -268,14 +268,24 @@ async fn admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applie
 }
 
 #[tokio::test]
-async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
+async fn skipped_malformed_arrow_keeps_diagnostics_and_orders_the_original_attempt() {
     let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
     let seed = rtdb_types::PlacedAttemptScope::new("deployment/1/replica", 7).unwrap().issue();
-    let message = rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(proto::Tx {
+    use rtdb_format::envelope::{SourceBody, SourceMessage};
+
+    let diagnostic = proto::Tx {
         tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100),
-        user: Some("alice".into()), placed_attempt_seed: Some(seed.encode().to_vec()), ..Default::default()
+        user: Some("alice".into()), ..Default::default()
+    };
+    let message = SourceMessage::Protobuf(SourceBody::Tx(proto::Tx {
+        user_metadata: Some(vec![4, 5, 6]), placed_attempt_seed: Some(seed.encode().to_vec()),
+        bounded_retry: Some(proto::BoundedRetry {
+            nonce: Some(b"0123456789abcdef0123456789abcdef".to_vec()),
+            not_after_micros: Some(100_000),
+        }),
+        ..diagnostic.clone()
     }));
-    let expected = message.encode().unwrap();
+    let expected = SourceMessage::Protobuf(SourceBody::Tx(diagnostic)).encode().unwrap();
     let handle = fixture.handle.clone();
     let driver = tokio::spawn(fixture.driver.run());
     let position = handle.submit_source(&message, Timestamp(100)).await.unwrap();

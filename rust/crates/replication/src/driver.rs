@@ -1415,13 +1415,20 @@ impl ReplicationDriver {
             let result = match work {
                 SourceWork::Resolve(request) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
                     Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes })).await,
-                SourceWork::Skip(message) => async {
+                SourceWork::Skip(mut message) => async {
+                    let attempt = SourceTransaction::skipped_attempt(&message, position)?;
+                    if let SourceMessage::Protobuf(SourceBody::Tx(tx)) = &mut message {
+                        tx.user_metadata = None;
+                        tx.idempotency_guard = None;
+                        tx.bounded_retry = None;
+                        tx.replay_submission = None;
+                        tx.placed_attempt_seed = None;
+                    }
                     let digits = position.0.to_string();
                     let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
                     let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
                     let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
                     context.storage.object_store().put(&key, payload).await?;
-                    let attempt = SourceTransaction::skipped_attempt(&message, position)?;
                     resolver.resolve_skipped(durable, position, log_time, attempt, &context).await
                 }.await,
             };
