@@ -114,6 +114,11 @@ pub struct OwnedWorld {
 }
 
 impl OwnedWorld {
+    /// The publication inherited when this world began its own journal.
+    pub fn inherited_basis(&self) -> TransactionKey {
+        self.ancestor.as_ref().map_or(self.basis, |ancestor| ancestor.basis)
+    }
+
     pub fn root_clock(&self) -> Timestamp {
         self.parent_publication.unwrap_or(self.basis.system_time)
     }
@@ -439,6 +444,8 @@ mod tests {
         let stored = child.record();
         assert_eq!(OwnedWorld::from_record(&stored)?, child);
         assert_eq!(child.initial_clock(), Timestamp(150));
+
+        assert_eq!(child.inherited_basis().system_time, Timestamp(200));
 
         child.mode = WorldClockMode::Held { start: Timestamp(150) };
         assert!(OwnedWorld::from_record(&child.record()).is_err());

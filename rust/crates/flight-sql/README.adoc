@@ -581,7 +581,8 @@ Exact and as-of selection can also reopen an earlier Held publication on the sam
 Point, valid interval, identity, range and rank requests use that overlay position together with the unchanged pinned Root.
 
 `rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
-It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.
+It returns ordered local overlay groups after the supplied revision at or above the inherited basis.
+A retained Held child begins its journal at the inherited Held position and has no local writes. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.
 
 `rtdb.owned.PublishWorldCut.v1` registers an initial archived cut or moves a retained world to a newer verified Root cut.
