@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rtdb_types::{Anomaly, LogicalType as L, Result, Value};
 
 use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_builder_bytes, estimate_read_value_bytes, from_field, leg_name, read_value, to_field};
@@ -38,15 +38,27 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         if source.fields().get(index).is_some_and(|candidate| candidate.name() == field.name()) { Some(index) }
         else { source.fields().iter().rposition(|candidate| candidate.name() == field.name()) }
     }).collect::<Vec<_>>();
+    let direct = declared.fields().iter().zip(&positions).map(|(target, position)| {
+        let position = (*position)?;
+        let field = source.field(position);
+        let array = batch.batch().column(position);
+        if !fixed_floats(field, target) { return None; }
+        physical::relayout(Arc::clone(array), field, target).ok()
+    }).collect::<Vec<_>>();
     let mut decoded_bound = multiply(batch.batch().num_rows(), multiply(declared.fields().len(), std::mem::size_of::<Value>())?)?;
-    for position in positions.iter().flatten() {
-        for row in 0..batch.batch().num_rows() { decoded_bound = add(decoded_bound, estimate_read_value_bytes(source.field(*position), batch.batch().column(*position).as_ref(), row)?)?; }
+    for (position, direct) in positions.iter().zip(&direct) {
+        let Some(position) = position.filter(|_| direct.is_none()) else { continue; };
+        for row in 0..batch.batch().num_rows() { decoded_bound = add(decoded_bound, estimate_read_value_bytes(source.field(position), batch.batch().column(position).as_ref(), row)?)?; }
     }
     let decoded = memory.reserve(add(decoded_bound, 4096)?)?;
     let mut values = Vec::with_capacity(declared.fields().len());
-    let mut logical = Vec::with_capacity(declared.fields().len());
     let mut fields = Vec::with_capacity(declared.fields().len());
-    for (field, position) in declared.fields().iter().zip(&positions) {
+    for ((field, position), direct) in declared.fields().iter().zip(&positions).zip(&direct) {
+        if let Some((physical, _)) = direct {
+            fields.push(physical.clone());
+            values.push(None);
+            continue;
+        }
         let target = from_field(field)?;
         let source_type = position.map(|position| from_field(source.field(position))).transpose()?.unwrap_or(L::Null);
         if position.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
@@ -56,12 +68,20 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
             None => Ok(Value::Null),
         }).collect::<Result<Vec<_>>>()?;
         let physical = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
-        fields.push(physical); logical.push(ty); values.push(column);
+        fields.push(physical); values.push(Some((ty, column)));
     }
-    let bound = logical.iter().zip(&values).try_fold(schema_bound, |bytes, (ty, values)| add(bytes, multiply(estimate_builder_bytes(ty, values)?, 2)?))?;
+    let bound = values.iter().zip(&direct).try_fold(schema_bound, |bytes, (values, direct)| {
+        match (values, direct) {
+            (_, Some((_, array))) => add(bytes, array.get_array_memory_size()),
+            (Some((ty, values)), None) => add(bytes, multiply(estimate_builder_bytes(ty, values)?, 2)?),
+            _ => Err(fault("page-outside-declared-type", "Page conformer lost a field")),
+        }
+    })?;
     let output = memory.reserve(bound)?;
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(fields.len());
-    for (((ty, values), field), target) in logical.iter().zip(&values).zip(&mut fields).zip(declared.fields()) {
+    for (((values, field), target), direct) in values.iter().zip(&mut fields).zip(declared.fields()).zip(direct) {
+        if let Some((_, array)) = direct { arrays.push(array); continue; }
+        let (ty, values) = values.as_ref().ok_or_else(|| fault("page-outside-declared-type", "Page conformer lost a field"))?;
         let (physical, array) = physical::relayout(copy_array(ty, values)?, field, target)?;
         *field = physical;
         arrays.push(array);
@@ -71,6 +91,14 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
     let batch = OwnedBatch::with_reservation(physical, output)?;
     drop(values); drop(decoded);
     Ok(DeclaredBatch { batch, declared, _reservation: reservation })
+}
+
+fn fixed_floats(source: &Field, target: &Field) -> bool {
+    if !source.metadata().is_empty() || !target.metadata().is_empty() { return false; }
+    matches!((source.data_type(), target.data_type()),
+        (DataType::FixedSizeList(left, width), DataType::FixedSizeList(right, expected))
+        if *width > 0 && width == expected && left.metadata().is_empty() && right.metadata().is_empty()
+            && left.data_type() == right.data_type() && matches!(left.data_type(), DataType::Float32 | DataType::Float64))
 }
 
 fn layout(target: &L, source: &L) -> Result<L> {
@@ -120,3 +148,31 @@ fn layout(target: &L, source: &L) -> Result<L> {
 fn fault(code: &str, message: &str) -> Anomaly { Anomaly::fault(format!("xtdb/{code}"), message) }
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(|| fault("page-allocation-size", "Page allocation exceeds addressable memory")) }
 fn multiply(value: usize, factor: usize) -> Result<usize> { value.checked_mul(factor).ok_or_else(|| fault("page-allocation-size", "Page allocation exceeds addressable memory")) }
+
+#[cfg(test)]
+mod fixed_float_tests {
+    use super::*;
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array};
+
+    #[test]
+    fn conformed_vector_shares_its_component_buffer_across_a_schema_change() {
+        let memory = MemoryBudget::new(1 << 20);
+        let original = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+        let address = original.values().as_ptr();
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let vectors = FixedSizeListArray::try_new(item, 2, Arc::new(original), None).unwrap();
+        let source = Schema::new(vec![
+            Field::new("embedding", vectors.data_type().clone(), false),
+            Field::new("id", DataType::Int64, false),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(source), vec![Arc::new(vectors), Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+        let target = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("embedding", DataType::FixedSizeList(Arc::new(Field::new("element", DataType::Float32, true)), 2), true),
+        ]);
+        let result = conform_batch(OwnedBatch::new(batch, &memory).unwrap(), &target, &memory).unwrap();
+        let list = result.batch().column(1).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let values = list.values().as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(values.values().as_ptr(), address);
+    }
+}

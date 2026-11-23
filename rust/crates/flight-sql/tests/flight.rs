@@ -287,6 +287,20 @@ async fn bulk_ingest_and_insert_select_preserve_fixed_float_embeddings() {
         assert_eq!(values.values().as_ref(), &[2.0, 0.0, 0.0, 3.0]);
         assert_eq!(distances.values().as_ref(), &[0.0, 1.0]);
     }
+    let query = client.prepare("SELECT _id, embedding, COSINE_DISTANCE(embedding, ?) AS d FROM vectors_copy ORDER BY d, _id LIMIT 1", None).await;
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let value = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![0.0, 1.0])), None).unwrap();
+    let schema = Schema::new(vec![Field::new("", value.data_type().clone(), false)]);
+    let args = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
+    let command = CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle };
+    let descriptor = CommandPreparedStatementQuery { prepared_statement_handle: command.prepared_statement_handle.clone() };
+    client.upload(command, vec![args]).await;
+    let request = client.request(FlightDescriptor::new_cmd(descriptor.as_any().encode_to_vec()));
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let result = client.redeem(&info).await;
+    assert_eq!(integer(&result[0], 0, 0), 2);
+    let output = result[0].column(1).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    assert_eq!(output.values().as_any().downcast_ref::<Float32Array>().unwrap().values().as_ref(), &[0.0, 3.0]);
     running.stop().await;
 }
 

@@ -78,17 +78,29 @@ impl ColumnBatch {
     /// Rows share the page's charge, which ends when the last of them drops.
     pub fn rows(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> { self.rows_admitting(memory, false) }
     pub fn rows_admitting(&self, memory: &Arc<MemoryBudget>, admit_dates: bool) -> Result<OwnedPage> {
+        self.rows_with(memory, admit_dates, |_| true)
+    }
+
+    fn rows_for(&self, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> {
+        let referenced = expression.referenced_columns();
+        self.rows_with(memory, false, |position| referenced.contains(&schema.fields()[position].id))
+    }
+
+    fn rows_with(&self, memory: &Arc<MemoryBudget>, admit_dates: bool, read: impl Fn(usize) -> bool) -> Result<OwnedPage> {
         let mut page = PageBuilder::new(self.len, memory)?;
         let mut bound = 0usize;
         for row in 0..self.len {
-            let row_bound = self.columns.iter().try_fold(256usize, |bound, column| bound.checked_add(column.bound(row)?).ok_or_else(size_error))?;
+            let row_bound = self.columns.iter().enumerate().try_fold(256usize, |bound, (position, column)| {
+                let cell = if read(position) { column.bound(row)? } else { std::mem::size_of::<Value>() };
+                bound.checked_add(cell).ok_or_else(size_error)
+            })?;
             bound = bound.checked_add(row_bound).ok_or_else(size_error)?;
         }
         let reservation = memory.reserve(bound)?;
         for row in 0..self.len {
             let mut values = Vec::with_capacity(self.columns.len());
-            for column in &self.columns {
-                let mut value = column.value(row)?;
+            for (position, column) in self.columns.iter().enumerate() {
+                let mut value = if read(position) { column.value(row)? } else { Value::Null };
                 if admit_dates { value.admit_expression_dates()?; }
                 values.push(value);
             }
@@ -183,7 +195,10 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
         let array = interleave(&arrays, cells)?;
         return Ok(Column::Arrow { array, field, logical });
     }
-    if !uniform && let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
+    if !uniform {
+        if let Some(column) = joined_float_lists(&children, cells, name)? { return Ok(column); }
+        if let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
+    }
     cells.iter().map(|&(source, offset)| match &children[source] {
         None => Ok(Value::Null),
         Some((array, field, logical)) => {
@@ -191,6 +206,36 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
             Ok(if matches!(value, Value::Undefined) { Value::Null } else { value })
         }
     }).collect::<Result<Vec<_>>>().map(Column::Values)
+}
+
+fn joined_float_lists(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalType>)>], cells: &[(usize, usize)], name: &str) -> Result<Option<Column>> {
+    if children.iter().flatten().any(|(array, _, logical)| {
+        logical.is_none() || (array.data_type() != &DataType::Null && !dense_float_list(array.as_ref()))
+    }) || !children.iter().flatten().any(|(array, ..)| dense_float_list(array.as_ref())) { return Ok(None); }
+    let logical = LogicalType::join_all(children.iter().map(|child| match child {
+        Some((array, _, Some(ty))) if array.data_type() != &DataType::Null => ty,
+        _ => &LogicalType::Null,
+    }));
+    let field = rtdb_columnar::to_field(name, &logical)?;
+    if !matches!(field.data_type(), DataType::FixedSizeList(..)) { return Ok(None); }
+    let null = arrow_array::new_null_array(field.data_type(), 1);
+    let mut missing = Vec::with_capacity(children.len());
+    let mut arrays = Vec::with_capacity(children.len());
+    for child in children {
+        let source = match child {
+            Some((array, _, Some(ty))) if array.data_type() != &DataType::Null => {
+                let Some(array) = conform_array(array, ty, &logical, &field) else { return Ok(None); };
+                missing.push(false);
+                array
+            }
+            _ => { missing.push(true); Arc::clone(&null) }
+        };
+        arrays.push(source);
+    }
+    let arrays = arrays.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+    let cells = cells.iter().map(|&(source, row)| (source, if missing[source] { 0 } else { row })).collect::<Vec<_>>();
+    let array = interleave(&arrays, &cells)?;
+    Ok(Some(Column::Arrow { array, field: Arc::new(field), logical: Some(logical) }))
 }
 
 /// Gathers a column whose sources store it in different scalar layouts, as a column written with several integer widths
@@ -291,7 +336,9 @@ fn dense_float_list(array: &dyn Array) -> bool {
     let DataType::FixedSizeList(item, width) = array.data_type() else { return false };
     *width > 0 && item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64)
         && array.as_any().downcast_ref::<arrow_array::FixedSizeListArray>()
-            .is_some_and(|list| item.is_nullable() || list.values().null_count() == 0)
+            .is_some_and(|list| item.is_nullable() || list.values().nulls().is_none_or(|items| {
+                items.iter().enumerate().all(|(index, valid)| valid || list.is_null(index / *width as usize))
+            }))
 }
 
 pub(crate) fn flat(data_type: &DataType) -> bool {
@@ -335,6 +382,15 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
         (LogicalType::Scalar(scalar), LogicalType::Scalar(expected)) => {
             let kept = copyable(&scalar) || scalar == rtdb_types::ScalarType::DateDay;
             (scalar == expected && kept && array.data_type() == field.data_type()).then(|| Arc::clone(array))
+        }
+        (LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(width), element },
+            LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(expected_width), element: expected }) => {
+            if width != expected_width || strip(&element) != strip(&expected) || !dense_float_list(array.as_ref()) { return None; }
+            let DataType::FixedSizeList(item, width) = field.data_type() else { return None };
+            let list = array.as_any().downcast_ref::<arrow_array::FixedSizeListArray>()?;
+            if list.data_type() == field.data_type() { return Some(Arc::clone(array)); }
+            arrow_array::FixedSizeListArray::try_new(Arc::clone(item), *width, Arc::clone(list.values()), list.nulls().cloned())
+                .ok().map(|array| Arc::new(array) as ArrayRef)
         }
         // A copied record's fields take the order of the result's, whatever order the cells came in.
         (LogicalType::Struct(children), LogicalType::Struct(expected)) => {
@@ -399,6 +455,47 @@ impl crate::pages::PageCursor for BatchRows {
 
 impl ColumnBatch {
     /// Keeps the rows `mask` selects, column by column.
+    pub(crate) fn gather_ranked(previous: Option<&Self>, incoming: &Self, picks: &[(usize, usize)], schema: &rtdb_plan::Schema,
+        projected: bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let sources = [previous.unwrap_or(incoming), incoming];
+        let mut reservation = memory.reserve(4096)?;
+        let mut columns = Vec::with_capacity(schema.len());
+        for (position, field) in schema.fields().iter().enumerate() {
+            let field_layout = rtdb_columnar::to_field(&field.name, &field.data_type)?;
+            let arrays = sources.map(|source| conform(&source.columns[position], &field.data_type, &field_layout));
+            let lease = Arc::get_mut(&mut reservation).ok_or_else(size_error)?;
+            let retained = lease.bytes();
+            let column = if let [Some(earlier), Some(later)] = arrays
+                && (flat(field_layout.data_type()) || [earlier.as_ref(), later.as_ref()].into_iter().all(dense_float_list)) {
+                let arrays = [earlier.as_ref(), later.as_ref()];
+                let data = arrays.map(Array::to_data);
+                let bound = picks.iter().try_fold(4096usize, |bound, &(source, row)| {
+                    let slice = data[source].slice(row, 1).get_slice_memory_size().map_err(|error| invalid("column-gather", error))?;
+                    bound.checked_add(slice.checked_mul(2).ok_or_else(size_error)?).and_then(|bytes| bytes.checked_add(128)).ok_or_else(size_error)
+                })?;
+                lease.grow_to(retained.checked_add(bound).ok_or_else(size_error)?)?;
+                let array = interleave(&arrays, picks)?;
+                Column::Arrow { array, field: Arc::new(field_layout), logical: Some(field.data_type.clone()) }
+            } else {
+                let bound = picks.iter().try_fold(4096usize, |bound, &(source, row)| {
+                    bound.checked_add(sources[source].columns[position].bound(row)?)
+                        .and_then(|bytes| bytes.checked_add(128)).ok_or_else(size_error)
+                })?;
+                lease.grow_to(retained.checked_add(bound).ok_or_else(size_error)?)?;
+                let values = picks.iter().map(|&(source, row)| {
+                    let mut value = sources[source].columns[position].value(row)?;
+                    if projected { value.admit_expression_dates()?; }
+                    Ok(value)
+                }).collect::<Result<Vec<_>>>()?;
+                Column::Values(values)
+            };
+            let bytes = retained.checked_add(column.retained_bytes()?).ok_or_else(size_error)?;
+            if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+            columns.push(column);
+        }
+        Self::settled(columns, picks.len(), reservation)
+    }
+
     fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let selected = mask.iter().filter(|keep| **keep).count();
         if selected == self.len { return Ok(self); }
@@ -432,7 +529,7 @@ impl BatchCursor for BatchFilter {
                     let metadata = self.execution.scope()?;
                     let invocation = self.execution.prepare_expression(&self.predicate, &self.schema, &metadata)?;
                     let scope = self.execution.scope()?;
-                    let mut page = batch.rows(&self.execution.context.memory)?;
+                    let mut page = batch.rows_for(&self.predicate, &self.schema, &self.execution.context.memory)?;
                     let mut mask = Vec::with_capacity(batch.len);
                     while let Some(row) = page.next() {
                         mask.push(rtdb_expr::is_true(&self.execution.evaluate_invocation(&scope, &invocation, &row.values).await?)?);
@@ -1053,11 +1150,11 @@ impl BatchCursor for BatchExpressions {
         let parameters = self.execution.parameters.values();
         if self.clocked.is_none() {
             let clocked = read_clock(&self.expressions, &self.execution).await?;
-            self.cosine = clocked.iter().map(|expr| crate::cosine::Projection::bind(expr, &self.schema, parameters, &self.execution.context.memory)).collect::<Result<_>>()?;
+            self.cosine = clocked.iter().map(|expr| crate::cosine::Projection::bind(expr, &self.schema, &self.execution.parameters, &self.execution.context.memory)).collect::<Result<_>>()?;
             self.clocked = Some(clocked);
         }
         let clocked = self.clocked.as_deref().unwrap_or_default();
-        let mut page = None;
+        let mut scalar = None;
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;
         for ((expression, kernel), cosine) in self.expressions.iter().zip(clocked).zip(&self.cosine) {
@@ -1079,16 +1176,19 @@ impl BatchCursor for BatchExpressions {
                 columns.push(column);
                 continue;
             }
-            if page.is_none() { page = Some(batch.rows(&self.execution.context.memory)?); }
-            let rows = page.as_ref().expect("rows were materialised for the evaluator");
-            let metadata = self.execution.scope()?;
-            let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
-            let scope = self.execution.scope()?;
+            let rows = batch.rows_for(expression, &self.schema, &self.execution.context.memory)?;
+            let execution = if crate::cosine::parameter(expression).is_some_and(|index| self.execution.parameters.vector(index).is_some()) {
+                if scalar.is_none() { scalar = Some(self.execution.with_scalar_parameters()?); }
+                scalar.as_ref().expect("scalar parameters for cosine fallback")
+            } else { &self.execution };
+            let metadata = execution.scope()?;
+            let invocation = execution.prepare_expression(expression, &self.schema, &metadata)?;
+            let scope = execution.scope()?;
             let mut values = Vec::with_capacity(batch.len);
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             lease.grow_to(lease.bytes().checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
             for row in rows.rows() {
-                let value = self.execution.evaluate_invocation(&scope, &invocation, &row.values).await?;
+                let value = execution.evaluate_invocation(&scope, &invocation, &row.values).await?;
                 // The value is charged before the evaluator's scope releases what it allocated it under.
                 lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size_error)?)?;
                 values.push(value);
@@ -1389,5 +1489,42 @@ pub(crate) mod projection {
             values.push(value);
         }
         Ok(Some(Column::Values(values)))
+    }
+}
+
+#[cfg(test)]
+mod ranked_arrow_tests {
+    use super::*;
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use rtdb_plan::{Binder, Schema};
+    use rtdb_types::{ListKind, ScalarType};
+
+    #[test]
+    fn ranked_payloads_stay_in_arrow_across_input_batches() {
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::List { kind: ListKind::FixedSizeList(2), element: Box::new(LogicalType::Scalar(ScalarType::F32)) };
+        let field = Arc::new(rtdb_columnar::to_field("embedding", &logical).unwrap());
+        let DataType::FixedSizeList(item, _) = field.data_type() else { unreachable!() };
+        let schema = Schema::new(vec![Binder::default().field("embedding", None, logical.clone()).unwrap()]).unwrap();
+        let batch = |a, b| {
+            let list = FixedSizeListArray::try_new(Arc::clone(item), 2, Arc::new(Float32Array::from(vec![a, b])), None).unwrap();
+            ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(list), field: Arc::clone(&field), logical: Some(logical.clone()) }],
+                1, memory.reserve(4096).unwrap()).unwrap()
+        };
+        let first = batch(1.0, 2.0);
+        let second = batch(3.0, 4.0);
+        let ranked = ColumnBatch::gather_ranked(Some(&first), &second, &[(1, 0), (0, 0)], &schema, true, &memory).unwrap();
+        let Column::Arrow { array, .. } = &ranked.columns[0] else { panic!("expected ranked Arrow payload"); };
+        let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let values = list.values().as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[3.0, 4.0, 1.0, 2.0]);
+        let Column::Arrow { array, field, logical } = &first.columns[0] else { unreachable!() };
+        let mixed = [Some((Arc::clone(array), Arc::clone(field), logical.clone())), None];
+        let Some(Column::Arrow { array, .. }) = joined_float_lists(&mixed, &[(1, 42), (0, 0)], "embedding").unwrap() else {
+            panic!("expected Arrow vectors alongside missing rows");
+        };
+        let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert!(list.is_null(0));
+        assert_eq!(list.value(1).as_any().downcast_ref::<Float32Array>().unwrap().values().as_ref(), &[1.0, 2.0]);
     }
 }

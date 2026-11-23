@@ -154,7 +154,7 @@ pub(crate) struct ParameterTypes {
     _reservation: Arc<MemoryReservation>,
 }
 impl ParameterTypes {
-    fn from_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
+    pub(crate) fn from_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
         let schema = batch.schema_ref();
         let reservation = memory.reserve(schema_bound(schema)?).map_err(status)?;
         Ok(Self { types: logical_parameter_types(schema)?, _reservation: reservation })
@@ -163,6 +163,7 @@ impl ParameterTypes {
     pub fn as_slice(&self) -> &[LogicalType] { &self.types }
 }
 
+#[cfg(test)]
 pub(crate) fn parameter_types(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<ParameterTypes, Status> {
     let batch = parameter_batch(bytes, memory)?;
     ParameterTypes::from_batch(batch.batch(), memory)

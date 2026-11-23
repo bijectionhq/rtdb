@@ -25,6 +25,54 @@ fn inputs(expr: &Expr) -> Option<(ColumnId, &Expr)> {
 
 pub(crate) fn shaped(expr: &Expr) -> bool { inputs(expr).is_some() }
 
+pub(crate) fn parameter(expr: &Expr) -> Option<usize> {
+    match inputs(expr) {
+        Some((_, Expr::Parameter { index, .. })) => Some(*index),
+        _ => None,
+    }
+}
+
+pub(crate) fn in_projection(relation: &rtdb_plan::Relation) -> bool {
+    use rtdb_plan::RelationNode;
+    match relation.node() {
+        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } =>
+            expressions.iter().any(|named| shaped(&named.expr)) || in_projection(input),
+        RelationNode::SortLimit { input, .. } | RelationNode::Filter { input, .. } => in_projection(input),
+        _ => false,
+    }
+}
+
+pub(crate) fn packed_parameters(relation: &rtdb_plan::Relation, width: usize) -> Vec<bool> {
+    use rtdb_plan::RelationNode;
+    fn visit(relation: &rtdb_plan::Relation, used: &mut [bool], scalar: &mut [bool]) -> bool {
+        let projection = matches!(relation.node(), RelationNode::Project { .. } | RelationNode::Rename { .. });
+        match relation.node() {
+            RelationNode::Scan(scan) if scan.matches.is_empty() && scan.ordered_top_k.is_none() && scan.top_k.is_none() => (),
+            RelationNode::Project { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::SortLimit { .. } => (),
+            _ => return false,
+        }
+        for expression in relation.expressions() {
+            if projection && let Some(index) = parameter(expression) {
+                if let Some(packed) = used.get_mut(index) { *packed = true; }
+            } else {
+                expression.visit(&mut |expr| if let Expr::Parameter { index, .. } = expr
+                    && let Some(required) = scalar.get_mut(*index) { *required = true; });
+            }
+        }
+        relation.children().into_iter().all(|child| visit(child, used, scalar))
+    }
+    let mut used = vec![false; width];
+    let mut scalar = vec![false; width];
+    if !visit(relation, &mut used, &mut scalar) { used.fill(false); }
+    used.iter_mut().zip(scalar).for_each(|(candidate, scalar)| *candidate &= !scalar);
+    used
+}
+
+pub(crate) fn fixed_float(array: &dyn Array) -> bool {
+    matches!(array.data_type(), DataType::FixedSizeList(item, width)
+        if *width > 0 && item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64))
+}
+
 fn components(value: &Value) -> Option<&[Value]> {
     match value {
         Value::List(values) | Value::FixedSizeList(values) => Some(values.as_slice()),
@@ -39,12 +87,15 @@ pub(crate) struct Projection {
 }
 
 impl Projection {
-    pub(crate) fn bind(expr: &Expr, schema: &Schema, parameters: &[Value], memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+    pub(crate) fn bind(expr: &Expr, schema: &Schema, parameters: &crate::parameters::BoundParameters, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let Some((id, other)) = inputs(expr) else { return Ok(None) };
         let Some(position) = schema.position(id) else { return Ok(None) };
         let prepared = match other {
             Expr::Literal(value) => Self::prepare(components(value).into_iter().flatten(), memory),
-            Expr::Parameter { index, .. } => Self::prepare(parameters.get(*index).and_then(components).into_iter().flatten(), memory),
+            Expr::Parameter { index, .. } => match parameters.vector(*index) {
+                Some(array) => Self::prepare_arrow(array, memory),
+                None => Self::prepare(parameters.values().get(*index).and_then(components).into_iter().flatten(), memory),
+            },
             Expr::List(items) => Self::prepare(items.iter().filter_map(|item| match item { Expr::Literal(value) => Some(value), _ => None }), memory),
             _ => return Ok(None),
         }?;
@@ -58,6 +109,22 @@ impl Projection {
             .ok_or_else(|| crate::invalid("vector-size", "Prepared vector exceeds addressable memory"))?;
         let Ok(reservation) = memory.reserve(bytes) else { return Ok(None) };
         Ok(CosineVector::prepare(values, len).ok().map(|query| (query, reservation)))
+    }
+
+    fn prepare_arrow(array: &FixedSizeListArray, memory: &Arc<MemoryBudget>) -> Result<Option<(CosineVector, Arc<MemoryReservation>)>> {
+        if array.len() != 1 || array.is_null(0) { return Ok(None); }
+        let child = array.value(0);
+        if child.null_count() != 0 { return Ok(None); }
+        let bytes = child.len().checked_mul(8).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| crate::invalid("vector-size", "Prepared vector exceeds addressable memory"))?;
+        let Ok(reservation) = memory.reserve(bytes) else { return Ok(None) };
+        let prepare = |values: &arrow_array::Float64Array| CosineVector::prepare_components(values.values().iter().copied().map(Ok), values.len());
+        let query = if let Some(values) = child.as_any().downcast_ref::<arrow_array::Float64Array>() {
+            prepare(values)
+        } else if let Some(values) = child.as_any().downcast_ref::<arrow_array::Float32Array>() {
+            CosineVector::prepare_components(values.values().iter().copied().map(|value| Ok(f64::from(value))), values.len())
+        } else { return Ok(None); };
+        Ok(query.ok().map(|query| (query, reservation)))
     }
 
     pub(crate) fn column(&self, batch: &ColumnBatch) -> Option<Column> {
@@ -130,7 +197,15 @@ mod tests {
         let batch = ColumnBatch::settled(vec![Column::Arrow {
             field: Arc::new(Field::new("embedding", array.data_type().clone(), true)), array: Arc::new(array), logical: Some(vector_type),
         }], 3, memory.reserve(16384).unwrap()).unwrap();
-        let parameters = [Value::List(vec![Value::F32(1.0), Value::F32(0.0)])];
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let vector = FixedSizeListArray::try_new(item, 2, Arc::new(arrow_array::Float32Array::from(vec![1.0, 0.0])), None).unwrap();
+        let arguments = arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("?1", vector.data_type().clone(), false),
+        ])), vec![Arc::new(vector)]).unwrap();
+        let ty = rtdb_columnar::from_field(arguments.schema_ref().field(0)).unwrap();
+        let arguments = rtdb_columnar::OwnedBatch::new(arguments, &memory).unwrap();
+        let parameters = crate::parameters::BoundParameters::new(vec![Value::Null], vec![ty], &memory).unwrap()
+            .with_arrow(Some(crate::parameters::PackedVectors { batch: arguments, mask: vec![true] }));
         let projection = Projection::bind(&expr, &schema, &parameters, &memory).unwrap().unwrap();
         let Some(Column::Arrow { array, .. }) = projection.column(&batch) else { panic!("Expected Arrow distances") };
         let distance = array.as_any().downcast_ref::<Float64Array>().unwrap();

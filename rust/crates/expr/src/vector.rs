@@ -40,10 +40,17 @@ pub struct CosineVector {
 
 impl CosineVector {
     pub fn prepare<'a>(values: impl Iterator<Item = &'a Value> + Clone, dimensions: usize) -> Result<Self> {
+        Self::prepare_components(values.map(component), dimensions)
+    }
+
+    pub fn prepare_components(values: impl Iterator<Item = Result<f64>>, dimensions: usize) -> Result<Self> {
         let mut scale = 0.0_f64;
         let mut components = Vec::with_capacity(dimensions);
         for value in values {
-            let value = component(value)?;
+            let value = value?;
+            if !value.is_finite() {
+                return Err(Anomaly::incorrect("rtdb.vector/component", "Vector components must be finite numbers"));
+            }
             scale = scale.max(value.abs());
             components.push(value);
         }

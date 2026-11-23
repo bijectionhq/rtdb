@@ -108,7 +108,8 @@ impl StatementHandle {
         let mut locked = self.state.lock();
         let state = locked.as_mut().ok_or_else(super::closed)?;
         let bulk = matches!(&state.source, Source::Bulk { .. });
-        state.bound = Some(unsafe { crate::arrow::import_binding(array, schema, self.session.region.memory(), bulk) }?);
+        let query = matches!(&state.source, Source::Sql { prepared, .. } if prepared.as_ref().is_none_or(|query| !query.is_dml()));
+        state.bound = Some(unsafe { crate::arrow::import_binding(array, schema, self.session.region.memory(), bulk, query) }?);
         Ok(())
     }
     pub fn prepare(&self, token: &CancellationToken) -> Result<()> {
@@ -175,11 +176,14 @@ impl StatementHandle {
                 Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     if prepared.is_none() {
-                        if args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
+                        if state.bound.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
                         let context = session.prepare_context_for(&self.creation_database, token).await?;
                         *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
                     let context = session.query_context_for(&self.creation_database, token).await?;
+                    if let Some(ImportedBinding::Arrow(arguments)) = &state.bound {
+                        return prepared.as_ref().ok_or_else(not_prepared)?.open_query_arrow(context, arguments.clone()).await;
+                    }
                     let values = argument_row(args, self.session.region.memory())?;
                     prepared.as_ref().ok_or_else(not_prepared)?.open_query_typed(context, values.0, args.map(SqlArguments::types).unwrap_or_default()).await
                 }
@@ -210,7 +214,16 @@ impl StatementHandle {
                         let context = session.prepare_context_for(&self.creation_database, token).await?;
                         *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
-                    let operation = prepared.as_ref().ok_or_else(not_prepared)?.dml_operation(StatementState::bound_arguments(&state.bound).cloned())?;
+                    let arguments = match &state.bound {
+                        Some(ImportedBinding::Arrow(arguments)) => {
+                            let batch = arguments.batch();
+                            let memory = self.session.region.memory();
+                            let charge = memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
+                            Some(crate::arrow::read_rows(batch, batch.schema_ref().fields(), charge, memory)?.arguments)
+                        }
+                        _ => StatementState::bound_arguments(&state.bound).cloned(),
+                    };
+                    let operation = prepared.as_ref().ok_or_else(not_prepared)?.dml_operation(arguments)?;
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(-1)
                 }
@@ -228,6 +241,7 @@ impl StatementHandle {
                             let count = i64::try_from(documents.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
                             (count, TxOp::PutArrowDocs { table: table.clone(), documents, valid_from: None, valid_to: None })
                         }
+                        ImportedBinding::Arrow(_) => return Err(super::invalid("Bulk input requires documents")),
                         ImportedBinding::Rows(bound) => {
                             let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
                             let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;

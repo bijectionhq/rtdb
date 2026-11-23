@@ -196,11 +196,28 @@ impl PreparedQuery {
         self.open(context, parameters, None, Batching::Columns).await
     }
 
-    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
-        rtdb_storage::IoRegion::retaining(context.clone(), self.open_retained(context, parameters, text, batching)).await
+    pub async fn execute_arrow(&self, context: Arc<QueryContext>, batch: OwnedBatch, text: Option<&str>, casts: &std::collections::BTreeMap<usize, LogicalType>) -> Result<QueryCursor> {
+        let mut mask = if self.settings.parameter_count() == 0 && context.tracer.is_none() && matches!(self.output, QueryOutput::Rows) {
+            crate::cosine::packed_parameters(&self.relation, batch.batch().num_columns())
+        } else { vec![false; batch.batch().num_columns()] };
+        for (index, (keep, array)) in mask.iter_mut().zip(batch.batch().columns()).enumerate() {
+            *keep &= !casts.contains_key(&index) && crate::cosine::fixed_float(array.as_ref()) && array.null_count() == 0;
+        }
+        let (mut parameters, _scratch) = crate::parameters::decode_row(&batch, &mask, &context.memory)?;
+        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        for (index, ty) in casts {
+            let parameter = parameters.get_mut(*index).ok_or_else(|| invalid("parameter-width", "Arrow parameter cast is outside the bound row"))?;
+            *parameter = rtdb_expr::cast(parameter, &rtdb_columnar::execution_type(ty), &context.timezone)?;
+        }
+        let arrow = mask.iter().any(|keep| *keep).then_some(crate::parameters::PackedVectors { batch, mask });
+        rtdb_storage::IoRegion::retaining(context.clone(), self.open_retained(context, parameters, text, Batching::Rows, arrow)).await
     }
 
-    async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+        rtdb_storage::IoRegion::retaining(context.clone(), self.open_retained(context, parameters, text, batching, None)).await
+    }
+
+    async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching, arrow: Option<crate::parameters::PackedVectors>) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         for dependency in self.relation.dependencies() {
             let Some(current) = context.catalog.table(&dependency.name)? else {
@@ -215,9 +232,20 @@ impl PreparedQuery {
             bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
         })?;
         let temporary = context.memory.reserve(bound)?;
-        let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
+        let apply_types = |mode, values: &[Value]| -> Result<Vec<LogicalType>> {
+            let mut types = parameter_types(&self.relation, values, mode);
+            if let Some(arrow) = &arrow {
+                for (index, &packed) in arrow.mask.iter().enumerate() {
+                    if packed { types[index] = mode.field_type(&rtdb_columnar::from_field(arrow.batch.batch().schema_ref().field(index))?); }
+                }
+            }
+            Ok(types)
+        };
+        let result_types = apply_types(EmissionMode::ArrowFields, &parameters)?;
+        let schema = self.emit_result_schema(&context, &result_types)?;
         parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         let context = context.apply_settings(&self.settings, &parameters)?;
+        let types = apply_types(EmissionMode::Execution, &parameters)?;
         let query_span = crate::trace::QueryTrace::start(&context, text);
         let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
         if let QueryOutput::Plan(plan) = &self.output {
@@ -229,8 +257,7 @@ impl PreparedQuery {
         }
         let scores_requested = !context.accelerators.is_empty() && uses_search_score(&self.relation);
         let context = context.with_score_corpus(scores_requested);
-        let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
-        let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?);
+        let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?.with_arrow(arrow));
         drop(temporary);
         let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, parameters.types(), &context.memory)?;
         let analysis = if matches!(&self.output, QueryOutput::Analyze(_)) { Some(crate::analysis::AnalysisNode::new(&self.relation, &context)?) } else { None };
@@ -238,12 +265,13 @@ impl PreparedQuery {
         let cancellation = context.cancellation.clone();
         let owner = context.owner_cancellation.clone();
         let operators = Arc::clone(&runtime_schema);
+        let vector_projection = crate::cosine::in_projection(&self.relation);
         let input = owner.run_until_cancelled(cancellation.run_until_cancelled(async {
             match batching {
                 Batching::Pages if analysis.is_none() => crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages),
-                Batching::Columns if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
+                mode if analysis.is_none() && (matches!(mode, Batching::Columns) || vector_projection) => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
                     Some(batches) => Ok(QueryInput::Columns(batches)),
-                    None => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
+                    None => crate::operators::build(operators, execution.with_scalar_parameters()?).await.map(QueryInput::Rows),
                 },
                 _ => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
             }

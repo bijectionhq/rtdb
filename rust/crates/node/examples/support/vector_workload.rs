@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, atomic::AtomicI64};
 use std::time::{Duration, Instant};
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
 use rtdb_node::{Membership, NativeSession, NativeResources, Node};
@@ -11,7 +11,7 @@ use rtdb_plan::{Relation, RelationNode, Statement};
 use rtdb_query::{PreparedQuery, QueryContext};
 use rtdb_storage::cache::BufferPool;
 use rtdb_tx::{ArrowDocuments, EntityIds, TxOp};
-use rtdb_types::{BlockIndex, EntityId, EventOp, Iid, TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{BlockIndex, EntityId, EventOp, Iid, TableRef, Timestamp};
 use serde_json::{Value as Json, json};
 
 use super::{Identity, TickClock, bench_options, bench_services, commit, flush, sql};
@@ -23,14 +23,6 @@ const VALID_AT: Timestamp = Timestamp(0);
 const TOP: usize = 10;
 
 type Rows = Vec<(i64, f64)>;
-
-fn vector(values: &[f32]) -> Value {
-    Value::FixedSizeList(values.iter().copied().map(Value::F32).collect())
-}
-
-fn time(value: Timestamp) -> Value {
-    Value::Timestamp { value: value.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }
-}
 
 fn documents<'a>(node: &Node, rows: impl IntoIterator<Item = (i64, &'a [f32], u32, u32)>, dimensions: usize) -> ArrowDocuments {
     let item = Arc::new(Field::new("item", DataType::Float32, false));
@@ -105,10 +97,14 @@ async fn search_with_scorer(context: &Arc<QueryContext>, query: &[f32], valid: T
         let Statement::Query(relation) = &mut prepared.statement else { unreachable!() };
         *relation = scope_scan(relation, iids);
     }
-    let mut args = vec![vector(query), time(valid)];
-    if scalar { args.push(Value::Bool(true)); }
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let query = FixedSizeListArray::try_new(item, i32::try_from(query.len()).unwrap(), Arc::new(Float32Array::from(query.to_vec())), None).unwrap();
+    let mut args: Vec<ArrayRef> = vec![Arc::new(query), Arc::new(TimestampMicrosecondArray::from(vec![valid.0]).with_timezone("UTC"))];
+    if scalar { args.push(Arc::new(BooleanArray::from(vec![true]))); }
+    let fields = args.iter().enumerate().map(|(index, array)| Field::new(format!("?{index}"), array.data_type().clone(), false)).collect::<Vec<_>>();
+    let args = rtdb_columnar::OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), args).unwrap(), &context.memory).unwrap();
     let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory).unwrap()
-        .execute(Arc::clone(context), args).await.unwrap();
+        .execute_arrow(Arc::clone(context), args, None, &Default::default()).await.unwrap();
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().await.unwrap() {
         let batch = batch.batch();

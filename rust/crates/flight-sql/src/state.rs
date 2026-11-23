@@ -111,6 +111,6 @@ impl Leased for Transaction { fn close(&self) { self.connection.close(); } }
 impl Drop for Transaction { fn drop(&mut self) { self.close(); } }
 #[derive(Clone)]
 pub(crate) enum PreparedScope { Session(String), Transaction(Bytes) }
-pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<Bytes>>, _reservation: Arc<MemoryReservation> }
+pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<rtdb_columnar::OwnedBatch>>, _reservation: Arc<MemoryReservation> }
 impl Prepared { pub fn new(owner: ResourceOwner, sql: String, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, scope, params: Mutex::new(None), _reservation: reservation } } }
 impl Leased for Prepared { fn close(&self) { *self.params.lock().expect("prepared parameters lock") = None; } }

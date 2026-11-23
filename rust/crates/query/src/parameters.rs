@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use arrow_array::{Array, FixedSizeListArray};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{LogicalType, Result, Value};
 
 use crate::{cursor::OwnedRow, invalid};
@@ -8,6 +9,7 @@ use crate::{cursor::OwnedRow, invalid};
 pub(crate) struct BoundParameters {
     values: OwnedRow,
     types: Vec<LogicalType>,
+    arrow: Option<PackedVectors>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -22,19 +24,59 @@ impl BoundParameters {
         let types = values.values.iter().map(Value::logical_type).collect::<Vec<_>>();
         let reservation = memory.reserve(type_bytes(&types)?)?;
         drop(temporary);
-        Ok(Self { values, types, _reservation: reservation })
+        Ok(Self { values, types, arrow: None, _reservation: reservation })
     }
 
     pub fn new(values: Vec<Value>, types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if values.len() != types.len() { return Err(invalid("parameter-width", "Parameter values and declared types have different widths")); }
         let values = OwnedRow::new(values, memory)?;
         let reservation = memory.reserve(type_bytes(&types)?)?;
-        Ok(Self { values, types, _reservation: reservation })
+        Ok(Self { values, types, arrow: None, _reservation: reservation })
+    }
+
+    pub fn with_arrow(mut self, arrow: Option<PackedVectors>) -> Self {
+        self.arrow = arrow;
+        self
+    }
+
+    pub fn vector(&self, index: usize) -> Option<&FixedSizeListArray> {
+        let parameters = self.arrow.as_ref()?;
+        if !parameters.mask.get(index).copied().unwrap_or(false) { return None; }
+        parameters.batch.batch().column(index).as_any().downcast_ref()
+    }
+
+    pub fn materialize(&self, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let Some(arrow) = &self.arrow else { return Ok(None); };
+        let skip = arrow.mask.iter().map(|packed| !packed).collect::<Vec<_>>();
+        let (mut values, _scratch) = decode_row(&arrow.batch, &skip, memory)?;
+        let _retained = memory.reserve(self.values.bytes())?;
+        for (index, value) in values.iter_mut().enumerate() {
+            if arrow.mask[index] { rtdb_columnar::admit_execution_value(value); }
+            else { *value = self.values.values[index].clone(); }
+        }
+        Ok(Some(Self::new(values, self.types.clone(), memory)?))
     }
 
     pub fn values(&self) -> &[Value] { &self.values.values }
     pub fn types(&self) -> &[LogicalType] { &self.types }
     pub fn bytes(&self) -> Result<usize> { self.values.bytes().checked_add(self._reservation.bytes()).ok_or_else(size_error) }
+}
+
+pub(crate) struct PackedVectors { pub batch: OwnedBatch, pub mask: Vec<bool> }
+
+pub(crate) fn decode_row(batch: &OwnedBatch, skip: &[bool], memory: &Arc<MemoryBudget>) -> Result<(Vec<Value>, Arc<MemoryReservation>)> {
+    let batch = batch.batch();
+    if batch.num_rows() != 1 { return Err(invalid("parameter-rows", "A query requires one Arrow argument row")); }
+    let schema = batch.schema_ref();
+    let bound = schema.fields().iter().zip(batch.columns()).enumerate().try_fold(4096usize, |bytes, (index, (field, array))| {
+        let cell = if skip.get(index) == Some(&true) { 0 } else { rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0)? };
+        bytes.checked_add(cell).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)
+    })?;
+    let scratch = memory.reserve(bound)?;
+    let values = schema.fields().iter().zip(batch.columns()).enumerate().map(|(index, (field, array))| {
+        if skip.get(index) == Some(&true) { Ok(Value::Null) } else { rtdb_columnar::read_value(field, array.as_ref(), 0) }
+    }).collect::<Result<_>>()?;
+    Ok((values, scratch))
 }
 
 fn type_bytes(types: &Vec<LogicalType>) -> Result<usize> {

@@ -88,6 +88,79 @@ impl PageCursor for SortCursor {
     }
 }
 
+pub(crate) struct ColumnTop {
+    input: Option<crate::columnar::BoxBatchCursor>,
+    plan: SortPlan,
+    projected: bool,
+    offset: usize,
+}
+
+impl ColumnTop {
+    pub fn new(input: crate::columnar::BoxBatchCursor, schema: Schema, order: Vec<SortExpr>, projected: bool, limit: u64, offset: u64, execution: Execution) -> Self {
+        Self { input: Some(input), plan: SortPlan { schema, order, limit, execution }, projected, offset: offset as usize }
+    }
+}
+
+#[async_trait]
+impl crate::columnar::BatchCursor for ColumnTop {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        let Some(mut input) = self.input.take() else { return Ok(None) };
+        let plan = &self.plan;
+        let limit = plan.limit as usize;
+        if limit <= self.offset { return Ok(None); }
+        let memory = &plan.execution.context.memory;
+        let positions: Vec<_> = plan.order.iter().map(|order| match &order.expr {
+            rtdb_plan::Expr::Column { id, .. } => plan.schema.position(*id),
+            _ => None,
+        }).collect::<Option<_>>().ok_or_else(|| invalid("sort-state", "A batch top-k sorts by input columns"))?;
+        let mut types = KeyTypes::declared(plan)?;
+        let _scratch = memory.reserve(limit.saturating_add(1).saturating_mul(128))?;
+        let mut kept: Vec<(OwnedRow, (usize, usize))> = Vec::with_capacity(limit + 1);
+        let mut winners = None;
+        let mut accumulated = 0usize;
+        let mut deferred = None;
+        while let Some(batch) = input.next_batch().await? {
+            accumulated = accumulated.saturating_add(batch.len);
+            for row in 0..batch.len {
+                plan.execution.context.check_cancelled()?;
+                let key = positions.iter().map(|&position| {
+                    let mut value = batch.columns[position].value(row)?;
+                    if self.projected { value.admit_expression_dates()?; }
+                    Ok(value)
+                }).collect::<Result<Vec<_>>>()?;
+                types.observe(&key, plan)?;
+                if deferred.is_some() { continue; }
+                match plan.top_position_by(kept.len(), limit, &key, |index| &kept[index].0.values) {
+                    Ok(Some(index)) => {
+                        kept.insert(index, (OwnedRow::new(key, memory)?, (1, row)));
+                        kept.truncate(limit);
+                    }
+                    Ok(None) => (),
+                    Err(error) => deferred = Some(error),
+                }
+            }
+            if accumulated > BLOCK_ROWS {
+                types.validate()?;
+                if let Some(error) = deferred.take() { return Err(error); }
+                accumulated = kept.len();
+            }
+            if kept.iter().any(|(_, (source, _))| *source == 1) {
+                let picks = kept.iter().map(|(_, position)| *position).collect::<Vec<_>>();
+                winners = Some(crate::columnar::ColumnBatch::gather_ranked(winners.as_ref(), &batch, &picks, &plan.schema, self.projected, memory)?);
+                for (row, (_, position)) in kept.iter_mut().enumerate() { *position = (0, row); }
+            }
+        }
+        if accumulated == 0 { return Ok(None); }
+        types.validate()?;
+        if let Some(error) = deferred { return Err(error); }
+        let Some(winners) = winners else { return Ok(None); };
+        if self.offset == 0 { return Ok(Some(winners)); }
+        if self.offset >= winners.len { return Ok(None); }
+        let picks = (self.offset..winners.len).map(|row| (1, row)).collect::<Vec<_>>();
+        crate::columnar::ColumnBatch::gather_ranked(None, &winners, &picks, &plan.schema, self.projected, memory).map(Some)
+    }
+}
+
 struct Accumulator { records: RecordBuffer, keys: KeyTypes }
 impl SortPlan {
     fn accumulator(&self) -> Result<Accumulator> {
@@ -188,17 +261,20 @@ impl SortPlan {
     /// Where `key` belongs among the kept rows, or `None` when it falls outside the limit.
     /// A comparison fails only on keys the sort rejects, and those report their key types first, so the caller defers it.
     fn top_position(&self, kept: &[OwnedRow], limit: usize, key: &[Value]) -> Result<Option<usize>> {
-        if kept.len() == limit {
-            match kept.last() { Some(worst) if self.compare(key, &worst.values[..key.len()])? != Ordering::Less => return Ok(None), _ => {} }
-        }
+        self.top_position_by(kept.len(), limit, key, |index| &kept[index].values[..key.len()])
+    }
+
+    fn top_position_by<'a>(&self, len: usize, limit: usize, key: &[Value], kept: impl Fn(usize) -> &'a [Value]) -> Result<Option<usize>> {
+        if len == limit && len > 0 && self.compare(key, kept(len - 1))? != Ordering::Less { return Ok(None); }
         let mut low = 0;
-        let mut high = kept.len();
+        let mut high = len;
         while low < high {
-            let middle = (low + high) / 2;
-            if self.compare(key, &kept[middle].values[..key.len()])? == Ordering::Less { high = middle; } else { low = middle + 1; }
+            let middle = low + (high - low) / 2;
+            if self.compare(key, kept(middle))? == Ordering::Less { high = middle; } else { low = middle + 1; }
         }
         Ok((low < limit).then_some(low))
     }
+
     async fn top_batches(&self, mut batches: crate::columnar::BoxBatchCursor, projected: bool) -> Result<Option<SortOutput>> {
         let limit = usize::try_from(self.limit).map_err(|_| invalid("sort-limit", "Sort limit exceeds addressable memory"))?;
         let mut keys = KeyTypes::declared(self)?;

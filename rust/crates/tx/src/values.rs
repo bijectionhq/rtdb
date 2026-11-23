@@ -171,19 +171,22 @@ impl ArrowDocuments {
             return Ok(None);
         }
         let mut vectors = false;
-        if batch.num_rows() == 0 || !schema.fields().iter().zip(batch.columns()).all(|(field, array)| {
-            if !field.metadata().is_empty() || array.null_count() != 0 ||
+        if batch.num_rows() == 0 || batch.column(id).null_count() != 0 || !schema.fields().iter().zip(batch.columns()).all(|(field, array)| {
+            if !field.metadata().is_empty() ||
                 (field.name().starts_with('_') && field.name() != "_id") {
                 return false;
             }
             match field.data_type() {
                 DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
-                DataType::Float32 | DataType::Float64 | DataType::Utf8 => true,
+                DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Null => true,
                 DataType::FixedSizeList(item, size) if *size > 0 && item.metadata().is_empty() &&
                     matches!(item.data_type(), DataType::Float32 | DataType::Float64) => {
-                    vectors = true;
-                    array.as_any().downcast_ref::<FixedSizeListArray>()
-                        .is_some_and(|list| list.values().null_count() == 0)
+                    vectors |= canonical || array.null_count() < array.len();
+                    array.as_any().downcast_ref::<FixedSizeListArray>().is_some_and(|list| {
+                        list.values().nulls().is_none_or(|items| {
+                            items.iter().enumerate().all(|(index, valid)| valid || list.is_null(index / *size as usize))
+                        })
+                    })
                 }
                 _ => false,
             }
@@ -197,18 +200,26 @@ impl ArrowDocuments {
         let mut fields = Vec::with_capacity(batch.num_columns());
         let mut columns = Vec::with_capacity(batch.num_columns());
         for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            if !canonical && column.null_count() == column.len() {
+                let field = to_field(field.name(), &LogicalType::Null)?;
+                fields.push(Arc::new(field));
+                columns.push(Arc::new(arrow_array::NullArray::new(column.len())) as ArrayRef);
+                continue;
+            }
+            let nullable = if canonical { field.is_nullable() } else { column.null_count() != 0 };
             let (logical, list) = match field.data_type() {
                 DataType::FixedSizeList(item, size) => {
                     let list = column.as_any().downcast_ref::<FixedSizeListArray>()
                         .ok_or_else(|| Anomaly::incorrect("rtdb.tx/document-schema", "Invalid embedding column"))?;
-                    let element = from_field(&item.as_ref().clone().with_nullable(false))?;
+                    let element = from_field(&item.as_ref().clone().with_nullable(canonical && item.is_nullable()))?;
                     (LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(*size), element: Box::new(element) }, Some(list))
                 }
                 _ => (from_field(&field.as_ref().clone().with_nullable(false))?, None),
             };
+            let logical = if nullable { logical.maybe() } else { logical };
             let field = to_field(field.name(), &logical)?;
             let column = if let (Some(list), DataType::FixedSizeList(item, size)) = (list, field.data_type()) {
-                Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *size, Arc::clone(list.values()), None)
+                Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *size, Arc::clone(list.values()), list.nulls().cloned())
                     .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?) as ArrayRef
             } else {
                 Arc::clone(column)

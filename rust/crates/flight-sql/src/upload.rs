@@ -48,7 +48,13 @@ impl Service {
                 Command::CommandPreparedStatementQuery(command) => {
                     let prepared = self.prepared(&call, &command.prepared_statement_handle)?;
                     let batch = upload.next().await?;
-                    let params = match batch { Some(batch) => wire::parameter_ipc(batch.batch(), self.memory())?, None => match upload.decoder.schema() { Some(schema) => wire::parameter_ipc(&RecordBatch::new_empty(Arc::clone(schema)), self.memory())?, None => None } };
+                    let params = match batch {
+                        Some(batch) if batch.batch().num_columns() == 0 => None,
+                        Some(batch) => Some(batch),
+                        None => upload.decoder.schema().filter(|schema| !schema.fields().is_empty()).map(|schema| {
+                            OwnedBatch::new(RecordBatch::new_empty(Arc::clone(schema)), self.memory()).map_err(status)
+                        }).transpose()?,
+                    };
                     *prepared.params.lock().expect("prepared parameters lock") = params; Ok(Vec::new())
                 }
                 Command::CommandPreparedStatementUpdate(command) => {

@@ -1,7 +1,7 @@
 use std::{ffi::{CStr, CString, c_char, c_void}, sync::Arc};
 use arrow_array::{Array, RecordBatch, StructArray, ffi::{FFI_ArrowArray, from_ffi}};
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, from_field, to_field};
+use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, OwnedBatch, from_field, to_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{Anomaly, LogicalType, Result};
 
@@ -66,9 +66,6 @@ pub(crate) fn export_schema(schema: &Schema, memory: &Arc<MemoryBudget>) -> Resu
     if decimals.next().is_some() { return Err(super::invalid("Unused decimal C export parameters")); }
     Ok(exported)
 }
-
-#[cfg(test)]
-use rtdb_columnar::OwnedBatch;
 
 #[cfg(test)]
 pub(crate) fn export_batch(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
@@ -176,21 +173,22 @@ pub(crate) struct ImportedRows {
 
 pub(crate) enum ImportedBinding {
     Rows(ImportedRows),
+    Arrow(OwnedBatch),
     Documents(rtdb_tx::ArrowDocuments),
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<ImportedRows> {
-    match unsafe { import_binding(array, schema, memory, false) }? {
+    match unsafe { import_binding(array, schema, memory, false, false) }? {
         ImportedBinding::Rows(rows) => Ok(rows),
-        ImportedBinding::Documents(_) => unreachable!(),
+        ImportedBinding::Documents(_) | ImportedBinding::Arrow(_) => unreachable!(),
     }
 }
 
 /// Takes ownership of a valid Arrow C Data array and schema by replacing both with released structs.
 /// Foreign buffers are copied into native allocations before returning, including on zero-row binds.
 /// Decimal precision and scale come from C format strings; reserved native field annotations are rejected.
-pub(crate) unsafe fn import_binding(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>, bulk: bool) -> Result<ImportedBinding> {
+pub(crate) unsafe fn import_binding(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>, bulk: bool, query: bool) -> Result<ImportedBinding> {
     if array.release.is_none() || schema.release.is_none() { return Err(super::invalid("Arrow bind inputs have already been released")); }
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
@@ -215,21 +213,30 @@ pub(crate) unsafe fn import_binding(array: &mut FFI_ArrowArray, schema: &mut FFI
     if bulk && let Some(documents) = rtdb_tx::ArrowDocuments::try_new(&batch, memory)? {
         return Ok(ImportedBinding::Documents(documents.copy_buffers()?));
     }
+    if query && batch.num_rows() == 1 && fields.fields().iter().any(|field| matches!(field.data_type(),
+        DataType::FixedSizeList(item, _) if matches!(item.data_type(), DataType::Float32 | DataType::Float64))) {
+        let batch = OwnedBatch::new(batch, memory)?.select(&rtdb_columnar::Selection::Indices(vec![0]))?;
+        return Ok(ImportedBinding::Arrow(batch));
+    }
+    read_rows(&batch, fields.fields(), schema_charge, memory).map(ImportedBinding::Rows)
+}
+
+pub(crate) fn read_rows(batch: &RecordBatch, fields: &arrow_schema::Fields, schema_charge: Arc<MemoryReservation>, memory: &Arc<MemoryBudget>) -> Result<ImportedRows> {
     let mut bound = super::add(4096, super::mul(batch.num_rows(), 64)?)?;
     for row in 0..batch.num_rows() {
-        for (field, column) in fields.fields().iter().zip(batch.columns()) {
+        for (field, column) in fields.iter().zip(batch.columns()) {
             bound = super::add(bound, rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), row)?)?;
         }
     }
     let _scratch = memory.reserve(super::mul(bound, 2)?)?;
     let mut rows = Vec::with_capacity(batch.num_rows());
-    let readers = fields.fields().iter().map(|field| rtdb_columnar::ColumnReader::new(field)).collect::<Result<Vec<_>>>()?;
+    let readers = fields.iter().map(|field| rtdb_columnar::ColumnReader::new(field)).collect::<Result<Vec<_>>>()?;
     for row in 0..batch.num_rows() {
         rows.push(readers.iter().zip(batch.columns()).map(|(reader, column)| reader.read(column.as_ref(), row)).collect::<Result<Vec<_>>>()?);
     }
-    let types = fields.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?;
-    let names = fields.fields().iter().map(|field| field.name().clone()).collect();
-    Ok(ImportedBinding::Rows(ImportedRows { arguments: SqlArguments::new(types, rows, memory)?, names, _reservation: schema_charge }))
+    let types = fields.iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?;
+    let names = fields.iter().map(|field| field.name().clone()).collect();
+    Ok(ImportedRows { arguments: SqlArguments::new(types, rows, memory)?, names, _reservation: schema_charge })
 }
 
 fn decimal_format(format: &str) -> Result<Option<DecimalParameters>> {

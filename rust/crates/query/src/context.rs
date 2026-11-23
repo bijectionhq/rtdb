@@ -221,6 +221,14 @@ impl OuterRows {
 }
 
 impl Execution {
+    pub fn with_scalar_parameters(&self) -> Result<Self> {
+        let mut execution = self.clone();
+        if let Some(parameters) = self.parameters.materialize(&self.context.memory)? {
+            execution.parameters = Arc::new(parameters);
+        }
+        Ok(execution)
+    }
+
     pub async fn bind_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: Arc<crate::cursor::OwnedRow>) -> Result<Self> {
         let scope = self.scope()?;
         let parameter_count = arguments.iter().try_fold(self.parameters.values().len(), |count, (index, _)| index.checked_add(1).map(|next| count.max(next)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameter index overflow")))?;

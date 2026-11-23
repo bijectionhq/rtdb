@@ -37,6 +37,11 @@ fn build_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constr
     Ok(crate::pages::rows(pages, context))
 }) }
 
+fn vector_limit(offset: Option<&Expr>, fetch: &Expr) -> bool {
+    let fixed = |expr: &Expr| matches!(expr, Expr::Literal(_) | Expr::Parameter { .. });
+    offset.is_none_or(fixed) && fixed(fetch)
+}
+
 /// Builds a scan, its filters and column-only projections as a batch source, or `None` where the subtree has another shape.
 /// The boolean reports whether the batches passed through a projection.
 pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> { Box::pin(async move {
@@ -68,6 +73,16 @@ pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution,
                 None => Box::new(crate::columnar::BatchExpressions::new(batches,schema,expressions.iter().map(|named|named.expr.clone()).collect(),execution)),
             };
             Ok(Some((batches,true)))
+        }
+        RelationNode::SortLimit { order_by, offset, fetch: Some(fetch), .. } if vector_limit(offset.as_ref(), fetch) && crate::cosine::in_projection(&relation) => {
+            let child = runtime.child(0)?;
+            let offset = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
+            let fetch = row_limit(Some(fetch), &execution).await?.unwrap_or(i64::MAX as u64);
+            let limit = offset.saturating_add(fetch).min(i64::MAX as u64);
+            if order_by.is_empty() || !crate::sort::SortCursor::batch_eligible(child.schema(), order_by, limit) { return Ok(None); }
+            let schema = child.schema().clone();
+            let Some((input, projected)) = build_batches(child, execution.child(0), None).await? else { return Ok(None); };
+            Ok(Some((Box::new(crate::sort::ColumnTop::new(input, schema, order_by.clone(), projected, limit, offset, execution)) as crate::columnar::BoxBatchCursor, projected)))
         }
         RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Inner,condition: Some(condition) } if execution.analysis.is_none() && execution.context.tracer.is_none() => {
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?)?,batch_shape(&runtime.child(1)?)?) else { return Ok(None) };
@@ -127,6 +142,7 @@ fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
             if !columns && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
             batch_shape(&child)?.map(|_| true)
         }
+        RelationNode::SortLimit { offset, fetch: Some(fetch), .. } if vector_limit(offset.as_ref(), fetch) && crate::cosine::in_projection(&relation) => batch_shape(&runtime.child(0)?)?,
         _ => None,
     })
 }

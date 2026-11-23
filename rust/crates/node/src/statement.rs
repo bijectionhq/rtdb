@@ -178,6 +178,18 @@ impl PreparedSql {
         Ok(cursor)
     }
 
+    pub async fn open_query_arrow(&self, context: Arc<QueryContext>, arguments: rtdb_columnar::OwnedBatch) -> Result<QueryCursor> {
+        let schema = arguments.batch().schema_ref();
+        if schema.fields().len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
+        let _schema = context.memory.reserve(rtdb_format::ipc::schema_translation_bound(schema)?)?;
+        let types = schema.fields().iter().map(|field| rtdb_columnar::from_field(field)).collect::<Result<Vec<_>>>()?;
+        let query = deep(self.source(), || self.bind(&context, &types, true))?;
+        if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
+        let cursor = query.execute_arrow(context, arguments, Some(self.source()), &self.0.options.parameter_types).await?;
+        if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
+        Ok(cursor)
+    }
+
     /// Preserves absent arguments and an explicitly empty argument batch as distinct source operations.
     /// SQL argument-width validation belongs to submission and transaction resolution.
     /// Table lookup occurs during transaction resolution.

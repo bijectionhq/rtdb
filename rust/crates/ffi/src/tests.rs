@@ -368,37 +368,53 @@ fn adbc_unsigned_bulk_documents_admit_ids_before_submission() {
 }
 
 #[test]
-fn adbc_bulk_embeddings_keep_their_fixed_size_float_layout_after_flush() {
-    use arrow_array::{FixedSizeListArray, Float32Array, Float64Array};
+fn adbc_embedded_vectors_stay_typed_from_bulk_ingest_through_bound_top_k() {
+    use arrow_array::{FixedSizeListArray, Float32Array, Float64Array, StringArray};
     let mut native = Native::open();
     let handle = native.statement("SELECT 1");
     let operation = native.operation();
     let statement = handles::statement(handle).unwrap();
     let token = handles::cancellation(operation, &statement.session).unwrap();
+    let bind = |batch: RecordBatch| {
+        let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+        let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
+        let mut error = 0;
+        ok(unsafe { rtdb_v1_statement_bind(handle, &mut array, &mut schema, &mut error) }, error);
+        assert!(array.release.is_none() && schema.release.is_none());
+    };
     statement.replace_source("vectors", true).unwrap();
-
     let item = Arc::new(Field::new("item", DataType::Float32, true));
-    let vectors = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![0.0, 2.0, 3.0, 0.0])), None).unwrap();
-    let schema = Schema::new(vec![Field::new("_id", DataType::Int64, true), Field::new("embedding", vectors.data_type().clone(), true)]);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(vectors)]).unwrap();
-    let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
-    let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
-    let mut error = 0;
-    ok(unsafe { rtdb_v1_statement_bind(handle, &mut array, &mut schema, &mut error) }, error);
-    assert!(array.release.is_none() && schema.release.is_none());
-    assert_eq!(statement.update(&token).unwrap(), 2);
+    let nulls = arrow_buffer::NullBuffer::from(vec![true, true, false, true]);
+    let values = Float32Array::from(vec![Some(0.0), Some(2.0), Some(3.0), Some(0.0), None, None, Some(4.0), Some(0.0)]);
+    let vectors = FixedSizeListArray::try_new(Arc::clone(&item), 2, Arc::new(values), Some(nulls)).unwrap();
+    let schema = Schema::new(vec![
+        Field::new("_id", DataType::Int64, true),
+        Field::new("embedding", vectors.data_type().clone(), true),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+    bind(RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4])), Arc::new(vectors),
+        Arc::new(StringArray::from(vec![Some("old"), None, None, Some("new")]))]).unwrap());
+    assert_eq!(statement.update(&token).unwrap(), 4);
 
+    let mut error = 0;
     ok(unsafe { rtdb_v1_database_flush_all(native.database, 5_000_000_000, &mut error) }, error);
-    statement.replace_source("SELECT _id, COSINE_DISTANCE(embedding, ARRAY[1,0]) AS d, embedding FROM vectors ORDER BY d", false).unwrap();
+    statement.replace_source("SELECT _id, COSINE_DISTANCE(embedding, ?) AS d, embedding, label FROM vectors ORDER BY d NULLS LAST, _id OFFSET 1 LIMIT 3", false).unwrap();
+    statement.prepare(&token).unwrap();
+    let query = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![1.0, 0.0])), None).unwrap();
+    let schema = Schema::new(vec![Field::new("", query.data_type().clone(), false)]);
+    bind(RecordBatch::try_new(Arc::new(schema), vec![Arc::new(query)]).unwrap());
     let page = statement.query(&token).unwrap().next().unwrap().unwrap();
     let batch = page.batch();
     let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     let distances = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
     let vectors = batch.column(2).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-    assert_eq!(ids.values().as_ref(), &[2, 1]);
-    assert_eq!(distances.values().as_ref(), &[0.0, 1.0]);
+    let labels = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(ids.values().as_ref(), &[4, 1, 3]);
+    assert_eq!(distances.iter().collect::<Vec<_>>(), [Some(0.0), Some(1.0), None]);
+    assert_eq!(labels.iter().collect::<Vec<_>>(), [Some("new"), Some("old"), None]);
     let values = vectors.values().as_any().downcast_ref::<Float32Array>().unwrap();
-    assert_eq!(values.values().as_ref(), &[3.0, 0.0, 0.0, 2.0]);
+    assert_eq!(&values.values()[..4], &[4.0, 0.0, 0.0, 2.0]);
+    assert!(vectors.is_null(2));
 }
 
 #[test]
