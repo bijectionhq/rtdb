@@ -42,17 +42,25 @@ pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> Option<i6
 }
 
 #[cfg(not(verus_keep_ghost))]
+pub fn clock_slot_reading(tick: rtdb_types::Timestamp) -> Option<rtdb_types::Timestamp> {
+    tick.0.checked_add(500_000).map(rtdb_types::Timestamp)
+}
+
+#[cfg(not(verus_keep_ghost))]
 pub(crate) fn clock_slot_time(
-    predecessor: rtdb_types::TransactionKey,
+    tick: rtdb_types::TransactionKey,
     head: Option<rtdb_types::TransactionKey>,
     appended: rtdb_types::Timestamp,
 ) -> Option<rtdb_types::Timestamp> {
-    const HOLD_MICROS: i64 = 5_000_000;
-    if head != Some(predecessor) {
-        return None;
-    }
-    let reading = predecessor.system_time.0.checked_add(1)?;
-    (appended.0 < reading.saturating_add(HOLD_MICROS)).then_some(rtdb_types::Timestamp(reading))
+    const GRACE_MICROS: i64 = 1_000_000;
+    let head = head?;
+    let reading = clock_slot_reading(tick.system_time)?;
+    (head.tx_id.0 >= tick.tx_id.0
+        && head.system_time >= tick.system_time
+        && head.system_time < reading
+        && appended >= reading
+        && appended.0 < reading.0.saturating_add(GRACE_MICROS))
+        .then_some(reading)
 }
 
 #[cfg(not(verus_keep_ghost))]
@@ -111,12 +119,14 @@ mod tests {
     use super::clock_slot_time;
 
     #[test]
-    fn clock_slot_expires_at_its_boundary_or_after_an_intervening_order() {
-        let predecessor = TransactionKey { tx_id: TxId(8), system_time: Timestamp(100) };
-        let intervening = TransactionKey { tx_id: TxId(9), system_time: Timestamp(101) };
+    fn clock_slot_survives_earlier_orders_and_admits_only_its_append_window() {
+        let tick = TransactionKey { tx_id: TxId(8), system_time: Timestamp(100) };
+        let earlier = TransactionKey { tx_id: TxId(9), system_time: Timestamp(101) };
+        let used = TransactionKey { tx_id: TxId(9), system_time: Timestamp(500_100) };
 
-        assert_eq!(clock_slot_time(predecessor, Some(predecessor), Timestamp(5_000_100)), Some(Timestamp(101)));
-        assert_eq!(clock_slot_time(predecessor, Some(predecessor), Timestamp(5_000_101)), None);
-        assert_eq!(clock_slot_time(predecessor, Some(intervening), Timestamp(102)), None);
+        assert_eq!(clock_slot_time(tick, Some(earlier), Timestamp(500_100)), Some(Timestamp(500_100)));
+        assert_eq!(clock_slot_time(tick, Some(tick), Timestamp(500_099)), None);
+        assert_eq!(clock_slot_time(tick, Some(tick), Timestamp(1_500_100)), None);
+        assert_eq!(clock_slot_time(tick, Some(used), Timestamp(500_100)), None);
     }
 }

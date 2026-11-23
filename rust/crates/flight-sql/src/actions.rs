@@ -63,6 +63,7 @@ impl Service {
                 crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V3 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_DECIDING_V2 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false, false).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_STAGED_V6 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true, false).await?)]),
+                crate::owned_actions::OFFER_CLOCK_SLOT_V1 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_AT_SLOT_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false, true).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),

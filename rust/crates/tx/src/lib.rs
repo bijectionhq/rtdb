@@ -7,6 +7,8 @@ mod replay_submission;
 mod bounded_retry;
 mod resolver;
 mod system_time;
+#[cfg(not(verus_keep_ghost))]
+pub use system_time::clock_slot_reading;
 mod replica;
 mod submission;
 mod inspection;

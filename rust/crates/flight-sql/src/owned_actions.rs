@@ -68,6 +68,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
 pub(crate) const COMMIT_HOSTED_DECIDING_V2: &str = "rtdb.owned.CommitHostedDeciding.v2";
+pub(crate) const OFFER_CLOCK_SLOT_V1: &str = "rtdb.owned.OfferClockSlot.v1";
 pub(crate) const COMMIT_HOSTED_AT_SLOT_V1: &str = "rtdb.owned.CommitHostedAtSlot.v1";
 pub(crate) const COMMIT_HOSTED_STAGED_V6: &str = "rtdb.owned.CommitHostedStaged.v6";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
@@ -991,9 +992,37 @@ impl Service {
         Ok((worlds, body))
     }
 
+    fn clock_slot_missed() -> Status {
+        status(rtdb_types::Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"))
+    }
+
+    pub(crate) async fn offer_clock_slot_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        let (tick, trailing) = self.owned_clock_slot(call, body).await?;
+        if !trailing.is_empty() {
+            return Err(invalid("A clock slot takes one original hold handle"));
+        }
+        let reading = rtdb_tx::clock_slot_reading(tick.system_time).ok_or_else(Self::clock_slot_missed)?;
+        Ok(ActionResult { body: wire::retain(reading.0.to_be_bytes().to_vec(), call.reserve(8)?) })
+    }
+
+    async fn wait_for_clock_slot(&self, call: &Call, tick: rtdb_types::TransactionKey) -> Result<(), Status> {
+        let reading = rtdb_tx::clock_slot_reading(tick.system_time).ok_or_else(Self::clock_slot_missed)?;
+        let delay = reading.0.saturating_sub(self.0.node.now().0);
+        if delay > 1_000_000 {
+            return Err(Self::clock_slot_missed());
+        }
+        if delay > 0 {
+            let wait = tokio::time::sleep(std::time::Duration::from_micros(delay as u64));
+            call.cancellation.run_until_cancelled(wait).await
+                .ok_or_else(|| Status::cancelled("The ordered clock slot was cancelled"))?;
+        }
+        Ok(())
+    }
+
     async fn owned_clock_slot<'a>(
         &self, call: &Call, body: &'a [u8],
     ) -> Result<(rtdb_types::TransactionKey, &'a [u8]), Status> {
+        self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing clock slot hold"))?;
         let original = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
@@ -1143,6 +1172,9 @@ impl Service {
         } else {
             None
         };
+        if let Some(tick) = slot {
+            self.wait_for_clock_slot(call, tick).await?;
+        }
         self.owned_write_reply_with_reads(call, writes, witnesses, worlds).await
     }
 
@@ -4115,6 +4147,9 @@ impl Service {
         }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
+        if let Some(tick) = slot {
+            self.wait_for_clock_slot(call, tick).await?;
+        }
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
