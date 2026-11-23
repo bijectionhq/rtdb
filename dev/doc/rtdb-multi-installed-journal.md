@@ -72,7 +72,15 @@ A disconnected worker can leave holds behind. Do not withdraw a worker merely be
 
 ## Verify the handoff and retention contract
 
-The Lean models in `verification/multi/lean/OrderedCapacity.lean`, `OrderedJournal.lean`, and `OrderedQuorum.lean` state the system obligations. The capacity model compares the saturated ordinary window with and without a funded maintenance sequence. The journal model composes exact handoff, receipt retention, nonce closure, checkpoint protection, provider disposition, and trim. The quorum lemmas state the assumptions on durable promises and agreement of higher ballots. The Lake package in `verification/multi` imports Logkeeper at the same source revision as the Rust workspace. `RecoveryComposition.lean` relates the exact decoded append selected by the voter model to the receipt retained by the RTDB trace, including across a modeled transfer of the exact predecessor image to a repaired cohort. It also models publication and trim under custody authority. Concrete wire decoding, durable media steps, provider evidence, and semantic fidelity of the database cut are separate refinement obligations.
+The Lean models in `verification/multi/lean/OrderedCapacity.lean`, `OrderedJournal.lean`, and `OrderedQuorum.lean` state the system obligations.
+The capacity model compares the saturated ordinary window with and without a funded maintenance sequence.
+The journal model composes exact handoff, receipt retention, nonce closure, checkpoint protection, provider disposition, and trim.
+The quorum lemmas state the assumptions on durable promises and agreement of higher ballots.
+The Lake package in `verification/multi` imports Logkeeper at the same source revision as the Rust workspace.
+Run `lake build` from `verification/multi` to check the composition against that pinned revision and the directory's Lean toolchain.
+`RecoveryComposition.lean` relates the exact decoded append selected by the voter model to the receipt retained by the RTDB trace, including across a modeled transfer of the exact predecessor image to a repaired cohort.
+It also models publication and trim under custody authority.
+Concrete wire decoding, durable media steps, provider evidence, and semantic fidelity of the database cut are separate refinement obligations.
 
 The standalone Logkeeper Verus harness includes the admission functions used by the production command reducer and compact-image decoder. It covers the checked debits, the trim gate, and the expiry and fingerprint decisions that govern exact reissue. The full codec round trip and the disk and network boundaries also need their own evidence.
 

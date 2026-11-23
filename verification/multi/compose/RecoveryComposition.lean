@@ -22,9 +22,9 @@ def projectReceipt (receipt : Protocol.AppendReceipt) : OrderedJournal.Receipt :
 
 structure RecordedAppend (ledger : Ledger Voter) (state : OrderedJournal.State)
     (position : Nat) where
-  seal : Protocol.Seal ledger
+  certifiedPrefix : Protocol.Seal ledger
   record : Protocol.Append
-  selected : seal.decisions[position]? = some (.append record)
+  selected : certifiedPrefix.decisions[position]? = some (.append record)
   placement : record.receipt.cut.placement = record.receipt.attempt.placement
   expiryPlacement : record.receipt.expiresAt.placement = record.receipt.attempt.placement
   decoded : state.receipts (projectAttempt record.receipt) = some (projectReceipt record.receipt)
@@ -41,7 +41,7 @@ theorem recovery_reissues_exact_chosen_append
     initial.record.receipt = result.receipt ∧
       OrderedJournal.Reissue after (projectAttempt result.receipt) result.receipt.requestDigest =
         some (projectReceipt result.receipt) := by
-  have agrees := Protocol.same_chosen_append voters initial.seal recovered initial.selected selected
+  have agrees := Protocol.same_chosen_append voters initial.certifiedPrefix recovered initial.selected selected
   have decoded := initial.decoded
   rw [agrees] at decoded
   have retained := OrderedJournal.live_receipt_survives_recovery decoded path live
@@ -54,7 +54,7 @@ theorem recovery_reissues_append_after_cohort_repair
     (oldVoters : Protocol.Evidence oldLedger) (newVoters : Protocol.Evidence newLedger)
     (transfer : Protocol.Transfer oldLedger newLedger)
     (initial : RecordedAppend oldLedger before position) (recovered : Protocol.Seal newLedger)
-    (beforeSeal : initial.seal.decisions.length ≤ transfer.finalSource.decisions.length)
+    (beforeSeal : initial.certifiedPrefix.decisions.length ≤ transfer.finalSource.decisions.length)
     (afterInstall : transfer.installedBase.decisions.length ≤ recovered.decisions.length)
     (selected : recovered.decisions[position]? = some (.append result))
     (path : OrderedJournal.Trace readers activations before after)
@@ -62,7 +62,7 @@ theorem recovery_reissues_append_after_cohort_repair
     initial.record.receipt = result.receipt ∧
       OrderedJournal.Reissue after (projectAttempt result.receipt) result.receipt.requestDigest =
         some (projectReceipt result.receipt) := by
-  have agrees := Protocol.same_append_after_transfer oldVoters newVoters transfer initial.seal
+  have agrees := Protocol.same_append_after_transfer oldVoters newVoters transfer initial.certifiedPrefix
     recovered beforeSeal afterInstall initial.selected selected
   have decoded := initial.decoded
   rw [agrees] at decoded
@@ -88,7 +88,7 @@ theorem prepared_checkpoint_and_trim_need_no_writer
     (s : OrderedJournal.State) (base target : OrderedJournal.Checkpoint)
     (through : OrderedJournal.Cut) (quorum : s.quorum = true)
     (ready : s.preparing = some ⟨base, target, true⟩)
-    (matches : s.chosen target.cut.next = some target.cut)
+    (agrees : s.chosen target.cut.next = some target.cut)
     (forward : s.published.cut.next < target.cut.next) (within : target.cut.next ≤ s.head.next)
     (exactTrim : s.chosen through.next = some through) (advancing : s.floor ≤ through.next)
     (covered : through.next ≤ target.cut.next)
@@ -98,7 +98,7 @@ theorem prepared_checkpoint_and_trim_need_no_writer
   let published := {s with published := target, preparing := none}
   let trimmed := {published with floor := through.next}
   have publishStep : OrderedJournal.Step readers activations s published :=
-    OrderedJournal.Step.publish s s.custodian base target rfl quorum ready matches forward within
+    OrderedJournal.Step.publish s s.custodian base target rfl quorum ready agrees forward within
   have trimStep : OrderedJournal.Step readers activations published trimmed :=
     OrderedJournal.Step.trim published s.custodian target through rfl quorum rfl exactTrim
       advancing covered unheld
