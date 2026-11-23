@@ -899,7 +899,7 @@ mod custody_tests {
             use rtdb_types::{EntityId, Interval, LogicalType, ScalarType, StructFields, Value};
             let row = StoredEvent {
                 entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(time),
-                valid_time: Interval::ALL, recency: None,
+                commit_position: 0, valid_time: Interval::ALL, recency: None,
                 operation: StoredOperation::Put(StructFields::from([(
                     "value".into(), Value::Utf8("x".repeat(MAXIMUM_LOG_MESSAGE_BYTES + 1)),
                 )])),
