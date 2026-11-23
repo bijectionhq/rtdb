@@ -245,12 +245,20 @@ pub async fn seal_recover_committed(config: &StreamConfig, epoch: u64) -> rtdb_t
 
 /// Lets every server drop entries at or below `through`, which must be committed.
 pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Result<()> {
+    trim_on(config, through, config.write_quorum).await
+}
+
+pub async fn trim_all(config: &StreamConfig, through: LogOffset) -> rtdb_types::Result<()> {
+    trim_on(config, through, config.servers.len()).await
+}
+
+async fn trim_on(config: &StreamConfig, through: LogOffset, required: usize) -> rtdb_types::Result<()> {
     validate(config)?;
     let ensemble = Ensemble::new(config.clone());
     let replies: Vec<_> = (0..ensemble.len()).map(|server| ensemble.trim(server, through.0)).collect::<FuturesUnordered<_>>().collect().await;
     let trimmed = replies.iter().filter(|reply| matches!(reply, Ok(Ack::Accepted(_)))).count();
-    if trimmed < config.write_quorum {
-        return Err(Error::Remote { key: config.stream.clone(), message: format!("trimmed {trimmed} servers, a write quorum is {}", config.write_quorum) }.into());
+    if trimmed < required {
+        return Err(Error::Remote { key: config.stream.clone(), message: format!("trimmed {trimmed} servers, {required} are required") }.into());
     }
     Ok(())
 }

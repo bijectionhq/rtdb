@@ -10,6 +10,21 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_physical_trim_receipt_requires_every_journal_and_survives_a_retry() {
+    let mut ensemble = Ensemble::start(3).await;
+    let stream = ensemble.config("all-trim");
+    let writer = open_writer(stream.clone(), 1, CancellationToken::new()).await.unwrap();
+    assert_eq!(append(writer.as_ref(), "offloaded", 1).await.offset, LogOffset(0));
+    ensemble.stop(2).await;
+    rtdb_logkeeper::trim(&stream, LogOffset(0)).await.unwrap();
+    assert!(rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.is_err());
+    ensemble.restart(2).await;
+    let stream = ensemble.config("all-trim");
+    rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.unwrap();
+    rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_audit_distinguishes_equal_committed_positions_with_different_payloads() {
     let ensemble = Ensemble::start(2).await;
     for (server, payload) in [(0, "first"), (1, "different")] {

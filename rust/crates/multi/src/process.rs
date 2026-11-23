@@ -131,6 +131,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             }) as Arc<dyn rtdb_flight_sql::OwnedWorldHost>
         });
     let storage = Arc::new(crate::store::CellStoreFactory {
+        replica_payload_reclamation: settings.agent.replica_payload_reclamation,
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
         storage_namespaces,
@@ -171,7 +172,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, Arc::clone(&settings.keys), server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();

@@ -21,6 +21,7 @@ const MAXIMUM_RELEASE_BYTES: u64 = 32 << 10;
 
 struct ReleaseWitness {
     record: super::GarbageRecord,
+    replica: Option<super::ReplicaPayloadRelease>,
     version: Option<PhysicalObjectVersion>,
     terminal: Option<TerminalObjectPublication>,
     pack: Option<String>,
@@ -29,6 +30,7 @@ struct ReleaseWitness {
 
 impl ReleaseWitness {
     fn target_name(&self) -> Option<&str> {
+        if self.replica.is_some() { return Some(&self.record.key); }
         match self.pack.as_deref() {
             Some(pack) if self.version.is_some() && self.record.trie_floor.is_none()
                 && pack_block(pack).is_some()
@@ -36,6 +38,12 @@ impl ReleaseWitness {
             None if self.record.trie_floor.is_some() => Some(&self.record.key),
             _ => None,
         }
+    }
+
+    fn permits(&self, owner: &DeploymentRecord, store: &str) -> bool {
+        if let Some(replica) = &self.replica { return replica.permits(owner, store); }
+        permits_release(owner, store, &self.record) && recovery_covers_release(owner, &self.record)
+            && super::oversized_payload_collectable(owner, &self.record.key, rtdb_directory::now_ms())
     }
 }
 
@@ -50,12 +58,13 @@ async fn read_release(bucket: &dyn ObjectStore, key: &ObjectKey) -> Result<Optio
         result => result?,
     };
     let Ok(stored) = serde_json::from_slice::<StoredRelease>(&observed.value) else { return Ok(None); };
-    let (record, version, terminal, pack) = match stored {
-        StoredRelease::Exact { record, version, pack } => (record, Some(version), None, pack),
-        StoredRelease::Terminal { record, terminal } => (record, None, Some(terminal), None),
-        StoredRelease::Path(record) => (record, None, None, None),
+    let (record, replica, version, terminal, pack) = match stored {
+        StoredRelease::Replica { replica, version } => (replica.record.clone(), Some(replica), Some(version), None, None),
+        StoredRelease::Exact { record, version, pack } => (record, None, Some(version), None, pack),
+        StoredRelease::Terminal { record, terminal } => (record, None, None, Some(terminal), None),
+        StoredRelease::Path(record) => (record, None, None, None, None),
     };
-    Ok(Some(ReleaseWitness { record, version, terminal, pack, release_version: observed.version }))
+    Ok(Some(ReleaseWitness { record, replica, version, terminal, pack, release_version: observed.version }))
 }
 
 
@@ -121,10 +130,7 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
         for marker in bucket.list(Some(&markers)).await? {
             let Some(witness) = read_release(bucket, &marker.key).await? else { continue; };
             let Some(relative) = witness.target_name().filter(|_| witness.release_version.is_some() || witness.terminal.is_some()) else { continue; };
-            if witness.record.released_at_ms > threshold || !permits_release(candidate, &store, &witness.record) { continue; }
-            if !recovery_covers_release(candidate, &witness.record)
-                || !super::oversized_payload_collectable(candidate, &witness.record.key, rtdb_directory::now_ms())
-            { continue; }
+            if witness.record.released_at_ms > threshold || !witness.permits(candidate, &store) { continue; }
             let target = ObjectKey::new(format!("{store}/{relative}"))?;
             if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
             eligible.push((marker.key, target, witness));
@@ -356,7 +362,7 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
 
     let owner = crate::admin::update_installation(directory, deployment, |record| {
         if record.lineage != lineage || record.storage_prefix() != retirement.source || !can_reap(record)
-            || !permits_release(record, &store, &witness.record)
+            || !witness.permits(record, &store)
         {
             return Err(changed());
         }
@@ -365,11 +371,6 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
             StorageRegion::Remote { archive: Some(_), .. } | StorageRegion::Local { archive: Some(_), .. } => true,
             _ => false,
         }) { return Err(changed()); }
-        if !recovery_covers_release(record, &witness.record)
-            || !super::oversized_payload_collectable(record, &witness.record.key, rtdb_directory::now_ms())
-        {
-            return Err(changed());
-        }
         if let Some(PackReadiness::Covered { block, youngest }) = pack {
             let oldest = record.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).min();
             if record.checkpoint != observed_successor
@@ -501,6 +502,52 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_certified_replica_payload_requires_settled_trim_and_retries_the_exact_version() {
+        use rtdb_directory::{Checkpoint, JournalAnchor, ReplicaPayloadTrim};
+
+        let directory = MemoryDirectory::new();
+        let bucket = VersionedReleaseStore::default();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.checkpoint = Some(Checkpoint { block: 1, boundary: 7, source: 5, system_time: 0, root_sha256: Some([1; 32]) });
+        record.recovery_manifest_sha256 = Some([2; 32]);
+        record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation: record.incarnation, interval: [0, 6], digest: [3; 32] }));
+        record.replica_payload_trim = Some(Box::new(ReplicaPayloadTrim { incarnation: record.incarnation, log_epoch: record.log_epoch,
+            through: 6, journals: [rtdb_types::JournalEndpoint::Member {
+                address: "127.0.0.1:1".into(), journal: Uuid::new_v4().to_string(),
+            }].into(), applied: false }));
+        let record = directory.create_deployment(record).await.unwrap();
+        let relative = "oversized/b00-published.binpb";
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
+        let target = ObjectKey::new(format!("{}/{root}/{relative}", record.storage_prefix())).unwrap();
+        bucket.put(&target, Bytes::from_static(b"another version")).await.unwrap();
+        let provider = Provider { version: PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
+            key: format!("cell/{target}"), version: "retired".into(),
+        }, attempts: AtomicUsize::new(0), markers: AtomicUsize::new(0) };
+        super::super::publish_replica_payload_release(&bucket, &record, relative.into(), 6, provider.version.clone()).await.unwrap();
+
+        reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
+        assert_eq!(provider.attempts.load(Ordering::Relaxed), 0);
+        let hold = Uuid::new_v4();
+        let record = crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.replica_payload_trim.as_mut().unwrap().applied = true;
+            record.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 6, custody: ReplayCustody::Local });
+            Ok(())
+        }).await.unwrap();
+        reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
+        assert_eq!(provider.attempts.load(Ordering::Relaxed), 0);
+        super::super::release_region(directory.as_ref(), &record.id, hold, false).await.unwrap();
+
+        let record = directory.deployment(&record.id).await.unwrap().unwrap();
+        let lost_reply = reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap_err();
+        assert_eq!(lost_reply.code, "fixture/provider-reply-lost");
+        assert!(directory.lineage_state(&record.lineage).await.unwrap().exact_erasure_authorized());
+        reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
+        assert_eq!(provider.attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(bucket.get(&target).await.unwrap().as_ref(), b"another version");
     }
 
     #[tokio::test]

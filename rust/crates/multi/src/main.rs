@@ -23,7 +23,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
@@ -388,6 +388,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             }
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
+            agent.replica_payload_reclamation = arguments.present("replica-payload-reclamation");
             if arguments.present("s3-write-role") {
                 let sts_endpoint = if arguments.present("sts-endpoint") { Some(arguments.required("sts-endpoint")?.to_owned()) } else { None };
                 agent.s3_write_role = Some(rtdb_multi::agent::S3WriteRole { arn: arguments.required("s3-write-role")?.to_owned(),

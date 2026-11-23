@@ -138,8 +138,10 @@ impl PartitionLogs {
             Err(StorageError::MessageTooLarge { .. }) => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
                 let key = ObjectKey::new(oversized_key(block, &payload_id)?)?;
-                let proxy = envelope.offloaded(self.storage_version, self.storage_epoch, block, payload_id, &payload);
-                self.store.put(&key, payload).await?;
+                let mut proxy = envelope.offloaded(self.storage_version, self.storage_epoch, block, payload_id, &payload);
+                if let Some(version) = self.store.put_replica_payload(&key, payload).await? {
+                    proxy.bind_offload_publication(version)?;
+                }
                 let payload = EncodedPayload::encode(proxy.encoded_len(), &self.memory, || Ok(proxy.encode()))?;
                 self.replica.enqueue(payload, now).await?
             }

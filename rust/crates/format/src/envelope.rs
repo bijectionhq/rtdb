@@ -1,9 +1,11 @@
 use prost::Message;
 use sha2::{Digest, Sha256};
-use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, Term, TermSequence};
+use rtdb_types::{Anomaly, BlockIndex, PhysicalObjectVersion, Result, S3ObjectNamespace, StorageEpoch, StorageVersion, Term, TermSequence};
 
 use crate::generated::xtdb::log::proto::{ReplicaLogMessage, SourceLogMessage};
 use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
+
+const ADMITTED_OFFLOAD_STORAGE: i32 = -1;
 
 pub use crate::generated::xtdb::log::proto::replica_log_message::Message as ReplicaBody;
 pub use crate::generated::xtdb::log::proto::source_log_message::Message as SourceBody;
@@ -186,6 +188,7 @@ impl ReplicaEnvelope {
                 block_index: Some(block.0),
                 payload_id: Some(payload_id),
                 payload_sha256: Some(Sha256::digest(bytes).to_vec()),
+                publication: None,
             }),
         }
     }
@@ -193,7 +196,9 @@ impl ReplicaEnvelope {
     /// The caller admits the envelope's term before reading the returned payload key.
     pub fn oversized_payload(&self, version: StorageVersion, epoch: StorageEpoch) -> Result<Option<String>> {
         let ReplicaBody::OversizedMessage(message) = &self.message else { return Ok(None) };
-        let message_version = StorageVersion(message.storage_version.unwrap_or_default());
+        let message_version = if message.storage_version == Some(ADMITTED_OFFLOAD_STORAGE) {
+            self.offload_publication()?.ok_or_else(|| invalid("Admitted offload has no publication"))?.0
+        } else { StorageVersion(message.storage_version.unwrap_or_default()) };
         let message_epoch = StorageEpoch(message.storage_epoch.unwrap_or_default());
         if message_version != version || message_epoch != epoch {
             return Err(Anomaly::fault(
@@ -206,6 +211,37 @@ impl ReplicaEnvelope {
             message.payload_id.as_deref().unwrap_or_default(),
         )?;
         Ok(Some(key))
+    }
+
+    pub fn offload_publication(&self) -> Result<Option<(StorageVersion, PhysicalObjectVersion)>> {
+        let ReplicaBody::OversizedMessage(message) = &self.message else { return Ok(None) };
+        if message.storage_version != Some(ADMITTED_OFFLOAD_STORAGE) { return Ok(None); }
+        let publication = message.publication.as_ref().ok_or_else(|| invalid("Admitted offload has no publication"))?;
+        let (Some(version), Some(bucket), Some(key), Some(version_id)) =
+            (publication.storage_version, &publication.bucket, &publication.key, &publication.version_id)
+            else { return Err(invalid("Admitted offload has an incomplete publication")); };
+        if version < 0 || bucket.is_empty() || key.is_empty() || version_id.is_empty() || version_id == "null"
+            || message.payload_sha256.as_ref().is_none_or(|digest| digest.len() != 32)
+        {
+            return Err(invalid("Admitted offload has an invalid publication"));
+        }
+        Ok(Some((StorageVersion(version), PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: bucket.clone(), endpoint: publication.endpoint.clone(), region: publication.region.clone() },
+            key: key.clone(), version: version_id.clone(),
+        })))
+    }
+
+    pub fn bind_offload_publication(&mut self, version: PhysicalObjectVersion) -> Result<()> {
+        let ReplicaBody::OversizedMessage(message) = &mut self.message else {
+            return Err(invalid("An object publication requires an oversized envelope"));
+        };
+        message.publication = Some(crate::log::proto::ReplicaPayloadPublication {
+            storage_version: message.storage_version,
+            bucket: Some(version.namespace.bucket), endpoint: version.namespace.endpoint, region: version.namespace.region,
+            key: Some(version.key), version_id: Some(version.version),
+        });
+        message.storage_version = Some(ADMITTED_OFFLOAD_STORAGE);
+        self.offload_publication().map(drop)
     }
 
     /// Checks the fetched record against the already-admitted envelope without admitting it a second time.

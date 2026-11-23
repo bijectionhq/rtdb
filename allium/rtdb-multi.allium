@@ -1556,6 +1556,9 @@ rule ReleaseReplicaReplay {
 -- Startup and ordinary delivery use the same directory trim frontier.
 -- The delivered pointer retains the replay hold until its provider read drains or the pointer is discarded.
 -- An inline delivery after startup consumes no replay hold.
+-- A replica payload release identifies the exact publication carried by a certified replica entry.
+-- Provider deletion requires the directory to record trim completion for every journal in the authorized inventory.
+-- A provider retry names the same publication until settlement is recorded.
 
 ------------------------------------------------------------
 -- Rules: compaction
