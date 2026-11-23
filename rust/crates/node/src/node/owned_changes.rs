@@ -68,6 +68,28 @@ struct Journal<'a> {
     next: OwnedJournalHeader,
 }
 
+/// One exact admitted local revision of one held-world identity.
+pub struct OwnedWorldVersionRead<'a> {
+    held: &'a OwnedReadSession,
+    world: rtdb_types::Iid,
+    relation: &'a OwnedRelation,
+    id: &'a EntityId,
+    system: Timestamp,
+}
+
+impl OwnedWorldVersionRead<'_> {
+    pub async fn boundaries(&self) -> Result<Option<rtdb_query::QueryCursor>> {
+        rtdb_query::open_owned_valid_boundaries(
+            self.held.relation_context(self.relation)?, &self.held.owner,
+            &self.relation.in_world(self.world)?, self.id, Interval::ALL, self.system,
+        ).await
+    }
+
+    pub async fn shadow_at(&self, valid: Timestamp) -> Result<super::OwnedWorldShadowRead> {
+        self.held.read_world_shadow_at(self.world, self.relation, self.id, valid, self.system, false).await
+    }
+}
+
 pub struct ExpiryCandidate {
     pub identity: Vec<u8>,
     pub nomination: String,
@@ -321,6 +343,28 @@ impl OwnedReadSession {
         let accepted = context.with_owned_system_cut(group, &context.cancellation)?;
         let columns = crate::ordered_index::stable_owned_path_columns(&prior, &accepted, &self.owner, relation, path).await?;
         Ok((before, columns))
+    }
+
+    /// Certifies a whole accepted local group and the complete address within it.
+    pub async fn world_version<'a>(
+        &'a self, world: rtdb_types::Iid, relation: &'a OwnedRelation, id: &'a EntityId,
+        from: Timestamp, through: Timestamp, system: Timestamp,
+    ) -> Result<OwnedWorldVersionRead<'a>> {
+        self.require_change_bounds(from, through)?;
+        if system <= from || system > through { return Err(change_feed_uncovered()); }
+        let before = Timestamp(system.0.checked_sub(1).ok_or_else(change_feed_uncovered)?);
+        let page = self.world_merged_changes(world, std::slice::from_ref(relation), before, system, 1).await?;
+        let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
+        let [changes] = commit.changes.as_slice() else { return Err(change_feed_uncovered()); };
+        if commit.revision != system || changes.relation != *relation || !changes.touches.iter().any(|touch| {
+            touch.id == *id && matches!(touch.kind, rtdb_types::OwnedChangeKind::Put | rtdb_types::OwnedChangeKind::Delete)
+        }) {
+            return Err(change_feed_uncovered());
+        }
+        // The exact branch journal also certifies the selected window floor,
+        // including a journal with a nonzero retained starting frontier.
+        self.world_merged_changes(world, std::slice::from_ref(relation), from, from, 1).await?;
+        Ok(OwnedWorldVersionRead { held: self, world, relation, id, system })
     }
 
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {

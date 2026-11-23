@@ -79,6 +79,7 @@ enum ArchiveRead {
         relation: OwnedRelation,
         id: EntityId,
         valid: Interval,
+        expected_schema: Option<rtdb_types::OwnedSchema>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<Vec<Timestamp>>>,
     },
@@ -498,6 +499,64 @@ impl HeldCheckpointWorld {
         Ok((result, witness))
     }
 
+    pub async fn version(
+        &self, relation: &OwnedRelation, id: &EntityId, from: Timestamp, through: Timestamp, group: Timestamp,
+    ) -> Result<Vec<(Interval, WorldFact, bool)>> {
+        self.check_relation(relation)?;
+        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+        if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
+            return Err(OwnedWorld::unavailable());
+        }
+        let guard = self.open.snapshot.relation_release_guard([relation])?;
+        self.require_archive_coverage(vec![(relation.clone(), 0)], Arc::clone(&guard)).await?;
+        self.open.snapshot.check_point_purge_floor(relation, id, self.parent_basis().system_time).await?;
+        let version = self.open.snapshot.world_version(self.open.record.id, relation, id, from, through, group).await?;
+        let valid = Interval::ALL;
+        let local = read_boundaries(version.boundaries().await?, valid).await?;
+        let parent = self.archive_boundaries(relation, id, valid, Some(schema.clone())).await?;
+        let boundaries = merge_boundaries(parent, local, valid)?;
+        let mut bytes = 0usize;
+        let mut slices = Vec::with_capacity(boundaries.len().saturating_sub(1));
+        let _framing = self.memory.reserve(boundaries.len().saturating_mul(256))?;
+        for window in boundaries.windows(2) {
+            guard()?;
+            let local = version.shadow_at(window[0]).await?;
+            let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
+            let shadowed = local.is_some();
+            let fact = match local {
+                Some(fact) => match WorldShadow::from_record(fact.row)? {
+                    WorldShadow::Deleted => None,
+                    WorldShadow::Present(row) => Some(WorldFact {
+                        row, revision: fact.revision, lifetime: None, _reservation: fact._reservation,
+                    }),
+                },
+                None => self.archive_point(relation, id, window[0], None).await?,
+            };
+            if let Some(fact) = fact {
+                if fact.revision > group { return Err(OwnedWorld::unavailable()); }
+                schema.validate_row(&fact.row)?;
+                bytes = bytes.checked_add(Value::document_retained_bytes(&fact.row)?)
+                    .filter(|bytes| *bytes <= 8 << 20).ok_or_else(history_limit)?;
+                slices.push((Interval::new(window[0], window[1])?, fact, shadowed));
+            }
+        }
+        guard()?;
+        self.check_relation(relation)?;
+        Ok(slices)
+    }
+
+    async fn archive_boundaries(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, expected_schema: Option<rtdb_types::OwnedSchema>,
+    ) -> Result<Vec<Timestamp>> {
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Boundaries {
+            relation: relation.clone(), id: id.clone(), valid, expected_schema,
+            guard: self.open.snapshot.relation_release_guard([relation])?, reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?
+    }
+
     pub async fn valid_during(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, parent_only: bool,
     ) -> Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)> {
@@ -513,22 +572,8 @@ impl HeldCheckpointWorld {
             let scan = self.open.snapshot.open_world_shadow_boundaries(self.open.record.id, relation, id, valid).await?;
             read_boundaries(scan, valid).await?
         };
-        let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Boundaries {
-            relation: relation.clone(), id: id.clone(), valid,
-            guard: self.open.snapshot.relation_release_guard([relation])?, reply,
-        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-        let parent = self.cancellation.run_until_cancelled(result).await
-            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
-        // A parent boundary inside a local shadow cannot affect the selected timeline.
-        let mut boundaries: Vec<_> = parent.into_iter().filter(|boundary| {
-            !local.chunks_exact(2).any(|span| span[0] < *boundary && *boundary < span[1])
-        }).collect();
-        boundaries.extend(local);
-        boundaries.extend([valid.lower(), valid.upper()]);
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        if boundaries.len() > MAX_HISTORY_SLICES + 1 { return Err(history_limit()); }
+        let parent = self.archive_boundaries(relation, id, valid, None).await?;
+        let boundaries = merge_boundaries(parent, local, valid)?;
         let mut visible = Vec::with_capacity(boundaries.len().saturating_sub(1));
         for window in boundaries.windows(2) {
             let fact = if parent_only {
@@ -681,6 +726,19 @@ fn history_limit() -> rtdb_types::Anomaly {
         rtdb_types::AnomalyCategory::Busy, "rtdb.world/history-size",
         "The world history interval exceeds its boundary limit",
     )
+}
+
+fn merge_boundaries(parent: Vec<Timestamp>, local: Vec<Timestamp>, valid: Interval) -> Result<Vec<Timestamp>> {
+    // A parent boundary inside a local shadow cannot affect the selected timeline.
+    let mut boundaries: Vec<_> = parent.into_iter().filter(|boundary| {
+        !local.chunks_exact(2).any(|span| span[0] < *boundary && *boundary < span[1])
+    }).collect();
+    boundaries.extend(local);
+    boundaries.extend([valid.lower(), valid.upper()]);
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    if boundaries.len() > MAX_HISTORY_SLICES + 1 { return Err(history_limit()); }
+    Ok(boundaries)
 }
 
 async fn read_boundaries(cursor: Option<rtdb_query::QueryCursor>, valid: Interval) -> Result<Vec<Timestamp>> {
@@ -866,11 +924,18 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Boundaries { relation, id, valid, guard, mut reply } => {
+                                ArchiveRead::Boundaries { relation, id, valid, expected_schema, guard, mut reply } => {
                                     let read = async {
                                         require_relation_purge_history(&context, &owner)?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        if let Some(expected) = expected_schema {
+                                            let schema = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &owner, &relation).await?;
+                                            if !schema.is_some_and(|(schema, _)| schema == expected) {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                        }
                                         let cursor = rtdb_query::open_owned_valid_boundaries(
-                                            Arc::clone(&context).with_owned_read_guard(guard),
+                                            context,
                                             &owner, &relation, &id, valid, parent_time,
                                         ).await?;
                                         read_boundaries(cursor, valid).await

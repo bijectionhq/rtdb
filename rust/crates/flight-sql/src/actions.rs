@@ -67,6 +67,7 @@ impl Service {
                 crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 => Ok(vec![Ok(self.held_protected_carriers_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
+                crate::owned_actions::HELD_WORLD_VERSION_V1 => self.held_world_version_action(&call, &action.body).await,
                 crate::owned_actions::HELD_WORLD_TOUCH_AFTER_V1 => Ok(vec![Ok(self.held_world_touch_after_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PATH_TOUCH_V1 => self.held_world_path_touch_action(&call, &action.body).await,
                 crate::owned_actions::HELD_OWNED_PATH_TOUCH_V1 => self.held_owned_path_touch_action(&call, &action.body).await,
