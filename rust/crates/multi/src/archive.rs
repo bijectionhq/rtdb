@@ -2300,7 +2300,8 @@ mod tests {
         let bytes = Bytes::from_static(b"observed bytes");
         store.put(&name, bytes.clone()).await?;
         let closure = BTreeMap::from([(name.clone(), Some(publication_digest(&bytes)))]);
-        let plan = plan_checkpoint_copy(&store, closure, Some(bytes.len() as u64 + crate::cipher::SEALED_OVERHEAD as u64)).await?;
+        let budget = crate::cipher::object::sealed_size(&name, bytes.len())? as u64;
+        let plan = plan_checkpoint_copy(&store, closure, Some(budget)).await?;
         assert_eq!(plan[0].version.as_ref().map(|identity| identity.key.as_str()),
             Some("serving/v06/tables/t/data/example.arrow"),
             "the source plan must retain the physical storage identity");
