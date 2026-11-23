@@ -21,6 +21,7 @@ mod units;
 pub struct S3KeyService {
     client: Client,
     bucket: String,
+    reads: Arc<IoRegion>,
 }
 
 enum Current {
@@ -44,18 +45,16 @@ impl S3KeyService {
         let vault = Self {
             client: Client::new(&config),
             bucket: bucket.to_owned(),
+            reads: IoRegion::new(),
         };
         vault.require_never_versioned().await?;
         Ok(vault)
     }
 
     async fn require_never_versioned(&self) -> Result<()> {
-        let reply = self
-            .client
-            .get_bucket_versioning()
-            .bucket(&self.bucket)
-            .send()
-            .await
+        let reply = self.reads.read_async(Arc::new(self.clone()), (), |vault, ()| async move {
+            Ok(vault.client.get_bucket_versioning().bucket(&vault.bucket).send().await)
+        }).await.map_err(|_| unavailable("validate bucket versioning"))?
             .map_err(|_| unavailable("validate bucket versioning"))?;
         if reply.status().is_some() || reply.mfa_delete().is_some() {
             return Err(versioned());
@@ -64,6 +63,12 @@ impl S3KeyService {
     }
 
     async fn read_vault_object(&self, path: &str, maximum: usize) -> Result<Option<(Bytes, String)>> {
+        self.reads.read_async(Arc::new(self.clone()), path.to_owned(), move |vault, path| async move {
+            Ok(vault.read_exact(&path, maximum).await)
+        }).await.map_err(|_| unavailable("read current key"))?
+    }
+
+    async fn read_exact(&self, path: &str, maximum: usize) -> Result<Option<(Bytes, String)>> {
         let reply = match self
             .client
             .get_object()
@@ -559,6 +564,7 @@ mod transport_tests {
             S3KeyService {
                 client: Client::from_conf(config),
                 bucket: "test-vault".into(),
+                reads: IoRegion::new(),
             },
             service,
         )

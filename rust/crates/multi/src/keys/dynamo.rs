@@ -28,6 +28,7 @@ const DESTROYED: &str = "destroyed";
 pub struct DynamoKeyService {
     client: Client,
     table: String,
+    reads: Arc<IoRegion>,
 }
 
 impl DynamoKeyService {
@@ -42,19 +43,17 @@ impl DynamoKeyService {
                 "Invalid deployment key table",
             ));
         }
-        Ok(Self { client, table })
+        Ok(Self { client, table, reads: IoRegion::new() })
+    }
+
+    async fn read_item(&self, id: &str, operation: &'static str) -> Result<aws_sdk_dynamodb::operation::get_item::GetItemOutput> {
+        self.reads.read_async(Arc::new(self.clone()), id.to_owned(), |vault, id| async move {
+            Ok(vault.client.get_item().table_name(&vault.table).key(ID, string(&id)).consistent_read(true).send().await)
+        }).await.map_err(|_| unavailable(operation))?.map_err(|_| unavailable(operation))
     }
 
     async fn existing(&self, id: &str) -> Result<Option<[u8; KEY_BYTES]>> {
-        let item = self
-            .client
-            .get_item()
-            .table_name(&self.table)
-            .key(ID, string(id))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|_| unavailable("read"))?;
+        let item = self.read_item(id, "read").await?;
         let Some(item) = item.item() else {
             return Ok(None);
         };
@@ -108,15 +107,7 @@ impl DynamoKeyService {
             .send()
             .await
             .map_err(|_| unavailable("destroy"))?;
-        let observed = self
-            .client
-            .get_item()
-            .table_name(&self.table)
-            .key(ID, string(id))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|_| unavailable("read back withdrawal"))?;
+        let observed = self.read_item(id, "read back withdrawal").await?;
         let item = observed
             .item()
             .ok_or_else(|| unavailable("read back withdrawal"))?;
@@ -168,19 +159,19 @@ impl DynamoKeyService {
         let prefix = format!("{namespace}-");
         let mut start = None;
         loop {
-            let page = self
-                .client
-                .scan()
-                .table_name(&self.table)
-                .consistent_read(true)
-                .set_exclusive_start_key(start)
-                .limit(128)
-                .filter_expression("begins_with(#id, :prefix)")
-                .projection_expression("#id")
-                .expression_attribute_names("#id", ID)
-                .expression_attribute_values(":prefix", string(&prefix))
-                .send()
-                .await
+            let page = self.reads.read_async(Arc::new(self.clone()), (prefix.clone(), start), |vault, (prefix, start)| async move {
+                Ok(vault.client.scan()
+                    .table_name(&vault.table)
+                    .consistent_read(true)
+                    .set_exclusive_start_key(start)
+                    .limit(128)
+                    .filter_expression("begins_with(#id, :prefix)")
+                    .projection_expression("#id")
+                    .expression_attribute_names("#id", ID)
+                    .expression_attribute_values(":prefix", string(&prefix))
+                    .send()
+                    .await)
+            }).await.map_err(|_| unavailable("read unit census"))?
                 .map_err(|_| unavailable("read unit census"))?;
             for item in page.items() {
                 let id = item
