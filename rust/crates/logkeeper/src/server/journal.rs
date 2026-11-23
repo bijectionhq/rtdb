@@ -105,7 +105,7 @@ enum Kind {
     Drop(u64),
     #[prost(message, tag = "13")]
     ObservedSync(ObservedSync),
-    #[prost(sint64, tag = "14")]
+    #[prost(sint64, tag = "18")]
     Install(i64),
     #[prost(message, tag = "15")]
     InstallCertificate(DecisionCertificate),
@@ -117,7 +117,7 @@ enum Kind {
 struct Record {
     #[prost(uint64, tag = "9")]
     stream: u64,
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 14, 15, 16")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 15, 16, 18")]
     kind: Option<Kind>,
     // An activation is an optional refinement of an existing synced record.
     #[prost(bytes = "bytes", tag = "12")]
@@ -945,6 +945,18 @@ pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn install_and_original_append_decode_as_distinct_journal_fields() {
+        use super::{Kind, Message, Record};
+
+        let old = Record::decode(&[0x70, 0x01][..]).unwrap();
+        assert_eq!(old.original_append, Some(true));
+        assert!(old.kind.is_none());
+        let installed = Record::decode(&[0x90, 0x01, 0x02][..]).unwrap();
+        assert!(matches!(installed.kind, Some(Kind::Install(1))));
+        assert_eq!(installed.original_append, None);
+    }
+
     use super::*;
 
     const UNBOUNDED: usize = usize::MAX;
