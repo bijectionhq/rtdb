@@ -291,3 +291,40 @@ The specialized vector benchmark uses ordered predicate indexes and resolves its
 The plain score and the scalar control in the updated benchmark run against the same captured source with scan acceleration disabled.
 The scalar control puts the same distance call under a bound true condition so the specialized projection declines it.
 The benchmark rotates the control, the plain Arrow score, and the exact ordered path, and asserts identical result IDs and distance bits for each query and filter.
+
+### Arrow benchmark at 100,000 embeddings
+
+This run uses `d59df7dc6` with Arrow IPC fixture input, the columnar write path, typed centroid ranges, and typed IID reranking.
+The fixture's vector, centroid, query, and cluster assignment buffers match the original test data bit for bit.
+The 60 stationary and 20 churn cases matched the scalar control in ID order and distance bits under exact SQL.
+Every ANN sample matched its original recall and result count.
+In the full-probe churn canary, shadowing 67 changed IIDs restored ten neighbors from the two returned by the stale shortlist.
+
+Loading and flushing the table took 0.86 s.
+Completing both ordered indexes took 13.95 s.
+Packing the centroid ranges took 67.43 ms after training.
+The Arrow centroid object used 42,399,112 bytes.
+Adding the IID column and IPC framing increased the original object by 1,999,112 bytes and removed the separate 2,400,000-byte resident IID dictionary.
+
+The latency cells show p50 / p95 milliseconds.
+The ANN columns show 32 probes.
+
+**Stationary**
+
+| Filter | Exact scalar control | Exact Arrow | Ordered exact Arrow | Warm ANN | Cold ANN | Cold reads / MiB, p50 | Mean recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | 4,778.24 / 5,005.07 | 579.66 / 607.28 | 585.06 / 647.47 | 4.98 / 7.74 | 5.35 / 7.70 | 32 / 2.84 | 79.2% |
+| Random, ~0.1% | 13.11 / 13.79 | 7.06 / 8.82 | 5.42 / 5.81 | 0.75 / 1.55 | 1.12 / 2.98 | 32 / 2.84 | 26.7% |
+| Random, ~1% | 61.79 / 75.02 | 10.76 / 11.59 | 9.13 / 13.00 | 4.15 / 4.61 | 4.72 / 10.72 | 32 / 2.84 | 42.5% |
+| Random, ~10% | 483.06 / 539.43 | 13.10 / 13.90 | 20.88 / 23.04 | 4.21 / 4.77 | 4.64 / 7.27 | 32 / 2.84 | 63.3% |
+| Whole clusters, ~1% | 70.37 / 72.77 | 10.99 / 11.30 | 9.49 / 9.92 | 4.08 / 4.68 | 4.23 / 4.85 | 6 / 0.50 | 100.0% |
+
+**Churn**
+
+| Filter | Exact scalar control | Exact Arrow | Ordered exact Arrow | Warm ANN | Cold ANN | Cold reads / MiB, p50 | Mean recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | 4,727.44 / 4,813.94 | 581.56 / 584.20 | 578.75 / 591.25 | 6.64 / 7.31 | 6.92 / 8.09 | 32 / 3.11 | 82.5% |
+| Random, ~0.1% | 13.21 / 13.43 | 6.93 / 7.21 | 15.26 / 15.40 | 3.40 / 4.15 | 3.97 / 4.50 | 32 / 3.11 | 30.0% |
+| Random, ~1% | 61.44 / 62.70 | 10.69 / 10.87 | 19.07 / 19.26 | 5.72 / 6.24 | 6.11 / 6.47 | 32 / 3.11 | 60.0% |
+| Random, ~10% | 480.13 / 488.64 | 12.99 / 13.46 | 29.84 / 30.59 | 5.75 / 5.87 | 6.05 / 6.12 | 32 / 3.11 | 72.5% |
+| Whole clusters, ~1% | 70.86 / 71.10 | 10.97 / 11.21 | 19.03 / 19.37 | 5.80 / 5.82 | 5.93 / 5.97 | 6 / 0.50 | 100.0% |
