@@ -48,6 +48,7 @@ pub struct CheckpointPoint<'a> {
     pub valid: Option<Interval>,
 }
 
+#[derive(Clone)]
 pub struct CheckpointReadResources<'a> {
     pub node: &'a NodeOptions,
     pub memory: &'a Arc<MemoryBudget>,

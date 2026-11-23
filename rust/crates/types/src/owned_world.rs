@@ -113,11 +113,12 @@ pub struct OwnedWorld {
 }
 
 impl OwnedWorld {
+    pub fn root_clock(&self) -> Timestamp {
+        self.parent_publication.unwrap_or(self.basis.system_time)
+    }
+
     pub fn inherited_clock(&self) -> Timestamp {
-        self.ancestor.as_ref().map_or_else(
-            || self.parent_publication.unwrap_or(self.basis.system_time),
-            |ancestor| ancestor.logical,
-        )
+        self.ancestor.as_ref().map_or_else(|| self.root_clock(), |ancestor| ancestor.logical)
     }
 
     pub fn initial_clock(&self) -> Timestamp {

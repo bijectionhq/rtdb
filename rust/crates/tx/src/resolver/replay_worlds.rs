@@ -72,28 +72,44 @@ impl OpenTransaction<'_> {
                 .checked_sub(remaining)
                 .ok_or_else(unavailable)?,
         );
-        let inherited = world.inherited_clock();
+        let root_clock = world.root_clock();
         if admission.basis.system_time != proven
             || restored != proven
             || admission.basis.tx_id >= ordered.tx_id
-            || inherited > world.basis.system_time
-            || (world.mode == WorldClockMode::Proposal && inherited != logical)
+            || root_clock > world.basis.system_time
+            || (world.mode == WorldClockMode::Proposal && root_clock != logical)
             || lease_start < proven
             || lease_start > ordered.system_time
             || admission.until <= ordered.system_time
         {
             return Err(unavailable());
         }
+        let ancestor = admission.retained_ancestor(&world)?.cloned();
+        if let Some(ancestor) = &ancestor {
+            let original = world.ancestor.as_ref().ok_or_else(unavailable)?.basis;
+            let locator = format!("native-transaction/{}", original.tx_id.0);
+            let (receipt, destination) = replay_control(context, &locator).await?;
+            replayed_parent_logical_time(&receipt, admission.binding, &archive, original)?;
+            if ancestor.basis.system_time != destination
+                || ancestor.basis.tx_id >= ordered.tx_id
+                || destination > lease_start
+            {
+                return Err(unavailable());
+            }
+        }
         admission.require_application(&world, controls)?;
+        world.ancestor = ancestor;
         world.capture = Iid(admission.capture);
         world.suffix = admission.suffix.map(Iid);
         world.manifest = admission.manifest;
         world.basis = admission.basis;
-        world.parent_publication = Some(inherited);
+        world.parent_publication = Some(root_clock);
         world.until = admission.until;
+        let record = world.record();
+        OwnedWorld::from_record(&record)?;
         self.buffer.put(
             OwnedRelation::world_catalog().table(owner),
-            world.record(),
+            record,
             Interval::ALL,
         )
     }
@@ -128,7 +144,9 @@ impl OpenTransaction<'_> {
             let world = registration.world;
             let previous =
                 rtdb_query::read_owned_world(Arc::clone(context), owner, world.id).await?;
-            if world.basis.system_time > at || world.dropped || world.until <= logical {
+            if world.basis.system_time > at || world.until <= logical
+                || world.ancestor.as_ref().is_some_and(|ancestor| ancestor.basis.system_time >= at)
+            {
                 return Err(OwnedWorld::unavailable());
             }
             if let Some(readmission) = registration.readmission.as_ref() {
@@ -137,10 +155,11 @@ impl OpenTransaction<'_> {
                 self.record_replayed_world_relocation(replay, world.id, readmission)?;
             } else {
                 match previous {
-                    None if world.pin == world.id => (),
+                    None if world.pin == world.id && !world.dropped => (),
                     Some((previous, _))
-                        if previous.until > logical
-                            && (previous.can_advance_to(&world)
+                        if !previous.dropped && previous.until > logical
+                            && ((world.dropped && previous.same_fork(&world))
+                                || previous.can_advance_to(&world)
                                 || previous.can_renew_to(&world)
                                 || previous.can_hold_proposal(&world)
                                 || previous.can_shorten_proposal(&world)) =>
@@ -151,6 +170,7 @@ impl OpenTransaction<'_> {
                 }
             }
             if registration.bind_parent {
+                if world.dropped { return Err(OwnedWorld::unavailable()); }
                 self.record_replayed_world_parent(replay, context, &world)
                     .await?;
             }

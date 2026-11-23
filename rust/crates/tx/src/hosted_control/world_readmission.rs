@@ -1,4 +1,4 @@
-use rtdb_types::{EntityId, Iid, OwnedWorld, Result, Timestamp, TransactionKey};
+use rtdb_types::{EntityId, Iid, OwnedWorld, OwnedWorldAncestor, Result, Timestamp, TransactionKey};
 use serde::{Deserialize, Serialize};
 
 use super::{HostedControlWrite, NATIVE_FRONTIER, RESTORE, control_body, replay_invalid};
@@ -22,6 +22,14 @@ pub(crate) struct WorldReadmission {
     pub(crate) source_cut: Timestamp,
     pub(crate) original_parent: TransactionKey,
     pub(crate) original_until: Timestamp,
+    pub(crate) ancestor: Option<RelocatedAncestor>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RelocatedAncestor {
+    pub(crate) original: TransactionKey,
+    pub(crate) retained: OwnedWorldAncestor,
 }
 
 pub(crate) fn world_readmission_control<'a>(
@@ -91,6 +99,25 @@ fn is_readmission(control: &HostedControlWrite) -> bool {
 }
 
 impl WorldReadmission {
+    pub(crate) fn retained_ancestor(&self, world: &OwnedWorld) -> Result<Option<&OwnedWorldAncestor>> {
+        match (&world.ancestor, &self.ancestor) {
+            (None, None) => Ok(None),
+            (Some(old), Some(relocated))
+                if relocated.original == old.basis
+                    && old.basis.system_time <= self.source_cut
+                    && relocated.retained.world == old.world
+                    && relocated.retained.pin == old.pin
+                    && relocated.retained.logical == old.logical
+                    && relocated.retained.basis.tx_id > self.basis.tx_id
+                    && relocated.retained.basis.system_time > self.basis.system_time
+                    && relocated.retained.basis.system_time < self.until =>
+            {
+                Ok(Some(&relocated.retained))
+            }
+            _ => Err(replay_invalid()),
+        }
+    }
+
     pub(crate) fn require_relocation(
         &self,
         prior: &OwnedWorld,
@@ -106,7 +133,9 @@ impl WorldReadmission {
             || next.dropped
             || next.mode != prior.mode
             || next.schemas != prior.schemas
-            || next.parent_publication != Some(prior.inherited_clock())
+            || next.parent_publication != Some(prior.root_clock())
+            || self.retained_ancestor(prior)? != next.ancestor.as_ref()
+            || next.ancestor.as_ref().is_some_and(|ancestor| ancestor.basis.system_time >= logical)
             || prior.basis != self.original_parent
             || prior.until != self.original_until
             || prior.basis.system_time > self.source_cut
@@ -195,6 +224,67 @@ impl WorldReadmission {
         if !owner_seen || !head_seen || !quota {
             return Err(replay_invalid());
         }
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_types::{TxId, WorldClockMode, WorldSchemas};
+
+    fn position(tx_id: i64, system_time: i64) -> TransactionKey {
+        TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(system_time) }
+    }
+
+    #[test]
+    fn retained_ancestor_relocation_preserves_the_original_overlay_identity() -> Result<()> {
+        let original = OwnedWorldAncestor {
+            world: [2; 16],
+            pin: [3; 16],
+            capture: [4; 16],
+            suffix: [5; 16],
+            manifest: "a".repeat(43),
+            basis: position(2, 20),
+            logical: Timestamp(17),
+        };
+        let world = OwnedWorld {
+            id: Iid([1; 16]),
+            pin: Iid([1; 16]),
+            capture: Iid([6; 16]),
+            suffix: None,
+            manifest: "b".repeat(43),
+            basis: position(1, 10),
+            parent_publication: Some(Timestamp(8)),
+            mode: WorldClockMode::Retained,
+            until: Timestamp(100),
+            schemas: WorldSchemas::from_bytes(b"{}")?,
+            ancestor: Some(original.clone()),
+            dropped: false,
+        };
+        let mut retained = original.clone();
+        retained.basis = position(102, 120);
+        let mut admission = WorldReadmission {
+            binding: [9; 32],
+            world: world.id.0,
+            pin: world.pin.0,
+            capture: [7; 16],
+            suffix: None,
+            manifest: "c".repeat(43),
+            basis: position(101, 110),
+            until: Timestamp(200),
+            source_cut: Timestamp(90),
+            original_parent: world.basis,
+            original_until: world.until,
+            ancestor: Some(RelocatedAncestor { original: original.basis, retained: retained.clone() }),
+        };
+        assert_eq!(admission.retained_ancestor(&world)?, Some(&retained));
+        let moved = admission.ancestor.as_mut().expect("fixture has a relocated ancestor");
+        moved.retained.pin = [10; 16];
+        assert!(admission.retained_ancestor(&world).is_err());
+        admission.ancestor = None;
+        assert!(admission.retained_ancestor(&world).is_err());
         Ok(())
     }
 }
