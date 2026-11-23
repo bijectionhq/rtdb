@@ -287,7 +287,7 @@ In-memory code keeps typed buffers alive across those boundaries and creates new
 | Exact scan and distance | Scan gather boxed each component, then scalar distance decoded each embedding and prepared the same query repeatedly. | The scan gathers compatible fixed-size float lists directly, including when another visible page lacks that column. A column-to-literal or column-to-parameter cosine expression prepares the query once, reads Float32 or Float64 child buffers, and emits an Arrow Float64 column. Unsupported layouts and general expressions continue through the scalar evaluator. |
 | Centroid ranges and live tail | Cluster records decoded each float manually. Tail reconciliation depended on an IID-to-ID dictionary and read whole documents to identify new rows. | Each range is an Arrow IPC stream. The reader borrows the buffer pool's range and reads typed vector and IID arrays. Tail reconciliation uses event-header IIDs, including for new rows. |
 | ANN reranking | Candidate IDs were formatted into a SQL disjunction and parsed again. | The prepared plan receives the typed IID scope directly. Primary-table visibility and residual predicates still apply before the Arrow scorer and top-k. |
-| Top-k and sort spill | The generic sorter compares scalar key cells and retains result rows as values. | A cosine query with a bounded ORDER BY and LIMIT uses Arrow gathers to retain and reorder the winning embedding rows. It reuses SQL ordering for keys, nulls, and ties. Generic sorts and spill still use the general row sorter. |
+| Top-k and sort spill | The generic sorter compares scalar key cells and retains result rows as values. | A cosine query with compatible column sort keys and `OFFSET + LIMIT` within the existing 10,000-row top-k bound uses Arrow gathers to retain and reorder the winning embedding rows. It reuses SQL ordering for keys, nulls, and ties. Generic sorts and spill still use the general row sorter. |
 | Result export | The benchmark converted result columns back to generic values. PostgreSQL clients use PostgreSQL protocol values. | The benchmark reads typed ID and distance buffers. ADBC exports Arrow C Data and Flight SQL writes Arrow IPC. Result schema conformance shares compatible embedding buffers even when other columns need conversion. Flight holds the bound batch in Arrow until it issues the stateless ticket, which carries the parameter IPC at the wire boundary. PostgreSQL conversion occurs at its wire boundary. |
 
 The Arrow path uses typed buffers in memory and Arrow IPC for persisted pages, log payloads, and Flight transfer. ADBC copies foreign buffers when it takes ownership. Top-k gathers write bounded Arrow result buffers in result order.
@@ -376,3 +376,13 @@ The ANN columns show 32 probes.
 | Random, ~1% | 722.09 / 726.25 | 245.57 / 245.93 | 276.31 / 277.61 | 177.24 / 185.78 | 178.15 / 186.72 | 32 / 30.59 | 75.0% |
 | Random, ~10% | 4,885.60 / 4,909.79 | 265.97 / 266.70 | 330.96 / 334.55 | 179.02 / 182.86 | 180.09 / 183.93 | 32 / 30.59 | 80.0% |
 | Whole clusters, ~1% | 882.51 / 882.93 | 244.77 / 245.63 | 288.01 / 387.64 | 183.96 / 187.99 | 183.38 / 188.80 | 6 / 5.38 | 100.0% |
+
+### Follow-up verification of Arrow binding and ranked output
+
+Commit `b211a0ee7` reran the 100,000-vector fixture through the Arrow parameter entry point and bounded columnar top-k.
+All 60 stationary and 20 churn query-and-filter cases matched the scalar comparator in result order and distance bits, and all five temporal checks passed.
+The ANN recall, returned counts, and cold range counts matched the preceding 100,000-vector run for every sample.
+Unfiltered exact p50 was 581.12 ms with the Arrow path and 4,691.70 ms with the scalar control on the same snapshot.
+Separate ADBC and Flight SQL tests ingest fixed-size floats, bind the reference vector through Arrow, and return the ranked embedding column.
+The ADBC test covers null embeddings, nullable metadata, stable ties, and an offset after flush.
+A result-conformance test verifies that schema changes share the original float component buffer.
