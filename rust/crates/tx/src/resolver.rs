@@ -2095,6 +2095,15 @@ impl<'a> OpenTransaction<'a> {
         rtdb_query::read_owned_world_clock(context, owner, world).await
     }
 
+    async fn held_overlay_reading(
+        &self, owner: &str, world: &rtdb_types::OwnedWorld,
+    ) -> Result<Timestamp> {
+        if let Some(reading) = self.timed_world_overlays.get(&world.id) {
+            return Ok(*reading);
+        }
+        self.owned_world_clock(owner, world.id).await?.unwrap_or(world.initial_clock()).next()
+    }
+
     async fn publish_owned_world(
         &mut self, world: Iid, parent_pin: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
         advance_to: Option<Timestamp>, drop_world: bool, settlement_pin: Option<Iid>,
@@ -2440,11 +2449,7 @@ impl<'a> OpenTransaction<'a> {
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
             let (from, to, explicit) = if matches!(record.mode, WorldClockMode::Held { .. }) && schema.has_acceptance_validity() {
-                let accepted = if let Some(at) = self.timed_world_overlays.get(&world) {
-                    *at
-                } else {
-                    self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock()).next()?
-                };
+                let accepted = self.held_overlay_reading(owner, record).await?;
                 if (from, to) != (None, None) && (from, to) != (Some(accepted), Some(Timestamp::MAX)) {
                     return Err(Anomaly::incorrect(
                         "rtdb.owned/validity-policy",
@@ -3883,6 +3888,22 @@ mod tests {
         let inherited_key = [write(WorldShadow::Present(fact(&one, b"inherited")), &one)?];
         duplicate.apply(&inherited_key[0]).await?;
         assert_eq!(duplicate.check_final_constraints(&inherited_key).await.unwrap_err().code, "rtdb.owned/unique-taken");
+
+        let held = OwnedWorld {
+            mode: WorldClockMode::Held { start: cut.system_time },
+            ..record.clone()
+        };
+        let mut timed = OpenTransaction::new(
+            cap.snapshot()?, TransactionKey { tx_id: TxId(3), system_time: Timestamp(300) },
+            &options, &context,
+        )?;
+        timed.owned_worlds.insert(world, (held, memory.reserve(4096)?));
+        timed.timed_world_overlays.insert(world, Timestamp(700));
+        timed.apply(&inherited_key[0]).await?;
+        assert_eq!(
+            timed.check_final_constraints(&inherited_key).await.unwrap_err().code,
+            "rtdb.owned/unique-taken",
+        );
 
         let first = [write(WorldShadow::Present(fact(&one, b"one")), &one)?];
         let mut accepted = OpenTransaction::new(

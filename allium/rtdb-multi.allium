@@ -1469,6 +1469,7 @@ rule ConsumeIntake {
 -- A held reading may exceed the physical publication timestamp.
 -- A timed overlay orders a strictly increasing held reading and the overlay facts together.
 -- Acceptance-valid overlay facts begin at that publication's held reading.
+-- Acceptance-valid capacity and unique occupancy checks use that same held reading.
 -- The physical timestamp bounds archive access and retention leases, and the held reading governs the world's effective time.
 -- A valid-time window on the child combines boundaries from both retained cuts and resolves each slice by the same point rule.
 -- The child pages the merged identities of both cuts, applying the same tombstone rule before emitting a candidate.

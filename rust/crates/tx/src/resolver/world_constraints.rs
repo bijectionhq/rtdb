@@ -466,8 +466,7 @@ impl OpenTransaction<'_> {
             let ordered = self.tx_key().system_time;
             let valid = match world.mode {
                 WorldClockMode::Proposal => ordered,
-                WorldClockMode::Held { .. } => self.owned_world_clock(owner, world.id).await?
-                    .unwrap_or(world.initial_clock()).next()?,
+                WorldClockMode::Held { .. } => self.held_overlay_reading(owner, world).await?,
                 WorldClockMode::Retained => return Err(uncovered()),
             };
             let mut masks = [BTreeSet::new(), BTreeSet::new()];
