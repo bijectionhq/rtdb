@@ -122,6 +122,7 @@
 -- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
 -- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its original receiver decision reading and have no valid end.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
+-- A Flight owned create or commit with compatible legacy vector fields retains the uploaded Arrow components through source encoding.
 -- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
 -- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.

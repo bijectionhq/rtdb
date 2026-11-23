@@ -117,6 +117,40 @@ pub(crate) fn owned_documents(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -
     })
 }
 
+pub(crate) fn owned_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>, Status> {
+    if let Some(documents) = ArrowDocuments::from_owned_payload(batch, memory).map_err(status)? {
+        return Ok(Some(documents));
+    }
+    ArrowDocuments::from_legacy_owned_payload(batch, memory).map_err(status)
+}
+
+#[test]
+fn owned_payload_retains_a_vector_with_legacy_upload_metadata() {
+    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let vector = ListArray::from_iter_primitive::<arrow_array::types::Float64Type, _, _>([
+        Some(vec![Some(-0.0), None]), None,
+    ]);
+    let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false),
+        Field::new("v", vector.data_type().clone(), true).with_metadata([("description".into(), "vector".into())].into())]));
+    let batch = RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef, Arc::new(vector),
+    ]).unwrap();
+    let batch = OwnedBatch::new(batch, &memory).unwrap();
+    let assert_components = |array: &dyn Array| {
+        let vector = array.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(vector.is_null(1));
+        let values = vector.values().as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(values.value(0).to_bits(), (-0.0f64).to_bits());
+        assert!(values.is_null(1));
+    };
+    assert_components(batch.batch().column(1).as_ref());
+    assert!(ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().is_none());
+    assert_eq!(owned_payload(&batch, &memory).unwrap().unwrap().row_count(), 2);
+}
+
 fn decode_documents(
     batch: &RecordBatch, memory: &Arc<MemoryBudget>,
     read: impl Fn(&rtdb_types::LogicalType, &arrow_schema::Field, &dyn arrow_array::Array, usize) -> rtdb_types::Result<Value>,

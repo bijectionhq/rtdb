@@ -10,6 +10,8 @@ use rtdb_types::{Anomaly, EntityId, ListKind, LogicalType, Result, TableRef, Tim
 pub(crate) mod arguments;
 mod union;
 
+pub(crate) use arguments::valid_argument_union_cell;
+
 #[derive(Clone, Debug)]
 pub struct RetainedBytes { data: Arc<Vec<u8>>, _reservation: Arc<MemoryReservation> }
 impl RetainedBytes {
@@ -53,6 +55,8 @@ pub(crate) struct DecodedDocumentLayout {
 }
 
 impl DecodedDocumentLayout {
+    pub(crate) fn column_type(&self, name: &str) -> Option<&LogicalType> { self.types.get(name) }
+
     pub(crate) fn new(fields: &Fields, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let schema = Schema::new(fields.clone());
         let mut reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
@@ -189,6 +193,20 @@ pub struct ArrowDocuments {
     array: StructArray,
     layout: Arc<DecodedDocumentLayout>,
     source_bytes: Option<usize>,
+    legacy_owned_presence: Option<LegacyOwnedPresence>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LegacyOwnedPresence {
+    Submitted,
+    Implicit,
+    Exact(Arc<OwnedFieldPresence>),
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedFieldPresence {
+    pub(crate) fields: Vec<BTreeSet<String>>,
+    _reservation: Arc<MemoryReservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -210,7 +228,7 @@ impl ArrowDocuments {
             let fields = Fields::from(Vec::<Arc<arrow_schema::Field>>::new());
             let layout = DecodedDocumentLayout::new(&fields, memory)?;
             let array = StructArray::new_empty_fields(0, None);
-            return Ok(Some(Self { array, layout, source_bytes: None }));
+            return Ok(Some(Self { array, layout, source_bytes: None, legacy_owned_presence: None }));
         };
         if let Some(documents) = Self::from_canonical_ingest_pages(pages, IngestMode::External, memory)? {
             return Ok(Some(documents));
@@ -325,7 +343,7 @@ impl ArrowDocuments {
         let layout = DecodedDocumentLayout::new(&fields, memory)?;
         let array = StructArray::try_new_with_length(fields, columns, None, batch.num_rows())
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
-        Ok(Some(Self { array, layout, source_bytes: None }))
+        Ok(Some(Self { array, layout, source_bytes: None, legacy_owned_presence: None }))
     }
 
     fn compatible(field: &arrow_schema::Field, normalize: bool) -> bool {
@@ -359,7 +377,7 @@ impl ArrowDocuments {
                 rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory)?;
             }
         }
-        Ok(Some(Self { array: array.clone(), layout, source_bytes: Some(source_bytes) }))
+        Ok(Some(Self { array: array.clone(), layout, source_bytes: Some(source_bytes), legacy_owned_presence: None }))
     }
 
     pub(crate) fn requires_legacy_receipt(&self, patch: bool) -> bool {
@@ -429,7 +447,43 @@ impl ArrowDocuments {
             return Ok(None);
         }
         let layout = DecodedDocumentLayout::new(batch.schema_ref().fields(), memory)?;
-        Ok(Some(Self { array: StructArray::from(batch.clone()), layout, source_bytes: None }))
+        Ok(Some(Self { array: StructArray::from(batch.clone()), layout, source_bytes: None, legacy_owned_presence: None }))
+    }
+
+    /// Retains a floating-point vector upload with compatible layouts, scalar companion fields, and complete entity IDs.
+    /// `None` lets the caller use the legacy row reader.
+    pub fn from_legacy_owned_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let source = batch.batch();
+        let fields = source.schema_ref().fields();
+        if source.num_rows() == 0 || !fields.iter().any(|field| float_vector_field(field))
+            || fields.iter().any(|field| !legacy_owned_field_name(field.name()))
+            || fields.iter().map(|field| field.name()).collect::<BTreeSet<_>>().len() != fields.len()
+        {
+            return Ok(None);
+        }
+        let array = StructArray::from(source.clone());
+        let layout = DecodedDocumentLayout::new(fields, memory)?;
+        let documents = Self { array, layout, source_bytes: None, legacy_owned_presence: None };
+        if !(0..documents.row_count()).all(|row| documents.owned_id_ref(row).is_ok()) {
+            return Ok(None);
+        }
+        for (field, column) in fields.iter().zip(source.columns()) {
+            let logical = documents.column_type(field.name()).expect("upload layout covers its fields");
+            if !float_vector_field(field) && !matches!(logical, LogicalType::Scalar(_) | LogicalType::Null | LogicalType::Nothing)
+                && !matches!(logical, LogicalType::Maybe(inner) if matches!(inner.as_ref(), LogicalType::Scalar(_)))
+            {
+                return Ok(None);
+            }
+            if (0..source.num_rows()).any(|row| !valid_argument_union_cell(field, column.as_ref(), row)) {
+                return Ok(None);
+            }
+            if logical != &LogicalType::Nothing
+                && rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory).is_err()
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Self { legacy_owned_presence: Some(LegacyOwnedPresence::Submitted), ..documents }))
     }
 
     pub(crate) fn owned_id(&self, row: usize) -> Result<EntityId> {
@@ -454,15 +508,64 @@ impl ArrowDocuments {
         let layout = DecodedDocumentLayout::new(&fields, memory)?;
         let array = StructArray::try_new_with_length(fields, columns, None, self.array.len())
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
-        Ok(Self { array, layout, source_bytes: self.source_bytes })
+        Ok(Self { array, layout, source_bytes: self.source_bytes, legacy_owned_presence: None })
     }
 
     pub fn row_count(&self) -> usize { self.array.len() }
     pub(crate) fn array(&self) -> &StructArray { &self.array }
     pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
     pub(crate) fn column_type(&self, name: &str) -> Option<&LogicalType> { self.layout.types.get(name) }
+    pub(crate) fn declared_types(&self) -> &StructFields<LogicalType> { &self.layout.types }
     pub(crate) fn source_bytes(&self) -> Option<usize> { self.source_bytes }
 
+    pub(crate) fn legacy_owned_presence(&self) -> Option<&LegacyOwnedPresence> {
+        self.legacy_owned_presence.as_ref()
+    }
+
+    pub(crate) fn with_legacy_owned_presence(mut self, fields: Option<Vec<BTreeSet<String>>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let Some(fields) = fields else {
+            self.legacy_owned_presence = Some(LegacyOwnedPresence::Implicit);
+            return Ok(self);
+        };
+        if fields.len() != self.row_count() {
+            return Err(Anomaly::incorrect("rtdb.tx/document-presence", "Document presence must cover every row"));
+        }
+        let mut bytes = 128usize;
+        for names in &fields {
+            bytes = bytes.checked_add(128).ok_or_else(overflow)?;
+            for name in names {
+                if !self.layout.types.contains_key(name) {
+                    return Err(Anomaly::incorrect("rtdb.tx/document-presence", "Document presence names an unknown column"));
+                }
+                bytes = bytes.checked_add(name.capacity() + 128).ok_or_else(overflow)?;
+            }
+        }
+        self.legacy_owned_presence = Some(LegacyOwnedPresence::Exact(Arc::new(OwnedFieldPresence { fields, _reservation: memory.reserve(bytes)? })));
+        Ok(self)
+    }
+
+    pub(crate) fn read_legacy_owned_rows(&self, memory: &Arc<MemoryBudget>) -> Result<Documents> {
+        match self.legacy_owned_presence().expect("legacy owned documents carry a presence policy") {
+            LegacyOwnedPresence::Exact(presence) => Documents::read_arrow_with_presence(&self.array, Arc::clone(&self.layout), true, Some(&presence.fields), memory),
+            LegacyOwnedPresence::Implicit => Documents::read_arrow(&self.array, Arc::clone(&self.layout), true, memory),
+            LegacyOwnedPresence::Submitted => {
+                let rows = Documents::read_arrow(&self.array, Arc::clone(&self.layout), false, memory)?;
+                let rows = Arc::into_inner(rows.0).expect("the uploaded row batch owns its rows");
+                Documents::with_column_order(rows.rows, self.columns().to_vec(), memory)
+            }
+        }
+    }
+
+    pub(crate) fn legacy_owned_cell_is_present(&self, cell: rtdb_columnar::ArrowCell<'_>) -> Result<bool> {
+        match self.legacy_owned_presence().expect("legacy owned documents carry a presence policy") {
+            LegacyOwnedPresence::Submitted => Ok(true),
+            LegacyOwnedPresence::Exact(presence) => Ok(presence.fields[cell.row].contains(cell.field.name())),
+            LegacyOwnedPresence::Implicit => Ok(cell.field.name() == "_id"
+                || (cell.field.data_type() == &DataType::Null && !cell.field.is_nullable()) || !cell.is_null()?),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn to_rows(&self, omit_nulls: bool, memory: &Arc<MemoryBudget>) -> Result<Documents> {
         Documents::read_arrow(&self.array, Arc::clone(&self.layout), omit_nulls, memory)
     }
@@ -637,6 +740,23 @@ pub(crate) fn contains_fixed_size_list(layout: &DataType) -> bool {
         DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().any(|(_, field)| contains_fixed_size_list(field.data_type())),
         _ => false,
     }
+}
+
+pub(crate) fn float_vector_field(field: &arrow_schema::Field) -> bool {
+    if field.extension_type_name().is_some() { return false; }
+    match field.data_type() {
+        DataType::List(item) | DataType::FixedSizeList(item, _) if item.metadata().is_empty() => {
+            matches!(item.data_type(), DataType::Float32 | DataType::Float64)
+                || rtdb_types::ListValue::supports_float_union(item.data_type())
+        }
+        DataType::Union(legs, arrow_schema::UnionMode::Dense) => legs.iter().any(|(_, leg)| float_vector_field(leg))
+            && legs.iter().all(|(_, leg)| plain_scalar_field(leg) || float_vector_field(leg)),
+        _ => false,
+    }
+}
+
+pub(crate) fn legacy_owned_field_name(name: &str) -> bool {
+    !name.starts_with('_') || matches!(name, "_id" | "_fn" | "_valid_from" | "_valid_to")
 }
 
 pub(crate) fn compatible_document_metadata(field: &arrow_schema::Field) -> bool {

@@ -1003,7 +1003,7 @@ impl Service {
         let batch = require_identity(decode_retained_batch(call, body.slice_ref(arrow))?)?;
         if relation.is_root_data() {
             if batch.batch().column_by_name("_absent").is_none() {
-                if let Some(documents) = ArrowDocuments::from_owned_payload(&batch, self.memory()).map_err(status)? {
+                if let Some(documents) = upload::owned_payload(&batch, self.memory())? {
                     return self.owned_write_reply(call, vec![TxOp::OwnedArrowDocs {
                         relation, documents, create_only: true, valid_from: None, valid_to: None,
                     }]).await;
@@ -1014,7 +1014,7 @@ impl Service {
                 let mut operations = Vec::with_capacity(rows);
                 for row in 0..rows {
                     let positions = owned_payload_columns(batch.batch(), row, &[])?;
-                    operations.push(match self.owned_payload(&batch, row, &positions)? {
+                    operations.push(match self.owned_payload(&relation, &batch, row, &positions)? {
                         Some(documents) => TxOp::OwnedArrowDocs {
                             relation: relation.clone(), documents, create_only: true, valid_from: None, valid_to: None,
                         },
@@ -1030,6 +1030,13 @@ impl Service {
                 }
                 return self.owned_write_reply(call, operations).await;
             }
+        } else if relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+            && batch.batch().column_by_name("_absent").is_none()
+            && let Some(documents) = ArrowDocuments::from_legacy_owned_payload(&batch, self.memory()).map_err(status)?
+        {
+            return self.owned_write_reply(call, vec![TxOp::OwnedArrowDocs {
+                relation, documents, create_only: true, valid_from: None, valid_to: None,
+            }]).await;
         }
         let (mut rows, _decoded) = upload::owned_documents(batch.batch(), call.memory())?;
         for row in &mut rows { strip_owned_absence(row)?; }
@@ -1527,7 +1534,7 @@ impl Service {
                 for row in 0..rows {
                     if checks.is_none_or(|checks| !checks.is_null(row) && !checks.value(row)) {
                         let positions = owned_payload_columns(batch.batch(), row, &["_expected_micros", "_check_only"])?;
-                        if let Some(documents) = self.owned_payload(&batch, row, &positions)? {
+                        if let Some(documents) = self.owned_payload(&relation, &batch, row, &positions)? {
                             let time = (!expected.is_null(row)).then(|| Timestamp(expected.value(row)));
                             if let Some(control) = HostedControlWrite::arrow_catalog(relation.clone(), scope, time, documents).map_err(status)? {
                                 controls.push(control);
@@ -1599,12 +1606,14 @@ impl Service {
         let mut operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
         writes.try_reserve_exact(operations)
             .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
-        if relation.is_root_data() {
+        if relation.is_root_data() || relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION {
             let charge = Arc::get_mut(&mut operations_charge).expect("commit group owns its operation reservation");
             for row in 0..rows {
                 let start = writes.len();
                 let bytes = charge.bytes();
-                if !self.append_owned_arrow_row(writes, relation, batch, row, effects, charge)? {
+                let arrow = relation.is_root_data() || ArrowCell::named(batch.batch(), "_op", row)
+                    .and_then(ArrowCell::utf8).is_some_and(|op| matches!(op, "create" | "replace"));
+                if !arrow || !self.append_owned_arrow_row(writes, relation, batch, row, effects, charge)? {
                     writes.truncate(start);
                     charge.shrink_to(bytes).map_err(status)?;
                     let (row, _decoded) = upload::owned_documents(&batch.batch().slice(row, 1), call.memory())?;
@@ -1618,10 +1627,24 @@ impl Service {
         Ok((operations_charge, documents_charge))
     }
 
-    fn owned_payload(&self, batch: &OwnedBatch, row: usize, positions: &[usize]) -> Result<Option<ArrowDocuments>, Status> {
+    fn owned_payload(&self, relation: &OwnedRelation, batch: &OwnedBatch, row: usize, positions: &[usize]) -> Result<Option<ArrowDocuments>, Status> {
         let selected = batch.batch().slice(row, 1).project(positions).map_err(arrow)?;
         let selected = OwnedBatch::with_reservation(selected, batch.reservation().clone()).map_err(status)?;
-        ArrowDocuments::from_owned_payload(&selected, self.memory()).map_err(status)
+        if rtdb_tx::HostedControlWrite::supports_arrow_catalog(relation) {
+            return ArrowDocuments::from_owned_payload(&selected, self.memory()).map_err(status);
+        }
+        if relation.is_root_data()
+            && let Some(documents) = ArrowDocuments::from_owned_payload(&selected, self.memory()).map_err(status)?
+        {
+            return Ok(Some(documents));
+        }
+        for (position, field) in batch.batch().schema_ref().fields().iter().enumerate() {
+            let cell = ArrowCell { field, array: batch.batch().column(position).as_ref(), row };
+            if !positions.contains(&position) && !field.name().starts_with('_') && cell.is_undefined().map_err(status)? {
+                return Ok(None);
+            }
+        }
+        ArrowDocuments::from_legacy_owned_payload(&selected, self.memory()).map_err(status)
     }
 
     fn append_owned_arrow_row(
@@ -1710,14 +1733,14 @@ impl Service {
         let from_offset = signed("_valid_from_offset_micros")?;
         let to_offset = signed("_valid_to_offset_micros")?;
         if from_offset.is_some() || to_offset.is_some() {
-            if matches!(effects, CommitEffects::Replay) {
+            if !relation.is_root_data() || matches!(effects, CommitEffects::Replay) {
                 return Err(invalid("Invalid relative Root period"));
             }
             let period = OwnedRelativePeriod::from_fields(valid_from, valid_to, from_offset, to_offset)
                 .ok_or_else(|| invalid("A relative Root period needs one coordinate for each finite bound"))?;
             let effect = match operation {
                 "create" | "replace" => {
-                    let Some(documents) = self.owned_payload(batch, row, &positions)? else { return Ok(false); };
+                    let Some(documents) = self.owned_payload(relation, batch, row, &positions)? else { return Ok(false); };
                     rtdb_tx::OwnedPeriodEffect::Arrow { documents, create_only: operation == "create" }
                 }
                 "delete" if !has_payload()? => rtdb_tx::OwnedPeriodEffect::Delete(own_id()?),
@@ -1736,7 +1759,7 @@ impl Service {
                 return Ok(true);
             }
             "create" | "replace" => {
-                let Some(documents) = self.owned_payload(batch, row, &positions)? else { return Ok(false); };
+                let Some(documents) = self.owned_payload(relation, batch, row, &positions)? else { return Ok(false); };
                 TxOp::OwnedArrowDocs { relation: relation.clone(), documents, create_only: operation == "create", valid_from, valid_to }
             }
             "delete" => {

@@ -222,7 +222,7 @@ fn validate_argument_uris(field: &Field, array: &dyn Array) -> Result<()> {
 }
 
 fn has_valid_union_nulls(field: &Field, array: &dyn Array) -> bool {
-    !contains_union(field.data_type()) || (0..array.len()).all(|row| has_valid_union_cell(field, array, row))
+    !contains_union(field.data_type()) || (0..array.len()).all(|row| valid_argument_union_cell(field, array, row))
 }
 
 fn contains_union(layout: &DataType) -> bool {
@@ -234,7 +234,7 @@ fn contains_union(layout: &DataType) -> bool {
     }
 }
 
-fn has_valid_union_cell(field: &Field, array: &dyn Array, row: usize) -> bool {
+pub(crate) fn valid_argument_union_cell(field: &Field, array: &dyn Array, row: usize) -> bool {
     match field.data_type() {
         DataType::Union(fields, UnionMode::Dense) => {
             let union = array.as_union();
@@ -243,20 +243,20 @@ fn has_valid_union_cell(field: &Field, array: &dyn Array, row: usize) -> bool {
             if field.data_type() == &DataType::Null { return field.is_nullable(); }
             let child = union.child(tag);
             let offset = union.value_offset(row);
-            child.is_valid(offset) && has_valid_union_cell(field, child.as_ref(), offset)
+            child.is_valid(offset) && valid_argument_union_cell(field, child.as_ref(), offset)
         }
         _ if array.is_null(row) => true,
         DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
-            .all(|(field, child)| has_valid_union_cell(field, child.as_ref(), row)),
+            .all(|(field, child)| valid_argument_union_cell(field, child.as_ref(), row)),
         DataType::List(field) => {
             let list = array.as_list::<i32>();
             let offsets = list.value_offsets();
-            (offsets[row]..offsets[row + 1]).all(|index| has_valid_union_cell(field, list.values().as_ref(), index as usize))
+            (offsets[row]..offsets[row + 1]).all(|index| valid_argument_union_cell(field, list.values().as_ref(), index as usize))
         }
         DataType::FixedSizeList(field, size) => {
             let list = array.as_fixed_size_list();
             let start = row * *size as usize;
-            (start..start + *size as usize).all(|index| has_valid_union_cell(field, list.values().as_ref(), index))
+            (start..start + *size as usize).all(|index| valid_argument_union_cell(field, list.values().as_ref(), index))
         }
         _ => true,
     }
@@ -401,6 +401,55 @@ fn argument_ipc_gathers_float_union_positions_with_an_unused_conflicting_alias()
 }
 
 #[test]
+fn canonical_nullable_float_vectors_keep_their_buffers_and_ipc_bytes() {
+    use rtdb_types::{ListValue, Value};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let vector = Value::FixedSizeList(ListValue::from_f32(arrow_array::Float32Array::from(vec![
+        Some(f32::from_bits(0x7fc0_4321)), None, Some(-0.0),
+    ])));
+    let ty = vector.logical_type().maybe();
+    let rows = vec![vec![Value::Null], vec![vector]];
+    let values = rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>();
+    let array = rtdb_columnar::build_array(&ty, &values).unwrap();
+    let field = to_field("?_0", &ty).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![Arc::clone(&array)]).unwrap();
+    let canonical = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let (kept, scratch) = argument_vector(&canonical.chunks[0].1, 0, &field, &ty, &memory).unwrap();
+    assert!(scratch.is_none());
+    assert_eq!(kept.as_fixed_size_list().values().to_data().buffers()[0].as_ptr(),
+        array.as_fixed_size_list().values().to_data().buffers()[0].as_ptr());
+    let from_rows = SqlArguments::from_rows(rows, &memory).unwrap().source_columnar_batch(&memory).unwrap();
+    let from_arrow = canonical.source_columnar_batch(&memory).unwrap();
+    let encode = |batch: &OwnedBatch| crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], &memory).unwrap();
+    assert_eq!(encode(&from_arrow).as_slice(), encode(&from_rows).as_slice());
+}
+
+#[test]
+fn canonical_mixed_float_vectors_stay_columnar_in_source_arguments() {
+    use rtdb_types::{ListValue, Value};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let values = vec![
+        Value::list(vec![Value::F32(f32::from_bits(0x7fc0_1234)), Value::Null, Value::F64(-0.0)]),
+        Value::FixedSizeList(ListValue::from_f64(arrow_array::Float64Array::from(vec![Some(-0.0), None]))),
+        Value::Null,
+    ];
+    let types = values.iter().map(Value::logical_type).collect::<Vec<_>>();
+    let ty = LogicalType::join_all(&types);
+    let field = to_field("?_0", &ty).unwrap();
+    let array = rtdb_columnar::build_array(&ty, &values).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![Arc::clone(&array)]).unwrap();
+    let canonical = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let (kept, scratch) = argument_vector(&canonical.chunks[0].1, 0, &field, &ty, &memory).unwrap();
+    assert!(scratch.is_none());
+    assert_eq!(kept.as_union().type_ids().as_ptr(), array.as_union().type_ids().as_ptr());
+    let rows = SqlArguments::from_rows(values.into_iter().map(|value| vec![value]).collect(), &memory).unwrap();
+    assert_eq!(crate::source::encode_arguments(&canonical, &memory).unwrap().as_slice(),
+        crate::source::encode_arguments(&rows, &memory).unwrap().as_slice());
+}
+
+#[test]
 fn canonical_argument_ipc_remaps_a_null_in_a_dense_float_union() {
     use arrow_array::{Float32Array, Float64Array, UnionArray};
     use arrow_buffer::ScalarBuffer;
@@ -461,4 +510,28 @@ fn canonical_argument_ipc_widens_float_vector_children_when_pages_join() {
     let expected = crate::source::encode_arguments(&from_rows, &memory).unwrap();
     let actual = crate::source::encode_arguments(&arguments, &memory).unwrap();
     assert_eq!(actual.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn canonical_fixed_float_union_arguments_preserve_padding_under_null_vectors() {
+    use rtdb_types::Value;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let vector = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null, Value::F64(2.0)].into());
+    let ty = vector.logical_type().maybe();
+    let field = to_field("?_0", &ty).unwrap();
+    let array = rtdb_columnar::build_array(&ty, &[Value::Null, vector]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![Arc::clone(&array)]).unwrap();
+    let canonical = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let (kept, scratch) = argument_vector(&canonical.chunks[0].1, 0, &field, &ty, &memory).unwrap();
+    assert!(scratch.is_none());
+    assert_eq!(kept.as_fixed_size_list().values().as_union().type_ids().as_ptr(),
+        array.as_fixed_size_list().values().as_union().type_ids().as_ptr());
+    let (rebuilt, _scratch) = copy_evaluated_cells(&ty, 2, &memory,
+        |row| estimate_read_cell_bytes(&field, array.as_ref(), row),
+        |row| read_value_as(&ty, &field, array.as_ref(), row)).unwrap();
+    let rebuilt = copy_selected_cells(&[rebuilt.as_ref()], &[(0, 0), (0, 1)]).unwrap();
+    let old = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![rebuilt]).unwrap();
+    let old = crate::ipc::encode(old.schema_ref(), [&old], &memory).unwrap();
+    assert_eq!(crate::source::encode_arguments(&canonical, &memory).unwrap().as_slice(), old.as_slice());
 }

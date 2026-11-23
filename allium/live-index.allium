@@ -245,6 +245,7 @@ entity StagedTxTable {
     -- Staging preserves event assembly when a batch from different struct layouts is combined with other writes.
     -- A create-only insert checks each requested interval against the transaction snapshot before staging that document from its Arrow vector.
     -- A governed Arrow event stages the full entity key and the assigned commit position with its document columns.
+    -- A governed put stages its selected Arrow field layout with any acceptance-filled fields.
     -- Staging views retain shared Arrow source allocations while exposing only the buffer spans they use.
     -- When memory admits the copy, a put with a large shared source allocation copies its selected cells into compact Arrow buffers.
     -- A staged put preserves its declared column types, including columns with only null cells.

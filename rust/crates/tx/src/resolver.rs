@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bounded_retry::is_bounded_receipts_table;
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
-use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
+use crate::values::{BoundArgumentRow, IngestMode, LegacyOwnedPresence, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
@@ -1225,7 +1225,7 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedArrowDocs { relation, documents, create_only, valid_from, valid_to }) =>
                 self.write_owned_arrow(relation, documents, None, *valid_from, *valid_to, *create_only).await,
             Operation::OwnedArrowIids { relation, documents, iids, presence, create_only, valid_from, valid_to } =>
-                self.write_owned_arrow(relation, documents, Some((iids, presence)), *valid_from, *valid_to, *create_only).await,
+                self.write_owned_arrow(relation, documents, Some((iids, presence.as_deref())), *valid_from, *valid_to, *create_only).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
                 self.write_owned(relation, documents, None, *valid_from, *valid_to, true).await,
             Operation::Public(TxOp::OwnedRelativePeriod { .. }) => Err(Anomaly::incorrect(
@@ -2975,15 +2975,20 @@ impl<'a> OpenTransaction<'a> {
 
     async fn write_owned_arrow(
         &mut self, relation: &rtdb_types::OwnedRelation, documents: &ArrowDocuments,
-        replay: Option<(&[Iid], &[std::collections::BTreeSet<String>])>,
+        replay: Option<(&[Iid], Option<&[BTreeSet<String>]>)>,
         from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool,
     ) -> Result<()> {
-        if !relation.is_root_data() {
+        let legacy = documents.legacy_owned_presence().is_some();
+        if !relation.is_root_data() && !(legacy && relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION) {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let table = relation.table(owner);
         let declaration = self.read_owned_schema(owner, relation).await?;
+        if legacy && (declaration.is_some() || self.hosted_replay.is_some()) {
+            let rows = documents.read_legacy_owned_rows(&self.context.memory)?;
+            return self.write_owned(relation, &rows, replay.map(|(iids, _)| iids), from, to, create_only).await;
+        }
         let base_time = self.terms_time;
         let restoring = self.hosted_replay.as_ref().map(|replay| replay.source_time());
         let mut lifetime_context = None;
@@ -3018,8 +3023,15 @@ impl<'a> OpenTransaction<'a> {
         }
         let mut lifetime_ids = BTreeSet::new();
         let array = documents.array();
-        if replay.is_some_and(|(iids, presence)| iids.len() != array.len() || presence.len() != array.len()) {
+        if replay.is_some_and(|(iids, presence)| iids.len() != array.len() || presence.is_some_and(|fields| fields.len() != array.len())) {
             return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
+        }
+        if legacy && let Some((iids, _)) = replay {
+            for (row, iid) in iids.iter().enumerate() {
+                if documents.owned_id_ref(row)?.iid() != *iid {
+                    return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
+                }
+            }
         }
         let memory = Arc::clone(&self.context.memory);
         let _scratch = memory.reserve(4096usize.saturating_add(array.fields().len().saturating_mul(256)))?;
@@ -3028,9 +3040,11 @@ impl<'a> OpenTransaction<'a> {
             if cell.is_null()? { return Ok(None); }
             cell.zoned_micros().map(Some).ok_or_else(|| Anomaly::fault("xtdb/invalid-timestamp-col-type", "Invalid timestamp col type"))
         };
+        let mut projection = OwnedPutProjection::default();
         for row in 0..array.len() {
-            let selected = replay.map(|(_, presence)| &presence[row]);
+            let selected = replay.and_then(|(_, presence)| presence).map(|fields| &fields[row]);
             let cell_is_present = |cell: ArrowCell<'_>| -> Result<bool> {
+                if legacy { return documents.legacy_owned_cell_is_present(cell); }
                 Ok(selected.is_none_or(|selection| selection.contains(cell.field.name())) && !cell.is_undefined()?)
             };
             let id_cell = row_cells(row).find(|cell| cell.field.name() == "_id")
@@ -3069,13 +3083,12 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
             let mut types = StructFields::new();
-            let mut fields = Vec::new();
-            let mut columns = Vec::new();
+            let mut positions = Vec::new();
             let mut fields_present = 0;
             let mut explicit_validity = false;
             let mut valid_from = from.unwrap_or(base_time);
             let mut valid_to = to.unwrap_or(Timestamp::MAX);
-            for (cell, source) in row_cells(row).zip(array.columns()) {
+            for (position, cell) in row_cells(row).enumerate() {
                 if !cell_is_present(cell)? { continue; }
                 fields_present += 1;
                 match cell.field.name().as_str() {
@@ -3087,16 +3100,12 @@ impl<'a> OpenTransaction<'a> {
                         }
                     }
                     name => {
-                        let ty = cell.logical_type()?;
-                        rtdb_columnar::validate_readable_cell(cell.field, cell.array, &rtdb_columnar::from_field(cell.field)?, row, &memory)?;
-                        types.insert(name.to_owned(), ty);
-                        if let Some(bytes) = filled.remove(name) {
-                            fields.push(arrow_schema::Field::new(name, DataType::Binary, false));
-                            columns.push(Arc::new(arrow_array::BinaryArray::from_iter_values([bytes])) as arrow_array::ArrayRef);
-                        } else {
-                            fields.push(cell.field.clone());
-                            columns.push(source.slice(row, 1));
+                        if !legacy {
+                            let source_type = documents.column_type(name).expect("documents carry their column types");
+                            rtdb_columnar::validate_readable_cell(cell.field, cell.array, source_type, row, &memory)?;
                         }
+                        if declaration.is_some() { types.insert(name.to_owned(), cell.logical_type()?); }
+                        positions.push(position);
                     }
                 }
             }
@@ -3116,9 +3125,10 @@ impl<'a> OpenTransaction<'a> {
                     schema.require_write_validity(explicit_validity)?;
                 }
                 schema.validate_types(&types)?;
-                for (field, column) in fields.iter().zip(&columns) {
+                for &position in &positions {
+                    let field = &array.fields()[position];
                     if schema.is_v2() || matches!(types.get(field.name()), Some(LogicalType::Scalar(ScalarType::Decimal { .. }))) {
-                        rtdb_columnar::validate_projected_decimals(field, column.as_ref())?;
+                        rtdb_columnar::validate_projected_decimals(field, array.column(position).slice(row, 1).as_ref())?;
                     }
                 }
             }
@@ -3134,7 +3144,7 @@ impl<'a> OpenTransaction<'a> {
             };
             let key = self.admit_owned_put(&table, relation, owner, &id, iid, valid_time, create_only).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.owned/missing-entity-key", "Governed put has no complete key"))?;
-            let content = rtdb_columnar::build_struct_array(fields.into(), &columns, 1, None)?;
+            let content = projection.select(array, positions, row, filled)?;
             let header = EventHeader { position: None, commit_position: 0, iid, system_from: base_time, valid_time, op: EventOp::Put };
             let fixed_before = self.fixed_range_before(owner, relation, &id, valid_time).await;
             let fixed = self.fixed_range_pair(&id, fixed_before, |column| {
@@ -3153,6 +3163,10 @@ impl<'a> OpenTransaction<'a> {
         }
         if let Some(floor) = lifetime_floor {
             self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
+        }
+        if matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Implicit | LegacyOwnedPresence::Exact(_))) && !array.is_empty() {
+            self.buffer.declare_document_types(&table, documents.declared_types().iter()
+                .filter(|(name, _)| !matches!(name.as_str(), "_valid_from" | "_valid_to")))?;
         }
         Ok(())
     }
@@ -3564,6 +3578,42 @@ fn replay_period_unavailable() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/restore-validity", "Native replay requires explicit original intervals and an exact declared effect")
 }
 
+#[derive(Default)]
+struct OwnedPutProjection {
+    projection: Option<(Vec<usize>, arrow_array::StructArray)>,
+}
+
+impl OwnedPutProjection {
+    fn select(
+        &mut self, array: &arrow_array::StructArray, positions: Vec<usize>, row: usize,
+        mut filled: BTreeMap<&str, Vec<u8>>,
+    ) -> Result<arrow_array::ArrayRef> {
+        if !filled.is_empty() {
+            let (fields, columns): (Vec<_>, Vec<arrow_array::ArrayRef>) = positions.into_iter().map(|position| {
+                let field = &array.fields()[position];
+                match filled.remove(field.name().as_str()) {
+                    Some(bytes) => (Arc::new(arrow_schema::Field::new(field.name(), arrow_schema::DataType::Binary, false)),
+                        Arc::new(arrow_array::BinaryArray::from_iter_values([bytes])) as arrow_array::ArrayRef),
+                    None => (Arc::clone(field), array.column(position).slice(row, 1)),
+                }
+            }).unzip();
+            return rtdb_columnar::build_struct_array(fields.into(), &columns, 1, None);
+        }
+        if positions.len() == array.num_columns() {
+            return Ok(Arc::new(if array.len() == 1 { array.clone() } else { array.slice(row, 1) }));
+        }
+        if let Some((previous, projection)) = &self.projection && previous == &positions {
+            return Ok(Arc::new(projection.slice(row, 1)));
+        }
+        let fields: arrow_schema::Fields = positions.iter().map(|&position| Arc::clone(&array.fields()[position])).collect();
+        let columns = positions.iter().map(|&position| Arc::clone(array.column(position))).collect::<Vec<_>>();
+        let projection = rtdb_columnar::build_struct_array(fields, &columns, array.len(), None)?.as_struct().clone();
+        let selected = Arc::new(projection.slice(row, 1));
+        self.projection = Some((positions, projection));
+        Ok(selected)
+    }
+}
+
 fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Value>) -> Result<()> {
     schema.validate_row(row)?;
     row.values().try_for_each(validate_owned_decimals)
@@ -3973,6 +4023,29 @@ fn overflow() -> Anomaly { Anomaly::fault("rtdb.tx/overflow", "Transaction posit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_put_projection_reuses_the_fields_and_float_buffer_for_repeated_presence() {
+        use arrow_array::{ArrayRef, Float64Array, Int64Array, ListArray, StructArray};
+        use arrow_schema::Field;
+
+        let vector = ListArray::from_iter_primitive::<arrow_array::types::Float64Type, _, _>([
+            Some(vec![Some(-0.0)]), Some(vec![None, Some(f64::from_bits(0x7ff8_0000_0000_1234))]),
+        ]);
+        let array = StructArray::new(vec![Field::new("_id", DataType::Int64, false),
+            Field::new("v", vector.data_type().clone(), false), Field::new("other", DataType::Null, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef, Arc::new(vector), Arc::new(arrow_array::NullArray::new(2))], None);
+        let mut projection = OwnedPutProjection::default();
+        let first = projection.select(&array, vec![0, 1], 0, BTreeMap::new()).unwrap();
+        let second = projection.select(&array, vec![0, 1], 1, BTreeMap::new()).unwrap();
+        assert_eq!(first.as_struct().fields().as_ptr(), second.as_struct().fields().as_ptr());
+        let float_values = |array: &StructArray| array.column(1).as_list::<i32>().values().to_data();
+        assert_eq!(float_values(&array).buffers()[0].as_ptr(), float_values(second.as_struct()).buffers()[0].as_ptr());
+        let values = second.as_struct().column(1).as_list::<i32>().value(0);
+        let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(values.is_null(0));
+        assert_eq!(values.value(1).to_bits(), 0x7ff8_0000_0000_1234);
+    }
 
     struct NoRoleChecks;
     impl TransactionAuthorization for NoRoleChecks {

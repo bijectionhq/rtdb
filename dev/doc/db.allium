@@ -435,6 +435,9 @@ variant TxMessage : SourceMessage {
     -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
+    -- Source decoding retains the original Arrow fields and presence policy for compatible legacy Root and publication writes.
+    -- An undeclared compatible owned relation stages those floating-point vectors from the decoded Arrow fields.
+    -- A legacy owned operation retains its row encoding for source IPC and receipt generation.
     -- Acceptance-relative Root writes retain those columns when their validity offsets are placed at the ordered system time.
     -- Root publication and fork admission count the Arrow document rows against the same effect limits as row writes.
     -- A held fork of an exact Root publication orders its new world registration with the Root section and owner controls.

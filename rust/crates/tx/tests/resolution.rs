@@ -1057,6 +1057,42 @@ async fn owned_arrow_replay_preserves_lifetime_and_explicit_bounds() {
 }
 
 #[tokio::test]
+async fn legacy_owned_arrow_resolution_emits_the_same_replica_bytes_as_row_resolution() {
+    use arrow_array::Float32Array;
+    use rtdb_format::envelope::{ReplicaBody, SourceMessage};
+    use rtdb_types::{ListValue, OwnedRelation};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let relation = OwnedRelation::new("embeddings").unwrap();
+    let vector = |bits| Value::FixedSizeList(ListValue::from_f32(Float32Array::from(vec![
+        Some(f32::from_bits(bits)), Some(-0.0), None,
+    ])));
+    let documents = Documents::new(vec![
+        StructFields::from([("_id".into(), Value::I64(1)), ("embedding".into(), vector(0x7fc0_1234))]),
+        StructFields::from([("_id".into(), Value::I64(2)), ("embedding".into(), Value::Null)]),
+        StructFields::from([("_id".into(), Value::I64(3))]),
+        StructFields::from([("_id".into(), Value::I64(4)), ("embedding".into(), vector(0x7fc0_5678)),
+            ("_valid_from".into(), Value::Timestamp { value: 90, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) })]),
+    ], &context.memory).unwrap();
+    let original = SourceTransaction::new(vec![TxOp::OwnedInsertDocs {
+        relation, documents, valid_from: None, valid_to: None,
+    }], SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory).unwrap();
+    let encoded = original.encode().unwrap();
+    let decoded = SourceTransaction::decode(&SourceMessage::decode(encoded.as_slice()).unwrap().unwrap(), &context.memory).unwrap();
+    let mut replicas = Vec::new();
+    for source in [original, decoded] {
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+        let result = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source, &context).await.unwrap();
+        assert!(result.result().committed(), "{:?}", result.result().error());
+        let replica = result.to_replica_body(&context.memory).unwrap();
+        let ReplicaBody::ResolvedTx(body) = replica.body() else { panic!("expected a resolved transaction"); };
+        replicas.push(body.table_data.clone());
+    }
+    assert_eq!(replicas[0], replicas[1]);
+}
+
+#[tokio::test]
 async fn world_mutations_refuse_source_operations_without_held_admission() {
     use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, TransactionKey, TxId, WorldSchemas, WorldShadow};
 

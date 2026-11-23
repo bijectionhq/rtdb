@@ -2319,6 +2319,54 @@ async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order(
 }
 
 #[tokio::test]
+async fn owned_flight_fallback_preserves_fixed_vector_bits_on_create_and_replace() {
+    use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array};
+    use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions};
+    use rtdb_columnar::ArrowCell;
+    use rtdb_format::ipc::write_arrow_stream;
+    use rtdb_types::ListView;
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let encode = |batch: &RecordBatch| {
+        write_arrow_stream(batch.schema_ref(), std::slice::from_ref(batch), IpcWriteOptions::default()).unwrap()
+    };
+    for (relation, action, bits) in [
+        ("vectors", "rtdb.owned.Create.v1", 0x7fc0_4321),
+        ("vectors", "rtdb.owned.Commit.v1", 0x7fc0_1234),
+        (rtdb_types::OWNED_ROOT_PUBLICATION_RELATION, "rtdb.owned.Create.v1", 0x7fc0_1111),
+        (rtdb_types::OWNED_ROOT_PUBLICATION_RELATION, "rtdb.owned.Commit.v1", 0x7fc0_2222),
+    ] {
+        let item = Arc::new(Field::new("$data$", DataType::Float32, true));
+        let data = Float32Array::from(vec![Some(f32::from_bits(bits)), Some(-0.0), None]);
+        let vector = Arc::new(FixedSizeListArray::new(item, 3, Arc::new(data), None)) as ArrayRef;
+        let mut fields = vec![Field::new("_id", DataType::Int64, false),
+            Field::new("v", vector.data_type().clone(), false).with_metadata([("description".into(), "embedding".into())].into())];
+        let mut columns = vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef, vector];
+        let relation = [(relation.len() as u16).to_be_bytes().as_slice(), relation.as_bytes()].concat();
+        let mut request = relation.clone();
+        if action.ends_with("Commit.v1") {
+            request.extend_from_slice(&i64::MAX.to_be_bytes());
+            fields.push(Field::new("_op", DataType::Utf8, false));
+            columns.push(Arc::new(StringArray::from(vec!["replace"])));
+        }
+        request.extend(encode(&RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()));
+        client.action(action, request.into()).await.unwrap();
+
+        let mut read = relation;
+        read.extend(encode(&RecordBatch::try_from_iter([("_id", Arc::new(Int64Array::from(vec![1])) as ArrayRef)]).unwrap()));
+        let output = client.action("rtdb.owned.ReadPoint.v1", read.into()).await.unwrap();
+        let batch = StreamReader::try_new(output[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+        let (view, span) = ArrowCell::named(&batch, "v", 0).unwrap().float_list_span().unwrap();
+        let ListView::F32(values) = view else { panic!("expected Float32 components"); };
+        assert_eq!(values.value(span.start).to_bits(), bits);
+        assert_eq!(values.value(span.start + 1).to_bits(), (-0.0f32).to_bits());
+        assert!(values.is_null(span.start + 2));
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn world_flight_actions_require_a_placed_world_host() {
     let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
