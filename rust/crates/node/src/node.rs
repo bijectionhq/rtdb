@@ -992,6 +992,7 @@ pub struct OwnedReadSession {
     cancellation: CancellationToken,
     session_cancellation: CancellationToken,
     historical: Option<historical_owned_read::Scope>,
+    scoped_root: Option<BTreeSet<rtdb_types::OwnedRelation>>,
     attachment: std::sync::Weak<Database>,
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
@@ -1008,7 +1009,59 @@ impl OwnedReadSession {
 
     pub fn evidence_until(&self) -> Timestamp { self.witness_until }
 
+    /// Derive a read-only Root capability from the exact original placed hold.
+    pub async fn scope_root_read(
+        &self, relations: Vec<rtdb_types::OwnedRelation>,
+    ) -> Result<Self> {
+        self.admit_read().await?;
+        self.require_unscoped_root()?;
+        if self.witness_scope.is_none() || !(1..=32).contains(&relations.len())
+            || relations.iter().any(|relation| !relation.is_root_data())
+        {
+            return Err(scoped_root_denied());
+        }
+        self.check_live_change_relations(&relations)?;
+        let count = relations.len();
+        let reservation = self.context.memory.reserve(count * 512 + 2048)?;
+        let relations = relations.into_iter().collect::<BTreeSet<_>>();
+        if relations.len() != count { return Err(scoped_root_denied()); }
+        let cancellation = self.cancellation.child_token();
+        let context = self.context.with_owned_system_cut(self.present.system_time, &cancellation)?;
+        Ok(Self {
+            context, node: self.node.clone(), identity: Arc::clone(&self.identity),
+            database: self.database.clone(), owner: self.owner.clone(), present: self.present,
+            witness_scope: self.witness_scope, witness_until: self.witness_until, fork_until: self.fork_until,
+            cancellation, session_cancellation: self.session_cancellation.clone(),
+            historical: None, scoped_root: Some(relations), attachment: self.attachment.clone(),
+            _reservation: reservation,
+        })
+    }
+
+    pub fn require_unscoped_root(&self) -> Result<()> {
+        if self.scoped_root.is_some() { return Err(scoped_root_denied()); }
+        Ok(())
+    }
+
+    pub fn check_witness_relation(&self, relation: &rtdb_types::OwnedRelation, evidence: &OwnedRangeWitness) -> Result<()> {
+        self.check()?;
+        if &evidence.relation != relation || evidence.basis != self.present
+            || !evidence.matches_scope(self.witness_scope)
+        {
+            return Err(scoped_root_denied());
+        }
+        self.relation_release_guard_for([relation], true)?()
+    }
+
+    /// A completed scoped point can conservatively depend on its relation's frontier.
+    pub fn scoped_point_witness(
+        &self, relation: &rtdb_types::OwnedRelation, expiry: Option<Timestamp>,
+    ) -> Result<Option<OwnedRangeWitness>> {
+        if self.scoped_root.is_none() { return Ok(None); }
+        self.relation_witness_for(relation, true, expiry)
+    }
+
     pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<OwnedForkCut> {
+        self.require_unscoped_root()?;
         self.admit_access().await?;
         let attached_scope = self.attachment.upgrade()
             .and_then(|database| database.await_authority.codec().map(|codec| codec.scope()));
@@ -1063,6 +1116,7 @@ impl OwnedReadSession {
     /// Admit a placed restore only while the original writer and replay
     /// hold still own the destination and no release has sealed it.
     pub async fn replay_parent_hold(&self, binding: [u8; 32], before_replay: bool) -> Result<Vec<u8>> {
+        self.require_unscoped_root()?;
         self.admit_access().await?;
         if self.historical.is_some() || self.witness_scope.is_none() || binding == [0; 32] {
             return Err(rtdb_types::OwnedWorld::unavailable());
@@ -1143,6 +1197,7 @@ impl OwnedReadSession {
     }
 
     pub async fn world_registration(&self, world: rtdb_types::Iid) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         let record = rtdb_query::read_owned_world(Arc::clone(&self.context), &self.owner, world).await?;
         self.check()?;
@@ -1151,6 +1206,7 @@ impl OwnedReadSession {
 
     /// Reads the exact local shadow, retaining its revision even when that shadow is a tombstone.
     pub async fn world_application_clock(&self, world: rtdb_types::Iid) -> Result<Option<Timestamp>> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         let clock = rtdb_query::read_owned_world_clock(Arc::clone(&self.context), &self.owner, world).await?;
         self.check()?;
@@ -1162,6 +1218,7 @@ impl OwnedReadSession {
         valid_at: Timestamp, observed: bool,
     ) -> Result<OwnedWorldShadowRead> {
         let valid = rtdb_types::Interval::at(valid_at)?;
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
         let root = relation;
@@ -1239,6 +1296,7 @@ impl OwnedReadSession {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native held reads"));
         }
         let frontiers = relations.into_iter().map(|relation| {
+            self.require_live_root_scope(relation)?;
             let root = relation.root_relation();
             let logical = root.as_ref().unwrap_or(relation);
             let lifetime = logical.lifetime_table(&self.owner);
@@ -1348,6 +1406,7 @@ impl OwnedReadSession {
     pub async fn lifetime_point_policy(
         &self, relation: &rtdb_types::OwnedRelation,
     ) -> Result<Option<rtdb_types::OwnedLifetimeFloor>> {
+        self.require_live_root_scope(relation)?;
         self.admit_access().await?;
         let database = self.retained_root_context().catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else { return Err(lifetime_read_unavailable()); };
@@ -1374,6 +1433,7 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<(String, Timestamp, Timestamp)> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || !relation.is_root_data() || self.node.now() >= self.witness_until {
             return Err(lifetime_read_unavailable());
@@ -1417,6 +1477,7 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, nomination: &str,
         scope: rtdb_types::PlacedAttemptScope, deadline: Timestamp,
     ) -> Result<(Timestamp, Timestamp)> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         let now = self.node.now();
         if self.historical.is_some() || self.witness_scope != Some(scope) || !relation.is_root_data()
@@ -1915,7 +1976,15 @@ impl OwnedReadSession {
         self.historical.as_ref().map_or(&self.context, |scope| &scope.root_context)
     }
 
+    fn require_live_root_scope(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
+        if self.scoped_root.as_ref().is_some_and(|scope| !scope.contains(relation)) {
+            return Err(scoped_root_denied());
+        }
+        Ok(())
+    }
+
     fn require_scoped_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
+        self.require_live_root_scope(relation)?;
         if self.historical.as_ref().is_some_and(|scope| !scope.relations.contains(relation)) {
             return Err(historical_owned_read::unavailable());
         }
@@ -1930,6 +1999,11 @@ impl OwnedReadSession {
         }
         self.check()
     }
+}
+
+fn scoped_root_denied() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/read-scope",
+        "The held Root read does not admit the requested relation or operation")
 }
 
 fn lifetime_read_unavailable() -> Anomaly {
@@ -2533,7 +2607,7 @@ impl NativeSession {
         context.check_cancelled()?;
         Ok(OwnedReadSession {
             context, node, identity, database, owner, present, witness_scope, witness_until, fork_until: witness_until,
-            cancellation, session_cancellation, historical: None, attachment: placement, _reservation: charge,
+            cancellation, session_cancellation, historical: None, scoped_root: None, attachment: placement, _reservation: charge,
         })
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {

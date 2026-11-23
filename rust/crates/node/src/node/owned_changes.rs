@@ -126,6 +126,7 @@ impl OwnedReadSession {
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<ExpiryCandidatePage> {
         const MAX_CANDIDATES: usize = 64;
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || !(1..=8).contains(&groups) {
             return Err(change_feed_uncovered());

@@ -15,6 +15,7 @@ impl OwnedReadSession {
         witnesses: &[OwnedRangeWitness],
         controls: &[HostedControlWrite],
     ) -> Result<Option<Timestamp>> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         let unavailable = || {
             Anomaly::new(

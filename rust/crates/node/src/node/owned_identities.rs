@@ -29,6 +29,7 @@ impl OwnedReadSession {
         limit: usize,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>)> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.witness_scope != Some(scope)
             || relation.name() != "fact_unit_column_payloads"
@@ -62,6 +63,7 @@ impl OwnedReadSession {
         prefix: &str,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<([u8; 72], OwnedRangeWitness)> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || relation.name() != "fact_unit_column_payloads"
             || !valid_carrier_prefix(prefix)
