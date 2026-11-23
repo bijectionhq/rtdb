@@ -146,12 +146,8 @@ impl HeldTextCorpus {
             return Err(corpus_limit());
         }
         let table = relation.table(owner);
-        if !snapshot.contains_table(&table) {
+        if !crate::definitions::has_owned_search_text(snapshot, &table, &column)? {
             return Ok(());
-        }
-        let types = snapshot.column_types_for(&table, [column.clone()]);
-        if !types.get(&column).is_some_and(rtdb_types::LogicalType::is_clear_search_text) {
-            return Err(Anomaly::incorrect("rtdb.owned/search-column", "Owned search path no longer describes only clear text"));
         }
         let Some(mut cursor) = rtdb_query::open_owned_root_projection(
             Arc::clone(context), owner, relation, valid, &["_id", &column],

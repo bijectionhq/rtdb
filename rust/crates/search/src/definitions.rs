@@ -5,7 +5,7 @@ use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_index::Snapshot;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, Instant, Result, TableRef, Value};
+use rtdb_types::{Anomaly, Instant, LogicalType, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
 
 /// One version of a search index definition, as `xt.search_indexes` holds it (fts.allium: SearchIndexDefinition).
@@ -18,6 +18,19 @@ impl SearchDefinition {
 }
 
 pub const DEFINITIONS: (&str, &str) = ("xt", "search_indexes");
+
+/// A declared optional text column may have no physical text at this cut.
+pub(crate) fn has_owned_search_text(snapshot: &Snapshot, table: &TableRef, column: &str) -> Result<bool> {
+    let types = snapshot.column_types_for(table, [column.to_owned()]);
+    let kind = types.get(column).unwrap_or(&LogicalType::Nothing);
+    if kind.is_clear_search_text() {
+        return Ok(true);
+    }
+    if kind.legs().iter().all(|leg| matches!(leg, LogicalType::Null)) {
+        return Ok(false);
+    }
+    Err(Anomaly::incorrect("rtdb.owned/search-column", "Owned search path no longer describes only clear text"))
+}
 
 /// The definitions in force in the database's snapshots, as of `now` in valid time.
 pub async fn definitions_in(database: &str, partitions: Vec<Snapshot>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, now: Instant, cancellation: &CancellationToken) -> Result<Vec<SearchDefinition>> {

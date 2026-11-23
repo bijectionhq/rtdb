@@ -379,9 +379,7 @@ async fn covered_owned_corpus(
     let captured = context.catalog.database(database)?;
     let [snapshot] = captured.partitions.as_slice() else { return Err(uncovered_owned_search()); };
     let present = context.current_time.as_micros()?;
-    if snapshot.system_time_cap() != Some(present)
-        || snapshot.iter_segments(&definition.table).any(|segment| segment.row_count() != 0)
-    {
+    if snapshot.system_time_cap() != Some(present) {
         return Err(uncovered_owned_search());
     }
     let [column] = definition.columns.as_slice() else { return Err(uncovered_owned_search()); };
@@ -389,15 +387,14 @@ async fn covered_owned_corpus(
         valid_time: Interval::at(valid_at.unwrap_or(present))?,
         system_time: Interval::at(present)?,
     };
-    if !snapshot.contains_table(&definition.table) {
+    if !crate::definitions::has_owned_search_text(snapshot, &definition.table, column)? {
         return Ok(CoveredCorpus {
             column: column.clone(), bounds, corpus: rtdb_text::Corpus::default(), visible_runs: Vec::new(),
             _scratch: context.memory.reserve(4096)?,
         });
     }
-    let types = snapshot.column_types_for(&definition.table, [column.clone()]);
-    if !types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text) {
-        return Err(Anomaly::incorrect("rtdb.owned/search-column", "Owned search path no longer describes only clear text"));
+    if snapshot.iter_segments(&definition.table).any(|segment| segment.row_count() != 0) {
+        return Err(uncovered_owned_search());
     }
     let runtime = crate::SearchRuntime::new(0);
     let mut files = Vec::new();
