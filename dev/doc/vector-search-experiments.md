@@ -508,6 +508,19 @@ Supporting `float4[]` and `float8[]` Bind parameters changes externally visible 
 
 The native Transit readers retain the existing cache and tag semantics while packing numeric arrays.
 
+#### SQL surfaces follow-up
+
+| Surface | Path | Route |
+| --- | --- | --- |
+| Flight planning | `flight-sql/src/execute.rs`, `node/src/statement.rs` | Reuse the statement across description and redemption where its catalog lookups agree, and charge a rebound plan to its keeper and execution budgets. Each statement ticket holds the original Arrow binding and captured catalog in the issuing session. |
+| Catalogs | `query/src/system.rs`, `query/src/context.rs` | Build projected columns and filter their Arrow batches. Resolve relation casts through the captured OID and name indexes. |
+| Inspection | `node/src/inspection.rs`, `query/src/inspection.rs` | Publish bounded Arrow windows of log and block records with the same EDN text cells. |
+| Reports | `query/src/explain.rs`, `query/src/analysis.rs`, `query/src/cursor.rs` | Share EXPLAIN report rows and write vectors from borrowed cells for EXPLAIN, ANALYZE, and SHOW. |
+| Outcomes | `node/src/node.rs` | Reuse the canned outcome queries and read the typed coordinates and status from their Arrow positions. Decode the stored Transit error at redemption. |
+| Arrow client conformance | `columnar/src/conform.rs` | Adapt admitted columns through Arrow layouts and return the scratch reservation error directly. |
+| XTQL literal pages | `xtql/src/bind/ra.rs`, `query/src/operators.rs` | Build compatible literal pages in the binder and retain those vectors at execution. Preserve the legacy serialized relation shape. |
+| Vector benchmark | `node/examples/support/vector_workload.rs` | Bind each filter and scorer once. Candidate reranking adds its current IID restriction to the bound plan. |
+
 #### Qualification of the closure pass
 
 The implementation commit `6c3e1f2905` sits on RTDB main `d488486491`.

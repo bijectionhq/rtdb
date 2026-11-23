@@ -64,7 +64,7 @@ impl AnalysisNode {
         let mut rows = Vec::new(); self.append_rows(0, peak, &mut rows)?; Ok(rows)
     }
     fn append_rows(&self, depth: usize, peak: usize, rows: &mut Vec<Vec<Value>>) -> Result<()> {
-        let counts = self.counts.lock().map_err(|_| invalid("analysis-state", "Analysis counters were poisoned"))?;
+        let mut counts = self.counts.lock().map_err(|_| invalid("analysis-state", "Analysis counters were poisoned"))?;
         let child_time = self.children.iter().try_fold(0i64, |sum, child| {
             let counts = child.counts.lock().map_err(|_| invalid("analysis-state", "Analysis counters were poisoned"))?;
             Ok::<_, rtdb_types::Anomaly>(sum.saturating_add(micros(counts.total)))
@@ -80,7 +80,7 @@ impl AnalysisNode {
         };
         rows.push(vec![Value::Utf8(format!("{}->", "  ".repeat(depth))), Value::Keyword(Keyword::from_name(self.op)), attributes,
             duration(micros(counts.total)), duration(micros(counts.total).saturating_sub(child_time)), counts.first.map_or(Value::Null, |time| duration(micros(time))),
-            Value::I64(i64::from(counts.pages)), Value::I64(counts.rows), counts.pushdowns.as_ref().map_or(Value::Null, |pushdowns| pushdowns.value.clone()), integer(counts.peak_memory as u64), integer(peak as u64)]);
+            Value::I64(i64::from(counts.pages)), Value::I64(counts.rows), counts.pushdowns.take().map_or(Value::Null, |pushdowns| pushdowns.value), integer(counts.peak_memory as u64), integer(peak as u64)]);
         drop(counts);
         for child in &self.children { child.append_rows(depth + 1, peak, rows)?; }
         Ok(())
@@ -106,7 +106,7 @@ fn duration(value: i64) -> Value { Value::Duration { value, unit: TimeUnit::Micr
 
 pub(crate) fn operator(relation: &Relation) -> &'static str {
     match relation.node() {
-        RelationNode::Values { .. } | RelationNode::ColumnTable { .. } => "table", RelationNode::LiteralPages { .. } => "pages", RelationNode::Scan(_) => "scan", RelationNode::Project { .. } | RelationNode::Extend { .. } => "project",
+        RelationNode::Values { .. } | RelationNode::ColumnTable { .. } => "table", RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } => "pages", RelationNode::Scan(_) => "scan", RelationNode::Project { .. } | RelationNode::Extend { .. } => "project",
         RelationNode::Rename { .. } => "rename", RelationNode::Let { .. } => "let", RelationNode::Reference { .. } => "relation",
         RelationNode::Filter { .. } => "select", RelationNode::Limit { .. } => "top", RelationNode::Distinct { .. } => "distinct",
         RelationNode::Sort { .. } => "order-by", RelationNode::SortLimit { .. } => "sort", RelationNode::Join { kind, .. } => match kind { rtdb_plan::JoinKind::Inner => "inner-join", rtdb_plan::JoinKind::Cross => "cross-join", rtdb_plan::JoinKind::Left | rtdb_plan::JoinKind::Right => "left-join", rtdb_plan::JoinKind::Full => "full-join", rtdb_plan::JoinKind::Semi => "semi-join", rtdb_plan::JoinKind::Anti => "anti-join", rtdb_plan::JoinKind::Single => "single-join" }, RelationNode::Aggregate { .. } => "group-by", RelationNode::Window { .. } => "window",

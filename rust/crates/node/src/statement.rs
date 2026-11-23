@@ -122,13 +122,15 @@ impl PreparedSql {
         let _parameters = context.memory.reserve(parameter_bytes)?;
         let mut parameters = (0..count).map(|index| options.parameter_types.get(&index).cloned().unwrap_or(LogicalType::Null)).collect::<Vec<_>>();
         let mut notices = Vec::new();
+        let mut cached = None;
         let result = match parsed.kind() {
             StatementKind::Dml => {
                 if dml_notices { notices = parsed.bind(&context.catalog, &options).map(|prepared| prepared.notices).unwrap_or_default(); }
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let prepared = parsed.bind(&context.catalog, &options)?;
+                let recording = RecordingCatalog::new(&context.catalog);
+                let prepared = parsed.bind(&recording, &options)?;
                 for (index, ty) in &prepared.parameter_types {
                     if !options.parameter_types.contains_key(index) { parameters[*index] = ty.clone(); }
                 }
@@ -140,7 +142,9 @@ impl PreparedSql {
                     query.schema().clone()
                 };
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
-                PreparedResult::Query { schema, pg_types, parameter_projection: query.is_parameter_projection() }
+                let result = PreparedResult::Query { schema, pg_types, parameter_projection: query.is_parameter_projection() };
+                cached = recording.finish().map(|lookups| CachedPlan { options: options.clone(), lookups: Arc::new(lookups), query });
+                result
             }
             StatementKind::Session => return Err(session_statement(source, &options, &context.memory)),
         };
@@ -149,9 +153,10 @@ impl PreparedSql {
         let bytes = bytes.checked_add(snapshot_selector.retained_bytes()?).ok_or_else(size_error)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, snapshot_selector, result, policy, _reservation: reservation, plan: Default::default() })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, snapshot_selector, result, policy, _reservation: reservation, plan: std::sync::Mutex::new(cached) })))
     }
 
+    pub fn search_path(&self) -> &[String] { &self.0.options.search_path }
     pub fn source(&self) -> &str { &self.0.source }
     pub fn parameter_count(&self) -> usize { self.0.parameters.len() }
     pub fn parameter_types(&self) -> &[LogicalType] { &self.0.parameters }
@@ -329,7 +334,7 @@ impl PreparedSql {
         Ok(TxOp::Sql { sql: self.0.source.clone(), args: arguments })
     }
 
-    fn bind(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType], execution: bool) -> Result<PreparedQuery> {
+    pub(crate) fn bind(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType], execution: bool) -> Result<PreparedQuery> {
         context.check_cancelled()?;
         if self.is_dml() { return Err(kind_error()); }
         if argument_types.len() != self.parameter_count() { return Err(parameter_error("Parameter field count differs from the prepared statement")); }
@@ -339,14 +344,22 @@ impl PreparedSql {
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
         let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref().filter(|plan| plan.options == options).map(|plan| (plan.lookups.clone(), plan.query.clone())));
         if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
-        let recording = RecordingCatalog::new(&context.catalog);
         let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
-        let query = PreparedQuery::from_prepared(rtdb_sql::prepare_in(&self.0.source, &recording, &options, &context.memory)?, &context.memory)?;
-        // A plan's allocations stay charged to the budget it was planned in, so the kept copy is planned in the statement's own.
-        if let Some(lookups) = recording.finish() {
-            let budget = self.0._reservation.budget();
-            let kept = rtdb_sql::prepare_in(&self.0.source, &context.catalog, &options, budget).and_then(|prepared| PreparedQuery::from_prepared(prepared, budget));
-            if let (Ok(kept), Ok(mut plan)) = (kept, self.0.plan.lock()) { *plan = Some(CachedPlan { options, lookups: Arc::new(lookups), query: kept }); }
+        let budget = self.0._reservation.budget();
+        let plan_in = |memory| {
+            let recording = RecordingCatalog::new(&context.catalog);
+            let query = PreparedQuery::from_prepared(rtdb_sql::prepare_in(&self.0.source, &recording, &options, memory)?, memory)?;
+            Ok::<_, Anomaly>((query, recording.finish()))
+        };
+        let (kept, lookups) = match plan_in(budget) {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" && !Arc::ptr_eq(budget, &context.memory) => {
+                return Ok(plan_in(&context.memory)?.0);
+            }
+            result => result?,
+        };
+        let query = kept.recharged(&context.memory)?;
+        if let Some(lookups) = lookups && let Ok(mut plan) = self.0.plan.lock() {
+            *plan = Some(CachedPlan { options, lookups: Arc::new(lookups), query: kept });
         }
         Ok(query)
     }
@@ -436,4 +449,30 @@ fn retained_bytes(source: &String, options: &PrepareOptions, parameters: &Vec<Lo
         for field in schema.fields() { bytes = bytes.checked_add(field.data_type.retained_bytes()?).and_then(|n| n.checked_add(field.name.capacity())).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }
     }
     Ok(bytes)
+}
+
+#[test]
+fn arrow_surface_preparation_reuses_the_first_plan_across_query_budgets() {
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+
+    let catalog = CatalogSnapshot::new("xtdb", [("xtdb".into(), DatabaseSnapshot {
+        partitions: vec![],
+        storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+    })].into_iter().collect(), false).unwrap();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let statement_budget = MemoryBudget::new(1 << 20);
+    let context = QueryContext::new(catalog, Arc::clone(&statement_budget), rtdb_types::Timestamp(0), "UTC", QueryOptions::default(), &cancellation).unwrap();
+    let prepared = PreparedSql::prepare("SELECT 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let original = prepared.0.plan.lock().unwrap().as_ref().unwrap().query.relation().clone();
+    let query_budget = MemoryBudget::new(1 << 20);
+    let mut query_context = context;
+    Arc::make_mut(&mut query_context).memory = Arc::clone(&query_budget);
+
+    let bound = prepared.bind(&query_context, &[], true).unwrap();
+    assert!(Arc::ptr_eq(bound.relation(), &original));
+    assert!(query_budget.used_bytes() > 0);
+    drop(bound);
+    assert_eq!(query_budget.used_bytes(), 0);
+    assert!(statement_budget.used_bytes() > 0);
 }

@@ -7,11 +7,9 @@ use rtdb_plan::{ApplyKind, Expr, NamedExpr, Relation, RelationNode, Schema, SetO
 use rtdb_types::{LogicalType, Result, Value};
 
 use crate::context::Execution;
-use crate::cursor::BoxCursor;
 use crate::limit_bounds::{checked_row_count, sort_prefix_len};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::invalid;
-use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchOutput { Arrow, ArrowPages }
@@ -81,6 +79,9 @@ async fn build_batches_at(
             let cursor = execution.open_list(expr.clone(), *page_rows).await?;
             Ok(Some((Box::new(cursor), false)))
         }
+        RelationNode::ArrowLiteralPages { .. } => {
+            Ok(Some((Box::new(ArrowLiteralCursor { relation, next: 0, execution }), false)))
+        }
         RelationNode::LiteralPages { .. } => {
             Ok(Some((Box::new(LiteralBatchCursor { relation, width: runtime.schema().len(), next: 0, execution }), false)))
         }
@@ -93,10 +94,8 @@ async fn build_batches_at(
             Ok(Some((batches,false)))
         }
         RelationNode::Scan(scan) => {
-            let width = runtime.schema().len();
-            let memory = Arc::clone(&execution.context.memory);
-            let pages = open_catalog_scan(scan, &runtime, execution).await?;
-            Ok(Some((crate::columnar::batches_from_pages(pages, width, memory), false)))
+            let batches = open_catalog_scan(scan, &runtime, execution).await?;
+            Ok(Some((batches, false)))
         }
         RelationNode::ColumnTable { expr, .. } => {
             Ok(Some((crate::column_table::open_columns(&execution, expr.clone()).await?, false)))
@@ -508,7 +507,7 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
             batch_shape(&runtime.child(1)?, output)?
         }
         RelationNode::Reference { .. } => Some(false),
-        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::List { .. } => Some(false),
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } | RelationNode::List { .. } => Some(false),
         RelationNode::ColumnTable { .. } => Some(false),
         RelationNode::Filter { .. } => {
             let mut child = runtime.child(0)?;
@@ -563,7 +562,7 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
     })
 }
 
-async fn open_catalog_scan(scan: &rtdb_plan::Scan, runtime: &Arc<EmittedRelation>, execution: Execution) -> Result<BoxPageCursor> {
+async fn open_catalog_scan(scan: &rtdb_plan::Scan, runtime: &Arc<EmittedRelation>, execution: Execution) -> Result<crate::columnar::BoxBatchCursor> {
     let execution = execution.in_operator();
     execution.context.check_cancelled()?;
     let reservation = state_reservation(runtime, &execution)?;
@@ -571,20 +570,17 @@ async fn open_catalog_scan(scan: &rtdb_plan::Scan, runtime: &Arc<EmittedRelation
     let context = Arc::clone(&execution.context);
     let mut constraints = crate::inspection::Constraints::default();
     for predicate in &scan.predicates { constraints.add(predicate); }
-    let rows: BoxCursor = if crate::inspection::is_inspection(&scan.table.name.table) {
+    let input: crate::columnar::BoxBatchCursor = if crate::inspection::is_inspection(&scan.table.name.table) {
         Box::new(crate::inspection::InspectionCursor::new(scan.clone(), execution.clone(), &constraints).await?)
     } else {
         Box::new(crate::system::SystemCursor::new(scan.clone(), execution.clone()))
     };
-    let pages = crate::pages::from_rows(rows, Arc::clone(&context));
-    let pages: BoxPageCursor = match scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right)) {
-        Some(predicate) => Box::new(CatalogFilter {
-            input: pages, schema: runtime.schema().clone(), predicate, execution,
-        }),
-        None => pages,
+    let batches: crate::columnar::BoxBatchCursor = match scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right)) {
+        Some(predicate) => Box::new(crate::columnar::BatchFilter::new(input, runtime.schema().clone(), predicate, execution)),
+        None => input,
     };
-    let pages = crate::pages::retain_page_state(pages, reservation);
-    Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis, &context.memory), runtime.relation(), &context))
+    let batches = crate::columnar::retain_batch_state(batches, reservation);
+    Ok(crate::trace::wrap_batches(crate::analysis::wrap_batches(batches, analysis, &context.memory), runtime.relation(), &context))
 }
 
 /// A valid literal or bound parameter can size a seek before the normal input opens.
@@ -655,6 +651,27 @@ async fn materialize_columns(
     Ok(Some(output))
 }
 
+struct ArrowLiteralCursor { relation: Arc<Relation>, next: usize, execution: Execution }
+
+#[async_trait]
+impl crate::columnar::BatchCursor for ArrowLiteralCursor {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        use crate::columnar::{Column, ColumnBatch};
+        self.execution.context.check_cancelled()?;
+        let RelationNode::ArrowLiteralPages { pages } = self.relation.node() else { return Err(invalid("page-source", "Expected Arrow literal pages")); };
+        let Some(page) = pages.pages().get(self.next) else { return Ok(None); };
+        self.next += 1;
+        let batch = page.batch();
+        let bytes = batch.num_columns().checked_mul(512).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("table-size", "Table column allocation overflow"))?;
+        let reservation = self.execution.context.memory.reserve(bytes)?;
+        let columns = batch.columns().iter().zip(batch.schema_ref().fields()).map(|(array, field)| {
+            Column::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical: None }
+        }).collect();
+        Ok(Some(ColumnBatch::sharing(columns, batch.num_rows(), reservation)))
+    }
+}
+
 struct LiteralBatchCursor { relation: Arc<Relation>, width: usize, next: usize, execution: Execution }
 
 #[async_trait]
@@ -711,29 +728,6 @@ fn ordered_input(
     }))
 }
 
-struct CatalogFilter { input: BoxPageCursor, schema: Schema, predicate: Expr, execution: Execution }
-
-#[async_trait]
-impl PageCursor for CatalogFilter {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        let execution = &self.execution;
-        execution.context.check_cancelled()?;
-        while let Some(mut page) = self.input.next_page().await? {
-            let metadata = execution.scope()?;
-            let invocation = execution.prepare_expression(&self.predicate, &self.schema, &metadata)?;
-            let mut output = PageBuilder::new(page.len(), &execution.context.memory)?;
-            let scope = execution.scope()?;
-            while let Some(row) = page.next() {
-                if is_true(&execution.evaluate_invocation(&scope, &invocation, &row.values).await?)? { output.push(row)?; }
-                scope.reset()?;
-            }
-            if output.len() != 0 { return Ok(Some(output.finish())); }
-        }
-        Ok(None)
-    }
-    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
-    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
-}
 struct BatchUnion { left: Option<crate::columnar::BoxBatchCursor>, right: crate::columnar::BoxBatchCursor }
 
 struct BatchLimit {

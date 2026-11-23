@@ -6,37 +6,49 @@ use crate::{EvalContext, EvaluationScope};
 /// Reserve enumeration scratch in `allocation` before creating it; borrowed names last only through `visit`.
 pub trait PgCatalogLookup: Send + Sync {
     fn relations(&self, allocation: &EvaluationScope, visit: &mut dyn FnMut(i32, &TableRef) -> Result<()>) -> Result<()>;
+
+    fn relation_name(&self, oid: i32, allocation: &EvaluationScope) -> Result<Option<String>> {
+        let mut name = None;
+        self.relations(allocation, &mut |candidate, table| {
+            if candidate == oid { name = Some(format_relation_name(table, allocation)?); }
+            Ok(())
+        })?;
+        Ok(name)
+    }
+
+    fn relation_oid(&self, schema: Option<&str>, table: &str, allocation: &EvaluationScope) -> Result<Option<i32>> {
+        let mut explicit = None;
+        let mut public = None;
+        let mut system = None;
+        self.relations(allocation, &mut |oid, relation| {
+            if relation.table == table { match schema {
+                Some(schema) if schema == relation.schema => explicit = Some(oid),
+                None if relation.schema == "pg_catalog" => system = Some(oid),
+                None if relation.schema == "public" => public = Some(oid),
+                _ => (),
+            } }
+            Ok(())
+        })?;
+        Ok(explicit.or(system).or(public))
+    }
+}
+
+pub fn format_relation_name(table: &TableRef, allocation: &EvaluationScope) -> Result<String> {
+    allocation.reserve(table.schema.len().checked_add(table.table.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(crate::numeric::overflow)?)?;
+    Ok(if matches!(table.schema.as_str(), "public" | "pg_catalog") { table.table.clone() } else { format!("{}.{}", table.schema, table.table) })
 }
 
 pub(crate) fn relation_text(oid: i32, context: &EvalContext<'_>) -> Result<String> {
     let Some(catalog) = context.catalog else { return Ok(oid.to_string()); };
     let allocation = context.allocation.ok_or_else(|| Anomaly::fault("rtdb.expr/catalog-allocation", "Catalog lookup requires an allocation scope"))?;
-    let mut name = None;
-    catalog.relations(allocation, &mut |candidate, table| {
-        if candidate == oid {
-            allocation.reserve(table.schema.len().checked_add(table.table.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(crate::numeric::overflow)?)?;
-            name = Some(if matches!(table.schema.as_str(), "public" | "pg_catalog") { table.table.clone() } else { format!("{}.{}", table.schema, table.table) });
-        }
-        Ok(())
-    })?;
-    Ok(name.unwrap_or_else(|| oid.to_string()))
+    Ok(catalog.relation_name(oid, allocation)?.unwrap_or_else(|| oid.to_string()))
 }
 
 pub(crate) fn relation_oid(name: &str, context: &EvalContext<'_>) -> Result<i32> {
     let Some(catalog) = context.catalog else { return Err(unknown_relation(name)); };
     let allocation = context.allocation.ok_or_else(|| Anomaly::fault("rtdb.expr/catalog-allocation", "Catalog lookup requires an allocation scope"))?;
     let (schema, table) = name.rsplit_once('.').map_or((None, name), |(schema, table)| (Some(schema), table));
-    let mut explicit = None; let mut public = None; let mut system = None;
-    catalog.relations(allocation, &mut |oid, relation| {
-        if relation.table == table { match schema {
-            Some(schema) if schema == relation.schema => explicit = Some(oid),
-            None if relation.schema == "pg_catalog" => system = Some(oid),
-            None if relation.schema == "public" => public = Some(oid),
-            _ => (),
-        } }
-        Ok(())
-    })?;
-    explicit.or(system).or(public).ok_or_else(|| unknown_relation(name))
+    catalog.relation_oid(schema, table, allocation)?.ok_or_else(|| unknown_relation(name))
 }
 fn unknown_relation(name: &str) -> Anomaly { Anomaly::incorrect("xtdb.expression.pg/unknown-relation", format!("Relation {name} does not exist")) }
 pub(crate) fn proc_text(oid: i32) -> String { if oid == rtdb_types::pg_name_oid("array_in") { "array_in".into() } else { oid.to_string() } }

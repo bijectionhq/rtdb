@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, to_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array_refs, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, to_field};
 use rtdb_plan::{BinaryOp, Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
@@ -60,8 +60,15 @@ enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema)
 impl PreparedQuery {
     /// The same plan, its retained bytes charged to `memory` instead: a plan kept beyond one query moves its charge to its keeper.
     pub fn recharged(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if self._plan_reservation.as_ref().is_some_and(|reservation| Arc::ptr_eq(reservation.budget(), memory)) {
+            return Ok(self.clone());
+        }
         let _plan_reservation = self._plan_reservation.as_ref().map(|reservation| memory.reserve(reservation.bytes())).transpose()?;
-        Ok(Self { _plan_reservation, ..self.clone() })
+        let output = match &self.output {
+            QueryOutput::Plan(plan) => QueryOutput::Plan(plan.recharged(memory)?),
+            output => output.clone(),
+        };
+        Ok(Self { output, _plan_reservation, ..self.clone() })
     }
     pub fn new(relation: Arc<Relation>) -> Result<Self> { Self::with_settings(relation, rtdb_plan::QuerySettings::default()) }
     /// Retains a validated relation with its existing operator shape.
@@ -349,7 +356,7 @@ impl PreparedQuery {
         let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
         if let QueryOutput::Plan(plan) = &self.output {
             let reservation = context.memory.reserve(plan.copy_bound()?)?;
-            let mut cursor = QueryCursor::from_rows(plan.schema.clone(), plan.rows(), context, reservation)?;
+            let mut cursor = QueryCursor::from_report_rows(&plan.schema, ReportRows::Plan { plan: Arc::clone(plan), _reservation: reservation }, context, None)?;
             cursor.query_span = query_span;
             cursor.plan_reservation = self._plan_reservation.clone();
             return Ok(cursor);
@@ -396,17 +403,12 @@ impl PreparedQuery {
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
         if let (QueryOutput::Analyze(schema), Some(analysis)) = (&self.output, analysis) {
             match input {
-                QueryInput::Rows(mut input) => {
-                    while owner.run_until_cancelled(cancellation.run_until_cancelled(input.next())).await.flatten().ok_or_else(cancelled)??.is_some() {
-                        context.check_cancelled()?;
-                    }
-                }
                 QueryInput::Columns(ColumnOutput { mut input, .. }) | QueryInput::ColumnPages(mut input) | QueryInput::Ordered(mut input) => {
                     while owner.run_until_cancelled(cancellation.run_until_cancelled(input.next_batch())).await.flatten().ok_or_else(cancelled)??.is_some() {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Projection { .. } => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
+                QueryInput::Rows { .. } | QueryInput::Projection { .. } => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
             }
             let peak = context.memory.peak_bytes();
             let reservation = context.memory.reserve(analysis.output_bound()?)?;
@@ -540,7 +542,7 @@ fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory
 }
 
 enum QueryInput {
-    Rows(BoxCursor),
+    Rows { input: ReportRows, offset: usize },
     Columns(ColumnOutput),
     ColumnPages(crate::columnar::BoxBatchCursor),
     Ordered(crate::columnar::BoxBatchCursor),
@@ -696,9 +698,12 @@ impl QueryCursor {
             bytes.checked_add(row_bytes(row, row.capacity())?).ok_or_else(|| invalid("row-size", "Owned row size overflow"))
         })?;
         if retained > reservation.bytes() { return Err(invalid("row-reservation", "Owned rows exceed their memory reservation")); }
-        let runtime_schema = RuntimeSchema::fixed(&schema, &context.memory)?;
+        Self::from_report_rows(&schema, ReportRows::Owned { rows: rows.into_iter(), _reservation: reservation }, context, sample)
+    }
+    fn from_report_rows(schema: &Schema, input: ReportRows, context: Arc<QueryContext>, sample: Option<ExecutionSample>) -> Result<Self> {
+        let runtime_schema = RuntimeSchema::fixed(schema, &context.memory)?;
         let sample = sample.or_else(|| Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query)));
-        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows(Box::new(OwnedRows { rows: rows.into_iter(), reservation }))), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
+        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows { input, offset: 0 }), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
     }
     pub fn schema(&self) -> &Schema { self.schema.schema() }
     pub fn context(&self) -> &Arc<QueryContext> { &self.context }
@@ -771,7 +776,7 @@ impl QueryCursor {
     }
     async fn pull_batch(&mut self) -> Result<Option<OwnedBatch>> {
         let Some(input) = &mut self.input else { return Ok(None); };
-        let page = match input {
+        let rows = match input {
             QueryInput::Projection { batch, trace } => {
                 let started = std::time::Instant::now();
                 if let Some(trace) = trace { trace.start(); }
@@ -789,32 +794,36 @@ impl QueryCursor {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }
             },
-            QueryInput::Rows(input) => {
-                let mut rows = crate::pages::PageBuilder::new(self.context.options.batch_rows, &self.context.memory)?;
-                while rows.len() < self.context.options.batch_rows {
-                    let Some(row) = input.next().await? else { break; };
-                    if row.values.len() != self.schema.schema().len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
-                    rows.push(row)?;
+            QueryInput::Rows { input, offset } => {
+                let limit = self.context.options.batch_rows;
+                match input {
+                    ReportRows::Owned { rows, .. } => &rows.as_slice()[..rows.len().min(limit)],
+                    ReportRows::Plan { plan, .. } => {
+                        let rows = plan.rows();
+                        let end = offset.saturating_add(limit).min(rows.len());
+                        let page = &rows[*offset..end];
+                        *offset = end;
+                        page
+                    }
                 }
-                if rows.len() == 0 { return Ok(None); }
-                rows.finish()
             }
         };
-        let rows = page.rows();
-        if rows.iter().any(|row| row.values.len() != self.schema.schema().len()) {
-            return Err(invalid("row-width", "Operator output differs from its declared schema"));
-        }
+        if rows.is_empty() { return Ok(None); }
         let schema = self.runtime_schema.schema();
         let mut bound = 4096usize;
         for (column, field) in schema.fields().iter().enumerate() {
-            bound = bound.checked_add(estimate_builder_bytes_refs(&field.data_type, rows.iter().map(|row| &row.values[column]))?).ok_or_else(|| invalid("batch-size", "Output batch allocation bound overflow"))?;
+            bound = bound.checked_add(estimate_builder_bytes_refs(&field.data_type, rows.iter().map(|row| &row[column]))?).ok_or_else(|| invalid("batch-size", "Output batch allocation bound overflow"))?;
         }
         let reservation = self.context.memory.reserve(bound)?;
         let fields = schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;
         let arrays: Vec<ArrayRef> = schema.fields().iter().enumerate().map(|(column, field)| {
-            copy_array(&field.data_type, &rows.iter().map(|row| row.values[column].clone()).collect::<Vec<_>>())
+            copy_array_refs(&field.data_type, &rows.iter().map(|row| &row[column]).collect::<Vec<_>>())
         }).collect::<Result<_>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        let count = rows.len();
+        if let QueryInput::Rows { input: ReportRows::Owned { rows, .. }, .. } = input {
+            rows.by_ref().take(count).for_each(drop);
+        }
+        let options = RecordBatchOptions::new().with_row_count(Some(count));
         let batch = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
         OwnedBatch::with_reservation(batch, reservation).map(Some)
     }
@@ -854,14 +863,16 @@ pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: c
     drop(batch);
     OwnedBatch::with_reservation(output, reservation)
 }
-struct OwnedRows { rows: std::vec::IntoIter<Vec<Value>>, reservation: Arc<MemoryReservation> }
-#[async_trait]
-impl RowCursor for OwnedRows { async fn next(&mut self) -> Result<Option<OwnedRow>> { Ok(self.rows.next().map(|values| OwnedRow { values, _bytes: self.reservation.bytes(), _reservation: Arc::clone(&self.reservation) })) } }
+enum ReportRows {
+    Owned { rows: std::vec::IntoIter<Vec<Value>>, _reservation: Arc<MemoryReservation> },
+    Plan { plan: Arc<crate::explain::ExplainPlan>, _reservation: Arc<MemoryReservation> },
+}
 impl Drop for QueryCursor { fn drop(&mut self) { self.context.cancellation.cancel(); self.finish_trace(); } }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_columnar::copy_array;
 
     #[test]
     fn query_output_relayouts_nested_union_children_without_copying_values() {
@@ -878,7 +889,7 @@ mod tests {
             LogicalType::Null,
         ]);
         let values = [Value::Struct(StructFields::from([("a".into(), Value::I64(5))]))];
-        let column = copy_array(&source, &values).unwrap();
+        let column = rtdb_columnar::copy_array(&source, &values).unwrap();
         let array = column.as_any().downcast_ref::<StructArray>().unwrap();
         let original = array.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr();
         let input = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![to_field("v", &source).unwrap()])), vec![column]).unwrap();

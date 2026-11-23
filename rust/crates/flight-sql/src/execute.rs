@@ -12,10 +12,11 @@ use tonic::{Response, Status};
 use uuid::Uuid;
 use crate::{error::{cancelled, invalid, status}, lease::Leased, service::{Call, Output, Service, found, query_ticket}, state::{ConnectionResource, ResourceOwner}, ticket::Ticket, wire};
 
-pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize }
+pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize, pub plan: Option<PreparedSql> }
 const QUERY_TICKET_LIFETIME: Duration = Duration::from_secs(60);
 
 pub(crate) struct QueryTicket {
+    session_id: String,
     owner: ResourceOwner,
     connection: Arc<ConnectionResource>,
     context: Arc<QueryContext>,
@@ -81,7 +82,7 @@ impl Service {
         let options = options(&native);
         if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
             native.prepare_context(&token).await.map_err(status)?;
-            return Ok(Shape { schema: control_schema(control.statement()).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0 });
+            return Ok(Shape { schema: control_schema(control.statement()).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0, plan: None });
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
@@ -89,7 +90,7 @@ impl Service {
         let schema = if prepared.is_dml() { None } else {
             Some(self.parameterized_schema(&prepared, &context, None)?)
         };
-        Ok(Shape { schema, parameters: prepared.parameter_count() })
+        Ok(Shape { schema, parameters: prepared.parameter_count(), plan: Some(prepared) })
     }
     fn parameterized_schema(
         &self, prepared: &PreparedSql, context: &Arc<QueryContext>, params: Option<&wire::BoundParameters>,
@@ -128,7 +129,10 @@ impl Service {
         Ok((wire::OwnedSchema::empty(self.memory())?, query_ticket(Ticket::Empty.encode(self.memory())?, self.memory())?))
     }
 
-    pub async fn query_info(&self, call: &Call, connection: Arc<ConnectionResource>, source: &str, params: Option<Arc<wire::BoundParameters>>) -> Result<(wire::OwnedSchema, Bytes), Status> {
+    pub async fn query_info(
+        &self, call: &Call, connection: Arc<ConnectionResource>, source: &str, previous: Option<&PreparedSql>,
+        params: Option<Arc<wire::BoundParameters>>,
+    ) -> Result<(wire::OwnedSchema, Bytes), Status> {
         let mut native = connection.borrow().await?;
         let token = native.state().cancellation().child_token();
         let options = options(&native);
@@ -147,7 +151,10 @@ impl Service {
         } else {
             let prepared = {
                 let context = native.prepare_context(&token).await.map_err(status)?;
-                PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic).map_err(status)?
+                match previous.filter(|plan| plan.search_path() == options.search_path.as_slice()) {
+                    Some(plan) => plan.clone(),
+                    None => PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?,
+                }
             };
             if prepared.is_dml() {
                 let arguments = params.as_ref().map(|params| params.arguments(self.memory())).transpose()?;
@@ -156,7 +163,6 @@ impl Service {
                 return self.empty_update_info();
             }
             let context = native.query_context_with(&token, true).await.map_err(status)?;
-            let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
             let schema = self.parameterized_schema(&prepared, &context, params.as_deref())?;
             let params = params.filter(|params| params.batch().num_columns() != 0);
             (context, schema, QueryInput::Statement { prepared, params })
@@ -169,9 +175,11 @@ impl Service {
             .map_err(|_| Status::resource_exhausted("The node has too many retained query tickets"))?;
         let deadline = tokio::time::Instant::now() + QUERY_TICKET_LIFETIME;
         let deadline = context.retention_deadline().map_or(deadline, |cutoff| deadline.min(cutoff.into()));
+        let session_id = call.session.id.clone();
+        let identity_bytes = wire::add(16, session_id.capacity())?;
         self.0.query_tickets.insert(id, Arc::new(QueryTicket {
-            owner: call.session.owner(), connection, context, input, deadline, _slot: slot,
-        }), QUERY_TICKET_LIFETIME, QUERY_TICKET_LIFETIME, false, 16).map_err(status)?;
+            session_id, owner: call.session.owner(), connection, context, input, deadline, _slot: slot,
+        }), QUERY_TICKET_LIFETIME, QUERY_TICKET_LIFETIME, false, identity_bytes).map_err(status)?;
         Ok((schema, ticket))
     }
 
@@ -180,7 +188,7 @@ impl Service {
         let Ticket::Read(id) = ticket else { return crate::service::result_stream(call, vec![Ok(wire::schema_data(&Schema::empty(), self.memory())?)]); };
         let work = async {
             let read = found(self.0.query_tickets.lookup(&id, false), "query ticket")?;
-            if !call.session.owns(&read.owner) {
+            if call.session.id != read.session_id || !call.session.owns(&read.owner) {
                 return Err(Status::not_found("unknown query ticket"));
             }
             if read.connection.cancellation.is_cancelled() {

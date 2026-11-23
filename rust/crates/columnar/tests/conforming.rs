@@ -288,3 +288,103 @@ fn a_nullable_vector_union_conforms_to_its_declared_plain_layout_with_typed_comp
     drop(page);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn arrow_surface_conformance_collapses_a_nullable_union_inside_a_list() {
+    use arrow_array::{ArrayRef, ListArray};
+    use arrow_buffer::OffsetBuffer;
+    let memory = MemoryBudget::new(1 << 22);
+    let fields = UnionFields::try_new([5, 9], [Field::new("i64", DataType::Int64, false), Field::new("null", DataType::Null, true)]).unwrap();
+    let values: ArrayRef = Arc::new(UnionArray::try_new(fields, vec![5, 9, 5].into(), Some(vec![1, 0, 0].into()),
+        vec![Arc::new(Int64Array::from(vec![11, 17])), Arc::new(NullArray::new(1))]).unwrap());
+    let item = Arc::new(Field::new("item", values.data_type().clone(), true));
+    let list: ArrayRef = Arc::new(ListArray::new(item, OffsetBuffer::new(vec![0, 3].into()), values, None));
+    let source = Schema::new(vec![Field::new("v", list.data_type().clone(), false)]);
+    let field = Field::new("v", DataType::List(Arc::new(Field::new("item", DataType::Int64, false))), false);
+    let target = Schema::new(vec![field]);
+    let batch = RecordBatch::try_new(Arc::new(source), vec![list]).unwrap();
+    let page = conform_batch(OwnedBatch::new(batch, &memory).unwrap(), &target, &memory).unwrap();
+    let list = page.batch().column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    let children = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(children.iter().collect::<Vec<_>>(), [Some(17), None, Some(11)]);
+    assert_eq!(page.declared_schema().as_ref(), &target);
+    assert_ne!(page.batch().schema().as_ref(), &target);
+}
+
+#[test]
+fn arrow_surface_conformance_returns_the_failed_scratch_reservation() {
+    let input = Field::new("v", DataType::Null, true);
+    let output = Field::new("v", DataType::Utf8, false);
+    let rows = 128;
+    let array = NullArray::new(rows);
+    let scratch = rtdb_columnar::arrow_relayout_bound(&array, &input, &output).unwrap();
+    let schema_bytes = 8192 + 4 * (input.size() + output.size());
+    let limit = schema_bytes * 2 + scratch - 1;
+    let memory = MemoryBudget::new(limit);
+    let source = RecordBatch::try_new(Arc::new(Schema::new(vec![input])), vec![Arc::new(array)]).unwrap();
+    let source = OwnedBatch::new(source, &MemoryBudget::new(1 << 20)).unwrap();
+    let error = conform_batch(source, &Schema::new(vec![output]), &memory).err().unwrap();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(error.message.as_deref(), Some(format!("Cannot reserve {scratch} bytes from budget {limit} with {} retained", schema_bytes * 2).as_str()));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn arrow_surface_borrowed_output_copies_nested_values_with_identical_arrow_buffers() {
+    let values = [
+        Value::Struct([("a".into(), Value::list(vec![Value::F64(-0.0), Value::Null]))].into_iter().collect()),
+        Value::Struct([("a".into(), Value::list(vec![Value::F64(f64::from_bits(0x7ff8_0000_0000_0007))]))].into_iter().collect()),
+    ];
+    let ty = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
+    let old = copy_array(&ty, &values).unwrap();
+    let borrowed = rtdb_columnar::copy_array_refs(&ty, &[&values[0], &values[1]]).unwrap();
+    fn buffers(array: &arrow_data::ArrayData) -> Vec<Vec<u8>> {
+        array.buffers().iter().map(|buffer| buffer.as_slice().to_vec())
+            .chain(array.child_data().iter().flat_map(buffers)).collect()
+    }
+    assert_eq!(old.data_type(), borrowed.data_type());
+    assert_eq!(buffers(&old.to_data()), buffers(&borrowed.to_data()));
+}
+
+#[test]
+fn arrow_surface_conformance_gathers_duplicate_physical_legs_in_row_order() {
+    let memory = MemoryBudget::new(1 << 22);
+    let fields = UnionFields::try_new([2, 3, 5], [
+        Field::new("first", DataType::Float64, true),
+        Field::new("second", DataType::Float64, false),
+        Field::new("null", DataType::Null, true),
+    ]).unwrap();
+    let first = arrow_array::Float64Array::from(vec![Some(-0.0), None]);
+    let second = arrow_array::Float64Array::from(vec![f64::from_bits(0x7ff8_0000_0000_0042)]);
+    let union = UnionArray::try_new(fields, vec![3, 2, 2, 5].into(), Some(vec![0, 1, 0, 0].into()),
+        vec![Arc::new(first), Arc::new(second), Arc::new(NullArray::new(1))]).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("v", union.data_type().clone(), false)]));
+    let input = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(union)]).unwrap(), &memory).unwrap();
+    let target = Schema::new(vec![Field::new("v", DataType::Float64, false)]);
+    let page = conform_batch(input, &target, &memory).unwrap();
+    let output = page.batch().column(0).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
+    assert_eq!(output.iter().map(|value| value.map(f64::to_bits)).collect::<Vec<_>>(),
+        [Some(0x7ff8_0000_0000_0042), None, Some((-0.0f64).to_bits()), None]);
+}
+
+#[test]
+fn arrow_surface_conformance_reuses_contiguous_union_children_inside_lists() {
+    use arrow_array::{ArrayRef, ListArray};
+    use arrow_buffer::OffsetBuffer;
+
+    let memory = MemoryBudget::new(1 << 22);
+    let values = Int64Array::from(vec![4, 5]);
+    let address = values.values().as_ptr();
+    let legs = UnionFields::try_new([1, 2], [Field::new("i64", DataType::Int64, false), Field::new("null", DataType::Null, true)]).unwrap();
+    let union: ArrayRef = Arc::new(UnionArray::try_new(legs, vec![1, 1].into(), Some(vec![0, 1].into()),
+        vec![Arc::new(values), Arc::new(NullArray::new(0))]).unwrap());
+    let item = Arc::new(Field::new("item", union.data_type().clone(), false));
+    let list: ArrayRef = Arc::new(ListArray::new(item, OffsetBuffer::new(vec![0, 2].into()), union, None));
+    let source = Schema::new(vec![Field::new("v", list.data_type().clone(), false)]);
+    let target = Schema::new(vec![Field::new("v", DataType::List(Arc::new(Field::new("item", DataType::Int64, true))), false)]);
+    let batch = RecordBatch::try_new(Arc::new(source), vec![list]).unwrap();
+    let page = conform_batch(OwnedBatch::new(batch, &memory).unwrap(), &target, &memory).unwrap();
+    let list = page.batch().column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(values.values().as_ptr(), address);
+}

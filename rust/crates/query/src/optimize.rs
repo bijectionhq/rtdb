@@ -327,7 +327,7 @@ fn prune_at(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Id
             if evaluated { without_matches(scan) } else { Ok(scan) }
         }
         // An opened VALUES table evaluates every cell, including fields discarded by a parent projection.
-        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } => Ok(relation),
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } => Ok(relation),
         RelationNode::Limit { input, offset, fetch } => {
             let child = prune(Arc::clone(input), required, ids)?;
             bounds(child, offset.clone(), fetch.clone())

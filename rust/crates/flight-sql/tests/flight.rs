@@ -408,6 +408,31 @@ async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_ke
 }
 
 #[tokio::test]
+async fn retained_ticket_pins_arrow_parameters_after_rebind() {
+    use arrow_flight::sql::TicketStatementQuery;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let query = client.prepare("SELECT ? AS n", None).await;
+    let command = CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle };
+    client.upload(command.clone(), vec![arguments(vec![41, 99])]).await;
+    let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+    let request = client.request(descriptor);
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let ticket = Any::decode(info.endpoint[0].ticket.as_ref().unwrap().ticket.as_ref()).unwrap();
+    let handle = TicketStatementQuery::decode(ticket.value).unwrap().statement_handle;
+    assert!(handle.starts_with(b"RTDBFT\x02"));
+    assert_eq!(handle.len(), 7 + 16);
+
+    client.upload(command, vec![arguments(vec![42])]).await;
+    assert_eq!(integer(&client.redeem(&info).await[0], 0, 0), 41);
+    let mut other = Client::connect(&running.server, None).await;
+    let request = other.request(info.endpoint[0].ticket.clone().unwrap());
+    assert_eq!(other.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn prepared_query_projects_nullable_and_boolean_arrow_parameters() {
     use arrow_array::{Array, BooleanArray, cast::AsArray};
 

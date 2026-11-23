@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{Schema, SchemaRef};
-use rtdb_types::{Anomaly, LogicalType as L, Result, Value};
+use rtdb_types::{Anomaly, LogicalType as L, Result};
 
-use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_evaluated_cells, estimate_read_value_bytes, from_field, leg_name, read_value, to_field};
+use crate::{MemoryBudget, MemoryReservation, OwnedBatch, from_field, leg_name};
 
 mod physical;
 
@@ -48,7 +48,7 @@ impl DeclaredBatch {
 }
 
 /// Conforms one page to the declared field order, preserving the reference ConformingUnloader's NULL promotion.
-/// Reserves decoded cells, schema copies, and builders before creating them.
+/// Reserves schema copies and Arrow relayout scratch before creating them.
 /// Extra source fields, missing required fields, and incompatible nonnull values are errors.
 /// Declared nested field order, metadata and dense union type IDs are retained.
 /// Exact-schema pages retain their existing physical layout without rebuilding.
@@ -81,7 +81,7 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         let target = from_field(field)?;
         let source_type = input.map(|(field, _)| from_field(field)).transpose()?.unwrap_or(L::Null);
         if input.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
-        let ty = layout(&target, &source_type)?;
+        layout(&target, &source_type)?;
         let absent;
         let nulls;
         let arrow_input = match input {
@@ -93,41 +93,7 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
             }
         };
         let (source_field, array) = arrow_input;
-        if let Some(collapse) = physical::collapse_bytes(array.as_ref(), source_field, field).ok().flatten()
-            && let Ok(_gather) = memory.reserve(collapse)
-            && let Some((leg, leg_field)) = physical::collapse_union(array, source_field, field).ok().flatten()
-            && let Ok(bound) = arrow_relayout_bound(leg.as_ref(), &leg_field, field)
-            && let Ok(_scratch) = memory.reserve(bound)
-            && let Ok((physical, retained)) = physical::relayout(leg, &leg_field, field, false)
-        {
-            output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
-            fields.push(physical);
-            arrays.push(retained);
-            continue;
-        }
-        let bound = arrow_relayout_bound(array.as_ref(), source_field, field)?;
-        if let Ok(_scratch) = memory.reserve(bound)
-            && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field, false)
-        {
-            output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
-            fields.push(physical);
-            arrays.push(retained);
-            continue;
-        }
-        let rows = batch.batch().num_rows();
-        let (column, _scratch) = copy_evaluated_cells(&ty, rows, memory,
-            |row| match input {
-                Some((field, array)) => estimate_read_value_bytes(field, array.as_ref(), row),
-                None => Ok(0),
-            },
-            |row| match input {
-                Some((field, array)) => read_value(field, array.as_ref(), row),
-                None => Ok(Value::Null),
-            },
-        )?;
-        let source = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
-        let _relayout = memory.reserve(arrow_relayout_bound(column.as_ref(), &source, field)?)?;
-        let (physical, array) = physical::relayout(column, &source, field, false)?;
+        let (physical, array, _scratch) = physical::relayout_result(array, source_field, field, memory)?;
         output.grow_to(add(output.bytes(), array.get_array_memory_size())?)?;
         fields.push(physical);
         arrays.push(array);

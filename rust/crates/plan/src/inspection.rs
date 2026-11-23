@@ -20,4 +20,11 @@ pub trait CatalogInspection: Send {
     /// Each page retains its complete allocation charge; `None` is the end of the finite requested range.
     /// Cancellation may drop this future and cursor; all child resources remain owned until their I/O finishes.
     async fn next(&mut self) -> Result<Option<CatalogRows<InspectionRow>>>;
+
+    fn supports_arrow(&self) -> bool { false }
+
+    /// Returns at most `limit` records with the provider's physical fields.
+    async fn next_arrow(&mut self, _limit: usize) -> Result<Option<rtdb_columnar::OwnedBatch>> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.plan/inspection-arrow", "The inspection provider does not return Arrow batches"))
+    }
 }

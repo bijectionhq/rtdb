@@ -15,7 +15,7 @@ use futures::{StreamExt, TryStreamExt};
 use rtdb_storage::{LocalStore, ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_types::{EntityId, Iid};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Filter {
     All,
     RandomBelow(u32),

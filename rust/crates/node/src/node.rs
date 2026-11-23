@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::try_join_all;
-use rtdb_columnar::{MemoryBudget, read_value};
+use rtdb_columnar::{ArrowCell, MemoryBudget, read_value};
 use rtdb_format::basis::decode_tx_basis;
 use rtdb_format::{database::proto::DatabaseConfig, envelope::{SourceBody, SourceMessage}, log::proto::{AttachDatabase, DetachDatabase, resolved_tx::DbOp}};
 use rtdb_maintenance::CollectionObserver;
@@ -37,7 +37,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AwaitAuthority, Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
+use crate::{AwaitAuthority, Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, PreparedSql, QueryBasis, ResourceFactory, ResultSignaturePolicy, Session, SessionIdentity, SessionService, SystemClock,
     catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory, OpenedDatabase}, placed_receipts::{PlacedToken, invalid_token, is_placed_token}, statement::prepare_query};
 
 
@@ -157,6 +157,25 @@ fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
         || (selected.tx_id > floor.tx_id && selected.system_time >= floor.system_time)
 }
 
+#[derive(Clone, Copy)]
+enum OutcomeQuery {
+    Historical,
+    Placed,
+    Await,
+    Bounded,
+}
+
+impl OutcomeQuery {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Historical => rtdb_tx::HISTORICAL_KEYED_TRANSACTION_SQL,
+            Self::Placed => "SELECT tx_id, tx_system_time, committed FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?",
+            Self::Await => "SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?",
+            Self::Bounded => "SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Node {
     catalog: Arc<DatabaseCatalog>,
@@ -168,6 +187,7 @@ pub struct Node {
     scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
     placement_slots: Option<Arc<Semaphore>>,
     sql_snapshots: Arc<crate::sql_snapshots::SqlSnapshots>,
+    outcome_queries: Arc<[std::sync::Mutex<Option<PreparedSql>>; 4]>,
 }
 
 pub struct NodeDriver {
@@ -254,7 +274,7 @@ impl Node {
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, placement_slots,
-            sql_snapshots: Arc::default() };
+            sql_snapshots: Arc::default(), outcome_queries: Default::default() };
         node.sql_snapshots.start(node.cancellation.clone());
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
@@ -843,20 +863,32 @@ impl Node {
         Ok(SubmittedTx { tx_id: TxId(position.0), placed_receipt })
     }
 
+    fn outcome_query(&self, query: OutcomeQuery, context: &Arc<QueryContext>, arguments: &[Value]) -> Result<PreparedQuery> {
+        let types = arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
+        let mut slot = self.outcome_queries[query as usize].lock()
+            .map_err(|_| Anomaly::fault("rtdb.node/outcome-query", "Outcome statement cache was poisoned"))?;
+        if let Some(prepared) = &*slot { return prepared.bind(context, &types, false); }
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: types.iter().cloned().enumerate().collect(),
+            default_timezone: context.timezone.clone(),
+            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
+            ..Default::default()
+        };
+        let mut planning = Arc::clone(context);
+        Arc::make_mut(&mut planning).memory = Arc::clone(self.memory());
+        let prepared = PreparedSql::prepare(query.sql(), &planning, options, ResultSignaturePolicy::Dynamic)?;
+        let bound = prepared.bind(context, &types, false)?;
+        *slot = Some(prepared);
+        Ok(bound)
+    }
+
     /// The committed outcome visible to the retry when its duplicate guard ran.
     async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
-        let options = rtdb_sql::PrepareOptions {
-            parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
-            default_timezone: context.timezone.clone(),
-            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
-            ..Default::default()
-        };
-        let sql = rtdb_tx::HISTORICAL_KEYED_TRANSACTION_SQL;
-        let prepared = match prepare_query(sql, &context, &options) {
+        let prepared = match self.outcome_query(OutcomeQuery::Historical, &context, &arguments) {
             Ok(prepared) => prepared,
             Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
             Err(error) => return Err(error),
@@ -865,40 +897,32 @@ impl Node {
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             if batch.num_rows() == 0 { continue; }
-            let id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
-            let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
-            let (Value::I64(id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (id, time) else {
+            let (Some(id), Some(system_time)) = (outcome_id(outcome_cell(batch, 0))?, outcome_time(outcome_cell(batch, 1))?) else {
                 return Err(Anomaly::fault("rtdb.node/idempotency-result", "Stored idempotency outcome has no transaction key"));
             };
-            return Ok(Some(TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
+            return Ok(Some(TransactionKey { tx_id: TxId(id), system_time }));
         }
         Ok(None)
     }
     async fn placed_outcome(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<PlacedDecision>> {
         let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
-        let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let sql = "SELECT tx_id, tx_system_time, committed FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
-        let prepared = match prepare_query(sql, &context, &options) {
+        let arguments = vec![Value::Utf8(attempt.outcome_key())];
+        let prepared = match self.outcome_query(OutcomeQuery::Placed, &context, &arguments) {
             Ok(prepared) => prepared,
             Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
             Err(error) => return Err(error),
         };
-        let mut cursor = prepared.execute(context, vec![Value::Utf8(attempt.outcome_key())]).await?;
+        let mut cursor = prepared.execute(context, arguments).await?;
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             if batch.num_rows() == 0 { continue; }
-            let tx_id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
-            let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
-            let committed = read_value(batch.schema().field(2), batch.column(2).as_ref(), 0)?;
-            if let (Value::I64(tx_id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }, Value::Bool(committed)) =
-                (tx_id, time, committed)
+            if let (Some(tx_id), Some(system_time), Some(committed)) = (
+                outcome_id(outcome_cell(batch, 0))?, outcome_time(outcome_cell(batch, 1))?, outcome_committed(outcome_cell(batch, 2))?,
+            )
                 && tx_id == attempt.position().0
             {
-                return Ok(Some(PlacedDecision {
-                    key: TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(value) },
-                    committed,
-                }));
+                return Ok(Some(PlacedDecision { key: TransactionKey { tx_id: TxId(tx_id), system_time }, committed }));
             }
             return Err(bad_attempt_outcome());
         }
@@ -1000,32 +1024,30 @@ impl Node {
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
-        let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let mut cursor = prepare_query("SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
-            .execute(context, vec![Value::I64(tx_id.0)]).await?;
+        let arguments = vec![Value::I64(tx_id.0)];
+        let mut cursor = self.outcome_query(OutcomeQuery::Await, &context, &arguments)?.execute(context, arguments).await?;
         let batch = cursor.next_batch().await?.ok_or_else(|| Anomaly::fault("xtdb/tx-await-missing", format!("tx {tx_id} not found after await")))?;
         let schema = batch.batch().schema();
-        let cell = |name: &str| -> Result<Value> {
+        let cell = |name: &str| -> Result<ArrowCell<'_>> {
             let index = schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.node/tx-result-schema", error.to_string()))?;
-            read_value(schema.field(index), batch.batch().column(index).as_ref(), 0)
+            Ok(outcome_cell(batch.batch(), index))
         };
-        let system_time = match cell("system_time")? { Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Timestamp(value), _ => return Err(Anomaly::fault("rtdb.node/tx-result-time", "Stored transaction result has no microsecond system-time")) };
+        let system_time = outcome_time(cell("system_time")?)?
+            .ok_or_else(|| Anomaly::fault("rtdb.node/tx-result-time", "Stored transaction result has no microsecond system-time"))?;
         let tx_key = TransactionKey { tx_id, system_time };
-        let committed = cell("committed")?;
-        if expected.is_some_and(|outcome| outcome.key != tx_key || committed != Value::Bool(outcome.committed)) {
+        let committed = outcome_committed(cell("committed")?)?;
+        if expected.is_some_and(|outcome| outcome.key != tx_key || committed != Some(outcome.committed)) {
             return Err(bad_attempt_outcome());
         }
         match committed {
-            Value::Bool(true) => Ok(TransactionResult::Committed { tx_key }),
-            Value::Bool(false) => {
+            Some(true) => Ok(TransactionResult::Committed { tx_key }),
+            Some(false) => {
                 let error = if let Some(TransactionResult::Aborted { error, .. }) = latest.as_deref() {
                     error.clone()
                 } else {
-                    match cell("error")? {
-                        Value::Null | Value::Undefined => None,
-                        Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?),
-                        _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")),
-                    }
+                    outcome_error(cell("error")?, &self.factory.memory, || {
+                        Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")
+                    })?
                 };
                 if !db.external_source()
                     && let Some(error) = &error
@@ -1049,9 +1071,9 @@ impl Node {
                 if !db.external_source()
                     && let Some(error) = &error
                     && is_historical_guard_abort(error)
-                    && let Some(key) = idempotency_key(&cell("user_metadata")?)
+                    && let Some(key) = outcome_metadata_key(cell("user_metadata")?)?
                     && let Some(submitted_at) = historical_guard_sample(error)
-                    && let Some(original) = self.historical_keyed_transaction(database, key, system_time, submitted_at, identity, placement, cancellation).await?
+                    && let Some(original) = self.historical_keyed_transaction(database, key.as_ref(), system_time, submitted_at, identity, placement, cancellation).await?
                 {
                     return Ok(TransactionResult::Committed { tx_key: original });
                 }
@@ -1066,28 +1088,16 @@ impl Node {
         if original.tx_id >= retry { return Err(invalid()); }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
-        let options = rtdb_sql::PrepareOptions {
-            parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]),
-            default_timezone: context.timezone.clone(),
-            ..Default::default()
-        };
-        let mut cursor = prepare_query("SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
-            .execute(context, vec![Value::I64(original.tx_id.0)]).await?;
+        let arguments = vec![Value::I64(original.tx_id.0)];
+        let mut cursor = self.outcome_query(OutcomeQuery::Bounded, &context, &arguments)?.execute(context, arguments).await?;
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             if batch.num_rows() == 0 { continue; }
-            let cell = |index: usize| read_value(batch.schema().field(index), batch.column(index).as_ref(), 0);
-            if !matches!(cell(0)?, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == original.system_time.0) {
-                return Err(invalid());
-            }
-            return match cell(1)? {
-                Value::Bool(true) => Ok(TransactionResult::Committed { tx_key: original }),
-                Value::Bool(false) => {
-                    let error = match cell(2)? {
-                        Value::Null | Value::Undefined => None,
-                        Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?),
-                        _ => return Err(invalid()),
-                    };
+            if outcome_time(outcome_cell(batch, 0))? != Some(original.system_time) { return Err(invalid()); }
+            return match outcome_committed(outcome_cell(batch, 1))? {
+                Some(true) => Ok(TransactionResult::Committed { tx_key: original }),
+                Some(false) => {
+                    let error = outcome_error(outcome_cell(batch, 2), &self.factory.memory, invalid)?;
                     Ok(TransactionResult::Aborted { tx_key: original, error })
                 }
                 _ => Err(invalid()),
@@ -4277,6 +4287,65 @@ fn answer_duplicate(result: TransactionResult) -> TransactionResult {
 }
 
 /// The `idempotency_key` a transaction's metadata carries, set with `BEGIN READ WRITE WITH (METADATA = {idempotency_key: '...'})`.
+fn outcome_cell(batch: &arrow_array::RecordBatch, column: usize) -> ArrowCell<'_> {
+    ArrowCell { field: batch.schema_ref().field(column), array: batch.column(column).as_ref(), row: 0 }
+}
+
+fn outcome_id(cell: ArrowCell<'_>) -> Result<Option<i64>> {
+    if let Some(id) = cell.int64() { return Ok(Some(id)); }
+    Ok(match read_value(cell.field, cell.array, cell.row)? { Value::I64(id) => Some(id), _ => None })
+}
+
+fn outcome_time(cell: ArrowCell<'_>) -> Result<Option<Timestamp>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::TimestampMicrosecondType;
+    if let Ok(physical) = cell.physical()
+        && matches!(physical.field.data_type(), arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _))
+        && physical.field.metadata().is_empty() && !physical.array.is_null(physical.row)
+    {
+        return Ok(Some(Timestamp(physical.array.as_primitive::<TimestampMicrosecondType>().value(physical.row))));
+    }
+    Ok(match read_value(cell.field, cell.array, cell.row)? {
+        Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Some(Timestamp(value)),
+        _ => None,
+    })
+}
+
+fn outcome_committed(cell: ArrowCell<'_>) -> Result<Option<bool>> {
+    use arrow_array::cast::AsArray;
+    if let Ok(physical) = cell.physical() && physical.field.data_type() == &arrow_schema::DataType::Boolean
+        && physical.field.metadata().is_empty() && !physical.array.is_null(physical.row)
+    {
+        return Ok(Some(physical.array.as_boolean().value(physical.row)));
+    }
+    Ok(match read_value(cell.field, cell.array, cell.row)? { Value::Bool(committed) => Some(committed), _ => None })
+}
+
+fn outcome_error(cell: ArrowCell<'_>, memory: &Arc<MemoryBudget>, invalid: impl FnOnce() -> Anomaly) -> Result<Option<RetainedAnomaly>> {
+    use arrow_array::cast::AsArray;
+    if let Ok(physical) = cell.physical()
+        && physical.field.data_type() == &arrow_schema::DataType::Binary
+        && physical.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).is_some_and(|name| name == "xt/transit+msgpack")
+        && !physical.array.is_null(physical.row)
+    {
+        return RetainedAnomaly::from_transit(physical.array.as_binary::<i32>().value(physical.row), memory).map(Some);
+    }
+    match read_value(cell.field, cell.array, cell.row)? {
+        Value::Null | Value::Undefined => Ok(None),
+        Value::Transit(bytes) => RetainedAnomaly::from_transit(&bytes, memory).map(Some),
+        _ => Err(invalid()),
+    }
+}
+
+fn outcome_metadata_key(cell: ArrowCell<'_>) -> Result<Option<std::borrow::Cow<'_, str>>> {
+    if let Some(mut fields) = cell.structure()
+        && let Some(key) = fields.find(|field| field.field.name() == "idempotency_key").and_then(ArrowCell::utf8)
+    {
+        return Ok(Some(std::borrow::Cow::Borrowed(key)));
+    }
+    Ok(idempotency_key(&read_value(cell.field, cell.array, cell.row)?).map(|key| std::borrow::Cow::Owned(key.to_owned())))
+}
+
 fn idempotency_key(metadata: &Value) -> Option<&str> {
     let Value::Struct(fields) = metadata else { return None };
     let Value::Utf8(key) = fields.get("idempotency_key")? else { return None };

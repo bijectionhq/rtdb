@@ -1,5 +1,5 @@
 use super::*;
-use crate::{columnar::{BatchCursor, BatchExpressions, ColumnBatch}, cursor::OwnedRow};
+use crate::{columnar::{BatchCursor, BatchExpressions, BatchFilter, ColumnBatch}, cursor::OwnedRow, pages::{OwnedPage, PageBuilder, PageCursor}};
 use rtdb_columnar::MemoryBudget;
 use rtdb_plan::{BinaryOp,ColumnId,Field};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
@@ -97,12 +97,10 @@ async fn filter_prepares_pattern_for_an_empty_child_page() {
     let execution = execution();
     let baseline = execution.context.memory.used_bytes();
     let predicate = Expr::binary(BinaryOp::Eq,invalid_pattern(),Expr::Literal(Value::Utf8("x".into())));
-    let mut filter = CatalogFilter {
-        input: Box::new(Input { rows: Some(vec![]),memory: Arc::clone(&execution.context.memory) }),
-        schema: Schema::new(vec![field(0,LogicalType::Scalar(ScalarType::I64))]).unwrap(),
-        predicate, execution: execution.clone(),
-    };
-    assert_eq!(filter.next_page().await.err().unwrap().code,"xtdb.expression/illegal-argument-exception");
+    let input = Box::new(BatchInput(Input { rows: Some(vec![]), memory: Arc::clone(&execution.context.memory) }));
+    let schema = Schema::new(vec![field(0, LogicalType::Scalar(ScalarType::I64))]).unwrap();
+    let mut filter = BatchFilter::new(input, schema, predicate, execution.clone());
+    assert_eq!(filter.next_batch().await.err().unwrap().code,"xtdb.expression/illegal-argument-exception");
     drop(filter);assert_eq!(execution.context.memory.used_bytes(),baseline);
 }
 

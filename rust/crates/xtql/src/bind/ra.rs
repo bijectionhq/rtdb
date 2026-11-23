@@ -1,4 +1,5 @@
 use rtdb_types::StructFields;
+use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, NullArray, RecordBatch, RecordBatchOptions, StringArray, UnionArray};
 use super::*;
 use crate::{Edn, EdnKind};
 use rtdb_plan::{ExplainMode, MaterializedBinding, PercentileFraction, PercentileKind, WindowExpr, WindowFunction};
@@ -254,6 +255,8 @@ impl Importer<'_, '_, '_> {
     }
 
     fn literal_pages(&mut self, options: &Edn) -> Result<Relation> {
+        if let Some(relation) = self.arrow_literal_pages(options)? { return Ok(relation); }
+
         let mut inferred = BTreeSet::new();
         let pages = sequence(required(options, "pages")?)?.iter().map(|page| {
             sequence(page)?.iter().map(|row| {
@@ -281,6 +284,87 @@ impl Importer<'_, '_, '_> {
             None => self.row_schema(columns, &pages)?,
         };
         Relation::new(schema, RelationNode::LiteralPages { pages })
+    }
+
+    fn arrow_literal_pages(&mut self, options: &Edn) -> Result<Option<Relation>> {
+        let mut inferred = BTreeSet::new();
+        let mut pages = Vec::new();
+        for page in sequence(required(options, "pages")?)? {
+            let mut rows = Vec::new();
+            for row in sequence(page)? {
+                let Some(fields) = row.map() else { return Ok(None); };
+                let mut literal = BTreeMap::new();
+                for (name, value) in fields {
+                    let name = field_name(name)?;
+                    if ArrowLiteral::from_edn(value).is_none() { return Ok(None); }
+                    inferred.insert(name.to_owned());
+                    literal.insert(name, value);
+                }
+                rows.push(literal);
+            }
+            pages.push(rows);
+        }
+        let declared = options.option("types").map(|types| {
+            types.map().ok_or_else(|| invalid("Literal page types must be a map"))?.iter().map(|(name, ty)| {
+                Ok((column_name(name)?.to_owned(), crate::cast::data_type(ty)?))
+            }).collect::<Result<BTreeMap<_, _>>>()
+        }).transpose()?;
+        let columns = output_names(options, declared.as_ref().map_or(inferred, |types| types.keys().cloned().collect()))?;
+        let mut seen = BTreeSet::new();
+        let present = columns.iter().map(|name| seen.insert(name.as_str())).collect::<Vec<_>>();
+        let mut page_types = Vec::with_capacity(pages.len());
+        let mut types = vec![Vec::new(); columns.len()];
+        for page in &pages {
+            let mut physical = Vec::with_capacity(columns.len());
+            for (index, name) in columns.iter().enumerate() {
+                let mut observed = Vec::new();
+                for row in page {
+                    let ty = present[index].then(|| row.get(name.as_str())).flatten().and_then(|form| ArrowLiteral::from_edn(form))
+                        .map_or(LogicalType::Null, |cell| cell.logical_type());
+                    if !types[index].contains(&ty) { types[index].push(ty.clone()); }
+                    if !observed.contains(&ty) { observed.push(ty); }
+                }
+                physical.push(if observed.is_empty() { LogicalType::Null } else { LogicalType::join_all(&observed) });
+            }
+            page_types.push(physical);
+        }
+
+        let mut batches = Vec::with_capacity(pages.len());
+        for (page, physical) in pages.into_iter().zip(page_types) {
+            let bytes = page.iter().try_fold(4096usize, |bytes, row| {
+                columns.iter().try_fold(bytes, |bytes, name| {
+                    let payload = row.get(name.as_str()).map_or(Ok(1024), |form| literal_bound(form))?;
+                    bytes.checked_add(payload).ok_or_else(literal_size)
+                })
+            })?;
+            let mut reservation = self.memory.reserve(bytes)?;
+            let mut fields = Vec::with_capacity(columns.len());
+            let mut arrays = Vec::with_capacity(columns.len());
+            for ((name, ty), present) in columns.iter().zip(physical).zip(&present) {
+                let field = rtdb_columnar::to_field(name, &ty)?;
+                let cells = page.iter().map(|row| {
+                    present.then(|| row.get(name.as_str())).flatten().and_then(|form| ArrowLiteral::from_edn(form)).unwrap_or(ArrowLiteral::Null)
+                });
+                arrays.push(ArrowLiteral::build(&ty, &field, cells, page.len())?);
+                fields.push(field);
+            }
+            let batch = RecordBatch::try_new_with_options(
+                Arc::new(arrow_schema::Schema::new(fields)), arrays, &RecordBatchOptions::new().with_row_count(Some(page.len())),
+            ).map_err(|error| invalid(error.to_string()))?;
+            let retained = rtdb_columnar::shared_allocation_size(&batch)?.checked_add(4096).ok_or_else(literal_size)?;
+            let lease = Arc::get_mut(&mut reservation).expect("A literal batch owns its reservation");
+            if retained < lease.bytes() { lease.shrink_to(retained)?; } else { lease.grow_to(retained)?; }
+            batches.push(rtdb_columnar::OwnedBatch::with_reservation(batch, reservation)?);
+        }
+        let schema = Schema::new(columns.into_iter().zip(types).map(|(name, inferred)| {
+            let ty = match &declared {
+                Some(types) => types.get(&name).cloned().unwrap_or(LogicalType::Null),
+                None if inferred.is_empty() => LogicalType::Null,
+                None => LogicalType::join_all(&inferred),
+            };
+            self.compiler.binder.field(name, None, ty)
+        }).collect::<Result<_>>()?)?;
+        Relation::new(schema, RelationNode::ArrowLiteralPages { pages: rtdb_plan::LiteralArrowPages::new(batches) }).map(Some)
     }
 
     fn row_schema(&mut self, columns: Vec<String>, pages: &[Vec<Vec<PExpr>>]) -> Result<Schema> {
@@ -831,6 +915,116 @@ fn field_name(form: &Edn) -> Result<&str> {
     }
 }
 
+enum ArrowLiteral<'a> { Null, Bool(bool), Integer(i64), Float(f64), Text(&'a str), Keyword(&'a str), List(&'a [Edn]), Set(&'a [Edn]) }
+
+impl<'a> ArrowLiteral<'a> {
+    fn from_edn(form: &'a Edn) -> Option<Self> {
+        Some(match &form.kind {
+            EdnKind::Nil => Self::Null,
+            EdnKind::Bool(value) => Self::Bool(*value),
+            EdnKind::Integer(value) => Self::Integer(*value),
+            EdnKind::Float(value) => Self::Float(*value),
+            EdnKind::String(value) => Self::Text(value),
+            EdnKind::Keyword(value) => Self::Keyword(value),
+            EdnKind::Set(values) if values.iter().all(|value| Self::from_edn(value).is_some()) => Self::Set(values),
+            EdnKind::List(values) | EdnKind::Vector(values) if values.iter().all(|value| Self::from_edn(value).is_some()) => Self::List(values),
+            _ => return None,
+        })
+    }
+
+    fn logical_type(&self) -> LogicalType {
+        LogicalType::Scalar(match self {
+            Self::Null => return LogicalType::Null,
+            Self::Bool(_) => ScalarType::Bool,
+            Self::Integer(_) => ScalarType::I64,
+            Self::Float(_) => ScalarType::F64,
+            Self::Text(_) => ScalarType::Utf8,
+            Self::Keyword(_) => ScalarType::Keyword,
+            Self::List(values) | Self::Set(values) => {
+                let mut observed = Vec::new();
+                for value in *values {
+                    let ty = Self::from_edn(value).expect("literal component admitted").logical_type();
+                    if !observed.contains(&ty) { observed.push(ty); }
+                }
+                let element = Box::new(LogicalType::join_all(&observed));
+                let kind = if matches!(self, Self::Set(_)) { ListKind::Set } else { ListKind::List };
+                return LogicalType::List { kind, element };
+            }
+        })
+    }
+
+    fn build(ty: &LogicalType, field: &arrow_schema::Field, cells: impl Iterator<Item = Self>, rows: usize) -> Result<ArrayRef> {
+        macro_rules! series {
+            ($array:ty, $variant:ident) => {
+                Arc::new(cells.map(|cell| match cell { Self::$variant(value) => Some(value), _ => None }).collect::<$array>())
+            }
+        }
+        if let arrow_schema::DataType::List(item) = field.data_type() {
+            let mut values = Vec::new();
+            let mut offsets = Vec::with_capacity(rows + 1);
+            let mut valid = Vec::with_capacity(rows);
+            offsets.push(0);
+            for cell in cells {
+                if let Self::List(forms) | Self::Set(forms) = cell {
+                    values.extend(forms.iter().map(|form| Self::from_edn(form).expect("literal component admitted")));
+                    valid.push(true);
+                } else {
+                    valid.push(false);
+                }
+                offsets.push(i32::try_from(values.len()).map_err(|_| literal_size())?);
+            }
+            let width = values.len();
+            let values = Self::build(&rtdb_columnar::from_field(item)?, item, values.into_iter(), width)?;
+            let validity = valid.iter().any(|value| !value).then(|| valid.into());
+            return rtdb_columnar::build_list_array(Arc::clone(item), offsets.into(), &values, validity);
+        }
+        if let arrow_schema::DataType::Union(fields, _) = field.data_type() {
+            let tags = fields.iter().map(|(id, field)| {
+                let ty = rtdb_columnar::from_field(field)?;
+                Ok((id, field, rtdb_columnar::leg_name(&ty)?, ty))
+            }).collect::<Result<Vec<_>>>()?;
+            let mut children = (0..tags.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+            let mut ids = Vec::with_capacity(rows);
+            let mut offsets = Vec::with_capacity(rows);
+            for cell in cells {
+                let name = rtdb_columnar::leg_name(&cell.logical_type())?;
+                let leg = tags.iter().position(|(_, _, leg, _)| *leg == name).ok_or_else(literal_size)?;
+                ids.push(tags[leg].0);
+                offsets.push(i32::try_from(children[leg].len()).map_err(|_| literal_size())?);
+                children[leg].push(cell);
+            }
+            let arrays = tags.into_iter().zip(children).map(|((_, field, _, ty), cells)| {
+                let rows = cells.len();
+                Self::build(&ty, field, cells.into_iter(), rows)
+            }).collect::<Result<Vec<_>>>()?;
+            let array = UnionArray::try_new(fields.clone(), ids.into(), Some(offsets.into()), arrays)
+                .map_err(|error| invalid(error.to_string()))?;
+            return Ok(Arc::new(array));
+        }
+        Ok(match ty.legs().iter().find(|ty| **ty != LogicalType::Null) {
+            None => Arc::new(NullArray::new(rows)),
+            Some(LogicalType::Scalar(ScalarType::Bool)) => series!(BooleanArray, Bool),
+            Some(LogicalType::Scalar(ScalarType::I64)) => series!(Int64Array, Integer),
+            Some(LogicalType::Scalar(ScalarType::F64)) => series!(Float64Array, Float),
+            Some(LogicalType::Scalar(ScalarType::Utf8)) => series!(StringArray, Text),
+            Some(LogicalType::Scalar(ScalarType::Keyword)) => series!(StringArray, Keyword),
+            _ => unreachable!("literal column type"),
+        })
+    }
+}
+
+fn literal_bound(form: &Edn) -> Result<usize> {
+    match &form.kind {
+        EdnKind::String(text) | EdnKind::Keyword(text) => text.len().checked_mul(4).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(literal_size),
+        EdnKind::Vector(items) | EdnKind::List(items) | EdnKind::Set(items) => items.iter().try_fold(1024usize, |bytes, item| {
+            bytes.checked_add(literal_bound(item)?).ok_or_else(literal_size)
+        }),
+        _ => Ok(1024),
+    }
+}
+
+fn literal_size() -> rtdb_types::Anomaly { invalid("Literal page allocation exceeds addressable memory") }
+
 fn page_value(form: &Edn) -> Result<Value> {
     Ok(match &form.kind {
         EdnKind::List(forms) | EdnKind::Vector(forms) => {
@@ -845,3 +1039,54 @@ fn page_value(form: &Edn) -> Result<Value> {
 }
 
 fn invalid(message: impl Into<String>) -> rtdb_types::Anomaly { error("rtdb.ra/invalid-relation", message) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::ListArray;
+
+    struct EmptyCatalog;
+    impl Catalog for EmptyCatalog {
+        fn default_database(&self) -> &str { "xtdb" }
+        fn databases(&self) -> BTreeSet<String> { BTreeSet::new() }
+        fn table(&self, _: &QualifiedTable) -> Result<Option<rtdb_plan::TableBinding>> { Ok(None) }
+        fn tables(&self, _: &str) -> Result<Vec<rtdb_plan::TableBinding>> { Ok(vec![]) }
+    }
+
+    #[test]
+    fn arrow_surface_literal_pages_keep_vectors_and_serialize_as_legacy_rows() {
+        let memory = MemoryBudget::new(1 << 20);
+        let prepared = compile_ra_in("[:literal-pages {:pages [[{:a -0.0} {:a nil}] [] [{:a 2.0}]]}]", &EmptyCatalog, &CompileOptions::default(), &memory).unwrap();
+        let Statement::Query(relation) = &prepared.statement else { panic!("expected query"); };
+        let RelationNode::ArrowLiteralPages { pages } = relation.node() else { panic!("expected Arrow plan"); };
+        assert_eq!(pages.pages().iter().map(|batch| batch.batch().num_rows()).collect::<Vec<_>>(), [2, 0, 1]);
+        let first = pages.pages()[0].batch().column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(first.value(0).to_bits(), (-0.0_f64).to_bits());
+        let encoded = serde_json::to_vec(relation).unwrap();
+        let decoded: Relation = serde_json::from_slice(&encoded).unwrap();
+        let RelationNode::LiteralPages { pages } = decoded.node() else { panic!("expected legacy plan"); };
+        assert!(matches!(&pages[0][0][0], PExpr::Literal(Value::F64(value)) if value.to_bits() == (-0.0_f64).to_bits()));
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn arrow_surface_literal_pages_retain_typed_list_components_and_union_order() {
+        let source = "[:literal-pages {:pages [[{:a [nil -0.0 3] :b #{:a :b}} {:a [4] :b #{:a}}]]}]";
+        let prepared = compile_ra_in(source, &EmptyCatalog, &CompileOptions::default(), &MemoryBudget::new(1 << 20)).unwrap();
+        let Statement::Query(relation) = &prepared.statement else { panic!("expected query"); };
+        let RelationNode::ArrowLiteralPages { pages } = relation.node() else { panic!("expected Arrow plan"); };
+        let list = pages.pages()[0].batch().column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value_offsets(), [0, 3, 4]);
+        let arrow_schema::DataType::Union(fields, _) = list.values().data_type() else { panic!("expected dense union"); };
+        assert_eq!(fields.iter().map(|(_, field)| field.name().as_str()).collect::<Vec<_>>(), ["null", "f64", "i64"]);
+        let values = list.values().as_any().downcast_ref::<UnionArray>().unwrap();
+        let float_leg = values.type_id(1);
+        let floats = values.child(float_leg).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(floats.value(values.value_offset(1)).to_bits(), (-0.0_f64).to_bits());
+        let batch = pages.pages()[0].batch();
+        let set = rtdb_columnar::read_value(batch.schema_ref().field(1), batch.column(1).as_ref(), 0).unwrap();
+        assert_eq!(set, Value::Set(vec![
+            Value::Keyword(rtdb_types::Keyword::from_name("a")), Value::Keyword(rtdb_types::Keyword::from_name("b"))
+        ]));
+    }
+}

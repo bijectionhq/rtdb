@@ -7,7 +7,7 @@ use rtdb_plan::{AggregateFunction, BinaryOp, ColumnId, Expr, Field, JoinKind, Re
 use rtdb_types::{AllocationScope, CheckedIndex, ClojureKeyIndex, KeySemantics, Keyword, LogicalType, Result, ScalarType, Value, clojure_string_hasheq, clojure_symbol_hasheq};
 use crate::invalid;
 
-pub(crate) struct ExplainPlan { pub schema: Schema, rows: Vec<Vec<Value>>, retained_bytes: usize, _reservation: Arc<MemoryReservation> }
+pub(crate) struct ExplainPlan { pub schema: Schema, rows: Arc<Vec<Vec<Value>>>, retained_bytes: usize, _reservation: Arc<MemoryReservation> }
 impl ExplainPlan {
     pub fn new(relation: &Relation, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let base = crate::runtime_schema::allocation_bound(relation)?.checked_mul(8).and_then(|bytes| bytes.checked_add(depth_bound(relation, 0).ok()?)).ok_or_else(size_error)?;
@@ -23,7 +23,12 @@ impl ExplainPlan {
         })
     }
     pub fn copy_bound(&self) -> Result<usize> { self.retained_bytes.checked_mul(2).and_then(|n| n.checked_add(self.rows.len().checked_mul(512)?)).ok_or_else(size_error) }
-    pub fn rows(&self) -> Vec<Vec<Value>> { self.rows.clone() }
+    pub fn rows(&self) -> &[Vec<Value>] { &self.rows }
+    pub fn recharged(&self, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let reservation = memory.reserve(self._reservation.bytes())?;
+        Ok(Arc::new(Self { schema: self.schema.clone(), rows: Arc::clone(&self.rows), retained_bytes: self.retained_bytes, _reservation: reservation }))
+    }
+
 }
 fn size_error() -> rtdb_types::Anomaly { invalid("explain-size", "Plan description exceeds addressable memory") }
 fn region_error() -> rtdb_types::Anomaly { invalid("explain-region", "Plan description belongs to a different construction region") }
@@ -143,7 +148,7 @@ impl<'work> WorkRows<'work> {
             Arc::get_mut(reservation).ok_or_else(region_error)?.shrink_to(target)?;
         }
         let reservation = match self.work.state.replace(WorkState::Published) { WorkState::Building { reservation, .. } => reservation, WorkState::Published => unreachable!() };
-        let plan = ExplainPlan { schema, rows: self.rows, retained_bytes, _reservation: reservation };
+        let plan = ExplainPlan { schema, rows: Arc::new(self.rows), retained_bytes, _reservation: reservation };
         Ok(Arc::new(plan))
     }
 }
@@ -533,7 +538,7 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
         }
         RelationNode::Apply { arguments: values, .. } => map(work, [("columns", text(arguments(values, &input_columns, work)?)?)])?,
         RelationNode::Set { operator, .. } => { op = match operator { rtdb_plan::SetOperator::Union => "union-all", rtdb_plan::SetOperator::Intersect => "intersect", rtdb_plan::SetOperator::Except => "difference" }; work.null() }
-        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::Sort { .. } | RelationNode::Limit { .. } | RelationNode::Distinct { .. }
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } | RelationNode::Sort { .. } | RelationNode::Limit { .. } | RelationNode::Distinct { .. }
         | RelationNode::Let { .. } | RelationNode::Reference { .. } => work.null(),
     };
     let mut columns = Columns::new(work);
@@ -1139,6 +1144,21 @@ mod rendering_tests {
             drop(clone);
             assert_eq!(memory.used_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn catalog_independent_explain_recharge_retains_the_same_report_rows() {
+        let preparation = MemoryBudget::new(1 << 20);
+        let execution = MemoryBudget::new(1 << 20);
+        let plan = ExplainPlan::new(&Relation::unit(), &preparation).unwrap();
+        let recharged = plan.recharged(&execution).unwrap();
+        assert!(std::ptr::eq(plan.rows().as_ptr(), recharged.rows().as_ptr()));
+        assert_eq!(preparation.used_bytes(), execution.used_bytes());
+        drop(plan);
+        assert_eq!(preparation.used_bytes(), 0);
+        assert_eq!(recharged.rows()[0][0], Value::Utf8("->".into()));
+        drop(recharged);
+        assert_eq!(execution.used_bytes(), 0);
     }
 
     #[test]

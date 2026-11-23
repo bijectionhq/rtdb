@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicI64};
 use std::time::{Duration, Instant};
@@ -7,7 +7,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Arra
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
 use rtdb_node::{Membership, NativeSession, NativeResources, Node};
-use rtdb_plan::{Relation, RelationNode, Statement};
+use rtdb_plan::{CatalogLookups, PreparedStatement, RecordingCatalog, Relation, RelationNode, Statement};
 use rtdb_query::{PreparedQuery, QueryContext};
 use rtdb_storage::cache::BufferPool;
 use rtdb_tx::{ArrowDocuments, EntityIds, TxOp};
@@ -82,47 +82,70 @@ fn scope_scan(relation: &Arc<Relation>, iids: &BTreeSet<Iid>) -> Arc<Relation> {
     Arc::new(Relation::new(relation.schema().clone(), node).unwrap())
 }
 
-async fn search(context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter, iids: Option<&BTreeSet<Iid>>) -> Rows {
-    search_with_scorer(context, query, valid, filter, iids, false).await
+struct SearchPlan {
+    bound: PreparedStatement,
+    exact: PreparedQuery,
+    lookups: CatalogLookups,
 }
 
-async fn search_with_scorer(context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter,
-    iids: Option<&BTreeSet<Iid>>, scalar: bool) -> Rows {
-    if iids.is_some_and(BTreeSet::is_empty) { return Rows::new(); }
-    let predicate = filter.sql();
-    let distance = if scalar {
-        "CASE WHEN $3 THEN COSINE_DISTANCE(embedding, $1) ELSE NULL END"
-    } else {
-        "COSINE_DISTANCE(embedding, $1)"
-    };
-    let statement = format!(
-        "SELECT _id, {distance} AS distance FROM vectors \
-         FOR VALID_TIME AS OF $2 WHERE {predicate} ORDER BY distance, _id LIMIT {TOP}"
-    );
-    let options = rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), ..Default::default() };
-    let mut prepared = rtdb_sql::prepare_in(&statement, &context.catalog, &options, &context.memory).unwrap();
-    if let Some(iids) = iids {
-        let Statement::Query(relation) = &mut prepared.statement else { unreachable!() };
-        *relation = scope_scan(relation, iids);
+struct SearchPlans(BTreeMap<(Filter, bool), SearchPlan>);
+
+impl SearchPlans {
+    fn new(context: &QueryContext, filters: &[Filter]) -> Self {
+        let filters = filters.iter().copied().chain([Filter::All, Filter::RandomBelow(10)]).collect::<BTreeSet<_>>();
+        let options = rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), ..Default::default() };
+        let plans = filters.into_iter().flat_map(|filter| [false, true].map(move |scalar| (filter, scalar)))
+            .map(|(filter, scalar)| {
+                let predicate = filter.sql();
+                let distance = if scalar { "CASE WHEN $3 THEN COSINE_DISTANCE(embedding, $1) ELSE NULL END" }
+                    else { "COSINE_DISTANCE(embedding, $1)" };
+                let statement = format!("SELECT _id, {distance} AS distance FROM vectors \
+                     FOR VALID_TIME AS OF $2 WHERE {predicate} ORDER BY distance, _id LIMIT {TOP}");
+                let recording = RecordingCatalog::new(&context.catalog);
+                let bound = rtdb_sql::prepare_in(&statement, &recording, &options, &context.memory).unwrap();
+                let lookups = recording.finish().unwrap();
+                let exact = PreparedQuery::from_prepared(bound.clone(), &context.memory).unwrap();
+                ((filter, scalar), SearchPlan { bound, exact, lookups })
+            }).collect();
+        Self(plans)
     }
-    let item = Arc::new(Field::new("item", DataType::Float32, false));
-    let query = FixedSizeListArray::try_new(item, i32::try_from(query.len()).unwrap(), Arc::new(query.clone()), None).unwrap();
-    let mut args: Vec<ArrayRef> = vec![Arc::new(query), Arc::new(TimestampMicrosecondArray::from(vec![valid.0]).with_timezone("UTC"))];
-    if scalar { args.push(Arc::new(BooleanArray::from(vec![true]))); }
-    let fields = args.iter().enumerate().map(|(index, array)| Field::new(format!("?{index}"), array.data_type().clone(), false)).collect::<Vec<_>>();
-    let args = rtdb_columnar::OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), args).unwrap(), &context.memory).unwrap();
-    let types = args.batch().schema_ref().fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
-    let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory).unwrap()
-        .execute_arrow_columns(Arc::clone(context), args, 0, &types, None).await.unwrap();
-    let mut rows = Vec::new();
-    while let Some(batch) = cursor.next_batch().await.unwrap() {
-        let batch = batch.batch();
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let distances = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        assert_eq!((ids.null_count(), distances.null_count()), (0, 0));
-        rows.extend(ids.values().iter().copied().zip(distances.values().iter().copied()));
+
+    async fn search(&self, context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter, iids: Option<&BTreeSet<Iid>>) -> Rows {
+        self.search_with_scorer(context, query, valid, filter, iids, false).await
     }
-    rows
+
+    async fn search_with_scorer(&self, context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter,
+        iids: Option<&BTreeSet<Iid>>, scalar: bool) -> Rows {
+        if iids.is_some_and(BTreeSet::is_empty) { return Rows::new(); }
+        let plan = &self.0[&(filter, scalar)];
+        assert!(plan.lookups.replay(&context.catalog).unwrap(), "Vector benchmark catalog changed across query bases");
+        let prepared = if let Some(iids) = iids {
+            let mut scoped = plan.bound.clone();
+            let Statement::Query(relation) = &mut scoped.statement else { unreachable!() };
+            *relation = scope_scan(relation, iids);
+            PreparedQuery::from_prepared(scoped, &context.memory).unwrap()
+        } else {
+            plan.exact.recharged(&context.memory).unwrap()
+        };
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let query = FixedSizeListArray::try_new(item, i32::try_from(query.len()).unwrap(), Arc::new(query.clone()), None).unwrap();
+        let mut args: Vec<ArrayRef> = vec![Arc::new(query), Arc::new(TimestampMicrosecondArray::from(vec![valid.0]).with_timezone("UTC"))];
+        if scalar { args.push(Arc::new(BooleanArray::from(vec![true]))); }
+        let fields = args.iter().enumerate().map(|(index, array)| Field::new(format!("?{index}"), array.data_type().clone(), false)).collect::<Vec<_>>();
+        let args = rtdb_columnar::OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), args).unwrap(), &context.memory).unwrap();
+        let types = args.batch().schema_ref().fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
+        let mut cursor = prepared
+            .execute_arrow_columns(Arc::clone(context), args, 0, &types, None).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            let batch = batch.batch();
+            let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let distances = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            assert_eq!((ids.null_count(), distances.null_count()), (0, 0));
+            rows.extend(ids.values().iter().copied().zip(distances.values().iter().copied()));
+        }
+        rows
+    }
 }
 
 struct Coverage {
@@ -165,6 +188,7 @@ impl Coverage {
 struct CapturedIndex<'a> {
     table: &'a TableRef,
     coverage: &'a Coverage,
+    plans: &'a SearchPlans,
     index: &'a VectorIndex,
     cache: &'a BufferPool,
 }
@@ -173,14 +197,14 @@ impl CapturedIndex<'_> {
     async fn approximate(&self, context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter, probes: usize) -> (Rows, Json) {
         let started = Instant::now();
         let Some(mut ids) = self.coverage.tail(context, self.table, valid) else {
-            let rows = search(context, query, valid, filter, None).await;
+            let rows = self.plans.search(context, query, valid, filter, None).await;
             return (rows, json!({"route": "exact", "ms": started.elapsed().as_secs_f64() * 1000.0}));
         };
         let changed = ids.len();
         let candidates = self.index.candidates(self.cache, query.values(), filter, probes, 64, &ids).await;
         assert!(candidates.rows.iter().all(|(id, _)| *id >= 0 && (*id as usize) < self.coverage.rows));
         ids.extend(candidates.rows.into_iter().map(|(_, iid)| iid));
-        let rows = search(context, query, valid, filter, Some(&ids)).await;
+        let rows = self.plans.search(context, query, valid, filter, Some(&ids)).await;
         (rows, json!({"route": "ann", "changed_iids": changed, "ms": started.elapsed().as_secs_f64() * 1000.0,
             "requested_ranges": candidates.requested_ranges, "requested_bytes": candidates.requested_bytes,
             "object_reads": candidates.object_reads, "object_bytes": candidates.object_bytes,
@@ -213,7 +237,7 @@ async fn compare_routes(
                 let position = (number + order) % paths.len();
                 let (context, scalar) = paths[position];
                 let start = Instant::now();
-                let rows = search_with_scorer(context, query, VALID_AT, filter, None, scalar).await;
+                let rows = captured.plans.search_with_scorer(context, query, VALID_AT, filter, None, scalar).await;
                 measured[position] = (rows, start.elapsed().as_secs_f64() * 1000.0);
             }
             let [(expected, exact_ms), (ordered, ordered_ms), (scalar, scalar_exact_ms)] = measured;
@@ -255,10 +279,10 @@ async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedInde
     }).unwrap();
     let fresh = data.clusters.len() as i64 + 1;
     let initial = session.query_context().await.unwrap();
-    let before = search(&initial, query, VALID_AT, Filter::All, None).await;
+    let before = captured.plans.search(&initial, query, VALID_AT, Filter::All, None).await;
     let reassigned_only = BTreeSet::from([EntityId::Integer(reassigned as i64).iid()]);
     let filter = Filter::RandomBelow(10);
-    assert!(search(&initial, query, VALID_AT, filter, Some(&reassigned_only)).await.is_empty());
+    assert!(captured.plans.search(&initial, query, VALID_AT, filter, Some(&reassigned_only)).await.is_empty());
 
     let documents = documents(node, [(reassigned as i64, data.vector(reassigned), 0, 0), (fresh, query.values().as_ref(), 0, 0)], data.dimensions, VALID_AT, None);
     let operations = vec![
@@ -271,12 +295,12 @@ async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedInde
         commit(session, operations).await;
         started.elapsed().as_secs_f64() * 1000.0
     };
-    let (held, commit_ms) = tokio::join!(search(&initial, query, VALID_AT, Filter::All, None), write);
+    let (held, commit_ms) = tokio::join!(captured.plans.search(&initial, query, VALID_AT, Filter::All, None), write);
     assert_eq!(held, before);
 
     let current = session.query_context().await.unwrap();
-    assert_eq!(search(&current, query, VALID_AT, filter, Some(&reassigned_only)).await[0].0, reassigned as i64);
-    let expected = search(&current, query, VALID_AT, Filter::All, None).await;
+    assert_eq!(captured.plans.search(&current, query, VALID_AT, filter, Some(&reassigned_only)).await[0].0, reassigned as i64);
+    let expected = captured.plans.search(&current, query, VALID_AT, Filter::All, None).await;
     assert_eq!(expected.len(), TOP);
     assert_eq!(expected[0].0, fresh);
     let (result, all_probes) = captured.approximate(&current, query, VALID_AT, Filter::All, all_clusters).await;
@@ -284,7 +308,7 @@ async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedInde
     assert!(all_probes["changed_iids"].as_u64().unwrap() >= 66);
 
     let stale_ids = removed.into_iter().chain([reassigned as i64, fresh]).map(|id| EntityId::Integer(id).iid()).collect();
-    let without_shadowing = search(&current, query, VALID_AT, Filter::All, Some(&stale_ids)).await;
+    let without_shadowing = captured.plans.search(&current, query, VALID_AT, Filter::All, Some(&stale_ids)).await;
     assert!(without_shadowing.len() < TOP);
     let samples = compare_routes(&current, captured, data, query_count, filters, probes).await;
     json!({"deletes": deleted.len(), "erases": erased.len(), "puts": 2, "commit_ms": commit_ms,
@@ -342,28 +366,29 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     eprintln!("built ordered indexes in {ordered_ms:.0} ms");
     let active = session.query_context().await.unwrap();
     let coverage = Coverage::capture(&active, &table, count);
+    let plans = SearchPlans::new(&active, filters);
     let build = Instant::now();
     let index = VectorIndex::build(&data, scratch.path()).await;
     let build_ms = build.elapsed().as_secs_f64() * 1000.0;
     let cache = index.warm_cache().await;
-    let captured_index = CapturedIndex { table: &table, coverage: &coverage, index: &index, cache: &cache };
+    let captured_index = CapturedIndex { table: &table, coverage: &coverage, plans: &plans, index: &index, cache: &cache };
     let samples = if workload == "vectors-churn" { Vec::new() } else {
         compare_routes(&active, &captured_index, &data, query_count, filters, probes).await
     };
 
     let query = &data.queries.slice(0, data.dimensions);
-    let before = search(&active, query, VALID_AT, Filter::All, None).await;
+    let before = plans.search(&active, query, VALID_AT, Filter::All, None).await;
     let update_started = Instant::now();
     put(&mut session, &table, documents(&node, [(count as i64, query.values().as_ref(), 0, 0)], data.dimensions, VALID_AT, None)).await;
     let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
     let newer = session.query_context().await.unwrap();
-    let expected = search(&newer, query, VALID_AT, Filter::All, None).await;
+    let expected = plans.search(&newer, query, VALID_AT, Filter::All, None).await;
     let all_clusters = index.centroids.len() / data.dimensions;
     let (overlay, plan) = captured_index.approximate(&newer, query, VALID_AT, Filter::All, all_clusters).await;
     assert_eq!(expected, overlay);
     assert_eq!(plan["changed_iids"], 1);
     assert_eq!(overlay[0].0, count as i64);
-    assert_eq!(search(&active, query, VALID_AT, Filter::All, None).await, before);
+    assert_eq!(plans.search(&active, query, VALID_AT, Filter::All, None).await, before);
 
     let affected = before[0].0;
     let previous = data.vector(affected as usize);
@@ -374,14 +399,14 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     commit(&mut session, vec![TxOp::EraseDocs { table: table.clone(), ids: erased }]).await;
 
     let corrected = session.query_context().await.unwrap();
-    let expected = search(&corrected, query, VALID_AT, Filter::All, None).await;
+    let expected = plans.search(&corrected, query, VALID_AT, Filter::All, None).await;
     let (overlay, plan) = captured_index.approximate(&corrected, query, VALID_AT, Filter::All, all_clusters).await;
     assert_eq!(plan["route"], "ann");
     assert_eq!(overlay, expected);
     assert!(overlay.iter().all(|row| ![-1, count as i64, affected].contains(&row.0)));
     let (later, fallback) = captured_index.approximate(&corrected, query, Timestamp(1), Filter::All, all_clusters).await;
     assert_eq!(fallback["route"], "exact");
-    assert_eq!(later, search(&corrected, query, Timestamp(1), Filter::All, None).await);
+    assert_eq!(later, plans.search(&corrected, query, Timestamp(1), Filter::All, None).await);
     assert!(later.iter().any(|row| row.0 == -1));
     assert!(later.iter().any(|row| row.0 == affected));
 
@@ -391,7 +416,7 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     } else { Json::Null };
     let expected = if !churn.is_null() {
         let captured = session.query_context().await.unwrap();
-        search(&captured, query, VALID_AT, Filter::All, None).await
+        plans.search(&captured, query, VALID_AT, Filter::All, None).await
     } else { expected };
     flush(&node).await;
     let flushed = session.query_context().await.unwrap();

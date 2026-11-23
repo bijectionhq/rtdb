@@ -519,6 +519,10 @@ impl ColumnBatch {
         position.checked_sub(offset).map_or(&self.reservation, |position| &self.appended[position])
     }
 
+    pub(crate) fn sharing(columns: Vec<Column>, len: usize, reservation: Arc<MemoryReservation>) -> Self {
+        Self { columns, len, reservation, appended: Vec::new() }
+    }
+
     /// A page of columns allocated under `reservation`, whose charge becomes exactly what they retain.
     pub fn settled(columns: Vec<Column>, len: usize, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let base = columns.capacity().checked_mul(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;

@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::{Arc, Mutex, Weak, atomic::{AtomicBool, O
 use bytes::Bytes;
 use rtdb_auth::Principal;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_node::{Database, NativeSession, Node};
+use rtdb_node::{Database, NativeSession, Node, PreparedSql};
 use rtdb_storage::cache::CacheBudget;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::Status;
@@ -198,6 +198,7 @@ impl Session {
         let attachment = self.require_database(database, node)?;
         Ok((database.into(), attachment))
     }
+
     pub fn select_catalog(&self, name: Option<String>) -> Result<(), Status> {
         let selection = name.map(|name| Ok::<_, Status>(CatalogSelection { _reservation: self.memory().reserve(name.capacity() + 128).map_err(status)?, name })).transpose()?;
         match &mut *self.state.lock().expect("session lock") { SessionState::Open { catalog, .. } => { *catalog = selection; Ok(()) }, SessionState::Closed => Err(Status::not_found("session closed")) }
@@ -245,8 +246,8 @@ impl Leased for Transaction { fn close(&self) { self.connection.close(); } }
 impl Drop for Transaction { fn drop(&mut self) { self.close(); } }
 #[derive(Clone)]
 pub(crate) enum PreparedScope { Session(String), Transaction(Bytes) }
-pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<Arc<BoundParameters>>>, _reservation: Arc<MemoryReservation> }
-impl Prepared { pub fn new(owner: ResourceOwner, sql: String, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, scope, params: Mutex::new(None), _reservation: reservation } } }
+pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub plan: Option<PreparedSql>, pub scope: PreparedScope, pub params: Mutex<Option<Arc<BoundParameters>>>, _reservation: Arc<MemoryReservation> }
+impl Prepared { pub fn new(owner: ResourceOwner, sql: String, plan: Option<PreparedSql>, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, plan, scope, params: Mutex::new(None), _reservation: reservation } } }
 impl Leased for Prepared { fn close(&self) { *self.params.lock().expect("prepared parameters lock") = None; } }
 
 #[cfg(test)]

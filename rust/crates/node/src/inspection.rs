@@ -1,17 +1,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use arrow_array::{ArrayRef, RecordBatch, builder::{Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder}};
+use arrow_schema::{Field, Schema};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, envelope::{ReplicaBody, SourceBody, SourceMessage}, keys::{TableSlug, TrieKey, block_key, lex_hex}, log::proto};
 use rtdb_plan::{CatalogInspection, CatalogRows, InspectionRequest, InspectionRow};
 use rtdb_storage::{ObjectKey, ReadReservation, cache::CacheLease, log::LogRange};
-use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, TimeUnit, Value};
+use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition};
 
 use crate::{Database, inspection_render as edn};
 
 enum Input {
     Log { range: Box<dyn LogRange>, source: bool, tx_ops: bool },
-    Blocks { next: i64, end: i64 },
+    Blocks { next: i64, end: i64, window_end: i64, found: bool },
     Table { name: String, block: i64, tries: bool },
     Tries { name: String, block: i64, partitions: Vec<rtdb_format::block::proto::Partition>, reservation: Arc<MemoryReservation>, partition: usize, trie: usize },
     Done,
@@ -23,7 +25,7 @@ pub(crate) async fn open(database: Arc<Database>, request: InspectionRequest, me
     let input = match request {
         InspectionRequest::SourceLog { from, to, tx_ops } => Input::Log { range: database.logs.source_range(SourcePosition(from), SourcePosition(to)).await?, source: true, tx_ops },
         InspectionRequest::ReplicaLog { from, to } => Input::Log { range: database.logs.replica_range(ReplicaPosition(from), ReplicaPosition(to)).await?, source: false, tx_ops: false },
-        InspectionRequest::BlockFiles { from, to } => Input::Blocks { next: from, end: to },
+        InspectionRequest::BlockFiles { from, to } => Input::Blocks { next: from, end: to, window_end: from.saturating_add(1024).min(to), found: false },
         InspectionRequest::TableBlock { table, block, tries } => Input::Table { name: table, block, tries },
     };
     Ok(Box::new(Inspection { database, memory, input }))
@@ -32,29 +34,45 @@ pub(crate) async fn open(database: Arc<Database>, request: InspectionRequest, me
 #[async_trait]
 impl CatalogInspection for Inspection {
     async fn next(&mut self) -> Result<Option<CatalogRows<InspectionRow>>> {
-        loop {
+        let Some(batch) = self.next_arrow(1).await? else { return Ok(None); };
+        let mut bound = 4096usize;
+        for (field, array) in batch.batch().schema_ref().fields().iter().zip(batch.batch().columns()) {
+            bound = bound.checked_add(512).and_then(|n| n.checked_add(field.name().len())).ok_or_else(size_error)?;
+            bound = bound.checked_add(rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0)?).ok_or_else(size_error)?;
+        }
+        let reservation = self.memory.reserve(bound)?;
+        let row = batch.batch().schema_ref().fields().iter().zip(batch.batch().columns()).map(|(field, array)| {
+            Ok((field.name().clone(), rtdb_columnar::read_value(field, array.as_ref(), 0)?))
+        }).collect::<Result<InspectionRow>>()?;
+        Ok(Some(CatalogRows::new(vec![row], reservation)))
+    }
+
+    fn supports_arrow(&self) -> bool { true }
+
+    async fn next_arrow(&mut self, limit: usize) -> Result<Option<OwnedBatch>> {
+        let mut page = InspectionPage::new(&self.memory)?;
+        while page.rows < limit {
             match std::mem::replace(&mut self.input, Input::Done) {
-                Input::Done => return Ok(None),
+                Input::Done => break,
                 Input::Log { mut range, source, tx_ops } => {
                     let bound = range.allocation_bound();
                     let reservation = self.memory.reserve(bound)?;
-                    let Some(record) = range.next(ReadReservation::new(bound, reservation)).await? else { return Ok(None); };
-                    self.input = Input::Log { range, source, tx_ops };
+                    let Some(record) = range.next(ReadReservation::new(bound, reservation)).await? else { break; };
                     let reservation = self.memory.reserve(allocation(record.payload.len(), 64)?)?;
                     let position = if source { self.database.logs.source_position(record.metadata)?.0 } else { ReplicaPosition::from_epoch_offset(self.database.logs.replica_epoch, record.metadata.offset.0)?.0 };
-                    let mut row = row([
-                        ("msg_id", Value::I64(position)), ("log_offset", Value::I64(record.metadata.offset.0)), ("log_timestamp", timestamp(record.metadata.timestamp.0)),
-                    ]);
+                    let log_offset = record.metadata.offset.0;
+                    let log_timestamp = record.metadata.timestamp.0;
+                    let mut operations = None;
                     let mut reservations = vec![reservation];
                     let (kind, message) = if source {
                         let message = SourceMessage::decode(&record.payload)?;
                         if tx_ops {
                             let (value, charge) = match &message {
                                 Some(SourceMessage::Protobuf(SourceBody::Tx(tx))) => decode_operations(tx.tx_ops.as_deref(), &self.memory)?,
-                                _ => (Value::Null, None),
+                                _ => (None, None),
                             };
                             if let Some(charge) = charge { reservations.push(charge); }
-                            row.insert("tx_ops".into(), value);
+                            operations = value;
                         }
                         source_message(message.as_ref())?
                     } else {
@@ -68,37 +86,47 @@ impl CatalogInspection for Inspection {
                             }
                         }
                     };
-                    row.insert("msg_type".into(), Value::Utf8(kind.into())); row.insert("msg".into(), Value::Utf8(message));
-                    return page(row, reservations, &self.memory).map(Some);
-                }
-                Input::Blocks { mut next, end } => {
-                    let window_end = next.saturating_add(1024).min(end);
-                    let mut rows = Vec::new();
-                    let mut reservations = Vec::new();
-                    while next < window_end {
-                        let block = next; next += 1;
-                        self.input = Input::Blocks { next, end };
-                        if next % 1024 == 0 { tokio::task::yield_now().await; }
-                        let Some(bytes) = self.read(&block_key(BlockIndex(block))?).await? else { continue; };
-                        let reservation = self.memory.reserve(allocation(bytes.as_slice().len(), 256)?)?;
-                        let Ok(catalog) = BlockCatalog::decode(bytes.as_slice()) else { continue; };
-                        let proto = catalog.as_proto();
-                        let row = row([
-                            ("block_idx", Value::Utf8(lex_hex(proto.block_index.unwrap_or_default() as u64))),
-                            ("tx_id", proto.latest_completed_tx.as_ref().map_or(Value::Null, |key| Value::I64(key.tx_id.unwrap_or_default()))),
-                            ("system_time", proto.latest_completed_tx.as_ref().map_or(Value::Null, |key| timestamp(key.system_time.unwrap_or_default()))),
-                            ("latest_processed_msg_id", Value::I64(proto.latest_processed_msg_id.unwrap_or_default())),
-                            ("table_names", Value::Utf8(edn::vector(proto.table_names.iter().map(|name| edn::quoted(name))))),
-                            ("boundary_replica_msg_id", proto.boundary_replica_msg_id.map_or(Value::Null, Value::I64)),
-                            ("file_size", Value::I64(bytes.as_slice().len() as i64)),
-                        ]);
-                        let retained = self.memory.reserve(Value::document_retained_bytes(&row)?.checked_add(512).ok_or_else(size_error)?)?;
-                        drop(reservation);
-                        rows.push(row); reservations.push(retained);
+                    let cells = [
+                        ("msg_id", Cell::I64(Some(position))),
+                        ("log_offset", Cell::I64(Some(log_offset))),
+                        ("log_timestamp", Cell::Timestamp(Some(log_timestamp))),
+                        ("msg_type", Cell::Text(Some(kind))),
+                        ("msg", Cell::Text(Some(&message))),
+                    ];
+                    if source {
+                        page.append(cells.into_iter().chain([("tx_ops", Cell::Text(operations.as_deref()))]))?;
+                    } else {
+                        page.append(cells)?;
                     }
-                    if rows.is_empty() { self.input = Input::Done; return Ok(None); }
-                    self.input = Input::Blocks { next, end };
-                    return pages(rows, reservations).map(Some);
+                    self.input = Input::Log { range, source, tx_ops };
+                }
+                Input::Blocks { mut next, end, mut window_end, mut found } => {
+                    if next == window_end {
+                        if !found || next >= end { break; }
+                        window_end = next.saturating_add(1024).min(end);
+                        found = false;
+                    }
+                    if next >= window_end { break; }
+                    let block = next;
+                    next += 1;
+                    self.input = Input::Blocks { next, end, window_end, found };
+                    if next % 1024 == 0 { tokio::task::yield_now().await; }
+                    let Some(bytes) = self.read(&block_key(BlockIndex(block))?).await? else { continue; };
+                    let _reservation = self.memory.reserve(allocation(bytes.as_slice().len(), 256)?)?;
+                    let Ok(catalog) = BlockCatalog::decode(bytes.as_slice()) else { continue; };
+                    let proto = catalog.as_proto();
+                    let block_idx = lex_hex(proto.block_index.unwrap_or_default() as u64);
+                    let names = edn::vector(proto.table_names.iter().map(|name| edn::quoted(name)));
+                    page.append([
+                        ("block_idx", Cell::Text(Some(&block_idx))),
+                        ("tx_id", Cell::I64(proto.latest_completed_tx.as_ref().map(|key| key.tx_id.unwrap_or_default()))),
+                        ("system_time", Cell::Timestamp(proto.latest_completed_tx.as_ref().map(|key| key.system_time.unwrap_or_default()))),
+                        ("latest_processed_msg_id", Cell::I64(Some(proto.latest_processed_msg_id.unwrap_or_default()))),
+                        ("table_names", Cell::Text(Some(&names))),
+                        ("boundary_replica_msg_id", Cell::I64(proto.boundary_replica_msg_id)),
+                        ("file_size", Cell::I64(Some(bytes.as_slice().len() as i64))),
+                    ])?;
+                    self.input = Input::Blocks { next, end, window_end, found: true };
                 }
                 Input::Table { name, block, tries } => {
                     let table = rtdb_format::catalog::legacy_table_ref(&name)?;
@@ -112,32 +140,44 @@ impl CatalogInspection for Inspection {
                     let schema = match rtdb_format::ipc::read_schema_message(metadata.as_proto().arrow_schema.as_deref().unwrap_or_default()) { Ok(schema) => schema, Err(_) => return Ok(None) };
                     let fields = schema.fields().iter().map(|field| Ok(format!("{} {}", edn::quoted(field.name()), rtdb_columnar::from_field(field)?.to_edn()?))).collect::<Result<Vec<_>>>()?.join(", ");
                     let hlls = metadata.as_proto().column_name_to_hll.iter().map(|(name, bytes)| Ok(format!("{} {}", edn::quoted(name), rtdb_format::hll::Hll::from_bytes(bytes.clone())?.estimate() as i64))).collect::<Result<Vec<_>>>()?.join(", ");
-                    return page(row([
-                        ("table_name", Value::Utf8(name)), ("block_idx", Value::Utf8(lex_hex(block as u64))), ("row_count", Value::I64(metadata.row_count())),
-                        ("fields", Value::Utf8(format!("{{{fields}}}"))), ("hlls", Value::Utf8(format!("{{{hlls}}}"))), ("partition_count", Value::I32(partitions.len() as i32)),
-                    ]), vec![reservation], &self.memory).map(Some);
+                    let block_idx = lex_hex(block as u64);
+                    let fields = format!("{{{fields}}}");
+                    let hlls = format!("{{{hlls}}}");
+                    page.append([
+                        ("table_name", Cell::Text(Some(&name))), ("block_idx", Cell::Text(Some(&block_idx))),
+                        ("row_count", Cell::I64(Some(metadata.row_count()))), ("fields", Cell::Text(Some(&fields))),
+                        ("hlls", Cell::Text(Some(&hlls))), ("partition_count", Cell::I32(partitions.len() as i32)),
+                    ])?;
+                    break;
                 }
                 Input::Tries { name, block, partitions, reservation: metadata_reservation, mut partition, mut trie } => {
                     while partition < partitions.len() && trie >= partitions[partition].tries.len() { partition += 1; trie = 0; }
-                    let Some(part) = partitions.get(partition) else { return Ok(None); };
+                    let Some(part) = partitions.get(partition) else { break; };
                     let details = &part.tries[trie];
-                    let reservation = self.memory.reserve(allocation(name.len().saturating_add(details.trie_key.as_ref().map_or(0, String::len)).saturating_add(part.part.as_ref().map_or(0, Vec::len)), 64)?)?;
+                    let _reservation = self.memory.reserve(allocation(name.len().saturating_add(details.trie_key.as_ref().map_or(0, String::len)).saturating_add(part.part.as_ref().map_or(0, Vec::len)), 64)?)?;
                     let temporal = details.trie_metadata.as_ref().and_then(|metadata| metadata.temporal_metadata.as_ref());
-                    let state = match details.trie_state { None => Value::Null, Some(state @ 0..=2) => Value::Utf8(["nascent", "live", "garbage"][state as usize].into()), Some(_) => return Err(Anomaly::incorrect("rtdb.node/inspection-trie-state", "Table block contains an unknown trie state")) };
-                    let row = row([
-                        ("table_name", Value::Utf8(name.clone())), ("block_idx", Value::Utf8(lex_hex(block as u64))), ("level", Value::I32(part.level.unwrap_or_default())),
-                        ("recency", part.recency.map_or(Value::Null, |micros| Value::Utf8(edn::date(micros.div_euclid(86_400_000_000))))),
-                        ("part", Value::Utf8(edn::vector(part.part.as_deref().unwrap_or_default().iter().map(u8::to_string)))),
-                        ("trie_key", Value::Utf8(details.trie_key.clone().unwrap_or_default())), ("data_file_size", Value::I64(details.data_file_size.unwrap_or_default())),
-                        ("trie_state", state),
-                        ("row_count", temporal.map_or(Value::Null, |_| Value::I64(details.trie_metadata.as_ref().and_then(|metadata| metadata.row_count).unwrap_or_default()))),
-                        ("temporal_metadata", temporal.map_or(Value::Null, |metadata| Value::Utf8(temporal_message(metadata)))),
-                    ]);
+                    let state = match details.trie_state {
+                        None => None,
+                        Some(state @ 0..=2) => Some(["nascent", "live", "garbage"][state as usize]),
+                        Some(_) => return Err(Anomaly::incorrect("rtdb.node/inspection-trie-state", "Table block contains an unknown trie state")),
+                    };
+                    let block_idx = lex_hex(block as u64);
+                    let recency = part.recency.map(|micros| edn::date(micros.div_euclid(86_400_000_000)));
+                    let part_path = edn::vector(part.part.as_deref().unwrap_or_default().iter().map(u8::to_string));
+                    let temporal_text = temporal.map(temporal_message);
+                    page.append([
+                        ("table_name", Cell::Text(Some(&name))), ("block_idx", Cell::Text(Some(&block_idx))),
+                        ("level", Cell::I32(part.level.unwrap_or_default())), ("recency", Cell::Text(recency.as_deref())),
+                        ("part", Cell::Text(Some(&part_path))), ("trie_key", Cell::Text(Some(details.trie_key.as_deref().unwrap_or_default()))),
+                        ("data_file_size", Cell::I64(Some(details.data_file_size.unwrap_or_default()))), ("trie_state", Cell::Text(state)),
+                        ("row_count", Cell::I64(temporal.map(|_| details.trie_metadata.as_ref().and_then(|metadata| metadata.row_count).unwrap_or_default()))),
+                        ("temporal_metadata", Cell::Text(temporal_text.as_deref())),
+                    ])?;
                     self.input = Input::Tries { name, block, partitions, reservation: metadata_reservation, partition, trie: trie + 1 };
-                    return page(row, vec![reservation], &self.memory).map(Some);
                 }
             }
         }
+        page.finish()
     }
 }
 
@@ -151,12 +191,12 @@ impl Inspection {
     }
 }
 
-fn decode_operations(bytes: Option<&[u8]>, memory: &Arc<MemoryBudget>) -> Result<(Value, Option<Arc<MemoryReservation>>)> {
-    let Some(bytes) = bytes else { return Ok((Value::Null, None)); };
+fn decode_operations(bytes: Option<&[u8]>, memory: &Arc<MemoryBudget>) -> Result<(Option<String>, Option<Arc<MemoryReservation>>)> {
+    let Some(bytes) = bytes else { return Ok((None, None)); };
     let rows = match rtdb_tx::decode_operation_rows(bytes, memory) {
         Ok(rows) => rows,
         Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Err(error),
-        Err(_) => return Ok((Value::Utf8("<error decoding tx-ops>".into()), None)),
+        Err(_) => return Ok((Some("<error decoding tx-ops>".into()), None)),
     };
     let bound = rows.rows().iter().try_fold(allocation(rows.allocation_bytes(), 8)?, |bytes,value| {
         bytes.checked_add(edn::operation_allocation_bound(value)?).ok_or_else(size_error)
@@ -164,7 +204,7 @@ fn decode_operations(bytes: Option<&[u8]>, memory: &Arc<MemoryBudget>) -> Result
     let reservation = memory.reserve(bound)?;
     let rendered = rows.rows().iter().map(edn::operation).collect::<Result<Vec<_>>>();
     let value = match rendered { Ok(rows) => edn::vector(rows), Err(_) => "<error decoding tx-ops>".into() };
-    Ok((Value::Utf8(value), Some(reservation)))
+    Ok((Some(value), Some(reservation)))
 }
 
 fn source_message(message: Option<&SourceMessage>) -> Result<(&'static str, String)> {
@@ -239,19 +279,88 @@ fn partitions(metadata: &TableBlock) -> Result<Vec<rtdb_format::block::proto::Pa
         level: Some(i32::try_from(level).map_err(|_| size_error())?), recency, part: Some(part), tries, max_block_index: None,
     })).collect()
 }
-fn page(row: InspectionRow, reservations: Vec<Arc<MemoryReservation>>, memory: &Arc<MemoryBudget>) -> Result<CatalogRows<InspectionRow>> {
-    let retained = memory.reserve(Value::document_retained_bytes(&row)?.checked_add(512).ok_or_else(size_error)?)?;
-    drop(reservations);
-    pages(vec![row], vec![retained])
+enum Cell<'a> { Text(Option<&'a str>), I32(i32), I64(Option<i64>), Timestamp(Option<i64>) }
+
+enum Column {
+    Text(StringBuilder),
+    I32(Int32Builder),
+    I64(Int64Builder),
+    Timestamp(TimestampMicrosecondBuilder),
 }
-fn pages(rows: Vec<InspectionRow>, reservations: Vec<Arc<MemoryReservation>>) -> Result<CatalogRows<InspectionRow>> {
-    let retained = rows.iter().try_fold(0usize, |bytes, row| bytes.checked_add(Value::document_retained_bytes(row)?).ok_or_else(size_error))?;
-    let reserved = reservations.iter().try_fold(0usize, |bytes, reservation| bytes.checked_add(reservation.bytes()).ok_or_else(size_error))?;
-    if retained > reserved { return Err(size_error()); }
-    Ok(CatalogRows::new(rows, Arc::new(reservations)))
+
+impl Column {
+    fn for_cell(cell: &Cell<'_>) -> Self {
+        match cell {
+            Cell::Text(_) => Self::Text(StringBuilder::with_capacity(0, 0)),
+            Cell::I32(_) => Self::I32(Int32Builder::with_capacity(0)),
+            Cell::I64(_) => Self::I64(Int64Builder::with_capacity(0)),
+            Cell::Timestamp(_) => Self::Timestamp(TimestampMicrosecondBuilder::with_capacity(0).with_timezone("UTC")),
+        }
+    }
+
+    fn append(&mut self, cell: Cell<'_>) -> Result<()> {
+        match (self, cell) {
+            (Self::Text(builder), Cell::Text(value)) => builder.append_option(value),
+            (Self::I32(builder), Cell::I32(value)) => builder.append_value(value),
+            (Self::I64(builder), Cell::I64(value)) => builder.append_option(value),
+            (Self::Timestamp(builder), Cell::Timestamp(value)) => builder.append_option(value),
+            _ => return Err(size_error()),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> ArrayRef {
+        match self {
+            Self::Text(mut builder) => Arc::new(builder.finish()),
+            Self::I32(mut builder) => Arc::new(builder.finish()),
+            Self::I64(mut builder) => Arc::new(builder.finish()),
+            Self::Timestamp(mut builder) => Arc::new(builder.finish()),
+        }
+    }
 }
-fn row<const N: usize>(fields: [(&str, Value); N]) -> InspectionRow { fields.into_iter().map(|(name, value)| (name.into(), value)).collect() }
-fn timestamp(value: i64) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
+
+struct InspectionPage {
+    rows: usize,
+    columns: Vec<(&'static str, Column)>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl InspectionPage {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { rows: 0, columns: Vec::new(), reservation: memory.reserve(0)? })
+    }
+
+    fn append<'a>(&mut self, fields: impl IntoIterator<Item = (&'static str, Cell<'a>)>) -> Result<()> {
+        let lease = Arc::get_mut(&mut self.reservation).expect("An inspection page owns its reservation");
+        lease.grow_to(lease.bytes().checked_add(512).ok_or_else(size_error)?)?;
+        for (index, (name, cell)) in fields.into_iter().enumerate() {
+            let payload = match &cell { Cell::Text(Some(value)) => value.len(), _ => 0 };
+            let bytes = payload.checked_mul(4).and_then(|size| size.checked_add(512)).ok_or_else(size_error)?;
+            lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+            if self.rows == 0 { self.columns.push((name, Column::for_cell(&cell))); }
+            let (expected, column) = self.columns.get_mut(index).ok_or_else(size_error)?;
+            if *expected != name { return Err(size_error()); }
+            column.append(cell)?;
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Option<OwnedBatch>> {
+        if self.rows == 0 { return Ok(None); }
+        let (fields, arrays): (Vec<_>, Vec<_>) = self.columns.into_iter().map(|(name, column)| {
+            let array = column.finish();
+            let field = Field::new(name, array.data_type().clone(), array.null_count() != 0);
+            (field, array)
+        }).unzip();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|error| Anomaly::fault("rtdb.node/inspection-arrow", error.to_string()))?;
+        let bytes = rtdb_columnar::shared_allocation_size(&batch)?.checked_add(4096).ok_or_else(size_error)?;
+        let lease = Arc::get_mut(&mut self.reservation).expect("An inspection page owns its reservation");
+        if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
+        OwnedBatch::with_reservation(batch, self.reservation).map(Some)
+    }
+}
 fn allocation(bytes: usize, multiplier: usize) -> Result<usize> { bytes.checked_mul(multiplier).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(size_error) }
 fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.node/inspection-allocation", "Inspection allocation exceeds its reservation or addressable memory") }
 
@@ -284,9 +393,42 @@ mod tests {
         let mut cursor = open(database, InspectionRequest::BlockFiles { from: 1024, to: 2048 }, Arc::clone(node.memory())).await.unwrap();
         let page = cursor.next().await.unwrap().unwrap();
         assert_eq!(page.rows().len(), 1);
-        assert_eq!(page.rows()[0]["block_idx"], Value::Utf8(lex_hex(1024)));
+        assert_eq!(page.rows()[0]["block_idx"], rtdb_types::Value::Utf8(lex_hex(1024)));
         assert!(cursor.next().await.unwrap().is_none());
         node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn arrow_surface_inspection_block_windows_return_all_records_in_order() {
+        let services = NodeServices::local(Arc::new(Services), Arc::new(Services), Arc::new(Services), Arc::new(Services));
+        let (node, _driver) = Node::open(NodeOptions::default(), services).await.unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        for index in [0, 1024] {
+            let catalog = BlockCatalog::from_proto(Block { block_index: Some(index), ..Default::default() }).unwrap();
+            database.storage.object_store().put(&ObjectKey::new(block_key(BlockIndex(index)).unwrap()).unwrap(), catalog.encode().into()).await.unwrap();
+        }
+        let mut cursor = open(database, InspectionRequest::BlockFiles { from: 0, to: 3072 }, Arc::clone(node.memory())).await.unwrap();
+        assert!(cursor.supports_arrow());
+        let page = cursor.next_arrow(3).await.unwrap().unwrap();
+        let ids = page.batch().column_by_name("block_idx").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(ids.iter().collect::<Vec<_>>(), [Some(lex_hex(0).as_str()), Some(lex_hex(1024).as_str())]);
+        let names = page.batch().column_by_name("table_names").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(names.iter().collect::<Vec<_>>(), [Some("[]"), Some("[]")]);
+        assert!(cursor.next_arrow(3).await.unwrap().is_none());
+        node.shutdown();
+    }
+
+    #[test]
+    fn arrow_surface_inspection_columns_keep_window_order_and_edn_strings() {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut page = InspectionPage::new(&memory).unwrap();
+        page.append([("msg_id", Cell::I64(Some(7))), ("msg", Cell::Text(Some("{:type :tx}")))]).unwrap();
+        page.append([("msg_id", Cell::I64(Some(9))), ("msg", Cell::Text(None))]).unwrap();
+        let page = page.finish().unwrap().unwrap();
+        let ids = page.batch().column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        let text = page.batch().column(1).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(ids.values().as_ref(), &[7, 9]);
+        assert_eq!(text.iter().collect::<Vec<_>>(), [Some("{:type :tx}"), None]);
     }
 
     #[test]

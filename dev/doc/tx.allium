@@ -39,6 +39,7 @@
 -- Native SQL, XTQL, and logical relation execution opens Arrow batches for the root operator.
 -- Semantic pages remain Arrow batches through downstream operators and transport batching.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- Arrow result layout adaptation reserves its scratch space against the client operation's budget.
 -- An Arrow client result union of one data leg and nullable null legs conforms to that leg's declared plain field by Arrow position.
 -- A fixed-size vector result column already in its declared layout keeps its component buffer.
 -- Query output aligns selected floating-point components and compatible scalar aliases with the declared Arrow field.
@@ -57,6 +58,8 @@
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
 -- The authenticated session and original attachment authorize redemption of its ticket.
+-- A prepared statement reuses its cached plan when its parameter types, planning options, and observed catalog lookups agree.
+-- Rebinding charges execution to the query budget while the statement retains its plan charge.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
@@ -79,6 +82,8 @@
 -- Each operator can report its own retained-allocation peak and the query reports the peak across all operators.
 -- EXPLAIN renders packed floating-point literals from their Arrow children at the original float width.
 -- EXPLAIN ANALYZE measures the opened Arrow operators when the query uses Arrow execution.
+-- EXPLAIN cursors share their preparation's report values.
+-- EXPLAIN, EXPLAIN ANALYZE, and SHOW write their result vectors from borrowed report cells.
 -- A direct Arrow parameter projection charges its own operator scope when traced.
 -- Native query spans use the application name of their connection.
 -- Pgwire uses the application name supplied at startup or by SET.
@@ -86,6 +91,9 @@
 -- The application name survives DISCARD ALL.
 -- Those spill pages retain each record's fields and preserve their original page boundaries.
 -- Computed VALUES and replayed literal pages admit their results column by column.
+-- Compatible XTQL literal pages build their Arrow columns during binding and retain the order and size of every page.
+-- System catalog scans build the requested columns in Arrow and apply filters to their batches.
+-- Relation name casts resolve against an identity map for the captured catalog.
 -- Column tables preserve one semantic page across the input list's batches.
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
 -- A cosine projection guarded by a simple Boolean CASE reads only the rows selected by its guard.

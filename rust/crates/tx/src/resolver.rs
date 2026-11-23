@@ -3727,7 +3727,7 @@ struct PlannedMutation { options: rtdb_sql::PrepareOptions, lookups: rtdb_plan::
 fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
     fn reads(relation: &rtdb_plan::Relation) -> bool {
         use rtdb_plan::RelationNode as N;
-        !matches!(relation.node(), N::Values { .. } | N::LiteralPages { .. } | N::Project { .. } | N::Extend { .. } | N::Rename { .. } | N::Filter { .. })
+        !matches!(relation.node(), N::Values { .. } | N::LiteralPages { .. } | N::ArrowLiteralPages { .. } | N::Project { .. } | N::Extend { .. } | N::Rename { .. } | N::Filter { .. })
             || relation.children().into_iter().any(|child| reads(child))
     }
     match mutation {

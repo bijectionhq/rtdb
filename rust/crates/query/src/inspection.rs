@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rtdb_plan::{BinaryOp, CatalogInspection, ColumnId, Expr, InspectionRequest, Scan, Schema};
 use rtdb_types::{Anomaly, Result, TableRef, Value};
 
-use crate::{context::Execution, cursor::{OwnedRow, RowCursor}, invalid};
+use crate::{columnar::{BatchCursor, Column, ColumnBatch}, context::Execution, cursor::OwnedRow, invalid, pages::PageBuilder};
 
 #[derive(Clone, Default)]
 pub(crate) struct Constraints { bounds: BTreeMap<ColumnId, Vec<(BinaryOp, Expr)>> }
@@ -77,17 +77,12 @@ impl InspectionCursor {
     }
 }
 
-#[async_trait]
-impl RowCursor for InspectionCursor {
-    async fn next(&mut self) -> Result<Option<OwnedRow>> {
+impl InspectionCursor {
+    async fn next_row(&mut self) -> Result<Option<OwnedRow>> {
         loop {
             self.execution.context.check_cancelled()?;
             if let Some(row) = self.rows.pop_front() { return Ok(Some(row)); }
             if self.done { return Ok(None); }
-            if let Some(request) = self.request.take() {
-                let runtime = self.execution.context.catalog.runtime.as_ref().ok_or_else(|| invalid("catalog-runtime-unavailable", "Runtime catalog provider was not supplied"))?;
-                self.input = Some(runtime.open_inspection(&self.scan.table.name.database, request).await?);
-            }
             let Some(input) = &mut self.input else { return Err(invalid("inspection-state", "Inspection cursor has no input")); };
             let Some(page) = input.next().await? else { self.done = true; self.input = None; return Ok(None); };
             let bound = page.rows().iter().try_fold(4096usize, |bytes, row| {
@@ -98,6 +93,47 @@ impl RowCursor for InspectionCursor {
             let reservation = self.execution.context.memory.reserve(bound)?;
             self.rows = page.rows().iter().map(|row| OwnedRow::with_reservation(self.scan.columns.iter().map(|field| row.get(&field.name).cloned().unwrap_or(Value::Null)).collect(), Arc::clone(&reservation))).collect::<Result<_>>()?;
         }
+    }
+}
+
+#[async_trait]
+impl BatchCursor for InspectionCursor {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        self.execution.context.check_cancelled()?;
+        if self.done { return Ok(None); }
+            if let Some(request) = self.request.take() {
+                let runtime = self.execution.context.catalog.runtime.as_ref().ok_or_else(|| invalid("catalog-runtime-unavailable", "Runtime catalog provider was not supplied"))?;
+                self.input = Some(runtime.open_inspection(&self.scan.table.name.database, request).await?);
+            }
+        let input = self.input.as_mut().ok_or_else(|| invalid("inspection-state", "Inspection cursor has no input"))?;
+        let limit = self.execution.context.options.batch_rows;
+        if input.supports_arrow() {
+            let Some(batch) = input.next_arrow(limit).await? else { self.done = true; self.input = None; return Ok(None); };
+            let record = batch.batch();
+            let columns = self.scan.columns.iter().map(|field| {
+                match record.schema_ref().column_with_name(&field.name) {
+                    Some((position, _)) => Column::Arrow {
+                        field: Arc::clone(&record.schema_ref().fields()[position]),
+                        array: Arc::clone(record.column(position)),
+                        logical: None,
+                    },
+                    None => Column::Arrow {
+                        field: Arc::new(arrow_schema::Field::new(&field.name, arrow_schema::DataType::Null, true)),
+                        array: Arc::new(arrow_array::NullArray::new(record.num_rows())),
+                        logical: None,
+                    },
+                }
+            }).collect();
+            return Ok(Some(ColumnBatch::sharing(columns, record.num_rows(), Arc::clone(batch.reservation()))));
+        }
+
+        let mut page = PageBuilder::new(limit, &self.execution.context.memory)?;
+        while page.len() < limit {
+            let Some(row) = self.next_row().await? else { break; };
+            page.push(row)?;
+        }
+        if page.len() == 0 { return Ok(None); }
+        ColumnBatch::from_page(&page.finish(), &self.execution.context.memory).map(Some)
     }
 }
 

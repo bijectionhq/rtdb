@@ -346,6 +346,9 @@ value Block {
     tables: List<TableEntry>
 }
 
+-- Native log and block inspection publish bounded Arrow pages in record order.
+-- Inspection columns declared as EDN retain their text representation.
+
 value TableEntry {
     -- A table's identity, and the directory under which its files live.
     oid: Integer
@@ -489,6 +492,8 @@ variant TxMessage : SourceMessage {
     -- The key marker is valid from its submission sample, inclusive, until one hour later, exclusive.
     -- For a record carrying the envelope, the failed assertion must have the recorded position to identify a duplicate.
     -- Typed outcome lookup selects the latest marker visible at the retry's system time whose validity extends past the retry's submission sample.
+    -- Outcome queries reuse preparations against the catalog captured for the requested read.
+    -- Stored transaction errors remain Transit payloads.
     -- A private replay submission instead carries its engine key, admission sample and exclusive cutoff.
     -- These values are required together when the private replay envelope is present.
     -- Submission refuses a sample at or after the cutoff before appending a source record.

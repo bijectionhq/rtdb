@@ -9,6 +9,7 @@ publish.workspace = true
 stacker.workspace = true
 async-trait.workspace = true
 rtdb-types.workspace = true
+rtdb-columnar.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

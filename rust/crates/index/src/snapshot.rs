@@ -175,7 +175,11 @@ impl Snapshot {
     pub fn table_entry(&self, table: &TableRef) -> Option<&TableEntry> { self.table_catalog.entry(table) }
     pub fn trie_entries(&self, table: &TableRef) -> Vec<&CatalogTrie> { self.trie_catalog.current_tries(table) }
     pub fn tables(&self) -> BTreeSet<TableRef> {
-        self.table_catalog.tables().keys().chain(self.durable.tables().keys()).chain(self.layered.keys()).cloned().collect()
+        self.table_names().cloned().collect()
+    }
+    /// Borrows each table identity source. A name can occur in more than one source.
+    pub fn table_names(&self) -> impl Iterator<Item = &TableRef> {
+        self.table_catalog.tables().keys().chain(self.durable.tables().keys()).chain(self.layered.keys())
     }
     /// Tests this snapshot's table names without allocating, including empty declarations and superseded live tables.
     pub fn contains_table(&self, table: &TableRef) -> bool {

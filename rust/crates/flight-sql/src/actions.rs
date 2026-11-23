@@ -376,7 +376,7 @@ impl Service {
                     let shape = self.prepare_shape(connection, &request.query).await?;
                     let scope = request.transaction_id.map_or_else(|| PreparedScope::Session(call.database.clone()), PreparedScope::Transaction);
                     let charge = self.memory().reserve(wire::add(request.query.capacity(), wire::add(call.database.len(), 1024)?)?).map_err(status)?;
-                    let prepared = Arc::new(Prepared::new(call.session.owner(), request.query, scope, charge));
+                    let prepared = Arc::new(Prepared::new(call.session.owner(), request.query, shape.plan, scope, charge));
                     let handle = Bytes::copy_from_slice(Uuid::new_v4().as_bytes());
                     let _parameters = self.memory().reserve(wire::add(wire::mul(shape.parameters, 1024)?, 4096)?).map_err(status)?;
                     let parameters = Schema::new((0..shape.parameters).map(|_| Field::new("", DataType::Null, true)).collect::<Vec<_>>());

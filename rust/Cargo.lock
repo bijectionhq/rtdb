@@ -5097,6 +5097,7 @@ name = "rtdb-plan"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rtdb-columnar",
  "rtdb-types",
  "serde",
  "serde_json",
@@ -5537,12 +5538,15 @@ dependencies = [
 name = "rtdb-xtql"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "base64 0.22.1",
  "bigdecimal",
  "chrono",
  "chrono-tz",
  "num-bigint",
  "num-traits",
+ "rtdb-columnar",
  "rtdb-expr",
  "rtdb-format",
  "rtdb-plan",

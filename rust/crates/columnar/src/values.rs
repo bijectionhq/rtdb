@@ -1,5 +1,5 @@
 use rtdb_types::StructFields;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::{Borrow, Cow}, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
@@ -69,16 +69,25 @@ pub fn copy_evaluated_cells(
 /// Unadmitted calendar objects are rejected, including nested cells.
 /// The caller reserves `estimate_builder_bytes` before invoking this function.
 pub fn copy_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
-    if values.iter().any(Value::has_calendar_object) {
+    copy_values(logical, values)
+}
+
+/// Copies existing logical cells from borrowed values without cloning them.
+pub fn copy_array_refs(logical: &LogicalType, values: &[&Value]) -> Result<ArrayRef> {
+    copy_values(logical, values)
+}
+
+fn copy_values(logical: &LogicalType, values: &[impl Borrow<Value>]) -> Result<ArrayRef> {
+    if values.iter().map(Borrow::borrow).any(Value::has_calendar_object) {
         return Err(Anomaly::incorrect("rtdb/unadmitted-calendar-value", "Stored-cell copies require admitted calendar values"));
     }
     build_values(logical, values, false)
 }
 
-fn build_values(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
+fn build_values(logical: &LogicalType, values: &[impl Borrow<Value>], check_precision: bool) -> Result<ArrayRef> {
     logical.validate()?;
     let admission = Admission::new(logical);
-    for (row, value) in values.iter().enumerate() {
+    for (row, value) in values.iter().map(Borrow::borrow).enumerate() {
         if !admission.accepts(value) {
             return Err(Anomaly::incorrect("rtdb/column-type-mismatch", format!("Value at row {row} does not belong to {logical:?}")));
         }
@@ -209,12 +218,20 @@ pub fn build_struct_array(fields: Fields, arrays: &[ArrayRef], length: usize, nu
     Ok(make_array(data))
 }
 
-fn validity(values: &[Value]) -> Option<NullBuffer> {
-    let valid: Vec<_> = values.iter().map(|v| !matches!(v, Value::Null | Value::Undefined)).collect();
+/// Constructs a list whose child layout may express nulls through a dense union.
+pub fn build_list_array(item: Arc<Field>, offsets: ScalarBuffer<i32>, values: &ArrayRef, nulls: Option<NullBuffer>) -> Result<ArrayRef> {
+    let length = offsets.len().checked_sub(1).ok_or_else(layout_error)?;
+    let data = arrow_data::ArrayData::builder(DataType::List(item)).len(length).nulls(nulls)
+        .add_buffer(offsets.into_inner()).add_child_data(values.to_data()).build().map_err(super::arrow_error)?;
+    Ok(make_array(data))
+}
+
+fn validity(values: &[impl Borrow<Value>]) -> Option<NullBuffer> {
+    let valid: Vec<_> = values.iter().map(Borrow::borrow).map(|v| !matches!(v, Value::Null | Value::Undefined)).collect();
     valid.iter().any(|v| !v).then(|| NullBuffer::from(valid))
 }
 
-fn build(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
+fn build(logical: &LogicalType, values: &[impl Borrow<Value>], check_precision: bool) -> Result<ArrayRef> {
     match logical {
         LogicalType::Nothing | LogicalType::Null => Ok(Arc::new(NullArray::new(values.len()))),
         LogicalType::Maybe(inner) => build(inner, values, check_precision),
@@ -224,9 +241,9 @@ fn build(logical: &LogicalType, values: &[Value], check_precision: bool) -> Resu
             let field = to_field("", logical)?;
             let DataType::Struct(fields) = field.data_type() else { return Err(layout_error()); };
             let arrays = children.iter().map(|(name, child_type)| {
-                let child_values = values.iter().map(|v| match v {
-                    Value::Struct(fields) => struct_field_cell(fields, name, child_type).clone(),
-                    _ => Value::Undefined,
+                let child_values = values.iter().map(Borrow::borrow).map(|v| match v {
+                    Value::Struct(fields) => struct_field_cell(fields, name, child_type),
+                    _ => &Value::Undefined,
                 }).collect::<Vec<_>>();
                 build(child_type, &child_values, check_precision)
             }).collect::<Result<Vec<_>>>()?;
@@ -239,12 +256,12 @@ fn build(logical: &LogicalType, values: &[Value], check_precision: bool) -> Resu
 
 macro_rules! primitive {
     ($values:expr, $array:ty, $pattern:pat => $value:expr) => {{
-        let values = $values.iter().map(|value| match value { $pattern => Some($value), _ => None }).collect::<Vec<_>>();
+        let values = $values.iter().map(Borrow::borrow).map(|value| match value { $pattern => Some($value), _ => None }).collect::<Vec<_>>();
         Ok(Arc::new(<$array>::from(values)) as ArrayRef)
     }};
 }
 
-fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
+fn build_scalar(scalar: &ScalarType, values: &[impl Borrow<Value>], check_precision: bool) -> Result<ArrayRef> {
     use ScalarType::*;
     match scalar {
         Bool => primitive!(values, BooleanArray, Value::Bool(v) => *v),
@@ -259,7 +276,7 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
         F16 => primitive!(values, Float16Array, Value::F16(v) => half::f16::from_bits(*v)),
         F32 => primitive!(values, Float32Array, Value::F32(v) => *v),
         F64 => primitive!(values, Float64Array, Value::F64(v) => *v),
-        DateDay => Ok(Arc::new(Date32Array::from(values.iter().map(|value| match value {
+        DateDay => Ok(Arc::new(Date32Array::from(values.iter().map(Borrow::borrow).map(|value| match value {
             Value::DateDay(value) => Ok(Some(*value)),
             Value::Date(value) => match rtdb_types::CalendarDate::new(value.date(), rtdb_types::DateUnit::Day).object_value()? {
                 Value::DateDay(days) => Ok(Some(days)),
@@ -267,7 +284,7 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
             },
             _ => Ok(None),
         }).collect::<Result<Vec<_>>>()?))),
-        DateMilli => Ok(Arc::new(Date64Array::from(values.iter().map(|value| match value {
+        DateMilli => Ok(Arc::new(Date64Array::from(values.iter().map(Borrow::borrow).map(|value| match value {
             Value::DateMilli(value) => Ok(Some(*value)),
             Value::Date(value) => match rtdb_types::CalendarDate::new(value.date(), rtdb_types::DateUnit::Millisecond).object_value()? {
                 Value::DateMilli(millis) => Ok(Some(millis)),
@@ -279,8 +296,8 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
         RegClass => primitive!(values, Int32Array, Value::RegClass(v) => *v),
         RegProc => primitive!(values, Int32Array, Value::RegProc(v) => *v),
         Utf8 | Uri | Keyword => {
-            if *scalar == Uri { for value in values { if let Value::Uri(text) = value { rtdb_types::UriParts::parse(text)?; } } }
-            let strings = values.iter().map(|value| match value {
+            if *scalar == Uri { for value in values.iter().map(Borrow::borrow) { if let Value::Uri(text) = value { rtdb_types::UriParts::parse(text)?; } } }
+            let strings = values.iter().map(Borrow::borrow).map(|value| match value {
                 Value::Utf8(value) | Value::Uri(value) => Some(value.as_str()),
                 Value::Keyword(value) => Some(value.as_str()),
                 _ => None,
@@ -288,7 +305,7 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
             Ok(Arc::new(StringArray::from(strings)))
         }
         Binary | Transit => {
-            let values = values.iter().map(|value| match value {
+            let values = values.iter().map(Borrow::borrow).map(|value| match value {
                 Value::Binary(value) | Value::Transit(value) => Some(value.as_slice()),
                 _ => None,
             }).collect::<Vec<_>>();
@@ -299,7 +316,7 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
         Decimal { precision, scale, bit_width } => build_decimal(*precision, *scale, *bit_width, values, check_precision),
         Time { unit, bit_width } => {
             if *bit_width == 32 {
-                let converted = values.iter().map(|value| match value {
+                let converted = values.iter().map(Borrow::borrow).map(|value| match value {
                     Value::Time { value, .. } => i32::try_from(*value).map(Some).map_err(|_| Anomaly::incorrect("rtdb/time-overflow", "Time exceeds i32 representation")),
                     _ => Ok(None),
                 }).collect::<Result<Vec<_>>>()?;
@@ -317,7 +334,7 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
             }
         }
         Timestamp { unit, timezone } => {
-            let values = values.iter().map(|v| match v { Value::Timestamp { value, .. } => Some(*value), _ => None }).collect::<Vec<_>>();
+            let values = values.iter().map(Borrow::borrow).map(|v| match v { Value::Timestamp { value, .. } => Some(*value), _ => None }).collect::<Vec<_>>();
             match unit {
                 TimeUnit::Second => Ok(Arc::new(TimestampSecondArray::from(values).with_timezone_opt(timezone.as_deref()))),
                 TimeUnit::Millisecond => Ok(Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(timezone.as_deref()))),
@@ -338,9 +355,9 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
     }
 }
 
-fn build_binary(width: i32, values: &[Value]) -> Result<ArrayRef> {
+fn build_binary(width: i32, values: &[impl Borrow<Value>]) -> Result<ArrayRef> {
     let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), width);
-    for value in values {
+    for value in values.iter().map(Borrow::borrow) {
         match value {
             Value::FixedSizeBinary(bytes) => builder.append_value(bytes).map_err(super::arrow_error)?,
             Value::Uuid(bytes) => builder.append_value(bytes).map_err(super::arrow_error)?,
@@ -350,10 +367,10 @@ fn build_binary(width: i32, values: &[Value]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
+fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[impl Borrow<Value>], check_precision: bool) -> Result<ArrayRef> {
     match bit_width {
         32 => {
-            let values = values.iter().map(|value| match value {
+            let values = values.iter().map(Borrow::borrow).map(|value| match value {
                 Value::Decimal(value) => {
                     let bytes: [u8; 4] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
                     Ok(Some(i32::from_be_bytes(bytes)))
@@ -363,7 +380,7 @@ fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[Value], c
             finish_decimal(Decimal32Array::from(values), precision, scale, check_precision)
         }
         64 => {
-            let values = values.iter().map(|value| match value {
+            let values = values.iter().map(Borrow::borrow).map(|value| match value {
                 Value::Decimal(value) => {
                     let bytes: [u8; 8] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
                     Ok(Some(i64::from_be_bytes(bytes)))
@@ -373,7 +390,7 @@ fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[Value], c
             finish_decimal(Decimal64Array::from(values), precision, scale, check_precision)
         }
         128 => {
-            let values = values.iter().map(|value| match value {
+            let values = values.iter().map(Borrow::borrow).map(|value| match value {
                 Value::Decimal(value) => {
                     let bytes: [u8; 16] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
                     Ok(Some(i128::from_be_bytes(bytes)))
@@ -383,7 +400,7 @@ fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[Value], c
             finish_decimal(Decimal128Array::from(values), precision, scale, check_precision)
         }
         256 => {
-            let values = values.iter().map(|value| match value {
+            let values = values.iter().map(Borrow::borrow).map(|value| match value {
                 Value::Decimal(value) => {
                     let bytes: [u8; 32] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
                     Ok(Some(i256::from_be_bytes(bytes)))
@@ -403,7 +420,7 @@ fn finish_decimal<T: arrow_array::types::DecimalType>(array: arrow_array::Primit
     Ok(Arc::new(array.with_data_type(T::TYPE_CONSTRUCTOR(crate::decimal_storage_precision(precision), crate::decimal_storage_scale(scale)))))
 }
 
-fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
+fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, values: &[impl Borrow<Value>], check_precision: bool) -> Result<ArrayRef> {
     let field = to_field("", logical)?;
     let packed_schema = match (kind, field.data_type()) {
         (ListKind::FixedSizeList(_), DataType::FixedSizeList(item, width)) => Some((item, Some(*width))),
@@ -414,7 +431,7 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
         if item.metadata().is_empty() && let Some(array) = build_float_lists(item, width, values)? {
             return Ok(array);
         }
-        let packed_scalars = values.iter().any(|value| matches!(value.list_view(), Some(ListView::Scalars(_))));
+        let packed_scalars = values.iter().any(|value| matches!(value.borrow().list_view(), Some(ListView::Scalars(_))));
         if (ListValue::supports_numeric_arrow(item) || packed_scalars)
             && let Some(array) = build_packed_lists(item, width, values, check_precision)?
         {
@@ -424,29 +441,25 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
     let mut flat = Vec::new();
     let mut offsets = vec![0i32];
     let fixed = match kind { ListKind::FixedSizeList(size) => Some(*size as usize), ListKind::TimestampTzRange => Some(2), _ => None };
-    for value in values {
+    for value in values.iter().map(Borrow::borrow) {
         match value {
-            Value::Set(children) => flat.extend(children.iter().cloned()),
-            Value::List(children) | Value::FixedSizeList(children) => flat.extend(children.iter().map(std::borrow::Cow::into_owned)),
+            Value::Set(children) => flat.extend(children.iter().map(Cow::Borrowed)),
+            Value::List(children) | Value::FixedSizeList(children) => flat.extend(children.iter()),
             Value::TimestampTzRange { lower, upper } => {
-                flat.push(Value::Timestamp { value: *lower, unit: TimeUnit::Microsecond, timezone: Some("UTC".to_owned()) });
-                flat.push(Value::Timestamp { value: *upper, unit: TimeUnit::Microsecond, timezone: Some("UTC".to_owned()) });
+                flat.push(Cow::Owned(Value::Timestamp { value: *lower, unit: TimeUnit::Microsecond, timezone: Some("UTC".to_owned()) }));
+                flat.push(Cow::Owned(Value::Timestamp { value: *upper, unit: TimeUnit::Microsecond, timezone: Some("UTC".to_owned()) }));
             }
             Value::Map { entries, .. } => for (key, value) in entries {
                 if matches!(key, Value::Null | Value::Undefined) { return Err(Anomaly::incorrect("rtdb/null-map-key", "Arrow map keys cannot be null")); }
-                flat.push(Value::Struct(StructFields::from([("key".to_owned(), key.clone()), ("value".to_owned(), value.clone())])));
+                flat.push(Cow::Owned(Value::Struct(StructFields::from([("key".to_owned(), key.clone()), ("value".to_owned(), value.clone())]))));
             },
-            _ => if let Some(size) = fixed { flat.extend((0..size).map(|_| Value::Undefined)); },
+            _ => if let Some(size) = fixed { flat.extend((0..size).map(|_| Cow::Borrowed(&Value::Undefined))); },
         }
         offsets.push(i32::try_from(flat.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
     }
     let array = build(element, &flat, check_precision)?;
     match field.data_type() {
-        DataType::List(_) => {
-            let data = arrow_data::ArrayData::builder(field.data_type().clone()).len(values.len()).nulls(validity(values))
-                .add_buffer(ScalarBuffer::from(offsets).into_inner()).add_child_data(array.to_data()).build().map_err(super::arrow_error)?;
-            Ok(make_array(data))
-        }
+        DataType::List(item) => build_list_array(Arc::clone(item), offsets.into(), &array, validity(values)),
         DataType::FixedSizeList(_, _) => {
             let data = arrow_data::ArrayData::builder(field.data_type().clone()).len(values.len()).nulls(validity(values))
                 .add_child_data(array.to_data()).build().map_err(super::arrow_error)?;
@@ -460,10 +473,10 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
     }
 }
 
-fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value]) -> Result<Option<ArrayRef>> {
+fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[impl Borrow<Value>]) -> Result<Option<ArrayRef>> {
     if width.is_some_and(|width| width <= 0) { return Ok(None); }
     if !matches!(item.data_type(), DataType::Float32 | DataType::Float64) { return Ok(None); }
-    let total = values.iter().try_fold(0usize, |length, value| {
+    let total = values.iter().map(Borrow::borrow).try_fold(0usize, |length, value| {
         let add = match value {
             Value::List(list) | Value::FixedSizeList(list) => list.len(),
             _ => width.unwrap_or(0) as usize,
@@ -475,7 +488,7 @@ fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value]) ->
             let mut builder = arrow_array::builder::PrimitiveBuilder::<$ty>::with_capacity(total);
             let mut offsets = Vec::new();
             if width.is_none() { offsets.push(0); }
-            for value in values {
+            for value in values.iter().map(Borrow::borrow) {
                 match value {
                     Value::Null | Value::Undefined => builder.append_nulls(width.unwrap_or(0) as usize),
                     Value::List(list) | Value::FixedSizeList(list) => {
@@ -511,13 +524,13 @@ fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value]) ->
     }
 }
 
-fn build_packed_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value], check_precision: bool) -> Result<Option<ArrayRef>> {
+fn build_packed_lists(item: &Arc<Field>, width: Option<i32>, values: &[impl Borrow<Value>], check_precision: bool) -> Result<Option<ArrayRef>> {
     if width.is_some_and(|width| width <= 0) { return Ok(None); }
     let padding = width.map(|width| arrow_array::new_null_array(item.data_type(), width as usize));
     let mut children = Vec::with_capacity(values.len());
     let mut offsets = vec![0];
     let mut length = 0usize;
-    for value in values {
+    for value in values.iter().map(Borrow::borrow) {
         let array = match value {
             Value::Null | Value::Undefined => padding.as_ref().cloned(),
             Value::List(list) | Value::FixedSizeList(list) => {
@@ -569,33 +582,33 @@ fn build_packed_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value], c
     Ok(Some(make_array(data.build().map_err(super::arrow_error)?)))
 }
 
-fn build_union(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
+fn build_union(logical: &LogicalType, values: &[impl Borrow<Value>], check_precision: bool) -> Result<ArrayRef> {
     let field = to_field("", logical)?;
     let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return build(&from_field(&field)?, values, check_precision); };
     let legs = fields.iter().map(|(_, field)| from_field(field)).collect::<Result<Vec<_>>>()?;
     let ids = fields.iter().map(|(id, _)| id).collect::<Vec<_>>();
     let admissions = legs.iter().map(Admission::new).collect::<Vec<_>>();
-    let mut children: Vec<Vec<Value>> = legs.iter().map(|_| Vec::new()).collect();
+    let mut children: Vec<Vec<&Value>> = legs.iter().map(|_| Vec::new()).collect();
     let mut type_ids = Vec::with_capacity(values.len());
     let mut offsets = Vec::with_capacity(values.len());
-    for value in values {
+    for value in values.iter().map(Borrow::borrow) {
         let leg = if matches!(value, Value::Undefined) { 0 } else {
             admissions.iter().position(|leg| leg.accepts(value)).ok_or_else(|| Anomaly::incorrect("rtdb/union-value", "Value has no matching union leg"))?
         };
         type_ids.push(ids[leg]);
         offsets.push(i32::try_from(children[leg].len()).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);
-        children[leg].push(value.clone());
+        children[leg].push(value);
     }
     let children = legs.iter().zip(children).map(|(leg, values)| build(leg, &values, check_precision)).collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(UnionArray::try_new(fields.clone(), ScalarBuffer::from(type_ids), Some(ScalarBuffer::from(offsets)), children).map_err(super::arrow_error)?))
 }
 
-fn build_runs(logical: &LogicalType, width: RunEndWidth, value_type: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
+fn build_runs(logical: &LogicalType, width: RunEndWidth, value_type: &LogicalType, values: &[impl Borrow<Value>], check_precision: bool) -> Result<ArrayRef> {
     let mut distinct = Vec::new();
     let mut ends = Vec::new();
-    for (index, value) in values.iter().enumerate() {
-        if values.get(index + 1).is_none_or(|next| !same_representation(value, next)) {
-            distinct.push(value.clone());
+    for (index, value) in values.iter().map(Borrow::borrow).enumerate() {
+        if values.get(index + 1).is_none_or(|next| !same_representation(value, next.borrow())) {
+            distinct.push(value);
             ends.push(index + 1);
         }
     }

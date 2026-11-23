@@ -45,7 +45,7 @@ impl ResolvedTables {
 
 fn collect(source: &Relation, catalog: &dyn Catalog, bindings: &mut Vec<TableBinding>) -> Result<()> {
     match source.node() {
-        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => {}
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => {}
         RelationNode::Scan(scan) => bindings.push(catalog.table(&scan.table.name)?
             .ok_or_else(|| gap("Prepared table disappeared from its own snapshot"))?),
         RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. }
@@ -91,6 +91,7 @@ impl Rebuilder<'_> {
         match &mut node {
             RelationNode::Values { rows } => self.expressions(rows.iter_mut().flatten())?,
             RelationNode::LiteralPages { pages } => self.expressions(pages.iter_mut().flatten().flatten())?,
+            RelationNode::ArrowLiteralPages { .. } => {},
             RelationNode::List { expr, .. } | RelationNode::ColumnTable { expr, .. } => self.expression(expr)?,
             RelationNode::Scan(scan) => {
                 scan.table = self.next_table()?;
@@ -365,6 +366,7 @@ mod tests {
             match restored.node() {
                 RelationNode::Values { rows } => assert_eq!(rows, &[vec![Expr::Literal(V::I64(7))]]),
                 RelationNode::LiteralPages { pages } => assert_eq!(pages, &[vec![vec![Expr::Literal(V::I64(7))]], vec![]]),
+                RelationNode::ArrowLiteralPages { .. } => unreachable!("Arrow literal pages use the legacy literal-page wire form"),
                 RelationNode::List { expr, element, page_rows } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); assert_eq!(*page_rows, std::num::NonZeroUsize::new(3)); }
                 RelationNode::ColumnTable { expr, element } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); }
                 RelationNode::Ordinality { field, scope, .. } => { assert_eq!(field.id, ColumnId(3)); assert_eq!(field.data_type, L::Scalar(S::I64)); assert_eq!(*scope, rtdb_plan::OrdinalityScope::Relation); }

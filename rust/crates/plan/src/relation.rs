@@ -313,6 +313,33 @@ impl WindowFunction {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowExpr { pub field: Field, pub function: WindowFunction }
 
+#[derive(Clone, Debug)]
+pub struct LiteralArrowPages(Arc<[rtdb_columnar::OwnedBatch]>);
+
+impl LiteralArrowPages {
+    pub fn new(pages: Vec<rtdb_columnar::OwnedBatch>) -> Self { Self(pages.into()) }
+    pub fn pages(&self) -> &[rtdb_columnar::OwnedBatch] { &self.0 }
+
+    fn serialize_legacy<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let pages = self.0.iter().map(|page| {
+            let batch = page.batch();
+            (0..batch.num_rows()).map(|row| {
+                batch.schema_ref().fields().iter().zip(batch.columns()).map(|(field, column)| {
+                    rtdb_columnar::read_value(field, column.as_ref(), row).map(Expr::Literal)
+                }).collect::<Result<Vec<_>>>()
+            }).collect::<Result<Vec<_>>>()
+        }).collect::<Result<Vec<_>>>().map_err(serde::ser::Error::custom)?;
+        pages.serialize(serializer)
+    }
+}
+
+impl PartialEq for LiteralArrowPages {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+            || self.0.iter().map(|page| page.batch()).eq(other.0.iter().map(|page| page.batch()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RelationNode {
     Values { rows: Vec<Vec<Expr>> },
@@ -353,6 +380,8 @@ pub enum RelationNode {
     Unnest { input: Arc<Relation>, expr: Expr, element: Field, ordinality: Option<Field>, outer: bool },
     /// Input is ordered by IID then valid-from, with nonoverlapping intervals per IID.
     PatchGaps { input: Arc<Relation>, iid: ColumnId, valid_from: ColumnId, valid_to: ColumnId, document: ColumnId, from: Expr, to: Expr },
+    #[serde(rename(serialize = "LiteralPages"), skip_deserializing)]
+    ArrowLiteralPages { #[serde(serialize_with = "LiteralArrowPages::serialize_legacy")] pages: LiteralArrowPages },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -401,7 +430,7 @@ impl Relation {
 
     pub fn children(&self) -> Vec<&Arc<Self>> {
         match &self.node {
-            RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
+            RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
             RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
             | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
@@ -416,6 +445,7 @@ impl Relation {
         match &self.node {
             RelationNode::Values { rows } => rows.iter().flatten().collect(),
             RelationNode::LiteralPages { pages } => pages.iter().flatten().flatten().collect(),
+            RelationNode::ArrowLiteralPages { .. } => vec![],
             RelationNode::Scan(scan) => scan.valid_time.expressions().into_iter().chain(scan.system_time.expressions()).chain(scan.predicates.iter()).collect(),
             RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } | RelationNode::Rename { expressions, .. } => expressions.iter().map(|expr| &expr.expr).collect(),
             RelationNode::Filter { predicate, .. } => vec![predicate],
@@ -488,6 +518,11 @@ impl Relation {
             }
             RelationNode::LiteralPages { pages } => {
                 if pages.iter().flatten().any(|row| row.len() != self.schema.len()) { return invalid("Literal page row width differs from schema"); }
+            }
+            RelationNode::ArrowLiteralPages { pages } => {
+                if pages.pages().iter().any(|page| page.batch().num_columns() != self.schema.len()) {
+                    return invalid("Literal page row width differs from schema");
+                }
             }
             RelationNode::Scan(scan) => {
                 if self.schema.fields() != scan.columns { return invalid("Scan columns differ from output schema"); }

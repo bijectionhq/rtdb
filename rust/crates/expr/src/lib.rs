@@ -28,7 +28,7 @@ mod volatile;
 mod admission;
 
 pub use rtdb_types::AllocationScope as EvaluationScope;
-pub use pg_catalog::{PgCatalogLookup, requires_pg_catalog};
+pub use pg_catalog::{PgCatalogLookup, format_relation_name, requires_pg_catalog};
 pub use string::render::allocation_bound as text_allocation_bound;
 pub use string::render::arrow_text;
 pub use string::pattern::JavaFullMatcher;

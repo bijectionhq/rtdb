@@ -1,6 +1,6 @@
 use super::*;
 use crate::columnar::{BatchCursor, BoxBatchCursor, ColumnBatch};
-use crate::cursor::OwnedRow;
+use crate::{cursor::OwnedRow, pages::PageBuilder};
 use std::{collections::VecDeque,sync::atomic::{AtomicUsize,Ordering}};
 use rtdb_columnar::MemoryBudget;
 use rtdb_plan::{ColumnId,Field};
