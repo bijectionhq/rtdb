@@ -1,5 +1,5 @@
 use rtdb_types::{
-    Anomaly, EntityId, OwnedRelation, PlacedAttemptScope, Result, StructFields, TableRef,
+    Anomaly, EntityId, Interval, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
 };
 
@@ -1243,6 +1243,7 @@ mod retained_release_tests {
                 settlement_pin: None, delete_root: None, land_root: Some(pin),
             },
         ].into_iter().map(Operation::Public).collect::<Vec<_>>();
+        let root_window = operations.len();
         operations.push(Operation::Public(TxOp::OwnedCheckRange {
             relation: relation.clone(), basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(3), system_time: Timestamp(4) },
             scope, frontier: 0, until: Timestamp(100), region: None,
@@ -1261,6 +1262,27 @@ mod retained_release_tests {
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
             world, pin, effect: ProposalLandingEffect::FixedPeriods,
         }));
+        let set_window = |operations: &mut [Operation], entity, end| -> Result<()> {
+            let Operation::Public(TxOp::OwnedCheckRange { region, .. }) = &mut operations[root_window] else {
+                unreachable!("the fixture installs a Root range guard");
+            };
+            *region = Some(std::sync::Arc::new(OwnedRangeEvidence::Entity {
+                anchor: 0, region: rtdb_types::OwnedEntityRegion { id: entity, valid: Interval::new(start, end)? },
+            }));
+            Ok(())
+        };
+        set_window(&mut operations, EntityId::String("another entity".into()), Timestamp(20))?;
+        assert_eq!(hosted_proposal_land(&operations), None);
+        set_window(&mut operations, id.clone(), Timestamp(19))?;
+        assert_eq!(hosted_proposal_land(&operations), None);
+        set_window(&mut operations, id.clone(), Timestamp(20))?;
+        assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
+            world, pin, effect: ProposalLandingEffect::FixedPeriods,
+        }));
+        let Operation::Public(TxOp::OwnedCheckRange { region, .. }) = &mut operations[root_window] else {
+            unreachable!("the fixture installs a Root range guard");
+        };
+        *region = None;
         let root_point = operations.pop().unwrap();
         operations.pop();
         operations.push(root_point);
@@ -1574,9 +1596,12 @@ pub fn is_proposal_landing_frontier(op: &crate::TxOp) -> bool {
         if proposal_frontier_rows(relation, documents, *valid_from, *valid_to))
 }
 
-fn finite_landing_period(from: Option<Timestamp>, to: Option<Timestamp>) -> Option<Timestamp> {
+fn finite_landing_period(from: Option<Timestamp>, to: Option<Timestamp>) -> Option<Interval> {
     let (from, to) = (from?, to?);
-    (Timestamp::MIN < from && from < to && to < Timestamp::MAX).then_some(from)
+    if from <= Timestamp::MIN || to >= Timestamp::MAX || from >= to {
+        return None;
+    }
+    Interval::new(from, to).ok()
 }
 
 pub fn proposal_landing_write_rows(op: &crate::TxOp) -> Option<usize> {
@@ -1625,7 +1650,7 @@ pub(crate) struct HostedProposalLanding {
 struct ProposalLandingKey<'a> {
     relation: &'a OwnedRelation,
     id: EntityId,
-    starts: Vec<Option<Timestamp>>,
+    extents: Vec<Option<Interval>>,
     create_only: bool,
 }
 
@@ -1658,7 +1683,7 @@ pub(crate) fn hosted_proposal_land(
             | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. }
                 if relation.is_root_data() && !close && !documents.rows().is_empty() =>
             {
-                let start = match (valid_from, valid_to) {
+                let extent = match (valid_from, valid_to) {
                     (None, None) => None,
                     _ => Some(finite_landing_period(*valid_from, *valid_to)?),
                 };
@@ -1668,12 +1693,12 @@ pub(crate) fn hosted_proposal_land(
                     if assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
                     match writes.entry((relation.name(), id.handle_bytes())) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(ProposalLandingKey { relation, id, starts: vec![start], create_only: false });
+                            entry.insert(ProposalLandingKey { relation, id, extents: vec![extent], create_only: false });
                         }
                         std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            let starts = &mut entry.get_mut().starts;
-                            if start.is_some() != starts[0].is_some() { return None; }
-                            if !starts.contains(&start) { starts.push(start); }
+                            let extents = &mut entry.get_mut().extents;
+                            if extent.is_some() != extents[0].is_some() { return None; }
+                            if !extents.contains(&extent) { extents.push(extent); }
                         }
                     }
                 }
@@ -1686,7 +1711,7 @@ pub(crate) fn hosted_proposal_land(
                     let id = row.get("_id")?.entity_id().ok()?;
                     assertion_count += 1;
                     if writes.insert((relation.name(), id.handle_bytes()), ProposalLandingKey {
-                        relation, id, starts: vec![None], create_only: true,
+                        relation, id, extents: vec![None], create_only: true,
                     }).is_some()
                         || assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
                 }
@@ -1695,7 +1720,7 @@ pub(crate) fn hosted_proposal_land(
             | Operation::OwnedArrowIids { relation, documents, valid_from, valid_to, create_only, .. }
                 if relation.is_root_data() && !close && documents.row_count() != 0 =>
             {
-                let start = match (valid_from, valid_to) {
+                let extent = match (valid_from, valid_to) {
                     (None, None) => None,
                     _ if !create_only => Some(finite_landing_period(*valid_from, *valid_to)?),
                     _ => return None,
@@ -1706,12 +1731,12 @@ pub(crate) fn hosted_proposal_land(
                     if assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
                     match writes.entry((relation.name(), id.handle_bytes())) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(ProposalLandingKey { relation, id, starts: vec![start], create_only: *create_only });
+                            entry.insert(ProposalLandingKey { relation, id, extents: vec![extent], create_only: *create_only });
                         }
                         std::collections::btree_map::Entry::Occupied(mut entry) if !create_only => {
-                            let starts = &mut entry.get_mut().starts;
-                            if start.is_some() != starts[0].is_some() { return None; }
-                            if !starts.contains(&start) { starts.push(start); }
+                            let extents = &mut entry.get_mut().extents;
+                            if extent.is_some() != extents[0].is_some() { return None; }
+                            if !extents.contains(&extent) { extents.push(extent); }
                         }
                         _ => return None,
                     }
@@ -1721,7 +1746,7 @@ pub(crate) fn hosted_proposal_land(
                 if relation.is_root_data() && writes.is_empty() => {
                 close = true;
                 writes.insert((relation.name(), id.handle_bytes()), ProposalLandingKey {
-                    relation, id: id.clone(), starts: vec![None], create_only: false,
+                    relation, id: id.clone(), extents: vec![None], create_only: false,
                 });
             }
             Operation::Public(TxOp::OwnedPublishWorld {
@@ -1735,17 +1760,17 @@ pub(crate) fn hosted_proposal_land(
     if writes.is_empty() || frontiers.len() > writes.len() || close && !frontiers.is_empty() {
         return None;
     }
-    let all_fixed_periods = writes.values().all(|key| key.starts[0].is_some());
+    let all_fixed_periods = writes.values().all(|key| key.extents[0].is_some());
     if operations.iter().filter_map(Operation::owned_relation)
         .any(|relation| relation.is_world_catalog() || relation.world().is_some_and(|other| other != world))
     {
         return None;
     }
-    for ProposalLandingKey { relation, id, starts, create_only } in writes.into_values() {
-        let root_checked = starts.iter().all(|start| operations.iter().any(|op| matches!(op,
+    for ProposalLandingKey { relation, id, extents, create_only } in writes.into_values() {
+        let root_checked = extents.iter().all(|extent| operations.iter().any(|op| matches!(op,
             Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected })
                 if checked == relation && observed == &id
-                    && start.map_or_else(|| expected.is_none() == create_only, |start| start == *valid_at)
+                    && extent.map_or_else(|| expected.is_none() == create_only, |extent| extent.lower() == *valid_at)
         )));
         if close {
             return (root_checked && proposal_close_controls(controls)
@@ -1757,17 +1782,25 @@ pub(crate) fn hosted_proposal_land(
                 });
         }
         let local = relation.in_world(world).ok()?;
-        let local_checked = starts.iter().all(|start| operations.windows(2).any(|pair| matches!(pair, [
+        let local_checked = extents.iter().all(|extent| operations.windows(2).any(|pair| matches!(pair, [
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
             Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: Some(revision) })
         ] if guarded == &local && checked == &local && observed == &id && *original == pin
-            && start.is_none_or(|start| {
-                start == *valid_at && expected_clock.is_some_and(|tip| *revision <= tip)
+            && extent.is_none_or(|extent| {
+                extent.lower() == *valid_at && expected_clock.is_some_and(|tip| *revision <= tip)
             }))));
-        if starts[0].is_some() {
-            let root_window = operations.iter().any(|op| matches!(op,
-                Operation::Public(TxOp::OwnedCheckRange { relation: checked, region: None, .. }) if checked == relation
-            ));
+        if extents[0].is_some() {
+            let root_window = extents.iter().flatten().all(|extent| operations.iter().any(|op| {
+                let Operation::Public(TxOp::OwnedCheckRange { relation: checked, region, .. }) = op else {
+                    return false;
+                };
+                checked == relation && match region.as_deref() {
+                    None => true,
+                    Some(OwnedRangeEvidence::Entity { region, .. }) => region.id == id
+                        && region.valid.lower() <= extent.lower() && extent.upper() <= region.valid.upper(),
+                    Some(OwnedRangeEvidence::FixedPath(_)) => false,
+                }
+            }));
             let local_window = operations.iter().any(|op| matches!(op,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation: checked, pin: original, local_frontier: Some(_), .. })
                     if checked == &local && *original == pin

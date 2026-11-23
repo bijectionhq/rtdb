@@ -412,7 +412,7 @@ impl TxResolver {
                 }
             } else { (None, Ok(())) };
             if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_owned_preconditions(primary, attempt.map(PlacedAttempt::scope)).await;
+                outcome = tx.check_owned_preconditions(primary, attempt.map(PlacedAttempt::scope), slot.is_some()).await;
             }
             for (index, operation) in primary.iter().enumerate().take_while(|_| outcome.is_ok()) {
                 context.check_cancelled()?;
@@ -1417,7 +1417,7 @@ impl<'a> OpenTransaction<'a> {
         operations: &[Operation],
         scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> Result<()> {
-        self.check_owned_preconditions(operations, scope).await?;
+        self.check_owned_preconditions(operations, scope, false).await?;
         for operation in operations {
             self.context.check_cancelled()?;
             validate_document_operation(operation, self.options.user.as_deref())?;
@@ -1428,7 +1428,9 @@ impl<'a> OpenTransaction<'a> {
         self.write_owned_changes().await
     }
 
-    async fn check_owned_preconditions(&mut self, operations: &[Operation], source_scope: Option<rtdb_types::PlacedAttemptScope>) -> Result<()> {
+    async fn check_owned_preconditions(
+        &mut self, operations: &[Operation], source_scope: Option<rtdb_types::PlacedAttemptScope>, has_clock_slot: bool,
+    ) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let replay = crate::hosted_control::hosted_replay_controls(operations.iter().filter_map(|op| match op {
             Operation::Public(TxOp::HostedControl(control)) => Some(control),
@@ -1531,6 +1533,13 @@ impl<'a> OpenTransaction<'a> {
         let retained_release = crate::hosted_control::retained_release_world(operations);
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
+        if !has_clock_slot && proposal_land.is_some_and(|land| {
+            land.effect != crate::hosted_control::ProposalLandingEffect::Close
+        }) {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/invalid-clock-slot", "Proposal landing requires its assigned transaction clock",
+            ));
+        }
         let mut clock_worlds = BTreeSet::new();
         for clock in operations.iter().filter_map(|operation| match operation {
             Operation::Public(TxOp::OwnedCheckWorldScope { clock: Some(clock), .. }) => Some(clock),

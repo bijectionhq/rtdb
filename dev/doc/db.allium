@@ -413,6 +413,9 @@ variant TxMessage : SourceMessage {
     -- Root publication and fork admission count the Arrow document rows against the same effect limits as row writes.
     -- A held fork of an exact Root publication orders its new world registration with the Root section and owner controls.
     -- The fork inherits the archived publication's clock while Root witnesses validate at ordering.
+    -- A reviewed Proposal landing must consume an offered Root clock slot before any of its effects can publish.
+    -- The slot's reading binds the Root writes, ordered predicates and landing outcome.
+    -- A fixed period's entity-window witness covers its full half-open validity at the original Root cut.
     -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
     -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
