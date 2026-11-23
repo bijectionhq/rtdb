@@ -184,6 +184,7 @@ pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathT
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_POSITION_POINT_V1: &str = "rtdb.owned.ReadHeldPositionPoint.v1";
+pub(crate) const HELD_OWNED_POSITION_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldPositionValidDuring.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
@@ -503,6 +504,14 @@ fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     if length > 96 { return Err(invalid("Owned action relation exceeds its length limit")); }
     let name = std::str::from_utf8(name).map_err(arrow)?;
     Ok((OwnedRelation::new(name).map_err(status)?, arrow_bytes))
+}
+
+fn split_position_mask(body: &[u8]) -> Result<((Timestamp, u32), &[u8]), Status> {
+    let (commit, rest) = body.split_first_chunk::<8>()
+        .ok_or_else(|| invalid("Owned position read has no masked commit"))?;
+    let (from, rest) = rest.split_first_chunk::<4>()
+        .ok_or_else(|| invalid("Owned position read has no mask position"))?;
+    Ok(((Timestamp(i64::from_be_bytes(*commit)), u32::from_be_bytes(*from)), rest))
 }
 
 fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
@@ -1192,10 +1201,8 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned position point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no system time"))?;
-        let (commit, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no masked commit"))?;
-        let (from, request) = request.split_first_chunk::<4>().ok_or_else(|| invalid("Owned position point has no mask position"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
-        let mask = (Timestamp(i64::from_be_bytes(*commit)), u32::from_be_bytes(*from));
+        let (mask, request) = split_position_mask(request)?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
         let valid = valid.ok_or_else(|| invalid("Owned position point has no valid instant"))?;
@@ -1303,7 +1310,9 @@ impl Service {
         Ok(replies)
     }
 
-    pub(crate) async fn held_owned_valid_during_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_valid_during_action(
+        &self, call: &Call, body: &[u8], positioned: bool,
+    ) -> Result<ActionResult, Status> {
         use rtdb_types::Interval;
 
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
@@ -1314,6 +1323,12 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
+        let (mask, request) = if positioned {
+            let (mask, remaining) = split_position_mask(request)?;
+            (Some(mask), remaining)
+        } else {
+            (None, request)
+        };
         let (relation, arrow_bytes) = split_relation(request)?;
         let batch = request_batch(call, arrow_bytes)?;
         let batch = batch.batch();
@@ -1327,7 +1342,10 @@ impl Service {
         if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
 
         let system = history_request_endpoint(batch, "system_micros")?;
-        let history = held.snapshot.open_valid_during_observed(&relation, &id, valid, system).await.map_err(status)?;
+        let history = match mask {
+            Some(mask) => held.snapshot.open_historical_position_valid_during(&relation, &id, valid, system, mask).await,
+            None => held.snapshot.open_valid_during_observed(&relation, &id, valid, system).await,
+        }.map_err(status)?;
         let read = HistoryRead::Observed { read: history, held: &held, relation: &relation };
         let reply = self.history_reply(call, &id, read, valid, system, None).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;

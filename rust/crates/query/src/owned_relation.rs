@@ -88,9 +88,29 @@ pub async fn open_owned_point_with_position_mask(
     valid: Interval, system: Timestamp, mask: (Timestamp, u32),
 ) -> Result<Option<QueryCursor>> {
     if !relation.is_root_data() || valid.is_empty() { return Err(address_unavailable()); }
+    let context = owned_context_at_position(context, system, mask)?;
+    open_owned_point(context, owner, relation, id, Some(valid), None).await
+}
+
+/// Resolve the winning valid-time slices after excluding the same commit suffix.
+#[doc(hidden)]
+pub async fn open_owned_valid_during_with_position_mask(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Interval, system: Timestamp, mask: (Timestamp, u32),
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || !relation.is_root_data() || valid.is_empty() {
+        return Err(address_unavailable());
+    }
+    let context = owned_context_at_position(context, system, mask)?;
+    open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, true).await
+}
+
+fn owned_context_at_position(
+    context: Arc<QueryContext>, system: Timestamp, mask: (Timestamp, u32),
+) -> Result<Arc<QueryContext>> {
     let mut context = owned_context_at_system(context, system)?;
     Arc::make_mut(&mut context).catalog.owned_position_mask = Some(mask);
-    open_owned_point(context, owner, relation, id, Some(valid), None).await
+    Ok(context)
 }
 
 fn owned_context_at_system(context: Arc<QueryContext>, system: Timestamp) -> Result<Arc<QueryContext>> {

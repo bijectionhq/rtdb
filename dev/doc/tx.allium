@@ -140,6 +140,8 @@
 -- The transaction orders these conditions with Root facts and hosted controls, and the observed worlds receive no writes.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
+-- A held position point or valid window excludes assertions from the first masked position through the end of one commit before resolving the winners.
+-- A held position read still honours live ordered erasure and returns no commit evidence.
 -- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
 -- Its ordered condition checks the original parent pin and Root purge frontier.
 -- Finite Proposal replacements can land after the Root publication advances when the transaction checks each exact start and both held timeline frontiers for each affected relation.
