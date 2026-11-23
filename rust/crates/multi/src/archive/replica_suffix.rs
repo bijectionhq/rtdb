@@ -7,9 +7,8 @@ use rtdb_directory::{Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, D
 use rtdb_format::{
     catalog::BlockCatalog,
     envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame},
-    keys::block_key,
+    keys::{CURRENT_STORAGE_VERSION, block_key},
     log::proto::NoOp,
-    CURRENT_STORAGE_VERSION,
 };
 use rtdb_logkeeper::{ArchivedReplicaEntry, JournalDigest};
 use rtdb_types::{Anomaly, BlockIndex, MemoryBudget, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey, TxId};

@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{CheckpointTransferBootstrap, Directory, HostedTask, Lifecycle};
-use rtdb_format::{CURRENT_STORAGE_VERSION, catalog::{BlockCatalog, CheckpointContents}, envelope::ReplicaEnvelope, keys::block_key};
+use rtdb_format::{catalog::{BlockCatalog, CheckpointContents}, envelope::ReplicaEnvelope, keys::{CURRENT_STORAGE_VERSION, block_key}};
 use rtdb_node::{NodeOptions, ReadFence};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, read_owned_schema_catalog};
 use rtdb_replication::{BlockDiscovery, BlockStore, PublishedCheckpoint, RecoveredPartition, TermFence};

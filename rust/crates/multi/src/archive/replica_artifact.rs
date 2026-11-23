@@ -194,15 +194,15 @@ impl<'a> ReplicaArtifact<'a> {
     }
 
     fn manifest(&self) -> Result<ObjectKey> {
-        key(&format!("{}/manifest", self.prefix))
+        key(&format!("{}/manifest", self.prefix)).map_err(Into::into)
     }
 
     fn segment(&self, first: i64) -> Result<ObjectKey> {
-        key(&format!("{}/segments/{first:020}", self.prefix))
+        key(&format!("{}/segments/{first:020}", self.prefix)).map_err(Into::into)
     }
 
     fn payload(&self, offset: i64) -> Result<ObjectKey> {
-        key(&format!("{}/payloads/{offset:020}", self.prefix))
+        key(&format!("{}/payloads/{offset:020}", self.prefix)).map_err(Into::into)
     }
 
     async fn put(&self, object: &ObjectKey, plaintext: &[u8]) -> Result<[u8; 32]> {
