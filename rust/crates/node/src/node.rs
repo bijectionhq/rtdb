@@ -452,6 +452,27 @@ impl Node {
         Ok(current)
     }
 
+    /// Re-admit access to the databases of an already held catalog.
+    pub async fn admit_retained_catalog(
+        &self, catalog: &CatalogSnapshot, identity: &dyn SessionIdentity, cancellation: &CancellationToken,
+    ) -> Result<()> {
+        for name in catalog.database_names() {
+            self.admit(name, DatabaseAccess::Read, identity, cancellation).await?;
+            if let Some(fence) = &self.read_fence {
+                fence.confirm(name).await?;
+            }
+            let captured = catalog.database(name)?;
+            let current = self.catalog.database(name)?;
+            if !Arc::ptr_eq(&captured.storage, &current.storage) {
+                return Err(lost_placement(name));
+            }
+        }
+        if let Some(lease) = catalog.read_lease() {
+            lease.check()?;
+        }
+        Ok(())
+    }
+
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.query_context_in_placement(database, basis, identity, None, CatalogReadCut::Current, cancellation).await
     }

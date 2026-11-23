@@ -714,6 +714,7 @@ impl QueryCursor {
         Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows(Box::new(OwnedRows { rows: rows.into_iter(), reservation }))), context: context.execution_child(), sample, trace: None, query_span: None, plan_reservation: None })
     }
     pub fn schema(&self) -> &Schema { self.schema.schema() }
+    pub fn context(&self) -> &Arc<QueryContext> { &self.context }
     /// Batch fields derived from this execution's pinned catalog, before any rows are read.
     /// The advertised result fields remain available through `schema`.
     pub fn runtime_schema(&self) -> &Schema { self.runtime_schema.schema() }
