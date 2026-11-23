@@ -188,8 +188,8 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
-pub(crate) const READ_HELD_WORLD_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldChanges.v1";
-pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
+pub(crate) const READ_HELD_WORLD_CHANGES_V2: &str = "rtdb.owned.ReadHeldWorldChanges.v2";
+pub(crate) const HELD_OWNED_MERGED_CHANGES_V2: &str = "rtdb.owned.ReadHeldMergedChanges.v2";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
 pub(crate) const APPLY_HELD_EXPIRY_V1: &str = "rtdb.owned.ApplyHeldExpiry.v1";
 pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
@@ -1697,8 +1697,8 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
-        let (after, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = held.snapshot.merged_changes(&relations, after, limit)
+        let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
+        let page = held.snapshot.merged_changes_at(&relations, after, through, limit)
             .await.map_err(status)?;
         let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
@@ -1709,8 +1709,8 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World changes require a held world handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
-        let (after, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = held.snapshot.changes(&relations, after, limit).await.map_err(status)?;
+        let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
+        let page = held.snapshot.changes(&relations, after, through, limit).await.map_err(status)?;
         let reply = self.owned_merged_changes_reply(&page, held.snapshot.present())?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
@@ -1718,8 +1718,9 @@ impl Service {
 
     fn merged_changes_request(
         &self, call: &Call, request: &[u8],
-    ) -> Result<(Timestamp, usize, Vec<OwnedRelation>, Arc<MemoryReservation>), Status> {
+    ) -> Result<(Timestamp, Timestamp, usize, Vec<OwnedRelation>, Arc<MemoryReservation>), Status> {
         let (after, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Merged changes require an exclusive revision"))?;
+        let (through, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Merged changes require an inclusive upper revision"))?;
         let (limit, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Merged changes require a group limit"))?;
         let (count, mut rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Merged changes require a relation count"))?;
         let count = usize::from(u16::from_be_bytes(*count));
@@ -1734,7 +1735,8 @@ impl Service {
             rest = tail;
         }
         if !rest.is_empty() { return Err(invalid("Merged changes have trailing bytes")); }
-        Ok((Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*limit)), relations, charge))
+        Ok((Timestamp(i64::from_be_bytes(*after)), Timestamp(i64::from_be_bytes(*through)),
+            usize::from(u16::from_be_bytes(*limit)), relations, charge))
     }
 
     fn owned_merged_changes_reply(
@@ -1751,7 +1753,7 @@ impl Service {
             rtdb_columnar::to_field("changes", &changes_type).map_err(status)?,
         ]).with_metadata(std::collections::HashMap::from([
             (OWNED_PRESENT.into(), present.0.to_string()),
-            (OWNED_CHANGE_COVERAGE.into(), page.covered_through(present).map_err(status)?.0.to_string()),
+            (OWNED_CHANGE_COVERAGE.into(), page.covered_through().map_err(status)?.0.to_string()),
         ]));
         if page.commits.is_empty() {
             return self.owned_action_reply(&schema, None);
