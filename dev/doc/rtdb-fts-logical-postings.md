@@ -40,6 +40,8 @@ A separate forward page stores each field's revision, keyed by the accepted even
 Equivalent analyzed text shares a posting revision for the same field and entity.
 A forward witness must match the resolved event's identity before a posting can certify its score.
 Older revisions and absent witnesses can be checked by scoring the resolved primary row.
+A point read uses table history where a trie has it and reads only the routed primary pages of a trie that does not.
+Data written before table history therefore keeps entity-level reads instead of falling back to a table scan.
 Upgrade readers and compaction workers together with ingest writers when enabling this mode or upgrading an existing format 16 deployment.
 Older writers can discard the optional event identity and cannot reproduce the resulting compaction output at the same key.
 

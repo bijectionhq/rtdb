@@ -457,3 +457,40 @@ async fn a_ten_thousand_row_insert_commits_within_the_default_execution_budget()
     assert_eq!(fixture.rows("SELECT COUNT(*) FROM samples FOR ALL VALID_TIME", vec![]).await, [vec![Value::I64(10_000)]]);
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn point_reads_on_tries_without_table_history_agree_with_the_scan_and_open_no_file_scan() {
+    let mut fixture = Fixture::open().await;
+    fixture.commit("INSERT INTO docs (_id, v) VALUES (?, ?)", (0..2_000).map(|index| vec![Value::I64(index), Value::I64(index)]).collect()).await.unwrap();
+    fixture.flush().await;
+    fixture.commit("UPDATE docs SET v = -5 WHERE _id = 5", vec![]).await.unwrap();
+    let corrected = fixture.rows("SELECT _system_from FROM docs WHERE _id = 5", vec![]).await.remove(0).remove(0);
+    fixture.commit("DELETE FROM docs WHERE _id = 6", vec![]).await.unwrap();
+    fixture.flush().await;
+    let before_erase = fixture.rows("SELECT _system_from FROM docs WHERE _id = 8", vec![]).await.remove(0).remove(0);
+    fixture.commit("ERASE FROM docs WHERE _id = 7", vec![]).await.unwrap();
+    fixture.commit("INSERT INTO docs (_id, v) VALUES (7, 77)", vec![]).await.unwrap();
+    fixture.flush().await;
+    let database = fixture.node.catalog().database("xtdb").unwrap();
+    let table = TableRef::new("public", "docs");
+    assert!(database.trie_catalog().current_tries(&table).iter().all(|trie| trie.artefact(rtdb_format::entity_history::KIND,
+        rtdb_format::entity_history::ID, rtdb_format::entity_history::VERSION).is_none()));
+    for compacted in [false, true] {
+        if compacted { fixture.compact().await; }
+        for id in [5, 6, 7, 8, 1_999, 2_000] {
+            for (time, at) in [("", None), (" FOR SYSTEM_TIME AS OF ?", Some(&corrected)), (" FOR SYSTEM_TIME AS OF ?", Some(&before_erase))] {
+                let params = |id| at.map(|at| vec![(*at).clone(), Value::I64(id)]).unwrap_or_else(|| vec![Value::I64(id)]);
+                let point = format!("SELECT v FROM docs{time} WHERE _id = ?");
+                let oracle = format!("SELECT v FROM docs{time} WHERE _id = ? OR v = -999999");
+                assert_eq!(fixture.rows(&point, params(id)).await, fixture.rows(&oracle, params(id)).await, "{point} for {id} after compaction {compacted}");
+                let counters = fixture.counters(&point, params(id)).await;
+                assert!(counters["scan_files_used"] == 0 && counters["scan_pages_used"] <= 2,
+                    "{point} for {id} reads only the entity's pages: {counters:?}");
+            }
+        }
+    }
+    assert_eq!(fixture.rows("SELECT v FROM docs FOR SYSTEM_TIME AS OF ? WHERE _id = 7", vec![before_erase.clone()]).await, Vec::<Vec<Value>>::new(),
+        "an erase applies at an earlier system time");
+    assert_eq!(fixture.rows("SELECT v FROM docs FOR SYSTEM_TIME AS OF ? WHERE _id = 5", vec![corrected.clone()]).await, vec![vec![Value::I64(-5)]]);
+    fixture.close().await;
+}

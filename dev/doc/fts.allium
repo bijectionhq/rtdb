@@ -180,6 +180,9 @@ rule SearchJobRuns {
     -- The format 15 lane fills missing coverage and can replace committed singleton files with one pack independently of primary compaction.
     -- A format 16 writer seals a posting run over the table's accepted block extent and writes forward witnesses for the indexed fields.
     -- The table owns one entity history for each primary trie, shared by ordinary point reads and searches.
+    -- A point read takes a primary trie without entity history from the data pages its metadata routes the requested keys to, so older data narrows the read rather than sending it to a scan.
+    -- Gap nomination reads such a trie the same way, within the same inspection budget.
+    -- Histories that record different entity keys under one IID resolve through the scan.
     -- A forward witness identifies an event and a digest of the ordered analyzer token sequence for one field.
     -- A resolved event must identify itself before a forward witness can certify its score.
     -- A posting run records durable custody before uploading its immutable body.

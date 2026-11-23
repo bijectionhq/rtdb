@@ -164,6 +164,62 @@ async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<
     Ok((metadata, reservation))
 }
 
+/// The events of `keys`, or of every entity, in one primary trie, read from the data pages whose metadata path covers them.
+/// `None` once more than `max_rows` rows would be inspected.
+pub(crate) async fn primary_point_events(
+    request: &crate::ScanRequest<'_>, slug: &TableSlug, trie: &TrieKey, keys: Option<&BTreeSet<Iid>>, max_rows: usize,
+) -> Result<Option<Vec<crate::LocatedHistoryEvent<()>>>> {
+    let memory = request.memory;
+    let metadata_key = ObjectKey::new(slug.metadata_key(trie))?;
+    let (metadata, _metadata) = read_metadata(request.storage, &metadata_key, memory).await?;
+    let mut pages = BTreeSet::new();
+    let mut pending = metadata.root_index().map(|root| vec![(root, Vec::<u8>::new())]).unwrap_or_default();
+    while let Some((node, path)) = pending.pop() {
+        if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
+        audience_work::scan_items(1)?;
+        let (lower, upper) = path_range(&path)?;
+        if keys.is_some_and(|keys| keys.range(lower..=upper).next().is_none()) { continue; }
+        match &metadata.nodes()[node] {
+            MetadataNode::Nil => {}
+            MetadataNode::Leaf { data_page_index, .. } => { pages.insert(*data_page_index); }
+            MetadataNode::IidBranch(children) => for (bucket, child) in children.iter().enumerate() {
+                if let Some(child) = child { pending.push((*child, [path.as_slice(), &[bucket as u8]].concat())); }
+            },
+            MetadataNode::RecencyBranch(children) => for (_, child) in children { pending.push((*child, path.clone())); },
+        }
+    }
+    let mut file = DataFile { storage: Arc::clone(request.storage), key: ObjectKey::new(slug.data_key(trie))?, metadata: metadata_key, opened: None };
+    let mut events = Vec::new();
+    let mut inspected = 0usize;
+    for page in pages {
+        if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
+        let (batch, _charged) = match file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+            Some(held) => {
+                audience_work::decode_bytes(held.bound)?;
+                (held.batch.view().clone(), memory.reserve(held.bound)?)
+            }
+            None => {
+                let (batch, charge) = file.decode_page(page, memory).await?;
+                (EventBatch::new(batch)?, charge)
+            }
+        };
+        inspected = inspected.saturating_add(batch.len());
+        if inspected > max_rows { return Ok(None); }
+        let page = u32::try_from(page).map_err(|error| invalid("point-page", error))?;
+        for row in 0..batch.len() {
+            let iid = batch.iid(row)?;
+            if keys.is_some_and(|keys| !keys.contains(&iid)) { continue; }
+            audience_work::scan_items(1)?;
+            events.push(crate::LocatedHistoryEvent { header: batch.header(row)?, origin: batch.origin(row)?, witness: None,
+                location: crate::SearchRowLocation::Persisted { trie: trie.clone(), page,
+                    row: u32::try_from(row).map_err(|error| invalid("point-row", error))? } });
+        }
+    }
+    Ok(Some(events))
+}
+
+fn point_cancelled() -> Anomaly { Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.query/cancelled", "Primary point read cancelled") }
+
 fn page_buffer(bytes: CacheLease) -> Buffer {
     // A cached page must release the rest of a whole object when the query is done reading it.
     if bytes.is_partial_allocation() { Buffer::from(bytes.as_slice().to_vec()) }
@@ -2834,6 +2890,25 @@ mod tests {
             };
             assert_eq!(*store.reads.lock().unwrap(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn a_point_read_resolves_a_trie_without_table_history_from_its_selected_page() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let value = state.value();
+        assert!(value.trie_catalog().iter_tries(&table).all(|trie| trie.artefact(rtdb_format::entity_history::KIND,
+            rtdb_format::entity_history::ID, rtdb_format::entity_history::VERSION).is_none()));
+        let (mut scan, execution, _) = descriptor_scan(state.value().snapshot(), table, Arc::new(BufferPool::new(store, 1 << 20)));
+        let at = |micros| TemporalFilter::At(Expr::Literal(Value::Timestamp { value: micros, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }));
+        (scan.valid_time, scan.system_time) = (at(150), at(150));
+        scan.iids = Some([events[1].iid].into());
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected a projected Arrow column"); };
+        assert_eq!(array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().values().as_ref(), &[2]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        let counts = cursor.scan_counts().unwrap();
+        assert_eq!((counts.files_used, counts.pages_used, counts.rows_read), (0, 1, 1), "the point path reads one page and opens no scan");
     }
 
     #[tokio::test]

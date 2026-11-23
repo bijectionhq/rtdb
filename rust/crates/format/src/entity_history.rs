@@ -164,6 +164,12 @@ impl HistoryPage {
         })
     }
 
+    /// The event's complete entity key, recorded where its table keeps one.
+    pub fn entity_key(&self, row: usize) -> Option<&[u8]> {
+        let keys = self.0.column(7).as_any().downcast_ref::<arrow_array::BinaryArray>().expect("history key layout");
+        keys.is_valid(row).then(|| keys.value(row))
+    }
+
     pub fn event(&self, row: usize) -> Result<(EventHeader, Option<EventOrigin>)> {
         let time = |column: usize| Timestamp(self.0.column(column).as_primitive::<Int64Type>().value(row));
         let origins = self.0.column(6).as_any().downcast_ref::<FixedSizeBinaryArray>().expect("history origin layout");
