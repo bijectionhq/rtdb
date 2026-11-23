@@ -40,7 +40,6 @@ mod streams;
 
 type Item = HashMap<String, AttributeValue>;
 
-/// The partition key of the deployments and members tables, and the names table's pointer to its deployment.
 const NAME: &str = "name";
 const EPOCH: &str = "epoch";
 const HOLDER: &str = "holder";
@@ -526,7 +525,7 @@ impl DynamoDirectory {
         let put = if expected == 0 {
             put.condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME)
         } else {
-            put.condition_expression(EXACT_VERSION).expression_attribute_names("#v", if legacy { VERSION } else { LINEAGE_VERSION })
+            put.condition_expression("#v = :expected").expression_attribute_names("#v", if legacy { VERSION } else { LINEAGE_VERSION })
                 .expression_attribute_values(":expected", number(expected))
         };
         Ok(TransactWriteItem::builder().put(put.build().map_err(build_fault)?).build())

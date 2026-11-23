@@ -4,11 +4,21 @@ use ordered_logkeeper::ordered::{
 };
 
 pub(super) fn placement_matches(expected: Placement, observed: Placement) -> bool {
-    expected == observed
+    let Placement {
+        deployment,
+        incarnation,
+        group,
+        generation,
+    } = expected;
+    deployment.as_u128() == observed.deployment.as_u128()
+        && incarnation.as_u128() == observed.incarnation.as_u128()
+        && group.as_u128() == observed.group.as_u128()
+        && generation == observed.generation
 }
 
 pub(super) fn barrier_read_matches(invocation: RequestId, read: RequestId) -> bool {
-    invocation == read
+    let RequestId { nonce, expires_at } = invocation;
+    nonce.as_u128() == read.nonce.as_u128() && expires_at == read.expires_at
 }
 
 pub(super) fn disposal_is_due(eligible_at: Option<u64>, local_time: u64, route_time: u64) -> bool {
@@ -33,7 +43,18 @@ pub(super) fn scoped_request(
 }
 
 pub(super) fn same_writer(observed: Option<Grant>, local: Grant) -> bool {
-    observed == Some(local)
+    let Some(grant) = observed else {
+        return false;
+    };
+    let Grant {
+        enrollment: Enrollment { worker, serial },
+        epoch,
+        key_generation,
+    } = local;
+    grant.enrollment.worker.as_u128() == worker.as_u128()
+        && grant.enrollment.serial == serial
+        && grant.epoch == epoch
+        && grant.key_generation == key_generation
 }
 
 pub(super) fn barrier_command() -> Command {
