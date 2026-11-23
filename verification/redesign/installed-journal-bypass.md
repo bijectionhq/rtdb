@@ -51,17 +51,28 @@ Direct write access to raw directory tables, object media or key vaults is outsi
 Installations previously sharing a directory must establish the reservation on their existing canonical UUID before relying on this boundary.
 A conflict with a directory record is a provisioning error and requires a fresh deployment identity.
 
-| Claim | Positive observation in the native fixture | Negative control and failure site | Status |
-| --- | --- | --- | --- |
-| The directory has one authority per UUID and excludes a reservation from work discovery | The shared directory contract creates and updates a legacy row, reserves and retries an installed UUID and observes it absent from reads and inventory. The local restart test checks persistence. | Remove the installed-UUID test from the Memory insert, or write the Dynamo reservation outside the deployment primary key. The attempted colliding creation must fail the assertion in the contract. Remove persistence to fail the restart test. | Pending execution |
-| Hosted retirement cannot create a tombstone for an installed UUID | The installer refuses a valid disposal request for the reserved UUID and schedules one for a fresh directory UUID. | Remove the Memory insert exclusion. The test must observe `Scheduled` where it asserts `Refused`. | Pending execution |
-| Mixed-cell directory controls cannot act on a live journal holder | The writer-replacement fixture uses one directory for its workers and gateways, updates a legacy deployment, commits and reads over installed PGWire and Flight, and verifies eight refused control calls and the unchanged grant. | Route ordinary `Park` directly to the local park operation. The control test must observe `Done` where it asserts `Refused`. Restore the guard and repeat for `Flush` and compaction publication. | Pending execution |
-| Directory pressure eviction preserves an installed holder | The same live fixture takes the node above its memory-pressure threshold, runs directory reconciliation and checks the installed holding and grant. | Admit journal holdings into the pressure candidates. The missing directory row then sends the live holder through the detach path and the holding assertion fails. | Pending execution |
+The unmutated baseline ran on RTDB revision `7cd65e3695` and the controls ran on `443f539212`.
+The Directory baseline passed 46 tests with the `network` and `dynamodb` features enabled and an in-memory DynamoDB Local 3.3.2 endpoint.
+It exercised the shared contract against Memory, TCP and DynamoDB and checked that the local reservation survives a restart.
+The hosted-retirement and installed writer-replacement baselines also passed.
+The writer-replacement fixture exercised the mixed cell's legacy deployment, the installed PGWire and Flight paths, eight refused directory controls, and the installed holding and grant after pressure reconciliation.
 
-The guarded Rust runner refused the baseline at 11.2 GB free against its 12 GB floor.
-Zero baseline tests and zero negative controls ran in this workstream.
-The DynamoDB contract needs a configured DynamoDB Local endpoint as well as a successful build.
-The effect rows beyond these fixtures are inspected call paths and still need native probes for background compactor assignment, fragment rejection, stage and recovery, and reaper retries before they can carry an end-to-end verification claim.
+| Claim | Temporary mutation | Observed failure |
+| --- | --- | --- |
+| An installed UUID excludes directory creation | Remove the installed-UUID check from the Memory insert. | The Memory and TCP contracts received `Ok(DeploymentRecord)` where they expected `rtdb.directory/exists`. [Creation assertion](../../rust/crates/directory/src/contract.rs#L20) |
+| The local reservation survives restart | Record the installed UUID in memory without persisting it. | The reopened directory accepted the colliding deployment at the `unwrap_err()` assertion. [Restart assertion](../../rust/crates/directory/src/lib.rs#L1916) |
+| The DynamoDB reservation occupies the deployment primary key | Prefix the reservation key with `installed#`. | DynamoDB Local accepted the colliding deployment at the `unwrap_err()` assertion. [Creation assertion](../../rust/crates/directory/src/contract.rs#L20) |
+| Hosted retirement cannot create a tombstone for an installed UUID | Remove the installed-UUID check from the Memory insert. | The installer returned `Scheduled` where the fixture expected `Refused`. [Retirement assertion](../../rust/crates/multi/src/install.rs#L413) |
+| Ordinary `Park` cannot act on a journal holder | Dispatch ordinary `Park` directly to the local park operation. | The worker returned `Done` where the fixture expected `Refused` with `rtdb.multi/ordered-placement`. [Control assertion](../../rust/crates/multi/tests/ordered_journal.rs#L1429) |
+| Ordinary `Flush` cannot act on a journal holder | Dispatch ordinary `Flush` directly to the local flush operation. | The worker returned `Flushed` with a checkpoint at block 0 where the fixture expected `rtdb.multi/ordered-placement`. [Control assertion](../../rust/crates/multi/tests/ordered_journal.rs#L1429) |
+| Directory compaction publication cannot act on a journal holder | Remove the directory-route check from compaction publication and keep the node grant check. | The worker returned `Published { position: 1 }` where the fixture expected `rtdb.multi/ordered-placement`. [Control assertion](../../rust/crates/multi/tests/ordered_journal.rs#L1429) |
+| Directory pressure eviction preserves an installed holder | Admit journal holdings into the pressure candidates. | The local holding was `None` where the fixture expected the incumbent epoch. [Holding assertion](../../rust/crates/multi/tests/ordered_journal.rs#L1435) |
+
+Seven mutations produced nine failures at the declared assertions.
+Each probe enabled a single mutation in its process.
+The source changes used to build the probe binaries were restored.
+The remaining effect rows are source inspection.
+Background compactor assignment, fragment rejection, stage and recovery, and reaper retries still need native probes before they can carry an end-to-end verification claim.
 
 The C6 plan cites `find_held_publication` for forks and exports at a basis.
 Its production caller here is the directory suffix pin, which requires the directory record and refuses an installed name.
