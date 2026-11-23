@@ -93,8 +93,20 @@ pub(crate) fn checkpoint_storage_root() -> Result<String> {
     Ok(StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key())
 }
 
-pub(crate) fn checkpoint_transfer_object(record: &DeploymentRecord, operation: Uuid) -> String {
-    format!("{}/checkpoint-transfers/{operation}.v1", record.storage_prefix())
+fn checkpoint_transfer_prefix(record: &DeploymentRecord, operation: Uuid) -> String {
+    format!("{}/checkpoint-transfers/{operation}/v2", record.storage_prefix())
+}
+
+pub(crate) fn admits_checkpoint_transfer_object(
+    record: &DeploymentRecord, stage: &rtdb_directory::CheckpointStage, name: &str,
+) -> bool {
+    let prefix = checkpoint_transfer_prefix(record, stage.intent.operation);
+    if name == format!("{prefix}/manifest") { return true; }
+    name.strip_prefix(&format!("{prefix}/segments/")).is_some_and(|suffix| {
+        suffix.parse::<i64>().is_ok_and(|first| {
+            first > stage.checkpoint.boundary && suffix == format!("{first:020}")
+        })
+    })
 }
 
 fn digest(ciphertext: &[u8]) -> String {

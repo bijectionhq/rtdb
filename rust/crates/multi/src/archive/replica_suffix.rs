@@ -177,31 +177,23 @@ pub(super) async fn apply_archived(
     Ok(())
 }
 
-pub(super) async fn open_terminal_entries(
-    source: &DeploymentRecord, keys: &dyn KeyService, mut entries: Vec<ArchivedReplicaEntry>,
-) -> Result<Vec<ArchivedReplicaEntry>> {
-    if entries.is_empty() { return Ok(entries); }
-    let material = keys.existing_key(&source.key_id()).await?.ok_or_else(suffix_unavailable)?;
-    let cipher = Cipher::new(&material)?;
-    let scope = source.replica_seal_scope();
-    for entry in &mut entries {
-        entry.payload = cipher.open(&scope, &entry.payload)?;
-    }
-    Ok(entries)
+pub(super) struct TerminalReplicaCipher {
+    cipher: Cipher,
+    scope: String,
 }
 
-pub(super) fn terminal_source_through(
-    entries: &[ArchivedReplicaEntry], fence: &rtdb_directory::CheckpointTransferFence,
-) -> Result<i64> {
-    for entry in entries.iter().rev() {
-        if let Some(ReplicaBody::ResolvedTx(message)) = ReplicaFrame::decode(&entry.payload)?.message {
-            return message.src_msg_id.map(SourcePosition)
-                .map(|position| position.after_offset(StorageEpoch(fence.destination.source_log_epoch)))
-                .filter(|offset| *offset > fence.destination.checkpoint.source)
-                .ok_or_else(suffix_unavailable);
-        }
+impl TerminalReplicaCipher {
+    pub(super) async fn open(source: &DeploymentRecord, keys: &dyn KeyService) -> Result<Self> {
+        let material = keys.existing_key(&source.key_id()).await?.ok_or_else(suffix_unavailable)?;
+        Ok(Self { cipher: Cipher::new(&material)?, scope: source.replica_seal_scope() })
     }
-    Ok(fence.destination.checkpoint.source)
+
+    pub(super) fn open_page(&self, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
+        for entry in entries {
+            entry.payload = self.cipher.open(&self.scope, &entry.payload)?;
+        }
+        Ok(())
+    }
 }
 
 /// Exact replay coordinates retained while the terminal interval is read in
@@ -271,16 +263,6 @@ impl TerminalReplayProgress {
     }
 }
 
-/// Replay a complete in-memory target artifact under the same sequence rules.
-pub(super) fn apply_terminal(
-    entries: &[ArchivedReplicaEntry],
-    fence: &rtdb_directory::CheckpointTransferFence,
-    recovered: &mut rtdb_replication::RecoveredPartition,
-    memory: &Arc<rtdb_columnar::MemoryBudget>,
-) -> Result<()> {
-    TerminalReplayProgress::new(fence).apply_segment(entries, fence, recovered, memory)
-}
-
 /// Reopen the original certified source interval without accumulating its raw bytes.
 pub(super) async fn replay_certified_terminal(
     source: &DeploymentRecord, keys: &dyn KeyService, stream: &rtdb_logkeeper::StreamConfig,
@@ -294,18 +276,14 @@ pub(super) async fn replay_certified_terminal(
     }
     if let Some(certificate) = certificate {
         if certificate.interval != [first, through] { return Err(suffix_unavailable()); }
-        let material = keys.existing_key(&source.key_id()).await?.ok_or_else(suffix_unavailable)?;
-        let cipher = Cipher::new(&material)?;
-        let scope = source.replica_seal_scope();
+        let cipher = TerminalReplicaCipher::open(source, keys).await?;
         let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, certificate)?;
         while let Some(mut entries) = pages.next_page().await? {
             let bytes = entries.iter().try_fold(0usize, |total, entry|
                 total.checked_add(entry.payload.len().saturating_mul(2).saturating_add(64))
                     .ok_or_else(suffix_unavailable))?;
             let _charge = memory.reserve(bytes)?;
-            for entry in &mut entries {
-                entry.payload = cipher.open(&scope, &entry.payload)?;
-            }
+            cipher.open_page(&mut entries)?;
             progress.apply_segment(&entries, fence, recovered, memory)?;
         }
     }

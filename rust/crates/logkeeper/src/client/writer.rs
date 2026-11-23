@@ -274,12 +274,11 @@ async fn bootstrap_replica_page(
     }
 
     let missing = &entries[(next - first) as usize..];
-    for entry in missing {
+    if let Some(entry) = missing.first() {
         // Each append also establishes the peer's sync at this epoch. An
         // overlapping writer can only append next or fail and re-observe.
-        deposed_by(epoch, ensemble.overwrite(server, epoch, entry.lsn, vec![entry.clone()], true).await?)?;
-    }
-    if missing.is_empty() && sealed.synced != epoch {
+        deposed_by(epoch, ensemble.overwrite(server, epoch, entry.lsn, missing.to_vec(), true).await?)?;
+    } else if sealed.synced != epoch {
         if sealed.last_lsn > through { return Err(conflict()); }
         deposed_by(epoch, ensemble.overwrite(server, epoch, through + 1, Vec::new(), true).await?)?;
     }
