@@ -304,6 +304,21 @@ impl OwnedWorld {
         self.id != next.id && next.id == next.pin && self.shares_retained_archive(next)
     }
 
+    /// A retained child takes its own custody of the source's exact media.
+    pub fn can_retain_overlay(&self, next: &Self) -> bool {
+        let Some(overlay) = &next.ancestor else { return false; };
+        let same_overlay = match &self.ancestor {
+            Some(inherited) => self.mode == WorldClockMode::Retained && inherited == overlay,
+            None => matches!(self.mode, WorldClockMode::Held { .. })
+                && self.id.0 == overlay.world && self.pin.0 == overlay.pin && self.basis == overlay.source_root,
+        };
+        same_overlay && self.id != next.id && next.id == next.pin && !self.dropped && !next.dropped
+            && next.mode == WorldClockMode::Retained && next.until <= self.until
+            && self.capture == next.capture && self.suffix == next.suffix
+            && self.manifest == next.manifest && self.basis == next.basis
+            && self.parent_publication == next.parent_publication && self.schemas == next.schemas
+    }
+
     fn shares_retained_archive(&self, next: &Self) -> bool {
         self.ancestor.is_none() && next.ancestor.is_none() && self.pin != next.pin && !self.dropped && !next.dropped
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
@@ -446,6 +461,22 @@ mod tests {
         assert_eq!(child.initial_clock(), Timestamp(150));
 
         assert_eq!(child.inherited_basis().system_time, Timestamp(200));
+
+        let mut descendant = child.clone();
+        descendant.id = Iid([6; 16]);
+        descendant.pin = descendant.id;
+        descendant.until = Timestamp(250);
+        assert!(child.can_retain_overlay(&descendant));
+        assert_eq!(descendant.ancestor, child.ancestor);
+        descendant.ancestor.as_mut().unwrap().suffix = [7; 16];
+        assert!(!child.can_retain_overlay(&descendant));
+        descendant.ancestor = child.ancestor.clone();
+        descendant.until = Timestamp(301);
+        assert!(!child.can_retain_overlay(&descendant));
+        descendant.until = Timestamp(250);
+        child.dropped = true;
+        assert!(!child.can_retain_overlay(&descendant));
+        child.dropped = false;
 
         child.mode = WorldClockMode::Held { start: Timestamp(150) };
         assert!(OwnedWorld::from_record(&child.record()).is_err());

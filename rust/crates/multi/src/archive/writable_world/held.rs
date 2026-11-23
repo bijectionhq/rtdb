@@ -272,6 +272,13 @@ impl HeldCheckpointWorld {
     ) -> Result<rtdb_node::OwnedForkCut> {
         self.check()?;
         let cut = self.open.snapshot.fork_overlay_cut(scope, &self.open.record, system).await?;
+        if let Some(ancestor) = &self.open.record.ancestor {
+            let relations = self.open.record.schemas.relations().map(|(name, _)| OwnedRelation::new(name))
+                .collect::<Result<Vec<_>>>()?;
+            if self.preflight_accepted_scope(&relations, system).await? != ancestor.logical {
+                return Err(OwnedWorld::unavailable());
+            }
+        }
         self.check()?;
         Ok(cut)
     }
