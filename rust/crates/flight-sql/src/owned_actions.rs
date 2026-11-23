@@ -192,6 +192,7 @@ pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V3: &str = "rtdb.owned.ReadHeldWorldChanges.v3";
+pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V3: &str = "rtdb.owned.ReadHeldMergedChanges.v3";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
 pub(crate) const APPLY_HELD_EXPIRY_V1: &str = "rtdb.owned.ApplyHeldExpiry.v1";
@@ -1732,7 +1733,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_merged_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_merged_changes_action(&self, call: &Call, body: &[u8], descending: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Merged changes require a held read handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -1742,9 +1743,12 @@ impl Service {
             return Err(status(error));
         }
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = held.snapshot.merged_changes_at(&relations, after, through, limit)
-            .await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time)?;
+        let page = if descending {
+            held.snapshot.merged_changes_descending(&relations, after, through, limit).await
+        } else {
+            held.snapshot.merged_changes_at(&relations, after, through, limit).await
+        }.map_err(status)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time, descending)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
     }
@@ -1755,7 +1759,7 @@ impl Service {
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
         let page = held.snapshot.changes(&relations, after, through, limit).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present())?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), false)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
@@ -1784,7 +1788,7 @@ impl Service {
     }
 
     fn owned_merged_changes_reply(
-        &self, page: &rtdb_node::OwnedMergedChanges, present: Timestamp,
+        &self, page: &rtdb_node::OwnedMergedChanges, present: Timestamp, descending: bool,
     ) -> Result<ActionResult, Status> {
         use rtdb_types::{LogicalType, ScalarType};
 
@@ -1792,13 +1796,17 @@ impl Service {
             ("relation".into(), LogicalType::Scalar(ScalarType::Utf8)),
             ("touches".into(), owned_touches_type()),
         ])));
+        let mut metadata = std::collections::HashMap::from([
+            (OWNED_PRESENT.into(), present.0.to_string()),
+            (OWNED_CHANGE_COVERAGE.into(), page.covered_through().map_err(status)?.0.to_string()),
+        ]);
+        if descending {
+            metadata.insert("rtdb.owned.change_complete".into(), page.is_complete().to_string());
+        }
         let schema = Schema::new(vec![
             Field::new("revision", DataType::Int64, false),
             rtdb_columnar::to_field("changes", &changes_type).map_err(status)?,
-        ]).with_metadata(std::collections::HashMap::from([
-            (OWNED_PRESENT.into(), present.0.to_string()),
-            (OWNED_CHANGE_COVERAGE.into(), page.covered_through().map_err(status)?.0.to_string()),
-        ]));
+        ]).with_metadata(metadata);
         if page.commits.is_empty() {
             return self.owned_action_reply(&schema, None);
         }
