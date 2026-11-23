@@ -2123,6 +2123,25 @@ rule OpenHostedAppliedRead {
             Replied(session, unavailable: true)
 }
 
+rule ConfirmHostedAppliedControls {
+    when: HostedAppliedConfirmationRequested(holding, session, original, floor, controls, cutoff)
+
+    requires: original.session = session
+    requires: controls.all(CheckFromInstalledAllowlist)
+
+    ensures:
+        let current = CaptureAppliedCatalog(holding)
+        if CurrentCatalogLease(holding, current)
+           and CoversTransaction(current.basis, original.basis)
+           and CoversTransaction(current.basis, floor)
+           and MatchesControls(original, controls)
+           and MatchesControls(current, controls)
+           and Clock.now < cutoff:
+            HostedAppliedControlsConfirmed(session, basis: current.basis)
+        else:
+            Replied(session, unavailable: true)
+}
+
 rule ServeOnSubscriber {
     when: QueryArrived(subscription, query, session)
 

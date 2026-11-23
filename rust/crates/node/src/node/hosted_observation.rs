@@ -1,9 +1,50 @@
 use std::sync::Arc;
 
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttemptScope, Result, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttemptScope, Result, Timestamp, TransactionKey};
 
-use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis};
+use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction};
+use rtdb_query::QueryContext;
+
+fn unavailable() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Unavailable,
+        "rtdb.hosted/observation-unavailable",
+        "The original hosted dependency scope is unavailable",
+    )
+}
+
+fn confirmation_floor(original: TransactionKey, acknowledged: TransactionKey) -> Result<TransactionKey> {
+    if covers_transaction(acknowledged, original) {
+        Ok(acknowledged)
+    } else if covers_transaction(original, acknowledged) {
+        Ok(original)
+    } else {
+        Err(unavailable())
+    }
+}
+
+async fn compare_controls(
+    original: &Arc<QueryContext>,
+    current: &Arc<QueryContext>,
+    controls: &[HostedControlWrite],
+) -> Result<bool> {
+    for control in controls {
+        let observed = rtdb_query::read_hosted_control_point(
+            Arc::clone(original), control.table(), control.id(), false,
+        ).await?;
+        if observed.row.map(|(_, revision)| revision) != control.expected() {
+            return Err(unavailable());
+        }
+        let found = rtdb_query::read_hosted_control_point(
+            Arc::clone(current), control.table(), control.id(), false,
+        ).await?;
+        if found.row.map(|(_, revision)| revision) != control.expected() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 impl OwnedReadSession {
     /// Compare cumulative journal events from a live held Root against a single
@@ -17,13 +58,6 @@ impl OwnedReadSession {
     ) -> Result<Option<Timestamp>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
-        let unavailable = || {
-            Anomaly::new(
-                AnomalyCategory::Unavailable,
-                "rtdb.hosted/observation-unavailable",
-                "The original hosted dependency scope is unavailable",
-            )
-        };
         let until = witnesses
             .iter()
             .fold(until.min(self.witness_until), |bound, witness| {
@@ -103,32 +137,90 @@ impl OwnedReadSession {
                 return Ok(None);
             }
         }
-        for control in controls {
-            let observed = rtdb_query::read_hosted_control_point(
-                Arc::clone(&self.context),
-                control.table(),
-                control.id(),
-                false,
-            )
-            .await?;
-            if observed.row.map(|(_, revision)| revision) != control.expected() {
-                return Err(unavailable());
-            }
-            let found = rtdb_query::read_hosted_control_point(
-                Arc::clone(&context),
-                control.table(),
-                control.id(),
-                false,
-            )
-            .await?;
-            if found.row.map(|(_, revision)| revision) != control.expected() {
-                return Ok(None);
-            }
+        if !compare_controls(&self.context, &context, controls).await? {
+            return Ok(None);
         }
         purge_guard()?;
         if self.node.now() >= until || head.system_time >= until {
             return Err(unavailable());
         }
         Ok(Some(head.system_time))
+    }
+
+    /// Validate a held read's original controls on one newly captured
+    /// applied catalog of the same recovered hosted attachment.
+    pub async fn confirm_applied_hosted_controls(
+        &self,
+        scope: PlacedAttemptScope,
+        floor: TransactionKey,
+        until: Timestamp,
+        controls: &[HostedControlWrite],
+    ) -> Result<Option<TransactionKey>> {
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope)
+            || self.node.now() >= until
+            || controls.is_empty()
+            || controls.iter().any(|control| !control.is_check() || control.scope() != scope)
+        {
+            return Err(unavailable());
+        }
+        let original = self.context.catalog.database(&self.database)?;
+        let [original] = original.partitions.as_slice() else {
+            return Err(unavailable());
+        };
+        if original.tx_basis() != Some(self.present) {
+            return Err(unavailable());
+        }
+        let attachment = self.node.attached_database(&self.database, Some(&self.attachment))?;
+        if attachment.await_authority.codec().map(|codec| codec.scope()) != Some(scope) {
+            return Err(unavailable());
+        }
+        let minimum = confirmation_floor(self.present, floor)?;
+        let basis = QueryBasis {
+            snapshot: TimeBasis::default(),
+            snapshot_time: None,
+            current_time: self.node.query_instant(),
+            timezone: self.context.timezone.clone(),
+        };
+        let current = self.node.query_context_in_placement(
+            &self.database, &basis, self.identity.as_ref(), Some(&self.attachment),
+            CatalogReadCut::HostedApplied(minimum), &self.cancellation,
+        ).await?;
+        let database = current.catalog.database(&self.database)?;
+        let [captured] = database.partitions.as_slice() else {
+            return Err(unavailable());
+        };
+        let head = captured.tx_basis().filter(|head| head.system_time < until)
+            .ok_or_else(unavailable)?;
+        let matches = compare_controls(&self.context, &current, controls).await?;
+        self.check()?;
+        current.check_cancelled()?;
+        if self.node.now() >= until {
+            return Err(unavailable());
+        }
+        Ok(matches.then_some(head))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_types::TxId;
+
+    fn cut(offset: i64, time: i64) -> TransactionKey {
+        TransactionKey { tx_id: TxId(offset), system_time: Timestamp(time) }
+    }
+
+    #[test]
+    fn confirmation_requires_both_floors_in_the_same_order() {
+        let original = cut(3, 5);
+        let later = cut(4, 8);
+        assert_eq!(confirmation_floor(original, original).unwrap(), original);
+        assert_eq!(confirmation_floor(original, later).unwrap(), later);
+        assert_eq!(confirmation_floor(later, original).unwrap(), later);
+        for divergent in [cut(3, 8), cut(4, 5), cut(4, 2)] {
+            assert!(confirmation_floor(original, divergent).is_err());
+        }
     }
 }

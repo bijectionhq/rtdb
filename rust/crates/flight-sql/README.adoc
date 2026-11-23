@@ -264,6 +264,15 @@ Its result uses the same held handle and cut format.
 The selected transaction must equal that floor or advance both coordinates in the same history.
 The node uses its maintained catalog lease and refuses an unapplied floor or expired lease without waiting for a new log position.
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
+
+`rtdb.owned.ConfirmAppliedHosted.v1` takes the 16-byte original held handle, the two floor coordinates above, an exclusive signed big-endian i64 Unix microsecond cutoff, and the normal hosted control groups.
+Every control must be a check from the placed attachment's installed allowlist.
+The node checks the supplied revisions and absences in the original hold and in one newly captured applied catalog at or above both floors.
+Success returns the newly captured transaction ID and time as two signed big-endian i64 values.
+A changed control returns one zero byte.
+The node refuses unproven cuts and checks the physical clock again before returning.
+This action appends no transaction and authorizes no write.
+
 Governed data pages carry a complete typed `_entity_key` on put, delete, and erase events. A native point seeks the canonical IID bucket and resolves only its exact key.
 Older governed pages without the key require a reset. Compaction resolves each complete key independently inside an IID bucket. Covered search and ordered paths use complete identities.
 

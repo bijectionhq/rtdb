@@ -21,6 +21,7 @@ impl Service {
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_COUNTED_V2 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::CONFIRM_APPLIED_HOSTED_V1 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V1 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V2 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),

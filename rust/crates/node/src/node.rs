@@ -94,6 +94,11 @@ enum CatalogReadCut {
     HostedApplied(TransactionKey),
 }
 
+fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
+    selected == floor
+        || (selected.tx_id > floor.tx_id && selected.system_time > floor.system_time)
+}
+
 #[derive(Clone)]
 pub struct Node {
     catalog: Arc<DatabaseCatalog>,
@@ -424,8 +429,7 @@ impl Node {
                 CatalogReadCut::HostedApplied(minimum) => {
                     crate::read_currency::require_current(&name, lease.as_deref())?;
                     let snapshot = database.partition.snapshot();
-                    let selected = snapshot.tx_basis().filter(|selected| *selected == minimum
-                        || (selected.tx_id > minimum.tx_id && selected.system_time > minimum.system_time))
+                    let selected = snapshot.tx_basis().filter(|selected| covers_transaction(*selected, minimum))
                         .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-below-floor",
                             "The local applied catalog does not cover the caller's transaction floor"))?;
                     applied = Some(selected);
