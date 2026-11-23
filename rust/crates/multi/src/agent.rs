@@ -24,21 +24,21 @@ use crate::hosted_recovery::{ReplicaTrimPlan, replay_start};
 
 enum SuffixCut<'a> {
     Tip(TransactionKey),
-    HeldPublication(&'a rtdb_node::OwnedForkCut),
+    HeldPublication(&'a rtdb_node::OwnedForkCut, &'a dyn crate::keys::KeyService),
 }
 
 impl SuffixCut<'_> {
     fn time(&self) -> rtdb_types::Timestamp {
         match self {
             Self::Tip(key) => key.system_time,
-            Self::HeldPublication(cut) => cut.basis(),
+            Self::HeldPublication(cut, _) => cut.basis(),
         }
     }
 
     fn matches(&self, key: TransactionKey) -> bool {
         match self {
             Self::Tip(expected) => *expected == key,
-            Self::HeldPublication(cut) => cut.matches_basis(key),
+            Self::HeldPublication(cut, _) => cut.matches_basis(key),
         }
     }
 }
@@ -590,9 +590,9 @@ impl NodeAgent {
 
     pub(crate) async fn pin_held_fork_suffix(
         &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
-        capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, expires_at_ms: i64,
+        capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, keys: &dyn crate::keys::KeyService, expires_at_ms: i64,
     ) -> Result<CheckpointSuffixPin> {
-        self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::HeldPublication(cut), expires_at_ms)
+        self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::HeldPublication(cut, keys), expires_at_ms)
             .await
     }
 
@@ -621,7 +621,7 @@ impl NodeAgent {
             {
                 return Err(unavailable());
             }
-            if let SuffixCut::HeldPublication(cut) = &cutoff {
+            if let SuffixCut::HeldPublication(cut, _) = &cutoff {
                 let expected = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
                 if !cut.is_publication() || cut.scope() != expected
                     || expires_at_ms > cut.until().0.div_euclid(1000)
@@ -650,7 +650,7 @@ impl NodeAgent {
                 && prior.checkpoint == checkpoint && cutoff.matches(prior.basis)
                 && (match &cutoff {
                     SuffixCut::Tip(_) => prior.expires_at_ms == expires_at_ms,
-                    SuffixCut::HeldPublication(_) => prior.expires_at_ms > now_ms() && prior.expires_at_ms <= expires_at_ms,
+                    SuffixCut::HeldPublication(..) => prior.expires_at_ms > now_ms() && prior.expires_at_ms <= expires_at_ms,
                 })
                 && prior.incarnation == record.incarnation && prior.log_epoch == record.log_epoch && prior.writer_epoch == epoch
             {
@@ -670,16 +670,14 @@ impl NodeAgent {
             && applied.tx_key.is_some_and(|head| {
                 match &cutoff {
                     SuffixCut::Tip(basis) => head == *basis,
-                    SuffixCut::HeldPublication(_) => head.system_time >= cutoff.time(),
+                    SuffixCut::HeldPublication(..) => head.system_time >= cutoff.time(),
                 }
             })
         ).ok_or_else(unavailable)?;
         let log_epoch = StorageEpoch(record.log_epoch);
         let replica_through = installed.replica.after_offset(log_epoch);
         let source_through = installed.source.after_offset(log_epoch);
-        if replica_through <= checkpoint.boundary || source_through <= checkpoint.source
-            || replica_through.saturating_sub(checkpoint.boundary) > crate::archive::MAX_SUFFIX_ENTRIES as i64
-        {
+        if replica_through <= checkpoint.boundary || source_through <= checkpoint.source {
             return Err(unavailable());
         }
 
@@ -696,23 +694,17 @@ impl NodeAgent {
             if let SuffixCut::Tip(basis) = &cutoff {
                 return Ok::<_, Anomaly>((*basis, replica_through, source_through, proof));
             }
-            // Discovery reads a bounded quorum-certified applied interval. Its
+            // Discovery streams the quorum-certified applied interval. Its
             // target is the original held publication, not the driver tip.
-            let _charge = self.node.memory().reserve(crate::archive::MAX_SUFFIX_BYTES * 2)?;
-            let entries = rtdb_logkeeper::copy_certified_range(
-                &stream, &proof, crate::archive::MAX_SUFFIX_BYTES, crate::archive::MAX_SUFFIX_ENTRIES,
-            ).await?;
-            let SuffixCut::HeldPublication(cut) = &cutoff else { return Err(unavailable()); };
+            let _charge = self.node.memory().reserve(32 << 20)?;
+            let SuffixCut::HeldPublication(cut, keys) = &cutoff else { return Err(unavailable()); };
             let (basis, replica, source) = crate::archive::find_held_publication(
-                &entries, cut, epoch, log_epoch,
-            )?;
+                &stream, &proof, &record, *keys, cut,
+            ).await?;
             if source <= checkpoint.source || source > source_through || replica > replica_through {
                 return Err(unavailable());
             }
             let prefix = rtdb_logkeeper::certify_committed_range(&stream, first_replica, replica).await?;
-            let count = usize::try_from(replica - first_replica + 1).map_err(|_| unavailable())?;
-            let prefix_entries = entries.get(..count).ok_or_else(unavailable)?;
-            rtdb_logkeeper::verify_certified_range(&prefix, prefix_entries)?;
             Ok((basis, replica, source, prefix))
         };
         let (basis, replica_through, source_through, proof) = tokio::time::timeout(

@@ -67,7 +67,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
         admin::administration_stream,
         archive::{archive_lifetime_floors_digest, replica_suffix, stage::{RegionPublication, with_region}},
     };
-    use super::transfer_artifact::{TransferArtifact, TransferSegments};
+    use super::super::replica_artifact::{ReplicaArtifact, CertifiedSegments};
 
     let (source, capture, org) = selector.source.as_ref()
         .ok_or_else(|| inconsistent("Transfer replay requires the authenticated original source"))?;
@@ -116,9 +116,9 @@ pub(crate) async fn verify_checkpoint_transfer_target(
             },
             |current, _, region| async move {
                 let bucket = storage.bucket(region).await?;
-                let artifact = TransferArtifact::open(bucket.as_ref(), keys, &current, held_terminal).await?;
+                let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &current, held_terminal).await?;
                 if let Some(prior) = current.checkpoint_transfer_bootstrap.as_deref() {
-                    artifact.read_manifest(prior).await?;
+                    artifact.read_manifest(prior.ciphertext_sha256).await?;
                     return Ok(prior.ciphertext_sha256);
                 }
                 let (mut recovered, _, pool, memory, options) =
@@ -132,7 +132,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                     let certificate = rtdb_logkeeper::JournalDigest::from_digest_bytes(
                         source.stream("replica"), [first, held_terminal.replica_through], digest,
                     );
-                    let mut segments = TransferSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
+                    let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                     let source_cipher = replica_suffix::TerminalReplicaCipher::open(source, keys).await?;
                     while let Some(mut entries) = segments.next().await? {
                         let first = entries.first().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
@@ -198,7 +198,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     use crate::{admin::{choose_ensemble, replica_servers}, archive::stage::with_region};
     use rtdb_directory::CheckpointTransferReplica;
     use rtdb_storage::log::LogOffset;
-    use super::transfer_artifact::{TransferArtifact, require_chain};
+    use super::super::replica_artifact::{ReplicaArtifact, require_chain};
 
     let bootstrap = verify_checkpoint_transfer_target(
         Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
@@ -225,8 +225,8 @@ pub(crate) async fn seed_checkpoint_transfer_target(
         owner, keys, &target_id, storage, hosted_task.as_ref(), None, None, admit_target,
         |target, _, region| async move {
             let bucket = storage.bucket(region).await?;
-            let artifact = TransferArtifact::open(bucket.as_ref(), keys, &target, terminal).await?;
-            let expected = artifact.read_manifest(ordered).await?;
+            let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &target, terminal).await?;
+            let expected = artifact.read_manifest(ordered.ciphertext_sha256).await?;
             let start = transfer_first(stage)?;
             let through = terminal.replica_through;
             let mut next = start;

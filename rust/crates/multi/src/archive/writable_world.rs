@@ -173,7 +173,23 @@ async fn copy_fork_suffix(
     let suffix = Uuid::from_bytes(id);
     let expires_at_ms = deadline.0.div_euclid(1000)
         .min(rtdb_directory::now_ms().saturating_add(60_000));
-    let pin = agent.pin_held_fork_suffix(&source.name, deployment, suffix, capture, cut, expires_at_ms).await?;
+    let pin = super::stage::with_region(
+        directory.as_ref(), keys, &source.id, archive, hosted_task, Some(capture), None,
+        |current| {
+            require_capture_open(current, capture)?;
+            let selected = current.checkpoint_captures.get(&capture)
+                .filter(|selected| {
+                    current.incarnation == source.incarnation && current.log_epoch == source.log_epoch
+                        && source.checkpoint_captures.get(&capture) == Some(*selected)
+                }).ok_or_else(OwnedWorld::unavailable)?;
+            Ok(Some(crate::hosted_recovery::replay_start(current, selected.checkpoint.boundary)?))
+        },
+        |_, _, _| async {
+            agent.pin_held_fork_suffix(
+                &source.name, deployment, suffix, capture, cut, keys, expires_at_ms,
+            ).await
+        },
+    ).await?;
     replica_suffix::capture(directory, archive, keys, hosted_task, deployment, suffix, pin).await?;
     Ok((capture, Some(suffix)))
 }

@@ -3,7 +3,7 @@ use std::{iter::Peekable, vec::IntoIter};
 use bytes::Bytes;
 use prost::Message;
 use ring::digest::{Context, SHA256};
-use rtdb_directory::{CheckpointTransferBootstrap, CheckpointTransferTerminal, DeploymentRecord};
+use rtdb_directory::{CheckpointTransferTerminal, DeploymentRecord};
 use rtdb_logkeeper::{ArchivedReplicaEntry, CertifiedRangeReader};
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::Result;
@@ -19,41 +19,59 @@ use crate::{
 
 const MAX_RECEIPT_BYTES: usize = 16 << 10;
 
-pub(super) struct TransferArtifact<'a> {
+pub(super) struct ReplicaArtifact<'a> {
     store: &'a dyn ObjectStore,
     cipher: Cipher,
     prefix: String,
     receipt: Bytes,
+    chain_domain: &'static [u8],
 }
 
-impl<'a> TransferArtifact<'a> {
-    pub(super) async fn open(
+impl<'a> ReplicaArtifact<'a> {
+    pub(super) async fn open_transfer(
         store: &'a dyn ObjectStore,
         keys: &dyn KeyService,
         record: &DeploymentRecord,
         terminal: &CheckpointTransferTerminal,
     ) -> Result<Self> {
         let receipt = encode(terminal)?;
-        if receipt.len() > MAX_RECEIPT_BYTES {
-            return Err(inconsistent(
-                "The terminal receipt exceeds the bootstrap bound",
-            ));
-        }
         let material = keys
             .existing_key(&record.key_id())
             .await?
             .ok_or_else(|| unavailable("The original target media key is unavailable"))?;
+        Self::new(
+            store,
+            &material,
+            checkpoint_transfer_prefix(record, terminal.fence.destination.intent.operation),
+            receipt,
+            b"RTDB checkpoint transfer segments v2\0",
+        )
+    }
+
+    pub(super) fn new(
+        store: &'a dyn ObjectStore,
+        key: &[u8],
+        prefix: String,
+        receipt: Bytes,
+        chain_domain: &'static [u8],
+    ) -> Result<Self> {
+        if receipt.len() > MAX_RECEIPT_BYTES {
+            return Err(inconsistent(
+                "The replica archive receipt exceeds its bound",
+            ));
+        }
         Ok(Self {
             store,
-            cipher: Cipher::new(&material)?,
-            prefix: checkpoint_transfer_prefix(record, terminal.fence.destination.intent.operation),
+            cipher: Cipher::new(key)?,
+            prefix,
             receipt,
+            chain_domain,
         })
     }
 
     pub(super) fn chain(&self) -> Context {
         let mut digest = Context::new(&SHA256);
-        digest.update(b"RTDB checkpoint transfer segments v2\0");
+        digest.update(self.chain_domain);
         digest.update(&sha256(&self.receipt));
         digest
     }
@@ -81,7 +99,7 @@ impl<'a> TransferArtifact<'a> {
     ) -> Result<Vec<ArchivedReplicaEntry>> {
         let object = self.segment(first)?;
         let sealed = self
-            .read(&object, replica_suffix::MAX_SUFFIX_BYTES + SEALED_OVERHEAD)
+            .read(&object, replica_suffix::MAX_SEGMENT_BYTES + SEALED_OVERHEAD)
             .await?;
         let entries = replica_suffix::decode(self.cipher.open(object.as_str(), &sealed)?)?;
         let through = require_dense(&entries, first, terminal)?;
@@ -97,23 +115,20 @@ impl<'a> TransferArtifact<'a> {
         self.put(&object, &body).await
     }
 
-    pub(super) async fn read_manifest(
-        &self,
-        bootstrap: &CheckpointTransferBootstrap,
-    ) -> Result<[u8; 32]> {
+    pub(super) async fn read_manifest(&self, expected_digest: [u8; 32]) -> Result<[u8; 32]> {
         let object = self.manifest()?;
         let sealed = self
             .read(&object, 32 + self.receipt.len() + SEALED_OVERHEAD)
             .await?;
-        if sha256(&sealed) != bootstrap.ciphertext_sha256 {
+        if sha256(&sealed) != expected_digest {
             return Err(inconsistent(
-                "The target bootstrap differs from its ordered digest",
+                "The replica archive differs from its ordered digest",
             ));
         }
         let opened = self.cipher.open(object.as_str(), &sealed)?;
         if opened.get(32..) != Some(self.receipt.as_ref()) {
             return Err(inconsistent(
-                "The target-key artifact names another terminal receipt",
+                "The replica archive names another exact receipt",
             ));
         }
         opened[..32].try_into().map_err(|_| bad_segment())
@@ -136,7 +151,14 @@ impl<'a> TransferArtifact<'a> {
 
     async fn put(&self, object: &ObjectKey, plaintext: &[u8]) -> Result<[u8; 32]> {
         let sealed = self.cipher.seal_deterministic(object.as_str(), plaintext)?;
-        crate::archive::stage::put_exact(self.store, object, sealed.clone()).await?;
+        match self.store.head_fresh(object).await {
+            Ok(prior) if prior.size == sealed.len() as u64 => (),
+            Ok(_) => return Err(bad_segment()),
+            Err(rtdb_storage::Error::MissingObject(_)) => {
+                self.store.put(object, sealed.clone()).await?
+            }
+            Err(error) => return Err(error.into()),
+        }
         let current = self
             .store
             .observe_fresh_exact(object, sealed.len())
@@ -144,7 +166,7 @@ impl<'a> TransferArtifact<'a> {
             .value;
         if current != sealed {
             return Err(inconsistent(
-                "The target replay artifact changed before receipt ordering",
+                "The replay artifact changed before receipt ordering",
             ));
         }
         Ok(sha256(&sealed))
@@ -161,12 +183,12 @@ impl<'a> TransferArtifact<'a> {
     }
 }
 
-pub(super) struct TransferSegments {
+pub(super) struct CertifiedSegments {
     reader: CertifiedRangeReader,
     page: Peekable<IntoIter<ArchivedReplicaEntry>>,
 }
 
-impl TransferSegments {
+impl CertifiedSegments {
     pub(super) fn new(reader: CertifiedRangeReader) -> Self {
         Self {
             reader,
@@ -179,7 +201,7 @@ impl TransferSegments {
     pub(super) async fn next(&mut self) -> Result<Option<Vec<ArchivedReplicaEntry>>> {
         let mut entries = Vec::new();
         let mut encoded_bytes = 128;
-        while entries.len() < replica_suffix::MAX_SUFFIX_ENTRIES {
+        while entries.len() < replica_suffix::MAX_SEGMENT_ENTRIES {
             if self.page.peek().is_none() {
                 let Some(page) = self.reader.next_page().await? else {
                     break;
@@ -191,7 +213,7 @@ impl TransferSegments {
             };
             // Reserve the length delimiter and existing segment format header.
             let next_size = encoded_bytes + entry.encoded_len() + 10;
-            if next_size > replica_suffix::MAX_SUFFIX_BYTES {
+            if next_size > replica_suffix::MAX_SEGMENT_BYTES {
                 if entries.is_empty() {
                     return Err(bad_segment());
                 }
@@ -207,7 +229,7 @@ impl TransferSegments {
 pub(super) fn require_chain(chain: Context, expected: [u8; 32]) -> Result<()> {
     if chain.finish().as_ref() != expected.as_slice() {
         return Err(inconsistent(
-            "The target segments differ from the ordered bootstrap manifest",
+            "The replica segments differ from the ordered archive manifest",
         ));
     }
     Ok(())
@@ -217,7 +239,7 @@ fn require_dense(entries: &[ArchivedReplicaEntry], first: i64, terminal: i64) ->
     let through = entries.last().ok_or_else(bad_segment)?.lsn;
     if through > terminal
         || through == i64::MAX
-        || entries.len() > replica_suffix::MAX_SUFFIX_ENTRIES
+        || entries.len() > replica_suffix::MAX_SEGMENT_ENTRIES
         || entries
             .iter()
             .enumerate()
@@ -235,5 +257,5 @@ fn extend_chain(chain: &mut Context, first: i64, through: i64, digest: &[u8; 32]
 }
 
 fn bad_segment() -> rtdb_types::Anomaly {
-    inconsistent("The target replay segment has another interval or exceeds its bound")
+    inconsistent("The replica segment has another interval or exceeds its bound")
 }

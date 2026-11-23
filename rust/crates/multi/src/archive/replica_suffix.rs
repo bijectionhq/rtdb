@@ -1,5 +1,6 @@
 //! Copy an admitted replica suffix into the checkpoint capture's key custody.
 
+use base64::Engine as _;
 use bytes::Bytes;
 use prost::Message;
 use rtdb_directory::{CheckpointSuffixPin, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
@@ -14,9 +15,10 @@ use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use super::{
-    CapturePoint, capture_receipt, digest, inconsistent, read_object, require_capture_open,
+    CapturePoint, URL_SAFE_NO_PAD, capture_receipt, encode, inconsistent, read_object, require_capture_open,
     unavailable, verified_archive, verify_cut,
 };
+use super::replica_artifact::{CertifiedSegments, ReplicaArtifact, require_chain};
 use super::stage::{RegionPublication, with_region};
 use crate::{
     admin::{administration_stream, update_installation},
@@ -27,31 +29,37 @@ use crate::{
 };
 use rtdb_storage::ObjectStore;
 
-pub(crate) const MAX_SUFFIX_BYTES: usize = 8 << 20;
-pub(crate) const MAX_SUFFIX_ENTRIES: usize = 4096;
+pub(crate) const MAX_SEGMENT_BYTES: usize = 8 << 20;
+pub(crate) const MAX_SEGMENT_ENTRIES: usize = 4096;
 const FORMAT: &[u8] = b"rtdb.replica-suffix.v1\0";
 
 /// Resolve the original accepted publication to its complete transaction and
 /// journal cut inside a previously quorum-certified applied interval.
-pub(crate) fn find_held_publication(
-    entries: &[ArchivedReplicaEntry], cut: &rtdb_node::OwnedForkCut,
-    writer_epoch: u64, log_epoch: StorageEpoch,
+pub(crate) async fn find_held_publication(
+    stream: &rtdb_logkeeper::StreamConfig, proof: &JournalDigest,
+    record: &DeploymentRecord, keys: &dyn KeyService, cut: &rtdb_node::OwnedForkCut,
 ) -> Result<(TransactionKey, i64, i64)> {
+    let cipher = TerminalReplicaCipher::open(record, keys).await?;
+    let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, proof)?;
+    let log_epoch = StorageEpoch(record.log_epoch);
     let mut selected = None;
-    for entry in entries {
-        let Some(ReplicaBody::ResolvedTx(row)) = ReplicaFrame::decode(&entry.payload)?.message
-        else { continue; };
-        if row.system_time_micros != Some(cut.basis().0) { continue; }
-        let basis = TransactionKey {
-            tx_id: TxId(row.tx_id.ok_or_else(suffix_unavailable)?),
-            system_time: cut.basis(),
-        };
-        let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
-        if entry.epoch != writer_epoch || !row.committed.unwrap_or(false)
-            || !cut.matches_basis(basis) || row.db_op.is_some() || row.external_source_token.is_some()
-            || source < 0 || selected.replace((basis, entry.lsn, source)).is_some()
-        {
-            return Err(suffix_unavailable());
+    while let Some(mut entries) = pages.next_page().await? {
+        cipher.open_page(&mut entries)?;
+        for entry in entries {
+            let Some(ReplicaBody::ResolvedTx(row)) = ReplicaFrame::decode(&entry.payload)?.message
+            else { continue; };
+            if row.system_time_micros != Some(cut.basis().0) { continue; }
+            let basis = TransactionKey {
+                tx_id: TxId(row.tx_id.ok_or_else(suffix_unavailable)?),
+                system_time: cut.basis(),
+            };
+            let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
+            if !(1..=record.epoch).contains(&entry.epoch) || !row.committed.unwrap_or(false)
+                || !cut.matches_basis(basis) || row.db_op.is_some() || row.external_source_token.is_some()
+                || source < 0 || selected.replace((basis, entry.lsn, source)).is_some()
+            {
+                return Err(suffix_unavailable());
+            }
         }
     }
     selected.ok_or_else(suffix_unavailable)
@@ -84,28 +92,40 @@ pub(crate) async fn capture(
                 let root_bytes = read_object(&files, &root, root_object).await?;
                 let catalog = BlockCatalog::decode(&cipher.open(root.as_str(), &root_bytes)?)?;
                 verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
-                let object = key(&format!("{prefix}/replica-suffix/{pin_id}.v1"))?;
-                let certificate = JournalDigest::from_digest_bytes(
-                    record.stream("replica"), pin.journal_interval, pin.journal_sha256,
-                );
+                let stream_name = record.stream("replica");
+                let artifact = suffix_artifact(bucket.as_ref(), &material, deployment, pin_id, pin, &stream_name)?;
 
                 let digest = if let Some(expected) = &pin.archive_sha256 {
-                    let sealed = read_sealed(bucket.as_ref(), &object, expected).await?;
-                    let plain = cipher.open(object.as_str(), &sealed)?;
-                    validate_records(&decode(plain)?, pin, &certificate, &catalog)?;
+                    artifact.read_manifest(archive_digest(expected)?).await?;
                     expected.clone()
                 } else {
                     let stream = administration_stream(directory.as_ref(), &record, 4 << 20).await?;
+                    let certificate = JournalDigest::from_digest_bytes(
+                        stream_name, pin.journal_interval, pin.journal_sha256,
+                    );
                     let remaining = pin.expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
-                    let entries = tokio::time::timeout(Duration::from_millis(remaining),
-                        rtdb_logkeeper::copy_certified_range(&stream, &certificate, MAX_SUFFIX_BYTES, MAX_SUFFIX_ENTRIES),
-                    ).await.map_err(|_| suffix_unavailable())??;
-                    validate_records(&entries, pin, &certificate, &catalog)?;
-                    let sealed = cipher.seal_deterministic(object.as_str(), &encode_records(&entries)?)?;
-                    let digest = digest(&sealed);
-                    bucket.put(&object, sealed).await?;
-                    read_sealed(bucket.as_ref(), &object, &digest).await?;
-                    digest
+                    let materialize = async {
+                        let cipher = TerminalReplicaCipher::open(&record, keys).await?;
+                        let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
+                        let mut progress = SuffixProgress::new(pin, &catalog)?;
+                        let mut chain = artifact.chain();
+                        while let Some(mut entries) = segments.next().await? {
+                            let first = entries.first().ok_or_else(suffix_unavailable)?.lsn;
+                            let through = entries.last().ok_or_else(suffix_unavailable)?.lsn;
+                            // Do not let provisional data occupy a segment key. The full
+                            // interval proof must also match before sealing the manifest.
+                            let segment = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
+                            rtdb_logkeeper::verify_certified_range(&segment, &entries)?;
+                            cipher.open_page(&mut entries)?;
+                            progress.apply_segment(&entries, pin, |_| Ok(()))?;
+                            artifact.put_segment(&entries, &mut chain).await?;
+                        }
+                        progress.finish(pin)?;
+                        artifact.put_manifest(chain).await
+                    };
+                    let digest = tokio::time::timeout(Duration::from_millis(remaining), materialize)
+                        .await.map_err(|_| suffix_unavailable())??;
+                    URL_SAFE_NO_PAD.encode(digest)
                 };
                 update_installation(directory.as_ref(), id, |current| {
                     let (_, prior) = admit(current, archive, deployment, pin_id, selected)?;
@@ -148,25 +168,19 @@ pub(super) async fn apply_archived(
     pin: &CheckpointSuffixPin, material: &[u8; crate::keys::KEY_BYTES],
     recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
 ) -> Result<()> {
-    let object = key(&format!("checkpoint-captures/{deployment}/{}/replica-suffix/{suffix}.v1", pin.capture))?;
     let expected = pin.archive_sha256.as_deref().ok_or_else(suffix_unavailable)?;
-    let bytes = bucket.head_fresh(&object).await?.size;
-    if bytes > MAX_SUFFIX_BYTES as u64 + 1024 { return Err(suffix_unavailable()); }
-    let charge = usize::try_from(bytes).ok().and_then(|size| size.checked_mul(4))
-        .and_then(|size| size.checked_add(4096 + MAX_SUFFIX_ENTRIES * 128)).ok_or_else(suffix_unavailable)?;
-    let _charge = memory.reserve(charge)?;
-    let sealed = read_sealed(bucket, &object, expected).await?;
-    let cipher = Cipher::new(material)?;
-    let plaintext = cipher.open(object.as_str(), &sealed)?;
-    let entries = decode(plaintext)?;
-    let certificate = JournalDigest::from_digest_bytes(stream, pin.journal_interval, pin.journal_sha256);
+    let artifact = suffix_artifact(bucket, material, deployment, suffix, pin, &stream)?;
+    let expected = artifact.read_manifest(archive_digest(expected)?).await?;
     let catalog = recovered.block.as_ref().ok_or_else(suffix_unavailable)?;
-    validate_records(&entries, pin, &certificate, catalog)?;
-    for entry in entries {
-        if let Some(ReplicaBody::ResolvedTx(message)) = ReplicaFrame::decode(&entry.payload)?.message {
-            recovered.apply_archived_transaction(&message, memory)?;
-        }
+    let mut progress = SuffixProgress::new(pin, catalog)?;
+    let mut chain = artifact.chain();
+    while progress.next <= pin.replica_through {
+        let _charge = memory.reserve(MAX_SEGMENT_BYTES * 4 + 4096 + MAX_SEGMENT_ENTRIES * 128)?;
+        let entries = artifact.read_segment(progress.next, pin.replica_through, &mut chain).await?;
+        progress.apply_segment(&entries, pin, |message| recovered.apply_archived_transaction(message, memory))?;
     }
+    progress.finish(pin)?;
+    require_chain(chain, expected)?;
     let epoch = StorageEpoch(pin.log_epoch);
     if recovered.progress.tx_key != Some(pin.basis)
         || recovered.progress.source_position.after_offset(epoch) != pin.source_through
@@ -175,6 +189,27 @@ pub(super) async fn apply_archived(
         return Err(suffix_unavailable());
     }
     Ok(())
+}
+
+fn suffix_artifact<'a>(
+    bucket: &'a dyn ObjectStore, material: &[u8], deployment: Uuid, suffix: Uuid,
+    pin: &CheckpointSuffixPin, stream: &str,
+) -> Result<ReplicaArtifact<'a>> {
+    let mut identity = pin.clone();
+    // A retry can renew the live pin. The immutable archive proves the
+    // journal cut itself independently of that authorization deadline.
+    identity.expires_at_ms = 0;
+    identity.writer_epoch = 0;
+    identity.archive_sha256 = None;
+    ReplicaArtifact::new(
+        bucket, material, format!("checkpoint-captures/{deployment}/{}/replica-suffix/{suffix}/v2", pin.capture),
+        encode(&(stream, identity))?, b"RTDB checkpoint suffix segments v2\0",
+    )
+}
+
+fn archive_digest(expected: &str) -> Result<[u8; 32]> {
+    let decoded = URL_SAFE_NO_PAD.decode(expected).map_err(|_| suffix_unavailable())?;
+    decoded.try_into().map_err(|_| suffix_unavailable())
 }
 
 pub(super) struct TerminalReplicaCipher {
@@ -326,14 +361,6 @@ fn admit<'a>(
     Ok((point, pin))
 }
 
-async fn read_sealed(bucket: &dyn ObjectStore, object: &rtdb_storage::ObjectKey, expected: &str) -> Result<Bytes> {
-    let size = bucket.head_fresh(object).await?.size;
-    if size > MAX_SUFFIX_BYTES as u64 + 1024 { return Err(suffix_unavailable()); }
-    let sealed = bucket.get_range(object, 0..size).await?;
-    if sealed.len() as u64 != size || digest(&sealed) != expected { return Err(suffix_unavailable()); }
-    Ok(sealed)
-}
-
 fn suffix_unavailable() -> Anomaly {
     unavailable("The exact replica suffix cannot be materialized")
 }
@@ -342,64 +369,121 @@ pub(super) fn encode_records(entries: &[ArchivedReplicaEntry]) -> Result<Vec<u8>
     let mut out = FORMAT.to_vec();
     for entry in entries {
         entry.encode_length_delimited(&mut out).map_err(|_| suffix_unavailable())?;
-        if out.len() > MAX_SUFFIX_BYTES { return Err(suffix_unavailable()); }
+        if out.len() > MAX_SEGMENT_BYTES { return Err(suffix_unavailable()); }
     }
     Ok(out)
 }
 
 pub(super) fn decode(mut bytes: Bytes) -> Result<Vec<ArchivedReplicaEntry>> {
-    if bytes.len() > MAX_SUFFIX_BYTES || !bytes.starts_with(FORMAT) { return Err(suffix_unavailable()); }
+    if bytes.len() > MAX_SEGMENT_BYTES || !bytes.starts_with(FORMAT) { return Err(suffix_unavailable()); }
     bytes = bytes.slice(FORMAT.len()..);
     let mut entries = Vec::new();
     while !bytes.is_empty() {
-        if entries.len() == MAX_SUFFIX_ENTRIES { return Err(suffix_unavailable()); }
+        if entries.len() == MAX_SEGMENT_ENTRIES { return Err(suffix_unavailable()); }
         entries.push(ArchivedReplicaEntry::decode_length_delimited(&mut bytes).map_err(|_| suffix_unavailable())?);
     }
     Ok(entries)
 }
 
-fn validate_records(
-    entries: &[ArchivedReplicaEntry], pin: &CheckpointSuffixPin,
-    certificate: &JournalDigest, catalog: &BlockCatalog,
-) -> Result<()> {
-    rtdb_logkeeper::verify_certified_range(certificate, entries)?;
-    let log_epoch = StorageEpoch(pin.log_epoch);
-    let mut tx = catalog.latest_completed_tx().ok_or_else(suffix_unavailable)?;
-    let mut source = pin.checkpoint.source;
-    let mut position = None;
-    for entry in entries {
-        if tx == pin.basis { return Err(suffix_unavailable()); }
-        let body = ReplicaFrame::decode(&entry.payload)?;
-        let sequence = body.term_sequence.filter(|sequence| sequence.0 >= 0).ok_or_else(suffix_unavailable)?;
-        if entry.epoch != pin.writer_epoch || body.term.0 <= 0
-            || position.is_some_and(|(term, prior): (_, i64)| body.term != term || prior.checked_add(1) != Some(sequence.0))
+/// The logical partition advances across replica segments independently of
+/// checkpoint boundaries. The archive needs the resolved facts and the
+/// exact original transaction and source coordinates.
+struct SuffixProgress {
+    next: i64,
+    tx: TransactionKey,
+    source: i64,
+    block: i64,
+    block_source: i64,
+    writer_epoch: Option<u64>,
+    fence: rtdb_replication::TermFence,
+}
+
+impl SuffixProgress {
+    fn new(pin: &CheckpointSuffixPin, catalog: &BlockCatalog) -> Result<Self> {
+        let tx = catalog.latest_completed_tx().ok_or_else(suffix_unavailable)?;
+        if tx.system_time.0 != pin.checkpoint.system_time
+            || pin.checkpoint.boundary.checked_add(1) != Some(pin.journal_interval[0])
+            || pin.journal_interval[1] != pin.replica_through
+            || pin.replica_through == i64::MAX
         {
             return Err(suffix_unavailable());
         }
-        position = Some((body.term, sequence.0));
-        match body.message {
-            Some(ReplicaBody::ResolvedTx(row)) if row.db_op.is_none() && row.external_source_token.is_none() => {
-                let id = row.tx_id.ok_or_else(suffix_unavailable)?;
-                let time = Timestamp(row.system_time_micros.ok_or_else(suffix_unavailable)?);
-                let offset = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
-                if id <= tx.tx_id.0 || time <= tx.system_time || offset <= source
-                    || id > pin.basis.tx_id.0 || time > pin.basis.system_time || offset > pin.source_through
-                {
-                    return Err(suffix_unavailable());
-                }
-                tx = TransactionKey { tx_id: TxId(id), system_time: time };
-                source = offset;
-            }
-            Some(ReplicaBody::BlockUploaded(upload)) if upload.block_index == Some(pin.checkpoint.block)
-                && upload.storage_epoch == Some(pin.log_epoch)
-                && upload.latest_processed_msg_id.map(SourcePosition).map(|pos| pos.after_offset(log_epoch)) == Some(pin.checkpoint.source)
-                && upload.external_source_token.is_none() => (),
-            Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none() => (),
-            _ => return Err(suffix_unavailable()),
-        }
+        Ok(Self {
+            next: pin.journal_interval[0], tx, source: pin.checkpoint.source,
+            block: pin.checkpoint.block, block_source: pin.checkpoint.source, writer_epoch: None,
+            fence: rtdb_replication::TermFence::from_catalog(catalog)?,
+        })
     }
-    if tx != pin.basis || source != pin.source_through { return Err(suffix_unavailable()); }
-    Ok(())
+
+    fn apply_segment(
+        &mut self, entries: &[ArchivedReplicaEntry], pin: &CheckpointSuffixPin,
+        mut apply: impl FnMut(&rtdb_format::log::proto::ResolvedTx) -> Result<()>,
+    ) -> Result<()> {
+        let log_epoch = StorageEpoch(pin.log_epoch);
+        for entry in entries {
+            if entry.lsn != self.next || entry.lsn > pin.replica_through || self.tx == pin.basis
+                || !(1..=pin.writer_epoch).contains(&entry.epoch)
+                || self.writer_epoch.is_some_and(|prior| prior > entry.epoch)
+            {
+                return Err(suffix_unavailable());
+            }
+            let body = ReplicaFrame::decode(&entry.payload)?;
+            if body.term.0 <= 0 || body.term_sequence.is_none_or(|sequence| sequence.0 < 0) {
+                return Err(suffix_unavailable());
+            }
+            let admission = self.fence.admit(body.term, body.term_sequence)?;
+            if admission.verdict != rtdb_replication::Verdict::Apply
+                || (admission.opens_term() && !matches!(&body.message,
+                    Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none()))
+            {
+                return Err(suffix_unavailable());
+            }
+            self.writer_epoch = Some(entry.epoch);
+            self.next = entry.lsn.checked_add(1).ok_or_else(suffix_unavailable)?;
+            match body.message {
+                Some(ReplicaBody::ResolvedTx(row)) if row.db_op.is_none() && row.external_source_token.is_none() => {
+                    let id = row.tx_id.ok_or_else(suffix_unavailable)?;
+                    let time = Timestamp(row.system_time_micros.ok_or_else(suffix_unavailable)?);
+                    let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
+                    if id <= self.tx.tx_id.0 || time <= self.tx.system_time || source <= self.source
+                        || id > pin.basis.tx_id.0 || time > pin.basis.system_time || source > pin.source_through
+                    {
+                        return Err(suffix_unavailable());
+                    }
+                    apply(&row)?;
+                    self.tx = TransactionKey { tx_id: TxId(id), system_time: time };
+                    self.source = source;
+                }
+                Some(ReplicaBody::BlockBoundary(boundary))
+                    if boundary.block_index.is_some_and(|block| block >= self.block) => (),
+                Some(ReplicaBody::BlockUploaded(upload)) if upload.storage_epoch == Some(pin.log_epoch)
+                    && upload.external_source_token.is_none() => {
+                    let block = upload.block_index.ok_or_else(suffix_unavailable)?;
+                    let source = upload.latest_processed_msg_id.map(SourcePosition)
+                        .map(|pos| pos.after_offset(log_epoch)).ok_or_else(suffix_unavailable)?;
+                    if block < self.block || source < self.block_source || source > self.source
+                        || (block == self.block && source != self.block_source)
+                    {
+                        return Err(suffix_unavailable());
+                    }
+                    self.block = block;
+                    self.block_source = source;
+                }
+                Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none() => (),
+                _ => return Err(suffix_unavailable()),
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, pin: &CheckpointSuffixPin) -> Result<()> {
+        if self.next.checked_sub(1) != Some(pin.replica_through)
+            || self.tx != pin.basis || self.source != pin.source_through
+        {
+            return Err(suffix_unavailable());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
