@@ -53,6 +53,7 @@ struct Placement { name: String, attachment: Weak<Database> }
 pub(crate) struct AudienceSession {
     pub source: Uuid,
     pub cache: Arc<CacheBudget>,
+    pub expires_at: tokio::time::Instant,
     pub _permit: OwnedSemaphorePermit,
 }
 
@@ -74,6 +75,11 @@ impl Session {
         }
     }
     pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|audience| audience.source) }
+
+    pub fn audience_remaining_micros(&self) -> Option<u64> {
+        let remaining = self.audience.as_ref()?.expires_at.saturating_duration_since(tokio::time::Instant::now());
+        u64::try_from(remaining.as_micros()).ok().filter(|remaining| *remaining > 0)
+    }
 
     pub fn audience_read(&self, handle: &Bytes) -> Option<Arc<OwnedReadResource>> {
         let state = self.state.lock().expect("session lock");
@@ -171,6 +177,8 @@ impl Session {
 fn placement_changed() -> Status { Status::unavailable("This node no longer holds the Flight SQL session's deployment") }
 
 impl Leased for Session {
+    fn hard_deadline(&self) -> Option<tokio::time::Instant> { self.audience.as_ref().map(|audience| audience.expires_at) }
+
     fn close(&self) {
         let state = std::mem::replace(&mut *self.state.lock().expect("session lock"), SessionState::Closed);
         if let SessionState::Open { connections, audience_read, .. } = state {

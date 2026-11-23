@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Duration};
 use arrow_flight::{self as flight, flight_service_server::FlightService, sql::{Any, Command, ProstMessageExt, TicketStatementQuery}};
 use bytes::Bytes;
 use futures::Stream;
@@ -181,7 +181,11 @@ impl Service {
             }
             let session = match sessions.lookup(&id.to_owned(), true) {
                 Lookup::Found(session) => session,
-                Lookup::Expired(after) => return Err(session_error(bearer.is_some(), format!("session expired after {} idle", crate::lease::duration(after)))),
+                Lookup::Expired(after) => {
+                    let message = if audience_source.is_some() { "audience session expired".into() }
+                        else { format!("session expired after {} idle", crate::lease::duration(after)) };
+                    return Err(session_error(bearer.is_some(), message));
+                }
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
@@ -232,7 +236,8 @@ impl Service {
             let audience_slot = audience.zip(audience_source).map(|(audience, source)| {
                 let permit = Arc::clone(&audience.session_slots).try_acquire_owned()
                     .map_err(|_| Status::resource_exhausted("Flight audience session slots are occupied"))?;
-                Ok::<_, Status>(AudienceSession { source, cache: Arc::clone(&audience.cache), _permit: permit })
+                let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
+                Ok::<_, Status>(AudienceSession { source, cache: Arc::clone(&audience.cache), expires_at, _permit: permit })
             }).transpose()?;
             let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_slot, memory.reserve(capacity).map_err(status)?));
             sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;

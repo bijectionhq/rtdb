@@ -66,6 +66,8 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let remaining = native.prepare_applied_owned_reads(&floor).await.map_err(status)?;
+        let lease = call.session.audience_remaining_micros().ok_or_else(|| Status::unavailable("The audience session expired during catalog preparation"))?;
+        let remaining = remaining.min(lease);
         Ok(ActionResult { body: Bytes::copy_from_slice(&remaining.to_be_bytes()) })
     }
 

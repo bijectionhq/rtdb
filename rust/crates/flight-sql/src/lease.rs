@@ -3,7 +3,10 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::Clock;
 use rtdb_types::{Anomaly, Result, Timestamp};
 
-pub(crate) trait Leased: Send + Sync { fn close(&self); }
+pub(crate) trait Leased: Send + Sync {
+    fn close(&self);
+    fn hard_deadline(&self) -> Option<tokio::time::Instant> { None }
+}
 struct Live<V> { value: Arc<V>, since: Timestamp, limit: Duration, idle: Duration, users: usize, _reservation: Arc<MemoryReservation> }
 enum Entry<V> { Live(Live<V>), Expired { at: Timestamp, after: Duration, _reservation: Arc<MemoryReservation> } }
 pub(crate) enum Lookup<V> { Found(Arc<V>), Expired(Duration), Unknown }
@@ -64,10 +67,11 @@ impl<K: Ord + Clone, V: Leased> Registry<K, V> {
     }
 }
 fn elapsed(since: Timestamp, now: Timestamp) -> Duration { Duration::from_micros(now.0.saturating_sub(since.0).max(0) as u64) }
-/// Expires an idle live entry past its limit, reporting whether it did.
+/// Expires a live entry at its absolute ceiling or its idle limit.
 fn expire<V: Leased>(entry: &mut Entry<V>, now: Timestamp) -> bool {
     if let Entry::Live(live) = entry {
-        if live.users == 0 && elapsed(live.since, now) >= live.limit {
+        let ceiling_elapsed = live.value.hard_deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+        if ceiling_elapsed || live.users == 0 && elapsed(live.since, now) >= live.limit {
             live.value.close();
             *entry = Entry::Expired { at: now, after: live.limit, _reservation: Arc::clone(&live._reservation) };
             return true;
@@ -97,6 +101,21 @@ mod tests {
     impl Clock for TestClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
     struct Resource(AtomicUsize);
     impl Leased for Resource { fn close(&self) { self.0.fetch_add(1, Ordering::Relaxed); } }
+    #[test]
+    fn an_expired_hard_deadline_closes_even_an_acquired_resource() {
+        struct Expired(Resource, tokio::time::Instant);
+        impl Leased for Expired {
+            fn close(&self) { self.0.close(); }
+            fn hard_deadline(&self) -> Option<tokio::time::Instant> { Some(self.1) }
+        }
+        let registry = Registry::new(Arc::new(TestClock(AtomicI64::new(0))), MemoryBudget::new(4096));
+        let resource = Arc::new(Expired(Resource(AtomicUsize::new(0)), tokio::time::Instant::now()));
+        registry.insert(1, resource.clone(), Duration::from_secs(30), Duration::from_secs(1), true, 8).unwrap();
+        assert!(matches!(registry.lookup(&1, false), Lookup::Expired(_)));
+        registry.release(&1);
+        assert_eq!(registry.len(), 0);
+        assert_eq!(resource.0.0.load(Ordering::Relaxed), 1);
+    }
     #[test]
     fn acquired_session_survives_idle_deadline_and_release_restarts_first_limit() {
         let clock = Arc::new(TestClock(AtomicI64::new(0))); let memory = MemoryBudget::new(4096);
