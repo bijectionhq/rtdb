@@ -4,6 +4,7 @@ use std::{
 };
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_text::{Corpus, Query, Scorer};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};

@@ -593,7 +593,7 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, selected: Timestamp, after: Timestamp,
         through: Timestamp, limit: usize, reverse: bool,
     ) -> Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)> {
-        if self.ancestor().is_none_or(|(_, cap)| cap != selected) {
+        if self.ancestor().is_none_or(|(_, cap)| cap.system_time != selected) {
             return Err(OwnedWorld::unavailable());
         }
         let (result, witness) = self.read_ancestor(
