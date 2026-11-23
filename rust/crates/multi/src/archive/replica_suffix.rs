@@ -305,7 +305,7 @@ pub(super) fn encode_records(entries: &[ArchivedReplicaEntry]) -> Result<Vec<u8>
     Ok(out)
 }
 
-fn decode(mut bytes: Bytes) -> Result<Vec<ArchivedReplicaEntry>> {
+pub(super) fn decode(mut bytes: Bytes) -> Result<Vec<ArchivedReplicaEntry>> {
     if bytes.len() > MAX_SUFFIX_BYTES || !bytes.starts_with(FORMAT) { return Err(suffix_unavailable()); }
     bytes = bytes.slice(FORMAT.len()..);
     let mut entries = Vec::new();

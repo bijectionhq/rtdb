@@ -166,6 +166,24 @@ pub async fn copy_retained(source: StreamConfig, destination: StreamConfig, epoc
     Ok(())
 }
 
+/// Seeds a reserved fresh stream above a durable checkpoint boundary. The
+/// offsets, entry epochs, timestamps and payloads are kept intact.
+pub async fn bootstrap_committed(
+    config: &StreamConfig, epoch: u64, checkpoint: LogOffset, entries: &[crate::protocol::Entry],
+) -> rtdb_types::Result<()> {
+    validate(config)?;
+    if epoch == 0 || checkpoint.0 < -1 || entries.len() > 4096
+        || checkpoint.0.checked_add(entries.len() as i64 + 1).is_none()
+        || entries.iter().enumerate().any(|(offset, entry)|
+            entry.lsn != checkpoint.0 + 1 + offset as i64 || entry.epoch == 0
+                || entry.epoch > epoch || entry.payload.len() > config.maximum_message_bytes)
+    {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/bootstrap", "The replica genesis does not follow its checkpoint"));
+    }
+    Writer::bootstrap_committed(&Ensemble::new(config.clone()), epoch, checkpoint.0, entries).await?;
+    Ok(())
+}
+
 /// Reads committed entries from whichever reachable server has the highest commit lsn, failing over on error.
 pub async fn open_reader(config: StreamConfig, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
     validate(&config)?;

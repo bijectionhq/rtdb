@@ -216,6 +216,178 @@ pub(crate) async fn verify_checkpoint_transfer_target(
     }).await
 }
 
+/// Provision the reserved target replica journals from the ordered
+/// target-key artifact. The stage remains held after the quorum commit.
+pub(crate) async fn seed_checkpoint_transfer_target(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+) -> Result<rtdb_directory::CheckpointTransferReplica> {
+    use crate::{
+        admin::{choose_ensemble, replica_servers},
+        archive::{checkpoint_transfer_object, encode, replica_suffix, sha256, stage::with_region},
+        cipher::Cipher,
+        reference::key,
+    };
+    use rtdb_directory::CheckpointTransferReplica;
+    use rtdb_storage::log::LogOffset;
+
+    let bootstrap = verify_checkpoint_transfer_target(
+        Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
+    ).await?;
+    let terminal = &bootstrap.terminal;
+    let stage = &terminal.fence.destination;
+    let target_id = stage.intent.destination.to_string();
+    let source = directory.deployment(&stage.intent.source.to_string()).await?
+        .filter(|record| record.checkpoint_transfer_terminal.as_deref() == Some(terminal))
+        .ok_or_else(|| inconsistent("The original terminal source receipt changed"))?;
+    let admit_target = |record: &rtdb_directory::DeploymentRecord| {
+        if record.lifecycle != Lifecycle::Restoring || record.holder.is_some()
+            || record.checkpoint_stage.as_deref() != Some(stage)
+            || record.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
+            || record.checkpoint_transfer_bootstrap.as_deref() != Some(&bootstrap)
+        {
+            return Err(inconsistent("The target no longer holds this ordered bootstrap"));
+        }
+        Ok(None)
+    };
+    let (target, entries) = with_region(
+        directory.as_ref(), keys, &target_id, storage, hosted_task.as_ref(), None, None, admit_target,
+        |record, _, region| {
+            let bootstrap = &bootstrap;
+            async move {
+                let object = key(&checkpoint_transfer_object(&record, stage.intent.operation))?;
+                let bucket = storage.bucket(region).await?;
+                let size = usize::try_from(bucket.head_fresh(&object).await?.size)
+                    .ok().filter(|size| *size <= replica_suffix::MAX_SUFFIX_BYTES + (16 << 10) + 64)
+                    .ok_or_else(|| inconsistent("The ordered bootstrap exceeds its storage bound"))?;
+                let sealed = bucket.observe_fresh_exact(&object, size).await?.value;
+                if sha256(&sealed) != bootstrap.ciphertext_sha256 {
+                    return Err(inconsistent("The target-key artifact differs from the ordered digest"));
+                }
+                let key = keys.existing_key(&record.key_id()).await?
+                    .ok_or_else(|| unavailable("The original target media key is unavailable"))?;
+                let cipher = Cipher::new(&key)?;
+                let opened = cipher.open(object.as_str(), &sealed)?;
+                let receipt = encode(terminal)?;
+                let length = (receipt.len() as u32).to_be_bytes();
+                if opened.get(..4) != Some(length.as_slice()) || opened.get(4..4 + receipt.len()) != Some(receipt.as_ref()) {
+                    return Err(inconsistent("The target-key artifact names another terminal receipt"));
+                }
+                let mut entries = replica_suffix::decode(opened.slice(4 + receipt.len()..))?;
+                let through = entries.last().map_or(stage.checkpoint.boundary, |entry| entry.lsn);
+                if through != terminal.replica_through
+                    || replica_suffix::terminal_source_through(&entries, &terminal.fence)? != terminal.source_through
+                {
+                    return Err(inconsistent("The target replica artifact has another terminal boundary"));
+                }
+                let scope = record.replica_seal_scope();
+                for entry in &mut entries {
+                    entry.payload = cipher.seal_deterministic(&scope, &entry.payload)?;
+                }
+                Ok((record, entries))
+            }
+        },
+    ).await?;
+
+    let reserved = if let Some(existing) = target.checkpoint_transfer_replica.as_deref() {
+        existing.clone()
+    } else {
+        let mut allocated = target.clone();
+        allocated.ensemble = choose_ensemble(directory.as_ref(), &target, source.ensemble.len()).await?;
+        let journals = replica_servers(directory.as_ref(), &allocated).await?;
+        directory.reserve_checkpoint_transfer_replica(&CheckpointTransferReplica {
+            bootstrap: bootstrap.clone(), ensemble: allocated.ensemble, journals,
+        }).await?
+    };
+    if reserved.bootstrap != bootstrap {
+        return Err(inconsistent("The reserved target replica belongs to another bootstrap"));
+    }
+    let stream = rtdb_logkeeper::StreamConfig {
+        servers: reserved.journals.clone(), stream: target.stream("replica"),
+        write_quorum: crate::deployment::write_quorum(reserved.journals.len()),
+        maximum_message_bytes: 4 << 20,
+    };
+    // The source transaction IDs and term sequences are in the already
+    // authenticated payload, and remain unchanged by the target log seal.
+    rtdb_logkeeper::bootstrap_committed(
+        &stream, terminal.fence.fenced_writer_epoch, LogOffset(stage.checkpoint.boundary), &entries,
+    ).await?;
+    if let Some(first) = entries.first() {
+        let proof = rtdb_logkeeper::certify_committed_range(&stream, first.lsn, terminal.replica_through).await?;
+        rtdb_logkeeper::verify_certified_range(&proof, &entries)?;
+    }
+    Ok(reserved)
+}
+
+/// Activate only a still-held target after its exact replica seed and serving
+/// root have both been observed through their production recovery owners.
+pub(crate) async fn activate_checkpoint_transfer_target(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+) -> Result<rtdb_directory::CheckpointTransferActivation> {
+    use crate::{
+        archive::{checkpoint_storage_root, recovery_manifest_sha256, stage::with_region},
+        packing::PackDiscovery,
+        reference::key,
+        store::{EncryptingStore, ROOT_MARKER, open_deployment_store, wall_clock},
+    };
+    use rtdb_directory::CheckpointTransferActivation;
+
+    let target_id = selector.destination.to_string();
+    let target = directory.deployment(&target_id).await?
+        .ok_or_else(|| unavailable("The checkpoint transfer target is unavailable"))?;
+    if let Some(accepted) = target.checkpoint_transfer_activation.as_deref() {
+        let stage = &accepted.replica.bootstrap.terminal.fence.destination;
+        if stage.intent.destination != selector.destination || stage.intent.operation != selector.operation
+            || stage.staged_manifest_sha256.as_deref() != Some(selector.manifest_sha256.as_str())
+            || !selector.source.as_ref().is_some_and(|(source, capture, org)|
+                *source == stage.intent.source && *capture == stage.intent.capture && *org == stage.intent.org)
+        {
+            return Err(inconsistent("The target already activated another transfer"));
+        }
+        return Ok(accepted.clone());
+    }
+    let replica = seed_checkpoint_transfer_target(
+        Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
+    ).await?;
+    let terminal = &replica.bootstrap.terminal;
+    let stage = &terminal.fence.destination;
+    let recovery_manifest_sha256 = with_region(
+        directory.as_ref(), keys, &target_id, storage, hosted_task.as_ref(), None, None,
+        |record| {
+            if record.lifecycle != Lifecycle::Restoring || record.holder.is_some()
+                || record.checkpoint_stage.as_deref() != Some(stage)
+                || record.checkpoint_transfer_replica.as_deref() != Some(&replica)
+            {
+                return Err(inconsistent("The target lost its reserved replica genesis"));
+            }
+            Ok(None)
+        },
+        |record, _, region| async move {
+            let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
+            let bucket = storage.bucket(region).await?;
+            let owner = bucket.get_fresh(&key(&format!("{root}/{ROOT_MARKER}"))?).await?;
+            if owner.as_ref() != record.id.as_bytes() {
+                return Err(inconsistent("The durable serving root has another owner"));
+            }
+            let material = keys.existing_key(&record.key_id()).await?
+                .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
+            let store = open_deployment_store(
+                bucket, &root, PackDiscovery::From(stage.checkpoint.block), wall_clock(),
+            ).await?;
+            let plaintext = EncryptingStore::new(store, &material)?;
+            recovery_manifest_sha256(&plaintext, stage.checkpoint, StorageEpoch(stage.source_log_epoch)).await
+        },
+    ).await?;
+    directory.activate_checkpoint_transfer(&CheckpointTransferActivation { replica, recovery_manifest_sha256 }).await
+}
+
 pub(crate) async fn stream_staged_owned_event_files(
     directory: Arc<dyn Directory>,
     storage: &CellStorage,

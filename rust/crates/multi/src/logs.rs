@@ -202,7 +202,13 @@ impl LogFactory for LogkeeperLogFactory {
             AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery }
         } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
-        let next = next_source_offset(replica.as_ref(), epoch).await?;
+        let mut next = next_source_offset(replica.as_ref(), epoch).await?;
+        if let Some(through) = config.transferred_source_through {
+            let floor = through.checked_add(1).filter(|floor| *floor >= 0)
+                .ok_or_else(|| Anomaly::fault("rtdb.multi/intake-floor", "Invalid transferred source offset"))?;
+            SourcePosition::from_epoch_offset(epoch, floor)?;
+            next = next.max(floor);
+        }
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {
             let intake = Arc::clone(&intake);
@@ -500,6 +506,7 @@ mod tests {
             epoch: record.epoch,
             require_read_index: false,
             log_epoch: record.log_epoch,
+            transferred_source_through: None,
             frozen_at: None,
             previous_servers: None,
         };
@@ -531,6 +538,7 @@ mod tests {
             require_read_index: true,
             frozen_at: None,
             log_epoch: record.log_epoch,
+            transferred_source_through: None,
             write_quorum: 1,
         };
         let provider = Arc::new(MemoryLog::new(1024));

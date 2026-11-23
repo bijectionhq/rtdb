@@ -80,6 +80,16 @@ enum Action {
         stage_operation: Uuid,
         staged_manifest_sha256: String,
     },
+    ActivateCheckpointTransferTarget {
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
+    },
+    SeedCheckpointTransferTarget {
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
+    },
     VerifyCheckpointTransferTarget {
         destination: Uuid,
         stage_operation: Uuid,
@@ -149,6 +159,12 @@ enum Reply {
         destination: Uuid,
         stage_operation: Uuid,
         disposal: DisposalReceipt,
+    },
+    TransferTargetActivated {
+        activation: rtdb_directory::CheckpointTransferActivation,
+    },
+    TransferTargetSeeded {
+        replica: rtdb_directory::CheckpointTransferReplica,
     },
     TransferTargetVerified {
         bootstrap: rtdb_directory::CheckpointTransferBootstrap,
@@ -473,6 +489,44 @@ impl RecoveryService {
                     staged_manifest_sha256,
                 })
             }
+            Action::ActivateCheckpointTransferTarget {
+                destination, stage_operation, staged_manifest_sha256,
+            } => {
+                if installation.checkpoint_stage.is_some() || destination.is_nil()
+                    || stage_operation.is_nil() || !valid_manifest(&staged_manifest_sha256)
+                {
+                    return Ok(Reply::Refused);
+                }
+                let selector = archive::StageSelector {
+                    destination,
+                    operation: stage_operation,
+                    manifest_sha256: staged_manifest_sha256,
+                    source: Some((request.authority, request.capture, self.org.clone())),
+                };
+                let activation = archive::activate_checkpoint_transfer_target(
+                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                ).await?;
+                Ok(Reply::TransferTargetActivated { activation })
+            },
+            Action::SeedCheckpointTransferTarget {
+                destination, stage_operation, staged_manifest_sha256,
+            } => {
+                if installation.checkpoint_stage.is_some() || destination.is_nil()
+                    || stage_operation.is_nil() || !valid_manifest(&staged_manifest_sha256)
+                {
+                    return Ok(Reply::Refused);
+                }
+                let selector = archive::StageSelector {
+                    destination,
+                    operation: stage_operation,
+                    manifest_sha256: staged_manifest_sha256,
+                    source: Some((request.authority, request.capture, self.org.clone())),
+                };
+                let replica = archive::seed_checkpoint_transfer_target(
+                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                ).await?;
+                Ok(Reply::TransferTargetSeeded { replica })
+            },
             Action::VerifyCheckpointTransferTarget {
                 destination, stage_operation, staged_manifest_sha256,
             } => {
