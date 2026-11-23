@@ -103,6 +103,8 @@ struct CountedRequest {
     append: Option<Bytes>,
     #[prost(bytes = "bytes", optional, tag = "7")]
     commit: Option<Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "35")]
+    install_decision: Option<Bytes>,
     #[prost(bytes = "bytes", optional, tag = "6")]
     overwrite: Option<Bytes>,
 }
@@ -115,6 +117,8 @@ struct ResponseWithRefusal {
     refusal: Option<Refusal>,
     #[prost(bytes = "bytes", optional, tag = "2")]
     accepted: Option<Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "12")]
+    installed_decision: Option<Bytes>,
 }
 
 #[derive(prost::Message)]
@@ -186,7 +190,7 @@ impl CountingProxy {
                                 held_overwrite_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 if held_overwrites.wait_for(|held| !held).await.is_err() { break; }
                             }
-                            if request.commit.is_some() {
+                            if request.commit.is_some() || request.install_decision.is_some() {
                                 commit_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 if dropping_commits.load(std::sync::atomic::Ordering::SeqCst) { continue; }
                                 commit_ids.lock().insert(request.id);
@@ -201,7 +205,8 @@ impl CountingProxy {
                         let mut body = vec![0; length as usize];
                         if server_reader.read_exact(&mut body).await.is_err() { break; }
                         if let Ok(response) = ResponseWithRefusal::decode(body.as_slice()) {
-                            if pending_commits.lock().remove(&response.id) && response.accepted.is_some() {
+                            if pending_commits.lock().remove(&response.id)
+                                && (response.accepted.is_some() || response.installed_decision.is_some()) {
                                 commit_accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                             if pending_appends.lock().remove(&response.id) {

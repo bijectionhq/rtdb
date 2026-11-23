@@ -1340,6 +1340,13 @@ impl NodeAgent {
         let mut record = self.directory.deployment(id).await?.ok_or_else(&deposed)?;
         let log_epoch = StorageEpoch(record.log_epoch);
         let Some(checkpoint) = checkpoint_for_block(block, log_epoch) else { return Ok(None); };
+        let writer = self.writers.lock().get(id).and_then(std::sync::Weak::upgrade).ok_or_else(&deposed)?;
+        // The adopted catalog names this exact replica boundary. A signed read
+        // index proves the log prefix covering it has reached stable publication.
+        let covered = writer.read_index(epoch).await?;
+        if covered.through().0 < checkpoint.boundary || covered.stream() != record.stream("replica") {
+            return Err(Anomaly::fault("rtdb.multi/checkpoint-decision", "The adopted checkpoint is outside the durable replica decision"));
+        }
         let mut manifest = None;
         for _ in 0..8 {
             if record.epoch != epoch || record.holder.as_ref() != Some(&member) || record.log_epoch != log_epoch.0 {
@@ -1371,6 +1378,7 @@ impl NodeAgent {
                         "revision": stored.version, "writer_epoch": stored.epoch, "epoch": stored.log_epoch,
                         "stream": stored.stream("replica"), "block": checkpoint.block, "through": checkpoint.boundary,
                         "root": checkpoint.root_sha256, "manifest": digest,
+                        "decision": covered.decision().map(|proof| proof.certificate.statement.fingerprint()),
                     }));
                     return Ok(Some((stored, checkpoint)));
                 }

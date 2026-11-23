@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::attestation::journal_id;
 use crate::protocol::{before_guarded_cutoff, ensemble_identity};
 
-const MAX_JOURNALS: usize = 31;
+pub(crate) const MAX_JOURNALS: usize = 31;
 
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct DecisionScope {

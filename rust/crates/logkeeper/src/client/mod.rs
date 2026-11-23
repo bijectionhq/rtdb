@@ -132,6 +132,9 @@ fn validate(config: &StreamConfig) -> rtdb_types::Result<()> {
     if !journals.is_empty() && journals.len() != config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a member ensemble needs an identity for every slot"));
     }
+    if !journals.is_empty() && (config.write_quorum <= journals.len() / 2 || journals.len() > crate::decision::MAX_JOURNALS) {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a member ensemble requires a bounded intersecting quorum"));
+    }
     if config.write_quorum == 0 || config.write_quorum > config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", format!("write quorum {} must be between 1 and the {} servers", config.write_quorum, config.servers.len())));
     }
