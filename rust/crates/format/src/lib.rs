@@ -3,6 +3,7 @@ pub mod bloom;
 pub mod catalog;
 pub mod columns;
 pub mod config;
+pub mod cow_tree;
 pub mod data;
 pub mod diagnostics;
 pub mod envelope;

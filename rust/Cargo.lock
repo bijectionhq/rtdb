@@ -4688,7 +4688,9 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
+ "async-trait",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "flatbuffers",
  "half",
@@ -4707,6 +4709,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
+ "tokio",
  "uuid",
  "zstd",
 ]

@@ -51,6 +51,8 @@ mod mark;
 
 pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, ConstantEvaluator, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, PartitionRanking, ResolvedSearchRow, ScanAccelerator, ScanRequest, ScanSelection, SearchRowLocation, SnapshotRow};
 pub use accelerate::{LocatedHistoryEvent, resolve_located_point};
+mod cow_pages;
+pub use cow_pages::ObjectPageStore;
 mod entity_history;
 pub use entity_history::{HistoryObject, table_point_rows, uncovered_history_iids};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryOptions, retain_catalog_snapshot};

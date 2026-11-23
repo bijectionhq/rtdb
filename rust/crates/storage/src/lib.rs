@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod cow_pages;
 pub mod audience_work;
 pub mod cache;
 pub mod disk_cache;
