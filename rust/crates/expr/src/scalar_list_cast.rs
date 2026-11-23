@@ -292,7 +292,7 @@ impl<'a> Cells<'a> {
             }
             Self::Selected(field, array, range) => {
                 let row = range.start + row;
-                let Ok(cell) = (ArrowCell { field, array, row }).physical() else { return Cell::Unsupported; };
+                let Ok(cell) = (ArrowCell { field, array: *array, row }).physical() else { return Cell::Unsupported; };
                 if !matches!(cell.is_undefined(), Ok(false)) { return Cell::Unsupported; }
                 if matches!(cell.is_null(), Ok(true)) { return Cell::Null; }
                 if let Some(span) = rtdb_types::NumericSpan::new(cell.field, cell.array, cell.row..cell.row + 1) {
