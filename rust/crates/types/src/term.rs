@@ -2,6 +2,9 @@
 
 use crate::{Anomaly, Result};
 
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
 #[cfg(not(verus_keep_ghost))]
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +28,12 @@ impl std::fmt::Display for TermSequence {
 
 impl TermSequence {
     pub const CLAIM: Self = Self(0);
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures match out {
+            Ok(next) => next.0 == self.0 as int + 1,
+            Err(_) => self.0 == i64::MAX,
+        },
+    ))]
     pub fn next(self) -> Result<Self> {
         match self.0.checked_add(1) {
             Some(next) => Ok(Self(next)),

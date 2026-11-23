@@ -82,7 +82,7 @@ def rust_function_at(source, line):
     function = None
     contract = False
     for index, text in enumerate(source.read_text().splitlines(), 1):
-        if text.startswith(("#[verus_spec(", "#[cfg_attr(verus_keep_ghost, verus_spec(")):
+        if text.lstrip().startswith(("#[verus_spec(", "#[cfg_attr(verus_keep_ghost, verus_spec(")):
             contract = True
         match = signature.match(text)
         if match:
@@ -1877,7 +1877,50 @@ def verify_gateway_replay_lean(args, scratch):
     verify_lean_model(args, scratch, path, "gateway-replay", controls, 4)
 
 
+def verify_fenced_replica_lean(args, scratch):
+    models = Path("verification/multi/lean")
+    verify_lean_model(
+        args, scratch, models / "FencedTermAdmission.lean", "fenced-term-admission",
+        {
+            "promote-without-grant": (
+                "mayLead && !alreadyLeading && holdsGrant",
+                "mayLead && !alreadyLeading && (holdsGrant || !holdsGrant)",
+                ["fenced_promotion_after_empty_read"],
+            ),
+            "promote-after-nonempty-read": (
+                "Bool := recordCount == 0", "Bool := (recordCount == 0) || (recordCount == 1)",
+                ["fenced_promotion_after_empty_read"],
+            ),
+            "accept-adjacent-stale-term": (
+                "decide (arriving < highest)", "decide (arriving + 1 < highest)",
+                ["a_superseded_record_is_fenced", "promotion_and_fencing_are_reachable"],
+            ),
+        },
+        5,
+    )
+    verify_lean_model(
+        args, scratch, models / "MaintenanceBound.lean", "maintenance-bound",
+        {
+            "charge-on-regrant": (
+                "grant := lane.grant + 1 }", "grant := lane.grant + 1, used := lane.used + 1 }",
+                ["every_reachable_lane_has_its_phase_shape"],
+            ),
+            "charge-noop": (
+                "| .noOp | .ordinary => false", "| .noOp => true\n  | .ordinary => false",
+                ["classifier_refines_three_record_bound"],
+            ),
+            "publish-without-trim": (
+                "Step lane { lane with used := 1, phase := .idle }",
+                "Step lane { lane with phase := .idle }",
+                ["every_reachable_lane_has_its_phase_shape"],
+            ),
+        },
+        6,
+    )
+
+
 def verify_lean(args, scratch):
+    verify_fenced_replica_lean(args, scratch)
     verify_gateway_replay_lean(args, scratch)
     verify_lean_model(
         args, scratch, Path("verification/lean/ObservedClockAndRetry.lean"), "observed-clock-and-retry",

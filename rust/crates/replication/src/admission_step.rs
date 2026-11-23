@@ -57,6 +57,14 @@ impl Admission {
 #[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
 pub struct TermFence { highest_term: Term, position: TermPosition }
 
+#[cfg(verus_keep_ghost)]
+verus! {
+impl TermFence {
+    pub closed spec fn observed_highest(&self) -> i64 { self.highest_term.0 }
+    pub closed spec fn observed_position(&self) -> TermPosition { self.position }
+}
+}
+
 impl TermFence {
     /// The replica reader owns this value across every leader/follower role change.
     pub fn from_boundary(term: Term, sequence: Option<TermSequence>) -> Result<Self> {
@@ -68,8 +76,17 @@ impl TermFence {
         Ok(Self { highest_term: term, position })
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures out.0 == self.observed_highest(),
+    ))]
     pub fn highest_term(&self) -> Term { self.highest_term }
     pub fn position(&self) -> TermPosition { self.position }
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures match out {
+            Ok(next) => next.0 == self.observed_highest() as int + 1,
+            Err(_) => self.observed_highest() == i64::MAX,
+        },
+    ))]
     pub fn claim_term(&self) -> Result<Term> {
         match self.highest_term.0.checked_add(1) {
             Some(next) => Ok(Term(next)),
@@ -79,6 +96,21 @@ impl TermFence {
 
     /// Call for every delivered record, including claims and records later discarded by a role.
     /// Only `Apply` permits the caller to change the live index or applied-progress monitor.
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures
+            term.0 < old(self).observed_highest() ==> (out matches Ok(admission)
+                && admission.verdict is Fenced
+                && final(self).observed_position() == old(self).observed_position()),
+            match out {
+                Ok(admission) => admission.previous_term.0 == old(self).observed_highest()
+                    && admission.highest_term.0 == final(self).observed_highest()
+                    && final(self).observed_highest() ==
+                        (if term.0 > old(self).observed_highest() { term.0 } else { old(self).observed_highest() }),
+                Err(_) => true,
+            },
+            out is Err ==> final(self).observed_highest() == old(self).observed_highest()
+                && final(self).observed_position() == old(self).observed_position(),
+    ))]
     pub fn admit(&mut self, term: Term, sequence: Option<TermSequence>) -> Result<Admission> {
         let previous_term = self.highest_term;
         let (highest_term, position, verdict) = if is_stale_term(self.highest_term.0, term.0) {

@@ -1,39 +1,211 @@
 {
-  "summary": "The production replica fence rejects a displaced term and classifies exact, duplicate and missing sequence positions.",
-  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 5,
+  "summary": "The production replica fence rejects superseded terms. Direct promotion needs an empty read and the writer grant, and opens the successor term at sequence zero.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "promotion",
+    "--verify-module",
+    "term_types"
+  ],
+  "min_verified_functions": 25,
   "controls": {
     "ignore_sequence_gap": {
       "defect": "A record past a missing predecessor is discarded without voiding the term.",
-      "mutate": [{
-        "file": "rust/crates/replication/src/admission_step.rs",
-        "find": "        Some(sequence) if sequence > expected => SequenceDecision::Void,\n",
-        "replace": ""
-      }],
-      "expect": [{
-        "file": "rust/crates/replication/src/admission_step.rs",
-        "function": "classify_sequence",
-        "category": "postcondition not satisfied"
-      }],
-      "min_verified_functions": 4
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "find": "        Some(sequence) if sequence > expected => SequenceDecision::Void,\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "function": "classify_sequence",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
     },
     "forget_term_fence_with_weakened_contract": {
       "defect": "Both the function and its contract permit records from a displaced leader.",
-      "mutate": [{
-        "file": "rust/crates/replication/src/admission_step.rs",
-        "find": "    observed < highest\n}",
-        "replace": "    false\n}"
-      }, {
-        "file": "rust/crates/replication/src/admission_step.rs",
-        "find": "ensures out == (observed < highest),",
-        "replace": "ensures !out,"
-      }],
-      "expect": [{
-        "file": "verification/verus/replica_admission/laws.rs",
-        "function": "a_displaced_term_is_always_fenced",
-        "category": "postcondition not satisfied"
-      }],
-      "min_verified_functions": 4
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "find": "    observed < highest\n}",
+          "replace": "    false\n}"
+        },
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "find": "ensures out == (observed < highest),",
+          "replace": "ensures !out,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "a_displaced_term_is_always_fenced",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "function": "admit",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "function": "admit",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "function": "admit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "apply_from_superseded_term": {
+      "defect": "The admission fold applies a lower-term record.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "find": "(self.highest_term, self.position, Verdict::Fenced)",
+          "replace": "(self.highest_term, self.position, Verdict::Apply)"
+        },
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "find": "&& admission.verdict is Fenced",
+          "replace": "&& admission.verdict is Apply"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "a_superseded_record_is_fenced",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "promote_before_empty_read": {
+      "defect": "A nonempty poll authorizes promotion.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "    record_count == 0\n",
+          "replace": "    true\n"
+        },
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "ensures out == (record_count == 0),",
+          "replace": "ensures out,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "fenced_promotion_after_empty_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "promote_without_grant": {
+      "defect": "A worker can promote without a positive grant observation.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "    may_lead && !already_leading && holds_grant\n",
+          "replace": "    may_lead && !already_leading\n"
+        },
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "ensures out == (may_lead && !already_leading && holds_grant),",
+          "replace": "ensures out == (may_lead && !already_leading),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "fenced_promotion_after_empty_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "start_fenced_term_at_one": {
+      "defect": "The first fenced append skips sequence zero.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "    if fenced { 0 } else { 1 }\n",
+          "replace": "    1\n"
+        },
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "ensures out == if fenced { 0i64 } else { 1i64 },",
+          "replace": "ensures out == 1,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "fenced_promotion_after_empty_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "reuse_highest_term": {
+      "defect": "Promotion reuses the current term.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "find": "self.highest_term.0.checked_add(1)",
+          "replace": "self.highest_term.0.checked_add(0)"
+        },
+        {
+          "file": "rust/crates/replication/src/admission_step.rs",
+          "find": "next.0 == self.observed_highest() as int + 1",
+          "replace": "next.0 == self.observed_highest() as int"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "fenced_promotion_after_empty_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "permit_claim_on_fenced_log": {
+      "defect": "The legacy claim path admits a fenced journal.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "    !fenced && may_lead && !already_leading && !claim_pending\n",
+          "replace": "    may_lead && !already_leading && !claim_pending\n"
+        },
+        {
+          "file": "rust/crates/replication/src/promotion.rs",
+          "find": "ensures out == (!fenced && may_lead && !already_leading && !claim_pending),",
+          "replace": "ensures out == (may_lead && !already_leading && !claim_pending),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "fenced_driver_never_starts_a_claim",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
     }
   }
 }

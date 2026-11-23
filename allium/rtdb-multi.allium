@@ -495,6 +495,15 @@ contract LogService {
         -- A gateway authenticates readiness against its invocation and the current installed journal grant.
         -- An installed journal route owns its session authority independently of the cell directory.
 
+    @invariant InstalledReplicaPromotionFollowsEmptyRead
+        -- After an empty replica read, a following worker with leadership enabled and a positive current-grant check can promote.
+        -- The worker opens the successor of the highest term it has read at sequence zero.
+        -- A newly delivered record below the highest observed term is fenced at admission.
+
+    @invariant InstalledReplicaMaintenanceChargesBlockProgress
+        -- Installed replica appends use the maintenance lane for block boundaries, block uploads, and fenced terminals that settle inherited receiver debt.
+        -- The lane charge carries through when an oversized payload is represented by a reference.
+
     @invariant InstalledJournalPayloadUsesItsGrantGeneration
         -- The installation provisions an independent journal payload key for its deployment incarnation and initial key generation.
         -- An installed writer seals each record under the key generation on its grant.

@@ -379,6 +379,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The rank cutoff area checks the production decision given the two maximum frontier bounds.
   The search window area checks the native functions that assign postings, set the scan endpoints, and combine frequency and length extrema.
   The temporal event and allocation shell, storage adapters, the reader protection protocol, and full search equivalence need separate refinement and replay evidence.
+* link:verus/replica_admission/README.md[Replica admission] checks the production term fence and the pure decisions for grant-fenced promotion.
+* link:verus/maintenance_class/README.md[Maintenance classification] checks the installed replica append class against the three-record Lean model from Logkeeper Study 111.
 * `verus/original_sync_audit` checks the original Logkeeper sync bound and digest-bound lookup decisions in `client/audit.rs` and `server/store.rs`.
   Verus 0.2026.11.20.9da409b checked 11 items and all 17 negative controls failed at their expected laws on 2026-11-23.
   See link:../dev/doc/rtdb-multi-bijection.md[the strict acceptance audit] for the call-site inspection and premises.

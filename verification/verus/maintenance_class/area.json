@@ -1,0 +1,82 @@
+{
+  "summary": "The production classifier charges only block boundaries and uploads during fenced checkpoint and grant progress, preserving Study 111's three-record bound at each eligible append.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 2,
+  "controls": {
+    "charge_fenced_no_op": {
+      "defect": "A sequence-zero no-op without a source reference consumes maintenance.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "!fenced && sequence == Some(0) && message.src_msg_id.is_none()",
+          "replace": "sequence == Some(0) && message.src_msg_id.is_none()"
+        },
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "!fenced && sequence == Some(0) && no_op.src_msg_id is None",
+          "replace": "sequence == Some(0) && no_op.src_msg_id is None"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/maintenance_class/laws.rs",
+          "function": "classifier_refines_three_record_bound",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "omit_boundary": {
+      "defect": "BlockBoundary is routed to the ordinary lane.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "    ensures out == match message {\n        ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,",
+          "replace": "    ensures out == match message {\n        ReplicaBody::BlockUploaded(_) => true,\n        ReplicaBody::BlockBoundary(_) => false,"
+        },
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "    match message {\n        ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,",
+          "replace": "    match message {\n        ReplicaBody::BlockUploaded(_) => true,\n        ReplicaBody::BlockBoundary(_) => false,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/maintenance_class/laws.rs",
+          "function": "classifier_refines_three_record_bound",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "omit_upload": {
+      "defect": "BlockUploaded is routed to the ordinary lane.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "    ensures out == match message {\n        ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,",
+          "replace": "    ensures out == match message {\n        ReplicaBody::BlockBoundary(_) => true,\n        ReplicaBody::BlockUploaded(_) => false,"
+        },
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "    match message {\n        ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,",
+          "replace": "    match message {\n        ReplicaBody::BlockBoundary(_) => true,\n        ReplicaBody::BlockUploaded(_) => false,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/maintenance_class/laws.rs",
+          "function": "classifier_refines_three_record_bound",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    }
+  }
+}

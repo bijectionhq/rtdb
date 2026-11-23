@@ -1,6 +1,8 @@
 #![feature(proc_macro_hygiene)]
 
 mod laws;
+#[path = "../../../rust/crates/replication/src/promotion.rs"]
+mod promotion;
 #[path = "../../../rust/crates/types/src/term.rs"]
 mod term_types;
 
