@@ -1,11 +1,11 @@
 //! RTDB storage-log projection of the installed journal's ordered grants
 //! and exact replay intervals.
 
-use super::{InstalledJournal, WriterAdmission, latest};
+use super::{InstalledJournal, ReadFailure, WriterAdmission, latest};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, Outcome, Refusal, Request,
+    APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, Request, RequestId,
     service::Route,
 };
 use rtdb_node::{ProtectedReadIndex, ReplicaReadIndex};
@@ -18,7 +18,6 @@ use rtdb_storage::{
     object_store::ReadReservation,
 };
 use rtdb_types::{Anomaly, Timestamp};
-use std::num::NonZeroU64;
 use std::sync::{
     Arc,
     atomic::{AtomicI64, Ordering},
@@ -32,6 +31,8 @@ const RELEASE_RETRY: Duration = Duration::from_secs(1);
 const DELIVERED_RECORD_OVERHEAD: usize = 256;
 const MAX_RANGE_RECORDS: usize = 4096;
 const MAX_RANGE_BYTES: usize = 32 << 20;
+/// Reads whose outcome is unknown and whose release has not yet settled.
+const MAX_UNSETTLED_READS: usize = 8;
 
 pub(crate) struct JournalLog {
     reads: Arc<Reads>,
@@ -44,8 +45,8 @@ struct Writer {
     grant: Grant,
     head: Cut,
     pending: Option<Request>,
-    pending_read: Option<Request>,
-    next_read: Option<NonZeroU64>,
+    /// Each read is a fresh admission; an uncertain one is released by its identity.
+    unsettled_reads: Vec<RequestId>,
 }
 
 struct Reads {
@@ -151,8 +152,7 @@ impl JournalLog {
             grant: admission.grant,
             head: admission.recovery.through,
             pending: None,
-            pending_read: None,
-            next_read: Some(NonZeroU64::MIN),
+            unsettled_reads: Vec::new(),
         });
         Ok(Arc::new(Self {
             reads,
@@ -269,57 +269,18 @@ impl JournalLog {
         Ok(cursor)
     }
 
-    async fn resolve_old_read(&self, writer: &mut Writer) -> rtdb_types::Result<()> {
-        let Some(request) = writer.pending_read.as_ref() else {
-            return Ok(());
-        };
-        match self.reads.journal.barrier(request).await {
-            Ok(proof) => drop(self.reads.retain(proof.claim.read())),
-            Err(error)
-                if matches!(
-                    error.code.as_ref(),
-                    "rtdb.multi/ordered-capacity"
-                        | "rtdb.multi/ordered-expired"
-                        | "rtdb.multi/ordered-read-closed"
-                        | "rtdb.multi/ordered-stale-grant"
-                ) =>
-            {
-                let route = self.reads.journal.route().await?;
-                if route.writer.grant != Some(writer.grant) {
-                    return Err(deposed(writer.grant, &route).into());
-                }
-                let nonce = writer.next_read.ok_or_else(read_exhausted)?;
-                let abandon = self.reads.journal.request(
-                    &route,
-                    Command::AbandonRead {
-                        grant: writer.grant,
-                        nonce,
-                    },
-                )?;
-                let decision = self.reads.journal.execute(&abandon).await?;
-                match decision.receipt.outcome {
-                    Ok(Outcome::ReadAbandoned) => {}
-                    Err(Refusal::Stale)
-                        if self.reads.journal.route().await?.writer.grant == Some(writer.grant) => {
-                    }
-                    Err(reason) => return Err(super::refused(reason)),
-                    Ok(_) => return Err(read_exhausted()),
-                }
+    /// Releases reads whose outcome was lost. A release settles a read once it is
+    /// decided at or after the read's retry horizon, after which a delayed copy of
+    /// that barrier can only expire. Failures keep the identity for a later attempt.
+    async fn settle_reads(&self, writer: &mut Writer) {
+        let mut unsettled = Vec::with_capacity(writer.unsettled_reads.len());
+        for read in writer.unsettled_reads.drain(..) {
+            match self.reads.journal.release_read(read).await {
+                Ok(position) if position >= read.expires_at => {}
+                Ok(_) | Err(_) => unsettled.push(read),
             }
-            Err(error) => return Err(error),
         }
-        writer.read_finished();
-        Ok(())
-    }
-}
-
-impl Writer {
-    fn read_finished(&mut self) {
-        self.next_read = self
-            .next_read
-            .and_then(|nonce| nonce.get().checked_add(1))
-            .and_then(NonZeroU64::new);
-        self.pending_read = None;
+        writer.unsettled_reads = unsettled;
     }
 }
 
@@ -331,29 +292,46 @@ impl ReplicaReadIndex for JournalLog {
 
     async fn protect(&self) -> rtdb_types::Result<ProtectedReadIndex> {
         let mut writer = self.writer.lock().await;
-        self.resolve_old_read(&mut writer).await?;
-        let current = self.reads.journal.route().await?;
-        if current.writer.grant != Some(writer.grant) {
-            return Err(deposed(writer.grant, &current).into());
+        let mut retried = false;
+        loop {
+            self.settle_reads(&mut writer).await;
+            if writer.unsettled_reads.len() >= MAX_UNSETTLED_READS {
+                return Err(reads_unsettled());
+            }
+            let current = self.reads.journal.route().await?;
+            if current.writer.grant != Some(writer.grant) {
+                return Err(deposed(writer.grant, &current).into());
+            }
+            let invocation = self.reads.journal.request(
+                &current,
+                Command::Barrier {
+                    grant: writer.grant,
+                },
+            )?;
+            // Record the identity first so a cancelled read is still released later.
+            writer.unsettled_reads.push(invocation.id);
+            match self.reads.journal.barrier(&invocation).await {
+                Ok(proof) => {
+                    writer.unsettled_reads.retain(|read| *read != invocation.id);
+                    let hold = proof.claim.read();
+                    let retention = self.reads.retain(hold);
+                    return Ok(ProtectedReadIndex {
+                        offset: latest(hold.through)?,
+                        wait: Duration::from_secs(2),
+                        retention: Some(retention),
+                    });
+                }
+                Err(ReadFailure::Refused(error)) => {
+                    writer.unsettled_reads.retain(|read| *read != invocation.id);
+                    return Err(error);
+                }
+                Err(ReadFailure::Uncertain(error)) if retried => {
+                    self.settle_reads(&mut writer).await;
+                    return Err(error);
+                }
+                Err(ReadFailure::Uncertain(_)) => retried = true,
+            }
         }
-        let nonce = writer.next_read.ok_or_else(read_exhausted)?;
-        let invocation = self.reads.journal.request(
-            &current,
-            Command::Barrier {
-                grant: writer.grant,
-                nonce,
-            },
-        )?;
-        writer.pending_read = Some(invocation.clone());
-        let proof = self.reads.journal.barrier(&invocation).await?;
-        let hold = proof.claim.read();
-        let retention = self.reads.retain(hold);
-        writer.read_finished();
-        Ok(ProtectedReadIndex {
-            offset: latest(hold.through)?,
-            wait: Duration::from_secs(2),
-            retention: Some(retention),
-        })
     }
 }
 
@@ -752,10 +730,10 @@ fn deposed(grant: Grant, current: &Route) -> Error {
     }
 }
 
-fn read_exhausted() -> Anomaly {
+fn reads_unsettled() -> Anomaly {
     Anomaly::new(
         rtdb_types::AnomalyCategory::Unavailable,
-        "rtdb.multi/ordered-read-sequence",
-        "The installed writer cannot issue another read nonce",
+        "rtdb.multi/ordered-read-unsettled",
+        "Earlier installed reads with lost outcomes are not yet released",
     )
 }

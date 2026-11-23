@@ -8,7 +8,6 @@ mod tls_fixture;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -493,7 +492,7 @@ async fn reconcile(client: &Client, grant: Grant, original: Request) -> AppendRe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and_repair() {
+async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_trim_and_repair() {
     const ORDINARY: u64 = 4096;
     let authority = Authority::new(Uuid::new_v4(), ORDINARY, 1024, 1);
     let mut cohort = authority.start("initial").await;
@@ -511,35 +510,41 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
     assert_eq!(appended.byte_end, ORDINARY);
     assert_eq!(route(&old).await.head, appended.cut);
 
-    let nonce = NonZeroU64::new(1).unwrap();
+    // A read whose reply is lost is never replayed: its exact resend conflicts,
+    // the reader releases it by identity, and a fresh read admits its own hold.
+    let lost_request = request(
+        route(&old).await,
+        Principal::Worker(incumbent.enrollment),
+        Command::Barrier { grant: incumbent },
+    );
+    discard_reply(&authority.workers[0], &installed, lost_request.clone()).await;
+    let resent = execute(&old, lost_request.clone()).await;
+    assert_eq!(resent.receipt.outcome, Err(Refusal::Conflict));
+    assert!(resent.barrier.is_none());
+    let released = execute(
+        &old,
+        request(
+            route(&old).await,
+            Principal::Worker(incumbent.enrollment),
+            Command::ReleaseRead {
+                read: lost_request.id,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(released.receipt.outcome, Ok(Outcome::Released));
     let read_request = request(
         route(&old).await,
         Principal::Worker(incumbent.enrollment),
-        Command::Barrier {
-            grant: incumbent,
-            nonce,
-        },
+        Command::Barrier { grant: incumbent },
     );
-    discard_reply(&authority.workers[0], &installed, read_request.clone()).await;
-    let recovered = execute(&old, read_request.clone()).await;
-    let Outcome::Barrier { read, .. } = recovered.receipt.outcome.unwrap() else {
-        panic!("the exact read remained unadmitted");
+    let admitted = execute(&old, read_request.clone()).await;
+    let Outcome::Barrier { read, .. } = admitted.receipt.outcome.unwrap() else {
+        panic!("the fresh read was not admitted after releasing the lost one");
     };
     assert_eq!(read.id, read_request.id);
     assert_eq!(read.through, appended.cut);
-    assert!(recovered.barrier.is_some());
-    let fresh_request = request(
-        route(&old).await,
-        Principal::Worker(incumbent.enrollment),
-        Command::Barrier {
-            grant: incumbent,
-            nonce,
-        },
-    );
-    assert_eq!(
-        execute(&old, fresh_request).await.receipt.outcome,
-        Err(Refusal::Stale)
-    );
+    assert!(admitted.barrier.is_some());
 
     let failed_voter = installed.endpoints[0].address;
     cohort

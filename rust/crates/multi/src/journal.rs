@@ -70,6 +70,23 @@ pub struct WriterAdmission {
     pub position: u64,
 }
 
+/// Why a fresh read returned no protected basis.
+#[derive(Debug)]
+pub enum ReadFailure {
+    /// The journal decided the read and admitted nothing.
+    Refused(Anomaly),
+    /// The read may still hold a basis under its invocation.
+    Uncertain(Anomaly),
+}
+
+impl From<ReadFailure> for Anomaly {
+    fn from(failure: ReadFailure) -> Self {
+        match failure {
+            ReadFailure::Refused(error) | ReadFailure::Uncertain(error) => error,
+        }
+    }
+}
+
 impl InstalledJournal {
     pub fn open(config: InstalledRoute) -> Result<Arc<Self>> {
         let placement = config.route.placement;
@@ -179,19 +196,45 @@ impl InstalledJournal {
         Ok(result)
     }
 
-    pub async fn barrier(&self, invocation: &Request) -> Result<SignedBarrier> {
+    pub async fn barrier(
+        &self,
+        invocation: &Request,
+    ) -> std::result::Result<SignedBarrier, ReadFailure> {
         if !matches!(&invocation.command, Command::Barrier { .. }) {
-            return Err(mismatch("The request is not a fresh read invocation"));
+            return Err(ReadFailure::Refused(mismatch(
+                "The request is not a fresh read invocation",
+            )));
         }
-        let decision = self.execute(invocation).await?;
-        decision.receipt.outcome.map_err(refused)?;
-        decision.barrier.ok_or_else(|| {
-            Anomaly::new(
+        let decision = self
+            .execute(invocation)
+            .await
+            .map_err(ReadFailure::Uncertain)?;
+        if let Err(reason) = decision.receipt.outcome {
+            return Err(ReadFailure::Refused(refused(reason)));
+        }
+        match decision.barrier {
+            Some(proof) if proof.claim.read().id == invocation.id => Ok(proof),
+            _ => Err(ReadFailure::Uncertain(Anomaly::new(
                 AnomalyCategory::Unavailable,
                 "rtdb.multi/ordered-read-closed",
-                "The original read no longer has a protected basis",
-            )
-        })
+                "The fresh read returned no protected basis for its invocation",
+            ))),
+        }
+    }
+
+    /// Releases any hold a read admitted under `read`, and returns the journal
+    /// position at which the release was decided.
+    pub async fn release_read(&self, read: RequestId) -> Result<u64> {
+        let route = self.route().await?;
+        let decision = self
+            .execute(&self.request(&route, Command::ReleaseRead { read })?)
+            .await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::Released => Ok(decision.receipt.position),
+            _ => Err(mismatch(
+                "The journal returned a different read release result",
+            )),
+        }
     }
 
     pub async fn replay(&self, hold: Hold, from: Cut, maximum_bytes: u64) -> Result<ReplayPage> {
@@ -451,7 +494,6 @@ fn refused(reason: Refusal) -> Anomaly {
         Refusal::Conflict => (Conflict, "rtdb.multi/ordered-conflict"),
         Refusal::Expired => (Conflict, "rtdb.multi/ordered-expired"),
         Refusal::Capacity => (Unavailable, "rtdb.multi/ordered-capacity"),
-        Refusal::ReadPending => (Unavailable, "rtdb.multi/ordered-read-pending"),
         Refusal::Unavailable => (Unavailable, "rtdb.multi/ordered-replay-unavailable"),
         Refusal::CohortSealed => (Unavailable, "rtdb.multi/ordered-cohort-sealed"),
         Refusal::Invalid | Refusal::WrongPlacement => {

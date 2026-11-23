@@ -2,7 +2,7 @@
 
 An installed journal owns the writer roster and grant, append decisions, protected read cuts, checkpoint selection, and the replay floor for one deployment. Keep the logical deployment, incarnation, group and generation fixed during worker and voter replacement. The physical voter digest changes only during independently funded cohort repair.
 
-Use a fresh deployment ID and Logkeeper placement for a cutover. The ordered application, command, and compact recovery-image formats require matching workers and voters. Version 3 of the ordered command and compact image adds custodian-owned checkpoint and trim commands and records exact trim credits. Version 6 of the application wire protocol gives the custodian bounded inspection of a retained suffix before preparation and identifies the newest retained maintenance cut. An existing RTDB directory record and its log offsets do not certify a Logkeeper history. Route the installation through the installed manifest when the initial group, storage and keys are ready.
+Use a fresh deployment ID and Logkeeper placement for a cutover. The ordered application, command, and compact recovery-image formats require matching workers and voters. Version 4 of the ordered command and compact image admits every read as a fresh invocation and releases a read with a lost outcome by its identity. It keeps custodian-owned checkpoint and trim commands and exact trim credits. Version 7 of the application wire protocol carries the version 4 read outcomes and keeps the custodian's bounded inspection of a retained suffix and its newest retained maintenance cut. An existing RTDB directory record and its log offsets do not certify a Logkeeper history. Route the installation through the installed manifest when the initial group, storage and keys are ready.
 
 ## Provision the journal and storage
 
@@ -101,7 +101,7 @@ A disconnected worker can leave holds behind. Do not withdraw a worker merely be
 
 The Lean models in `verification/multi/lean/OrderedCapacity.lean`, `OrderedJournal.lean`, and `OrderedQuorum.lean` state the system obligations.
 The capacity model compares the saturated ordinary window with and without a funded maintenance sequence.
-The journal model composes exact handoff, receipt retention, nonce closure, checkpoint protection, provider disposition, and trim.
+The journal model composes exact handoff, receipt retention, fresh read admission and release, checkpoint protection, provider disposition, and trim.
 The quorum lemmas state the assumptions on durable promises and agreement of higher ballots.
 The Lake package in `verification/multi` imports Logkeeper at the same source revision as the Rust workspace.
 Run `lake build` from `verification/multi` to check the composition against that pinned revision and the directory's Lean toolchain.

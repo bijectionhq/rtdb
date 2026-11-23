@@ -33,7 +33,7 @@ structure Receipt where
 
 structure Hold where
   enrollment : Nat
-  nonce : Nat
+  read : Nat
   base : Checkpoint
   first : Nat
   through : Cut
@@ -61,7 +61,6 @@ structure State where
   disposed : List Checkpoint
   holdBook : List Hold
   receipts : Attempt → Option Receipt
-  readFloor : Nat
   observed : Nat
   quorum : Bool
   provider : Bool
@@ -103,7 +102,6 @@ def seed : State where
   disposed := []
   holdBook := []
   receipts := fun _ => none
-  readFloor := 0
   observed := 0
   quorum := true
   provider := true
@@ -135,16 +133,11 @@ inductive Step (readerSlots activationSlots : Nat) : State → State → Prop wh
       Step readerSlots activationSlots s
         {s with
           writer := s.writer + 1
-          readFloor := 0
           holdBook := hold s (s.writer + 1) nonce true :: s.holdBook}
   | barrier (s : State) (cohort writer nonce : Nat) (auth : Current s cohort writer)
-      (quorum : s.quorum = true) (room : ReaderCount s < readerSlots)
-      (next : nonce = s.readFloor + 1) :
+      (quorum : s.quorum = true) (room : ReaderCount s < readerSlots) :
       Step readerSlots activationSlots s
-        {s with readFloor := nonce, holdBook := hold s writer nonce false :: s.holdBook}
-  | abandon (s : State) (cohort writer nonce : Nat) (auth : Current s cohort writer)
-      (quorum : s.quorum = true) (next : nonce = s.readFloor + 1) :
-      Step readerSlots activationSlots s {s with readFloor := nonce}
+        {s with holdBook := hold s writer nonce false :: s.holdBook}
   | closeHold (s : State) (closing : Hold) (owner : Nat) (quorum : s.quorum = true)
       (agrees : closing.enrollment = owner) (present : closing ∈ s.holdBook) :
       Step readerSlots activationSlots s {s with holdBook := s.holdBook.filter (fun entry => decide (entry ≠ closing))}
@@ -258,9 +251,6 @@ theorem activated_slot_survives_reader_pressure (s : State) (expected cohort non
     (room : ActivationCount s < activationSlots) :
     ∃ t, Step readerSlots activationSlots s t ∧ t.writer = s.writer + 1 :=
   ⟨_, Step.grant s cohort expected nonce auth quorum room, rfl⟩
-
-theorem fresh_nonce_cannot_reopen (s : State) (nonce : Nat) (spent : nonce ≤ s.readFloor) :
-    nonce ≠ s.readFloor + 1 := by omega
 
 theorem previous_writer_cannot_act (s : State) (cohort : Nat) :
     ¬Current {s with writer := s.writer + 1} cohort s.writer := by

@@ -488,6 +488,9 @@ contract LogService {
     @invariant FreshJournalReadConsumesAnInvocation
         -- The chosen read result authenticates the exact placement, writer grant, invocation and applied cut.
         -- The receiving database applies the protected cut before the fresh read can proceed.
+        -- Every read is a fresh admission under a new invocation, and the journal never replays an earlier read's result.
+        -- A reader that loses a read's outcome releases it by invocation identity, and that release settles once the invocation can no longer be admitted.
+        -- Mutations keep exact retry through their original receipts.
 
     @invariant QuorumsCountDistinctJournals
         -- Each loglet slot names a distinct durable journal.
