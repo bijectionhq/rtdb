@@ -2,7 +2,7 @@ use prost::Message;
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
 use rtdb_format::generated::xtdb::{block::proto::Block, log::proto as pb};
-use rtdb_types::{Term, TermSequence};
+use rtdb_types::{PlacedAttemptScope, SourcePosition, Term, TermSequence, Timestamp};
 
 #[test]
 fn every_message_kind_carries_its_term_position_through_the_codec() {
@@ -22,6 +22,40 @@ fn every_message_kind_carries_its_term_position_through_the_codec() {
         assert_eq!(stamped.encoded_len(), stamped.encode().len());
         assert_eq!(ReplicaEnvelope::decode(&stamped.encode()).unwrap(), Some(stamped));
     }
+}
+
+#[test]
+fn a_strict_replica_record_preserves_and_checks_its_original_staging_sample() {
+    let source = SourcePosition(1);
+    let placement = PlacedAttemptScope::new("replica", 1).unwrap().issue()
+        .identify(source, Some("owner")).unwrap();
+    let tx = pb::ResolvedTx { tx_id: Some(source.0), system_time_micros: Some(100),
+        src_msg_id: Some(source.0), committed: Some(true), placed_attempt: Some(placement.encode().to_vec()),
+        acceptance_stage: Some(pb::AcceptanceStage { clock_upper_micros: Some(198), cutoff_micros: Some(200) }),
+        ..Default::default() };
+    let encode = |tx| ReplicaEnvelope { term: Term(5), term_sequence: Some(TermSequence(3)), message: ReplicaBody::ResolvedTx(tx) }.encode();
+    let encoded = encode(tx.clone());
+    let Some(ReplicaEnvelope { message: ReplicaBody::ResolvedTx(decoded), .. }) = ReplicaEnvelope::decode(&encoded).unwrap() else {
+        panic!("strict committed transaction should decode");
+    };
+    let stage = decoded.checked_acceptance_stage().unwrap().unwrap();
+    assert_eq!(stage.source_position, source);
+    assert_eq!(stage.ordered_at, Timestamp(100));
+    assert_eq!(stage.clock_upper, Timestamp(198));
+    assert_eq!(stage.cutoff, Timestamp(200));
+
+    let mut preflight = tx.clone();
+    preflight.acceptance_stage.as_mut().unwrap().clock_upper_micros = Some(0);
+    assert_eq!(encode(preflight).len(), encoded.len());
+
+    let mut at_cutoff = tx.clone();
+    at_cutoff.acceptance_stage.as_mut().unwrap().clock_upper_micros = Some(200);
+    let at_cutoff_bytes = encode(at_cutoff);
+    assert_eq!(at_cutoff_bytes.len(), encoded.len());
+    assert!(ReplicaEnvelope::decode(&at_cutoff_bytes).is_err());
+    let mut aborted = tx;
+    aborted.committed = Some(false);
+    assert!(ReplicaEnvelope::decode(&encode(aborted)).is_err());
 }
 
 #[test]

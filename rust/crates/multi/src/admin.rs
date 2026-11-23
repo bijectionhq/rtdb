@@ -1878,11 +1878,26 @@ pub struct AuditAnchor {
     pub digest: String,
 }
 
+/// Acceptance-stage coordinates from one retained replica record.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AuditAcceptanceStage {
+    pub replica_offset: i64,
+    pub source_position: i64,
+    pub term: i64,
+    pub ordered_at_micros: i64,
+    pub staging_clock_upper_micros: i64,
+    pub cutoff_micros: i64,
+}
+
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AuditReport {
     pub records: usize,
     pub transactions: usize,
+    #[serde(default)]
+    pub retained_acceptance_stages: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_retained_acceptance_stage: Option<AuditAcceptanceStage>,
     pub highest_term: i64,
     pub violations: Vec<String>,
     #[serde(default)]
@@ -1929,6 +1944,17 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
             report.highest_term = report.highest_term.max(envelope.term.0);
             if let ReplicaBody::ResolvedTx(tx) = &envelope.message {
                 report.transactions += 1;
+                if let Some(stage) = tx.checked_acceptance_stage()? {
+                    report.retained_acceptance_stages += 1;
+                    report.last_retained_acceptance_stage = Some(AuditAcceptanceStage {
+                        replica_offset: record.metadata.offset.0,
+                        source_position: stage.source_position.0,
+                        term: envelope.term.0,
+                        ordered_at_micros: stage.ordered_at.0,
+                        staging_clock_upper_micros: stage.clock_upper.0,
+                        cutoff_micros: stage.cutoff.0,
+                    });
+                }
                 for (what, value, last) in [("transaction id", tx.tx_id, &mut last_tx), ("system time", tx.system_time_micros, &mut last_time), ("source position", tx.src_msg_id, &mut last_source)] {
                     if let Some(value) = value {
                         if value <= *last { report.violations.push(format!("position {}: {what} {value} does not rise past {}", record.metadata.offset.0, *last)); }

@@ -512,6 +512,10 @@ variant ResolvedTxMessage : ReplicaMessage {
     -- The leader's RESOLVE-side source watermark when this record was produced: for a source-log transaction its own position, for an external-source one the leader's current source-log position, so that followers keep their durable watermark in step between block boundaries.
     -- Null only on records written before the field existed, where readers fall back to the tx_id or to the tracked watermark.
     src_msg_id: MessageId?
+
+    -- A strict placed commit retains its rounded writer staging sample and exclusive staging cutoff inline with its effect and receipt. The sample and resolved system time both precede the cutoff. These coordinates record the admission check before quorum durability.
+    staging_clock_upper: Timestamp?
+    staging_cutoff: Timestamp?
 }
 
 variant BlockBoundaryMessage : ReplicaMessage {

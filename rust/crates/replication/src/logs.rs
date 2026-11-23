@@ -137,11 +137,15 @@ impl PartitionLogs {
     pub(crate) fn replica_inline_limit(&self) -> Option<usize> { self.replica.maximum_append_bytes() }
     pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp,
         allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
+        let has_acceptance_stage = match &envelope.message {
+            ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?.is_some(),
+            _ => false,
+        };
         let payload = EncodedPayload::encode(envelope.encoded_len(), &self.memory, || Ok(envelope.encode()))?;
         before_enqueue(&payload)?;
         let receipt = match self.replica.enqueue(payload.clone(), now).await {
             Ok(receipt) => receipt,
-            Err(StorageError::MessageTooLarge { .. }) if allow_offload => {
+            Err(StorageError::MessageTooLarge { .. }) if allow_offload && !has_acceptance_stage => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
                 self.store.put(&ObjectKey::new(oversized_key(block, &payload_id)?)?, payload).await?;
                 let proxy = ReplicaEnvelope { term: envelope.term, term_sequence: envelope.term_sequence,

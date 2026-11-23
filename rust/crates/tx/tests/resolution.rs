@@ -1093,6 +1093,9 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(accepted.writes().tables().contains_key(&facts.table("owner")));
     assert_eq!(accepted.staging_clock_upper(), Some(Timestamp(199)));
     let Some(rtdb_format::envelope::ReplicaBody::ResolvedTx(message)) = accepted.inline_replica_body() else { panic!("expected an inline replica transaction"); };
+    let stage = message.checked_acceptance_stage().unwrap().unwrap();
+    assert_eq!(stage.clock_upper, Timestamp(199));
+    assert_eq!(stage.cutoff, Timestamp(200));
     let replayed = rtdb_tx::decode_replica(message, Some(oversized.result().tx_key()), accepted.writes().block_index(), &context.memory).unwrap();
     assert!(replayed.writes.tables().contains_key(&table));
     assert!(replayed.writes.tables().contains_key(&facts.table("owner")));

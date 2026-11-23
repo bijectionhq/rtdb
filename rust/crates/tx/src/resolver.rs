@@ -7,7 +7,7 @@ use prost::Message;
 use arrow_array::{Array, RecordBatch, cast::AsArray};
 use arrow_schema::{DataType, Schema};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
+use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{AcceptanceStage, ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
 use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
@@ -72,7 +72,13 @@ impl ResolveContext {
 }
 
 pub struct OwnedReplicaBody { body: ReplicaBody, _reservation: Arc<MemoryReservation> }
-impl OwnedReplicaBody { pub fn body(&self) -> &ReplicaBody { &self.body } }
+impl OwnedReplicaBody {
+    pub fn body(&self) -> &ReplicaBody { &self.body }
+    fn acceptance_stage(&self) -> Option<&AcceptanceStage> {
+        let ReplicaBody::ResolvedTx(tx) = &self.body else { return None; };
+        tx.acceptance_stage.as_ref()
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ResolvedInput {
@@ -92,13 +98,8 @@ pub struct ResolvedTx {
     input: ResolvedInput,
     external_token: Option<Vec<u8>>,
     db_op: Option<DbOp>,
-    inline_replica: Option<InlineReplica>,
+    inline_replica: Option<OwnedReplicaBody>,
     _reservation: Arc<MemoryReservation>,
-}
-
-struct InlineReplica {
-    body: OwnedReplicaBody,
-    staging_clock_upper: Timestamp,
 }
 
 impl ResolvedTx {
@@ -116,28 +117,43 @@ impl ResolvedTx {
     }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
-    pub fn inline_replica_body(&self) -> Option<&ReplicaBody> { self.inline_replica.as_ref().map(|replica| replica.body.body()) }
-    pub fn staging_clock_upper(&self) -> Option<Timestamp> { self.inline_replica.as_ref().map(|replica| replica.staging_clock_upper) }
+    pub fn inline_replica_body(&self) -> Option<&ReplicaBody> { self.inline_replica.as_ref().map(OwnedReplicaBody::body) }
+    pub fn staging_clock_upper(&self) -> Option<Timestamp> {
+        self.inline_replica.as_ref()?.acceptance_stage()?.clock_upper_micros.map(Timestamp)
+    }
 
     fn prepare_inline_replica(&mut self, writer: Option<&WriterPublication<'_>>, until: Timestamp, memory: &Arc<MemoryBudget>) -> Result<()> {
         let (writer, maximum) = writer.and_then(|writer| writer.maximum_inline_bytes.map(|maximum| (writer, maximum)))
             .ok_or_else(|| Anomaly::unsupported("rtdb.owned/replica-inline-unavailable", "The writer has no installed inline replica limit"))?;
-        let body = self.to_replica_body(memory)?;
+        // Both coordinates use fixed-width fields. Reserving them before the
+        // capacity check makes substituting the live sample size invariant.
+        let mut body = self.encode_replica_body(memory, Some(AcceptanceStage {
+            clock_upper_micros: Some(0), cutoff_micros: Some(until.0),
+        }))?;
         if ReplicaEnvelope::maximum_encoded_len(body.body()) > maximum {
             return Err(Anomaly::incorrect("rtdb.owned/replica-inline-bound", "The resolved transaction exceeds the writer's inline replica limit"));
         }
         // The effect and receipt are encoded, and the candidate can still be discarded.
         // Round up the sampled clock because its microsecond coordinate was truncated.
-        let Some(upper) = (writer.clock)().0.checked_add(1).filter(|upper| *upper < until.0) else {
+        let Some(upper) = (writer.clock)().0.checked_add(1).filter(|upper| 0 < *upper && *upper < until.0) else {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before staging"));
         };
-        self.inline_replica = Some(InlineReplica { body, staging_clock_upper: Timestamp(upper) });
+        let ReplicaBody::ResolvedTx(WireResolvedTx { acceptance_stage: Some(stage), .. }) = &mut body.body else {
+            return Err(Anomaly::fault("rtdb.tx/acceptance-stage", "Prepared replica body has no acceptance stage"));
+        };
+        stage.clock_upper_micros = Some(upper);
+        self.inline_replica = Some(body);
         Ok(())
     }
 
     /// Serializes only this transaction's deltas, including zero-row schema declarations.
     /// The append owner supplies the term and sequence after obtaining this body.
     pub fn to_replica_body(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedReplicaBody> {
+        let stage = self.inline_replica.as_ref().and_then(OwnedReplicaBody::acceptance_stage).cloned();
+        self.encode_replica_body(memory, stage)
+    }
+
+    fn encode_replica_body(&self, memory: &Arc<MemoryBudget>, acceptance_stage: Option<AcceptanceStage>) -> Result<OwnedReplicaBody> {
         let mut tables = Vec::new();
         let mut bound = 65_536usize.checked_add(db_op_bytes(self.db_op.as_ref())?).ok_or_else(overflow)?;
         for (table, write) in self.writes.tables() {
@@ -156,7 +172,7 @@ impl ResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
             table_data: tables.into_iter().map(|(name, bytes)| (name, bytes.as_slice().to_vec())).collect(),
             db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position().0),
-            placed_attempt,
+            placed_attempt, acceptance_stage,
         });
         Ok(OwnedReplicaBody { body, _reservation: reservation })
     }
