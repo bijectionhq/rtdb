@@ -307,6 +307,9 @@ impl TxResolver {
             if outcome.is_ok() {
                 outcome = tx.write_owned_changes().await;
             }
+            if outcome.is_ok() {
+                outcome = tx.buffer.require_archived_positions_consumed();
+            }
             outcome.and_then(|()| match (replay, receipt) {
                 (Some(replay), _) => tx.write_replay_marker(replay),
                 (None, Some((id, digest))) => tx.put_receipt(&id, &digest, log_time),
@@ -1118,6 +1121,9 @@ impl<'a> OpenTransaction<'a> {
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
         if proposal_land.is_some() {
             self.buffer.retain_owned_positions()?;
+        }
+        if let Some(replay) = replay.as_ref().filter(|replay| !replay.commit_positions().is_empty()) {
+            self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
         }
         admitted.extend(proposal_land.map(|landing| landing.world));
         if proposal_land.is_none() && operations.iter().any(|op| matches!(op,
