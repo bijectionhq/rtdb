@@ -1539,6 +1539,26 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         .join(authority.placement.generation.to_string());
     let retired_prefix = generation_root.join(incumbent.epoch.to_string());
     assert!(retired_prefix.join(&storage_root).join("~grant").is_file());
+    {
+        let database = original_node.server.node().catalog().database("shop").unwrap();
+        let block = database.status().adopted_block.as_ref().unwrap().block_index();
+        let root = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(block).unwrap()).unwrap();
+        let payload = database.object_store().list(Some(&rtdb_storage::ObjectKey::new("oversized").unwrap()))
+            .await.unwrap().into_iter().next().unwrap().key;
+        for key in [root, payload] {
+            database.object_store().delete(&key).await.unwrap();
+            database.object_store().delete(&key).await.unwrap();
+            let physical = retired_prefix.join(&storage_root).join(key.as_str());
+            assert!(physical.is_file(), "delete must preserve the selectable closure object {key}");
+            let name = physical.strip_prefix(&serving_root).unwrap().to_str().unwrap();
+            let matching: Vec<Value> = fs::read_dir(retired_prefix.join("~reclaim/v1")).unwrap()
+                .map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap())
+                .filter(|candidate: &Value| candidate["key"] == name)
+                .collect();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0]["grant"]["epoch"], json!(incumbent.epoch));
+        }
+    }
     // An overlapping reader of the incumbent's prefix, as a zombie process
     // would hold it, keeps the prefix through every other piece of evidence.
     let zombie = OpenOptions::new()

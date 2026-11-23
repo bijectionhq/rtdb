@@ -528,6 +528,16 @@ contract LogService {
         -- An unqualified provider or a prefix without its grant record is refused.
         -- A settled receipt records the evidence, and a retry resumes from the recorded intent.
 
+    @invariant InstalledServingObjectReclamation
+        -- A serving writer submits a reclamation candidate only for an observed object in its own grant's prefix.
+        -- The create-only candidate binds the exact grant, provider namespace and key, and includes the observed provider version when available.
+        -- Equivalent submissions retain one candidate, and the candidate survives a worker restart.
+        -- The queue retains each candidate independently of checkpoint selection and conveys no permission to remove its object.
+        -- Physical removal requires an exact withdrawal decision ordered against reference admission.
+        -- Every selectable checkpoint and pending preparation, every retained typed replay suffix, every live journal hold, and every live RTDB reader lease protect their dependencies from withdrawal.
+        -- Physical removal follows the withdrawal fence and the drain of previously admitted operations for that object.
+        -- An authorized retirement of a superseded grant's prefix covers that prefix's candidate records as well.
+
     @invariant FreshJournalReadConsumesAnInvocation
         -- The chosen read result authenticates the exact placement, writer grant, invocation and applied cut.
         -- The receiving database applies the protected cut before the fresh read can proceed.

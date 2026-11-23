@@ -52,6 +52,33 @@ async fn block_gc_collects_old_metadata_but_preserves_offloaded_replica_payloads
 }
 
 #[tokio::test]
+async fn block_gc_queues_only_age_eligible_payloads_when_the_store_opts_in() {
+    let store = Arc::new(ObservedStore {
+        inner: Arc::new(MemoryStore::default()),
+        versions: BTreeMap::new(),
+        queued_payloads: Some(Mutex::default()),
+    });
+    let old = ObjectKey::new(oversized_key(BlockIndex(7), "old").unwrap()).unwrap();
+    let young = ObjectKey::new(oversized_key(BlockIndex(8), "young").unwrap()).unwrap();
+    for key in [&old, &young] {
+        store.put(key, Bytes::from_static(b"payload")).await.unwrap();
+    }
+    let tables = TableCatalog::load(Some(block(10)), &BTreeMap::new()).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let observer = Arc::new(Observer::default());
+    let config = GarbageConfig { blocks_to_keep: 3, ..Default::default() };
+
+    BlockCollector::new(store.clone(), state, observer.clone(), config).unwrap()
+        .collect(&CancellationToken::new()).await.unwrap();
+
+    assert_eq!(*store.queued_payloads.as_ref().unwrap().lock().unwrap(), [old.clone()]);
+    for key in [old, young] {
+        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"payload"));
+    }
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn ending_the_leader_term_cancels_block_gc_without_recording_a_failure() {
     let store = Arc::new(MemoryStore::default());
     let oldest = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
@@ -544,6 +571,7 @@ async fn collection_preserves_open_readers_and_their_inflight_io() {
 struct ObservedStore {
     inner: Arc<MemoryStore>,
     versions: BTreeMap<ObjectKey, PhysicalObjectVersion>,
+    queued_payloads: Option<Mutex<Vec<ObjectKey>>>,
 }
 
 fn provider_version(key: &ObjectKey, version: &str) -> PhysicalObjectVersion {
@@ -563,6 +591,14 @@ impl ObjectStore for ObservedStore {
     async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, path).await }
     async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::object_store::StoredObject>> { self.inner.list(prefix).await }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    fn queues_offloaded_payload_reclamation(&self) -> bool { self.queued_payloads.is_some() }
+    async fn collect_recovery_file(&self, key: &ObjectKey) -> Result<()> {
+        if let Some(queued) = &self.queued_payloads && key.as_str().starts_with("oversized/") {
+            queued.lock().unwrap().push(key.clone());
+            return Ok(());
+        }
+        Ok(self.delete(key).await?)
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
         let Some(version) = self.versions.get(key) else { return Ok(None); };
         self.inner.head(key).await?;
@@ -595,7 +631,7 @@ async fn retirement_binds_only_the_same_version_the_catalog_published() {
         replica_epoch: StorageEpoch(0), through: ReplicaPosition(0) }).unwrap();
     let store = Arc::new(MemoryStore::default());
     for key in [&data, &metadata] { store.put(key, Bytes::from_static(b"published")).await.unwrap(); }
-    let observing = Arc::new(ObservedStore { inner: store.clone(), versions: BTreeMap::from([
+    let observing = Arc::new(ObservedStore { inner: store.clone(), queued_payloads: None, versions: BTreeMap::from([
         (data.clone(), published_data), (metadata.clone(), provider_version(&metadata, "replacement-version")),
     ]) });
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
@@ -657,6 +693,7 @@ async fn shared_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     }
     let observing = Arc::new(ObservedStore {
         inner: store.clone(),
+        queued_payloads: None,
         versions: [&agreed, &mixed, &legacy].into_iter()
             .map(|key| (key.clone(), provider_version(key, "group-file-version"))).collect(),
     });

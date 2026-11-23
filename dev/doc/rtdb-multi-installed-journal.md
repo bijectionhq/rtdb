@@ -162,6 +162,20 @@ Existing holds keep their entitlement until the deadline, at most 120 seconds fr
 Clean publication and revocation must account for offloaded record bodies, retained plaintext and dependent storage in the custody domain.
 The resulting provider and clock guarantees have to cover all outstanding key operations and grants.
 
+### Queue reclamation inside the current writer's prefix
+
+Installed serving storage records a delete request for an existing object owned by the current writer as a create-only candidate under `STORAGE_PREFIX/~ordered/GENERATION/EPOCH/~reclaim/v1/`.
+Each record names the grant, storage namespace fingerprint, cell-relative object key and observed provider version when available.
+Retries for the same observation converge on one record.
+An inherited checkpoint member stays under its original checkpoint custody.
+Block collection also submits offloaded payloads using the same block-age cutoff as checkpoint metadata.
+The queue sits outside the database's storage root and retires with its writer prefix.
+
+A successful request acknowledges the candidate and leaves the bytes available for reads and replay.
+The current writer's storage still grows until an ordered exact-object withdrawal operation and a qualified provider disposal path are available.
+Withdrawal must serialize with new references and cover both crash-selectable checkpoint images, preparations, the typed closure of every retained suffix, Logkeeper's replay, recovery, root and read holds, and RTDB reader leases.
+An inspection of the current route and suffix can assist discovery, but an append, preparation or admission after that inspection can introduce a dependency before a provider effect.
+
 ## Repair the voter cohort
 
 1. Create successor manifests that keep the same logical placement and identify the predecessor digest and its receipt-verification keys. Provision the new voter volumes and run `logkeeper ordered reserve-repair` on each successor to produce signed capacity tickets. The pending votes cannot serve the journal.

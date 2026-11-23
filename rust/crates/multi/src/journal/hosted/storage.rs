@@ -1,4 +1,5 @@
 use super::prefix_retirement::{DESCRIPTOR, GrantDescriptor, local_lifetime};
+use super::reclamation::{ReclamationQueue, queue_prefix};
 use super::{Routes, genesis, invalid, material};
 use crate::deployment::CellStorage;
 use crate::journal::{
@@ -153,45 +154,53 @@ impl RemoteStorageFactory for StoreFactory {
         };
         let storage_prefix = placement.record.storage_prefix();
         let installed = placement.worker.placement();
-        let io = local_lifetime(&self.storage, &grant_prefix(&storage_prefix, installed.generation, grant.epoch), &io)?;
+        let grant_prefix = grant_prefix(&storage_prefix, installed.generation, grant.epoch);
+        let io = local_lifetime(&self.storage, &grant_prefix, &io)?;
         let bucket = self.storage.bucket(Arc::clone(&io)).await?;
         let prefix = source_prefix(&storage_prefix, installed.generation, grant.epoch, root);
-        let writer = match (&self.storage, &self.scoped_writes) {
+        let queue_prefix = queue_prefix(&grant_prefix);
+        let (writer, queue_writer) = match (&self.storage, &self.scoped_writes) {
             (CellStorage::S3 { config }, Some(scoped)) => {
                 let authorization: Arc<dyn rtdb_s3::WriteAuthorization> = scope.clone();
-                Some(
-                    scoped
-                        .ordered_writer(config, &prefix, authorization, Arc::clone(&io))
-                        .await?,
+                (
+                    Some(scoped.ordered_writer(config, &prefix, Arc::clone(&authorization), Arc::clone(&io)).await?),
+                    Some(scoped.ordered_writer(config, &queue_prefix, authorization, Arc::clone(&io)).await?),
                 )
             }
             (CellStorage::S3 { .. }, None) => {
                 return Err(invalid("An ordered S3 writer requires a scoped write role"));
             }
-            (CellStorage::Local { .. }, _) => None,
+            (CellStorage::Local { .. }, _) => (None, None),
         };
+        let grant = GrantDescriptor::new(&placement, grant);
+        let descriptor = serde_json::to_vec(&grant).map_err(|error| invalid(&error.to_string()))?;
+        let reclamation = ReclamationQueue::new(
+            Arc::clone(&bucket), queue_writer, queue_prefix, prefix.clone(), grant,
+            self.storage.custody_namespace()?,
+        );
         let upper = Arc::new(
             crate::reference::PrefixedStore::new(Arc::clone(&bucket), prefix).with_writer(writer),
         );
         crate::store::check_root(upper.as_ref(), &placement.record.id, true).await?;
-        let descriptor = serde_json::to_vec(&GrantDescriptor::new(&placement, grant))
-            .map_err(|error| invalid(&error.to_string()))?;
         upper.put(&ObjectKey::new(DESCRIPTOR)?, Bytes::from(descriptor)).await?;
         let upper: Arc<dyn ObjectStore> = Arc::new(EncryptingStore::new(upper, &material)?);
         let store = Arc::new(ServingStore {
             lower,
             upper,
-            scope: Some(scope),
-            replica_objects: Some(ReplicaObjects {
-                installed,
-                storage_prefix,
-                root: root.clone(),
-                bucket,
-                storage: self.storage.clone(),
-                io,
-                material,
+            writer: Some(ServingWriter {
+                scope,
+                reclamation,
+                replica_objects: ReplicaObjects {
+                    installed,
+                    storage_prefix,
+                    root: root.clone(),
+                    bucket,
+                    storage: self.storage.clone(),
+                    io,
+                    material,
+                },
+                _protection: protection,
             }),
-            _protection: Some(protection),
         });
         Ok(OpenedRecoveryStore {
             store,
@@ -316,9 +325,7 @@ pub(super) async fn reopen_source(
     Ok(Arc::new(ServingStore {
         lower,
         upper,
-        scope: None,
-        replica_objects: None,
-        _protection: None,
+        writer: None,
     }))
 }
 
@@ -327,9 +334,14 @@ pub(super) async fn reopen_source(
 struct ServingStore {
     lower: Option<Arc<dyn ObjectStore>>,
     upper: Arc<dyn ObjectStore>,
-    scope: Option<Arc<WriteScope>>,
-    replica_objects: Option<ReplicaObjects>,
-    _protection: Option<Arc<crate::journal::Held>>,
+    writer: Option<ServingWriter>,
+}
+
+struct ServingWriter {
+    scope: Arc<WriteScope>,
+    reclamation: ReclamationQueue,
+    replica_objects: ReplicaObjects,
+    _protection: Arc<crate::journal::Held>,
 }
 
 impl ServingStore {
@@ -345,8 +357,8 @@ impl ServingStore {
     }
 
     async fn reading(&self, key: &ObjectKey) -> rtdb_storage::Result<&dyn ObjectStore> {
-        if let Some(scope) = &self.scope {
-            scope.serving().await.map_err(|error| Error::Remote {
+        if let Some(writer) = &self.writer {
+            writer.scope.serving().await.map_err(|error| Error::Remote {
                 key: key.to_string(),
                 message: error.to_string(),
             })?;
@@ -354,34 +366,39 @@ impl ServingStore {
         Ok(self.inherited(key).await?.unwrap_or(self.upper.as_ref()))
     }
 
-    async fn authorize(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+    async fn authorize(&self, key: &ObjectKey) -> rtdb_storage::Result<&ServingWriter> {
         use rtdb_s3::WriteAuthorization;
-        self.scope
+        let writer = self.writer
             .as_ref()
             .ok_or_else(|| Error::Remote {
                 key: key.to_string(),
                 message: "A checkpoint preparation source is read-only".into(),
-            })?
-            .authorize(None)
+            })?;
+        writer.scope.authorize(None)
             .await
             .map_err(|error| Error::Remote {
                 key: key.to_string(),
                 message: error.to_string(),
-            })
+            })?;
+        Ok(writer)
     }
 }
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    fn queues_offloaded_payload_reclamation(&self) -> bool {
+        self.writer.is_some()
+    }
+
     async fn open_replica_objects(
         &self,
         scope: ReplicaObjectScope,
     ) -> rtdb_storage::Result<Arc<dyn ObjectStore>> {
         let owner = self
-            .replica_objects
+            .writer
             .as_ref()
             .ok_or_else(|| Error::Task("The store has no installed replica object scope".into()))?;
-        owner.open(scope).await
+        owner.replica_objects.open(scope).await
     }
 
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
@@ -489,10 +506,8 @@ impl ObjectStore for ServingStore {
     }
 
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        // The writer's published objects can still be the source of an
-        // ordered checkpoint or a read whose grant has been replaced.
-        // Retention of this immutable source is owned by its installation.
-        self.authorize(key).await
+        let writer = self.authorize(key).await?;
+        writer.reclamation.enqueue(self.upper.as_ref(), self.lower.as_deref(), key).await
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {

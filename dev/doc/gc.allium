@@ -10,6 +10,7 @@
 -- The period is the configured reader lease clamped to 100 milliseconds through 60 seconds.
 -- A retry gives an eligible trie or pending receipt a fresh collection opportunity even if no new block arrives.
 -- The timer only schedules cycles. The collector still checks eligibility, elapsed reader leases and the catalog admission floor.
+-- In installed-journal mode, a storage delete request queues the owned serving object for reclamation under journal custody.
 --
 -- Tries transition to `garbage` during addTries (see trie-cat.allium); this
 -- spec covers physical cleanup: deleting object-store files and publishing

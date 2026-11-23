@@ -449,6 +449,7 @@ impl ObjectStore for DiskCachedStore {
         self.remote.delete(key).await?;
         self.cache.invalidate(&self.key(key)?)
     }
+    fn queues_offloaded_payload_reclamation(&self) -> bool { self.remote.queues_offloaded_payload_reclamation() }
     async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;

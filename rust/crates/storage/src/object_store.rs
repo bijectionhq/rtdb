@@ -278,6 +278,8 @@ pub trait ObjectStore: Send + Sync {
     /// A listing may observe concurrent writes or deletions while enumerating the names.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
+    /// Whether block collection may submit offloaded payloads for deferred reclamation.
+    fn queues_offloaded_payload_reclamation(&self) -> bool { false }
     /// Collects an eligible checkpoint or offloaded replica file unless recovery still retains its block.
     async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
         self.delete(key).await.map_err(Into::into)

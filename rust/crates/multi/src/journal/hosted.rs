@@ -2,6 +2,7 @@
 
 mod discovery;
 pub(crate) mod prefix_retirement;
+mod reclamation;
 mod storage;
 
 use super::{

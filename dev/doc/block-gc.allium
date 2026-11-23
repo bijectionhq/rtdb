@@ -26,6 +26,7 @@
 -- Offloaded replica-message payloads (`oversized/b{idx}-{uuid}.binpb`, see db.allium's OversizedMessage) belong to the durable history of each record that references them.
 -- A follower can fetch such a payload while applying a record from a block whose catalog files have already been collected.
 -- Block collection preserves offloaded payloads.
+-- An installed serving store queues age-eligible offloaded payloads for journal-checked reclamation under its exact writer grant.
 -- Storage disposal may remove them after the deployment's journal and all serving and recovery admissions end.
 --
 -- Per-database, leader-only, signal-driven. Same lifecycle and trigger model

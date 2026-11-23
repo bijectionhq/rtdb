@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use rtdb_format::{
     catalog::{BlockCatalog, TableEntry},
-    keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key},
+    keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key, oversized_block_index},
     log::proto::{ArtefactEntry, ArtefactsAdded, ArtefactsRemoved, PublishedObjectVersion, SearchRunChange},
 };
 use rtdb_index::{PartitionState, TrieCatalog};
@@ -445,12 +445,13 @@ impl BlockCollector {
         Ok(Self { store, snapshots, observer, config })
     }
 
-    async fn sweep(&self, prefix: &str, latest: BlockIndex, cancellation: &CancellationToken, deletes: &Semaphore) -> Result<()> {
+    async fn sweep(&self, prefix: &str, block_index: fn(&str) -> Option<BlockIndex>, latest: BlockIndex,
+        cancellation: &CancellationToken, deletes: &Semaphore) -> Result<()> {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let prefix = ObjectKey::new(prefix).map_err(crate::invalid)?;
         let objects = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?;
         let objects = objects.into_iter().filter(|object| {
-            block_index_from_key(object.key.as_str()).ok().is_some_and(|index| block_is_garbage(index, latest, self.config.blocks_to_keep))
+            block_index(object.key.as_str()).is_some_and(|index| block_is_garbage(index, latest, self.config.blocks_to_keep))
         });
         let results = stream::iter(objects).map(|object| async move {
             let _permit = deletes.acquire().await.map_err(crate::invalid)?;
@@ -469,7 +470,14 @@ impl CycleWorker for BlockCollector {
         let snapshot = self.snapshots.snapshot();
         let Some(latest) = snapshot.table_catalog().block_index() else { return Ok(()); };
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
-        if let Err(error) = self.sweep("blocks", latest, cancellation, &deletes).await {
+        let catalog_block = |key: &str| block_index_from_key(key).ok();
+        if let Err(error) = self.sweep("blocks", catalog_block, latest, cancellation, &deletes).await {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            self.observer.table_failed(None, &error);
+        }
+        if self.store.queues_offloaded_payload_reclamation()
+            && let Err(error) = self.sweep("oversized", oversized_block_index, latest, cancellation, &deletes).await
+        {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
         }
@@ -477,7 +485,7 @@ impl CycleWorker for BlockCollector {
         stream::iter(entries).map(|entry| {
             let deletes = Arc::clone(&deletes);
             async move {
-                if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), latest, cancellation, &deletes).await
+            if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), catalog_block, latest, cancellation, &deletes).await
                     && !cancellation.is_cancelled() {
                     self.observer.table_failed(Some(&entry.table), &error);
                 }
