@@ -1,0 +1,110 @@
+{
+  "summary": "Exact checkpoint and suffix key membership against the typed Lean replay closure.",
+  "flags": [
+    "--edition",
+    "2024",
+    "--triggers-mode",
+    "silent",
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "foreign_contracts": [
+    "prost-replay-payload"
+  ],
+  "min_verified_functions": 38,
+  "controls": {
+    "omit-adopted-catalog": {
+      "defect": "The adopted catalog contributes no keys.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/replay_closure_algorithm.rs",
+          "find": "        $keys.append(&mut checkpoint_dependencies($catalog, $tables)?);",
+          "replace": "        let _ = checkpoint_dependencies($catalog, $tables)?;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replay_closure/production.rs",
+          "function": "adopt_catalog",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "omit-decoded-oversized-body": {
+      "defect": "The oversized proxy contributes its payload path but discards the decoded body.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/replay_closure_algorithm.rs",
+          "find": "                $bodies.push(Cow::Owned($envelope.unwrap_payload(&payload)?.message));",
+          "replace": "                let _ = $envelope.unwrap_payload(&payload)?;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replay_closure/production.rs",
+          "function": "resolve_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "omit-added-tries": {
+      "defect": "TriesAdded contributes no trie or artefact files.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/replay_closure_algorithm.rs",
+          "find": "                    added_trie_keys($slugs, &message.tries, $keys)?;",
+          "replace": "                    let _ = &message.tries;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replay_closure/production.rs",
+          "function": "record_dependency_keys",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "omit-search-runs": {
+      "defect": "Replay omits all active search runs.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/catalog/checkpoint_files.rs",
+          "find": "        if matches!($contents, CheckpointContents::Replay) {",
+          "replace": "        if false && matches!($contents, CheckpointContents::Replay) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replay_closure/production.rs",
+          "function": "checkpoint_trie_files",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "omit-added-artefacts": {
+      "defect": "ArtefactsAdded omits valid references.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/replay_closure_algorithm.rs",
+          "find": "            ReplicaBody::ArtefactsAdded(message) => {\n                if same_storage(",
+          "replace": "            ReplicaBody::ArtefactsAdded(message) => {\n                if false && same_storage("
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replay_closure/production.rs",
+          "function": "record_dependency_keys",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    }
+  }
+}

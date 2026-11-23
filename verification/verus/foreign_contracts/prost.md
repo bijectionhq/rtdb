@@ -20,3 +20,7 @@ The framing proof checks which byte span reaches each leaf and what the RTDB wra
 The authored conformance cases are `replica_decoding_consumes_unknown_fields_and_rejects_malformed_suffixes` in `rust/crates/format/tests/term_sequence.rs` and `generated_source_decoding_rejects_an_incomplete_field_after_a_known_body` in `rust/crates/format/tests/source_classification.rs`.
 The journal cases in `rust/crates/logkeeper/src/server/journal.rs` are `journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body` and `journal_readers_preserve_the_activation_publication_mode`.
 The cases remain unverified by native execution in the formal-only sessions.
+
+The [replay payload leaf](prost_replay.rs) uses the same whole-buffer premise and projects the decoded replica message onto the term, optional sequence and present typed body.
+On success, RTDB's unwrap path supplies the suffix after the production protobuf header to Prost and checks the resulting term and sequence against the proxy.
+The replay closure proof uses this success contract and leaves digest verification and decoder rejection to the framing and runtime checks.

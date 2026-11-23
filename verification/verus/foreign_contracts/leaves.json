@@ -40,5 +40,11 @@
     "dependency": "prost 0.14.6",
     "contract": "The supplied journal body is consumed as one generated Record. An encoder-produced Record decodes to its original fields, including the certified publication mode and kind, within the supported nesting depth.",
     "conformance": "journal::tests::journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body and journal::tests::journal_readers_preserve_the_activation_publication_mode"
+  },
+  "prost-replay-payload": {
+    "model": "verification/verus/foreign_contracts/prost_replay.rs",
+    "dependency": "prost 0.14.6",
+    "contract": "On successful oversized payload unwrapping, the typed body is the whole replica protobuf frame's decoded body at the proxy's term and sequence. Runtime digest and envelope checks may reject a fetch before any dependency set is returned.",
+    "conformance": "checkpointless_suffix_keeps_the_offloaded_body_and_adopts_block_zero_once and replica_decoding_consumes_unknown_fields_and_rejects_malformed_suffixes"
   }
 }

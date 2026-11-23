@@ -13,7 +13,7 @@ macro_rules! trie_checkpoint_files {
         if matches!($contents, CheckpointContents::Replay) && !matches!(state, TrieState::Garbage) {
             $each!(files, &$detail.artefacts, record => {
                 if let Some(key) = replay_artefact_file($slug, &trie, record)? { files.insert(key); }
-            }, [|record: ArtefactRecord| ISet::empty().insert(artefactKey(*$slug, trie, record))]);
+            }, [|record: ArtefactRecord| artefactEntryKeys(*$slug, (trie, record))]);
         }
         Ok(files)
     }};
