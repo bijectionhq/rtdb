@@ -270,7 +270,7 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v9` on the audience gateway during its handshake.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v10` on the audience gateway during its handshake.
 The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
 The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
 The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
@@ -278,6 +278,7 @@ Before serving, the holder reserves 16 MiB of execution memory and 16 MiB of cac
 Each session uses its own buffer pool on the audience cache budget from initial preparation through applied confirmation.
 Audience queries use local scans. The holder requires an uncached view of the live writer's exact S3 storage attachment for the installed source.
 That view shares the attachment's object mapping, custody and serving key and bypasses the ordinary SSD cache and its fill queue.
+Provider object reads use a distinct S3 HTTP client, including when retained I/O outlives its caller. A remote store without that client refuses the scoped read.
 Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
 A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
 The audience handshake and subsequent actions use the reserved admission.

@@ -6,6 +6,7 @@ use crate::{Error, ReadLease, Result};
 tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
     static READ_LEASE: Arc<ReadLease>;
+    static AUDIENCE_OBJECT_READ: ();
 }
 
 pub struct IoRegion {
@@ -60,6 +61,12 @@ impl IoRegion {
         };
         Either::Left(READ_LEASE.scope(lease, work))
     }
+    /// Selects the dedicated provider read transport within an audience object read.
+    pub async fn audience_object_read<T>(work: impl std::future::Future<Output = T>) -> T {
+        AUDIENCE_OBJECT_READ.scope((), work).await
+    }
+    #[cfg(any(feature = "remote", test))]
+    pub(crate) fn requires_audience_transport() -> bool { AUDIENCE_OBJECT_READ.try_with(|_| ()).is_ok() }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
     /// Idle child handles do not delay any drain.
@@ -142,9 +149,11 @@ impl IoRegion {
     #[cfg(any(feature = "remote", test))]
     async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let audience = Self::requires_audience_transport();
         tokio::spawn(async move {
             let operation = operation;
-            drop(sender.send(work.await));
+            let result = if audience { Self::audience_object_read(work).await } else { work.await };
+            drop(sender.send(result));
             drop(operation);
         }).await.map_err(|error| Error::Task(error.to_string()))?;
         receiver.await.map_err(|error| Error::Task(error.to_string()))?

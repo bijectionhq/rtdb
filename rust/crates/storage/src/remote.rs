@@ -72,13 +72,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None, terminal_allocation: None }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None, terminal_allocation: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None, terminal_allocation: None }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None, terminal_allocation: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -88,8 +88,14 @@ impl RemoteStore {
         io: Arc<IoRegion>,
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
-        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
+        let objects = Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
         Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None }
+    }
+
+    /// Uses a separate read client for the same provider namespace and credentials.
+    pub fn with_audience_reader(mut self, reader: Arc<dyn ProviderStore>) -> Self {
+        Arc::make_mut(&mut self.objects).audience_reader = Some(reader);
+        self
     }
 
     /// Enables version observations for a store backed by the specified S3 namespace.
@@ -269,8 +275,10 @@ impl ObjectStore for RemoteStore {
     }
 }
 
+#[derive(Clone)]
 struct RemoteObjects {
     client: Arc<dyn ProviderStore>,
+    audience_reader: Option<Arc<dyn ProviderStore>>,
     prefix: Option<ObjectKey>,
     uploads: Option<Arc<dyn PublicationUploads>>,
     hide_tombstones: bool,
@@ -355,8 +363,15 @@ fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
 }
 
 impl RemoteObjects {
+    fn reader(&self) -> Result<&dyn ProviderStore> {
+        if IoRegion::requires_audience_transport() {
+            return self.audience_reader.as_deref().ok_or_else(|| Error::Closed("The provider has no dedicated audience read transport".into()));
+        }
+        Ok(self.client.as_ref())
+    }
+
     async fn read(&self, key: &ObjectKey, options: GetOptions) -> Result<GetResult> {
-        let response = self.client.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
+        let response = self.reader()?.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
         if self.is_tombstone(&response) {
             return Err(Error::MissingObject(key.to_string()));
         }
@@ -373,7 +388,7 @@ impl RemoteObjects {
         if self.hide_tombstones {
             return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }).await?.meta);
         }
-        self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
+        self.reader()?.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
@@ -419,7 +434,7 @@ impl RemoteObjects {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
         }
         if range.is_empty() { return Ok(Bytes::new()); }
-        let bytes = self.client.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
+        let bytes = self.reader()?.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
         if bytes.len() as u64 != range.end - range.start {
             return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
         }
@@ -543,7 +558,7 @@ impl RemoteObjects {
         let namespace = self.prefix.as_ref().map(|key| Path::from(key.as_str()));
         let path = directory.map(|key| self.path(key)).or_else(|| namespace.clone());
         let prefix = namespace.map(|path| format!("{path}/"));
-        let mut stream = self.client.list(path.as_ref());
+        let mut stream = self.reader()?.list(path.as_ref());
         let mut result = Vec::new();
         while let Some(metadata) = stream.try_next().await.map_err(|error| {
             let key = directory.map(ToString::to_string).unwrap_or_default();
@@ -613,6 +628,27 @@ mod tests {
             store: "test", source: Box::new(std::io::Error::other("403 AccessDenied PermissionDenied")),
         };
         assert!(matches!(provider_error(&key, error), Error::Remote { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_audience_read_uses_its_own_client_or_refuses() {
+        use object_store::memory::InMemory;
+
+        let regular = Arc::new(InMemory::new());
+        let audience = Arc::new(InMemory::new());
+        let key = ObjectKey::new("receipt").unwrap();
+        regular.put(&Path::from("cell/receipt"), Bytes::from_static(b"regular").into()).await.unwrap();
+        audience.put(&Path::from("cell/receipt"), Bytes::from_static(b"audience").into()).await.unwrap();
+        let store = RemoteStore::new_single_put(regular, ObjectKey::new("cell").unwrap(), IoRegion::new());
+
+        let refused = IoRegion::audience_object_read(store.get(&key)).await;
+        assert!(matches!(refused, Err(Error::Closed(_))));
+
+        let store = store.with_audience_reader(audience);
+        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"regular"));
+        assert_eq!(IoRegion::audience_object_read(store.head(&key)).await.unwrap().size, 8);
+        assert_eq!(IoRegion::audience_object_read(store.get_fresh_exact(&key, 8)).await.unwrap(), Bytes::from_static(b"audience"));
+        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"regular"));
     }
 
     #[tokio::test]

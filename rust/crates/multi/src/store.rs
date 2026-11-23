@@ -295,7 +295,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             && !config.compactor && config.snapshot_block.is_none()
         {
             Uuid::parse_str(&record.id).ok().filter(|source| !source.is_nil()).map(|source| {
-                Ok::<_, Anomaly>(AudienceReadStorage { source, store: Arc::new(EncryptingStore::new(uncached, &material)?) })
+                Ok::<_, Anomaly>(AudienceReadStorage { source, store: Arc::new(AudienceObjectStore(EncryptingStore::new(uncached, &material)?)) })
             }).transpose()?
         } else {
             None
@@ -930,6 +930,50 @@ impl ObjectStore for FencedStore {
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         Err(Error::ReadOnlyLog(PathBuf::from(key.as_str())))
     }
+}
+
+/// The scheduled reader only follows exact keys in its pinned catalog.
+struct AudienceObjectStore(EncryptingStore);
+
+fn audience_read_only() -> Error { Error::Closed("The audience object view admits only exact reads".into()) }
+
+#[async_trait]
+impl ObjectStore for AudienceObjectStore {
+    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
+        self.0.retain_catalog(cut).await
+    }
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        IoRegion::audience_object_read(self.0.head(key)).await
+    }
+    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        IoRegion::audience_object_read(self.0.head_fresh(key)).await
+    }
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
+        IoRegion::audience_object_read(self.0.observe_head(key)).await
+    }
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> rtdb_storage::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
+        IoRegion::audience_object_read(self.0.observe_heads(keys)).await
+    }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        IoRegion::audience_object_read(self.0.get(key)).await
+    }
+    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        IoRegion::audience_object_read(self.0.get_fresh(key)).await
+    }
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
+        IoRegion::audience_object_read(self.0.get_fresh_exact(key, length)).await
+    }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        IoRegion::audience_object_read(self.0.observe_fresh_exact(key, length)).await
+    }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+        IoRegion::audience_object_read(self.0.get_range(key, range)).await
+    }
+    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { false }
+    async fn put(&self, _: &ObjectKey, _: Bytes) -> rtdb_storage::Result<()> { Err(audience_read_only()) }
+    async fn put_file(&self, _: &ObjectKey, _: &Path) -> rtdb_storage::Result<()> { Err(audience_read_only()) }
+    async fn list(&self, _: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { Err(audience_read_only()) }
+    async fn delete(&self, _: &ObjectKey) -> rtdb_storage::Result<()> { Err(audience_read_only()) }
 }
 
 pub struct EncryptingStore { inner: Arc<dyn ObjectStore>, cipher: Cipher }

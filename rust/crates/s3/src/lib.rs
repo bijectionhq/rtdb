@@ -185,7 +185,11 @@ impl S3Config {
             endpoint: endpoint.map(|endpoint| endpoint.to_string()),
             region: Some(builder.get_config_value(&AmazonS3ConfigKey::Region).unwrap_or_else(|| "us-east-1".into())),
         };
-        let client = Arc::new(builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?);
+        let build = |builder: AmazonS3Builder| {
+            builder.build().map(Arc::new).map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))
+        };
+        let audience_reader = cell.then(|| build(builder.clone())).transpose()?;
+        let client = build(builder)?;
         if !cell {
             return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
         }
@@ -196,7 +200,8 @@ impl S3Config {
         };
         #[cfg(not(feature = "versioning"))]
         let store = RemoteStore::new_single_put(client, prefix, io);
-        let store = store.with_s3_versioning(namespace);
+        let store = store.with_audience_reader(audience_reader.expect("a cell opens a distinct read client"))
+            .with_s3_versioning(namespace);
         Ok(Arc::new(match &self.terminal_scope {
             Some(scope) => store.with_terminal_allocation(scope.allocation),
             None => store,
