@@ -81,8 +81,13 @@ The conservative cutoff remains in use where the exact-reachability policy is pe
 |The reset fence against running collection.
 
 |System state in user tables
-|An engine-owned receipt map keyed by database, principal and key, holding a body digest; the resolver answers a duplicate with the original outcome and a mismatched body with `rtdb/idempotency-conflict`.
-Receipts and transaction metadata expire by log time and are removed physically.
+|The RTDB retry key binds a transaction in its registered receiver scope of database and authenticated principal.
+The resolver compares its transaction body digest, replays the original outcome within the receipt window and reports `rtdb/idempotency-conflict` for a changed body.
+Application intent lookup and labelled command comparison belong to the application or its kernel adapter.
+For an owned publication, the deciding history orders the slot witness and guarded decision with the effects.
+Repair preserves the original position and applies current custody masks.
+A successor installs authenticated exclusion and transfer evidence before admitting inherited work.
+Receipt expiry governs readback and physical collection. Closed execution uses its independent slot fence.
 |`public.rtdb_idempotency_keys` and its SQL guard.
 
 |Proofs versus composition

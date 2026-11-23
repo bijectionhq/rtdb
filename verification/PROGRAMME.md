@@ -32,7 +32,7 @@ The second review narrows the fork decision to shared custody and defines how er
 | Erasure versus admitted views | A view admitted before an erasure keeps its answers until the erasure deadline (≤ 120 s); after that a read that needs destroyed key material fails with `rtdb/erased-under-view`. SNAP-1 and DUR-1 are amended accordingly. |
 | Forks | Erasure reaches shared history within its key custody domain. Independently keyed copies have their own erasure authority. |
 | Future system time | A client may not supply a system time later than the source log's append time (tolerance zero). Landed. |
-| Retry identities | Required for transaction submit, scoped to (database, principal, key) with a body digest and a conflict outcome. Landed. |
+| Retry identities | An exact transaction retry is scoped to its registered receiver, database and principal, with a body digest and a conflict outcome. An owned publication orders its separate slot witness with the guarded decision and effects. Business intent and application command comparison belong to the application boundary. |
 | Transaction metadata | Retained only for the receipt window, and erasable with its unit before then (R8). |
 | Physical erasure and non-interference | OPT-2 is in scope with the declared bound; OPT-3 only for rows and search scores of fresh views. |
 | XTDB compatibility | Not a constraint. |
@@ -207,7 +207,10 @@ Goal: state and witness the progress guarantees RTDB adopts, and verify the opti
 
 1. LIVE-1: give an eligible request in stable service a progress witness, plus a mutation that disables the needed progress step or fairness assumption.
 2. LIVE-2: show that a retired generation becomes reclaimable after its last obligation ends; this shares a witness with W1 item 6.
-3. OPT-1: run acceptance program A12 (lose the reply, restart, retry the same identity and a different body) against the engine-owned receipts, and verify the receipt decision in Verus.
+3. OPT-1: exercise reply loss, repair, and same- and changed-body retries against engine-owned receipts.
+   For owned publications, establish that the decision, slot witness and consequences share one original position, repair applies current custody masks, and successors require authenticated exclusion and transfer before accepting inherited work.
+   Controls remove the fence at restore or use SQL metadata expiry as evidence of exclusion.
+   Application equality and schedule coverage refine their own owners over this transaction order.
 4. OPT-2 and OPT-3: verify the eraser (R7) against the storage inventory: logs, checkpoints, object versions, caches, replicas, exports, backups and keys.
 
 **Done when:** each adopted claim has its witness and its mutation.

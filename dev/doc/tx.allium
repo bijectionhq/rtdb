@@ -419,14 +419,16 @@ value CommitOpts {
     --                   The engine projects automatic history time strictly forward even at equal or regressed append timestamps.
     --   user_metadata — per-transaction metadata.
     --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
-    --                   A reusable application key has separate stored receipt identities for separate hour buckets.
+    --                   A reusable SQL retry key has separate stored receipt identities for separate hour buckets.
     --                   Lookup covers the current and previous buckets and checks the exclusive expiry.
     --                   A typed metadata association names one ordinary record or an exact record in the submitting owner's Root.
     --                   Its payload is retained only when the transaction commits a put for that record without erasing it.
     --                   An ordered record erase erases its associated metadata in the same commit.
     --                   The installed catalog determines retention even when a query selects an earlier system time.
     --                   A settled retry keeps its original causal coordinate after that metadata expires.
-    --                   An idempotency_key field names a retry identity scoped to the database and principal: a same-body retry within the receipt window is answered with the original's outcome, and a different body aborts with rtdb/idempotency-conflict.
+    --                   An idempotency_key field names an exact transaction retry identity scoped to the registered receiver, database and authenticated principal.
+    --                   A same-body retry within the receipt window returns the original outcome and a changed body aborts with rtdb/idempotency-conflict.
+    --                   Application owners register business intents and compare any labelled commands at their own decision boundaries.
     --                   Within one installed history, receipt admission and expiry use the greatest source-log append time observed through the transaction being resolved.
     --                   The native rtdb_retry_v1 field takes a document with a lowercase 32-hex-digit nonce and an integer not_after_micros.
     --                   Its principal-scoped identity includes that exclusive UTC-microsecond deadline, which is within one hour of the admission clock.
@@ -435,6 +437,10 @@ value CommitOpts {
     --                   The engine uses a nondecreasing clock of observed bounded-request log timestamps, preserved across restarts.
     --                   A new operation uses a fresh identity, and rtdb_retry_v1 is mutually exclusive with idempotency_key.
     --                   PgWire exposes the native protocol with SHOW rtdb_bounded_retry = 1, checked on each new connection before a bounded submission.
+    --                   For an owned publication, the deciding history orders the guarded decision and slot witness with the effects.
+    --                   Repair retains the original slot and position and applies current custody masks.
+    --                   A successor installs authenticated exclusion and transfer evidence before admitting inherited work.
+    --                   SQL retry metadata expiry ends readback. Owned execution exclusion survives through its separate fence.
     --                   RTDB recognises the Boolean rtdb_ordered_system_time field as an opt-in to rejecting an explicit system time behind the source log.
     --                   The PgWire SHOW rtdb_ordered_system_time value is 1 when the server supports this guard.
     --   async         — true: commit submits without awaiting; false: execute-and-await.
