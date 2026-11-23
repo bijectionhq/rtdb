@@ -79,7 +79,8 @@ The node's PostgreSQL TLS configuration does not apply to this endpoint.
 
 == Queries, writes, and metadata
 
-GetFlightInfo captures a query's SQL, database, optional parameter IPC, and explicit read basis into the Kotlin-compatible JSON ticket inside `TicketStatementQuery`.
+GetFlightInfo captures the query plan, Arrow parameters, catalog and clock behind a bounded opaque `TicketStatementQuery` handle.
+Authenticated ticket redemption requires the original session and deployment attachment.
 It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
 GetFlightInfo, GetSchema, CreatePreparedStatement and DoPut statement updates use the same selected Direct parser diagnostics for initial preparation.
 When the vendor parser rejects a first unquoted ASCII identifier outside both vocabularies, the frontend compares the byte range and accepts a matching extraneous-input or statement-head mismatch report.
@@ -155,7 +156,7 @@ Query metrics count pull and Arrow-encoding failures; transport failures after a
 == Regression source mapping
 
 `tests/flight.rs` uses an actual native Node and tonic Flight client in its test source.
-Cases cover captured read bases, effect-free empty-ticket redemption, positional and multi-batch parameters, rebind isolation, authenticated handle ownership, transferable tickets, anonymous cross-session transaction completion, immediate lease expiry, bulk ingestion, metadata union offsets, and shutdown while an upload waits for its first message.
+Cases cover captured read bases, effect-free empty-ticket redemption, positional and multi-batch parameters, rebind isolation, authenticated handle and ticket ownership, anonymous cross-session transaction completion, immediate lease expiry, bulk ingestion, metadata union offsets, and shutdown while an upload waits for its first message.
 Internal cases cover idle leases and tombstones, nested session calls, credential parsing, cookie selection, Kotlin ticket JSON with required nullable fields, retained Arrow ownership, empty argument distinctions, and malformed IPC extents.
 The reserved metadata API has a source regression in `rtdb-query` for clone lifetime and reservation failure.
 

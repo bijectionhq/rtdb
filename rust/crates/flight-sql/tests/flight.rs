@@ -344,7 +344,7 @@ async fn query_info_pins_read_only_and_announced_schema_matches_redeemed_rows() 
 async fn query_ticket_keeps_an_empty_cut_and_the_original_clock() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
-    let clock = client.info("SELECT CURRENT_TIMESTAMP(6) AS now", None).await;
+    let clock = client.info("SELECT CURRENT_TIMESTAMP(6) AS held_clock", None).await;
     let before = client.redeem(&clock).await;
     let query = "SELECT count(*) AS n FROM xt.txs FOR ALL VALID_TIME";
     let empty = client.info(query, None).await;
@@ -477,12 +477,15 @@ async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads()
 }
 
 #[tokio::test]
-async fn authenticated_handles_are_session_scoped_but_query_tickets_can_be_redeemed_by_another_caller() {
+async fn authenticated_handles_and_query_tickets_require_the_original_session() {
     let running = Running::start(Some("correct"), FlightConfig::default()).await;
     let mut first = Client::connect(&running.server, Some("xtdb:correct")).await; let mut second = Client::connect(&running.server, Some("xtdb:correct")).await;
     let handle = first.begin().await; assert_eq!(second.end(handle.clone(), true).await.unwrap_err().code(), tonic::Code::NotFound);
     first.end(handle, false).await.unwrap(); let info = first.info("SELECT 1::bigint AS n", None).await;
-    assert_eq!(integer(&second.redeem(&info).await[0], 0, 0), 1); running.stop().await;
+    let request = second.request(info.endpoint[0].ticket.clone().unwrap());
+    assert_eq!(second.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(integer(&first.redeem(&info).await[0], 0, 0), 1);
+    running.stop().await;
 }
 
 #[tokio::test]
