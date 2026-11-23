@@ -4,7 +4,7 @@ use super::connection::CALL_TIMEOUT;
 use super::ensemble::{Ack, Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::CopyFrom;
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Accepted, Commit, Entry, PageDigest, RequestBody, Sealed};
+use crate::protocol::{Accepted, Commit, Entry, PageDigest, RequestBody, Sealed, before_guarded_cutoff};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -302,7 +302,10 @@ struct GuardedEvidence {
 impl GuardedEvidence {
     fn record_exact(&mut self, proof: &PageDigest) {
         match (proof.original_append, proof.synced_clock_upper_micros) {
-            (Some(true), Some(upper)) if upper > 0 => self.observed += 1,
+            (Some(true), Some(upper)) if upper > 0 => {
+                if before_guarded_cutoff(upper, proof.guarded_before) { self.observed += 1; }
+                else { self.possible -= 1; }
+            }
             (Some(false), None) => self.possible -= 1,
             // An original that survived without its post-sync sample still
             // may have synced before the cutoff. An incomplete probe is open.
@@ -345,7 +348,7 @@ async fn settle_guarded_tail(ensemble: &Ensemble, epoch: u64, source: usize, his
     let mut pending: FuturesUnordered<_> = holding.into_iter().filter(|server| *server != source)
         .map(|server| ensemble.guarded_digest(server, offset, epoch)).collect();
     while matches!(evidence.decision(quorum), TailDecision::Unknown) && let Some(reply) = pending.next().await {
-        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest {
+        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest && proof.guarded_before == exact.guarded_before {
             evidence.record_exact(&proof);
         }
     }
@@ -592,13 +595,16 @@ impl Writer {
         } else { None };
         // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
         let payload = Bytes::copy_from_slice(&payload);
-        let timestamp = match time {
-            AppendTime::Ordinary(timestamp) => timestamp,
-            AppendTime::Guarded(guard) => guard.sample()?,
+        let (timestamp, guarded_before) = match time {
+            AppendTime::Ordinary(timestamp) => (timestamp, None),
+            AppendTime::Guarded(guard) => {
+                let before = guard.journal_before().map(|before| before.0);
+                (guard.sample()?, before)
+            }
         };
         pipeline.guarded = guarded;
         pipeline.next_lsn = next;
-        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, guarded: pipeline.guarded.is_some(), payload };
+        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, guarded: pipeline.guarded.is_some(), guarded_before, payload };
         pipeline.history.push(lsn, self.epoch);
         let (receipt, durable) = oneshot::channel();
         pipeline.buffered_bytes += entry.payload.len();
@@ -1000,11 +1006,12 @@ mod tests {
             directories.push(directory);
         }
 
-        for (stream, originals, copies, expected) in [
-            ("minority", 1, 0, -1), ("quorum", 2, 0, 0), ("copied", 1, 1, -1),
+        for (stream, originals, copies, guarded_before, expected) in [
+            ("minority", 1, 0, None, -1), ("quorum", 2, 0, Some(i64::MAX), 0),
+            ("copied", 1, 1, None, -1), ("late", 3, 0, Some(1), -1),
         ] {
             let ensemble = Ensemble::new(StreamConfig { servers: endpoints.clone(), stream: stream.to_owned(), write_quorum: 2, maximum_message_bytes: 1024 });
-            let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true };
+            let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true, guarded_before };
             for server in 0..3 {
                 deposed_by(1, ensemble.overwrite(server, 1, 0, Vec::new(), true).await.unwrap()).unwrap();
                 deposed_by(1, ensemble.activate(server, 1).await.unwrap()).unwrap();
@@ -1013,7 +1020,11 @@ mod tests {
                     let request = ensemble.append_request(1, entry.clone(), -1);
                     ensemble.links[server].send(request, Box::new(move |reply| { let _ = done.send(reply); }));
                     let reply = tokio::time::timeout(CALL_TIMEOUT, durable).await.unwrap().unwrap();
-                    deposed_by(1, ensemble.ack(server, reply).unwrap()).unwrap();
+                    if guarded_before == Some(1) {
+                        assert!(matches!(ensemble.ack(server, reply), Err(Error::Remote { message, .. }) if message.contains("exclusive cutoff")));
+                    } else {
+                        deposed_by(1, ensemble.ack(server, reply).unwrap()).unwrap();
+                    }
                 } else if server < originals + copies {
                     let sealed = ensemble.seal(server, 2).await.unwrap();
                     assert_eq!(sealed.last_lsn, -1);

@@ -38,6 +38,7 @@ impl RetainedChain {
         link.update((entry.payload.len() as u64).to_be_bytes());
         link.update(&entry.payload);
         if entry.guarded { link.update(b"rtdb.logkeeper/guarded-entry\0"); }
+        if let Some(before) = entry.guarded_before { link.update(before.to_be_bytes()); }
         self.0 = link.finalize();
     }
 

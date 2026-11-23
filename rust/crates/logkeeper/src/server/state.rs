@@ -43,6 +43,7 @@ pub struct Held<P = Bytes> {
     pub epoch: u64,
     pub timestamp: i64,
     pub guarded: bool,
+    pub guarded_before: Option<i64>,
     pub payload: P,
     pub(super) observed_sync: Option<Arc<OnceLock<i64>>>,
 }
@@ -177,7 +178,8 @@ impl<P: Payload> StreamState<P> {
             }
             Event::Append(entry) => {
                 self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
-                    guarded: entry.guarded, payload: P::decided(&entry.payload), observed_sync: None });
+                    guarded: entry.guarded, guarded_before: entry.guarded_before,
+                    payload: P::decided(&entry.payload), observed_sync: None });
             }
             Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
             Event::Trim(through) => {
@@ -246,7 +248,7 @@ impl<P: Payload> StreamState<P> {
         if from <= self.trim || from > self.last() + 1 || from <= self.commit {
             return invalid(format!("an overwrite at {from} must start above trim {} and commit {} and at most one past last {}", self.trim, self.commit, self.last()));
         }
-        if !dense(from, &entries) || entries.iter().any(|entry| entry.epoch > epoch) {
+        if !dense(from, &entries) || entries.iter().any(|entry| entry.epoch > epoch || !entry.valid_guard()) {
             return invalid("an overwrite's entries must be dense from its first lsn and no later than its epoch");
         }
         // A writer's own overwrites never cut what it placed, so one that would is a request delivered after newer ones: deciding it would drop entries those may have committed.
@@ -370,7 +372,7 @@ impl<P: Payload> StreamState<P> {
 #[cfg(any(test, feature = "simulation"))]
 impl StreamState<Bytes> {
     pub fn entries(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Entries {
-        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, payload: held.payload.clone() });
+        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, payload: held.payload.clone() });
         Entries { entries: window.items, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn }
     }
 }
@@ -379,7 +381,7 @@ impl StreamState<Bytes> {
 mod tests {
     use super::*;
 
-    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
+    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, guarded_before: None, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
 
     fn synced(epoch: u64) -> StreamState {
         let mut state = <StreamState>::default();

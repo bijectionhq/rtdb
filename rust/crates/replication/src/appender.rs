@@ -177,8 +177,12 @@ impl ReplicaAppender {
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
                     let guarded = matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());
+                    let journal_before = match &request.write.body {
+                        WriteBody::Resolved(tx) => tx.journal_before(),
+                        WriteBody::Message(_) => None,
+                    };
                     let observation = self.durable_commit_observation(&request.write.body);
-                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, || (self.clock)(), allow_offload,
+                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, || (self.clock)(), allow_offload, journal_before,
                         |frame| request.write.stamp_append(sequence, frame));
                     let enqueued = observe_enqueue(enqueue, &self.cancellation, &mut receipts).await;
                     drop(envelope);

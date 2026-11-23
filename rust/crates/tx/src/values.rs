@@ -1184,7 +1184,7 @@ pub enum TxOp {
     OwnedDeclarePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, columns: Vec<String> },
     HostedControl(crate::HostedControlWrite),
     HostedConstraintRefusal,
-    OwnedDeadline { until: Timestamp, recheck_at_staging: bool },
+    OwnedDeadline { until: Timestamp, recheck_at_staging: bool, journal_before: Option<Timestamp> },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope, clock: Option<rtdb_types::WorldClockLimit> },
     OwnedForkWorld {
         record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,
@@ -1224,7 +1224,7 @@ pub enum TxOp {
 
 impl TxOp {
     pub fn owned_deadline(until: Timestamp) -> Self {
-        Self::OwnedDeadline { until, recheck_at_staging: false }
+        Self::OwnedDeadline { until, recheck_at_staging: false, journal_before: None }
     }
 
     pub fn is_owned(&self) -> bool {

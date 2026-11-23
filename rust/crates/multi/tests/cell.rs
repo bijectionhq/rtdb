@@ -536,12 +536,12 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     assert!(writer.maximum_guarded_append_bytes().is_some());
     for late in [118, 149, 200] {
         let clock = || Timestamp(late);
-        let result = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff)).await;
+        let result = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff, None)).await;
         assert!(matches!(result, Err(Error::GuardedAppendCutoff)));
         assert_eq!(writer.latest().unwrap(), LogOffset(-1));
     }
     let clock = || Timestamp(124);
-    let durable = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff))
+    let durable = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff, None))
         .await.unwrap().durable().await.unwrap();
     assert_eq!(durable.offset, LogOffset(0));
     drop(writer);

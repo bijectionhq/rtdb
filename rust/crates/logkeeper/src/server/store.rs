@@ -1,6 +1,6 @@
 //! Every stream a server holds, and the order in which their mutations reach the journal.
 
-use super::journal::{Captured, Journal, Recovered, Work, Write};
+use super::journal::{Captured, Journal, ObservedAppend, Recovered, Work, Write};
 use super::payload::{Item, Source, Stored};
 use super::state::{Decision, StreamState, Window, WriterAuthority};
 use crate::history::RetainedChain;
@@ -108,16 +108,17 @@ impl Store {
     /// Reserves journal capacity before deciding the mutation.
     /// The decision and submission share the stream lock, so decisions reach the journal in order.
     pub async fn mutate(&self, body: RequestBody, frame_bytes: usize) -> Outcome {
-        let observed_lsn = match &body {
+        let observation = match &body {
             RequestBody::AppendObserved(append) => {
-                if !self.journal.is_durable() || !matches!(append.entries.as_slice(), [entry] if entry.guarded)
-                    || append.first_lsn.checked_sub(1) != Some(append.commit_lsn)
-                {
+                let [entry] = append.entries.as_slice() else {
+                    return Outcome::Now(failed("a guarded sync observation requires one guarded entry"));
+                };
+                if !self.journal.is_durable() || !entry.guarded || !entry.valid_guard() || append.first_lsn.checked_sub(1) != Some(append.commit_lsn) {
                     return Outcome::Now(failed("a guarded sync observation requires one guarded entry after a committed prefix"));
                 }
-                Some(append.first_lsn)
+                Some((append.first_lsn, entry.guarded_before))
             }
-            RequestBody::Append(append) if !append.guarded_ensemble.is_empty() || append.entries.iter().any(|entry| entry.guarded) => {
+            RequestBody::Append(append) if !append.guarded_ensemble.is_empty() || append.entries.iter().any(|entry| entry.guarded || !entry.valid_guard()) => {
                 return Outcome::Now(failed("guarded metadata requires the observed append request"));
             }
             _ => None,
@@ -173,10 +174,10 @@ impl Store {
         let previous_authority = state.writer_authority();
         let decision = decide(&mut state);
         if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
-        let observed_append = observed_lsn.map(|lsn| {
+        let observed_append = observation.map(|(lsn, before)| {
             let sample = Arc::new(OnceLock::new());
             assert!(state.track_sync(lsn, Arc::clone(&sample)), "admitted append holds its new entry");
-            (lsn, sample)
+            ObservedAppend { lsn, sample, before }
         });
         let authority = state.writer_authority();
         let authority_revision = if authority == previous_authority {
@@ -279,7 +280,7 @@ impl Store {
 
     /// Selects entries in `[from, to]` and where to find each payload, under the stream's lock.
     fn select(&self, state: &StreamState<Stored>, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Window<Item> {
-        state.window(from, to, max_entries, max_bytes, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, source: self.journal.source(&held.payload) })
+        state.window(from, to, max_entries, max_bytes, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, source: self.journal.source(&held.payload) })
     }
 
     /// Held entries in `[from, to)`, committed or not; a selection with payloads still on disk is resolved by `entries`.
@@ -353,7 +354,8 @@ impl Store {
             }
             ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn,
                 digest: Bytes::copy_from_slice(&chain.bytes()),
-                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()), original_append })
+                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()), original_append,
+                guarded_before: (page.from_lsn == page.through_lsn).then_some(last.guarded_before).flatten() })
         }).await {
             Ok(reply) => reply,
             Err(error) => failed(error.to_string()),
@@ -397,7 +399,7 @@ impl Selected {
         let Window { items, commit_lsn, trim_lsn, last_lsn } = self.0;
         let entries = items.into_iter().map(|item| {
             let Source::Ready(payload) = item.source else { unreachable!("checked above") };
-            Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, payload }
+            Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, guarded_before: item.guarded_before, payload }
         }).collect();
         Ok(ResponseBody::Entries(Entries { entries, commit_lsn, trim_lsn, last_lsn }))
     }
@@ -498,7 +500,7 @@ mod tests {
             stream: "drop-me".into(),
             epoch: 1,
             from_lsn: 0,
-            entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, guarded: false, payload: Bytes::from(vec![1; 2 << 20]) }],
+            entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, guarded: false, guarded_before: None, payload: Bytes::from(vec![1; 2 << 20]) }],
             complete: true,
             commit_lsn: 0, activate_ensemble: Bytes::new(),
         }), 2 << 20).await, Outcome::Durable(_, _)));

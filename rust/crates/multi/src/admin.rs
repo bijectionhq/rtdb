@@ -1952,6 +1952,7 @@ pub struct AuditAcceptanceQuorum {
     pub required_replica_quorum: usize,
     pub acceptance: AuditAcceptanceStage,
     pub replica_append_sample_micros: i64,
+    pub journal_cutoff_micros: Option<i64>,
     pub quorum_observed_clock_upper_micros: i64,
     pub journal_sync_observations: BTreeMap<String, i64>,
     pub quorum_sync_clock_upper_micros: Option<i64>,
@@ -2005,6 +2006,7 @@ pub async fn audit_acceptance_quorum(
             cutoff_micros: stage.cutoff.0,
         },
         replica_append_sample_micros: entry.timestamp,
+        journal_cutoff_micros: entry.guarded_before,
         quorum_observed_clock_upper_micros,
         journal_sync_observations: journal_sync_observations.into_iter()
             .map(|observation| (observation.journal, observation.synced_clock_upper_micros)).collect(),

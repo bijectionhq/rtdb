@@ -1161,7 +1161,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert_eq!(changed.result().error().unwrap().code, "rtdb.hosted/stale-control");
     assert!(!changed.writes().tables().contains_key(&facts.table("owner")));
 
-    let staging_deadline = || TxOp::OwnedDeadline { until: Timestamp(200), recheck_at_staging: true };
+    let staging_deadline = || TxOp::OwnedDeadline { until: Timestamp(200), recheck_at_staging: true, journal_before: None };
     let apply_staged = |resolver: &mut TxResolver| {
         while let Some(staged) = resolver.take_head() { state.apply(staged.writes()).unwrap(); }
     };

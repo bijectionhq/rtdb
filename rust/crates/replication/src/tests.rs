@@ -736,7 +736,7 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };
-    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), || Timestamp(100), false, |_| Ok(())).await
+    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), || Timestamp(100), false, None, |_| Ok(())).await
         else { panic!("an inline-only append must fail before emitting an oversized proxy"); };
     assert_eq!(error.code, "rtdb.storage/message-too-large");
     assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
@@ -775,7 +775,7 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
     let wall = AtomicI64::new(119);
     for sample in [118, 124, 130] {
         let Err(error) = fixture.logs.enqueue_replica_with(
-            &envelope, BlockIndex(0), || Timestamp(wall.load(Ordering::Relaxed)), false,
+            &envelope, BlockIndex(0), || Timestamp(wall.load(Ordering::Relaxed)), false, None,
             |_| { wall.store(sample, Ordering::Relaxed); Ok(()) },
         ).await else { panic!("An invalid dispatch clock must leave the replica log untouched"); };
         assert_eq!(error.code, crate::logs::STRICT_DISPATCH_CUTOFF);
@@ -786,7 +786,7 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
     assert!(fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(119)).await.is_err());
     assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
     let receipt = fixture.logs.enqueue_replica_with(
-        &envelope, BlockIndex(0), || Timestamp(123), false, |_| Ok(()),
+        &envelope, BlockIndex(0), || Timestamp(123), false, None, |_| Ok(()),
     ).await.unwrap();
     assert_eq!(receipt.durable().await.unwrap().position, ReplicaPosition(0));
 }
@@ -1848,7 +1848,7 @@ async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies
     let (_, prior_applied, prior_record) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
     assert!(matches!(ReplicaEnvelope::decode(&prior_record.payload).unwrap().unwrap().message, ReplicaBody::OversizedMessage(_)));
 
-    let strict = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true }],
+    let strict = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true, journal_before: None }],
         SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory,
     ).unwrap().with_placed_seed(Some(scope.issue()));
     fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord {
@@ -1890,7 +1890,7 @@ async fn a_strict_write_expired_before_dispatch_resolves_again_from_its_source()
     fixture.driver.consume(claim_record).await.unwrap();
     fixture.driver.promote().await.unwrap();
 
-    let command = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true }],
+    let command = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true, journal_before: None }],
         SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory,
     ).unwrap().with_placed_seed(Some(scope.issue()));
     let payload = command.encode().unwrap().into_bytes();

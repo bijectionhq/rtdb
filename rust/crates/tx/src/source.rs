@@ -666,9 +666,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("version".into(), Value::I64(1));
             "rtdb-hosted-constraint-refusal-v1"
         }
-        Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging }) => {
+        Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging, journal_before }) => {
             body.insert("until".into(), Value::I64(until.0));
-            if *recheck_at_staging { "rtdb-owned-staging-deadline-v1" } else { "rtdb-owned-deadline-v1" }
+            if let Some(before) = journal_before {
+                if !*recheck_at_staging || until.0 <= 0 || before < until { return Err(invalid("Invalid physical journal deadline")); }
+                body.insert("journal_before".into(), Value::I64(before.0));
+                "rtdb-owned-physical-deadline-v1"
+            } else if *recheck_at_staging { "rtdb-owned-staging-deadline-v1" } else { "rtdb-owned-deadline-v1" }
         }
         Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1705,9 +1709,14 @@ impl SourceOperationReader<'_> {
                 }
                 TxOp::HostedConstraintRefusal
             }
-            "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => {
+            "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" | "rtdb-owned-physical-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
-                TxOp::OwnedDeadline { until: Timestamp(until), recheck_at_staging: name == "rtdb-owned-staging-deadline-v1" }
+                let journal_before = if name == "rtdb-owned-physical-deadline-v1" {
+                    let Value::I64(before) = value("journal_before")? else { return Err(invalid("Missing physical journal deadline")); };
+                    if until <= 0 || before < until { return Err(invalid("Invalid physical journal deadline")); }
+                    Some(Timestamp(before))
+                } else { None };
+                TxOp::OwnedDeadline { until: Timestamp(until), recheck_at_staging: name != "rtdb-owned-deadline-v1", journal_before }
             }
             "rtdb-owned-sweep-expired-v2" => {
                 let (Value::Utf8(relation), Value::I64(created), Value::I64(expiry), Value::Binary(scope)) =

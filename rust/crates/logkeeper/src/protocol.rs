@@ -22,6 +22,19 @@ pub struct Entry {
     /// A guarded entry retains its admission kind through repair and replay.
     #[prost(bool, tag = "5")]
     pub guarded: bool,
+    /// Exclusive bound on a qualifying original journal's rounded UTC upper sample.
+    #[prost(sfixed64, optional, tag = "6")]
+    pub guarded_before: Option<i64>,
+}
+
+impl Entry {
+    pub(crate) fn valid_guard(&self) -> bool {
+        self.guarded_before.is_none_or(|before| self.guarded && before > 0)
+    }
+}
+
+pub(crate) fn before_guarded_cutoff(upper: i64, before: Option<i64>) -> bool {
+    upper > 0 && before.is_none_or(|before| upper < before)
 }
 
 /// Entries from `start_lsn` up to the next run's start (or the holder's last lsn) were written at `epoch`.
@@ -221,7 +234,8 @@ pub(crate) enum RequestBody {
     Identify(Identify),
     #[prost(message, tag = "18")]
     ConfirmAuthority(LogletCheck),
-    #[prost(message, tag = "19")]
+    // Providers that do not enforce the journal cutoff cannot acknowledge this request.
+    #[prost(message, tag = "31")]
     AppendObserved(Append),
     #[prost(message, tag = "30")]
     TrimDurable(Trim),
@@ -231,7 +245,7 @@ pub(crate) enum RequestBody {
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 30")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 30, 31")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -304,6 +318,8 @@ pub struct PageDigest {
     /// For an exact guarded probe at a durable seal, this journal's local origin.
     #[prost(bool, optional, tag = "4")]
     pub original_append: Option<bool>,
+    #[prost(sfixed64, optional, tag = "5")]
+    pub guarded_before: Option<i64>,
 }
 
 /// Confirms only the promised writer. It conveys no append or commit position.

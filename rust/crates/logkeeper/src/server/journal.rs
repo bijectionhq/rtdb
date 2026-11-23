@@ -9,7 +9,7 @@ use super::payload::{Cache, Item, Location, Source, Stored};
 use super::state::{Event, Held, StreamState, Window};
 use super::store::{Slot, Store};
 use crate::history::RetainedChain;
-use crate::protocol::{Entries, Entry};
+use crate::protocol::{Entries, Entry, before_guarded_cutoff};
 use bytes::{BufMut, Bytes, BytesMut};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -149,7 +149,23 @@ pub(crate) struct Work {
     pub done: oneshot::Sender<std::result::Result<(), String>>,
     pub _admission: Option<tokio::sync::OwnedSemaphorePermit>,
     pub authority_revision: Option<u64>,
-    pub observed_append: Option<(i64, Arc<OnceLock<i64>>)>,
+    pub observed_append: Option<ObservedAppend>,
+}
+
+pub(crate) struct ObservedAppend {
+    pub lsn: i64,
+    pub sample: Arc<OnceLock<i64>>,
+    pub before: Option<i64>,
+}
+
+impl ObservedAppend {
+    fn vote(&self) -> std::result::Result<(), String> {
+        let upper = self.sample.get().ok_or("the guarded append has no retained sync observation")?;
+        if !before_guarded_cutoff(*upper, self.before) {
+            return Err("the guarded sync observation missed its exclusive cutoff".into());
+        }
+        Ok(())
+    }
 }
 
 /// The segment being appended to; touched only by the journal's rounds.
@@ -468,8 +484,8 @@ impl Journal {
                             _ => Bytes::new(),
                         };
                         let observation = match event {
-                            Event::Append(entry) => work.observed_append.as_ref().filter(|(lsn, _)| *lsn == entry.lsn)
-                                .map(|(_, sample)| sample),
+                            Event::Append(entry) => work.observed_append.as_ref().filter(|append| append.lsn == entry.lsn)
+                                .map(|append| &append.sample),
                             _ => None,
                         };
                         let original_append = matches!(event, Event::Append(entry) if entry.guarded).then_some(observation.is_some());
@@ -507,7 +523,7 @@ impl Journal {
             let mut state = placed.slot.state.lock();
             let Some(held) = state.held_mut(entry.lsn) else { continue };
             let same = held.epoch == entry.epoch && held.timestamp == entry.timestamp
-                && held.guarded == entry.guarded
+                && held.guarded == entry.guarded && held.guarded_before == entry.guarded_before
                 && matches!(&held.payload, Stored::Pending(payload) if payload.as_ptr() == entry.payload.as_ptr() && payload.len() == entry.payload.len());
             if same {
                 held.payload = Stored::Written(location);
@@ -572,7 +588,7 @@ impl Journal {
                 };
                 let start = buffer.len();
                 let length = payload.len() as u32;
-                let entry = Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, payload };
+                let entry = Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, payload };
                 let original_append = held.guarded.then_some(held.observed_sync.is_some());
                 frame_record(Record { stream: id, kind: Some(Kind::Append(entry)), active_ensemble: Bytes::new(), original_append }, &mut buffer);
                 locations.push(Location { segment: sequence, offset: written + start as u64, length: (buffer.len() - start) as u32, payload: length });
@@ -656,7 +672,7 @@ impl Journal {
                     payload
                 }
             };
-            entries.push(Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, payload });
+            entries.push(Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, guarded_before: item.guarded_before, payload });
         }
         Ok(Entries { entries, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn })
     }
@@ -724,9 +740,10 @@ impl Replay {
                 Kind::Append(entry) => {
                     if entry.lsn != state.last() + 1 { return Err(corrupt(path, format!("stream {stream}'s entry {} follows {}", entry.lsn, state.last()))); }
                     if entry.guarded != original_append.is_some() { return Err(corrupt(path, "entry kind and append provenance disagree")); }
+                    if !entry.valid_guard() { return Err(corrupt(path, "invalid guarded journal cutoff")); }
                     let location = Location { segment: sequence, offset: at, length: framed as u32, payload: entry.payload.len() as u32 };
                     state.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
-                        guarded: entry.guarded, payload: Stored::Written(location),
+                        guarded: entry.guarded, guarded_before: entry.guarded_before, payload: Stored::Written(location),
                         observed_sync: (original_append == Some(true)).then(|| Arc::new(OnceLock::new())) });
                 }
                 Kind::ObservedSync(observation) => {
@@ -843,7 +860,7 @@ pub fn inspect_retained_with_prefix(data_dir: &Path, stream: &str, requested: Op
             file = Some((location.segment, File::open(path).map_err(|error| io_error(path, error))?));
         }
         let payload = read_payload(&file.as_ref().expect("opened segment").1, path, lsn, location)?;
-        digest.append(&Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, payload });
+        digest.append(&Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, payload });
     }
     Ok(Some(JournalDigest { stream: stream.to_owned(), interval: [chain_first, last], digest: digest.digest() }))
 }
@@ -875,8 +892,7 @@ pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mp
                         }
                         Write::Compact(_) => released = false,
                     }
-                    let observed = work.observed_append.as_ref().is_none_or(|(_, sample)| sample.get().is_some());
-                    let _ = work.done.send(if observed { Ok(()) } else { Err("the guarded append has no retained sync observation".into()) });
+                    let _ = work.done.send(work.observed_append.as_ref().map_or(Ok(()), ObservedAppend::vote));
                 }
                 if released && let Some(store) = store.upgrade() { store.compact_if_mostly_dead(); }
             }
@@ -897,9 +913,9 @@ mod tests {
 
     const UNBOUNDED: usize = usize::MAX;
 
-    fn entry(lsn: i64) -> Entry { Entry { lsn, epoch: 1, timestamp: lsn, guarded: false, payload: Bytes::from(format!("entry {lsn}")) } }
+    fn entry(lsn: i64) -> Entry { Entry { lsn, epoch: 1, timestamp: lsn, guarded: false, guarded_before: None, payload: Bytes::from(format!("entry {lsn}")) } }
 
-    fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
+    fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, guarded_before: None, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
     fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None, authority_revision: None, observed_append: None } }
 
@@ -931,7 +947,7 @@ mod tests {
     fn retained(journal: &Journal, slot: &Slot) -> Vec<Entry> {
         let window = {
             let state = slot.state.lock();
-            state.window(state.trim + 1, state.last(), UNBOUNDED, UNBOUNDED, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, source: journal.source(&held.payload) })
+            state.window(state.trim + 1, state.last(), UNBOUNDED, UNBOUNDED, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, source: journal.source(&held.payload) })
         };
         journal.resolve(window).unwrap().entries
     }
@@ -989,7 +1005,7 @@ mod tests {
             events
         };
         let mut queued = work(Write::Events(Arc::clone(&stream), events));
-        queued.observed_append = Some((0, Arc::clone(&observation)));
+        queued.observed_append = Some(ObservedAppend { lsn: 0, sample: Arc::clone(&observation), before: None });
         let captured = Captured { slot: Arc::clone(&stream), state: stream.state.lock().clone() };
         journal.write_round(&[queued, work(Write::Compact(vec![captured]))]).unwrap();
         let original = *observation.get().unwrap();
@@ -1165,7 +1181,7 @@ mod tests {
         frame(7, Kind::Declare("a/b".into()), &mut buffer);
         frame(7, Kind::Promise(4), &mut buffer);
         let good = buffer.len();
-        frame(7, Kind::Append(Entry { lsn: 0, epoch: 4, timestamp: 1, guarded: false, payload: Bytes::from_static(b"torn") }), &mut buffer);
+        frame(7, Kind::Append(Entry { lsn: 0, epoch: 4, timestamp: 1, guarded: false, guarded_before: None, payload: Bytes::from_static(b"torn") }), &mut buffer);
         fs::write(&path, &buffer[..buffer.len() - 3]).unwrap();
         let (journal, recovered, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         assert_eq!((recovered.len(), recovered[0].name.as_str(), recovered[0].state.promised, recovered[0].state.last()), (1, "a/b", 4, -1));

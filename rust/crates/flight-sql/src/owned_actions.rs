@@ -50,7 +50,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
 pub(crate) const COMMIT_HOSTED_DECIDING_V2: &str = "rtdb.owned.CommitHostedDeciding.v2";
-pub(crate) const COMMIT_HOSTED_STAGED_V4: &str = "rtdb.owned.CommitHostedStaged.v4";
+pub(crate) const COMMIT_HOSTED_STAGED_V5: &str = "rtdb.owned.CommitHostedStaged.v5";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_HOSTED_WORLD_READS_V3: &str = "rtdb.owned.CommitHostedWorldReads.v3";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
@@ -864,6 +864,12 @@ impl Service {
         let (witnesses, body, _witness_charge) = self.owned_witness_prefix(call, body, true)?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted commit has no deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
+        let (journal_before, body) = if recheck_at_staging {
+            let (before, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing physical journal deadline"))?;
+            let before = Timestamp(i64::from_be_bytes(*before));
+            if deadline.0 <= 0 || before < deadline { return Err(invalid("Invalid physical journal deadline")); }
+            (Some(before), body)
+        } else { (None, body) };
         let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
         let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
             .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
@@ -883,7 +889,7 @@ impl Service {
             .sum::<usize>() + usize::from(!worlds.is_empty());
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len())
             .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
-        let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging }];
+        let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging, journal_before }];
         writes.extend(conditions);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();

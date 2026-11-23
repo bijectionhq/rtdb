@@ -105,6 +105,7 @@ pub struct ResolvedTx {
     external_token: Option<Vec<u8>>,
     db_op: Option<DbOp>,
     inline_replica: Option<OwnedReplicaBody>,
+    journal_before: Option<Timestamp>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -112,7 +113,7 @@ impl ResolvedTx {
     fn new(writes: StagedWrite, result: TransactionResult, input: ResolvedInput, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Self> {
         let bound = 4096usize.checked_add(token.as_ref().map_or(0, Vec::capacity)).and_then(|bytes| bytes.checked_add(db_op_bytes(db_op.as_ref()).ok()?)).and_then(|bytes| bytes.checked_add(result.error().map(crate::values::anomaly_bytes).transpose().ok()?.unwrap_or(0))).ok_or_else(overflow)?;
         let reservation = context.memory.reserve(bound)?;
-        Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_replica: None, _reservation: reservation })
+        Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_replica: None, journal_before: None, _reservation: reservation })
     }
 
     pub fn writes(&self) -> &Arc<StagedWrite> { &self.writes }
@@ -124,11 +125,12 @@ impl ResolvedTx {
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
     pub fn inline_replica_body(&self) -> Option<&ReplicaBody> { self.inline_replica.as_ref().map(OwnedReplicaBody::body) }
+    pub fn journal_before(&self) -> Option<Timestamp> { self.journal_before }
     pub fn staging_clock_upper(&self) -> Option<Timestamp> {
         self.inline_replica.as_ref()?.acceptance_stage()?.clock_upper_micros.map(Timestamp)
     }
 
-    fn prepare_inline_replica(&mut self, writer: Option<&WriterPublication<'_>>, until: Timestamp, memory: &Arc<MemoryBudget>) -> Result<()> {
+    fn prepare_inline_replica(&mut self, writer: Option<&WriterPublication<'_>>, until: Timestamp, journal_before: Option<Timestamp>, memory: &Arc<MemoryBudget>) -> Result<()> {
         let (writer, maximum) = writer.and_then(|writer| writer.maximum_inline_bytes.map(|maximum| (writer, maximum)))
             .ok_or_else(|| Anomaly::unsupported("rtdb.owned/replica-inline-unavailable", "The writer has no installed inline replica limit"))?;
         // Both coordinates use fixed-width fields. Reserving them before the
@@ -148,6 +150,7 @@ impl ResolvedTx {
             return Err(Anomaly::fault("rtdb.tx/acceptance-stage", "Prepared replica body has no acceptance stage"));
         };
         stage.clock_upper_micros = Some(upper);
+        self.journal_before = journal_before;
         self.inline_replica = Some(body);
         Ok(())
     }
@@ -325,7 +328,7 @@ impl TxResolver {
             Err(error) => (request.operations.as_slice(), &[][..], Some(error)),
         };
         let staging_deadline = primary.iter().find_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging: true }) => Some(*until),
+            Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging: true, journal_before }) => Some((*until, *journal_before)),
             _ => None,
         });
         let mut constraint_failed = false;
@@ -463,8 +466,8 @@ impl TxResolver {
         });
         let selected = if settled { refusal } else { primary };
         let mut resolved = tx.finish_source(result, input, log_time, clock, selected).await?;
-        if resolved.result().committed() && let Some(until) = staging_deadline
-            && let Err(error) = resolved.prepare_inline_replica(writer.as_ref(), until, &context.memory)
+        if resolved.result().committed() && let Some((until, journal_before)) = staging_deadline
+            && let Err(error) = resolved.prepare_inline_replica(writer.as_ref(), until, journal_before, &context.memory)
         {
             if !error.is_caller_error() { return Err(error); }
             drop(resolved);

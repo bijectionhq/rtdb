@@ -43,6 +43,7 @@ pub(crate) struct Item {
     pub epoch: u64,
     pub timestamp: i64,
     pub guarded: bool,
+    pub guarded_before: Option<i64>,
     pub source: Source,
 }
 
