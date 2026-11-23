@@ -58,10 +58,16 @@ pub(super) fn bridge(target: &Schema, actual: &Schema, value: Avro, connect: &Co
             let Schema::Array(actual) = actual else { return Err(invalid()); };
             let child = match &connect.kind { SchemaKind::Array(child) => child.as_ref(), SchemaKind::Map(_, _) => connect.as_ref(), _ => return Err(invalid()) };
             let values = match value {
-                Avro::PackedArray(packed) => {
-                    if target.items == actual.items && (packed.values.is_empty() || depth + 1 + usize::from(packed.branches.is_some()) <= 128)
-                        && (child.resolved().optional || packed.values.array().is_some_and(|array| array.logical_null_count() == 0))
+                Avro::PackedArray(mut packed) => {
+                    if let Some((kind, branches)) = datum::PackedArray::layout(&target.items)
+                        && kind == packed.kind
+                        && datum::PackedArray::layout(&actual.items) == Some((packed.kind, packed.branches))
+                        && (branches.is_none_or(|(null, _)| null.is_some()) || target_plan.unions.flatten_singleton)
+                        && (packed.values.is_empty() || depth + 1 + usize::from(branches.is_some()) <= 128)
+                        && ((child.resolved().optional && branches.is_some_and(|(null, _)| null.is_some()))
+                            || packed.values.array().is_some_and(|array| array.logical_null_count() == 0))
                     {
+                        packed.branches = branches;
                         return Ok(Avro::PackedArray(packed));
                     }
                     packed.into_physical_values()

@@ -1,4 +1,4 @@
-use super::{Avro, AvroDatumPlan, AvroMap, BinaryWindow, MapKey, PackedArray, Preflight, Result, Schema, error, resolve, resolution};
+use super::{Avro, AvroDatumPlan, AvroMap, BinaryWindow, MapKey, NumericInput, PackedArray, Preflight, Result, Schema, error, resolve, resolution};
 
 pub(super) fn decode(plan: &AvroDatumPlan, bytes: &[u8]) -> Result<Avro> {
     let mut reader = Preflight { bytes, offset: 0, window: BinaryWindow::new(bytes.len()), allocated: 0, limit: usize::MAX, names: &plan.names, view_bytes: 0 };
@@ -40,8 +40,10 @@ pub(in crate::connect::avro) fn value(schema: &Schema, reader: &mut Preflight<'_
         }
         Schema::Record(record) => Avro::Record(record.fields.iter().map(|field| Ok((field.name.clone(), value(&field.schema, reader, depth + 1)?))).collect::<Result<_>>()?),
         Schema::Array(array) => {
-            if let Some((kind, branches)) = PackedArray::layout(&array.items) {
-                return Ok(Avro::PackedArray(PackedArray::read(kind, kind, branches, reader, depth + 1)?));
+            if let Some(layout) = PackedArray::layout(&array.items)
+                && let Some(writer) = NumericInput::from_schema(&array.items)
+            {
+                return Ok(Avro::PackedArray(PackedArray::read(writer, layout, reader, depth + 1)?));
             }
             let mut values = Vec::new();
             loop { let count = block(reader)?; if count == 0 { break; } for _ in 0..count { values.push(value(&array.items, reader, depth + 1)?); } }

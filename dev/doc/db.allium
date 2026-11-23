@@ -1553,7 +1553,8 @@ rule ExternalSourceAssigned {
 
 rule ExternalSourceIndexesTx {
     -- Kafka Connect builds compatible JSON and Avro numeric lists as typed Arrow children.
-    -- Compatible nullable Avro numeric arrays keep typed children while reader resolution reorders the null branch and promotes the numeric branch.
+    -- Avro array reader resolution appends selected numeric branches directly to one typed child when their reader layout has a single numeric member.
+    -- Connect union members retain packed numeric array children through reader bridging and destination validation.
     -- Its schema coercion and document writer preserve packed numeric payloads and apply wrapping integer narrowing to Arrow children.
     -- The per-transaction entry point. The source supplies an opaque resume token, an optional system time, and a writer that populates a transaction with the transformed row data.
     -- It may await the result or not; the indexing below is identical either way, and the difference is caller-side.

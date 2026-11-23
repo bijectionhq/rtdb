@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use apache_avro::{Schema, schema::{Aliases, Name}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
-use super::{Avro, AvroDatumPlan, AvroDatum, ConversionContext, error};
+use super::{Avro, AvroDatumPlan, AvroDatum, ConversionContext, datum::{NumericKind, PackedArray, PackedLayout}, error};
 #[path = "resolution_default.rs"] mod defaults;
 #[path = "resolution_value.rs"] mod value;
 #[path = "resolution_binary.rs"] mod binary;
@@ -15,7 +15,7 @@ pub(in crate::connect) struct AvroResolution { actions: Vec<Action>, root: usize
 enum Action {
     Error(String),
     Scalar { writer: Kind, reader: Kind, fixed: Option<usize> },
-    Array(usize), Map { child: usize, strings: bool },
+    Array { child: usize, packed: Option<PackedLayout> }, Map { child: usize, strings: bool },
     Enum(Vec<Option<(u32, String)>>),
     Record { writer_names: Vec<String>, fields: Vec<Option<(usize, usize)>>, reader_names: Vec<String>, defaults: Vec<(usize, Avro)> },
     WriterUnion { branches: Vec<usize>, equivalent: bool },
@@ -26,8 +26,7 @@ enum Action {
 enum Kind { Null, Boolean, Int, Long, Float, Double, String, Bytes, Fixed, Enum, Record, Array, Map, Union }
 
 impl Kind {
-    fn numeric(self) -> Option<super::datum::NumericKind> {
-        use super::datum::NumericKind;
+    fn numeric(self) -> Option<NumericKind> {
         Some(match self {
             Self::Int => NumericKind::Int, Self::Long => NumericKind::Long,
             Self::Float => NumericKind::Float, Self::Double => NumericKind::Double,
@@ -37,27 +36,48 @@ impl Kind {
 }
 
 impl AvroResolution {
-    fn packed_array_target(
-        &self, action: usize, kind: super::datum::NumericKind, branches: Option<(u32, u32)>,
-    ) -> Option<(super::datum::NumericKind, Option<(u32, u32)>, usize)> {
-        match (branches, self.actions.get(action)?) {
-            (None, Action::Scalar { writer, reader, .. }) if writer.numeric() == Some(kind) =>
-                Some((reader.numeric()?, None, 0)),
-            (Some(branches), Action::WriterUnion { equivalent: true, .. }) => Some((kind, Some(branches), 0)),
-            (Some((null, present)), Action::WriterUnion { branches, equivalent: false }) => {
-                let Action::ReaderUnion { index: reader_null, child: null_action } =
-                    self.actions.get(*branches.get(null as usize)?)? else { return None; };
-                let Action::ReaderUnion { index: reader_present, child: present_action } =
-                    self.actions.get(*branches.get(present as usize)?)? else { return None; };
-                if !matches!(self.actions.get(*null_action)?, Action::Scalar { writer: Kind::Null, reader: Kind::Null, .. }) {
-                    return None;
-                }
-                let Action::Scalar { writer, reader, .. } = self.actions.get(*present_action)? else { return None; };
-                if writer.numeric() != Some(kind) { return None; }
-                Some((reader.numeric()?, Some((*reader_null, *reader_present)), 1))
+    fn packed_array_branch(
+        &self, id: usize, writer: Option<NumericKind>, writer_index: Option<u32>,
+        (reader, reader_branches): PackedLayout,
+    ) -> Option<usize> {
+        let reader_index = match (writer, reader_branches) {
+            (Some(_), branches) => branches.map(|(_, present)| present),
+            (None, Some((Some(null), _))) => Some(null),
+            _ => return None,
+        };
+        let mut action = self.actions.get(id)?;
+        let mut reader_index = reader_index;
+        if let Some(index) = writer_index {
+            let Action::WriterUnion { branches, equivalent } = action else { return None; };
+            if *equivalent {
+                if reader_index != Some(index) { return None; }
+                reader_index = None;
             }
-            _ => None,
+            action = self.actions.get(*branches.get(index as usize)?)?;
         }
+        if let Some(index) = reader_index {
+            let Action::ReaderUnion { index: resolved, child } = action else { return None; };
+            if *resolved != index { return None; }
+            action = self.actions.get(*child)?;
+        }
+        let Action::Scalar { writer: from, reader: to, .. } = action else { return None; };
+        let compatible = if writer.is_some() {
+            from.numeric() == writer && to.numeric() == Some(reader)
+        } else {
+            *from == Kind::Null && *to == Kind::Null
+        };
+        compatible.then_some(usize::from(reader_index.is_some()))
+    }
+
+    fn packed_array_levels(&self, child: usize, input: &PackedArray, target: PackedLayout) -> Option<usize> {
+        let levels = self.packed_array_branch(child, Some(input.kind), input.branches.map(|(_, present)| present), target)?;
+        if let Some((Some(null), _)) = input.branches
+            && input.values.array()?.logical_null_count() > 0
+            && self.packed_array_branch(child, None, Some(null), target)? != levels
+        {
+            return None;
+        }
+        Some(levels)
     }
 
     pub fn compile(writer: &Arc<AvroDatumPlan>, reader: &Arc<AvroDatumPlan>, context: &mut ConversionContext) -> Result<Self> {
@@ -113,7 +133,10 @@ impl ResolutionBuilder<'_> {
             Action::WriterUnion { branches, equivalent }
         } else if wk == rk {
             match (writer, reader) {
-                (Schema::Array(writer), Schema::Array(reader)) => Action::Array(self.resolve(&writer.items, &reader.items, depth + 1)?),
+                (Schema::Array(writer), Schema::Array(reader)) => Action::Array {
+                    child: self.resolve(&writer.items, &reader.items, depth + 1)?,
+                    packed: PackedArray::layout(&reader.items),
+                },
                 (Schema::Map(writer), Schema::Map(reader)) => Action::Map { child: self.resolve(&writer.types, &reader.types, depth + 1)?, strings: reader.attributes.get("avro.java.string").and_then(serde_json::Value::as_str) == Some("String") },
                 (Schema::Record(writer_record), Schema::Record(reader_record)) => {
                     let bytes = writer_record.fields.iter().chain(&reader_record.fields).try_fold(4096usize, |bytes, field| bytes.checked_add(field.name.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow))?;

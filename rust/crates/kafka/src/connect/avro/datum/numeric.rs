@@ -17,6 +17,14 @@ impl NumericKind {
         })
     }
 
+    pub fn from_wire_schema(schema: &Schema) -> Option<Self> {
+        match schema {
+            Schema::Date | Schema::TimeMillis => Some(Self::Int),
+            Schema::TimestampMillis => Some(Self::Long),
+            _ => Self::from_schema(schema),
+        }
+    }
+
     pub fn matches_connect(self, kind: &super::super::SchemaKind) -> bool {
         use super::super::SchemaKind;
         matches!((self, kind), (Self::Int, SchemaKind::I8 | SchemaKind::I16 | SchemaKind::I32)
@@ -24,43 +32,84 @@ impl NumericKind {
     }
 }
 
+pub(in crate::connect::avro) type Branches = (Option<u32>, u32);
+pub(in crate::connect::avro) type PackedLayout = (NumericKind, Option<Branches>);
+
+#[derive(Clone, Copy)]
+pub(in crate::connect::avro) enum NumericInput<'a> {
+    Plain(NumericKind),
+    Union(&'a [Schema]),
+}
+
+impl<'a> NumericInput<'a> {
+    pub fn from_schema(schema: &'a Schema) -> Option<Self> {
+        if let Schema::Union(union) = schema {
+            return Some(Self::Union(union.variants()));
+        }
+        Some(Self::Plain(NumericKind::from_wire_schema(schema)?))
+    }
+
+    fn next(self, input: &mut Preflight<'_>, depth: usize) -> Result<Option<NumericKind>> {
+        let too_deep = || error("avro-decode", "Avro datum nesting limit exceeded");
+        if depth > 128 { return Err(too_deep()); }
+        match self {
+            Self::Plain(kind) => Ok(Some(kind)),
+            Self::Union(members) => {
+                let index = usize::try_from(input.int()?).map_err(|cause| error("avro-decode", cause))?;
+                let member = members.get(index).ok_or_else(|| error("avro-decode", "Union index is out of range"))?;
+                if depth == 128 { return Err(too_deep()); }
+                if matches!(member, Schema::Null) {
+                    Ok(None)
+                } else {
+                    NumericKind::from_wire_schema(member).map(Some)
+                        .ok_or_else(|| error("avro-decode", "Array member lacks a numeric wire type"))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::connect::avro) struct PackedArray {
     pub kind: NumericKind,
-    pub branches: Option<(u32, u32)>,
+    pub branches: Option<Branches>,
     pub values: ListValue,
 }
 
 impl PackedArray {
-    pub fn layout(schema: &Schema) -> Option<(NumericKind, Option<(u32, u32)>)> {
+    pub fn layout(schema: &Schema) -> Option<PackedLayout> {
         if let Schema::Union(union) = schema {
-            let members = union.variants();
-            let [first, second] = members else { return None; };
-            if matches!(first, Schema::Null) { return Some((NumericKind::from_schema(second)?, Some((0, 1)))); }
-            if matches!(second, Schema::Null) { return Some((NumericKind::from_schema(first)?, Some((1, 0)))); }
+            return match union.variants() {
+                [only] => Some((NumericKind::from_schema(only)?, Some((None, 0)))),
+                [Schema::Null, present] => Some((NumericKind::from_schema(present)?, Some((Some(0), 1)))),
+                [present, Schema::Null] => Some((NumericKind::from_schema(present)?, Some((Some(1), 0)))),
+                _ => None,
+            };
         }
         Some((NumericKind::from_schema(schema)?, None))
     }
 
-    pub fn read(
-        writer: NumericKind, reader: NumericKind, branches: Option<(u32, u32)>,
-        input: &mut Preflight<'_>, depth: usize,
-    ) -> Result<Self> {
+    pub fn read(writer: NumericInput<'_>, (kind, branches): PackedLayout, input: &mut Preflight<'_>, depth: usize) -> Result<Self> {
         use NumericKind::{Double, Float, Int, Long};
-        let values = match (writer, reader) {
-            (Int, Int) => read_array::<Int32Type>(input, branches, depth, |input| input.int())?,
-            (Int, Long) => read_array::<Int64Type>(input, branches, depth, |input| Ok(i64::from(input.int()?)))?,
-            (Int, Float) => read_array::<Float32Type>(input, branches, depth, |input| Ok(input.int()? as f32))?,
-            (Int, Double) => read_array::<Float64Type>(input, branches, depth, |input| Ok(f64::from(input.int()?)))?,
-            (Long, Long) => read_array::<Int64Type>(input, branches, depth, |input| input.long())?,
-            (Long, Float) => read_array::<Float32Type>(input, branches, depth, |input| Ok(input.long()? as f32))?,
-            (Long, Double) => read_array::<Float64Type>(input, branches, depth, |input| Ok(input.long()? as f64))?,
-            (Float, Float) => read_array::<Float32Type>(input, branches, depth, float)?,
-            (Float, Double) => read_array::<Float64Type>(input, branches, depth, |input| Ok(f64::from(float(input)?)))?,
-            (Double, Double) => read_array::<Float64Type>(input, branches, depth, double)?,
-            _ => unreachable!("compatible numeric array resolution"),
+        let values = match kind {
+            Int => read_array::<Int32Type>(input, writer, depth, |_, input| input.int())?,
+            Long => read_array::<Int64Type>(input, writer, depth, |kind, input| match kind {
+                Int => Ok(i64::from(input.int()?)),
+                _ => input.long(),
+            })?,
+            Float => read_array::<Float32Type>(input, writer, depth, |kind, input| match kind {
+                Int => Ok(input.int()? as f32),
+                Long => Ok(input.long()? as f32),
+                _ => float(input),
+            })?,
+            Double => read_array::<Float64Type>(input, writer, depth, |kind, input| match kind {
+                Int => Ok(f64::from(input.int()?)),
+                Long => Ok(input.long()? as f64),
+                Float => Ok(f64::from(float(input)?)),
+                Double => double(input),
+            })?,
         };
-        Ok(Self { kind: reader, branches, values })
+        Ok(Self { kind, branches, values })
     }
 
     pub fn promote(mut self, reader: NumericKind) -> Self {
@@ -91,7 +140,7 @@ impl PackedArray {
     pub fn into_physical_values(self) -> Vec<Avro> {
         let wrap = |value| match self.branches {
             Some((null, present)) => {
-                let branch = if matches!(value, Avro::Null) { null } else { present };
+                let branch = if matches!(value, Avro::Null) { null.expect("packed null requires an Avro branch") } else { present };
                 Avro::Union(branch, Box::new(value))
             }
             None => value,
@@ -115,24 +164,16 @@ impl PackedArray {
 }
 
 fn read_array<T: ArrowPrimitiveType>(
-    input: &mut Preflight<'_>, branches: Option<(u32, u32)>, depth: usize,
-    read: impl Fn(&mut Preflight<'_>) -> Result<T::Native>,
+    input: &mut Preflight<'_>, writer: NumericInput<'_>, depth: usize,
+    read: impl Fn(NumericKind, &mut Preflight<'_>) -> Result<T::Native>,
 ) -> Result<ListValue> {
     let mut builder = PrimitiveBuilder::<T>::with_capacity(0);
     loop {
         let count = block(input)?;
         if count == 0 { break; }
         for _ in 0..count {
-            if depth > 128 { return Err(error("avro-decode", "Avro datum nesting limit exceeded")); }
-            if let Some((null, present)) = branches {
-                let index = usize::try_from(input.int()?).map_err(|cause| error("avro-decode", cause))?;
-                if index != null as usize && index != present as usize {
-                    return Err(error("avro-decode", "Union index is out of range"));
-                }
-                if depth == 128 { return Err(error("avro-decode", "Avro datum nesting limit exceeded")); }
-                if index == null as usize { builder.append_null(); continue; }
-            }
-            builder.append_value(read(input)?);
+            let value = writer.next(input, depth)?.map(|kind| read(kind, input)).transpose()?;
+            builder.append_option(value);
         }
     }
     Ok(numeric::pack_primitive(builder.finish()))

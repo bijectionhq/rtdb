@@ -36,7 +36,7 @@ impl AvroResolution {
                     else { reader.skip(&field.schema, depth + 1)?; }
                 }
             }
-            Action::Array(child) => {
+            Action::Array { child, .. } => {
                 let Schema::Array(array) = schema else { return Err(invalid()); };
                 self.preflight_collection(*child, &array.items, false, reader, depth + 1)?;
             }
@@ -51,6 +51,22 @@ impl AvroResolution {
             Action::ReaderUnion { child, .. } => self.preflight(*child, schema, reader, depth + 1)?,
         }
         reader.claim(4096)
+    }
+
+    fn can_pack_array(&self, child: usize, writer: datum::NumericInput<'_>, target: PackedLayout) -> bool {
+        match writer {
+            datum::NumericInput::Plain(kind) => self.packed_array_branch(child, Some(kind), None, target).is_some(),
+            datum::NumericInput::Union(members) => {
+                let Action::WriterUnion { branches, .. } = &self.actions[child] else { return false; };
+                members.iter().zip(branches).enumerate().all(|(index, (schema, action))| {
+                    // Preflight has already rejected any selected incompatible branch.
+                    if matches!(&self.actions[*action], Action::Error(_)) { return true; }
+                    let kind = NumericKind::from_wire_schema(schema);
+                    (kind.is_some() || matches!(schema, Schema::Null))
+                        && self.packed_array_branch(child, kind, Some(index as u32), target).is_some()
+                })
+            }
+        }
     }
 
     fn preflight_collection(&self, child: usize, schema: &Schema, map: bool, reader: &mut Preflight<'_>, depth: usize) -> Result<()> {
@@ -86,14 +102,13 @@ impl AvroResolution {
                 for (index, value) in defaults { output[*index] = Some(value.clone()); }
                 Ok(Avro::Record(reader_names.iter().cloned().zip(output).map(|(name, value)| Ok((name, value.ok_or_else(invalid)?))).collect::<Result<_>>()?))
             }
-            Action::Array(child) => {
+            Action::Array { child, packed } => {
                 let Schema::Array(array) = schema else { return Err(invalid()); };
-                if let Some((writer, branches)) = datum::PackedArray::layout(&array.items)
-                    && let Some((kind, output_branches, _)) = self.packed_array_target(*child, writer, branches)
+                if let Some(target) = packed
+                    && let Some(writer) = datum::NumericInput::from_schema(&array.items)
+                    && self.can_pack_array(*child, writer, *target)
                 {
-                    let mut packed = datum::PackedArray::read(writer, kind, branches, reader, depth + 1)?;
-                    packed.branches = output_branches;
-                    return Ok(Avro::PackedArray(packed));
+                    return Ok(Avro::PackedArray(datum::PackedArray::read(writer, *target, reader, depth + 1)?));
                 }
                 let mut values = Vec::new();
                 loop {

@@ -11,14 +11,14 @@ impl AvroResolution {
                 if !scalar_matches(*writer, *fixed, value) { return Err(invalid()); }
                 value_bound(value, depth)
             }
-            (Action::Array(child), Avro::PackedArray(values)) => {
-                if let Some((_, _, extra_resolution_level)) = self.packed_array_target(*child, values.kind, values.branches) {
+            (Action::Array { child, packed }, Avro::PackedArray(values)) => {
+                if let Some(extra_resolution_level) = packed.and_then(|target| self.packed_array_levels(*child, values, target)) {
                     packed_bound(values, depth, extra_resolution_level)
                 } else {
                     self.bound(id, &Avro::Array(values.clone().into_physical_values()), depth)
                 }
             }
-            (Action::Array(child), Avro::Array(values)) => values.iter().try_fold(4096usize, |size, value| add(size, self.bound(*child, value, depth + 1)?)),
+            (Action::Array { child, .. }, Avro::Array(values)) => values.iter().try_fold(4096usize, |size, value| add(size, self.bound(*child, value, depth + 1)?)),
             (Action::Map { child, .. }, Avro::Map(values)) => values.iter().try_fold(4096usize, |size, (key, value)| add(add(size, key.len().checked_mul(8).ok_or_else(overflow)?)?, self.bound(*child, value, depth + 1)?)),
             (Action::Enum(symbols), Avro::Enum(index, _)) => match symbols.get(*index as usize).and_then(Option::as_ref) { Some((_, symbol)) => add(4096, symbol.len()), None => Err(error("avro-resolution", "Reader enum has no symbol or default")) },
             (Action::Record { writer_names, fields, reader_names, defaults }, Avro::Record(values)) => {
@@ -39,16 +39,18 @@ impl AvroResolution {
         match (self.actions.get(id).ok_or_else(invalid)?, datum) {
             (Action::Error(message), _) => Err(error("avro-resolution", message)),
             (Action::Scalar { reader, .. }, value) => promote(value, *reader),
-            (Action::Array(child), Avro::PackedArray(values)) => {
-                if let Some((reader, branches, _)) = self.packed_array_target(*child, values.kind, values.branches) {
-                    let mut values = values.promote(reader);
-                    values.branches = branches;
+            (Action::Array { child, packed }, Avro::PackedArray(values)) => {
+                if let Some((reader, branches)) = packed
+                    && self.packed_array_levels(*child, &values, (*reader, *branches)).is_some()
+                {
+                    let mut values = values.promote(*reader);
+                    values.branches = *branches;
                     Ok(Avro::PackedArray(values))
                 } else {
                     self.apply(id, Avro::Array(values.into_physical_values()), depth)
                 }
             }
-            (Action::Array(child), Avro::Array(values)) => Ok(Avro::Array(values.into_iter().map(|value| self.apply(*child, value, depth + 1)).collect::<Result<_>>()?)),
+            (Action::Array { child, .. }, Avro::Array(values)) => Ok(Avro::Array(values.into_iter().map(|value| self.apply(*child, value, depth + 1)).collect::<Result<_>>()?)),
             (Action::Map { child, strings }, Avro::Map(values)) => Ok(Avro::Map(values.map_values(|value| self.apply(*child, value, depth + 1))?.with_strings(*strings))),
             (Action::Enum(symbols), Avro::Enum(index, _)) => match symbols.get(index as usize).and_then(Option::as_ref) { Some((index, symbol)) => Ok(Avro::Enum(*index, symbol.clone())), None => Err(invalid()) },
             (Action::Record { fields, reader_names, defaults, .. }, Avro::Record(values)) => {

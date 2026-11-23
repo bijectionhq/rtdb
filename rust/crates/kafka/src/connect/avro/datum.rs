@@ -2,7 +2,7 @@ use super::*;
 mod map_order;
 mod binary;
 mod numeric;
-pub(super) use numeric::{NumericKind, PackedArray};
+pub(super) use numeric::{NumericInput, NumericKind, PackedArray, PackedLayout};
 pub(super) use binary::{bytes as read_bytes, block as read_block, value as read_value};
 #[cfg(test)] mod utf8_tests;
 

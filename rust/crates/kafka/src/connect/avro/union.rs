@@ -89,7 +89,10 @@ fn into_destination(value: Value, source: &ConnectSchema, destination: &ConnectS
 fn numeric_array_unchanged(list: &rtdb_types::ListValue, destination: &ConnectSchema) -> bool {
     use rtdb_types::{LogicalType, ScalarType};
     let destination = destination.resolved();
-    if destination.name.is_some() { return false; }
+    if matches!(destination.name.as_deref(), Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time"
+        | "org.apache.kafka.connect.data.Timestamp" | "org.apache.kafka.connect.data.Decimal")) {
+        return false;
+    }
     let scalar = match destination.kind {
         SchemaKind::I8 => ScalarType::I8,
         SchemaKind::I16 => ScalarType::I16,
@@ -106,6 +109,31 @@ fn numeric_array_unchanged(list: &rtdb_types::ListValue, destination: &ConnectSc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_array_with_a_connect_name_keeps_child_buffers_in_a_generalized_union() {
+        let options = BTreeMap::from([("generalized.sum.type.support".into(), "true".into())]);
+        let plan = AvroPlan::parse_version(
+            r#"[{"type":"array","items":{"type":"float","connect.name":"Magnitude"}},"string","null"]"#,
+            &[], &options, None,
+        ).unwrap();
+        let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+        let mut bytes = vec![0, 4];
+        bytes.extend_from_slice(&(-0.0_f32).to_le_bytes());
+        bytes.extend_from_slice(&0x7fc1_2345_u32.to_le_bytes());
+        bytes.push(0);
+        let datum = plan.datum.decode_datum(&bytes, &mut context).unwrap();
+        let Avro::Union(_, inner) = &datum.value else { panic!("expected union datum"); };
+        let Avro::PackedArray(packed) = inner.as_ref() else { panic!("expected packed array"); };
+        let (_, input) = packed.values.packed_column().unwrap();
+
+        let Value::Struct(fields) = plan.convert(datum, &mut 0, &mut context).unwrap().value else { panic!("expected Connect union"); };
+        assert_eq!(fields["connect_union_field_1"], Value::Null);
+        let Value::List(list) = &fields["connect_union_field_0"] else { panic!("expected array member"); };
+        let (_, output) = list.packed_column().unwrap();
+        let child_buffer = |array: &arrow_array::ArrayRef| array.as_any().downcast_ref::<arrow_array::Float32Array>().unwrap().values().as_ptr();
+        assert_eq!(child_buffer(&input), child_buffer(&output));
+    }
 
     #[test]
     fn logical_union_destination_preserves_the_date_object_before_schema_admission() {

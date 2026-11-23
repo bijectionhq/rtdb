@@ -205,9 +205,114 @@ fn resolution_handles_reordered_nullable_numeric_arrays_in_typed_buffers() {
     let memory = resolution.resolve(writer.decode_datum(&bytes, &mut context).unwrap(), &mut context).unwrap();
     for datum in [binary, memory] {
         let Avro::PackedArray(packed) = datum.value else { panic!("expected promoted nullable array"); };
-        assert_eq!(packed.branches, Some((0, 1)));
+        assert_eq!(packed.branches, Some((Some(0), 1)));
         let array = packed.values.array().unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(array.value(0), 7.0);
         assert!(array.is_null(1));
     }
+}
+
+#[test]
+fn generalized_numeric_writer_branches_resolve_to_one_typed_reader_child() {
+    use arrow_array::{Array, Float64Array};
+
+    let writer = plan(r#"{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":["int","float","null","double","string"]}}]}"#);
+    let reader = plan(r#"{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":["null","double"]}}]}"#);
+    let mut context = context();
+    let resolution = AvroResolution::compile(&writer, &reader, &mut context).unwrap();
+    let nan = f32::from_bits(0x7fc1_2345);
+    let mut bytes = vec![8, 0, 13, 2];
+    bytes.extend_from_slice(&nan.to_le_bytes());
+    bytes.extend([4, 6]);
+    bytes.extend_from_slice(&(-0.0_f64).to_le_bytes());
+    bytes.push(0);
+    let binary = resolution.decode_datum(&bytes, &mut context).unwrap();
+    let legacy = resolution.resolve(writer.decode_datum(&bytes, &mut context).unwrap(), &mut context).unwrap();
+    let Avro::Record(fields) = &binary.value else { panic!("expected resolved record"); };
+    let Avro::PackedArray(packed) = &fields[0].1 else { panic!("expected packed resolution"); };
+    let child = packed.values.array().unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+    assert_eq!(child.value(0), -7.0);
+    assert_eq!(child.value(1).to_bits(), f64::from(nan).to_bits());
+    assert!(child.is_null(2));
+    assert_eq!(child.value(3).to_bits(), (-0.0_f64).to_bits());
+
+    let connect = reader.connect_plan(None, None, &mut 0, &mut context).unwrap();
+    for datum in [binary, legacy] {
+        let rtdb_types::Value::Struct(fields) = connect.convert(datum, &mut 0, &mut context).unwrap().value else { panic!("expected Connect record"); };
+        let rtdb_types::Value::List(list) = &fields["a"] else { panic!("expected Connect array"); };
+        let out = list.array().unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(out.value(1).to_bits(), f64::from(nan).to_bits());
+        assert!(out.is_null(2));
+        assert_eq!(out.value(3).to_bits(), (-0.0_f64).to_bits());
+    }
+
+    let incompatible = resolution.decode_datum(&[2, 8, 2, b'a', 0], &mut context).err().unwrap();
+    assert_eq!(incompatible.code, "xtdb.kafka-connect-source/avro-resolution");
+    assert_eq!(incompatible.message.as_deref(), Some("No matching reader union branch"));
+    let invalid = resolution.decode_datum(&[2, 10, 0], &mut context).err().unwrap();
+    assert_eq!(invalid.code, "xtdb.kafka-connect-source/avro-decode");
+    assert_eq!(invalid.message.as_deref(), Some("Union index is out of range"));
+}
+
+#[test]
+fn numeric_arrays_keep_buffers_when_entering_singleton_or_nullable_reader_unions() {
+    use arrow_array::Float32Array;
+    let writer = plan(r#"{"type":"array","items":"float"}"#);
+    let mut bytes = vec![2];
+    bytes.extend_from_slice(&(-0.0_f32).to_le_bytes());
+    bytes.push(0);
+    let mut context = context();
+    let raw = writer.decode_datum(&bytes, &mut context).unwrap();
+    let Avro::PackedArray(packed) = &raw.value else { panic!("expected packed writer"); };
+    let values = packed.values.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().as_ptr();
+
+    for (schema, branches) in [
+        (r#"{"type":"array","items":["float"]}"#, Some((None, 0))),
+        (r#"{"type":"array","items":["null","float"]}"#, Some((Some(0), 1))),
+    ] {
+        let reader = plan(schema);
+        let resolution = AvroResolution::compile(&writer, &reader, &mut context).unwrap();
+        let datum = resolution.resolve(AvroDatum::untracked(Arc::clone(&writer), raw.value.clone()), &mut context).unwrap();
+        let Avro::PackedArray(packed) = &datum.value else { panic!("expected packed reader"); };
+        assert_eq!(packed.branches, branches);
+        assert_eq!(packed.values.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().as_ptr(), values);
+        let bridge = writer.connect_plan(None, None, &mut 0, &mut context).unwrap();
+        let rtdb_types::Value::List(list) = bridge.convert(datum, &mut 0, &mut context).unwrap().value else { panic!("expected packed writer output"); };
+        assert_eq!(list.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap().values().as_ptr(), values);
+    }
+}
+
+#[test]
+fn a_required_reader_keeps_packed_values_when_no_writer_item_selects_null() {
+    use arrow_array::Float32Array;
+
+    let writer = plan(r#"{"type":"array","items":["null","float"]}"#);
+    let reader = plan(r#"{"type":"array","items":"float"}"#);
+    let mut context = context();
+    let resolution = AvroResolution::compile(&writer, &reader, &mut context).unwrap();
+    let mut bytes = vec![2, 2];
+    bytes.extend_from_slice(&(-0.0_f32).to_le_bytes());
+    bytes.push(0);
+    let raw = writer.decode_datum(&bytes, &mut context).unwrap();
+    let Avro::PackedArray(packed) = &raw.value else { panic!("expected packed writer"); };
+    let array = packed.values.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap();
+    let source_values = array.values().as_ptr();
+    let binary = resolution.decode_datum(&bytes, &mut context).unwrap();
+    let memory = resolution.resolve(raw, &mut context).unwrap();
+    for datum in [&binary, &memory] {
+        let Avro::PackedArray(packed) = &datum.value else { panic!("expected packed reader"); };
+        let array = packed.values.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(packed.branches, None);
+        assert_eq!(array.value(0).to_bits(), (-0.0_f32).to_bits());
+    }
+    let Avro::PackedArray(packed) = memory.value else { unreachable!(); };
+    let array = packed.values.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(array.values().as_ptr(), source_values);
+
+    let null = [2, 0, 0];
+    let binary_error = resolution.decode_datum(&null, &mut context).err().unwrap();
+    let raw = writer.decode_datum(&null, &mut context).unwrap();
+    let memory_error = resolution.resolve(raw, &mut context).err().unwrap();
+    assert_eq!(binary_error.code, "xtdb.kafka-connect-source/avro-resolution");
+    assert_eq!((binary_error.code, binary_error.message), (memory_error.code, memory_error.message));
 }
