@@ -1124,7 +1124,10 @@ mod tests {
         ]).unwrap();
         let runs = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2, 5, 7, 8]), &child).unwrap();
         let item = Arc::new(Field::new("item", runs.data_type().clone(), false));
-        let list = ListArray::try_new(item, OffsetBuffer::new(vec![0, 3, 8].into()), Arc::new(runs), None).unwrap();
+        let data = arrow_data::ArrayData::builder(DataType::List(item)).len(2)
+            .add_buffer(ScalarBuffer::from(vec![0_i32, 3, 8]).into_inner())
+            .add_child_data(runs.to_data()).build().unwrap();
+        let list = ListArray::from(data);
         let field = Field::new("v", list.data_type().clone(), false);
         let first = crate::ArrowCell { field: &field, array: &list, row: 0 };
         assert!(first.numeric_list_span().is_none());
@@ -1147,7 +1150,7 @@ mod tests {
         let child = UnionArray::try_new(fields, vec![7, 2, 4, 2].into(), Some(vec![0, 1, 0, 0].into()), vec![
             Arc::new(StringArray::from(vec!["a", "b"])), Arc::new(NullArray::new(1)), Arc::new(Int32Array::from(vec![3])),
         ]).unwrap();
-        let item = Arc::new(Field::new("item", child.data_type().clone(), false));
+        let item = Arc::new(Field::new("item", child.data_type().clone(), true));
         let list = ListArray::try_new(item, OffsetBuffer::new(vec![0, 1, 4].into()), Arc::new(child), None).unwrap();
         let field = Field::new("v", list.data_type().clone(), false);
         let value = read_value(&field, &list, 1).unwrap();
@@ -1170,7 +1173,7 @@ mod tests {
         let child = UnionArray::try_new(fields, vec![7, 4, 2, 7].into(), Some(vec![0, 0, 0, 1].into()), vec![
             Arc::new(StringArray::from(vec!["tag"])), Arc::new(NullArray::new(1)), Arc::new(UInt32Array::from(vec![u32::MAX, 4])),
         ]).unwrap();
-        let item = Arc::new(Field::new("item", child.data_type().clone(), false));
+        let item = Arc::new(Field::new("item", child.data_type().clone(), true));
         let list = ListArray::try_new(item, OffsetBuffer::new(vec![0, 4].into()), Arc::new(child), None).unwrap();
         let field = Field::new("v", list.data_type().clone(), false);
         let keyword = Value::Keyword(rtdb_types::Keyword::from_name("tag"));
