@@ -1,6 +1,7 @@
 mod binary;
 mod float_array;
 mod interval;
+mod numeric;
 mod output;
 mod text;
 
@@ -49,6 +50,24 @@ pub fn decode_argument(
     use arrow_schema::DataType;
 
     let mut charge = memory.reserve(decode_bound(bytes)?)?;
+    match ty {
+        PgType::Numeric => {
+            let value = match format {
+                Format::Text => numeric::parse(std::str::from_utf8(bytes).map_err(invalid)?)?,
+                Format::Binary => binary::read_numeric(bytes)?,
+            };
+            let (field, array) = value.into_arrow(name)?;
+            return Ok((field, array, charge));
+        }
+        PgType::Int4s | PgType::Int8s | PgType::Texts => {
+            let array = match format {
+                Format::Text => text::read_array_argument(ty, std::str::from_utf8(bytes).map_err(invalid)?)?,
+                Format::Binary => binary::read_array_argument(ty, bytes)?,
+            };
+            return Ok((arrow_schema::Field::new(name, array.data_type().clone(), false), array, charge));
+        }
+        _ => {}
+    }
     let fixed_type = match (format, ty) {
         (_, PgType::Default | PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword) => PgType::Text.logical_type(),
         (_, PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Float4 | PgType::Float8 | PgType::Bool
@@ -99,6 +118,21 @@ pub fn decode_argument(
         (rtdb_columnar::to_field(name, &logical)?, rtdb_columnar::build_array(&logical, values)?)
     };
     Ok((field, array, charge))
+}
+
+fn array_argument(child: arrow_array::ArrayRef) -> Result<arrow_array::ArrayRef> {
+    use arrow_array::{ListArray, NullArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field};
+
+    let len = child.len();
+    let end = i32::try_from(len).map_err(|_| rtdb_types::Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?;
+    let (field, child) = if child.null_count() == len {
+        (Field::new("$data$", DataType::Null, len != 0), Arc::new(NullArray::new(len)) as arrow_array::ArrayRef)
+    } else {
+        (Field::new("$data$", child.data_type().clone(), child.null_count() != 0), child)
+    };
+    Ok(Arc::new(ListArray::try_new(Arc::new(field), OffsetBuffer::new(vec![0, end].into()), child, None).map_err(invalid)?))
 }
 
 fn fixed_binary<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {

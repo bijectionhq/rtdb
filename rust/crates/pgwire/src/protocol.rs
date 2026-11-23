@@ -1856,12 +1856,21 @@ mod argument_tests {
     fn canonical_pgwire_arguments_keep_legacy_sql_log_bytes() {
         let memory = MemoryBudget::new(16 << 20);
         let nan = 0x7fa0_0001u32.to_be_bytes();
+        let binary_array = [1i32, 0, 23, 1, 1, 4, -9].into_iter().flat_map(i32::to_be_bytes).collect::<Vec<_>>();
+        let binary_numeric = [2i16, 0, 0x4000, 3, 42, 1250].into_iter().flat_map(i16::to_be_bytes).collect::<Vec<_>>();
         let inputs = [
             (PgType::Int8, Format::Text, b"42".as_slice()),
             (PgType::Float4, Format::Binary, nan.as_slice()),
             (PgType::Int4s, Format::Text, b"{4,NULL,8}".as_slice()),
             (PgType::Numeric, Format::Text, b"1.25".as_slice()),
             (PgType::Json, Format::Text, br#"{"value":[1.5,null,2.5]}"#.as_slice()),
+            (PgType::Int8s, Format::Text, b"{NULL,-32,NULL,7}".as_slice()),
+            (PgType::Int4s, Format::Text, b"{NULL,NULL}".as_slice()),
+            (PgType::Int8s, Format::Text, b"{}".as_slice()),
+            (PgType::Int8s, Format::Binary, binary_array.as_slice()),
+            (PgType::Texts, Format::Text, br#"{NULL,"x,y",""}"#.as_slice()),
+            (PgType::Numeric, Format::Binary, binary_numeric.as_slice()),
+            (PgType::Numeric, Format::Text, b"-123456789012345678901234567890123e-200".as_slice()),
         ];
         let mut values = Vec::new();
         let mut fields = Vec::new();

@@ -209,38 +209,29 @@ impl NativeSession {
             ControlStatement::Rollback => { self.state.rollback_tx()?; Ok(command("ROLLBACK", allocation)) }
             ControlStatement::SetSessionCharacteristics(access) => { self.state.set_session_characteristics(*access)?; Ok(command("SET SESSION CHARACTERISTICS", allocation)) }
             ControlStatement::SetTimeZone(expression) => {
-                let value = self.control_value(expression, arguments, &allocation, catalog).await?;
-                self.state.set_timezone(string(value, "TIME ZONE")?.ok_or_else(|| invalid("TIME ZONE requires a string"))?)?;
+                let eval = self.control_context(arguments, &allocation, catalog);
+                let timezone = control_string(expression, &eval, "TIME ZONE").await?.ok_or_else(|| invalid("TIME ZONE requires a string"))?;
+                self.state.set_timezone(timezone)?;
                 allocation.reserve(self.state.effective_timezone().len())?;
                 Ok(ControlResult::Command { tag: "SET TIME ZONE".into(), transaction: None, parameter_status: Some(("TimeZone".into(), self.state.effective_timezone().into())), allocation })
             }
             ControlStatement::SetAwaitToken(expression) => {
-                let value = self.control_value(expression, arguments, &allocation, catalog).await?;
-                self.state.set_await_token(string(value, "AWAIT_TOKEN")?)?; Ok(command("SET AWAIT_TOKEN", allocation))
+                let eval = self.control_context(arguments, &allocation, catalog);
+                let token = control_string(expression, &eval, "AWAIT_TOKEN").await?;
+                self.state.set_await_token(token)?; Ok(command("SET AWAIT_TOKEN", allocation))
             }
             ControlStatement::SetParameter { name, value } => {
+                let eval = self.control_context(arguments, &allocation, catalog);
                 if name == "bijection.at" {
-                    let value = self.control_value(value, arguments, &allocation, catalog).await?;
+                    let value = evaluate_async(value, &Schema::default(), &[], &eval).await?;
                     let time = if matches!(value, Value::Null | Value::Undefined) { None } else {
-                        Some(rtdb_expr::timestamp_micros(&value, self.state.effective_timezone())?.0.to_string())
+                        Some(rtdb_expr::timestamp_micros(&value, eval.timezone)?.0.to_string())
                     };
                     self.state.set_parameter(name.clone(), time)?;
                     return Ok(command("SET", allocation));
                 }
-                let value = match value {
-                    Expr::DurationLiteral(value) => {
-                        allocation.reserve(rtdb_types::DurationLiteral::MAX_TEXT_LEN)?;
-                        Value::Utf8(value.to_iso_string())
-                    }
-                    value => self.control_value(value, arguments, &allocation, catalog).await?,
-                };
-                allocation.reserve(rtdb_expr::text_allocation_bound(&value)?)?;
+                let value = session_parameter_text(value, &eval, &allocation).await?;
                 allocation.reserve(name.len().checked_mul(4).ok_or_else(|| invalid("SET name allocation overflow"))?)?;
-                let value = if matches!(value, Value::Null | Value::Undefined) { None } else {
-                    let eval = EvalContext { parameters: arguments, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(&allocation), catalog };
-                    let Value::Utf8(value) = rtdb_expr::scalar_call("str", &[value], &eval)? else { return Err(invalid("Session parameter could not be formatted")); };
-                    Some(value)
-                };
                 self.state.set_parameter(name.clone(), value.clone())?;
                 Ok(ControlResult::Command { tag: "SET".into(), transaction: None, parameter_status: value.map(|value| (name.clone(), value)), allocation })
             }
@@ -314,8 +305,8 @@ impl NativeSession {
         }
     }
 
-    async fn control_value(&self, expression: &Expr, parameters: Parameters<'_>, allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<Value> {
-        evaluate_async(expression, &Schema::default(), &[], &EvalContext { parameters, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }).await
+    fn control_context<'a>(&'a self, parameters: Parameters<'a>, allocation: &'a EvaluationScope, catalog: Option<&'a dyn rtdb_expr::PgCatalogLookup>) -> EvalContext<'a> {
+        EvalContext { parameters, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }
     }
 
     fn check_database_control(&self, action: &str, name: &str, options: ControlExecutionOptions) -> Result<()> {
@@ -414,18 +405,17 @@ pub async fn transaction_settings(options: &TransactionOptions, parameters: &[Va
 
 async fn evaluate_transaction_settings(options: &TransactionOptions, parameters: Parameters<'_>, timezone: &str, session_timezone: &str, current_time: impl Into<rtdb_types::Instant>, memory: &Arc<MemoryBudget>, allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<TransactionSettings> {
     let initial = EvalContext { parameters, parameter_types: None, current_time: current_time.into(), timezone, outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog };
-    let timezone_update = update(options.timezone.as_ref(), &initial, |value| string(value, "TIMEZONE")).await?;
+    let timezone_update = update_string(options.timezone.as_ref(), &initial, "TIMEZONE").await?;
     let timezone = match &timezone_update { OptionUpdate::Set(timezone) => rtdb_expr::normalize_timezone(timezone)?, OptionUpdate::Clear => session_timezone.to_owned(), OptionUpdate::Unchanged => timezone.to_owned() };
     let eval = EvalContext { timezone: &timezone, ..initial };
-    let token = |value| string(value, "Transaction token");
     let instant = |value| {
         if matches!(value, Value::Null | Value::Undefined) { Ok(None) } else { rtdb_expr::timestamp_micros(&value, &timezone).map(Some) }
     };
     let access = match &options.access {
         None => None,
         Some(ControlAccessOptions::ReadOnly(options)) => Some(AccessSettings::ReadOnly(ReadOnlySettings {
-            snapshot_token: update(options.snapshot_token.as_ref(), &eval, token).await?, snapshot_time: update(options.snapshot_time.as_ref(), &eval, instant).await?,
-            clock_time: clock_update(options.clock_time.as_ref(), &eval).await?, await_token: update(options.await_token.as_ref(), &eval, token).await?,
+            snapshot_token: update_string(options.snapshot_token.as_ref(), &eval, "Transaction token").await?, snapshot_time: update(options.snapshot_time.as_ref(), &eval, instant).await?,
+            clock_time: clock_update(options.clock_time.as_ref(), &eval).await?, await_token: update_string(options.await_token.as_ref(), &eval, "Transaction token").await?,
         })),
         Some(ControlAccessOptions::ReadWrite(options)) => Some(AccessSettings::ReadWrite(ReadWriteSettings {
             user_metadata: update(options.metadata.as_ref(), &eval, |value| match value { Value::Null | Value::Undefined => Ok(None), value => UserMetadata::new(value, memory).map(Some) }).await?,
@@ -441,6 +431,53 @@ async fn update<T>(option: Option<&ControlValue>, context: &EvalContext<'_>, con
         Some(ControlValue::TimestampLiteral(_)) => return Err(invalid("An unadmitted timestamp literal requires CLOCK_TIME resolution")),
     })
 }
+async fn update_string(option: Option<&ControlValue>, context: &EvalContext<'_>, name: &str) -> Result<OptionUpdate<String>> {
+    if let Some(ControlValue::Expression(expression)) = option {
+        return Ok(control_string(expression, context, name).await?.map_or(OptionUpdate::Clear, OptionUpdate::Set));
+    }
+    update(option, context, |value| string(value, name)).await
+}
+
+async fn control_string(expression: &Expr, context: &EvalContext<'_>, option: &str) -> Result<Option<String>> {
+    if let Expr::Parameter { index, .. } = expression
+        && let Some(cell) = context.parameters.arrow_cell(*index)
+        && let Some(allocation) = context.allocation
+    {
+        if cell.is_null()? && !cell.is_undefined()? { return Ok(None); }
+        if let Some(text) = cell.utf8() {
+            allocation.reserve(size(std::mem::size_of::<Value>(), text.len())?)?;
+            return Ok(Some(text.to_owned()));
+        }
+    }
+    string(evaluate_async(expression, &Schema::default(), &[], context).await?, option)
+}
+
+async fn session_parameter_text(expression: &Expr, context: &EvalContext<'_>, allocation: &EvaluationScope) -> Result<Option<String>> {
+    use std::ops::ControlFlow;
+
+    let value = if let Expr::DurationLiteral(value) = expression {
+        allocation.reserve(rtdb_types::DurationLiteral::MAX_TEXT_LEN)?;
+        Value::Utf8(value.to_iso_string())
+    } else {
+        if let Expr::Parameter { index, .. } = expression
+            && let Some(cell) = context.parameters.arrow_cell(*index)
+            && let Some(text) = rtdb_expr::arrow_text(cell, allocation)?
+        {
+            return Ok(Some(text));
+        }
+        let schema = Schema::default();
+        let invocation = rtdb_expr::ExpressionInvocation::prepare(expression, &schema, context)?;
+        match invocation.evaluate_async_with_arrow_list(&[], context, |cell| rtdb_expr::arrow_text(cell, allocation)).await? {
+            ControlFlow::Break(text) => return Ok(Some(text)),
+            ControlFlow::Continue(value) => value,
+        }
+    };
+    allocation.reserve(rtdb_expr::text_allocation_bound(&value)?)?;
+    if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
+    let Value::Utf8(text) = rtdb_expr::scalar_call("str", &[value], context)? else { return Err(invalid("Session parameter could not be formatted")); };
+    Ok(Some(text))
+}
+
 async fn clock_update(option: Option<&ControlValue>, context: &EvalContext<'_>) -> Result<OptionUpdate<rtdb_types::Instant>> {
     if let Some(ControlValue::TimestampLiteral(text)) = option {
         return rtdb_types::parse_sql_timestamp_instant(text,context.timezone).map(OptionUpdate::Set);
@@ -465,12 +502,22 @@ fn control_requires_catalog(expression: &Expr, arguments: Parameters<'_>) -> boo
     expression.visit(&mut |expr| {
         if let Expr::Parameter { index, .. } = expr {
             required |= arguments.known(*index).is_some_and(regclass)
-                || arguments.arrow_cell(*index).and_then(|cell| cell.physical().ok())
-                    .is_some_and(|cell| rtdb_columnar::from_field(cell.field).is_ok_and(|ty| regclass_type(&ty))
-                        && arguments.get(*index).ok().flatten().is_some_and(regclass));
+                || arguments.arrow_cell(*index).is_some_and(arrow_contains_regclass);
         }
     });
     required
+}
+fn arrow_contains_regclass(cell: rtdb_columnar::ArrowCell<'_>) -> bool {
+    let Ok(cell) = cell.physical() else { return false; };
+    let Ok(ty) = cell.logical_type() else { return false; };
+    match ty {
+        LogicalType::Scalar(ScalarType::RegClass) => true,
+        ty if regclass_type(&ty) => {
+            cell.structure().is_some_and(|mut children| children.any(arrow_contains_regclass))
+                || cell.sequence().is_some_and(|mut children| children.any(arrow_contains_regclass))
+        }
+        _ => false,
+    }
 }
 fn regclass_type(ty: &LogicalType) -> bool {
     match ty {
@@ -503,6 +550,7 @@ fn control_argument_bytes(arguments: Parameters<'_>, base: usize) -> Result<usiz
 }
 
 async fn execute_arguments(expressions: &[Expr], eval: &EvalContext<'_>, memory: &Arc<MemoryBudget>, allocation: &EvaluationScope) -> Result<OwnedBatch> {
+    use std::ops::ControlFlow;
     use arrow_array::{RecordBatch, RecordBatchOptions};
     use arrow_schema::Schema as ArrowSchema;
 
@@ -538,16 +586,116 @@ async fn execute_arguments(expressions: &[Expr], eval: &EvalContext<'_>, memory:
                 }
             }
         }
-        let value = evaluate_async(expression, &Schema::default(), &[], eval).await?;
+        let schema = Schema::default();
+        let invocation = rtdb_expr::ExpressionInvocation::prepare(expression, &schema, eval)?;
+        let value = match invocation.evaluate_async_with_arrow_list(&[], eval, |cell| {
+            selected_execute_list(&name, cell, &mut output, allocation)
+        }).await? {
+            ControlFlow::Break((field, array)) => {
+                fields.push(field);
+                columns.push(array);
+                continue;
+            }
+            ControlFlow::Continue(value) => value,
+        };
         let logical = value.logical_type();
-        fields.push(rtdb_columnar::to_field(&name, &logical)?);
+        let field = rtdb_columnar::to_field(&name, &logical)?;
         let values = std::slice::from_ref(&value);
-        columns.push(output.column(rtdb_columnar::estimate_builder_bytes(&logical, values)?, || rtdb_columnar::copy_array(&logical, values))?);
+        let column = match packed_execute_list(&field, &value, &mut output)? {
+            Some(array) => array,
+            None => output.column(rtdb_columnar::estimate_builder_bytes(&logical, values)?, || rtdb_columnar::copy_array(&logical, values))?,
+        };
+        fields.push(field);
+        columns.push(column);
     }
     let options = RecordBatchOptions::new().with_row_count(Some(1));
     let batch = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), columns, &options)
         .map_err(|error| invalid(error.to_string()))?;
     output.finish(batch)
+}
+
+fn selected_execute_list(
+    name: &str, cell: rtdb_columnar::ArrowCell<'_>, output: &mut BatchBuilder, allocation: &EvaluationScope,
+) -> Result<Option<(arrow_schema::Field, arrow_array::ArrayRef)>> {
+    use arrow_array::{Array, ArrayRef, NullArray, cast::AsArray, types::{Float32Type, Float64Type}};
+    use arrow_schema::DataType;
+
+    let Some((source, values, range)) = cell.sequence_range() else { return Ok(None); };
+    if !source.metadata().is_empty() || range.is_empty() || !matches!(source.data_type(), DataType::Float32 | DataType::Float64) {
+        return Ok(None);
+    }
+    allocation.reserve(cell.observed_type_bytes()?)?;
+    let field = rtdb_columnar::to_field(name, &cell.observed_type()?)?;
+    let Some((item, width)) = execute_list_layout(&field) else { return Ok(None); };
+    let len = range.len();
+    let compact_bound = size(1024, len.checked_mul(16).ok_or_else(|| invalid("EXECUTE allocation size overflow"))?)?;
+    let retained = size(values.get_array_memory_size(), 512)?;
+    let bound = if retained <= compact_bound { retained } else { compact_bound };
+    let array = output.column(bound, || {
+        // A computed float list is a fresh canonical argument, including the bytes beneath invalid components.
+        macro_rules! float_child {
+            ($ty:ty) => {{
+                let array = values.as_primitive::<$ty>().slice(range.start, len);
+                if array.null_count() != 0 || retained > compact_bound { Arc::new(array.iter().collect::<arrow_array::PrimitiveArray<$ty>>()) }
+                else { Arc::new(array) }
+            }};
+        }
+        let child: ArrayRef = match item.data_type() {
+            DataType::Null => Arc::new(NullArray::new(len)),
+            DataType::Float32 => float_child!(Float32Type),
+            DataType::Float64 => float_child!(Float64Type),
+            _ => unreachable!(),
+        };
+        wrap_execute_list(item, width, child)
+    })?;
+    Ok(Some((field, array)))
+}
+
+fn packed_execute_list(field: &arrow_schema::Field, value: &Value, output: &mut BatchBuilder) -> Result<Option<arrow_array::ArrayRef>> {
+    use arrow_array::Array;
+    use arrow_schema::DataType;
+
+    let Some((item, width)) = execute_list_layout(field) else { return Ok(None); };
+    let (Value::List(list) | Value::FixedSizeList(list)) = value else { return Ok(None); };
+    let Some((source, child)) = list.packed_column() else { return Ok(None); };
+    if source.data_type() != item.data_type() || source.metadata() != item.metadata() || child.is_empty() {
+        return Ok(None);
+    }
+    if matches!(child.data_type(), DataType::Float32 | DataType::Float64) && child.null_count() != 0 {
+        return Ok(None);
+    }
+    let bound = size(child.get_array_memory_size(), 512)?;
+    if matches!(child.data_type(), DataType::Float32 | DataType::Float64)
+        && bound > size(1024, child.len().checked_mul(16).ok_or_else(|| invalid("EXECUTE allocation size overflow"))?)?
+    {
+        return Ok(None);
+    }
+    output.column(bound, || wrap_execute_list(item, width, child)).map(Some)
+}
+
+fn execute_list_layout(field: &arrow_schema::Field) -> Option<(&arrow_schema::FieldRef, Option<i32>)> {
+    use arrow_schema::DataType;
+
+    match field.data_type() {
+        DataType::List(item) => Some((item, None)),
+        DataType::FixedSizeList(item, width) if *width > 0 => Some((item, Some(*width))),
+        _ => None,
+    }
+}
+
+fn wrap_execute_list(item: &arrow_schema::FieldRef, width: Option<i32>, child: arrow_array::ArrayRef) -> Result<arrow_array::ArrayRef> {
+    use arrow_array::{FixedSizeListArray, ListArray};
+    use arrow_buffer::OffsetBuffer;
+
+    let error = |error: arrow_schema::ArrowError| invalid(error.to_string());
+    let array: arrow_array::ArrayRef = match width {
+        Some(width) => Arc::new(FixedSizeListArray::try_new(Arc::clone(item), width, child, None).map_err(error)?),
+        None => {
+            let len = i32::try_from(child.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?;
+            Arc::new(ListArray::try_new(Arc::clone(item), OffsetBuffer::new(vec![0, len].into()), child, None).map_err(error)?)
+        }
+    };
+    Ok(array)
 }
 
 fn command(tag: &str, allocation: Arc<EvaluationScope>) -> ControlResult { ControlResult::Command { tag: tag.into(), transaction: None, parameter_status: None, allocation } }
@@ -559,14 +707,15 @@ fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/que
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, cast::AsArray};
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, cast::AsArray};
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use rtdb_columnar::{MemoryBudget, OwnedBatch};
     use rtdb_expr::{EvalContext, EvaluationScope};
     use rtdb_plan::{Expr, Schema};
     use rtdb_query::BoundParameters;
     use rtdb_types::LogicalType;
-    use super::execute_arguments;
+    use super::{control_requires_catalog, control_string, execute_arguments, session_parameter_text};
 
     #[tokio::test]
     async fn execute_forwards_the_fixed_float_parameter_buffer() {
@@ -590,5 +739,107 @@ mod tests {
         assert!(returned.is_null(1));
         assert_eq!(returned.value(2).to_bits(), (-0.0f32).to_bits());
         assert!(parameters.evaluator().known(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_coalesce_retains_selected_components_and_canonicalizes_nulls() {
+        let memory = MemoryBudget::new(1 << 20);
+        let item = Arc::new(Field::new("$data$", DataType::Float32, true));
+        let nan = f32::from_bits(0x7fa0_0001);
+        let components = Float32Array::new(vec![nan, -0.0, 7.0, 41.0].into(), Some(NullBuffer::from(vec![true, true, true, false])));
+        let pointer = components.values().as_ptr();
+        let column = FixedSizeListArray::new(item, 2, Arc::new(components), None);
+        let field = Field::new("?_0", column.data_type().clone(), false);
+        let ty = rtdb_columnar::from_field(&field).unwrap();
+        let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![Arc::new(column)]).unwrap(), &memory).unwrap();
+        let expression = Expr::Coalesce(vec![Expr::Literal(rtdb_types::Value::Null), Expr::Parameter { index: 0, data_type: LogicalType::Nothing }]);
+        for row in 0..2 {
+            let parameters = BoundParameters::from_arrow(batch.clone(), row, vec![ty.clone()], &memory).unwrap();
+            let allocation = EvaluationScope::new(&memory).unwrap();
+            let eval = EvalContext { parameters: parameters.evaluator(), allocation: Some(&allocation), ..Default::default() };
+            let args = execute_arguments(std::slice::from_ref(&expression), &eval, &memory, &allocation).await.unwrap();
+            let child = args.batch().column(0).as_fixed_size_list().values().as_primitive::<arrow_array::types::Float32Type>();
+            if row == 0 {
+                assert_eq!(child.values().as_ptr(), pointer);
+                assert_eq!(child.value(0).to_bits(), nan.to_bits());
+                assert_eq!(child.value(1).to_bits(), (-0.0f32).to_bits());
+            } else {
+                assert_eq!(child.value(0), 7.0);
+                assert!(child.is_null(1));
+                assert_eq!(child.value(1).to_bits(), 0);
+            }
+            assert!(parameters.evaluator().known(0).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn control_string_reads_bound_text_without_populating_the_scalar_cache() {
+        let memory = MemoryBudget::new(1 << 20);
+        let field = Field::new("?_0", DataType::Utf8, true);
+        let ty = rtdb_columnar::from_field(&field).unwrap();
+        let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])),
+            vec![Arc::new(StringArray::from(vec![Some("UTC"), None]))]).unwrap(), &memory).unwrap();
+        let expression = Expr::Parameter { index: 0, data_type: LogicalType::Nothing };
+        for (row, expected) in [Some("UTC"), None].into_iter().enumerate() {
+            let parameters = BoundParameters::from_arrow(batch.clone(), row, vec![ty.clone()], &memory).unwrap();
+            let allocation = EvaluationScope::new(&memory).unwrap();
+            let eval = EvalContext { parameters: parameters.evaluator(), allocation: Some(&allocation), ..Default::default() };
+            assert_eq!(control_string(&expression, &eval, "TIME ZONE").await.unwrap().as_deref(), expected);
+            assert!(parameters.evaluator().known(0).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn set_formats_a_bound_float_list_without_populating_the_scalar_cache() {
+        let memory = MemoryBudget::new(1 << 20);
+        let item = Arc::new(Field::new("$data$", DataType::Float32, true));
+        let components = Arc::new(Float32Array::from(vec![Some(-0.0), None, Some(f32::INFINITY)]));
+        let column = FixedSizeListArray::new(item, 3, components, None);
+        let field = Field::new("?_0", column.data_type().clone(), false);
+        let ty = rtdb_columnar::from_field(&field).unwrap();
+        let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![Arc::new(column)]).unwrap(), &memory).unwrap();
+        let parameters = BoundParameters::from_arrow(batch, 0, vec![ty], &memory).unwrap();
+        let allocation = EvaluationScope::new(&memory).unwrap();
+        let eval = EvalContext { parameters: parameters.evaluator(), allocation: Some(&allocation), ..Default::default() };
+        let expression = Expr::Parameter { index: 0, data_type: LogicalType::Nothing };
+        let expected = rtdb_expr::scalar_call("str", &[rtdb_types::Value::FixedSizeList(vec![
+            rtdb_types::Value::F32(-0.0), rtdb_types::Value::Null, rtdb_types::Value::F32(f32::INFINITY),
+        ].into())], &eval).unwrap();
+        assert_eq!(session_parameter_text(&expression, &eval, &allocation).await.unwrap().map(rtdb_types::Value::Utf8), Some(expected));
+        assert!(parameters.evaluator().known(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn set_formats_dense_float_legs_at_their_original_width() {
+        use rtdb_types::Value;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let list = Value::list(vec![Value::F32(0.1), Value::Null, Value::F64(f64::from(0.1f32))]);
+        let ty = list.logical_type();
+        let field = rtdb_columnar::to_field("?_0", &ty).unwrap();
+        let array = rtdb_columnar::build_array(&ty, std::slice::from_ref(&list)).unwrap();
+        let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![array]).unwrap(), &memory).unwrap();
+        let parameters = BoundParameters::from_arrow(batch, 0, vec![ty], &memory).unwrap();
+        let allocation = EvaluationScope::new(&memory).unwrap();
+        let eval = EvalContext { parameters: parameters.evaluator(), allocation: Some(&allocation), ..Default::default() };
+        let expression = Expr::Coalesce(vec![Expr::Literal(Value::Null), Expr::Parameter { index: 0, data_type: LogicalType::Nothing }]);
+        let expected = rtdb_expr::scalar_call("str", &[list], &eval).unwrap();
+        assert_eq!(session_parameter_text(&expression, &eval, &allocation).await.unwrap().map(Value::Utf8), Some(expected));
+        assert!(parameters.evaluator().known(0).is_none());
+    }
+
+    #[test]
+    fn catalog_detection_reads_only_the_selected_regclass_cells() {
+        let memory = MemoryBudget::new(1 << 20);
+        let ty = LogicalType::Scalar(rtdb_types::ScalarType::RegClass).maybe();
+        let field = rtdb_columnar::to_field("?_0", &ty).unwrap();
+        let array = rtdb_columnar::build_array(&ty, &[rtdb_types::Value::RegClass(42), rtdb_types::Value::Null]).unwrap();
+        let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![array]).unwrap(), &memory).unwrap();
+        let expression = Expr::Parameter { index: 0, data_type: LogicalType::Nothing };
+        for row in 0..2 {
+            let parameters = BoundParameters::from_arrow(batch.clone(), row, vec![ty.clone()], &memory).unwrap();
+            assert_eq!(control_requires_catalog(&expression, parameters.evaluator()), row == 0);
+            assert!(parameters.evaluator().known(0).is_none());
+        }
     }
 }

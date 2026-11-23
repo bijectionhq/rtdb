@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Int32Array, Int64Array, NullArray, builder::StringBuilder};
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::invalid;
+use crate::numeric::Numeric;
 
 pub(crate) const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 pub(crate) const PG_EPOCH_DAYS: i32 = 10_957;
@@ -13,7 +17,7 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
         PgType::Int2 => Value::I16(input.i16()?), PgType::Int4 => Value::I32(input.i32()?), PgType::Int8 => Value::I64(input.i64()?),
         PgType::Float4 => Value::F32(f32::from_bits(input.i32()? as u32)), PgType::Float8 => Value::F64(f64::from_bits(input.i64()? as u64)),
         PgType::Bool => Value::Bool(match input.take(1)?[0] { 0 => false, 1 => true, _ => return Err(invalid("Invalid binary boolean value")) }),
-        PgType::Numeric => numeric_read(&mut input)?,
+        PgType::Numeric => numeric_read(&mut input)?.into_value()?,
         PgType::Timestamp | PgType::TimestampTz => Value::Timestamp { value: input.i64()?.wrapping_add(PG_EPOCH_MICROS), unit: TimeUnit::Microsecond, timezone: (ty == PgType::TimestampTz).then(|| "UTC".into()) },
         PgType::Date => Value::DateDay(input.i32()?.checked_add(PG_EPOCH_DAYS).ok_or_else(|| invalid("Date exceeds Arrow Date32 range"))?),
         PgType::Time => { let micros = input.i64()?; if !(0..86_400_000_000).contains(&micros) { return Err(invalid("Time is outside a day")); } Value::Time { value: micros * 1000, unit: TimeUnit::Nanosecond, bit_width: 64 } },
@@ -31,27 +35,75 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
 }
 
 fn array_read(ty: PgType, input: &mut Input<'_>) -> Result<Value> {
-    let dimensions = input.i32()?;
-    let flags = input.i32()?;
-    let oid = input.i32()?;
-    if dimensions == 0 { return Ok(Value::list(Vec::new())); }
-    if dimensions != 1 || flags != 0 { return Err(invalid("Binary array requires one dimension and non-null elements")); }
-    let count = usize::try_from(input.i32()?).map_err(invalid)?;
-    let _lower = input.i32()?;
-    if count > input.0.len() / 4 { return Err(invalid("Binary array count exceeds remaining bytes")); }
-    let element = match (ty, oid) { (PgType::Texts, 25) => PgType::Text, (PgType::Int4s | PgType::Int8s, 23) => PgType::Int4, (PgType::Int4s | PgType::Int8s, 20) => PgType::Int8, _ => return Err(invalid("Unsupported binary array element OID")) };
+    let Some((count, element)) = array_header(ty, input)? else { return Ok(Value::list(Vec::new())); };
     let mut values = Vec::with_capacity(count);
     for _ in 0..count {
-        let length = usize::try_from(input.i32()?).map_err(|_| invalid("Binary array reader does not support null elements"))?;
-        let value = read(element, input.take(length)?)?;
+        let value = read(element, array_element(input)?)?;
         values.push(match (ty, value) { (PgType::Int4s, Value::I64(value)) => Value::I32(value as i32), (PgType::Int8s, Value::I32(value)) => Value::I64(i64::from(value)), (_, value) => value });
     }
     Ok(Value::list(values))
 }
 
-fn numeric_read(input: &mut Input<'_>) -> Result<Value> {
+pub(crate) fn read_array_argument(ty: PgType, bytes: &[u8]) -> Result<ArrayRef> {
+    let mut input = Input(bytes);
+    let child: ArrayRef = match array_header(ty, &mut input)? {
+        None => Arc::new(NullArray::new(0)),
+        Some((count, element)) => match ty {
+            PgType::Int4s => {
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count { values.push(array_integer(element, array_element(&mut input)?)? as i32); }
+                Arc::new(Int32Array::from(values))
+            }
+            PgType::Int8s => {
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count { values.push(array_integer(element, array_element(&mut input)?)?); }
+                Arc::new(Int64Array::from(values))
+            }
+            PgType::Texts => {
+                let mut builder = StringBuilder::with_capacity(count, 0);
+                for _ in 0..count {
+                    builder.append_value(std::str::from_utf8(array_element(&mut input)?).map_err(invalid)?);
+                }
+                Arc::new(builder.finish())
+            }
+            _ => unreachable!(),
+        },
+    };
+    if !input.0.is_empty() { return Err(invalid("Trailing bytes in PostgreSQL binary value")); }
+    crate::array_argument(child)
+}
+
+fn array_integer(ty: PgType, bytes: &[u8]) -> Result<i64> {
+    match ty {
+        PgType::Int4 => Ok(i64::from(i32::from_be_bytes(crate::fixed_binary(bytes)?))),
+        PgType::Int8 => Ok(i64::from_be_bytes(crate::fixed_binary(bytes)?)),
+        _ => unreachable!(),
+    }
+}
+
+fn array_header(ty: PgType, input: &mut Input<'_>) -> Result<Option<(usize, PgType)>> {
+    let dimensions = input.i32()?;
+    let flags = input.i32()?;
+    let oid = input.i32()?;
+    if dimensions == 0 { return Ok(None); }
+    if dimensions != 1 || flags != 0 { return Err(invalid("Binary array requires one dimension and non-null elements")); }
+    let count = usize::try_from(input.i32()?).map_err(invalid)?;
+    let _lower = input.i32()?;
+    if count > input.0.len() / 4 { return Err(invalid("Binary array count exceeds remaining bytes")); }
+    let element = match (ty, oid) { (PgType::Texts, 25) => PgType::Text, (PgType::Int4s | PgType::Int8s, 23) => PgType::Int4, (PgType::Int4s | PgType::Int8s, 20) => PgType::Int8, _ => return Err(invalid("Unsupported binary array element OID")) };
+    Ok(Some((count, element)))
+}
+
+fn array_element<'a>(input: &mut Input<'a>) -> Result<&'a [u8]> {
+    let length = usize::try_from(input.i32()?).map_err(|_| invalid("Binary array reader does not support null elements"))?;
+    input.take(length)
+}
+
+pub(crate) fn read_numeric(bytes: &[u8]) -> Result<Numeric> { numeric_read(&mut Input(bytes)) }
+
+fn numeric_read(input: &mut Input<'_>) -> Result<Numeric> {
     let count = i32::from(input.i16()?);
-    if count == 0 { return crate::text::decimal("0"); }
+    if count == 0 { return Numeric::new(BigInt::zero(), 0); }
     let weight = i32::from(input.i16()?);
     let sign = input.i16()?;
     let scale = i32::from(input.i16()?);
@@ -71,7 +123,7 @@ fn numeric_read(input: &mut Input<'_>) -> Result<Value> {
         }
     }
     if sign != 0 { coefficient = -coefficient; }
-    crate::text::decimal_parts(coefficient, scale)
+    Numeric::new(coefficient, scale)
 }
 
 pub(crate) fn numeric_allocation_bound(unscaled: &[u8], scale: i32) -> Result<usize> {

@@ -247,6 +247,23 @@ async fn execute(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &Ev
     materialize(value,&frame)?.await
 }
 
+pub(super) async fn execute_with_arrow_list<T>(
+    expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>, replacements: &super::invocation::Replacements<'_>,
+    retain: impl FnOnce(ArrowCell<'_>) -> Result<Option<T>>,
+) -> Result<std::ops::ControlFlow<T, Value>> {
+    use std::ops::ControlFlow;
+
+    let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
+    let value = evaluate(expr, &frame)?.await?;
+    if let EvalValue::List(Kind::List | Kind::Fixed, reader) = &value
+        && let ListReader::Arrow(cell) = reader.as_ref()
+        && let Some(output) = retain(*cell)?
+    {
+        return Ok(ControlFlow::Break(output));
+    }
+    materialize(value, &frame)?.await.map(ControlFlow::Continue)
+}
+
 pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Value], context: &'a EvalContext<'a>, replacements: &'a super::invocation::Replacements<'a>, batch_rows: usize)
     -> futures::stream::BoxStream<'a, Result<super::ListEvent>> {
     Box::pin(async_stream::try_stream! {

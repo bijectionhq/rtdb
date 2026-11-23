@@ -22,9 +22,14 @@
 -- A prepared Flight SQL query binds the first row of a multi-row parameter batch for the streaming cursor.
 -- It compacts that row when the selection fits the memory budget.
 -- Pgwire Bind publishes a portal with one Arrow argument row.
+-- Numeric Bind writes the coefficient at its inferred Decimal128 or Decimal256 width and preserves the logical scale.
+-- Integer and text array Bind write their inferred Arrow child layout, offsets and validity.
 -- Declared query parameters retain compatible argument columns and cast incompatible columns individually.
 -- Native control evaluation reads reached expressions against positional Arrow parameters.
+-- Time zone and token controls can read bound strings from their selected Arrow cells.
+-- SET can render bound text and selected floating-point lists from their Arrow cells, preserving the width of each component.
 -- A direct floating-point list argument in pgwire EXECUTE is rebound from its selected Arrow cell.
+-- A computed EXECUTE expression can bind a selected floating-point list from Arrow or use the packed child of a compatible expression result.
 -- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
 -- Logical relation cursors expose the root operator's pages as separate batches.

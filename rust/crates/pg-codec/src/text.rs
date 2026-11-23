@@ -1,6 +1,6 @@
 use rtdb_types::StructFields;
 use std::collections::BTreeMap;
-use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
+use rtdb_types::{Anomaly, DecimalValue, PgType, Result, TimeUnit, Value};
 use crate::interval::parse as interval;
 
 mod column;
@@ -39,26 +39,53 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
 fn parse_boolean(text: &str) -> Result<bool> { Ok(match text.trim().to_ascii_lowercase().as_str() { "tr" | "yes" | "tru" | "true" | "on" | "ye" | "t" | "y" | "1" => true, "f" | "fa" | "fal" | "fals" | "false" | "no" | "n" | "off" | "0" => false, _ => return Err(invalid("Invalid PostgreSQL boolean")) }) }
 pub(crate) fn float32(text: &str) -> Result<f32> { Ok(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }) }
 pub(crate) fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }
-pub(crate) fn decimal(text: &str) -> Result<Value> {
-    let decimal = rtdb_expr::parse_decimal(text).map_err(invalid)?;
-    let (coefficient, scale) = decimal.as_bigint_and_exponent();
-    decimal_parts(coefficient, i32::try_from(scale).map_err(invalid)?)
-}
-pub(crate) fn decimal_parts(coefficient: num_bigint::BigInt, scale: i32) -> Result<Value> {
-    let digits = coefficient.to_string().trim_start_matches('-').len().max(1);
-    let precision = if digits <= 32 { 32 } else if digits <= 64 { 64 } else { return Err(invalid("Decimal exceeds the pinned value writer precision")); };
-    let width = if precision == 32 { 128 } else { 256 };
-    let bytes = coefficient.to_signed_bytes_be(); let length = usize::from(width / 8);
-    if bytes.len() > length { return Err(invalid("Decimal coefficient exceeds its Arrow width")); }
-    let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 0xff } else { 0 }; length - bytes.len()]; unscaled.extend_from_slice(&bytes);
-    Ok(Value::Decimal(DecimalValue::new(unscaled, precision, scale, width)?))
-}
+fn decimal(text: &str) -> Result<Value> { crate::numeric::parse(text)?.into_value() }
 fn timestamp(text: &str) -> Result<Value> {
     let Value::Timestamp { value, unit, timezone: Some(zone) } = rtdb_types::parse_sql_timestamp_literal(text)? else { return Err(invalid("Zoned timestamp requires an offset or region")); };
     Ok(Value::Timestamp { value, unit, timezone: Some(rtdb_expr::normalize_timezone(&zone)?) })
 }
 fn visit_array<'a>(text: &'a str, visit: impl FnMut(Option<std::borrow::Cow<'a, str>>) -> Result<()>) -> Result<()> {
     visit_array_elements(text, false, visit)
+}
+
+pub(crate) fn read_array_argument(ty: PgType, text: &str) -> Result<arrow_array::ArrayRef> {
+    use arrow_array::types::{Int32Type, Int64Type};
+
+    match ty {
+        PgType::Int4s => read_integer_array_argument::<Int32Type>(text),
+        PgType::Int8s => read_integer_array_argument::<Int64Type>(text),
+        PgType::Texts => Ok(read_text_column(1009, 1, |_| Ok(Some(text)))?.expect("text array decoder")),
+        _ => unreachable!(),
+    }
+}
+
+fn read_integer_array_argument<T: arrow_array::ArrowPrimitiveType>(text: &str) -> Result<arrow_array::ArrayRef>
+where
+    T::Native: std::str::FromStr,
+    <T::Native as std::str::FromStr>::Err: std::fmt::Display,
+{
+    use arrow_array::PrimitiveArray;
+    use arrow_buffer::NullBufferBuilder;
+    use std::sync::Arc;
+
+    let mut values = Vec::new();
+    let mut validity = NullBufferBuilder::new(0);
+    let mut first = None;
+    visit_array(text, |item| {
+        let value = item.map(|item| item.parse::<T::Native>().map_err(invalid)).transpose()?;
+        if first.is_none() { first = value; }
+        values.push(value.unwrap_or_default());
+        validity.append(value.is_some());
+        Ok(())
+    })?;
+    let validity = validity.finish();
+    if let (Some(first), Some(validity)) = (first, &validity) {
+        // The legacy dense-union collapse gathered index zero for masked slots, whose bytes are included in SQL argument IPC.
+        for index in 0..values.len() {
+            if validity.is_null(index) { values[index] = first; }
+        }
+    }
+    crate::array_argument(Arc::new(PrimitiveArray::<T>::new(values.into(), validity)))
 }
 
 pub(crate) fn visit_array_elements<'a>(text: &'a str, strict_quotes: bool, mut visit: impl FnMut(Option<std::borrow::Cow<'a, str>>) -> Result<()>) -> Result<()> {

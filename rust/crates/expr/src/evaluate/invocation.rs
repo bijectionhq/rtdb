@@ -71,6 +71,26 @@ impl<'expr> ExpressionInvocation<'expr> {
         self.evaluate_row_async(ExpressionRow::Values(row), context).await
     }
 
+    /// Offers a reached Arrow list before materializing it, using the same evaluation and fallback as `evaluate_async`.
+    pub async fn evaluate_async_with_arrow_list<T>(
+        &self, row: &[Value], context: &EvalContext<'_>,
+        retain: impl FnOnce(super::ArrowParameterCell<'_>) -> Result<Option<T>> + Send,
+    ) -> Result<std::ops::ControlFlow<T, Value>> {
+        use std::ops::ControlFlow;
+
+        let row = ExpressionRow::Values(row);
+        if !reader::required(self.expression) {
+            return self.evaluate_row_async(row, context).await.map(ControlFlow::Continue);
+        }
+        match reader::execute_with_arrow_list(self.expression, self.schema, row, context, &self.replacements, retain).await? {
+            ControlFlow::Break(output) => Ok(ControlFlow::Break(output)),
+            ControlFlow::Continue(mut value) => {
+                value.admit_expression_dates()?;
+                Ok(ControlFlow::Continue(value))
+            }
+        }
+    }
+
     async fn evaluate_row_async(&self,row: ExpressionRow<'_>,context: &EvalContext<'_>) -> Result<Value> {
         let mut value = if reader::required(self.expression) { reader::execute_async_prepared(self.expression,self.schema,row,context,&self.replacements).await? }
             else { super::evaluate_async_inner(self.expression,self.schema,row,context).await? };

@@ -1,6 +1,6 @@
 use arrow_array::Array;
 use rtdb_types::{Anomaly, Result, TimeUnit, Value};
-use crate::{admission::Admission, numeric::overflow, temporal::IntervalParts};
+use crate::{admission::Admission, numeric::overflow, temporal::IntervalParts, EvaluationScope};
 
 /// Bounds scratch and output retained while casting a value to text, including Transit cache expansion.
 /// Acquire this charge before calling `cast` directly and retain it until the returned text acquires its own owner.
@@ -26,6 +26,50 @@ fn float_bound(len: usize, nulls: usize, present: &Value) -> Result<usize> {
     let absent = nulls.checked_mul(allocation_bound(&Value::Null)?);
     let present = (len - nulls).checked_mul(allocation_bound(present)?);
     absent.zip(present).and_then(|(absent, present)| absent.checked_add(present)).ok_or_else(overflow)
+}
+
+/// Formats an ordinary Arrow string or a floating-point list with SQL `str` semantics.
+pub fn arrow_text(cell: rtdb_columnar::ArrowCell<'_>, allocation: &EvaluationScope) -> Result<Option<String>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Float64Type};
+    use arrow_schema::{DataType, UnionMode};
+    use rtdb_types::ListView;
+
+    if let Some(text) = cell.utf8() {
+        super::check_size(text.len())?;
+        allocation.reserve(text.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        return Ok(Some(text.to_owned()));
+    }
+    let Some((view, range)) = cell.float_list_span() else { return Ok(None); };
+    let width = match view {
+        ListView::F32(_) => 4,
+        ListView::F64(_) => 8,
+        ListView::Union(array) if matches!(array.data_type(), DataType::Union(fields, UnionMode::Dense)
+            if fields.iter().all(|(_, field)| field.data_type() != &DataType::Null || field.is_nullable())) => 16,
+        _ => return Ok(None),
+    };
+    let bytes = range.len().checked_mul(4096 + 64 * (std::mem::size_of::<Value>() + width))
+        .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?;
+    allocation.reserve(bytes)?;
+    let single = |value| printed_float(f64::from(value), Some(value));
+    let double = |value| printed_float(value, None);
+    let output = match view {
+        ListView::F32(array) => floats(range.map(|row| array.is_valid(row).then(|| single(array.value(row))))),
+        ListView::F64(array) => floats(range.map(|row| array.is_valid(row).then(|| double(array.value(row))))),
+        ListView::Union(array) => floats(range.map(|row| {
+            let leg = array.child(array.type_id(row));
+            let row = array.value_offset(row);
+            if leg.is_null(row) { return None; }
+            match leg.data_type() {
+                DataType::Float32 => Some(single(leg.as_primitive::<Float32Type>().value(row))),
+                DataType::Float64 => Some(double(leg.as_primitive::<Float64Type>().value(row))),
+                _ => None,
+            }
+        })),
+        _ => unreachable!(),
+    };
+    super::check_size(output.len())?;
+    Ok(Some(output))
 }
 
 pub(crate) fn text(value: &Value) -> Result<String> {
