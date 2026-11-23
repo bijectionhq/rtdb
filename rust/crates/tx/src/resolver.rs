@@ -1590,7 +1590,12 @@ impl<'a> OpenTransaction<'a> {
             let root = write.relation.root_relation().ok_or_else(unavailable)?;
             let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
             let bounded = record.schemas.relation(&root).is_some_and(|schema| schema.requires_bounded_period());
-            if ((bounded || write.create_only) && proposal_overlay != Some(world))
+            let held = matches!(record.mode, rtdb_types::WorldClockMode::Held { .. });
+            let publishes_overlay = publications.iter().any(|(published, _, _, advance, drop, settlement, _)| {
+                *published == world && advance.is_none() && !*drop && settlement.is_none()
+            });
+            if !publishes_overlay
+                || ((bounded && !held || write.create_only) && proposal_overlay != Some(world))
                 || (proposal_overlay == Some(world) && bounded != (write.from.is_some() && write.to.is_some()))
             {
                 return Err(unavailable());
@@ -2209,7 +2214,6 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
             if schema.requires_bounded_period() {
-                if !explicit || record.mode != WorldClockMode::Proposal { return Err(unavailable()); }
                 schema.require_root_write_period(Some(from), Some(to))?;
             } else {
                 schema.require_write_validity(explicit)?;
@@ -2229,12 +2233,19 @@ impl<'a> OpenTransaction<'a> {
                     self.require_proposal_create_absence(owner, &root, relation, &id).await?;
                 }
             }
+            let bounded_held = schema.requires_bounded_period() && matches!(record.mode, WorldClockMode::Held { .. });
             if self.context.world_constraints.is_none() {
                 self.require_noncharging_world_write(owner, &root, schema, documents.rows()).await?;
                 if snapshot.contains_table(&root.unique_table(owner))
                     && !documents.rows().iter().all(rtdb_types::WorldShadow::is_tombstone)
                 {
                     return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
+                }
+            }
+            if bounded_held {
+                for row in documents.rows() {
+                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    self.reserve_bounded_period_write(relation, id)?;
                 }
             }
             return self.put_documents(&table, documents, iids, Some(from), Some(to),
@@ -3203,6 +3214,20 @@ mod tests {
             tx.write_owned(&overlay, &allowed, None, None, None, false).await?;
             assert_eq!(tx.read_owned_revision("owner", &overlay, &id, Interval::at(valid)?).await?, Some(ordered.system_time));
             tx.write_owned(&overlay, &withdrawn, None, None, None, false).await?;
+            if matches!(mode, WorldClockMode::Held { .. }) {
+                let period_schema = OwnedSchema::from_json(br#"{"fields":[{"name":"partition","type":{"kind":"binary"},"optional":false,"nullable":false}],"validity":"bounded_period"}"#)?;
+                let (world, _) = tx.owned_worlds.get_mut(&world).expect("original test world");
+                world.schemas = WorldSchemas::new(BTreeMap::from([(relation.name().into(), period_schema)]))?;
+                let from = Timestamp(10);
+                let to = Timestamp(30);
+                let error = tx.write_owned(&overlay, &allowed, None, Some(from), Some(Timestamp::MAX), false).await.unwrap_err();
+                assert_eq!(error.code, "rtdb.owned/validity-policy");
+                tx.write_owned(&overlay, &allowed, None, Some(from), Some(to), false).await?;
+                assert_eq!(tx.read_owned_revision("owner", &overlay, &id, Interval::at(from)?).await?, Some(ordered.system_time));
+                assert_eq!(tx.read_owned_revision("owner", &overlay, &id, Interval::at(to)?).await?, None);
+                let error = tx.write_owned(&overlay, &withdrawn, None, Some(from), Some(to), false).await.unwrap_err();
+                assert_eq!(error.code, "rtdb.owned/repeated-period");
+            }
         }
         Ok(())
     }
