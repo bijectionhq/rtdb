@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest};
+use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest};
 use rtdb_plan::Catalog;
 use rtdb_storage::cache::CacheBudget;
 use tokio::sync::{mpsc, oneshot};
@@ -95,7 +95,7 @@ enum OrderedRead {
 enum OrderedResult {
     Page(OwnedRangePage),
     Count(u64),
-    Measure { count: u64, sum: i128 },
+    Measure(OwnedRangeCount),
 }
 
 pub(crate) struct WorldIdentityPage {
@@ -384,13 +384,13 @@ impl HeldCheckpointWorld {
 
     pub async fn measure(
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>,
-    ) -> Result<(u64, i128, OwnedWorldWitness)> {
+    ) -> Result<(OwnedRangeCount, OwnedWorldWitness)> {
         if self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
         let (result, witness) = self.ordered(
             relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Measure,
         ).await?;
-        let OrderedResult::Measure { count, sum } = result else { return Err(OwnedWorld::unavailable()); };
-        Ok((count, sum, witness))
+        let OrderedResult::Measure(measured) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((measured, witness))
     }
 
     async fn ordered(
@@ -741,10 +741,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                                 let result = rtdb_node::measure_owned_cut(
                                                     context, &owner, &relation, &path, request,
                                                 ).await?;
-                                                OrderedResult::Measure {
-                                                    count: result.count,
-                                                    sum: result.sum.ok_or_else(OwnedWorld::unavailable)?,
-                                                }
+                                                OrderedResult::Measure(result)
                                             }
                                         };
                                         guard()?;
