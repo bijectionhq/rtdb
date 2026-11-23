@@ -1921,6 +1921,7 @@ surface QueryAccess {
     @guarantee ColumnarScanProjection
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
         -- A scan can read compatible leaf counts, bounds, and Bloom bytes directly from metadata arrays.
+        -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.

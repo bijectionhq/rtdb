@@ -271,23 +271,26 @@ pub(crate) struct PartitionScan {
 use crate::analysis::ScanCounts;
 
 /// The IIDs an `_id` predicate selects, as the reference's scan narrows to them: `_id = v`, or an OR of such, with every
-/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name one IID — `_id = 7.0` still
+/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name known IIDs — `_id = 7.0` still
 /// matches the integer ID 7 — so the scan reads every IID; the predicate itself is applied either way.
 fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<std::collections::BTreeSet<Iid>> {
     let id = scan.columns.iter().find(|field| field.name == "_id")?.id;
-    let eid = |expr: &Expr| -> Option<Iid> {
-        if let Some(uuid) = uuid_constant(expr, parameters) { return Some(Iid(uuid)); }
+    let eid = |expr: &Expr| -> Option<(Iid, Option<Iid>)> {
+        if let Some(uuid) = uuid_constant(expr, parameters) { return Some((Iid(uuid), None)); }
         let value = match expr {
             Expr::Literal(value) => value,
             Expr::Parameter { index, .. } => {
-                if let Some(cell) = parameters.arrow_cell(*index) { return arrow_parameter_iid(cell); }
+                if let Some(cell) = parameters.arrow_cell(*index) { return arrow_parameter_iids(cell); }
                 parameters.known(*index)?
             }
             _ => return None,
         };
-        value.entity_id().ok().map(|entity| entity.iid())
+        match value {
+            Value::Keyword(value) => Some(keyword_iids(value.as_str())),
+            _ => value.entity_id().ok().map(|entity| (entity.iid(), None)),
+        }
     };
-    let equality = |expr: &Expr| -> Option<Iid> {
+    let equality = |expr: &Expr| {
         let Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } = expr else { return None };
         match (left.as_ref(), right.as_ref()) {
             (Expr::Column { id: column, .. }, value) | (value, Expr::Column { id: column, .. }) if *column == id => eid(value),
@@ -300,7 +303,13 @@ fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<st
     scan.predicates.iter().filter(|predicate| predicate.referenced_columns() == std::collections::BTreeSet::from([id])).find_map(|predicate| {
         let mut clauses = Vec::new();
         disjuncts(predicate, &mut clauses);
-        clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
+        let mut iids = std::collections::BTreeSet::new();
+        for clause in clauses {
+            let (iid, reference) = equality(clause)?;
+            iids.insert(iid);
+            iids.extend(reference);
+        }
+        Some(iids)
     })
 }
 /// The order of a scan's rows by IID.
@@ -343,13 +352,18 @@ fn uuid_constant(expr: &Expr, parameters: rtdb_expr::Parameters<'_>) -> Option<[
     match value { Value::Uuid(bytes) => Some(*bytes), _ => None }
 }
 
-fn arrow_parameter_iid(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<Iid> {
+fn keyword_iids(name: &str) -> (Iid, Option<Iid>) {
+    let [native, reference] = EntityId::keyword_lookup_iids(name);
+    (native, Some(reference))
+}
+
+fn arrow_parameter_iids(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<(Iid, Option<Iid>)> {
     if cell.array.is_null(cell.row) { return None; }
     let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
     match (cell.field.data_type(), extension) {
-        (DataType::Utf8, None) => Some(EntityId::string_iid(cell.array.as_string::<i32>().value(cell.row))),
-        (DataType::Utf8, Some("xt/clj-keyword")) => Some(EntityId::keyword_iid(cell.array.as_string::<i32>().value(cell.row))),
-        _ => cell.signed_integer().map(|value| EntityId::Integer(value).iid()),
+        (DataType::Utf8, None) => Some((EntityId::string_iid(cell.array.as_string::<i32>().value(cell.row)), None)),
+        (DataType::Utf8, Some("xt/clj-keyword")) => Some(keyword_iids(cell.array.as_string::<i32>().value(cell.row))),
+        _ => cell.signed_integer().map(|value| (EntityId::Integer(value).iid(), None)),
     }
 }
 /// The inclusive IID interval that `_id` range predicates select: the conjuncts comparing `_id` with a UUID literal or
@@ -1665,6 +1679,25 @@ mod tests {
         assert_eq!(id_selection(&scan(either), rtdb_expr::Parameters::Values(&[Value::Null])), None);
         let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
         assert_eq!(id_selection(&scan(range), rtdb_expr::Parameters::Values(&[])), None);
+    }
+
+    #[test]
+    fn keyword_id_equality_includes_both_persisted_digests() {
+        let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::Keyword) };
+        let literal = Expr::Literal(Value::Keyword(rtdb_types::Keyword::from_name("solo")));
+        let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
+        let scan = Scan { table, columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates: vec![Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), literal)],
+            top_k: None, ordered_top_k: None, matches: Vec::new() };
+        let canonical: Iid = "e5c907a6fac1f49cb3f8599a43a7cbf9".parse().unwrap();
+        let legacy: Iid = "cf1a1098ce21209264ea9942c920ee6a".parse().unwrap();
+        assert_eq!(id_selection(&scan, rtdb_expr::Parameters::Values(&[])), Some([canonical, legacy].into()));
+
+        let field = arrow_schema::Field::new("?_0", DataType::Utf8, false)
+            .with_metadata([(rtdb_columnar::EXTENSION_NAME_KEY.into(), "xt/clj-keyword".into())].into());
+        let array = arrow_array::StringArray::from(vec!["solo"]);
+        let cell = rtdb_expr::ArrowParameterCell { field: &field, array: &array, row: 0 };
+        assert_eq!(arrow_parameter_iids(cell), Some((legacy, Some(canonical))));
     }
 
     #[test]
