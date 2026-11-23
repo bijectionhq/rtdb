@@ -155,6 +155,8 @@
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
 -- A checked Proposal settlement binds a count condition to its own world and evaluates the complete counted prefix across the retained parent and final overlay.
 -- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
+-- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.
+-- In a Proposal, local period rows and absence shadows mask the same identity in the held parent at that cut.
 -- When a registered decision offers a refusal receipt, a violated count or constraint selects that receipt and its exact attempt in the same order.
 -- The refusal retains the original Proposal settlement receipt without a new overlay root or approval, and charges the retained bytes of the selected business receipt.
 -- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.

@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, num::NonZeroUsize};
 use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, WorldShadow};
 
 use super::{
-    owned_unique::{MAX_KEY_BYTES, unique_id},
+    owned_unique::{MAX_KEY_BYTES, occupancy_value_at, unique_id},
     replay_constraints::{ConstraintMember, ConstraintMembers},
     *,
 };
@@ -278,6 +278,18 @@ struct Delta {
     claims: i64,
 }
 
+/// The hosted FactStore period layout uses its complete owned valid-time
+/// membership. Ordinary capacity paths still use their installed counters.
+pub(super) const PERIOD_MEMBERSHIP: &str = "period_membership";
+
+pub(super) fn count_bound_exceeded() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Conflict,
+        "rtdb.owned/count-bound-exceeded",
+        "The final owned population exceeds its transaction bound",
+    )
+}
+
 pub(super) struct CapacityCondition<'a> {
     pub(super) relation: &'a OwnedRelation,
     pub(super) column: &'a str,
@@ -304,6 +316,31 @@ fn capacity_condition(operation: &Operation) -> Option<CapacityCondition<'_>> {
         }),
         _ => None,
     }
+}
+
+pub(super) async fn period_population(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    ordered: Timestamp,
+    masked: &BTreeSet<EntityId>,
+) -> Result<i64> {
+    let mut count = 0i64;
+    if let Some(mut cursor) = rtdb_query::open_owned_root_projection(
+        Arc::clone(&context), owner, relation, ordered, &["_id"],
+    ).await? {
+        while let Some(batch) = cursor.next_batch().await? {
+            let rows = batch.batch();
+            for row in 0..rows.num_rows() {
+                context.check_cancelled_at(row)?;
+                let id = occupancy_value_at(&context.memory, rows, row, "_id", uncovered)?.entity_id()?;
+                if !masked.contains(&id) {
+                    count = count.checked_add(1).ok_or_else(overflow)?;
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 impl OpenTransaction<'_> {
@@ -438,8 +475,24 @@ impl OpenTransaction<'_> {
                 ));
             }
             let root = relation.root_relation();
-            self.declared_prefix_count(base.clone(), root.as_ref().unwrap_or(relation), column, prefix)
-                .await?;
+            let root = root.as_ref().unwrap_or(relation);
+            if column == PERIOD_MEMBERSHIP {
+                let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
+                if !prefix.is_empty() || !root.is_root_data() || !root.name().starts_with("fact_")
+                    || !self.context.authorization.is_hosted_control_owner(owner)
+                    || self.context.owned_witness_scope.is_none()
+                    || !operations.iter().any(|op| matches!(op, Operation::Public(TxOp::HostedControl(control))
+                        if control.is_check() && control.name() == "bj_installation" && control.expected().is_some()
+                            && matches!(control.id(), EntityId::String(id) if id == "authority"))
+                    )
+                    || !self.read_owned_schema(owner, root).await?.is_some_and(|(schema, _)|
+                        schema.requires_bounded_period() && !schema.has_opaque_columns())
+                {
+                    return Err(count_uncovered(uncovered()));
+                }
+            } else {
+                self.declared_prefix_count(base.clone(), root, column, prefix).await?;
+            }
         }
         Ok(())
     }
@@ -461,15 +514,18 @@ impl OpenTransaction<'_> {
                 continue;
             };
             if relation.world().is_some() { continue; }
-            let count = self
-                .declared_prefix_count(snapshot.clone(), relation, column, prefix)
-                .await?;
+            let count = if column == PERIOD_MEMBERSHIP {
+                let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
+                let ordered = self.tx_key().system_time;
+                let context = self.context.query_context(
+                    snapshot.clone(), ordered, &self.options.default_tz, self.trace_parent,
+                )?;
+                period_population(context, owner, relation, ordered, &BTreeSet::new()).await?
+            } else {
+                self.declared_prefix_count(snapshot.clone(), relation, column, prefix).await?
+            };
             if count > at_most {
-                return Err(Anomaly::new(
-                    AnomalyCategory::Conflict,
-                    "rtdb.owned/count-bound-exceeded",
-                    "The final owned prefix count exceeds its transaction bound",
-                ));
+                return Err(count_bound_exceeded());
             }
         }
         Ok(())
