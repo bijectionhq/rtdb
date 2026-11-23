@@ -93,8 +93,10 @@ The host checks the SDK reply's encoded size with a bounded byte counter.
 Transaction resolution still orders admission, locality, and final-state checks.
 
 | Bijection deploy-hook catalog
-| Hook setup decoded the staged declaration bodies, re-encoded them while opening the Root, and parsed the successor schema again.
-| Hook setup uses the prepared typed schema, its digest, and the typed relation declarations.
+| Layout planning and release admission decoded the already analyzed successor schema from JSON.
+Hook setup also decoded and re-encoded the staged declarations.
+| Layout planning, release admission, and deploy hooks use the analyzed schema.
+The native runtime binds it to the exact canonical bytes retained by the successor program, while hook opening shares the prepared typed relation declarations.
 The ordered publication builds its Arrow declaration batch from the prepared durable bodies.
 
 | Hosted Root catalog replacement
@@ -125,9 +127,6 @@ Bijection's `schema_predecessor` and `open_root_facts` read the installed owner,
 `read_accepted_layouts` receives row records and decodes each declaration body in that transaction.
 The Arrow hosted-control point action can read one declared key at a held cut.
 The preparation path still needs a held Arrow inventory that returns all active declarations under the same owner and program observation.
-
-The schema preparation caller also encodes the analyzed successor schema as JSON before the native runtime decodes it to compare table definitions.
-The persisted program schema and its digest already use those exact bytes.
 
 == Bijection and RTDB Flight integration tests
 
