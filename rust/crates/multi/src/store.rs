@@ -1648,13 +1648,11 @@ fn recovery_covers_release(owner: &DeploymentRecord, release: &GarbageRecord) ->
     let receipt_l0 = rtdb_format::keys::is_receipt_l0_file(&release.key);
     let Some(floor) = &release.trie_floor else { return !receipt_l0; };
     let through = floor.cut.through.after_offset(floor.cut.replica_epoch);
-    if receipt_l0
-        && !owner.replica_payload_trim.as_ref().is_some_and(|trim| {
-            trim.applied && trim.belongs_to(owner) && trim.through >= through && !trim.journals.is_empty()
-                && owner.replica_journals.iter().chain(&owner.log_copy_servers).chain(owner.move_from.iter().flatten())
-                    .all(|endpoint| endpoint.journal().is_some() && trim.journals.iter().any(|journal| endpoint.journal() == journal.journal()))
-        })
-    {
+    if receipt_l0 && (through < 0 || !owner.replica_anchor.as_ref().is_some_and(|anchor| {
+        anchor.interval[0] >= 0 && anchor.interval[1] >= through
+            && matches!(crate::hosted_recovery::replay_start(owner, through - 1),
+                Err(Error::UnavailableLogRange { .. }))
+    })) {
         return false;
     }
     through >= 0 && owner.log_epoch == floor.cut.replica_epoch.0 && owner.recovery_manifest_sha256.is_some()
@@ -2126,17 +2124,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_receipt_l0_needs_successor_coverage_and_trim_on_every_known_journal() {
-        use rtdb_directory::{CatalogAdmissionFloor, Checkpoint, ReplicaPayloadTrim};
+    fn a_receipt_l0_needs_a_recovery_exclusion_and_a_successor() {
+        use rtdb_directory::{CatalogAdmissionFloor, Checkpoint, JournalAnchor};
         use rtdb_types::{CatalogCut, JournalEndpoint, ReplicaPosition, StorageEpoch, StorageVersion};
 
-        let journal = |id: &str| JournalEndpoint::Member {
-            address: id.to_owned(), journal: id.to_owned(),
-        };
-        let first = journal("first");
-        let later = journal("later");
         let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
-        owner.replica_journals.insert(first.clone());
         owner.checkpoint = Some(Checkpoint {
             block: 2, boundary: 8, source: 4, system_time: 100, root_sha256: Some([1; 32]),
         });
@@ -2156,16 +2148,12 @@ mod tests {
         assert!(!recovery_covers_release(&owner, &release));
         release.trie_floor = Some(floor);
         assert!(!recovery_covers_release(&owner, &release));
-        owner.replica_payload_trim = Some(Box::new(ReplicaPayloadTrim {
-            incarnation: owner.incarnation, log_epoch: owner.log_epoch, through: 6,
-            journals: BTreeSet::from([first]), applied: false, candidates: Vec::new(),
+        owner.replica_anchor = Some(Box::new(JournalAnchor {
+            root_incarnation: owner.incarnation, interval: [0, 5], digest: [3; 32],
         }));
         assert!(!recovery_covers_release(&owner, &release));
-        owner.replica_payload_trim.as_mut().unwrap().applied = true;
-        assert!(recovery_covers_release(&owner, &release));
-        owner.replica_journals.insert(later.clone());
-        assert!(!recovery_covers_release(&owner, &release));
-        owner.replica_payload_trim.as_mut().unwrap().journals.insert(later);
+        owner.replica_anchor.as_mut().unwrap().interval[1] = 6;
+        owner.replica_journals.insert(JournalEndpoint::Address("unavailable".into()));
         assert!(recovery_covers_release(&owner, &release));
         owner.checkpoint.as_mut().unwrap().boundary = 5;
         assert!(!recovery_covers_release(&owner, &release));

@@ -1,5 +1,6 @@
 use rtdb_columnar::read_value;
-use rtdb_types::{Anomaly, Result, TimeUnit, TxId, Timestamp, Value};
+use rtdb_types::{Anomaly, Iid, Result, TableRef, TimeUnit, TxId, Timestamp, Value};
+use sha2::{Digest, Sha256};
 
 use super::OpenTransaction;
 use crate::idempotency_window::advance_retry_clock;
@@ -98,7 +99,37 @@ async fn read_receipt_clock_row(
 
 fn clock_error(message: &str) -> Anomaly { Anomaly::fault("rtdb.tx/retention-clock", message) }
 
+pub(super) const METADATA_ERASURE_UNIT: &str = "metadata_erasure_unit";
+
+pub(super) fn metadata_erasure_key(table: &TableRef, iid: Iid, key: Option<&[u8]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb/transaction-metadata-erasure/v1");
+    for field in [table.schema.as_bytes(), table.table.as_bytes(), key.unwrap_or(&iid.0)] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 impl OpenTransaction<'_> {
+    pub(super) async fn retire_unit_metadata(&mut self, table: &TableRef, iid: Iid, key: Option<&[u8]>) -> Result<()> {
+        let receipts = super::receipts_table();
+        if !self.buffer.base_snapshot().column_names(&receipts).contains(METADATA_ERASURE_UNIT) { return Ok(()); }
+        let value = Value::Utf8(metadata_erasure_key(table, iid, key));
+        let mut cursor = self.open_query(
+            "SELECT _id FROM xt.idempotency_receipts FOR ALL VALID_TIME WHERE metadata_erasure_unit = ?",
+            vec![value],
+        ).await?;
+        while let Some(page) = cursor.next_batch().await? {
+            let batch = page.batch();
+            for row in 0..batch.num_rows() {
+                let id = read_value(batch.schema().field(0), batch.column(0).as_ref(), row)?.entity_id()?;
+                self.buffer.erase(receipts.clone(), &id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn historical_guard_original(&self, key: &str, submitted_at: Timestamp) -> Result<Option<rtdb_types::TransactionKey>> {
         let markers = rtdb_types::TableRef::new("public", "rtdb_idempotency_keys");
         if !self.snapshot()?.contains_table(&markers) { return Ok(None); }

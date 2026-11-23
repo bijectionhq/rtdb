@@ -102,7 +102,10 @@ Bounded collection emits exact logical erase events for expired metadata, applic
 Legacy application keys use a separate stored identity per hour bucket, so a fresh use cannot keep the older receipt alive.
 Lookup checks the current and previous bucket against the ordered expiry.
 Existing stores that predate this layout require a reset to use it.
-Arbitrary user metadata has no typed association with another storage unit, so early privacy erasure of such an association still needs an explicit data contract.
+The optional metadata field `rtdb_erasure_unit_v1` names one record as `{table: "public.table", id: ...}` or one owner-scoped Root record as `{owned_relation: "relation", id: ...}`.
+RTDB retains associated metadata only when the same transaction commits a put for that unit and carries no erase for it.
+Native ordinary SQL and document erases and governed Root erases stage erasures for the associated metadata in the same commit.
+This scope excludes indirect associations in free-form metadata and relation-wide disposal.
 For a placed deployment enrolled in the versioned outcome format, each frame carries its exact current outcome and at most 128 distinct older erasures per collection step.
 An operator confirms format support in every eligible serving and recovery image and parks the deployment before pinning a compatible engine.
 Check `rtdb-multi --build-info` for `placed_receipt_retirement: true`.
@@ -134,9 +137,10 @@ The original source still supplies the skipped attempt's ordered abort.
 
 In the hosted directory path, new receipt L0 data and metadata are loose objects with their own publication identities.
 Deployments enrolled in exact replica payload reclamation can settle those objects through the existing versioned reaper.
-The reaper requires an authenticated successor, an installed catalog floor, released recovery references, and a trim receipt through the removal from every known journal.
+The grant owner requires an authenticated successor, an installed catalog floor, released recovery references, and a certified replay anchor that excludes the receipt's removal position.
+Physical journal trim retains its own media obligations.
 
 M1 remains open for durable source and replica copies outside the settled trim, receipt L0 on other storage profiles, previously packed inputs, older checkpoints and archives with live recovery rights, and previously archived or legacy skipped payloads.
 Closure needs exact custodian settlement after the successor and all such references are released.
 A quiet history still needs ordered receipt-clock progress to trigger collection.
-Early erasure for metadata naming an application unit still requires an explicit association and custody contract.
+Early erasure of associated metadata enters the same copy-settlement path as expiry.

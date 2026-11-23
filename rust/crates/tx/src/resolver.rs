@@ -940,7 +940,14 @@ impl<'a> OpenTransaction<'a> {
             let batch = batch.batch();
             match kind {
                 MutationKind::Put => self.stage_mutation_puts(&table.table, batch, system_time)?,
-                _ => mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?,
+                MutationKind::Erase => {
+                    mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?;
+                    let iids = mutation_column(batch, "_iid")?;
+                    for row in 0..batch.num_rows() {
+                        self.retire_unit_metadata(&table.table, iids.iid(row)?, None).await?;
+                    }
+                }
+                MutationKind::Delete => mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?,
             }
         }
         Ok(())
@@ -1116,7 +1123,14 @@ impl<'a> OpenTransaction<'a> {
                 for id in ids.ids() { self.buffer.delete(table.clone(), id, interval)?; }
                 Ok(())
             }
-            Operation::Public(TxOp::EraseDocs { table, ids }) => { check_table(table)?; for id in ids.ids() { self.buffer.erase(table.clone(), id)?; } Ok(()) }
+            Operation::Public(TxOp::EraseDocs { table, ids }) => {
+                check_table(table)?;
+                for id in ids.ids() {
+                    self.buffer.erase(table.clone(), id)?;
+                    self.retire_unit_metadata(table, id.iid(), None).await?;
+                }
+                Ok(())
+            }
             Operation::Public(TxOp::PatchDocs { table, documents, valid_from, valid_to }) => self.patch_documents(table, documents, None, *valid_from, *valid_to).await,
             Operation::PatchIids { table, documents, iids, valid_from, valid_to } => self.patch_documents(table, documents, Some(iids), *valid_from, *valid_to).await,
             Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => self.patch_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to).await,
@@ -2413,6 +2427,7 @@ impl<'a> OpenTransaction<'a> {
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Erase, recency: None,
         })?;
+        self.retire_unit_metadata(&table, id.iid(), Some(&id.handle_bytes())).await?;
         let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
         self.record_owned_change(relation, id.clone(), kind, Interval::ALL, position, fixed)?;
         let floors = relation.purge_floor_table(owner);
@@ -3157,12 +3172,30 @@ impl<'a> OpenTransaction<'a> {
             |metadata| metadata.value().logical_type().maybe(),
         );
         if let Some(metadata) = metadata {
-            let expiry = Timestamp(observed.0.saturating_add(RECEIPT_WINDOW_MICROS));
-            let retained = StructFields::from([
-                ("_id".into(), Value::I64(key.tx_id.0)),
-                (metadata_column.clone(), metadata.value().clone()),
-            ]);
-            self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
+            use crate::values::MetadataErasureUnit;
+
+            let unit = metadata.erasure_unit()?;
+            let linked = match &unit {
+                Some(MetadataErasureUnit::Table { table, id }) => Some((table.clone(), id.iid(), None)),
+                Some(MetadataErasureUnit::Owned { relation, id }) => self.options.user.as_deref()
+                    .filter(|owner| !owner.is_empty()).map(|owner| (relation.table(owner), id.iid(), Some(id.handle_bytes()))),
+                None => None,
+            };
+            let mut retained = StructFields::new();
+            let keep = match linked {
+                Some((table, iid, entity)) if result.committed() && self.buffer.puts_metadata_unit(&table, iid, entity.as_deref())? => {
+                    let erased_with = retention::metadata_erasure_key(&table, iid, entity.as_deref());
+                    retained.insert(retention::METADATA_ERASURE_UNIT.into(), Value::Utf8(erased_with));
+                    true
+                }
+                _ => unit.is_none(),
+            };
+            if keep {
+                let expiry = Timestamp(observed.0.saturating_add(RECEIPT_WINDOW_MICROS));
+                retained.insert("_id".into(), Value::I64(key.tx_id.0));
+                retained.insert(metadata_column.clone(), metadata.value().clone());
+                self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
+            }
         }
         let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),

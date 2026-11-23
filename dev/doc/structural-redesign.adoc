@@ -156,7 +156,8 @@ SQL erasure still requires ordered closure of affected admissions, a complete su
 |Transaction metadata retention.
 |Ordered expiry, historical transaction projection and receipt compaction landed.
 New recovery checkpoints omit covered receipt tries, placed intake releases applied records, and new native skip diagnostics omit receipt fields.
-Opted-in hosted directory deployments can retire exact loose receipt L0 versions after a successor and settled journal trim.
+Opted-in hosted directory deployments can retire exact loose receipt L0 versions after a successor and certified replay exclusion.
+An exact record erase co-orders erasure of transaction metadata explicitly associated with that record.
 Retirement of every earlier copy remains open.
 
 |9

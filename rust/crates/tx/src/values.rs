@@ -938,16 +938,50 @@ impl EntityIds {
     pub fn ids(&self) -> &[EntityId] { &self.ids }
 }
 
+pub(crate) enum MetadataErasureUnit {
+    Table { table: TableRef, id: EntityId },
+    Owned { relation: rtdb_types::OwnedRelation, id: EntityId },
+}
+
+impl MetadataErasureUnit {
+    fn parse(value: &Value) -> Result<Option<Self>> {
+        let Value::Struct(metadata) = value else { return Ok(None); };
+        let Some(target) = metadata.get("rtdb_erasure_unit_v1") else { return Ok(None); };
+        let invalid = || Anomaly::incorrect("rtdb.tx/metadata-erasure-unit",
+            "Metadata erasure requires one table or owned relation and an exact entity ID");
+        let Value::Struct(fields) = target else { return Err(invalid()); };
+        if fields.len() != 2 { return Err(invalid()); }
+        let id = fields.get("id").ok_or_else(invalid)?.entity_id()?;
+        let unit = match (fields.get("table"), fields.get("owned_relation")) {
+            (Some(Value::Utf8(table)), None) => {
+                let table = TableRef::parse(table)?;
+                if crate::source::is_reserved_write_schema(&table.schema) { return Err(invalid()); }
+                Self::Table { table, id }
+            }
+            (None, Some(Value::Utf8(relation))) => {
+                let relation = rtdb_types::OwnedRelation::new(relation)?;
+                if !relation.is_root_data() { return Err(invalid()); }
+                Self::Owned { relation, id }
+            }
+            _ => return Err(invalid()),
+        };
+        Ok(Some(unit))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UserMetadata { value: Arc<Value>, _reservation: Arc<MemoryReservation> }
 impl UserMetadata {
     pub fn new(mut value: Value, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if !matches!(value, Value::Struct(_)) { return Err(Anomaly::incorrect("xtdb/invalid-user-metadata", "Transaction metadata must be a document")); }
         value.admit_object_dates()?;
+        MetadataErasureUnit::parse(&value)?;
         let reservation = memory.reserve(value.retained_bytes()?.checked_add(128).ok_or_else(overflow)?)?;
         Ok(Self { value: Arc::new(value), _reservation: reservation })
     }
     pub fn value(&self) -> &Value { &self.value }
+
+    pub(crate) fn erasure_unit(&self) -> Result<Option<MetadataErasureUnit>> { MetadataErasureUnit::parse(self.value()) }
 
     pub(crate) fn requires_ordered_system_time(&self) -> bool {
         matches!(

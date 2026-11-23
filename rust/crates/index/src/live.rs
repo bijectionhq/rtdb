@@ -835,6 +835,31 @@ impl TransactionBuffer {
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
         self.append(table, StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
+    pub fn puts_metadata_unit(&self, table: &TableRef, iid: Iid, key: Option<&[u8]>) -> Result<bool> {
+        let Some(pending) = self.tables.get(table) else { return Ok(false); };
+        let mut put = false;
+        for event in &pending.events {
+            if event.iid != iid || event.entity_key.as_deref() != key { continue; }
+            match &event.operation {
+                StoredOperation::Erase => return Ok(false),
+                StoredOperation::Put(_) => put = true,
+                _ => {}
+            }
+        }
+        for (_, batch) in &pending.batches {
+            for row in 0..batch.len() {
+                let header = batch.header(row)?;
+                if header.iid != iid || batch.view().entity_key(row)? != key { continue; }
+                match header.op {
+                    EventOp::Erase => return Ok(false),
+                    EventOp::Put => put = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(put)
+    }
+
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event).map(drop) }
     /// As `append`, copying the table reference only for the table's first write.
     pub fn append_to(&mut self, table: &TableRef, event: StoredEvent) -> Result<Option<NonZeroU32>> {
