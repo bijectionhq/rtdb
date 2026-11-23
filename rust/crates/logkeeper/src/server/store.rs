@@ -29,7 +29,7 @@ use super::state::{Decision, StreamState, Window, WriterAuthority};
 #[cfg(not(verus_keep_ghost))]
 use crate::history::RetainedChain;
 #[cfg(not(verus_keep_ghost))]
-use crate::protocol::{AuthorityConfirmed, DigestPage, LogletCheck, Refused, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, RequestBody, ResponseBody};
+use crate::protocol::{AuthorityConfirmed, DigestPage, LogletCheck, Refused, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, ReadIndexReply, RequestBody, ResponseBody};
 #[cfg(not(verus_keep_ghost))]
 use bytes::Bytes;
 #[cfg(not(verus_keep_ghost))]
@@ -210,10 +210,19 @@ impl Store {
                 let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
                 (check.stream, Box::new(move |state| state.activate(check.epoch, ensemble)))
             }
-            RequestBody::ReadIndex(check) => {
+            RequestBody::ReadIndex(request) => {
                 if !self.journal.is_durable() { return Outcome::Now(failed("read indexes require a durable journal")); }
+                let Some(check) = request.loglet else { return Outcome::Now(failed("a read index must name a loglet")); };
+                if request.nonce.len() != 16 { return Outcome::Now(failed("invalid read index nonce")); }
                 let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
-                return self.check_after_durability(&check.stream, admission, |state| state.read_index(check.epoch, ensemble));
+                return self.check_after_durability(&check.stream, admission, |state| {
+                    match state.read_index(check.epoch, ensemble) {
+                        ResponseBody::Accepted(accepted) => ResponseBody::ReadIndex(ReadIndexReply {
+                            nonce: request.nonce, decided: accepted.commit_lsn,
+                        }),
+                        other => other,
+                    }
+                });
             }
             RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) | RequestBody::Identify(_) | RequestBody::ConfirmAuthority(_) => return Outcome::Now(failed("not a direct mutation")),
         };
@@ -318,7 +327,7 @@ impl Store {
         };
         let state = slot.state.lock();
         let reply = check(&state);
-        if !matches!(reply, ResponseBody::Accepted(_)) { return Outcome::Now(reply); }
+        if !matches!(reply, ResponseBody::Accepted(_) | ResponseBody::ReadIndex(_)) { return Outcome::Now(reply); }
 
         // The reply's position includes accepted mutations that the journal may still be syncing.
         let (done, durable) = oneshot::channel();

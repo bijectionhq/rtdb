@@ -234,6 +234,22 @@ pub(crate) struct LogletCheck {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub(crate) struct ReadIndexRequest {
+    #[prost(message, optional, tag = "1")]
+    pub loglet: Option<LogletCheck>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub nonce: Bytes,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReadIndexReply {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub nonce: Bytes,
+    #[prost(sint64, tag = "2")]
+    pub decided: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub(crate) struct DropStream {
     #[prost(string, tag = "1")]
     pub stream: String,
@@ -296,8 +312,8 @@ pub(crate) enum RequestBody {
     CheckSynced(Check),
     #[prost(message, tag = "14")]
     ActivateLoglet(LogletCheck),
-    #[prost(message, tag = "15")]
-    ReadIndex(LogletCheck),
+    #[prost(message, tag = "32")]
+    ReadIndex(ReadIndexRequest),
     #[prost(message, tag = "16")]
     Identify(Identify),
     #[prost(message, tag = "18")]
@@ -313,7 +329,7 @@ pub(crate) enum RequestBody {
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 30, 31")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 30, 31, 32")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -414,13 +430,15 @@ pub enum ResponseBody {
     JournalIdentity(JournalIdentity),
     #[prost(message, tag = "9")]
     AuthorityConfirmed(AuthorityConfirmed),
+    #[prost(message, tag = "10")]
+    ReadIndex(ReadIndexReply),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub body: Option<ResponseBody>,
 }
 

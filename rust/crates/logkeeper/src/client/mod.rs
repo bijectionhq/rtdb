@@ -28,7 +28,6 @@ pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, aud
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
-const READ_INDEX_GRACE: Duration = Duration::from_millis(15);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
@@ -346,15 +345,6 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()>
     Ok(())
 }
 
-fn read_index_frontiers(held: &mut [i64], published: i64, journals: usize, quorum: usize) -> (i64, i64) {
-    held.sort_unstable_by(|left, right| right.cmp(left));
-    // Unobserved slots could all hold a completed write, including slots that refused the active-epoch check.
-    let unknown = journals - held.len();
-    let known_committed = published.max(held[quorum - 1]);
-    let maybe_committed = known_committed.max(held[quorum - unknown - 1]);
-    (maybe_committed, known_committed)
-}
-
 impl QuorumLog {
     fn enqueue_at(&self, payload: Bytes, time: AppendTime<'_>) -> Result<AppendReceipt> {
         let maximum = self.shared.ensemble.config.maximum_message_bytes;
@@ -365,50 +355,68 @@ impl QuorumLog {
             Role::Reader(_) => Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream))),
         }
     }
-    /// Bounds writes completed before this call on the exact active ensemble.
-    /// The caller must wait for committed application through the returned position.
+    /// Finds a quorum-installed decision in the active loglet.
+    /// A local decision recovered by the probe must be installed on a quorum before exposure.
     pub async fn read_index(&self, epoch: u64) -> Result<ActiveLogletReadIndex> {
         let ensemble = &self.shared.ensemble;
-        let confirmed = |through| ActiveLogletReadIndex {
-            stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(), through: LogOffset(through),
-        };
         let quorum = ensemble.config.write_quorum;
         let unavailable = |message: &str| Error::Remote { key: ensemble.config.stream.clone(), message: message.into() };
-        if quorum <= ensemble.len() / 2 { return Err(unavailable("read indexes require intersecting write quorums")); }
-        let mut replies: FuturesUnordered<_> = (0..ensemble.len()).map(|server| ensemble.read_index(server, epoch)).collect();
-        let mut held = Vec::with_capacity(ensemble.len());
-        let mut published = -1;
-        let mut grace = None;
-        let mut bound = None;
-        while !replies.is_empty() {
-            let reply = tokio::select! {
-                biased;
-                _ = self.shared.cancellation.cancelled() => return Err(Error::Closed("quorum log closed".into())),
-                reply = replies.next() => reply.expect("pending read-index replies"),
-                _ = async {
-                    match grace {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => break,
-            };
-            match reply {
-                Ok(Ack::Accepted(position)) => {
-                    held.push(position.last_lsn);
-                    published = published.max(position.commit_lsn);
-                }
-                Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
-                _ if held.len() + replies.len() < quorum => break,
-                _ => continue,
-            }
-            if held.len() >= quorum {
-                let (maybe_committed, known_committed) = read_index_frontiers(&mut held, published, ensemble.len(), quorum);
-                if maybe_committed == known_committed { return Ok(confirmed(maybe_committed)); }
-                bound = Some(maybe_committed);
-                grace.get_or_insert_with(|| tokio::time::Instant::now() + READ_INDEX_GRACE);
-            }
+        if quorum <= ensemble.len() / 2 {
+            return Err(unavailable("read indexes require intersecting write quorums"));
         }
-        bound.map(confirmed).ok_or_else(|| unavailable("a write quorum did not confirm the active loglet"))
+        let nonce = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let round = async {
+            let mut probes: FuturesUnordered<_> = (0..ensemble.len()).map(|server| {
+                let nonce = nonce.clone();
+                async move { (server, ensemble.read_index(server, epoch, nonce).await) }
+            }).collect();
+            let mut observed = Vec::with_capacity(quorum);
+            while observed.len() < quorum {
+                if observed.len() + probes.len() < quorum {
+                    return Err(unavailable("a quorum did not confirm the active loglet"));
+                }
+                match probes.next().await.expect("need more probe replies") {
+                    (server, Ok(decided)) => observed.push((server, decided)),
+                    (_, Err(error @ Error::Deposed { .. })) => return Err(error),
+                    _ => (),
+                }
+            }
+
+            let selected = observed.iter().map(|&(_, decided)| decided).max().expect("nonempty quorum");
+            let mut installed = 0;
+            let mut repair = FuturesUnordered::new();
+            for (server, decided) in observed {
+                if decided >= selected { installed += 1; }
+                else { repair.push(ensemble.commit(server, epoch, selected)); }
+            }
+            while installed < quorum {
+                if installed + probes.len() + repair.len() < quorum {
+                    return Err(unavailable("a quorum did not install the selected decision"));
+                }
+                tokio::select! {
+                    Some((server, reply)) = probes.next(), if !probes.is_empty() => match reply {
+                        Ok(decided) if decided >= selected => installed += 1,
+                        Ok(_) => repair.push(ensemble.commit(server, epoch, selected)),
+                        Err(error @ Error::Deposed { .. }) => return Err(error),
+                        Err(_) => (),
+                    },
+                    Some(reply) = repair.next(), if !repair.is_empty() => match reply {
+                        Ok(Ack::Accepted(ack)) if ack.commit_lsn >= selected => installed += 1,
+                        Ok(Ack::Refused(refusal)) if refusal.promised > epoch =>
+                            return Err(Error::Deposed { epoch, promised: refusal.promised }),
+                        _ => (),
+                    },
+                }
+            }
+            Ok(ActiveLogletReadIndex {
+                stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(), through: LogOffset(selected),
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = self.shared.cancellation.cancelled() => Err(Error::Closed("quorum log closed".into())),
+            index = round => index,
+        }
     }
 
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.

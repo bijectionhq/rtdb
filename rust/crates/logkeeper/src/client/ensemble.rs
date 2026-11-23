@@ -2,7 +2,7 @@
 
 use super::connection::{Binding, Callback, Connection, connection, remote};
 use super::{JournalEndpoint, StreamConfig};
-use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
+use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, ReadIndexRequest, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
@@ -201,9 +201,14 @@ impl Ensemble {
         self.ack(server, reply)
     }
 
-    pub async fn read_index(&self, server: usize, epoch: u64) -> Result<Ack> {
-        let reply = self.links[server].call(RequestBody::ReadIndex(self.loglet_check(epoch))).await;
-        self.ack(server, reply)
+    pub async fn read_index(&self, server: usize, epoch: u64, nonce: Bytes) -> Result<i64> {
+        let request = ReadIndexRequest { loglet: Some(self.loglet_check(epoch)), nonce: nonce.clone() };
+        match self.links[server].call(RequestBody::ReadIndex(request)).await? {
+            ResponseBody::ReadIndex(reply) if reply.nonce == nonce => Ok(reply.decided),
+            ResponseBody::Refused(refused) if refused.promised > epoch =>
+                Err(Error::Deposed { epoch, promised: refused.promised }),
+            other => Err(self.unexpected(server, other)),
+        }
     }
 
     pub fn append_request(&self, epoch: u64, entry: Entry, commit_lsn: i64) -> RequestBody {

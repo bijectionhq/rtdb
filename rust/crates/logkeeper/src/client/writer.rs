@@ -727,6 +727,7 @@ impl Writer {
                 let through = flight.lsn;
                 pipeline.guarded = None;
                 self.release(pipeline, through);
+                self.install_through(pipeline, through);
                 self.repair_down(pipeline);
             }
             return;
@@ -738,20 +739,33 @@ impl Writer {
             self.release(pipeline, through);
             pipeline.publication = None;
         }
+        let committed = pipeline.commit;
         let through = match pipeline.publication {
             Some(through) => through,
             None => {
                 let mut held: Vec<_> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
                 held.select_nth_unstable_by(write_quorum - 1, |left, right| right.cmp(left));
                 let through = held[write_quorum - 1].min(pipeline.next_lsn - 1);
-                if through <= pipeline.commit { return; }
+                if through <= pipeline.commit {
+                    self.install_through(pipeline, committed);
+                    return;
+                }
                 pipeline.publication = Some(through);
                 through
             }
         };
+        self.install_through(pipeline, through);
+        if through > pipeline.commit {
+            self.install_through(pipeline, committed);
+        }
+    }
+
+    fn install_through(self: &Arc<Self>, pipeline: &mut Pipeline, through: i64) {
         for server in 0..pipeline.replicas.len() {
             let replica = &mut pipeline.replicas[server];
-            if matches!(replica.link, Link::Live) && replica.acked >= through && replica.installing < through {
+            if matches!(replica.link, Link::Live) && replica.acked >= through
+                && replica.installed < through && replica.installing < through
+            {
                 replica.installing = through;
                 self.send(pipeline, server, RequestBody::Commit(Commit {
                     stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: through,
