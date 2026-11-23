@@ -93,6 +93,7 @@ pub struct OwnedWorldAncestor {
     pub suffix: [u8; 16],
     pub manifest: String,
     pub basis: TransactionKey,
+    pub source_root: TransactionKey,
     pub logical: Timestamp,
 }
 
@@ -160,6 +161,8 @@ impl OwnedWorld {
                 ("manifest".into(), Value::Utf8(ancestor.manifest.clone())),
                 ("basis_id".into(), Value::I64(ancestor.basis.tx_id.0)),
                 ("basis_time".into(), Value::I64(ancestor.basis.system_time.0)),
+                ("source_root_id".into(), Value::I64(ancestor.source_root.tx_id.0)),
+                ("source_root_time".into(), Value::I64(ancestor.source_root.system_time.0)),
                 ("logical".into(), Value::I64(ancestor.logical.0)),
             ])));
         }
@@ -213,7 +216,7 @@ impl OwnedWorld {
         };
         let ancestor = match row.get("ancestor") {
             None | Some(Value::Null | Value::Undefined) => None,
-            Some(Value::Struct(fields)) if fields.len() == 8 => {
+            Some(Value::Struct(fields)) if fields.len() == 10 => {
                 let uuid = |name| match fields.get(name) {
                     Some(Value::Uuid(id)) if *id != [0; 16] => Ok(*id),
                     _ => Err(Self::unavailable()),
@@ -230,16 +233,21 @@ impl OwnedWorld {
                     tx_id: TxId(integer("basis_id")?),
                     system_time: Timestamp(integer("basis_time")?),
                 };
+                let source_root = TransactionKey {
+                    tx_id: TxId(integer("source_root_id")?),
+                    system_time: Timestamp(integer("source_root_time")?),
+                };
                 let logical = Timestamp(integer("logical")?);
                 let world = uuid("world")?;
                 if world == *id || *pin != *id || mode != WorldClockMode::Retained
                     || basis.tx_id.0 <= *tx_id || basis.system_time.0 <= *time
                     || basis.system_time.0 >= *until || logical <= inherited || logical > basis.system_time
+                    || source_root.tx_id.0 < 0 || source_root.system_time.0 <= 0 || source_root.system_time.0 > *time
                 {
                     return Err(Self::unavailable());
                 }
                 Some(OwnedWorldAncestor { world, pin: uuid("pin")?, capture: uuid("capture")?,
-                    suffix: uuid("suffix")?, manifest, basis, logical })
+                    suffix: uuid("suffix")?, manifest, basis, source_root, logical })
             }
             _ => return Err(Self::unavailable()),
         };
@@ -420,6 +428,7 @@ mod tests {
                 world: [3; 16], pin: [3; 16], capture: [4; 16], suffix: [5; 16],
                 manifest: "b".repeat(43),
                 basis: TransactionKey { tx_id: TxId(20), system_time: Timestamp(200) },
+                source_root: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
                 logical: Timestamp(150),
             }),
             manifest: "a".repeat(43),

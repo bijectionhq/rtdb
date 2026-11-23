@@ -108,6 +108,7 @@ impl WorldReadmission {
                     && relocated.retained.world == old.world
                     && relocated.retained.pin == old.pin
                     && relocated.retained.logical == old.logical
+                    && relocated.retained.source_root == old.source_root
                     && relocated.retained.basis.tx_id > self.basis.tx_id
                     && relocated.retained.basis.system_time > self.basis.system_time
                     && relocated.retained.basis.system_time < self.until =>
@@ -247,6 +248,7 @@ mod tests {
             suffix: [5; 16],
             manifest: "a".repeat(43),
             basis: position(2, 20),
+            source_root: position(1, 10),
             logical: Timestamp(17),
         };
         let world = OwnedWorld {
@@ -281,7 +283,7 @@ mod tests {
         };
         assert_eq!(admission.retained_ancestor(&world)?, Some(&retained));
         let moved = admission.ancestor.as_mut().expect("fixture has a relocated ancestor");
-        moved.retained.pin = [10; 16];
+        moved.retained.source_root = position(101, 110);
         assert!(admission.retained_ancestor(&world).is_err());
         admission.ancestor = None;
         assert!(admission.retained_ancestor(&world).is_err());

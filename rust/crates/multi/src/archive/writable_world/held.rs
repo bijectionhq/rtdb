@@ -801,8 +801,8 @@ impl HeldCheckpointWorld {
             }).collect::<Result<Vec<_>>>()?;
             Some((system, schemas))
         } else { None };
-        let ancestor_schemas = if self.ancestor().is_some() {
-            if parent_at.is_some() || earlier.is_some() || frontiers.iter().any(|frontier| *frontier != 0) {
+        let ancestor_schemas = if self.ancestor().is_some() && parent_at.is_none() {
+            if earlier.is_some() || frontiers.iter().any(|frontier| *frontier != 0) {
                 return Err(OwnedWorld::unavailable());
             }
             Some(partitions.iter().map(|(relation, _)| {
@@ -1450,7 +1450,7 @@ impl<'a> InheritedRelation<'a> {
         let root_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&root), owner, relation).await?;
         if record.dropped || record.ancestor.is_some() || record.pin.0 != *ancestor.pin.as_bytes()
             || !matches!(record.mode, WorldClockMode::Held { .. }) || record.schemas.relation(relation) != Some(schema)
-            || record.basis.system_time != root.current_time.as_micros()?
+            || record.basis != ancestor.source_root || ancestor.source_root.system_time > root.current_time.as_micros()?
             || clock != Some((ancestor.logical, ancestor.basis.system_time))
             || !root_schema.is_some_and(|(actual, _)| &actual == schema)
         {
