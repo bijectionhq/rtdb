@@ -87,13 +87,13 @@ impl PointRanking {
                 let summary = match self.summaries.entry(key) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        let Some(summary) = WindowSummary::new(group.file, &self.ids) else {
+                        let Some(summary) = WindowSummary::new(&group.file, &self.ids) else {
                             return Ok((Err(Fallback::IdCoverage), work));
                         };
                         entry.insert(summary)
                     }
                 };
-                summary.prepare(group.file, column, scoring.query())?;
+                summary.prepare(&group.file, column, scoring.query())?;
                 work.preparation += start.elapsed();
                 work.summary_bytes += summary.retained_bytes();
                 cursor.with_tie_bounds(summary);
