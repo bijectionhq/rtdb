@@ -3428,6 +3428,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finite_world_unique_claims_check_exact_half_open_shadow_coverage() -> Result<()> {
+        use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, OwnedWorld, WorldClockMode, WorldSchemas, WorldShadow};
+
+        struct Parent(Arc<QueryContext>);
+        #[async_trait]
+        impl WorldConstraintArchive for Parent {
+            async fn check(&self, check: ArchivedWorldConstraints<'_>) -> Result<()> {
+                check.validate(Arc::clone(&self.0)).await
+            }
+        }
+
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            placed_receipt_retirement: false,
+            owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-unique", 1)?),
+            world_constraints: None,
+            database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory),
+            query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(),
+            authorization: Arc::new(NoRoleChecks),
+            execution_observer: None,
+            tracer: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default())?;
+        let options = SubmitOptions { user: Some("owner".into()), ..Default::default() };
+        let relation = OwnedRelation::new("facts")?;
+        let schema = OwnedSchema::from_json(
+            br#"{"fields":[{"name":"key","type":{"kind":"binary"},"optional":false,"nullable":false}],"validity":"bounded_period"}"#,
+        )?;
+        let fact = |id: &EntityId| StructFields::from([
+            ("_id".into(), id.as_value()), ("key".into(), Value::Binary(b"shared".to_vec())),
+        ]);
+        let parent_holder = EntityId::String("parent".into());
+        let other = EntityId::String("other".into());
+        let local = EntityId::String("local".into());
+        let cut = TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) };
+        let mut root = OpenTransaction::new(state.value().snapshot(), cut, &options, &context)?;
+        root.declare_owned_relation(&relation, &schema).await?;
+        root.declare_owned_unique_path(&relation, &OwnedRelation::new("by-key")?, "key").await?;
+        root.write_owned(&relation, &crate::Documents::new(vec![fact(&parent_holder)], &memory)?,
+            None, Some(Timestamp(10)), Some(Timestamp(30)), false).await?;
+        root.finish_owned_unique().await?;
+        let parent = root.snapshot()?;
+        drop(root);
+        let archive = parent.clone().with_system_time_cap(Some(cut.system_time))?;
+        let archive = context.query_context(archive, cut.system_time, "UTC", None)?;
+        let context = ResolveContext { world_constraints: Some(Arc::new(Parent(archive))), ..context };
+        let world = Iid([1; 16]);
+        let overlay = relation.in_world(world)?;
+        let write = |id: &EntityId, from, to, tombstone| -> Result<Operation> {
+            let shadow = if tombstone { WorldShadow::Deleted } else { WorldShadow::Present(fact(id)) };
+            Ok(Operation::Public(TxOp::OwnedReplaceDocs {
+                relation: overlay.clone(), documents: crate::Documents::new(vec![shadow.record(id)?], &memory)?,
+                valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)),
+            }))
+        };
+        for mode in [WorldClockMode::Proposal, WorldClockMode::Held { start: cut.system_time }] {
+            let record = OwnedWorld {
+                ancestor: None, id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
+                manifest: "a".repeat(43), basis: cut, parent_publication: None, mode,
+                until: Timestamp(1000), dropped: false,
+                schemas: WorldSchemas::new(BTreeMap::from([(relation.name().into(), schema.clone())]))?,
+            };
+            for (start, shadow, another_start, accepted) in [
+                (20, None, None, false),
+                (20, Some((&other, 20)), None, false),
+                (20, Some((&parent_holder, 21)), None, false),
+                (20, Some((&parent_holder, 20)), Some(40), true),
+                (30, None, Some(39), false),
+                (30, None, Some(40), true),
+            ] {
+                let mut tx = OpenTransaction::new(
+                    parent.clone(), TransactionKey { tx_id: TxId(2), system_time: Timestamp(200) },
+                    &options, &context,
+                )?;
+                tx.owned_worlds.insert(world, (record.clone(), memory.reserve(4096)?));
+                let mut writes = vec![write(&local, start, 40, false)?];
+                if let Some((id, from)) = shadow { writes.push(write(id, from, 30, true)?); }
+                if let Some(from) = another_start { writes.push(write(&other, from, 50, false)?); }
+                for operation in &writes { tx.apply(operation).await?; }
+                let result = tx.check_final_constraints(&writes).await;
+                if accepted {
+                    result?;
+                } else {
+                    assert_eq!(result.unwrap_err().code, "rtdb.owned/unique-taken");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_world_constraints_combine_current_policy_with_inherited_rows_and_local_shadows() -> Result<()> {
         use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, OwnedWorld, WorldClockMode, WorldSchemas, WorldShadow};
 

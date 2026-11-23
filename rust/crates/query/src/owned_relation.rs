@@ -344,17 +344,47 @@ pub async fn open_owned_unique_window(
     mask: Option<(Timestamp, u32)>,
     fetch: usize,
 ) -> Result<Option<QueryCursor>> {
-    if owner.is_empty() || !relation.is_root_data() || valid.is_empty()
-        || valid.lower() == Timestamp::MIN || valid.upper() == Timestamp::MAX
-        || !(1..=1025).contains(&fetch)
-        || key.is_some_and(|key| key.is_empty() || key.len() > crate::OWNED_UNIQUE_KEY_MAX)
-    {
+    if !relation.is_root_data() {
         return Err(address_unavailable());
     }
     let context = match mask {
         Some(mask) => owned_context_at_position(context, system, mask)?,
         None => owned_context_at_system(context, system)?,
     };
+    open_unique_window(context, owner, relation, column, key, valid, fetch).await
+}
+
+pub async fn open_staged_unique_window(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    column: &str,
+    key: &[u8],
+    valid: Interval,
+    fetch: usize,
+) -> Result<Option<QueryCursor>> {
+    if !context.catalog.transaction_scoped() || relation.root_relation().is_none() {
+        return Err(address_unavailable());
+    }
+    open_unique_window(context, owner, relation, column, Some(key), valid, fetch).await
+}
+
+async fn open_unique_window(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    column: &str,
+    key: Option<&[u8]>,
+    valid: Interval,
+    fetch: usize,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || valid.is_empty()
+        || valid.lower() == Timestamp::MIN || valid.upper() == Timestamp::MAX
+        || !(1..=1025).contains(&fetch)
+        || key.is_some_and(|key| key.is_empty() || key.len() > crate::OWNED_UNIQUE_KEY_MAX)
+    {
+        return Err(address_unavailable());
+    }
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
         table: relation.table(owner),

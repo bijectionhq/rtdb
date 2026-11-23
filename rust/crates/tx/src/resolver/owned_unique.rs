@@ -31,9 +31,9 @@ struct KeyChange {
     claims: Vec<Segment<EntityId>>,
 }
 
-struct Segment<T> {
-    valid: Interval,
-    value: T,
+pub(super) struct Segment<T> {
+    pub(super) valid: Interval,
+    pub(super) value: T,
 }
 
 impl OpenTransaction<'_> {
@@ -327,25 +327,14 @@ impl OpenTransaction<'_> {
             let batch = batch.batch();
             for row in 0..batch.num_rows() {
                 rtdb_query::owned_row_revision(batch, row, id, &self.context.memory)?;
-                let edge = |name: &str| {
-                    batch.column_by_name(name)
-                        .and_then(|array| array.as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>())
-                        .ok_or_else(unique_uncovered)
-                };
-                let start = edge("_valid_from")?;
-                let end = edge("_valid_to")?;
-                if start.is_null(row) {
+                let valid = unique_segment_interval(batch, row, window)?;
+                if valid.lower() < through {
                     return Err(unique_uncovered());
                 }
-                let lower = Timestamp(start.value(row));
-                let upper = if end.is_null(row) { Timestamp::MAX } else { Timestamp(end.value(row)) };
-                if lower < through || lower >= upper || upper > window.upper() {
-                    return Err(unique_uncovered());
-                }
-                through = upper;
+                through = valid.upper();
                 let value = self.read_occupancy_value_at(batch, row, column, unique_uncovered)?;
                 allocations.push(self.context.memory.reserve(value.retained_bytes()?.saturating_add(512))?);
-                segments.push(Segment { valid: Interval::new(lower, upper)?, value });
+                segments.push(Segment { valid, value });
             }
         }
         Ok(segments)
@@ -417,7 +406,28 @@ impl OpenTransaction<'_> {
     }
 }
 
-fn merge_windows(mut windows: Vec<Interval>) -> Result<Vec<Interval>> {
+pub(super) fn unique_segment_interval(
+    batch: &RecordBatch, row: usize, window: Interval,
+) -> Result<Interval> {
+    let edge = |name: &str| {
+        batch.column_by_name(name)
+            .and_then(|array| array.as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>())
+            .ok_or_else(unique_uncovered)
+    };
+    let start = edge("_valid_from")?;
+    let end = edge("_valid_to")?;
+    if start.is_null(row) {
+        return Err(unique_uncovered());
+    }
+    let lower = Timestamp(start.value(row));
+    let upper = if end.is_null(row) { Timestamp::MAX } else { Timestamp(end.value(row)) };
+    if lower < window.lower() || lower >= upper || upper > window.upper() {
+        return Err(unique_uncovered());
+    }
+    Interval::new(lower, upper)
+}
+
+pub(super) fn merge_windows(mut windows: Vec<Interval>) -> Result<Vec<Interval>> {
     windows.sort_unstable();
     let mut merged: Vec<Interval> = Vec::new();
     for window in windows {
@@ -465,7 +475,7 @@ fn final_holders(
     Ok(updates)
 }
 
-fn ordered_segments(segments: &mut [Segment<EntityId>], overlap: fn() -> Anomaly) -> Result<()> {
+pub(super) fn ordered_segments(segments: &mut [Segment<EntityId>], overlap: fn() -> Anomaly) -> Result<()> {
     segments.sort_unstable_by_key(|part| part.valid);
     if segments.windows(2).any(|pair| pair[0].valid.intersects(pair[1].valid)) {
         return Err(overlap());

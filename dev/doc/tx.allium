@@ -155,6 +155,9 @@
 -- Held replay certifies the locator, interval and holder of every derived unique occupancy change.
 -- A world unique claim checks final local occupancy and the exact archived occupant for its path and key.
 -- A final local shadow can withdraw an inherited occupant and transfer the unique key in the same ordered write.
+-- A finite Proposal or Held world validates each affected unique key over its final winning local intervals and the exact admitted archived parent.
+-- A local shadow masks an inherited claim only for the same entity and the intersection with the shadow's winning valid interval.
+-- Two adjacent half-open claims may share the key, and any remaining intersection aborts the world write.
 -- Acceptance-valid writes in a Held world start at the logical clock that the world publishes with them and have an open end.
 -- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
 -- When an Original replay receipt carries archived assertion positions, the governed events retain those exact positions in the destination transaction.
