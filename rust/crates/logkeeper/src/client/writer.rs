@@ -42,6 +42,10 @@ enum Link {
 struct Replica {
     /// The highest lsn this server has acknowledged durable at this writer's epoch.
     acked: i64,
+    /// The highest decision this journal confirmed durable.
+    installed: i64,
+    /// The latest ordinary publication queued on this connection.
+    installing: i64,
     link: Link,
 }
 
@@ -137,6 +141,7 @@ impl Round {
 struct Pipeline {
     next_lsn: i64,
     commit: i64,
+    publication: Option<i64>,
     history: Holding,
     /// Entry `i` has lsn `buffer_first + i`; it holds every uncommitted entry and some recent committed ones.
     buffer_first: i64,
@@ -245,16 +250,16 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
         .map(|(server, sealed)| async move { (*server, sync_server(ensemble, epoch, *server, sealed, recovered).await) })
         .collect::<FuturesUnordered<_>>();
     let mut committing = FuturesUnordered::new();
-    let mut synced = Vec::with_capacity(replies.len());
+    let mut synced = 0;
     let mut uncommitted = Vec::new();
-    let mut committed = 0;
+    let mut committed = Vec::with_capacity(replies.len());
     let mut grace = None;
     loop {
-        if recovery_commit_quorum(committed, quorum) {
+        if recovery_commit_quorum(committed.len(), quorum) {
             grace.get_or_insert_with(|| tokio::time::Instant::now() + RECOVERY_GRACE);
-        } else if synced.len() >= quorum {
+        } else if synced >= quorum {
             for server in uncommitted.drain(..) {
-                committing.push(ensemble.commit(server, epoch, commit));
+                committing.push(async move { (server, ensemble.commit(server, epoch, commit).await) });
             }
         }
 
@@ -263,17 +268,17 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
             biased;
             Some((server, reply)) = syncing.next(), if !syncing.is_empty() => match reply {
                 Ok(ack) => {
-                    synced.push(server);
-                    if covers_recovered_commit(ack.commit_lsn, commit) { committed += 1; }
+                    synced += 1;
+                    if covers_recovered_commit(ack.commit_lsn, commit) { committed.push(server); }
                     else { uncommitted.push(server); }
                 }
                 Err(Error::Deposed { promised, .. }) => return Err(Error::Deposed { epoch, promised }),
                 Err(_) => (),
             },
-            Some(reply) = committing.next(), if !committing.is_empty() => {
+            Some((server, reply)) = committing.next(), if !committing.is_empty() => {
                 if let Ok(reply) = reply {
                     let ack = deposed_by(epoch, reply)?;
-                    committed += usize::from(covers_recovered_commit(ack.commit_lsn, commit));
+                    if covers_recovered_commit(ack.commit_lsn, commit) { committed.push(server); }
                 }
             }
             _ = async {
@@ -284,11 +289,11 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
             } => break,
         }
     }
-    if !recovery_commit_quorum(committed, quorum) {
+    if !recovery_commit_quorum(committed.len(), quorum) {
         return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!(
-            "recovered on {} servers and confirmed commit on {committed}, a write quorum is {quorum}", synced.len()) });
+            "recovered on {synced} servers and confirmed commit on {}, a write quorum is {quorum}", committed.len()) });
     }
-    Ok(synced)
+    Ok(committed)
 }
 
 fn winning_seal(replies: &[(usize, Sealed)]) -> &(usize, Sealed) {
@@ -526,7 +531,7 @@ impl Writer {
         Ok(())
     }
 
-    /// Recovers a durable write quorum of `ensemble` before opening the pipeline.
+    /// Recovers and activates only journals that confirmed the selected decision.
     async fn establish(ensemble: Arc<Ensemble>, epoch: u64, replies: &[(usize, Sealed)], recovered: Recovered<'_>) -> Result<Arc<Self>> {
         let last = recovered.history.last;
         let synced = sync_quorum(&ensemble, epoch, replies, &recovered, last).await?;
@@ -549,11 +554,11 @@ impl Writer {
         }
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
         let replicas = (0..ensemble.len()).map(|server| if active.contains(&server) {
-            Replica { acked: last, link: Link::Live }
+            Replica { acked: last, installed: last, installing: last, link: Link::Live }
         } else {
-            Replica { acked: -1, link: Link::Down(long_ago) }
+            Replica { acked: -1, installed: -1, installing: -1, link: Link::Down(long_ago) }
         }).collect();
-        let pipeline = Pipeline { next_lsn: last + 1, commit: last, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
+        let pipeline = Pipeline { next_lsn: last + 1, commit: last, publication: None, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
         let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(last)).0 });
         {
             let mut state = writer.state.lock();
@@ -689,10 +694,13 @@ impl Writer {
             Ok(Ack::Accepted(accepted)) => {
                 let replica = &mut pipeline.replicas[server];
                 replica.acked = replica.acked.max(accepted.last_lsn);
+                replica.installed = replica.installed.max(accepted.commit_lsn);
                 self.advance(pipeline);
             }
             Ok(Ack::Refused(_)) | Err(_) => {
-                if matches!(pipeline.replicas[server].link, Link::Live) {
+                let replica = &mut pipeline.replicas[server];
+                replica.installing = replica.installed;
+                if matches!(replica.link, Link::Live) {
                     pipeline.replicas[server].link = Link::Repairing;
                     self.spawn_repair(server);
                 }
@@ -714,12 +722,45 @@ impl Writer {
             }
             return;
         }
-        if pipeline.guarded.as_ref().is_some_and(|flight| !flight.releasable(write_quorum)) { return; }
-        let mut acked: Vec<i64> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
-        acked.sort_unstable_by(|left, right| right.cmp(left));
-        let quorum = acked[write_quorum - 1].min(pipeline.next_lsn - 1);
-        if quorum <= pipeline.commit { return; }
-        let guarded = pipeline.guarded.take();
+        if let Some(flight) = &pipeline.guarded {
+            if flight.releasable(write_quorum) {
+                let through = flight.lsn;
+                pipeline.guarded = None;
+                self.release(pipeline, through);
+                self.repair_down(pipeline);
+            }
+            return;
+        }
+
+        if let Some(through) = pipeline.publication
+            && pipeline.replicas.iter().filter(|replica| replica.installed >= through).count() >= write_quorum
+        {
+            self.release(pipeline, through);
+            pipeline.publication = None;
+        }
+        let through = match pipeline.publication {
+            Some(through) => through,
+            None => {
+                let mut held: Vec<_> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
+                held.select_nth_unstable_by(write_quorum - 1, |left, right| right.cmp(left));
+                let through = held[write_quorum - 1].min(pipeline.next_lsn - 1);
+                if through <= pipeline.commit { return; }
+                pipeline.publication = Some(through);
+                through
+            }
+        };
+        for server in 0..pipeline.replicas.len() {
+            let replica = &mut pipeline.replicas[server];
+            if matches!(replica.link, Link::Live) && replica.acked >= through && replica.installing < through {
+                replica.installing = through;
+                self.send(pipeline, server, RequestBody::Commit(Commit {
+                    stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: through,
+                }));
+            }
+        }
+    }
+
+    fn release(&self, pipeline: &mut Pipeline, quorum: i64) {
         let previous = pipeline.commit;
         pipeline.commit = quorum;
         self.tip.send_replace(Tip::Open(quorum));
@@ -730,20 +771,12 @@ impl Writer {
                 let _ = receipt.send(Ok(record(&buffered.entry).metadata));
             }
         }
-        if guarded.is_none() && pipeline.commit == pipeline.next_lsn - 1 {
-            for server in 0..pipeline.replicas.len() {
-                if matches!(pipeline.replicas[server].link, Link::Live) {
-                    self.send(pipeline, server, RequestBody::Commit(Commit { stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: quorum }));
-                }
-            }
-        }
         while pipeline.buffer.front().is_some_and(|buffered| buffered.entry.lsn <= pipeline.commit)
             && (pipeline.buffer.len() > RECENT_ENTRIES || pipeline.buffered_bytes > RECENT_BYTES) {
             let dropped = pipeline.buffer.pop_front().expect("checked above");
             pipeline.buffered_bytes -= dropped.entry.payload.len();
             pipeline.buffer_first += 1;
         }
-        if guarded.is_some() { self.repair_down(pipeline); }
     }
 
     fn depose(&self, state: &mut State, promised: u64) {
