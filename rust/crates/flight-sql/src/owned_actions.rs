@@ -2548,9 +2548,9 @@ impl Service {
                     let mut writes = Vec::new();
                     self.decode_world_writes(call, owned_groups(overlay, true, false)?, &mut rows_left, &mut writes, &mut reservations)?;
                     if writes.is_empty() { return Err(invalid("The world overlay has no writes")); }
-                    if let Some(write) = writes.iter().find(|write| write.create_only) {
-                        if writes.len() != 1 || mode != rtdb_types::WorldClockMode::Proposal {
-                            return Err(invalid("Only one create-only Proposal effect can be ordered"));
+                    for write in writes.iter().filter(|write| write.create_only) {
+                        if mode != rtdb_types::WorldClockMode::Proposal {
+                            return Err(invalid("Only a Proposal overlay can create"));
                         }
                         resource.require_create_absence(nonces, write)?;
                     }

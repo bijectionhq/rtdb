@@ -141,6 +141,8 @@
 -- Its ordered condition checks the original parent pin and Root purge frontier.
 -- Finite Proposal replacements can land after the Root publication advances when the transaction checks each exact start and both held timeline frontiers for each affected relation.
 -- A landing with point writes requires the original parent publication and may also contain finite replacements at distinct addresses.
+-- A Proposal overlay may append multiple fresh carriers in any generation.
+-- Each create checks its own original absence in the parent and overlay.
 -- The transaction checks a Root absence and original Proposal winner for each insert and rejects an identity with retained history or a purge floor.
 -- Fully covered range counts and completed head valid windows can issue relation-frontier evidence under the same placed lease as range pages.
 -- Held system versions seek both window edges in the relation's ordered change journal and verify its event frontier.

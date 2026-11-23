@@ -964,6 +964,40 @@ mod retained_release_tests {
     }
 
     #[test]
+    fn later_proposal_appends_require_absence_for_each_carrier() -> Result<()> {
+        let scope = PlacedAttemptScope::new("proposal-appends", 1)?;
+        let world = Iid([1; 16]);
+        let relation = OwnedRelation::new("samples")?.in_world(world)?;
+        let control = OwnedRelation::new("bj_owner")?;
+        let row = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let mut operations = vec![
+            TxOp::HostedControl(HostedControlWrite::check(control.clone(), scope, Some(Timestamp(1)), row("installed"))?),
+            TxOp::HostedControl(HostedControlWrite::new(control, scope, Some(Timestamp(2)), row("owner"))?),
+            TxOp::OwnedPublishWorld {
+                world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                expected: Some(Timestamp(3)), advance_to: None, drop_world: false, settlement_pin: None,
+                delete_root: None, land_root: None,
+            },
+        ].into_iter().map(Operation::Public).collect::<Vec<_>>();
+        for id in ["first", "second"] {
+            operations.push(Operation::Public(TxOp::OwnedInsertDocs {
+                relation: relation.clone(), documents: crate::Documents::new(vec![row(id)], &memory)?,
+                valid_from: None, valid_to: None,
+            }));
+        }
+        for id in ["first", "second"] {
+            assert_eq!(hosted_proposal_overlay(&operations), None);
+            operations.push(Operation::Public(TxOp::OwnedCheck {
+                relation: relation.clone(), id: EntityId::String(id.into()),
+                valid_at: Timestamp(4), expected: None,
+            }));
+        }
+        assert_eq!(hosted_proposal_overlay(&operations), Some(world));
+        Ok(())
+    }
+
+    #[test]
     fn proposal_landing_orders_frontiers_with_the_fact_and_both_receipt_locators() -> Result<()> {
         let scope = PlacedAttemptScope::new("proposal-landing", 1)?;
         let world = Iid([1; 16]);
@@ -1156,7 +1190,6 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
     let mut controls = Vec::new();
     let mut writes = Vec::new();
     let mut terminal = false;
-    let mut create = false;
     let mut points = BTreeMap::<_, BTreeSet<_>>::new();
     let mut timelines = BTreeSet::new();
     for operation in operations {
@@ -1171,9 +1204,9 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
                 points.entry((relation, id.handle_bytes())).or_default().insert((*valid_at, expected.is_none()));
             }
             Operation::Public(TxOp::OwnedPublishWorld {
-                world: next, advance_to: None, drop_world: false, settlement_pin, delete_root: None, expected, ..
+                world: next, advance_to: None, drop_world: false, settlement_pin, delete_root: None, ..
             }) if world.is_none() => {
-                world = Some((*next, expected.is_none()));
+                world = Some(*next);
                 terminal = settlement_pin.is_some();
             },
             operation => {
@@ -1185,21 +1218,17 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
                 };
                 if write.documents.rows().len() != 1 { return None; }
                 let id = write.documents.rows()[0].get("_id")?.entity_id().ok()?;
-                if write.create_only {
-                    if start.is_some() || create { return None; }
-                    create = true;
-                }
-                writes.push((write.relation, id.handle_bytes(), start));
+                if write.create_only && start.is_some() { return None; }
+                writes.push((write.relation, id.handle_bytes(), start, write.create_only));
             }
         }
     }
-    let (world, initial) = world?;
-    if create && (!initial || writes.len() != 1) { return None; }
+    let world = world?;
     let controls_allowed = if terminal { retained_delete_controls(controls) } else { proposal_overlay_controls(controls) };
-    (terminal == writes.is_empty() && controls_allowed && writes.into_iter().all(|(relation, id, start)| {
+    (terminal == writes.is_empty() && controls_allowed && writes.into_iter().all(|(relation, id, start, create_only)| {
         relation.world() == Some(world)
             && points.remove(&(relation, id)).is_some_and(|instants| {
-                if create {
+                if create_only {
                     instants.iter().all(|(_, absent)| *absent)
                 } else {
                     start.is_none_or(|start| instants.iter().any(|(at, _)| *at == start) && timelines.contains(&relation))
