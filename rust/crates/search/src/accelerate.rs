@@ -849,7 +849,7 @@ fn exceeds_retry_limit(
 impl Candidates<'_> {
     fn push(&mut self, iid: Iid, score: f64, id: Option<i64>, exact: bool) {
         self.scored += 1;
-        self.pending.push(Pending { key: RankKey { score, id }, iid, exact });
+        self.pending.push(Pending { key: RankKey::integer(score, id), iid, exact });
     }
 
     fn drop_seen(&mut self) { while self.pending.peek().is_some_and(|top| self.seen.contains(&top.iid)) { self.pending.pop(); } }
@@ -862,7 +862,7 @@ impl Candidates<'_> {
         self.drop_seen();
         let pending = self.pending.peek().map(|top| top.key);
         let unread = self.best_file().map(|(_, bound)| bound);
-        if kth.id.is_none() {
+        if !kth.has_id() {
             return crate::rank_cutoff::can_stop(kth.score.to_bits(), pending.map(|key| key.score.to_bits()), unread.map(|key| key.score.to_bits()));
         }
         pending.into_iter().chain(unread).all(|bound| kth.beats(bound))
@@ -911,8 +911,8 @@ fn reserve_ranking(reservation: &mut Arc<rtdb_columnar::MemoryReservation>, cand
 fn verified_cutoff(rows: &mut [(RankKey, Iid)], limit: usize) -> Option<RankKey> {
     rows.sort_unstable_by(|left, right| right.0.compare(left.0).then_with(|| left.1.cmp(&right.1)));
     let mut kth = rows.get(limit - 1)?.0;
-    if rows.iter().any(|(key, _)| key.id.is_none() && key.score_order(kth).is_eq()) {
-        kth.id = None;
+    if rows.iter().any(|(key, _)| !key.has_id() && key.score_order(kth).is_eq()) {
+        kth = kth.score_only();
     }
     Some(kth)
 }
@@ -922,17 +922,17 @@ impl SearchAccelerator {
     /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
         let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
-        let limit = match request.constants.constant(&top_k.limit).await.ok().flatten() {
-            Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => { work.decline = Some("unsupported-limit"); return Ok(None); },
-        };
-        let Ok(limit) = usize::try_from(limit) else { work.decline = Some("unsupported-limit"); return Ok(None) };
+        let Some(limit) = request.ranked_prefix_len(top_k).await else { work.decline = Some("unsupported-limit"); return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
         let ascending_id = top_k.ascending_id.filter(|_| request.partitions.len() == 1
             && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point());
+        let uuid_id = ascending_id.filter(|&id| request.ranked_id_is_uuid(id));
+        let ascending_id = ascending_id.filter(|_| uuid_id.is_none());
+        let uuid_order = uuid_id.is_some_and(|id| request.permits_ranked_uuid_id(id));
         let scoring_query = Query::parse(&text);
         if !options.estimate_first && !options.baseline {
             let (result, io) = crate::file::observe_tree_io(self.tree_top_k(request, definition, column, top_k.column, matching,
-                scoring_query.clone(), ascending_id, limit, options.scope, work)).await;
+                scoring_query.clone(), ascending_id, uuid_order, limit, options.scope, work)).await;
             work.tree_io = io;
             if let Some(result) = result? { return Ok(Some(result)); }
         }
@@ -1049,10 +1049,10 @@ impl SearchAccelerator {
             work.verification_rounds += 1;
             if cfg!(feature = "experiments") { work.verifier_rows += iids.len(); }
             let scores = request.verifier.score_visible(iids, top_k.column, ascending_id, &scoring).await?;
-            verified.extend(scores.ranked().map(|(iid, score, id)| (RankKey { score, id }, iid)));
+            verified.extend(scores.ranked().map(|(iid, score, id)| (RankKey::integer(score, id), iid)));
         }
         if let Some(kth) = verified_cutoff(&mut verified, limit) {
-            if kth.id.is_some() { verified.truncate(limit); }
+            if kth.has_id() { verified.truncate(limit); }
             else { verified.retain(|(key, _)| !key.score_order(kth).is_lt()); }
         }
         let iids = verified.iter().map(|&(_, iid)| iid).collect();
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn retry_budget_requires_distinct_iids_and_available_scratch() {
         let iid = |n| Iid([n; 16]);
-        let pending_event = |score, iid| Pending { key: RankKey { score, id: None }, iid, exact: true };
+        let pending_event = |score, iid| Pending { key: RankKey::integer(score, None), iid, exact: true };
         let seen = BTreeSet::from([iid(1)]);
         let mut pending = std::collections::BinaryHeap::from([
             pending_event(1.0, iid(1)), pending_event(0.5, iid(2)), pending_event(0.25, iid(2)),

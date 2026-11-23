@@ -423,7 +423,7 @@ mod join_iid_tests {
             let rows = join_rows(node, &format!("EXPLAIN ANALYZE {sql}"), i64::MAX).await?;
             let source = text(source);
             let (attributes, pushdowns) = rows.iter().find_map(|row| match row.as_slice() {
-                [_, op, attributes, _, _, _, _, _, Value::Transit(bytes), _]
+                [_, op, attributes, _, _, _, _, _, Value::Transit(bytes), ..]
                     if *op == keyword("scan") && attributes.field("scan_source") == Some(&source) => Some((attributes, bytes)),
                 _ => None,
             }).ok_or("Compacted probe scan metrics are missing")?;

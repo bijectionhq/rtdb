@@ -212,13 +212,17 @@ pub(crate) enum RequestBody {
     Identify(Identify),
     #[prost(message, tag = "18")]
     ConfirmAuthority(LogletCheck),
+    #[prost(message, tag = "19")]
+    AppendObserved(Append),
+    #[prost(message, tag = "30")]
+    TrimDurable(Trim),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 30")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -284,6 +288,8 @@ pub struct PageDigest {
     pub through_lsn: i64,
     #[prost(bytes = "bytes", tag = "2")]
     pub digest: Bytes,
+    #[prost(sfixed64, optional, tag = "3")]
+    pub synced_clock_upper_micros: Option<i64>,
 }
 
 /// Confirms only the promised writer. It conveys no append or commit position.
@@ -358,6 +364,59 @@ async fn a_frame_is_charged_for_its_wire_bytes_even_if_decoding_discards_unknown
     assert_eq!(bytes, 3);
     assert_eq!(request.encoded_len(), 0);
     assert!(frame.is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn a_legacy_peer_cannot_decode_a_durable_trim_as_an_ordinary_trim() {
+    #[derive(Message)]
+    struct LegacyTrimRequest {
+        #[prost(message, optional, tag = "8")]
+        trim: Option<Trim>,
+        #[prost(string, tag = "17")]
+        target_journal: String,
+    }
+
+    let trim = Trim { stream: "scope".into(), through_lsn: 4 };
+    let request = |body| Request { id: 1, body: Some(body), target_journal: "journal".into() }.encode_to_vec();
+    let ordinary = LegacyTrimRequest::decode(request(RequestBody::Trim(trim.clone())).as_slice()).unwrap();
+    assert!(ordinary.trim == Some(trim.clone()));
+    let durable = LegacyTrimRequest::decode(request(RequestBody::TrimDurable(trim)).as_slice()).unwrap();
+    assert!(durable.trim.is_none());
+    assert_eq!(durable.target_journal, "journal");
+}
+
+#[cfg(test)]
+#[test]
+fn authority_confirmation_and_durable_trim_use_disjoint_requests() {
+    #[derive(Message)]
+    struct AuthorityRequest {
+        #[prost(message, optional, tag = "18")]
+        confirm_authority: Option<LogletCheck>,
+    }
+
+    let confirm = AuthorityRequest {
+        confirm_authority: Some(LogletCheck {
+            stream: "scope".into(),
+            epoch: 8,
+            ensemble: Bytes::from_static(&[42; 32]),
+        }),
+    };
+    let decoded = Request::decode(confirm.encode_to_vec().as_slice()).unwrap();
+    assert!(matches!(decoded.body, Some(RequestBody::ConfirmAuthority(check))
+        if check.stream == "scope" && check.epoch == 8 && check.ensemble == &[42; 32][..]));
+
+    let trim = Request {
+        id: 1,
+        body: Some(RequestBody::TrimDurable(Trim { stream: "scope".into(), through_lsn: 4 })),
+        target_journal: "journal".into(),
+    };
+    let encoded = trim.encode_to_vec();
+    let legacy = AuthorityRequest::decode(encoded.as_slice()).unwrap();
+    assert!(legacy.confirm_authority.is_none());
+    let decoded = Request::decode(encoded.as_slice()).unwrap();
+    assert!(matches!(decoded.body, Some(RequestBody::TrimDurable(trim))
+        if trim.stream == "scope" && trim.through_lsn == 4));
 }
 
 /// Groups consecutive lsns written at the same epoch.

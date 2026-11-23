@@ -79,10 +79,15 @@ The states bind the deployment history and exact loglet configuration.
 
 The current writer returns an append receipt as soon as a quorum holds the entry, before every commit-watermark publication is acknowledged.
 Sampling only published commit watermarks can therefore miss a completed write.
-A quorum of exact active-loglet replies can conservatively bound completed writes by the largest held position among its replies, since that quorum intersects the write quorum.
-Such a bound can include unpublished entries.
+The read index collects positive replies from an intersecting quorum of the exact active loglet.
+It counts each unobserved slot as a possible vote for a completed position.
+With `q` write votes required and `u` unobserved slots, the `(q - u)`th highest held position is a conservative bound.
+It also includes the highest reported published position.
+An observation from every slot excludes a tail held only by a minority, even when publication is delayed.
+A brief grace for further replies only starts when the held bound exceeds the published or quorum-observed frontier.
 The subscriber waits until its committed prefix is applied through the bound and refuses freshness if it cannot reach it.
-The read path can keep the one-quorum append contract with this rule.
+The wire protocol and the one-quorum append contract are unchanged.
+[ReadIndexFrontiers.lean](../lean/ReadIndexFrontiers.lean) proves the bound over arbitrary finite inventories and witnesses why a silent slot cannot be counted as a negative vote.
 [ActiveLogletReadIndex.tla](../tla/ActiveLogletReadIndex.tla) checks this rule with overlapping three-journal ensembles, two available positions and a single read.
 It separates a synced predecessor from an active successor and allows publication to lag acknowledgement.
 The move and activation are atomic in the model.

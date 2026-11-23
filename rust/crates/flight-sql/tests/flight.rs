@@ -29,10 +29,13 @@ impl Clock for ManualClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(
 struct Running { node: Node, node_task: tokio::task::JoinHandle<Result<()>>, server: ServerHandle, server_task: tokio::task::JoinHandle<Result<()>>, clock: Arc<ManualClock> }
 impl Running {
     async fn start(password: Option<&str>, config: FlightConfig) -> Self { Self::start_with_placements(password, config, &[]).await }
-    async fn start_with_placements(password: Option<&str>, mut config: FlightConfig, placements: &[&str]) -> Self {
+    async fn start_with_placements(password: Option<&str>, config: FlightConfig, placements: &[&str]) -> Self {
+        Self::start_with_tracer(password, config, placements, None).await
+    }
+    async fn start_with_tracer(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
-        let services = NodeServices { clock: node_clock, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        let services = NodeServices { clock: node_clock, tracer, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         options.owned_relations = config.owned_native_actions;
         if !placements.is_empty() { options.membership = Membership::Placed; }
@@ -102,6 +105,32 @@ impl Client {
 }
 fn integer(batch: &RecordBatch, column: usize, row: usize) -> i64 { batch.column(column).as_any().downcast_ref::<Int64Array>().unwrap().value(row) }
 fn arguments(values: Vec<i64>) -> RecordBatch { RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("any-client-name", DataType::Int64, false)])), vec![Arc::new(Int64Array::from(values))]).unwrap() }
+
+#[tokio::test]
+async fn flight_sql_query_spans_follow_the_session_application_name() {
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 32, true, false).unwrap();
+    let running = Running::start_with_tracer(None, FlightConfig::default(), &[], Some(tracer.clone())).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let default_query = "SELECT 42::BIGINT AS flight_default";
+    let named_query = "SELECT 43::BIGINT AS flight_named";
+    assert_eq!(integer(&client.query(default_query).await[0], 0, 0), 42);
+    client.update("SET application_name = 'flight-importer'", None).await;
+    assert_eq!(integer(&client.query(named_query).await[0], 0, 0), 43);
+    drop(client);
+    running.stop().await;
+    tracer.close();
+    let mut names = std::collections::BTreeMap::new();
+    while let Some(span) = receiver.next().await {
+        if span.name == "xtdb.query" {
+            let attrs: std::collections::BTreeMap<_, _> = span.attributes().collect();
+            if let Some(text) = attrs.get("query.text") {
+                names.insert((*text).to_owned(), attrs["application.name"].to_owned());
+            }
+        }
+    }
+    assert_eq!(names[default_query], "XTDB Flight SQL");
+    assert_eq!(names[named_query], "flight-importer");
+}
 
 #[tokio::test]
 async fn placed_flight_sessions_scope_catalogs_tickets_and_handles_to_their_attachment() {

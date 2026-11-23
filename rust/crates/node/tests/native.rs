@@ -2250,7 +2250,7 @@ async fn a_trusted_checkpoint_and_replica_journal_rebuild_after_l0_is_removed() 
 
 #[tokio::test]
 async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_through_collection() {
-    use rtdb_format::{catalog::BlockCatalog, keys::{block_key, oversized_block_index, oversized_key}};
+    use rtdb_format::{catalog::BlockCatalog, keys::{block_key, oversized_block_index}};
 
     let directory = tempfile::tempdir().unwrap();
     let source_storage = directory.path().join("source");
@@ -2333,8 +2333,6 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     let sql = "SELECT count(*) FROM docs";
     let expected = rows(session.query_sql(sql, vec![]).await.unwrap()).await;
     assert_eq!(expected, vec![vec![Value::I64(3002)]]);
-    let sentinel = objects.join(oversized_key(old.block_index(), "unreferenced").unwrap());
-    std::fs::write(&sentinel, []).unwrap();
     session.state_mut().execute_operation(put(&node, -3, -3)).await.unwrap();
     let replacement = flush(&database).await;
     let await_collection = async |path: &std::path::Path| {
@@ -2342,8 +2340,7 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
             while path.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
         }).await.unwrap();
     };
-    await_collection(&sentinel).await;
-    assert!(!objects.join(block_key(old.block_index()).unwrap()).exists());
+    await_collection(&objects.join(block_key(old.block_index()).unwrap())).await;
     let root = objects.join(block_key(through.block_index()).unwrap());
     assert!(root.exists());
     for entry in through.table_entries().unwrap() {
@@ -2403,8 +2400,8 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     session.state_mut().execute_operation(put(&node, -4, -4)).await.unwrap();
     assert!(flush(&database).await.block_index() > replacement.block_index());
-    await_collection(&payload).await;
-    assert!(!root.exists());
+    await_collection(&root).await;
+    assert!(payload.exists());
     drop((session, database));
     stop(&node, driver).await;
 }
@@ -2726,11 +2723,15 @@ async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes()
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if matches!(store.head_fresh(&intent).await, Err(Error::MissingObject(_))) { break; }
+                let retired = futures::future::join_all(files.iter().map(|file| store.head_fresh(file))).await;
+                if matches!(store.head_fresh(&intent).await, Err(Error::MissingObject(_)))
+                    && retired.into_iter().all(|result| matches!(result, Err(Error::MissingObject(_))))
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.expect("the successor must finish the installed retirement after the query releases its hold");
-        for file in &files { assert!(matches!(store.head_fresh(file).await, Err(Error::MissingObject(_)))); }
         drop((reader, writer, previous, current));
         stop(&predecessor, predecessor_driver).await;
         stop(&successor, successor_driver).await;
@@ -3992,7 +3993,8 @@ async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
             })),
             ..Default::default()
         };
-        let runtime = services();
+        let clock = Arc::new(ReplayTestClock(AtomicI64::new(1_000_000)));
+        let runtime = NodeServices { clock: clock.clone(), ..services() };
         let resources = NativeResources::default().with_local_log_clock(Arc::clone(&runtime.clock), false);
         let cancellation = CancellationToken::new();
         let mut seeded = resources.open("xtdb", &config, LogAccess::ReadWrite, cancellation.clone()).await.unwrap();
@@ -4044,7 +4046,15 @@ async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
         let legacy_retry = node.await_transaction("xtdb", ids[1], &Authority, &cancellation).await.unwrap();
         assert_eq!(legacy_retry.tx_key(), original.tx_key());
 
+        clock.0.store(1_000_000 + rtdb_tx::RECEIPT_WINDOW_MICROS, Ordering::Relaxed);
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        assert!(session.state_mut().execute_tx(vec![TxOp::Sql { sql: "ASSERT TRUE".into(), args: None }], Default::default()).await.unwrap().committed());
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+        drop(session);
         stop(&node, driver).await;
+
+        clock.0.store(999_999, Ordering::Relaxed);
 
         let (reopened, driver) = running(settings, fresh_local_services(&runtime)).await;
         let result = reopened.await_transaction("xtdb", ids[1], &Authority, &cancellation).await.unwrap();
@@ -4052,6 +4062,8 @@ async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
         assert_eq!(result.tx_key(), original.tx_key());
         let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+        let projection = format!("SELECT user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = {}", ids[1].0);
+        assert_eq!(rows(session.query_sql(&projection, vec![]).await.unwrap()).await, [vec![Value::Null]]);
         drop(session);
         stop(&reopened, driver).await;
     }).await.unwrap();
@@ -4061,6 +4073,100 @@ struct ReplayTestClock(AtomicI64);
 
 impl Clock for ReplayTestClock {
     fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) }
+}
+
+#[tokio::test]
+async fn bounded_retries_preserve_terminal_aborts_and_do_not_reopen_after_clock_rollback() {
+    let directory = tempfile::tempdir().unwrap();
+    let primary = DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLog {
+            path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0),
+        })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage {
+            path: Some(directory.path().join("store").to_string_lossy().into_owned()), epoch: Some(0),
+        })),
+        ..Default::default()
+    };
+    let mut settings = options();
+    settings.membership = Membership::Durable { primary, skipped: BTreeSet::new() };
+    let clock = Arc::new(ReplayTestClock(AtomicI64::new(1_000_000)));
+    let runtime = NodeServices { clock: clock.clone(), ..services() };
+    let cutoff = 2_000_000;
+    let retry_options = |node: &Node, nonce| AutonomousTxOptions {
+        user_metadata: Some(rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
+            ("rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+                ("nonce".into(), Value::Utf8(format!("{nonce:032x}"))),
+                ("not_after_micros".into(), Value::I64(cutoff)),
+            ]))),
+        ])), node.memory()).unwrap()),
+        ..Default::default()
+    };
+    let conditional_write = |node| vec![
+        TxOp::Sql { sql: "ASSERT EXISTS (SELECT 1 FROM docs WHERE _id = 1)".into(), args: None },
+        put(node, 2, 20),
+    ];
+
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let show = rtdb_sql::parse_control("SHOW rtdb_bounded_retry", &Default::default()).unwrap().unwrap();
+    let ControlResult::Rows(reply) = session.execute_control(&show, &[], &CancellationToken::new()).await.unwrap() else {
+        panic!("expected bounded retry capability");
+    };
+    assert_eq!(rows(reply).await, [vec![Value::Utf8("1".into())]]);
+    assert!(session.state_mut().execute_tx(vec![put(&node, 0, 0)], Default::default()).await.unwrap().committed());
+    let aborted = session.state_mut().execute_tx(conditional_write(&node), retry_options(&node, 1)).await.unwrap();
+    assert_eq!(aborted.error().map(|error| error.code.as_str()), Some("xtdb/assert-failed"));
+    let committed = session.state_mut().execute_tx(vec![put(&node, 1, 10)], retry_options(&node, 2)).await.unwrap();
+    assert!(committed.committed());
+    node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    drop(session);
+    stop(&node, driver).await;
+
+    clock.0.store(999_999, Ordering::Relaxed);
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let aborted_retry = session.state_mut().execute_tx(conditional_write(&node), retry_options(&node, 1)).await.unwrap();
+    assert_eq!(aborted_retry, aborted);
+    let committed_retry = session.state_mut().execute_tx(vec![put(&node, 1, 10)], retry_options(&node, 2)).await.unwrap();
+    assert_eq!(committed_retry, committed);
+    let conflict = session.state_mut().execute_tx(vec![put(&node, 3, 30)], retry_options(&node, 2)).await.unwrap();
+    assert_eq!(conflict.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-conflict"));
+
+    clock.0.store(cutoff, Ordering::Relaxed);
+    assert!(session.state_mut().execute_tx(vec![TxOp::Sql { sql: "ASSERT TRUE".into(), args: None }], Default::default()).await.unwrap().committed());
+    clock.0.store(cutoff - 1, Ordering::Relaxed);
+    let expired = session.state_mut().execute_tx(vec![put(&node, 3, 30)], retry_options(&node, 2)).await.unwrap();
+    assert_eq!(expired.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-expired"));
+    drop(session);
+    stop(&node, driver).await;
+
+    clock.0.store(999_999, Ordering::Relaxed);
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let late = session.state_mut().execute_tx(conditional_write(&node), retry_options(&node, 1)).await.unwrap();
+    assert_eq!(late.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-expired"));
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME ORDER BY _id", vec![]).await.unwrap()).await,
+        [vec![Value::I64(0)], vec![Value::I64(1)]]);
+    let retirement = 1_000_000 + rtdb_tx::RECEIPT_WINDOW_MICROS;
+    clock.0.store(retirement, Ordering::Relaxed);
+    assert!(session.state_mut().execute_tx(vec![TxOp::Sql { sql: "ASSERT TRUE".into(), args: None }], Default::default()).await.unwrap().committed());
+    node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    drop(session);
+    stop(&node, driver).await;
+
+    clock.0.store(999_999, Ordering::Relaxed);
+    let (node, driver) = running(settings, fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let history = format!("SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = {}", committed.tx_key().tx_id.0);
+    assert_eq!(rows(session.query_sql(&history, vec![]).await.unwrap()).await, [vec![Value::Bool(true), Value::Null]]);
+    let resident = "SELECT _id FROM xt.bounded_retry_receipts FOR ALL VALID_TIME";
+    assert!(rows(session.query_sql(resident, vec![]).await.unwrap()).await.is_empty());
+    let original = node.await_transaction("xtdb", committed.tx_key().tx_id, &Authority, &CancellationToken::new()).await.unwrap();
+    assert_eq!(original, committed);
+    drop(session);
+    stop(&node, driver).await;
 }
 
 #[tokio::test]
@@ -4599,10 +4705,13 @@ impl rtdb_plan::TraceSpan for BatchSortTrace {
         rtdb_plan::SpanContext { trace_id: [1; 16], span_id: [1; 8] }
     }
     fn attribute(&mut self, name: &str, value: rtdb_plan::TraceValue<'_>) {
-        if let rtdb_plan::TraceValue::Unsigned(value) = value {
-            let mut trace = self.0.lock().unwrap();
-            trace.entry(name.into()).and_modify(|old| *old = (*old).max(value)).or_insert(value);
-        }
+        let value = match value {
+            rtdb_plan::TraceValue::Unsigned(value) => value,
+            rtdb_plan::TraceValue::Boolean(value) => u64::from(value),
+            _ => return,
+        };
+        let mut trace = self.0.lock().unwrap();
+        trace.entry(name.into()).and_modify(|old| *old = (*old).max(value)).or_insert(value);
     }
     fn end_at(&mut self, _: std::time::SystemTime) {}
 }

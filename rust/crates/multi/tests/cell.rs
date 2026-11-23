@@ -557,6 +557,11 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     assert_eq!(report.acceptance.staging_clock_upper_micros, 120);
     assert_eq!(report.replica_append_sample_micros, 124);
     assert!(report.quorum_observed_clock_upper_micros > 124);
+    assert!(report.journal_sync_observations.len() >= report.required_replica_quorum);
+    let mut observed = report.journal_sync_observations.values().copied().collect::<Vec<_>>();
+    observed.sort_unstable();
+    assert_eq!(report.quorum_sync_clock_upper_micros, Some(observed[1]));
+    assert!(observed[1] > 124);
     assert!(admin::audit_acceptance_quorum(directory, &keys, authority, deployment.incarnation,
         deployment.log_epoch + 1, 0, 4 << 20).await.is_err());
     cell.stop().await;
@@ -2395,20 +2400,26 @@ async fn cold_snapshot_refuses_a_mismatched_recovery_manifest() {
     drop(client);
     let agent = &cell.node(0).agent;
     agent.park("shop").await.unwrap();
-    let mut parked = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let parked = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
     let expected = parked.recovery_manifest_sha256.unwrap();
+    let set_manifest = async |digest| {
+        for _ in 0..8 {
+            let mut current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            let version = current.version;
+            current.recovery_manifest_sha256 = Some(digest);
+            if cell.directory.replace_deployment(current, version).await.unwrap().applied().is_some() {
+                return;
+            }
+        }
+        panic!("the parked record kept changing while setting its recovery manifest");
+    };
     let mut wrong = expected;
     wrong[0] ^= 1;
-    parked.recovery_manifest_sha256 = Some(wrong);
-    let version = parked.version;
-    let mut parked = cell.directory.replace_deployment(parked, version).await.unwrap().applied().unwrap();
+    set_manifest(wrong).await;
     let error = agent.snapshot("shop").await.unwrap_err();
     assert_eq!(error.code, "rtdb.multi/storage-region");
 
-    parked = cell.directory.deployment(&parked.id).await.unwrap().unwrap();
-    parked.recovery_manifest_sha256 = Some(expected);
-    let version = parked.version;
-    assert!(cell.directory.replace_deployment(parked, version).await.unwrap().applied().is_some());
+    set_manifest(expected).await;
     agent.snapshot("shop").await.unwrap();
     cell.stop().await;
 }

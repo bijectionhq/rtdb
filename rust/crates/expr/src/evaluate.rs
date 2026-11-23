@@ -552,7 +552,7 @@ pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalCo
         let bytes = values.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
         let reservation = budget.reserve(bytes)?;
         let mut values = values.to_vec();
-        values.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        values.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         Some((values, reservation))
     } else { None };
     let parameters = normalized.as_ref().map_or(context.parameters, |(values, _)| Parameters::Values(values));

@@ -46,6 +46,13 @@ class DecimalVector private constructor(
     override fun getAsFloat(idx: Int): Float = getDecimal(idx).toFloat()
     override fun getAsDouble(idx: Int): Double = getDecimal(idx).toDouble()
 
+    override fun setBigDecimal(idx: Int, v: BigDecimal) {
+        ensureCapacity(idx + 1)
+        setNotNull(idx)
+        dataBuffer.setBigDecimal(idx, v, byteWidth)
+        valueCount = maxOf(valueCount, idx + 1)
+    }
+
     fun increment(idx: Int, v: BigDecimal) {
         ensureCapacity(idx + 1)
         setNotNull(idx)
@@ -81,8 +88,6 @@ class DecimalVector private constructor(
             outVec.increment(groupIdx, if (isNull(idx)) BigDecimal.ZERO else getDecimal(idx))
         }
     }
-
-    override fun getMetaDouble(idx: Int): Double = getObject0(idx, KEBAB_CASE_KEYWORD).toDouble()
 
     override fun hashCode0(idx: Int, hasher: Hasher) = hasher.hash(getObject0(idx, KEBAB_CASE_KEYWORD).toDouble())
 

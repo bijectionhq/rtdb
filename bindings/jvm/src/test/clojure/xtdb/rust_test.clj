@@ -74,6 +74,14 @@
     (is (= [{:xt/id 1}] (xt/q connection "SELECT _id FROM docs")))
     (is (thrown? xtdb.api.error.Incorrect (xt/q connection "SELECT 1" {:database :other})))))
 
+(deftest api-adbc-test-application-name
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (is (= [{:application-name "XTDB Clojure API"}]
+           (xt/q node "SHOW application_name")))
+    (is (= [{:application-name "embedded 'app'"}]
+           (xt/q node "SHOW application_name" {:application-name "embedded 'app'"})))))
+
 (deftest api-adbc-test-node-rejects-an-unknown-database-as-incorrect
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]
@@ -711,7 +719,9 @@
 
 (deftest-original-api original-info-schema/columns-data-type-follows-postgres-spelling)
 
-(deftest-original-api original-info-schema/test-pg-attribute)
+(deftest test-pg-attribute
+  (binding [original-info-schema/*source-log-time-column?* true]
+    (run-original-api-case #'original-info-schema/test-pg-attribute)))
 
 (deftest-original-api original-node/test-mutable-data-buffer-bug)
 

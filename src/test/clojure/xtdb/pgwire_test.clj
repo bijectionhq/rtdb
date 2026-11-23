@@ -26,9 +26,10 @@
            (java.sql Array Connection PreparedStatement ResultSet SQLWarning Statement Timestamp Types)
            (java.time Clock Instant LocalDate LocalDateTime LocalTime OffsetDateTime ZoneId ZoneOffset ZonedDateTime)
            (java.time.temporal Temporal)
-           (java.util Arrays Calendar List TimeZone)
+           (java.util Arrays Calendar List Map TimeZone)
            (java.util.concurrent CountDownLatch Executor TimeUnit)
            (org.postgresql.util PGobject PSQLException)
+           (xtdb.arrow Relation)
            (xtdb.pgwire PgType)
            (xtdb JsonSerde JsonLdSerde)
            (xtdb.api DataSource$ConnectionBuilder PasswordHash Xtdb$Connection)
@@ -679,16 +680,22 @@
 (defn test-cancel [sql]
   (with-open [conn (jdbc-conn)
               stmt (jdbc/prepare conn [sql])]
-    (future
-      (Thread/sleep 2000)
-      (log/debug "cancelling...")
-      (.cancel stmt))
-    (let [t0 (System/currentTimeMillis)
+    (let [start-time (System/nanoTime)
+          cancelling (future
+                       (Thread/sleep 2000)
+                       (log/debug "cancelling...")
+                       (let [request-time (System/nanoTime)]
+                         (.cancel stmt)
+                         request-time))
           ex (is (thrown? PSQLException (.executeQuery stmt)))
-          exec-time (- (System/currentTimeMillis) t0)]
+          response-time (System/nanoTime)]
       (is (= "57014" (.getSQLState ex)))
       (is (-> ex .getServerErrorMessage .getMessage (.contains "cancel")))
-      (is (< 1500 exec-time 2500)))
+      (if-let [request-time (deref cancelling 5000 nil)]
+        (do
+          (is (< (.toNanos TimeUnit/MILLISECONDS 1500) (- (long request-time) start-time)))
+          (is (< 0 (- response-time (long request-time)) (.toNanos TimeUnit/MILLISECONDS 500))))
+        (is false "JDBC cancellation request did not finish")))
     (t/is (.isValid conn 3000))))
 
 (deftest cancel_sleep
@@ -2961,6 +2968,27 @@ ORDER BY 1,2;")
           (.next rs)
           (t/is (= (if binary? binary-val text-val)
                    (.getObject rs 1 type))))))))
+
+(t/deftest test-binary-date-milli-reads-back-as-its-text-date
+  (with-open [conn (pgjdbc-conn)
+              rel (Relation. tu/*allocator* #xt/schema [{"_id" :i64} {"d" [:date :milli]}])]
+    (let [copy-in (xt-jdbc/copy-in conn "COPY dm FROM STDIN WITH (FORMAT 'arrow-file')")]
+      (.writeRows rel (into-array Map [{:xt/id 1, :d #xt/date "2018-07-25"}]))
+      (let [bytes (.getAsArrowFile rel)]
+        (.writeToCopy copy-in bytes 0 (alength bytes)))
+      (t/is (= 1 (.endCopy copy-in)))))
+
+  (letfn [(read-val [binary? sql]
+            (with-open [conn (pgjdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary?})
+                        stmt (.prepareStatement conn sql)
+                        rs (.executeQuery stmt)]
+              (.next rs)
+              (.getObject rs 1 LocalDate)))]
+    (t/is (= #xt/date "2018-07-25" (read-val true "SELECT d FROM dm")))
+
+    (doseq [sql ["SELECT CASE WHEN _id = 1 THEN d ELSE DATE '2020-01-01' END FROM dm"
+                 "SELECT CASE WHEN _id = 2 THEN d ELSE DATE '2020-01-01' END FROM dm"]]
+      (t/is (= (read-val false sql) (read-val true sql)) sql))))
 
 (defn- compare-decimals-with-scale [^BigDecimal d1 ^BigDecimal d2]
   (and (= (.scale d1) (.scale d2))

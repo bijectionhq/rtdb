@@ -209,10 +209,7 @@ impl TrieCatalog {
     }
     pub fn all_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         let mut result: Vec<_> = self.tables.get(table).into_iter().flat_map(|table| table.shards.values()).flat_map(|shard| shard.tries.values()).collect();
-        result.sort_by(|left, right| {
-            (left.key.level(), left.key.block_index(), left.key.recency().unwrap_or(CivilDate::MAX), left.key.part())
-                .cmp(&(right.key.level(), right.key.block_index(), right.key.recency().unwrap_or(CivilDate::MAX), right.key.part()))
-        });
+        result.sort_by(|left, right| left.key.scan_precedence().cmp(&right.key.scan_precedence()));
         result
     }
     pub fn current_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {

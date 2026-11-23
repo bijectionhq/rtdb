@@ -1,5 +1,5 @@
 {
-  "summary": "The checked helpers compute a finite endpoint, enforce the private cutoff, and recognize the recorded application guard position.",
+  "summary": "The checked helpers compute finite receipt windows, enforce the private and bounded application cutoffs, and recognize the recorded application guard position.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -9,7 +9,7 @@
     "--verify-module",
     "guard_attribution"
   ],
-  "min_verified_functions": 6,
+  "min_verified_functions": 10,
   "controls": {
     "expire_one_microsecond_early": {
       "mutate": [
@@ -117,6 +117,39 @@
         }
       ],
       "min_verified_functions": 5
+    },
+    "regress_bounded_admission_clock": {
+      "mutate": [{
+        "file": "rust/crates/tx/src/idempotency_window.rs",
+        "find": "    previous.max(appended)",
+        "replace": "    appended"
+      }],
+      "expect": [{
+        "file": "rust/crates/tx/src/idempotency_window.rs",
+        "function": "advance_retry_clock",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 9
+    },
+    "admit_bounded_cutoff_equality": {
+      "mutate": [{
+        "file": "rust/crates/tx/src/idempotency_window.rs",
+        "find": "    if not_after <= observed {",
+        "replace": "    if not_after < observed {"
+      }],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "function": "bounded_window",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "function": "bounded_window",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
     }
   }
 }

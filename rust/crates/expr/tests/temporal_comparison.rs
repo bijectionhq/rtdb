@@ -11,17 +11,17 @@ fn binary(op: B, left: V, right: V, timezone: &str) -> V {
 }
 
 #[test]
-fn date_and_timestamp_equality_uses_session_zone_and_truncated_date_millis() {
+fn date_and_timestamp_equality_uses_session_zone_and_floored_date_millis() {
     let local = timestamp(0, U::Microsecond, None);
     let instant = timestamp(-7_200, U::Second, Some("Pacific/Honolulu"));
-    for date in [V::DateDay(0), V::DateMilli(-1), V::DateMilli(86_399_999)] {
+    for date in [V::DateDay(0), V::DateMilli(0), V::DateMilli(86_399_999)] {
         assert_eq!(sql_eq_in_timezone(&date, &local, "+02:00", &equality_scope()).unwrap(), Some(true));
         assert_eq!(sql_eq_in_timezone(&date, &instant, "+02:00", &equality_scope()).unwrap(), Some(true));
         assert_eq!(compare_in_timezone(&instant, &date, false, "+02:00").unwrap(), Ordering::Equal);
         assert_eq!(sql_eq(&date, &instant, &equality_scope()).unwrap(), Some(false));
     }
-    assert_eq!(sql_eq(&V::DateDay(-1), &V::DateMilli(-86_400_001), &equality_scope()).unwrap(), Some(true));
-    assert_eq!(compare(&V::DateMilli(-1), &V::DateMilli(1), false).unwrap(), Ordering::Equal);
+    assert_eq!(sql_eq(&V::DateDay(-2), &V::DateMilli(-86_400_001), &equality_scope()).unwrap(), Some(true));
+    assert_eq!(compare(&V::DateMilli(-1), &V::DateMilli(1), false).unwrap(), Ordering::Less);
     assert_eq!(sql_eq_in_timezone(&V::DateDay(0), &timestamp(18_000, U::Second, Some("UTC")), "America/New_York", &equality_scope()).unwrap(), Some(true));
     assert_eq!(sql_eq(&timestamp(1, U::Second, Some("UTC")), &timestamp(1_000_000, U::Microsecond, Some("Asia/Tokyo")), &equality_scope()).unwrap(), Some(true));
 }
@@ -42,15 +42,27 @@ fn temporal_units_check_overflow_before_comparison() {
 }
 
 #[test]
-fn temporal_inequality_retains_raw_read_value_dispatch() {
+fn temporal_inequality_negates_equality_and_preserves_nested_unknown() {
     let second = timestamp(1, U::Second, Some("UTC"));
     let microsecond = timestamp(1, U::Microsecond, Some("UTC"));
-    assert_eq!(binary(B::Eq, second.clone(), microsecond.clone(), "UTC"), V::Bool(false));
-    assert_eq!(binary(B::NotEq, second.clone(), microsecond.clone(), "UTC"), V::Bool(false));
-    assert_eq!(binary(B::IsDistinctFrom, second.clone(), microsecond.clone(), "UTC"), V::Bool(false));
-    assert_eq!(binary(B::IsNotDistinctFrom, second.clone(), microsecond.clone(), "UTC"), V::Bool(true));
-    assert_eq!(binary(B::NotEq, second.clone(), timestamp(1_000_000, U::Microsecond, Some("UTC")), "UTC"), V::Bool(true));
-    assert_eq!(binary(B::NotEq, V::list(vec![second]), V::list(vec![microsecond]), "UTC"), V::Bool(true));
+    let same_instant = timestamp(1_000_000, U::Microsecond, Some("Asia/Tokyo"));
+    let time = |value, unit, bit_width| V::Time { value, unit, bit_width };
+    for (left, right, equal) in [
+        (second.clone(), microsecond, false),
+        (second.clone(), same_instant.clone(), true),
+        (V::DateDay(0), timestamp(-7_200, U::Second, Some("UTC")), true),
+        (time(1, U::Second, 32), time(1_000, U::Millisecond, 32), true),
+        (V::Duration { value: 1, unit: U::Second }, V::Duration { value: 1_000, unit: U::Millisecond }, true),
+    ] {
+        assert_eq!(binary(B::Eq, left.clone(), right.clone(), "+02:00"), V::Bool(equal));
+        assert_eq!(binary(B::NotEq, left.clone(), right.clone(), "+02:00"), V::Bool(!equal));
+        assert_eq!(binary(B::IsDistinctFrom, left.clone(), right.clone(), "+02:00"), V::Bool(!equal));
+        assert_eq!(binary(B::IsNotDistinctFrom, left, right, "+02:00"), V::Bool(equal));
+    }
+    let left = V::list(vec![second, V::Null]);
+    let right = V::list(vec![same_instant, V::I64(1)]);
+    assert_eq!(binary(B::Eq, left.clone(), right.clone(), "UTC"), V::Null);
+    assert_eq!(binary(B::NotEq, left, right, "UTC"), V::Null);
     assert_eq!(binary(B::NotEq, V::Null, V::DateDay(0), "UTC"), V::Null);
     assert_eq!(binary(B::IsDistinctFrom, V::Null, V::DateDay(0), "UTC"), V::Bool(true));
 }
@@ -58,11 +70,11 @@ fn temporal_inequality_retains_raw_read_value_dispatch() {
 #[test]
 fn strict_equality_preserves_temporal_categories_zone_labels_and_interval_units() {
     assert!(!strict_eq(&V::DateDay(0), &timestamp(0, U::Microsecond, None), &equality_scope()).unwrap());
-    assert!(strict_eq(&V::DateDay(0), &V::DateMilli(-1), &equality_scope()).unwrap());
+    assert!(strict_eq(&V::DateDay(-1), &V::DateMilli(-1), &equality_scope()).unwrap());
     assert!(!strict_eq(&timestamp(0, U::Second, Some("UTC")), &timestamp(0, U::Microsecond, Some("Z")), &equality_scope()).unwrap());
     assert!(strict_eq(&timestamp(1, U::Second, Some("UTC")), &timestamp(1_000_000, U::Microsecond, Some("UTC")), &equality_scope()).unwrap());
     assert!(!strict_eq(&V::IntervalYearMonth(12), &V::IntervalMonthDayMicro { months: 12, days: 0, nanoseconds: 0 }, &equality_scope()).unwrap());
-    assert!(strict_eq(&V::list(vec![V::Null, V::I32(1)]), &V::list(vec![V::Null, V::I64(1)]), &equality_scope()).unwrap());
+    assert!(strict_eq(&V::List(vec![V::Null, V::I32(1)]), &V::List(vec![V::Null, V::I64(1)]), &equality_scope()).unwrap());
     assert!(!strict_eq(&V::I64(1), &V::F64(1.0), &equality_scope()).unwrap());
     assert_eq!(scalar_call("===", &[V::Null, V::Null], &EvalContext::default()).unwrap(), V::Bool(true));
     let period = Expr::Literal(V::TimestampTzRange { lower: 0, upper: i64::MAX });

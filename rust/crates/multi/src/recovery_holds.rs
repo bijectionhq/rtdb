@@ -1,8 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
-use rtdb_storage::{Error, Result, log::LogOffset};
+use rtdb_format::envelope::ReplicaFrame;
+use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord}};
 use rtdb_types::Anomaly;
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
@@ -30,6 +32,20 @@ pub(crate) struct RecoveryAdmission {
 pub(crate) struct ReplayHold {
     pub through: LogOffset,
     _release: oneshot::Sender<()>,
+}
+
+impl ReplayHold {
+    pub fn retain_delivery(self: &Arc<Self>, payload: Bytes) -> Bytes {
+        struct Delivery {
+            payload: Bytes,
+            _hold: Arc<ReplayHold>,
+        }
+
+        impl AsRef<[u8]> for Delivery {
+            fn as_ref(&self) -> &[u8] { &self.payload }
+        }
+        Bytes::from_owner(Delivery { payload, _hold: Arc::clone(self) })
+    }
 }
 
 impl RecoveryAdmission {
@@ -80,7 +96,25 @@ impl RecoveryAdmission {
         Ok(Some(ReplayHold { through, _release: release }))
     }
 
-    async fn check_start(&self, after: LogOffset) -> Result<()> {
+    pub(crate) async fn retain_offloaded(&self, records: &mut [LogRecord]) -> Result<()> {
+        let mut offloaded = Vec::new();
+        for record in records {
+            if ReplicaFrame::has_external_payload(&record.payload).map_err(|error| self.directory_error(error))? {
+                offloaded.push(record);
+            }
+        }
+        let Some((first, last)) = offloaded.first().zip(offloaded.last()) else { return Ok(()); };
+        let after = first.metadata.offset.0.checked_sub(1)
+            .ok_or_else(|| Error::Task("Invalid first offloaded replica offset".into()))?;
+        let hold = self.hold(LogOffset(after), last.metadata.offset).await?
+            .map(Arc::new).ok_or_else(|| Error::Task("The offloaded replica delivery has no replay hold".into()))?;
+        for record in offloaded {
+            record.payload = hold.retain_delivery(std::mem::take(&mut record.payload));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn check_start(&self, after: LogOffset) -> Result<()> {
         self.checked_record(after).await.map(|_| ())
     }
 
@@ -109,5 +143,40 @@ impl RecoveryAdmission {
 
     fn directory_error(&self, error: Anomaly) -> Error {
         Error::Remote { key: self.stream.clone(), message: error.to_string() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_delivered_reference_keeps_its_replay_hold_through_provider_drain() {
+        let (release, closed) = oneshot::channel();
+        let hold = Arc::new(ReplayHold { through: LogOffset(3), _release: release });
+        let delivery = hold.retain_delivery(Bytes::from_static(b"last record"));
+        drop(hold);
+
+        let (entered, started) = oneshot::channel();
+        let (resume, gate) = std::sync::mpsc::channel();
+        let region = rtdb_storage::IoRegion::new();
+        let provider = Arc::clone(&region);
+        let read = tokio::spawn(async move {
+            rtdb_storage::IoRegion::retaining(Arc::new(delivery), provider.run_blocking(move || {
+                let _ = entered.send(());
+                gate.recv().unwrap();
+                Ok(())
+            })).await
+        });
+        started.await.unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+
+        let mut closed = closed;
+        let pending = closed.try_recv();
+        resume.send(()).unwrap();
+        assert!(matches!(pending, Err(oneshot::error::TryRecvError::Empty)));
+        region.close_and_wait().await;
+        assert!(matches!(closed.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
     }
 }

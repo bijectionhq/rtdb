@@ -117,6 +117,7 @@ sealed interface ReplicaMessage {
                             OversizedMessage(
                                 it.storageVersion, it.storageEpoch, it.blockIndex, it.payloadId,
                                 termId = msg.termId, termSeq = termSeq,
+                                payloadSha256 = if (it.hasPayloadSha256()) it.payloadSha256 else null,
                             )
                         }
 
@@ -272,18 +273,14 @@ sealed interface ReplicaMessage {
      * Stands in for a message the log declined for its size; [path] holds that message's own encoding.
      *
      * [termId] is the wrapped message's, so a reader fences on this envelope without fetching the payload.
-     * [blockIndex] is the open block as the writer last saw it, rather than the last completed one, so that
-     * GC — which collects on it — errs towards keeping a payload rather than dropping one still referenced.
-     * It is read off the catalog without synchronising against the apply coroutine that advances it, so a
-     * block adopted in between leaves the payload keyed one block early; `blocksToKeep` is the margin.
-     *
-     * Writer, reader and GC all go through [path] and [blockIndexOf]; the key format lives nowhere else.
+     * [blockIndex] is the open block used in the payload name. It carries no replay position.
      */
     data class OversizedMessage(
         val storageVersion: Int, val storageEpoch: StorageEpoch,
         val blockIndex: BlockIndex, val payloadId: String,
         override val termId: Long,
         override val termSeq: Long? = null,
+        val payloadSha256: ByteString? = null,
     ) : ProtobufMessage() {
         override fun withTermSeq(termSeq: Long) = copy(termSeq = termSeq)
 
@@ -295,6 +292,7 @@ sealed interface ReplicaMessage {
                 this.storageEpoch = this@OversizedMessage.storageEpoch
                 this.blockIndex = this@OversizedMessage.blockIndex
                 this.payloadId = this@OversizedMessage.payloadId
+                this@OversizedMessage.payloadSha256?.let { this.payloadSha256 = it }
             }
         }
 

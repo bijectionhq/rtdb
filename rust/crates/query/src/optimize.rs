@@ -108,8 +108,7 @@ fn annotate_top_k(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<Relation
         RelationNode::Project { input, expressions } => RelationNode::Project { input: annotate_top_k(Arc::clone(input), ids)?, expressions: expressions.clone() },
         RelationNode::Rename { input, prefix, expressions } => RelationNode::Rename { input: annotate_top_k(Arc::clone(input), ids)?, prefix: prefix.clone(), expressions: expressions.clone() },
         RelationNode::SortLimit { input, order_by, offset, fetch: Some(fetch) } => {
-            let limit = match offset { Some(offset) => Expr::binary(BinaryOp::Add, offset.clone(), fetch.clone()), None => fetch.clone() };
-            let Some(input) = push_top_k(input, order_by, &limit, &[], false)? else { return Ok(relation) };
+            let Some(input) = push_top_k(input, order_by, fetch, offset.as_ref(), &[], false)? else { return Ok(relation) };
             if let Some(first) = order_by.first()
                 && let Some((input, field)) = add_ranked_score(&input, &first.expr, ids)?
             {
@@ -128,7 +127,7 @@ fn annotate_top_k(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<Relation
     Ok(Arc::new(Relation::new(relation.schema().clone(), rebuilt)?))
 }
 
-fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &Expr, residuals: &[Expr], distinct: bool) -> Result<Option<Arc<Relation>>> {
+fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &Expr, offset: Option<&Expr>, residuals: &[Expr], distinct: bool) -> Result<Option<Arc<Relation>>> {
     let through = |expressions: &[NamedExpr]| {
         let defined: BTreeMap<ColumnId, Expr> = expressions.iter().map(|named| (named.field.id, named.expr.clone())).collect();
         let rewrite = |expression: &mut Expr| if let Expr::Column { id, .. } = expression {
@@ -143,23 +142,23 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
     let node = match relation.node() {
         RelationNode::Project { input, expressions } => {
             let (order, residuals) = through(expressions);
-            let Some(input) = push_top_k(input, &order, limit, &residuals, distinct)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, &order, limit, offset, &residuals, distinct)? else { return Ok(None) };
             RelationNode::Project { input, expressions: expressions.clone() }
         }
         RelationNode::Rename { input, prefix, expressions } => {
             let (order, residuals) = through(expressions);
-            let Some(input) = push_top_k(input, &order, limit, &residuals, distinct)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, &order, limit, offset, &residuals, distinct)? else { return Ok(None) };
             RelationNode::Rename { input, prefix: prefix.clone(), expressions: expressions.clone() }
         }
         RelationNode::Extend { input, expressions } => {
             let (order, residuals) = through(expressions);
-            let Some(input) = push_top_k(input, &order, limit, &residuals, distinct)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, &order, limit, offset, &residuals, distinct)? else { return Ok(None) };
             return Ok(Some(Arc::new(input.extend(expressions.clone())?)));
         }
         RelationNode::Filter { input, predicate } if ordered_index_filter(predicate) => {
             let mut residuals = residuals.to_vec();
             residuals.push(predicate.clone());
-            let Some(input) = push_top_k(input, order, limit, &residuals, distinct)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, order, limit, offset, &residuals, distinct)? else { return Ok(None) };
             RelationNode::Filter { input, predicate: predicate.clone() }
         }
         RelationNode::Distinct { input } if !distinct => {
@@ -169,7 +168,7 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
             }) {
                 return Ok(None);
             }
-            let Some(input) = push_top_k(input, order, limit, residuals, true)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, order, limit, offset, residuals, true)? else { return Ok(None) };
             RelationNode::Distinct { input }
         }
         RelationNode::Scan(scan) => {
@@ -196,7 +195,7 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
                     _ => None,
                 };
                 scan.top_k = Some(rtdb_plan::ScanTopK {
-                    column: *id, query: query.clone(), limit: limit.clone(), score: None, ascending_id,
+                    column: *id, query: query.clone(), limit: limit.clone(), offset: offset.cloned(), score: None, ascending_id,
                 });
             }
             return Ok(Some(Arc::new(Relation::scan(scan)?)));

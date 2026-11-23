@@ -90,7 +90,7 @@ fn millisecond_date_boxes_preserve_full_days_until_vector_output() {
     let record = Expr::Struct(vec![("date".into(),wide(DateUnit::Millisecond))]);
     assert_eq!(run(&text(field(record.clone(),"date"))).unwrap(),Value::Utf8(CivilDate::MAX.to_string()));
     assert_eq!(run(&text(nth(Expr::List(vec![wide(DateUnit::Millisecond)]),0))).unwrap(),Value::Utf8(CivilDate::MAX.to_string()));
-    assert_eq!(run(&record).unwrap(),Value::Struct(StructFields::from([("date".into(),Value::DateMilli(CivilDate::MAX.epoch_day().wrapping_mul(86_400_000)))])));
+    assert_eq!(run(&record).unwrap_err().code, "xtdb.expression/overflow-error");
 }
 
 #[test]

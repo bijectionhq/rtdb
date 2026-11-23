@@ -106,7 +106,7 @@ class BlockGarbageCollectorTest {
     }
 
     @Test
-    fun `garbageCollectBlocks collects offloaded payloads once their block ages out`(
+    fun `garbageCollectBlocks preserves offloaded payloads beyond the metadata horizon`(
         @TempDir tempDir: Path, al: BufferAllocator,
     ) = runTest {
         MemoryCache.Factory().open(al).use { memoryCache ->
@@ -132,8 +132,7 @@ class BlockGarbageCollectorTest {
 
                 val remaining = bufferPool.listAllObjects(OversizedMessage.oversizedDir).map { it.key }.toSet()
 
-                assertEquals(setOf(kept), remaining, "keeps a payload whose block is still within blocksToKeep")
-                assertFalse(aged in remaining, "collects a payload whose block has aged out")
+                assertEquals(setOf(aged, kept), remaining)
             }
         }
     }

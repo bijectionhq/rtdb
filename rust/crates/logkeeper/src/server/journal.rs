@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -42,6 +43,18 @@ struct Snapshot {
     retired: bool,
     #[prost(bytes = "bytes", tag = "6")]
     active_ensemble: Bytes,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ObservedSync {
+    #[prost(sint64, tag = "1")]
+    lsn: i64,
+    #[prost(uint64, tag = "2")]
+    epoch: u64,
+    #[prost(sint64, tag = "3")]
+    timestamp: i64,
+    #[prost(sfixed64, tag = "4")]
+    clock_upper_micros: i64,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
@@ -68,13 +81,15 @@ enum Kind {
     Base(bool),
     #[prost(uint64, tag = "11")]
     Drop(u64),
+    #[prost(message, tag = "13")]
+    ObservedSync(ObservedSync),
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct Record {
     #[prost(uint64, tag = "9")]
     stream: u64,
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13")]
     kind: Option<Kind>,
     // An activation is an optional refinement of an existing synced record.
     #[prost(bytes = "bytes", tag = "12")]
@@ -130,6 +145,7 @@ pub(crate) struct Work {
     pub done: oneshot::Sender<std::result::Result<(), String>>,
     pub _admission: Option<tokio::sync::OwnedSemaphorePermit>,
     pub authority_revision: Option<u64>,
+    pub observed_append: Option<(i64, Arc<OnceLock<i64>>)>,
 }
 
 /// The segment being appended to; touched only by the journal's rounds.
@@ -170,6 +186,12 @@ struct Placed<'a> {
     entry: &'a Entry,
     start: usize,
     length: usize,
+    observation: Option<&'a Arc<OnceLock<i64>>>,
+}
+
+fn clock_upper_micros() -> Option<i64> {
+    i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_micros())
+        .ok()?.checked_add(1)
 }
 
 #[cfg(unix)]
@@ -442,7 +464,11 @@ impl Journal {
                             _ => Bytes::new(),
                         };
                         frame_record(Record { stream: slot.id, kind: Some(record(event)), active_ensemble }, &mut buffer);
-                        if let Event::Append(entry) = event { placed.push(Placed { slot, entry, start, length: buffer.len() - start }); }
+                        if let Event::Append(entry) = event {
+                            let observation = work.observed_append.as_ref().filter(|(lsn, _)| *lsn == entry.lsn)
+                                .map(|(_, sample)| sample);
+                            placed.push(Placed { slot, entry, start, length: buffer.len() - start, observation });
+                        }
                     }
                     sync = true;
                 }
@@ -463,6 +489,10 @@ impl Journal {
     fn flush(&self, current: &mut Current, buffer: &[u8], sync: bool, placed: &[Placed]) -> Result<()> {
         let (segment, base) = (current.sequence, current.bytes);
         self.append(current, buffer, sync)?;
+        let observed_at = (self.fsync && placed.iter().any(|placed| placed.observation.is_some()))
+            .then(clock_upper_micros).flatten();
+        let mut witnesses = BytesMut::new();
+        let mut observations = Vec::new();
         for placed in placed {
             let entry = placed.entry;
             let location = Location { segment, offset: base + placed.start as u64, length: placed.length as u32, payload: entry.payload.len() as u32 };
@@ -473,7 +503,19 @@ impl Journal {
             if same {
                 held.payload = Stored::Written(location);
                 self.cache.lock().insert(location, &entry.payload);
+                if let Some(clock_upper_micros) = observed_at
+                    && let Some(sample) = placed.observation
+                    && held.observed_sync.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, sample))
+                {
+                    frame(placed.slot.id, Kind::ObservedSync(ObservedSync { lsn: entry.lsn,
+                        epoch: entry.epoch, timestamp: entry.timestamp, clock_upper_micros }), &mut witnesses);
+                    observations.push(sample);
+                }
             }
+        }
+        self.append(current, &witnesses, true)?;
+        if let Some(observed_at) = observed_at {
+            for sample in observations { let _ = sample.set(observed_at); }
         }
         Ok(())
     }
@@ -523,6 +565,10 @@ impl Journal {
                 let length = payload.len() as u32;
                 frame(id, Kind::Append(Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload }), &mut buffer);
                 locations.push(Location { segment: sequence, offset: written + start as u64, length: (buffer.len() - start) as u32, payload: length });
+                if let Some(clock_upper_micros) = held.observed_sync.as_ref().and_then(|sample| sample.get().copied()) {
+                    frame(id, Kind::ObservedSync(ObservedSync { lsn, epoch: held.epoch,
+                        timestamp: held.timestamp, clock_upper_micros }), &mut buffer);
+                }
                 if buffer.len() >= COMPACTION_WRITE_BYTES {
                     file.write_all(&buffer).map_err(|error| io_error(&temporary, error))?;
                     written += buffer.len() as u64;
@@ -667,7 +713,17 @@ impl Replay {
                 Kind::Append(entry) => {
                     if entry.lsn != state.last() + 1 { return Err(corrupt(path, format!("stream {stream}'s entry {} follows {}", entry.lsn, state.last()))); }
                     let location = Location { segment: sequence, offset: at, length: framed as u32, payload: entry.payload.len() as u32 };
-                    state.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp, payload: Stored::Written(location) });
+                    state.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
+                        payload: Stored::Written(location), observed_sync: None });
+                }
+                Kind::ObservedSync(observation) => {
+                    let matches = state.held_mut(observation.lsn)
+                        .is_some_and(|entry| entry.epoch == observation.epoch && entry.timestamp == observation.timestamp);
+                    if !matches || observation.clock_upper_micros <= 0 ||
+                        !state.track_sync(observation.lsn, Arc::new(OnceLock::from(observation.clock_upper_micros)))
+                    {
+                        return Err(corrupt(path, "invalid sync observation"));
+                    }
                 }
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),
@@ -807,7 +863,8 @@ pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mp
                         }
                         Write::Compact(_) => released = false,
                     }
-                    let _ = work.done.send(Ok(()));
+                    let observed = work.observed_append.as_ref().is_none_or(|(_, sample)| sample.get().is_some());
+                    let _ = work.done.send(if observed { Ok(()) } else { Err("the guarded append has no retained sync observation".into()) });
                 }
                 if released && let Some(store) = store.upgrade() { store.compact_if_mostly_dead(); }
             }
@@ -832,7 +889,7 @@ mod tests {
 
     fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
-    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None, authority_revision: None } }
+    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None, authority_revision: None, observed_append: None } }
 
     fn slot(journal: &Journal, name: &str) -> Arc<Slot> {
         Arc::new(Slot::new(journal.allocate_id(), name.into(), StreamState::default()))
@@ -904,6 +961,38 @@ mod tests {
         assert!(matches!(stream.state.lock().read_index(1, ensemble), crate::protocol::ResponseBody::Accepted(_)));
         synced(&journal, &stream, 2);
         assert!(matches!(stream.state.lock().read_index(2, ensemble), crate::protocol::ResponseBody::Refused(_)));
+    }
+
+    #[test]
+    fn a_guarded_sync_observation_survives_an_earlier_capture_and_never_moves_to_a_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, _, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let stream = slot(&journal, "timed");
+        synced(&journal, &stream, 1);
+        let observation = Arc::new(OnceLock::new());
+        let events = {
+            let mut state = stream.state.lock();
+            let events = state.append(1, 0, vec![entry(0)], -1).events;
+            assert!(state.track_sync(0, Arc::clone(&observation)));
+            events
+        };
+        let mut queued = work(Write::Events(Arc::clone(&stream), events));
+        queued.observed_append = Some((0, Arc::clone(&observation)));
+        let captured = Captured { slot: Arc::clone(&stream), state: stream.state.lock().clone() };
+        journal.write_round(&[queued, work(Write::Compact(vec![captured]))]).unwrap();
+        let original = *observation.get().unwrap();
+        drop(journal);
+
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let stream = recovered_slots(recovered).remove("timed").unwrap();
+        assert_eq!(stream.state.lock().sync_observation(0).unwrap().get().copied(), Some(original));
+        decide(&journal, &stream, |state| state.overwrite(2, 0, vec![sized(0, 2, 3)], true, 0));
+        assert!(stream.state.lock().sync_observation(0).is_none());
+        drop(journal);
+
+        let (_, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let stream = recovered_slots(recovered).remove("timed").unwrap();
+        assert!(stream.state.lock().sync_observation(0).is_none());
     }
 
     #[test]

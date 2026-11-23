@@ -186,14 +186,41 @@ A parked installation can repeat the operation at a newer captured checkpoint.
 Regions that already use an older source retain that archive until their provider work drains.
 Direct forks of an installation with an attached archive require a separate materialization path.
 
-`discard_checkpoint_capture` installs a permanent release for one capture
-ID in its original cell. It can close an unattempted ID and prevents a late
-capture from creating archive state. Physical retirement waits for the
-recorded capture and repair readers, withdraws only the archive key, and
-purges the capture's versions and unfinished uploads. The release receipt
-and authority witness remain available. The serving installation keeps
-its own key and placement.
-A capture used by the current repair or selected for serving replay belongs to the serving closure until the installation replaces or releases it.
+The authenticated recovery service splits independent checkpoint capture discard into `prepare_checkpoint_capture_discard`, `checkpoint_capture_discard_status`, and `settle_checkpoint_capture_discard`.
+Each request uses the original deployment and capture selectors, with an optional exact manifest digest.
+Preparation durably closes new archive admissions and returns `capture_discard_prepared` with the time that fence was accepted.
+Existing storage regions keep their archive through provider drain.
+A caller can then settle the same preparation.
+Settlement records withdrawal from the archive key vault before physical cleanup and returns `capture_discarded` only after it observes the archive inventory empty.
+Status observes the stored receipt, including a withdrawal that has settled while physical cleanup is pending.
+The combined `discard_checkpoint_capture` action accepts and settles the same durable preparation.
+Closing an unattempted ID fences future publication under that ID.
+A preparation with `deadline_ms` returns `capture_discard_deadline_unsupported` before changing custody because the installed key services lack an enforced revocation deadline for outstanding grants.
+The selected custody domain covers the capture and its dependent archive suffixes.
+Serving history and independently keyed exports have separate custody.
+New captures bind their original vault identity before any key or archive data publication.
+Settlement checks that identity before withdrawing the capture key.
+The recorded vault withdrawal is an observation of that vault's tombstone.
+A capture retained by a repair, selected serving replay, or active Held publication remains part of its serving closure until that reference is released.
+
+For a local checkpoint archive, the optional `--keys local-broker:PATH` authority creates new capture keys in operation-only custody.
+A capture and its archived replica suffixes use opaque handles for sealing and opening under that authority.
+An independent stage copy re-encrypts its verified plaintext under the destination installation key.
+A captured handle must reenter the broker on each operation and becomes unusable after revocation even when it has retained ciphertext.
+All processes handling an enrolled archive must use a broker-aware binary and the original vault.
+Vault custody assumes the vault directory has exclusive access and that retained backups cannot recover its withdrawn material.
+After preparation, `commit_checkpoint_capture_revocation` requires the exact manifest and reports a pending operation until admitted regions drain.
+The vault commits withdrawal before the service records `capture_revocation_committed`; a lost response can be recovered from the same vault and exact preparation.
+The optional `schedule_checkpoint_capture_revocation` action prepares the exact capture and returns the due time only after the local vault durably records it.
+Retries use the original absolute `due_at_ms` and manifest digest.
+On an observation at or after the due time, vault operations permanently close the key even through an already-issued handle or after reopening the vault.
+A bounded wall-time guarantee requires a separately qualified time source.
+Provider work checks the schedule before and after cryptography.
+The directory reaper can resume the scheduled revocation and waits for admitted regions before removing ciphertext.
+
+Physical cleanup confirms the original capture media witness before reporting an empty inventory.
+This contract covers the enrolled archive's ability to decrypt, which is revoked by the time the commitment is recorded.
+The capture protocol's deadline request requires a qualified provider and active-reader policy, and remains unavailable with these providers.
 
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
@@ -1521,3 +1548,13 @@ Hosted disposal by installation ID and classic deletion by name settle through t
 It waits for admitted storage regions, reconciles remote writes against their recorded provider publication identities, and retires every recorded replica journal.
 The terminal record retains the hosted disposal receipt and signed inventory receipt.
 Deployment-scoped S3 credentials address the same cell-relative publication keys used by reconciliation.
+
+### Replica payload reclamation
+
+Enable `--replica-payload-reclamation` on the cell's writers after upgrading every serving and recovery reader to the same release.
+A new versioned S3 payload carries its exact provider version and an envelope format that requires the replay admission protocol.
+The holder certifies bounded ranges and installs exact candidates with the directory admission frontier.
+Every known journal must acknowledge the trim using the fsync-backed protocol before S3 retirement.
+The reaper compares its release with the directory candidate and retains each intent through exact settlement.
+An unavailable journal defers physical settlement.
+Legacy, local, and unversioned payloads remain protected against age-based retirement.

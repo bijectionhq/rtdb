@@ -29,7 +29,7 @@ pub struct Scan {
     pub iids: Option<BTreeSet<Iid>>,
     #[serde(default)]
     pub predicates: Vec<Expr>,
-    /// Set when the scan's rows feed a sort taking only the `limit` best by `search_score(column, query)`; see fts.allium.
+    /// Set when the scan's rows feed a bounded sort by `search_score(column, query)`; see fts.allium.
     #[serde(default)]
     pub top_k: Option<ScanTopK>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,6 +44,8 @@ pub struct ScanTopK {
     pub column: ColumnId,
     pub query: Expr,
     pub limit: Expr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<Expr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<ColumnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

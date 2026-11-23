@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key, log::proto};
-use rtdb_storage::{Error as StorageError, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
+use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
@@ -19,6 +19,7 @@ pub struct ReplicaRecord {
     pub envelope: Arc<ReplicaEnvelope>,
     reservation: Arc<MemoryReservation>,
     pub(crate) fingerprint: Option<ReplicaFingerprint>,
+    oversized_delivery: Option<Bytes>,
 }
 impl ReplicaRecord { pub fn retained_bytes(&self) -> usize { self.reservation.bytes() } }
 
@@ -161,9 +162,11 @@ impl PartitionLogs {
             Ok(receipt) => receipt,
             Err(StorageError::MessageTooLarge { .. }) if allow_offload => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
-                self.store.put(&ObjectKey::new(oversized_key(block, &payload_id)?)?, payload).await?;
-                let proxy = ReplicaEnvelope { term: envelope.term, term_sequence: envelope.term_sequence,
-                    message: ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(self.storage_version.0), storage_epoch: Some(self.storage_epoch.0), block_index: Some(block.0), payload_id: Some(payload_id) }) };
+                let key = ObjectKey::new(oversized_key(block, &payload_id)?)?;
+                let mut proxy = envelope.offloaded(self.storage_version, self.storage_epoch, block, payload_id, &payload);
+                if let Some(version) = self.store.put_replica_payload(&key, payload).await? {
+                    proxy.bind_offload_publication(version)?;
+                }
                 let payload = EncodedPayload::encode(proxy.encoded_len(), &self.memory, || Ok(proxy.encode()))?;
                 self.replica.enqueue(payload, now).await?
             }
@@ -188,29 +191,43 @@ impl PartitionLogs {
         let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
         let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
             .then(|| fingerprint(&record.payload));
-        Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint }))
+        let oversized_delivery = matches!(&envelope.message, ReplicaBody::OversizedMessage(_)).then_some(record.payload);
+        Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery }))
     }
     /// Admission runs on the outer envelope before this fetch; a held block receives the resolved body.
-    pub async fn resolve_oversized(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+    pub async fn resolve_oversized(&self, mut record: ReplicaRecord) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
-        let lease = self.cache.get(&ObjectKey::new(key)?).await?;
+        let delivery = record.take_oversized_delivery()?;
+        let key = ObjectKey::new(key)?;
+        let lease = IoRegion::retaining(Arc::new(delivery), self.cache.get(&key)).await?;
         self.decode_oversized(record, lease.as_slice())
     }
 
-    pub(crate) async fn resolve_oversized_fresh(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+    pub(crate) async fn resolve_oversized_fresh(&self, mut record: ReplicaRecord) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
+        let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
-        let length = usize::try_from(self.store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
-        let _payload = self.memory.reserve(length)?;
-        let payload = self.store.get_fresh_exact(&key, length).await?;
-        self.decode_oversized(record, &payload)
+        IoRegion::retaining(Arc::new(delivery), async {
+            let length = usize::try_from(self.store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
+            let _payload = self.memory.reserve(length)?;
+            let payload = self.store.get_fresh_exact(&key, length).await?;
+            self.decode_oversized(record, &payload)
+        }).await
     }
 
     fn decode_oversized(&self, record: ReplicaRecord, payload: &[u8]) -> Result<ReplicaRecord> {
         let reservation = self.memory.reserve(replica_decode_bound(payload.len())?)?;
         let envelope = record.envelope.unwrap_payload(payload)?;
         let fingerprint = record.fingerprint.map(|_| fingerprint(payload));
-        Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint })
+        Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery: None })
+    }
+}
+
+impl ReplicaRecord {
+    fn take_oversized_delivery(&mut self) -> Result<Bytes> {
+        self.oversized_delivery.take().ok_or_else(|| Anomaly::fault(
+            "rtdb.replication/oversized-delivery", "An offloaded replica record has no admitted delivery",
+        ))
     }
 }
 

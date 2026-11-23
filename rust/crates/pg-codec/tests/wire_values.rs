@@ -150,8 +150,8 @@ fn transit_legacy_dates_accept_epoch_milliseconds_in_json_and_messagepack() {
 }
 
 #[test]
-fn millisecond_date_text_uses_truncated_epoch_days_in_each_output_family() {
-    for (millis, expected) in [(-86_400_001, "1969-12-31"), (-86_399_999, "1970-01-01"), (-1, "1970-01-01"), (0, "1970-01-01"), (86_399_999, "1970-01-01"), (86_400_001, "1970-01-02")] {
+fn millisecond_date_text_uses_the_containing_day_in_each_output_family() {
+    for (millis, expected) in [(-86_400_001, "1969-12-30"), (-86_399_999, "1969-12-31"), (-1, "1969-12-31"), (0, "1970-01-01"), (86_399_999, "1970-01-01"), (86_400_001, "1970-01-02")] {
         let value = Value::DateMilli(millis);
         assert_eq!(output(PgType::Date, Format::Text, &value), expected.as_bytes());
         for format in [Format::Text, Format::Binary] {
@@ -165,13 +165,16 @@ fn millisecond_date_text_uses_truncated_epoch_days_in_each_output_family() {
 }
 
 #[test]
-fn binary_millisecond_date_has_no_integer_reader_and_releases_its_reservation() {
+fn binary_dates_use_checked_postgres_days_for_both_vector_units() {
     let memory = MemoryBudget::new(1 << 20);
-    let error = encode(PgType::Date, Format::Binary, &Value::DateMilli(0), &SessionEnvironment::default(), &memory).err().unwrap();
-    assert_eq!(error.category, rtdb_types::AnomalyCategory::Fault);
-    assert_eq!(error.message.as_deref(), Some("getInt unsupported on DateMilliVector"));
+    for (millis, unix_day) in [(-86_400_001, -2i32), (-1, -1), (0, 0), (86_400_001, 1)] {
+        let bytes = (unix_day - 10_957).to_be_bytes();
+        assert_eq!(output(PgType::Date, Format::Binary, &Value::DateMilli(millis)), bytes);
+        assert_eq!(output(PgType::Date, Format::Binary, &Value::DateDay(unix_day)), bytes);
+    }
+    let error = encode(PgType::Date, Format::Binary, &Value::DateMilli(i64::MAX), &SessionEnvironment::default(), &memory).err().unwrap();
+    assert_eq!(error.code, "xtdb/date-out-of-range");
     assert_eq!(memory.used_bytes(), 0);
-    assert_eq!(output(PgType::Date, Format::Binary, &Value::DateDay(0)), (-10_957i32).to_be_bytes());
     assert!(encode(PgType::Date, Format::Binary, &Value::Null, &SessionEnvironment::default(), &memory).unwrap().is_none());
     assert_eq!(memory.used_bytes(), 0);
 }
@@ -205,8 +208,10 @@ fn protocol_calendar_values_cover_wide_dates_and_future_region_rules() {
     let mut value = read_text(1082,&date.to_string()).unwrap();
     assert_eq!(value,Value::calendar_date(date,rtdb_types::DateUnit::Day));
     assert!(encode_value(PgType::Date,Format::Text,&value,&SessionEnvironment::default()).is_err());
-    rtdb_columnar::admit_execution_value(&mut value);
-    assert_eq!(value,Value::DateDay(date.epoch_day() as i32));
+    let error = rtdb_columnar::admit_execution_value(&mut value).unwrap_err();
+    assert_eq!(error.category, rtdb_types::AnomalyCategory::Incorrect);
+    assert_eq!(error.code, "xtdb/date-out-of-range");
+    assert_eq!(value,Value::calendar_date(date,rtdb_types::DateUnit::Day));
 }
 
 #[test]

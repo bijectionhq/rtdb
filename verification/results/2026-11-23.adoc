@@ -149,3 +149,71 @@ The default local Gradle integration suite with the same revision and FFI passed
 One PostgreSQL slot-recreation case was skipped, and the XML recorded no skip reason.
 The integration run emitted no reflection or boxed math warnings.
 Its log is retention-e2e-land-l0hwk6pi/gradle-integration.log.
+
+== Replica payload retirement, streaming transfer and receipt retention
+
+Ordinary serving cursors retain offloaded deliveries and the provider work they start.
+Hosted versioned S3 retirement binds the exact object version to a certified replica position in the directory before advancing its replay frontier.
+The dedicated trim protocol requires each known physical journal to sync a trim event, including when it previously acknowledged or applied that position.
+The reaper matches the exact durable candidate, checks lineage references and retries removal of the same version.
+
+The transfer fixture reconstructs two detached Arrow payloads over 8 MiB in total across source terms.
+It rejects a modified source body and an unadmitted target object, activates and reseeds after losing the source key, reopens the durable directory, and advances intake from 501 to 502 after a subsequent oversized write.
+The fallback reader requires the exact ordered v1 bootstrap digest.
+
+Enrolled local archive keys support operation-only use, scheduled denial at the vault's observed deadline, and physical settlement on the original archive media after outstanding work drains.
+The recovery test restarts the authority across an accepted schedule and confirms that an existing handle loses access while an independent archive remains readable.
+Qualification of a fixed wall-time deadline for live SQL erasure depends on the serving and replay key custodians, active grants and backup scope.
+
+The runtime separates ordered receipt time from source-clock observations and the transaction's temporal SQL label.
+Ordinary, bounded, private and enrolled placed receipts can be retired by an ordered transaction without rewriting the surviving transaction history.
+New user metadata is stored separately and projected against the installed retirement floor, including for historical SQL reads.
+The same-history retry outcome and still-live rows survive retirement and restart.
+Historical checkpoint, log, archive and backup copies retain separate physical custody obligations.
+
+TLC matched 25 cases, covering 80 replica-reclamation states, 42 archive revocation states and 160 scheduled-expiry states in their baselines.
+Eighteen mutation cases and four reachability witnesses matched their declared assertions.
+Lean checked eight clock and receipt theorems and rejected six targeted controls.
+Verus checked ten receipt-window and guard-attribution functions and matched the exact diagnostics of all eight mutation controls.
+
+The integrated runtime at `8cde787acc`, with the declared-schema fixture at `dad808c500`, passed 1,260 reported native tests across Multi, Logkeeper, format, replication, transactions, node, directory, maintenance, storage and S3, with seven ignored benchmarks.
+The merge retained the erase marker and removed both an older payload-bearing put and an older delete.
+The native run exercised real local journals and controlled versioned-provider settlement.
+The hosted S3 fixture endpoint was unavailable.
+The exact Logkeeper and Multi rerun at `62f42c5be9` reported 360 passes and seven ignored benchmarks.
+It checked that the writer-confirmation and durable-trim decoders each treat the other's request as an unknown body.
+The same run requalified the real journal transfer after source payload removal, interrupted physical trim, archive key revocation and exact-version settlement after a lost reply.
+Allium reported the same 153 distinct diagnostics on the base and the integrated Multi specification.
+The transaction specification retained its 21 existing diagnostics after adding the PgWire cancellation guarantee.
+
+Gradle property testing passed all 3,348 cases with the final JVM sorter and native library.
+Integration testing passed 5,629 cases and skipped PostgreSQL's `slot recreation silently drops changes()` case.
+The final `./gradlew test` on `5185fee509` passed all 3,200 cases, for 12,177 passes across the three gates.
+The spill-merge regression triggered interruption inside a merge and checked bounded work and cleanup.
+The PgWire fixtures measured the time from the explicit cancellation request and passed for the sort and sleep workloads.
+The L2 compaction fixture waited for its exact submitted source positions and passed its row sets and persisted output checks.
+The Gradle gates emitted no reflection or boxed math warnings.
+
+These runs qualify the continuation on streaming recovery base `af11cd79f7`.
+A dry merge with `e263067b0c` found overlapping changes in strict hosted writes, fresh replay and retained archive ancestry.
+The merge needs to preserve the newer write and restore contracts while carrying the new reader holds and retirement checks.
+
+== Direct-main qualification of the structural work
+
+The landing composes the continuation with guarded Logkeeper append, replay archive advancement, authenticated frame reads, spatial support, and the Arrow search trees.
+The legacy repair path verifies complete bodies under an ordinary read budget.
+New archived range readers keep both the provider region and the memory charge through cancelled vault operations.
+Timestamp forks retain the checkpoint and consume the admitted, term-fenced replay prefix.
+Arrow rank pruning uses a certified UUID order and the same offset and fetch arithmetic as SQL execution.
+Compaction retains assertion-position order and selects scan tie precedence at the configured naming epoch.
+
+The complete Gradle run on `d037dd79ef` passed 3,202 unit, 3,348 property, and 5,629 integration cases, with the existing PostgreSQL slot-recreation skip.
+On runtime `4755186bae`, the unchanged JVM bindings passed all 398 unit cases and the integration case again against the rebuilt native library.
+The final native overlay passed all 615 selected cases on default stacks, including normal-stack streamed transfer and managed archive restore and move, the archive vault drain, the guarded cutoff, and UUID search with literal and prepared offsets.
+Earlier native gates checked the affected foundation crates and broad backend and simulation paths.
+
+TLC matched 48 cases across the affected archive and read-index models.
+Lean checked eleven receipt-clock and quorum-bound theorems with their controls.
+Verus matched the selected receipt, rank, limit, compaction, checkpoint, and replay handoff manifests with 73 verified functions across their baselines.
+The changed Allium specs added no diagnostics relative to `c33f341252`.
+Hosted provider checks that require a live S3 endpoint remain outside this local qualification.

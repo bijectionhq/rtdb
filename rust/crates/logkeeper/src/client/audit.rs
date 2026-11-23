@@ -18,6 +18,59 @@ pub struct RetainedAudit {
     pub unavailable: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct JournalSyncObservation {
+    pub journal: String,
+    pub synced_clock_upper_micros: i64,
+}
+
+/// Verify one committed entry and collect the original append's retained sync observations.
+pub async fn certify_observed_entry(
+    config: &StreamConfig, offset: i64,
+) -> Result<(JournalDigest, Vec<JournalSyncObservation>)> {
+    validate(config)?;
+    if offset < 0 || config.servers.iter().any(|server| server.journal().is_none()) {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/sync-observation-scope",
+            "A sync observation requires an exact position and identified journals"));
+    }
+    let ensemble = Ensemble::new(config.clone());
+    let mut responses = (0..ensemble.len()).map(|server| {
+        let ensemble = &ensemble;
+        async move {
+            (server, ensemble.digest_page(server, offset, offset, None).await.map_err(Anomaly::from))
+        }
+    }).collect::<FuturesUnordered<_>>();
+    let mut agreed = None;
+    let mut agreeing = 0;
+    let mut observations = Vec::new();
+    while let Some((server, response)) = responses.next().await {
+        let page = match response {
+            Ok(page) => page,
+            Err(error) if error.category == AnomalyCategory::Unavailable => continue,
+            Err(error) => return Err(error),
+        };
+        let digest: [u8; 32] = page.digest.as_ref().try_into()
+            .map_err(|_| Anomaly::fault("rtdb.logkeeper/audit-proof", "A replica returned an invalid digest"))?;
+        if page.through_lsn != offset || agreed.is_some_and(|expected| expected != digest) {
+            return Err(Anomaly::fault("rtdb.logkeeper/audit-divergence", "Replicas disagree on the exact committed entry"));
+        }
+        agreed = Some(digest);
+        agreeing += 1;
+        if let Some(synced_clock_upper_micros) = page.synced_clock_upper_micros {
+            if synced_clock_upper_micros <= 0 {
+                return Err(Anomaly::fault("rtdb.logkeeper/sync-observation-clock", "A journal returned an invalid sync sample"));
+            }
+            observations.push(JournalSyncObservation {
+                journal: config.servers[server].journal().expect("validated journal identities").to_owned(),
+                synced_clock_upper_micros,
+            });
+        }
+    }
+    let digest = agreed.filter(|_| agreeing >= config.write_quorum).ok_or_else(range_unavailable)?;
+    observations.sort_unstable_by_key(|observation| observation.synced_clock_upper_micros);
+    Ok((JournalDigest::from_digest_bytes(config.stream.clone(), [offset, offset], digest), observations))
+}
+
 /// Compares independently read replicas without appending, sealing or advancing their commit positions.
 pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
     validate(config)?;

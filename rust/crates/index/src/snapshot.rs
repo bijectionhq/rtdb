@@ -131,8 +131,11 @@ impl Snapshot {
     /// Confirms that every put in this table's captured scan inputs uses the IID derived from its document ID.
     /// A serving trie, a mismatched ID, or an unverified live segment leaves the relationship unproved.
     pub fn has_canonical_entity_iids(&self, table: &TableRef) -> bool {
-        !self.trie_catalog.has_current_tries(table)
-            && self.iter_segments(table).all(|segment| segment.has_canonical_entity_iids())
+        !self.trie_catalog.has_current_tries(table) && self.live_has_canonical_entity_iids(table)
+    }
+
+    pub fn live_has_canonical_entity_iids(&self, table: &TableRef) -> bool {
+        self.iter_segments(table).all(|segment| segment.has_canonical_entity_iids())
     }
 
     pub fn column_types(&self, table: &TableRef) -> StructFields<LogicalType> { self.column_types_for(table, self.column_names(table)) }

@@ -8,7 +8,7 @@ pub fn allocation_bound(value: &Value) -> Result<usize> {
     let extra = match value {
         Value::Uri(text) => rtdb_types::UriParts::parse(text)?.ascii_allocation_bound()?,
         Value::Transit(bytes) => bytes.len().checked_mul(bytes.len()).and_then(|bytes| bytes.checked_mul(16)).ok_or_else(overflow)?,
-        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => value.list_view().unwrap().iter().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value.as_ref())?).ok_or_else(overflow))?,
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value)?).ok_or_else(overflow))?,
         Value::Struct(fields) => fields.values().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value)?).ok_or_else(overflow))?,
         Value::Map { entries, .. } => entries.iter().try_fold(0usize, |bytes, (key, value)| bytes.checked_add(allocation_bound(key)?).and_then(|bytes| bytes.checked_add(allocation_bound(value).ok()?)).ok_or_else(overflow))?,
         _ => 0,
@@ -30,7 +30,7 @@ pub(crate) fn text(value: &Value) -> Result<String> {
         Value::F64(value) => super::float_text(*value, None),
         Value::Date(value) => value.date().to_string(),
         Value::DateDay(days) => date(i64::from(*days))?,
-        Value::DateMilli(millis) => date(millis / 86_400_000)?,
+        Value::DateMilli(millis) => date(millis.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY))?,
         Value::Time { value, unit, .. } => time(nanos(*value, *unit))?,
         Value::Timestamp { value, unit, timezone } => timestamp(nanos(*value, *unit), timezone.as_deref())?,
         Value::Duration { value, unit } => crate::temporal_text::duration_text(i128::from(i64::try_from(nanos(*value, *unit)).map_err(|_| overflow())?)),
@@ -49,21 +49,21 @@ fn reader(value: &Value, depth: usize) -> Result<String> {
         Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) => value.to_string(),
         Value::F16(bits) => { let value = half::f16::from_bits(*bits).to_f32(); printed_float(f64::from(value), Some(value)) }
         Value::F32(value) => printed_float(f64::from(*value), Some(*value)), Value::F64(value) => printed_float(*value, None),
-        Value::Utf8(value) => quoted(value), Value::Keyword(value) => quoted(value.as_str()),
+        Value::Utf8(value) => quoted(value),
         Value::Binary(value) | Value::FixedSizeBinary(value) => format!("#bytes {}", quoted(&hex(value))),
-        Value::Uuid(value) => format!("#bytes {}", quoted(&hex(value))),
         Value::Uri(value) => format!("#xt/uri {}", quoted(&rtdb_types::UriParts::parse(value)?.to_ascii_string())),
         Value::Decimal(value) => format!("{}M", crate::decimal_text(value)),
         Value::Date(value) => tagged("time/date", &value.date().to_string()),
         Value::DateDay(days) => tagged("time/date", &date(i64::from(*days))?),
-        Value::DateMilli(millis) => tagged("time/date", &date(millis / 86_400_000)?),
+        Value::DateMilli(millis) => tagged("time/date", &date(millis.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY))?),
         Value::Time { value, unit, .. } => tagged("time/time", &time(nanos(*value, *unit))?),
         Value::Timestamp { value, unit, timezone } => tagged(if timezone.is_some() { "time/zoned-date-time" } else { "time/date-time" }, &timestamp(nanos(*value, *unit), timezone.as_deref())?),
         Value::Duration { value, unit } => tagged("time/duration", &crate::temporal_text::duration_text(nanos(*value, *unit))),
         value if IntervalParts::of(value).is_some() => tagged("xt/interval", &crate::temporal_text::interval_text(IntervalParts::of(value).ok_or_else(overflow)?)),
         Value::TimestampTzRange { lower, upper } => format!("[{} {}]", tagged("time/zoned-date-time", &timestamp(nanos(*lower, TimeUnit::Microsecond), Some("UTC"))?), tagged("time/zoned-date-time", &timestamp(nanos(*upper, TimeUnit::Microsecond), Some("UTC"))?)),
-        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => format!("[{}]", value.list_view().unwrap().iter().map(|value| reader(value.as_ref(), depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-        Value::Struct(fields) => format!("{{{}}}", fields.iter().map(|(name, value)| Ok(format!("{} {}", quoted(name), reader(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
+        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => format!("[{}]", value.list_view().unwrap().iter()
+            .map(|value| object(value.as_ref(), depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+        Value::Struct(fields) => record(fields.iter(), depth)?,
         Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", object(key, depth + 1)?, object(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Transit(bytes) => crate::transit_object::printed_text(bytes, Admission::Standalone)?,
         _ => return Err(crate::numeric::inapplicable("text", &[value])),
@@ -75,9 +75,20 @@ fn object(value: &Value, depth: usize) -> Result<String> {
     Ok(match value {
         Value::Keyword(value) => value.to_string(), Value::Uuid(value) => tagged("uuid", &uuid::Uuid::from_bytes(*value).to_string()),
         Value::Set(values) => format!("#{{{}}}", values.iter().map(|value| object(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-        Value::List(_) | Value::FixedSizeList(_) => format!("[{}]", value.list_view().unwrap().iter().map(|value| object(value.as_ref(), depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+        Value::Struct(fields) => record(fields.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)), depth)?,
+        Value::TimestampTzRange { lower, upper } => {
+            let endpoint = |value, unbounded| if value == unbounded { Ok("nil".into()) }
+                else { timestamp(nanos(value, TimeUnit::Microsecond), Some("UTC")).map(|text| tagged("time/zoned-date-time", &text)) };
+            format!("#xt/tstz-range [{} {}]", endpoint(*lower, i64::MIN)?, endpoint(*upper, i64::MAX)?)
+        }
         value => reader(value, depth)?,
     })
+}
+
+fn record<'a>(fields: impl Iterator<Item = (&'a String, &'a Value)>, depth: usize) -> Result<String> {
+    let fields = fields.map(|(name, value)| Ok(format!("{} {}", quoted(name), object(value, depth + 1)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{{{}}}", fields.join(", ")))
 }
 
 fn quoted(value: &str) -> String {

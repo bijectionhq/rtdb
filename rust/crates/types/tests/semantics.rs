@@ -37,12 +37,20 @@ fn iids_match_existing_arrow_golden_documents() {
         (EntityId::String("baz".into()), "47a6245d9effb01c6b67db10b5d9aaa8"),
         (EntityId::Integer(5), "0016cf5ed68e5a5349722594ae8f5926"),
         (EntityId::Integer(28), "001e832ee50bb5bd3dab482eb130abf1"),
-        (EntityId::Keyword(Keyword::parse(":solo").unwrap()), "e5c907a6fac1f49cb3f8599a43a7cbf9"),
         (EntityId::uuid("424f5622-c826-4ded-a5db-e2144d665c38").unwrap(), "424f5622c8264deda5dbe2144d665c38"),
     ] {
         assert_eq!(id.iid().to_string(), expected, "{id:?}");
         assert_eq!(expected.parse::<Iid>().unwrap(), id.iid());
     }
+}
+
+#[test]
+fn keyword_lookups_include_the_native_write_digest_and_reference_digest() {
+    let keyword = Keyword::parse(":solo").unwrap();
+    let [native, reference] = EntityId::keyword_lookup_iids(keyword.as_str());
+    assert_eq!(EntityId::Keyword(keyword).iid(), native);
+    assert_eq!(native.to_string(), "cf1a1098ce21209264ea9942c920ee6a");
+    assert_eq!(reference.to_string(), "e5c907a6fac1f49cb3f8599a43a7cbf9");
 }
 
 #[test]

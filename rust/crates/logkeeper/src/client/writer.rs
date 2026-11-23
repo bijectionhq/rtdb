@@ -7,7 +7,7 @@ use crate::protocol::{Accepted, Append, Commit, Entry, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
-use rtdb_storage::log::{AppendReceipt, LogMetadata, LogOffset, LogRecord};
+use rtdb_storage::log::{AppendReceipt, GuardedAppend, LogMetadata, LogOffset, LogRecord};
 use rtdb_storage::{Error, Result};
 use rtdb_types::Timestamp;
 use std::collections::VecDeque;
@@ -43,6 +43,11 @@ struct Replica {
 struct Buffered {
     entry: Entry,
     receipt: Option<oneshot::Sender<Result<LogMetadata>>>,
+}
+
+pub(super) enum AppendTime<'a> {
+    Ordinary(Timestamp),
+    Guarded(GuardedAppend<'a>),
 }
 
 /// One leadership confirmation, by identity: a reply counts towards it only if its request was sent while it was the round in flight.
@@ -416,7 +421,7 @@ impl Writer {
         }
     }
 
-    pub fn enqueue(self: &Arc<Self>, payload: Bytes, sample: impl FnOnce() -> Result<Timestamp>) -> Result<AppendReceipt> {
+    pub fn enqueue(self: &Arc<Self>, payload: Bytes, time: AppendTime<'_>) -> Result<AppendReceipt> {
         let mut state = self.state.lock();
         let pipeline = match &mut *state {
             State::Open(pipeline) => pipeline,
@@ -426,7 +431,10 @@ impl Writer {
         let next = lsn.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
         let payload = Bytes::copy_from_slice(&payload);
-        let timestamp = sample()?;
+        let (timestamp, observe_sync) = match time {
+            AppendTime::Ordinary(timestamp) => (timestamp, false),
+            AppendTime::Guarded(guard) => (guard.sample()?, true),
+        };
         pipeline.next_lsn = next;
         let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, payload };
         pipeline.history.push(lsn, self.epoch);
@@ -435,7 +443,9 @@ impl Writer {
         pipeline.buffer.push_back(Buffered { entry: entry.clone(), receipt: Some(receipt) });
         for server in 0..pipeline.replicas.len() {
             if matches!(pipeline.replicas[server].link, Link::Live) {
-                let body = RequestBody::Append(Append { stream: self.ensemble.stream(), epoch: self.epoch, first_lsn: lsn, entries: vec![entry.clone()], commit_lsn: pipeline.commit });
+                let append = Append { stream: self.ensemble.stream(), epoch: self.epoch,
+                    first_lsn: lsn, entries: vec![entry.clone()], commit_lsn: pipeline.commit };
+                let body = if observe_sync { RequestBody::AppendObserved(append) } else { RequestBody::Append(append) };
                 self.send(pipeline, server, body);
             }
         }

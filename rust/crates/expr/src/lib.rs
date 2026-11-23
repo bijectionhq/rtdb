@@ -14,7 +14,6 @@ mod interval_constructor;
 mod decimal;
 mod period;
 mod search;
-mod vector;
 mod string;
 mod pg_catalog;
 mod session_info;
@@ -36,7 +35,7 @@ pub use ordered::{ordered_compare_in_timezone, validate_order_type};
 pub use evaluate::{ArrowParameterCell, CompiledExpr, EvalContext, ExpressionRow, RowInput, EvaluatedList, IndexedListBatches, ListBatch, ListExpression, ExpressionInvocation, OuterRow, ParameterLookup, Parameters, expression_type, evaluate_list_async, evaluate, evaluate_async, evaluate_batch, evaluate_projection, evaluate_projection_async, is_true, validate_projection_value};
 pub use functions::{function_type, scalar_call, scalar_call_async};
 pub use vector::CosineVector;
-pub use numeric::{arithmetic, arithmetic_in_timezone, integer, number};
+pub use numeric::{arithmetic, arithmetic_in_timezone, float_modulo, integer, number, signed_modulo};
 pub use timezone::normalize_timezone;
 pub use decimal::{decimal_text, decimal_long_value, decimal_rescale, decimal_to_f64, parse_decimal, decimal_sum, infer_decimal};
 
@@ -44,3 +43,5 @@ mod field;
 mod transit_object;
 pub(crate) use rtdb_types::jvm_number;
 mod semantic_text;
+
+mod vector;

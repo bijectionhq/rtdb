@@ -8,7 +8,7 @@ use crate::protocol::{AuthorityConfirmed, DigestPage, LogletCheck, Refused, Entr
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -108,13 +108,24 @@ impl Store {
     /// Reserves journal capacity before deciding the mutation.
     /// The decision and submission share the stream lock, so decisions reach the journal in order.
     pub async fn mutate(&self, body: RequestBody, frame_bytes: usize) -> Outcome {
+        let observed_lsn = match &body {
+            RequestBody::AppendObserved(append) => {
+                if !self.journal.is_durable() || append.entries.len() != 1 {
+                    return Outcome::Now(failed("a guarded sync observation requires one entry on a durable journal"));
+                }
+                Some(append.first_lsn)
+            }
+            _ => None,
+        };
         let charge = frame_bytes.saturating_add(MINIMUM_WRITE_CHARGE).min(PENDING_WRITE_BYTES) as u32;
         let Ok(admission) = self.pending_writes.clone().acquire_many_owned(charge).await else {
             return Outcome::Now(failed("the journal has stopped"));
         };
         if self.queue.is_closed() { return Outcome::Now(failed("the journal has stopped")); }
         let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
-            RequestBody::Append(append) => (append.stream, Box::new(move |state| state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn))),
+            RequestBody::Append(append) | RequestBody::AppendObserved(append) => (append.stream, Box::new(move |state| {
+                state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn)
+            })),
             RequestBody::Overwrite(overwrite) if overwrite.activate_ensemble.is_empty() => (overwrite.stream, Box::new(move |state| {
                 state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn)
             })),
@@ -126,6 +137,10 @@ impl Store {
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
+            RequestBody::TrimDurable(trim) => {
+                if !self.journal.is_durable() { return Outcome::Now(failed("durable trim requires a journal with fsync")); }
+                (trim.stream, Box::new(move |state| state.trim_durable(trim.through_lsn)))
+            }
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
             RequestBody::CheckSynced(check) => return self.check_after_durability(&check.stream, admission, |state| state.check_synced(check.epoch)),
             RequestBody::ActivateLoglet(check) => {
@@ -145,6 +160,11 @@ impl Store {
         let previous_authority = state.writer_authority();
         let decision = decide(&mut state);
         if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
+        let observed_append = observed_lsn.map(|lsn| {
+            let sample = Arc::new(OnceLock::new());
+            assert!(state.track_sync(lsn, Arc::clone(&sample)), "admitted append holds its new entry");
+            (lsn, sample)
+        });
         let authority = state.writer_authority();
         let authority_revision = if authority == previous_authority {
             None
@@ -152,7 +172,8 @@ impl Store {
             slot.authority.lock().record(authority)
         };
         let (done, durable) = oneshot::channel();
-        if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done, _admission: Some(admission), authority_revision }).is_err() {
+        if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done,
+            _admission: Some(admission), authority_revision, observed_append }).is_err() {
             return Outcome::Now(failed("the journal has stopped"));
         }
         if (state.commit, state.trim, state.dropped) != before { slot.progressed.notify_waiters(); }
@@ -176,7 +197,7 @@ impl Store {
         let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
         let captured = locked.iter().map(|(slot, state)| Captured { slot: Arc::clone(slot), state: (**state).clone() }).collect();
         let (done, finished) = oneshot::channel();
-        if self.queue.send(Work { write: Write::Compact(captured), done, _admission: None, authority_revision: None }).is_err() {
+        if self.queue.send(Work { write: Write::Compact(captured), done, _admission: None, authority_revision: None, observed_append: None }).is_err() {
             self.journal.release_compaction();
             return Err("the journal has stopped".into());
         }
@@ -238,7 +259,7 @@ impl Store {
 
         // The reply's position includes accepted mutations that the journal may still be syncing.
         let (done, durable) = oneshot::channel();
-        let barrier = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: Some(admission), authority_revision: None };
+        let barrier = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: Some(admission), authority_revision: None, observed_append: None };
         if self.queue.send(barrier).is_err() { return Outcome::Now(failed("the journal has stopped")); }
         Outcome::Durable(durable, reply)
     }
@@ -282,18 +303,20 @@ impl Store {
         };
         let Ok(_page) = self.digest_pages.try_acquire() else { return failed("history proof capacity exhausted"); };
         let Some(slot) = self.existing(&page.stream) else { return failed("the stream was not found"); };
-        let (window, durable) = {
+        let (window, durable, observation) = {
             let state = slot.state.lock();
             if state.dropped || page.from_lsn <= state.trim || page.through_lsn > state.commit {
                 return failed("the digest interval is outside the committed retained window");
             }
             let window = self.select(&state, page.from_lsn, page.through_lsn, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
+            let observation = (page.from_lsn == page.through_lsn)
+                .then(|| state.sync_observation(page.from_lsn)).flatten();
             let (done, durable) = oneshot::channel();
             // A selected commit can still be queued for fsync. The barrier is ordered after that commit.
-            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, authority_revision: None }).is_err() {
+            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, authority_revision: None, observed_append: None }).is_err() {
                 return failed("the journal has stopped");
             }
-            (window, durable)
+            (window, durable, observation)
         };
         if !matches!(durable.await, Ok(Ok(()))) { return failed("the digest interval was not made durable"); }
         let journal = Arc::clone(&self.journal);
@@ -309,7 +332,9 @@ impl Store {
                 }
                 chain.append(entry);
             }
-            ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn, digest: Bytes::copy_from_slice(&chain.bytes()) })
+            ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn,
+                digest: Bytes::copy_from_slice(&chain.bytes()),
+                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()) })
         }).await {
             Ok(reply) => reply,
             Err(error) => failed(error.to_string()),
@@ -461,7 +486,7 @@ mod tests {
         let slot = store.existing("drop-me").unwrap();
         let capture = Captured { slot: Arc::clone(&slot), state: slot.state.lock().clone() };
         assert!(journal.claim_compaction());
-        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0, _admission: None, authority_revision: None };
+        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0, _admission: None, authority_revision: None, observed_append: None };
         assert!(store.queue.send(first_compaction).is_ok());
         let Outcome::Durable(dropped, _) = store.mutate(RequestBody::DropStream(DropStream { stream: "drop-me".into(), epoch: 2 }), 32).await else {
             panic!("the drop was refused");

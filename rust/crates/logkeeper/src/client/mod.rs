@@ -21,12 +21,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use writer::{Tip, Writer};
+use writer::{AppendTime, Tip, Writer};
 
-pub use audit::{CertifiedRangeReader, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, copy_certified_range, verify_certified_range};
+pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, verify_certified_range};
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
+const READ_INDEX_GRACE: Duration = Duration::from_millis(15);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
@@ -245,12 +246,38 @@ pub async fn seal_recover_committed(config: &StreamConfig, epoch: u64) -> rtdb_t
 
 /// Lets every server drop entries at or below `through`, which must be committed.
 pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Result<()> {
+    trim_on(config, through, TrimPolicy::Quorum).await
+}
+
+/// Requires a fresh durable trim acknowledgement from each configured journal, including on retry.
+pub async fn trim_all(config: &StreamConfig, through: LogOffset) -> rtdb_types::Result<()> {
+    trim_on(config, through, TrimPolicy::DurableAll).await
+}
+
+#[derive(Clone, Copy)]
+enum TrimPolicy { Quorum, DurableAll }
+
+async fn trim_on(config: &StreamConfig, through: LogOffset, policy: TrimPolicy) -> rtdb_types::Result<()> {
     validate(config)?;
     let ensemble = Ensemble::new(config.clone());
-    let replies: Vec<_> = (0..ensemble.len()).map(|server| ensemble.trim(server, through.0)).collect::<FuturesUnordered<_>>().collect().await;
-    let trimmed = replies.iter().filter(|reply| matches!(reply, Ok(Ack::Accepted(_)))).count();
-    if trimmed < config.write_quorum {
-        return Err(Error::Remote { key: config.stream.clone(), message: format!("trimmed {trimmed} servers, a write quorum is {}", config.write_quorum) }.into());
+    let required = match policy {
+        TrimPolicy::Quorum => config.write_quorum,
+        TrimPolicy::DurableAll => ensemble.len(),
+    };
+    let ensemble = &ensemble;
+    let requests = (0..ensemble.len()).map(|server| async move {
+        match policy {
+            TrimPolicy::Quorum => ensemble.trim(server, through.0).await,
+            TrimPolicy::DurableAll => ensemble.trim_durable(server, through.0).await,
+        }
+    });
+    let mut replies: FuturesUnordered<_> = requests.collect();
+    let mut trimmed = 0;
+    while let Some(reply) = replies.next().await {
+        if matches!(reply, Ok(Ack::Accepted(_))) { trimmed += 1; }
+    }
+    if trimmed < required {
+        return Err(Error::Remote { key: config.stream.clone(), message: format!("trimmed {trimmed} servers, {required} are required") }.into());
     }
     Ok(())
 }
@@ -292,13 +319,22 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()>
     Ok(())
 }
 
+fn read_index_frontiers(held: &mut [i64], published: i64, journals: usize, quorum: usize) -> (i64, i64) {
+    held.sort_unstable_by(|left, right| right.cmp(left));
+    // Unobserved slots could all hold a completed write, including slots that refused the active-epoch check.
+    let unknown = journals - held.len();
+    let known_committed = published.max(held[quorum - 1]);
+    let maybe_committed = known_committed.max(held[quorum - unknown - 1]);
+    (maybe_committed, known_committed)
+}
+
 impl QuorumLog {
-    fn enqueue_at(&self, payload: Bytes, sample: impl FnOnce() -> Result<Timestamp>) -> Result<AppendReceipt> {
+    fn enqueue_at(&self, payload: Bytes, time: AppendTime<'_>) -> Result<AppendReceipt> {
         let maximum = self.shared.ensemble.config.maximum_message_bytes;
         if payload.len() > maximum { return Err(Error::MessageTooLarge { size: payload.len(), maximum }); }
         self.shared.check_open()?;
         match &self.shared.role {
-            Role::Writer(writer) => writer.enqueue(payload, sample),
+            Role::Writer(writer) => writer.enqueue(payload, time),
             Role::Reader(_) => Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream))),
         }
     }
@@ -310,26 +346,39 @@ impl QuorumLog {
         let unavailable = |message: &str| Error::Remote { key: ensemble.config.stream.clone(), message: message.into() };
         if quorum <= ensemble.len() / 2 { return Err(unavailable("read indexes require intersecting write quorums")); }
         let mut replies: FuturesUnordered<_> = (0..ensemble.len()).map(|server| ensemble.read_index(server, epoch)).collect();
-        let mut confirmed = 0;
-        let mut last = -1;
-        loop {
+        let mut held = Vec::with_capacity(ensemble.len());
+        let mut published = -1;
+        let mut grace = None;
+        let mut bound = None;
+        while !replies.is_empty() {
             let reply = tokio::select! {
+                biased;
                 _ = self.shared.cancellation.cancelled() => return Err(Error::Closed("quorum log closed".into())),
-                reply = replies.next() => reply,
+                reply = replies.next() => reply.expect("pending read-index replies"),
+                _ = async {
+                    match grace {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => break,
             };
-            let Some(reply) = reply else { break };
             match reply {
-                Ok(Ack::Accepted(held)) => {
-                    confirmed += 1;
-                    last = last.max(held.last_lsn);
-                    if confirmed == quorum { return Ok(LogOffset(last)); }
+                Ok(Ack::Accepted(position)) => {
+                    held.push(position.last_lsn);
+                    published = published.max(position.commit_lsn);
                 }
                 Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
-                _ => (),
+                _ if held.len() + replies.len() < quorum => break,
+                _ => continue,
             }
-            if confirmed + replies.len() < quorum { break; }
+            if held.len() >= quorum {
+                let (maybe_committed, known_committed) = read_index_frontiers(&mut held, published, ensemble.len(), quorum);
+                if maybe_committed == known_committed { return Ok(LogOffset(maybe_committed)); }
+                bound = Some(maybe_committed);
+                grace.get_or_insert_with(|| tokio::time::Instant::now() + READ_INDEX_GRACE);
+            }
         }
-        Err(unavailable("a write quorum did not confirm the active loglet"))
+        bound.map(LogOffset).ok_or_else(|| unavailable("a write quorum did not confirm the active loglet"))
     }
 
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
@@ -517,11 +566,11 @@ impl Log for QuorumLog {
     fn maximum_guarded_append_bytes(&self) -> Option<usize> { self.maximum_append_bytes() }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, || Ok(timestamp))
+        self.enqueue_at(payload, AppendTime::Ordinary(timestamp))
     }
 
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, || guard.sample())
+        self.enqueue_at(payload, AppendTime::Guarded(guard))
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.latest().map(LogOffset) }

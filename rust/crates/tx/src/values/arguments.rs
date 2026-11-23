@@ -66,7 +66,7 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
                 |row| estimate_read_cell_bytes(field, array.as_ref(), row),
                 |row| {
                     let mut cell = read_value_as(source, field, array.as_ref(), row)?;
-                    cell.admit_object_dates();
+                    cell.admit_object_dates()?;
                     Ok(cell)
                 })?;
             Ok((output, Some(scratch)))

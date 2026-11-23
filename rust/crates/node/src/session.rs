@@ -289,6 +289,8 @@ impl Session {
     }
     pub fn database(&self) -> &str { &self.database }
     pub fn set_database(&mut self, database: impl Into<String>) -> Result<()> { self.ensure_open()?; self.database = RetainedText::new(database.into(), self.service.memory())?; Ok(()) }
+    pub fn application_name(&self) -> &str { self.parameter("application_name").unwrap_or("XTDB") }
+    pub fn set_application_name(&mut self, name: impl Into<String>) -> Result<()> { self.set_parameter("application_name", Some(name.into())) }
     pub fn user(&self) -> Option<&str> { self.service.user() }
     pub fn auto_commit(&self) -> bool { self.auto_commit }
     pub fn effective_timezone(&self) -> &str { self.transaction().map_or(&self.timezone, |tx| &tx.timezone) }
@@ -483,7 +485,7 @@ impl Session {
     pub fn reset(&mut self) -> Result<()> {
         self.ensure_open()?;
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/discard-in-tx", "DISCARD ALL cannot run inside a transaction block")); }
-        self.parameters.clear();
+        self.parameters.retain(|name, _| name == "application_name");
         self.timezone = self.initial_timezone.clone();
         self.replace_await_token(None);
         self.default_access_mode = None;
