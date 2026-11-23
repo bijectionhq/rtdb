@@ -245,9 +245,10 @@ pub(crate) async fn capture(
                                 } else {
                                     (envelope, None)
                                 };
+                                let mut stripped_reservation = false;
                                 if held {
                                     if let ReplicaBody::NoOp(noop) = &mut resolved.message {
-                                        noop.placed_slot_reservation = None;
+                                        stripped_reservation = noop.placed_slot_reservation.take().is_some();
                                     }
                                     if let ReplicaBody::ResolvedTx(message) = &mut resolved.message {
                                         rtdb_replication::project_held_replica(
@@ -268,7 +269,7 @@ pub(crate) async fn capture(
                                         payload.bytes.as_ref()
                                     };
                                     detached.push((entry.lsn, artifact.write_payload(entry.lsn, body).await?));
-                                } else if held && matches!(&resolved.message, ReplicaBody::ResolvedTx(_)) {
+                                } else if stripped_reservation || held && matches!(&resolved.message, ReplicaBody::ResolvedTx(_)) {
                                     entry.payload = resolved.encode().into();
                                 }
                                 progress.apply(resolved, pin, |_| Ok(()))?;
@@ -437,6 +438,7 @@ pub(super) struct TerminalReplayProgress {
     writer_epoch: Option<u64>,
     last_offset: i64,
     replay: LogicalReplay,
+    placed: Option<(rtdb_types::Term, rtdb_types::PlacedReservation)>,
 }
 
 impl TerminalReplayProgress {
@@ -449,6 +451,7 @@ impl TerminalReplayProgress {
         Ok(Self {
             writer_epoch: None, last_offset: checkpoint.boundary,
             replay: LogicalReplay::new(checkpoint, fence.destination.source_log_epoch, catalog),
+            placed: None,
         })
     }
 
@@ -471,12 +474,43 @@ impl TerminalReplayProgress {
         match envelope.message {
             ReplicaBody::ResolvedTx(message) => {
                 let next = self.replay.transaction_source(message.src_msg_id)?;
+                match (self.placed, message.placed_slot_terminal.as_deref(), message.placed_attempt.as_deref()) {
+                    (None, None, None) => (),
+                    (Some((term, reserved)), Some(terminal), Some(attempt)) => {
+                        let terminal = rtdb_types::PlacedTerminal::decode(terminal)?;
+                        let (attempt, _) = rtdb_format::envelope::decode_replica_outcome_attempt(attempt)?;
+                        if attempt != reserved.attempt || terminal.commitment != reserved.commitment
+                            || if terminal.fenced { envelope.term <= term || message.committed != Some(false) }
+                               else { envelope.term != term }
+                        {
+                            return Err(suffix_unavailable());
+                        }
+                    }
+                    _ => return Err(suffix_unavailable()),
+                }
                 recovered.apply_archived_transaction(&message, memory)?;
+                self.placed = None;
                 self.replay.source = next;
             }
+            ReplicaBody::NoOp(noop) if noop.placed_slot_reservation.is_some() => {
+                if self.placed.is_some() || noop.src_msg_id.is_some() || self.replay.pending.is_some() {
+                    return Err(suffix_unavailable());
+                }
+                let reserved = rtdb_types::PlacedReservation::decode(
+                    noop.placed_slot_reservation.as_deref().ok_or_else(suffix_unavailable)?,
+                )?;
+                if self.replay.source_offset(reserved.attempt.position().0)? <= self.replay.source {
+                    return Err(suffix_unavailable());
+                }
+                self.placed = Some((envelope.term, reserved));
+            }
             control => {
+                let control = ReplayControl::read(&control)?;
+                if self.placed.is_some() && !matches!(control, ReplayControl::Advance(None)) {
+                    return Err(suffix_unavailable());
+                }
                 let prior = self.replay.source;
-                self.replay.apply_control(ReplayControl::read(&control)?)?;
+                self.replay.apply_control(control)?;
                 if self.replay.source > prior {
                     recovered.progress.source_position =
                         SourcePosition::from_epoch_offset(self.replay.epoch, self.replay.source)?;
@@ -487,7 +521,9 @@ impl TerminalReplayProgress {
     }
 
     pub(super) fn finish(self, through: i64) -> Result<i64> {
-        if self.last_offset != through { return Err(suffix_unavailable()); }
+        if self.last_offset != through || self.placed.is_some() {
+            return Err(suffix_unavailable());
+        }
         Ok(self.replay.source)
     }
 }
