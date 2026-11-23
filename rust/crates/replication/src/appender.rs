@@ -5,6 +5,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
+use rtdb_index::PreparedSearchDelta;
 use rtdb_tx::{ResolvedTx, TransactionResult};
 use rtdb_types::{Anomaly, BlockIndex, PlacedTerminal, ReplicaPosition, Result, Term, TermSequence, Timestamp};
 use tokio::sync::{mpsc, oneshot};
@@ -13,7 +14,16 @@ use tokio_util::sync::CancellationToken;
 use crate::{PartitionLogs, ReplicaMetadata, ReplicationClock, progress::term_ended};
 use crate::readback_identity::{ReplicaFingerprint, TransactionEvent, fingerprint, matching_present_integer, transaction_completion};
 
-pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>, Option<bytes::Bytes>), Message(ReplicaBody) }
+pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>, Option<PreparedSearchDelta>), Message(ReplicaBody) }
+
+impl WriteBody {
+    pub(crate) fn search_delta(&self) -> Option<&PreparedSearchDelta> {
+        match self {
+            Self::Resolved(_, delta) => delta.as_ref(),
+            Self::Message(_) => None,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Control, TrieRemoval(ReplicaPosition) }
 
@@ -191,11 +201,11 @@ impl ReplicaAppender {
                     {
                         tx.placed_slot_terminal = Some(terminal.encode());
                     }
-                    let _search_copy = if let WriteBody::Resolved(_, Some(delta)) = &request.write.body
+                    let _search_copy = if let Some(delta) = request.write.body.search_delta()
                         && let ReplicaBody::ResolvedTx(tx) = &mut envelope.message
                         && tx.acceptance_stage.is_none()
-                        && let Ok(charge) = self.memory.reserve(delta.len().saturating_mul(8)) {
-                        tx.search_delta = Some(delta.to_vec());
+                        && let Ok(charge) = self.memory.reserve(delta.encoded.len().saturating_mul(8)) {
+                        tx.search_delta = Some(delta.encoded.clone());
                         Some(charge)
                     } else { None };
                     let guarded = matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());

@@ -684,6 +684,17 @@ pub struct LiveIndex {
 }
 
 #[derive(Clone)]
+pub struct PreparedSearchDelta {
+    pub encoded: bytes::Bytes,
+    pub batch: OwnedBatch,
+}
+
+pub enum SearchDelta {
+    Prepared(PreparedSearchDelta),
+    Replayed(bytes::Bytes),
+}
+
+#[derive(Clone)]
 pub struct ServingSearch(Arc<dyn std::any::Any + Send + Sync>);
 
 impl ServingSearch {

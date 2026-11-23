@@ -649,12 +649,12 @@ impl rtdb_replication::ServingSearchBuilder for PrepareSearch {
     fn journals_deltas(&self) -> bool { self.search.as_ref().is_some_and(|search| search.journals_search_deltas()) }
 
     async fn prepare_delta(&self, snapshot: rtdb_index::Snapshot, write: Arc<rtdb_index::StagedWrite>, cancellation: &CancellationToken)
-        -> Result<Option<bytes::Bytes>> {
+        -> Result<Option<rtdb_index::PreparedSearchDelta>> {
         let Some(search) = &self.search else { return Ok(None); };
         search.prepare_search_delta(snapshot, write, cancellation).await
     }
 
-    async fn install_delta(&self, snapshot: rtdb_index::Snapshot, write: &rtdb_index::StagedWrite, delta: Option<&[u8]>, cancellation: &CancellationToken)
+    async fn install_delta(&self, snapshot: rtdb_index::Snapshot, write: &rtdb_index::StagedWrite, delta: Option<rtdb_index::SearchDelta>, cancellation: &CancellationToken)
         -> Result<Option<rtdb_index::ServingSearch>> {
         let Some(search) = &self.search else { return Ok(None); };
         search.install_search_delta(snapshot, write, delta, cancellation).await

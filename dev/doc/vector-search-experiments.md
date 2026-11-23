@@ -537,6 +537,16 @@ The Gradle suites did not run, because this host has JDK 21 and 26 but not the J
 | Candidate and payload handling | Sort and deduplicate candidate IIDs before building the Arrow membership column, and reuse the payload cursor and join storage for each batch. | Legacy accelerator interfaces still accept IID sets. |
 | Query constants | Cache projected constants across range, cursor and residual binding for each seek. | DDL and system catalog compatibility paths retain their existing representations. |
 
+### Full-text build and maintenance
+
+| Audited path | Arrow path |
+| --- | --- |
+| Repeated analysis in build, revision digest and forward witnesses | A logical posting hashes its token vector and block sealing feeds that digest to the forward page. An independent forward build streams analyzer terms into its digest. |
+| Full event-page decode and copied cache-lease pages | The search projection selects headers, `_id` and indexed put fields in the IPC inventory. On-demand pages borrow the original lease buffers. |
+| Token delta, append, readback and serving pages | The analyzer fills the delta's Arrow list child. The replica field carries immutable bytes, leader readback installs the prepared batch, and replay reads slices of the IPC body. A live page holds its delta list slice and indexes borrowed term text. |
+| Per-token strings, posting map keys and run assembly | The analyzer appends lowercase bytes to its Arrow builder and supports a borrowed-term visitor. The writer allocates a term key on first insertion and appends each run's Arrow token vector as a range. |
+| In-memory legacy transcode and query-built search files | Both paths open typed Arrow batches directly. Disk-spooled Tantivy conversion retains its mapped-file custody, and writing format 11 still supplies Tantivy with owned token text at its API boundary. |
+
 ### Pre-integration non-Arrow inventory at `fa969b755`
 
 This source audit covers RTDB vector search at `fa969b755`, from client input and primary storage through exact SQL, the experimental ANN workload, and result export.

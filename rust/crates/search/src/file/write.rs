@@ -4,7 +4,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Int32Array, Int64Array, StringArray, UInt8Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
 };
 use rtdb_columnar::MemoryReservation;
@@ -14,7 +14,7 @@ use rtdb_types::{Anomaly, EntityId, EventHeader, EventPosition, Iid, Result};
 use super::{
     FORMAT_VERSION, TREE_FORMAT_VERSION, PACKED_FORMAT_VERSION, NO_DOC, NULL_DOC, IndexedRow, Section, SearchPage, TextRevision, STORED_IMPACTS, artefact_digest,
     fault, lifespan, op_code, sections_array, SearchPosition, event_positions, search_position,
-    layout::{Table, Writer, item_of, list},
+    layout::{Table, Writer, item_of, list, record},
     paged::PostingPlan,
     postings::{POSTING_TERMS, PostingBuilder, posting_table},
 };
@@ -123,6 +123,21 @@ struct Column {
     postings: BTreeMap<String, PostingBuilder>,
 }
 
+enum Output<W> {
+    File(Writer<W>),
+    Batches(Vec<RecordBatch>),
+}
+
+impl<W: Write> Output<W> {
+    fn page(&mut self, tables: impl IntoIterator<Item = (Table, StructArray)>) -> Result<()> {
+        match self {
+            Self::File(writer) => { writer.page(tables)?; }
+            Self::Batches(pages) => pages.push(record(FORMAT_VERSION, tables)?),
+        }
+        Ok(())
+    }
+}
+
 struct Builder {
     reservation: Option<Arc<MemoryReservation>>,
     estimated: usize,
@@ -169,9 +184,13 @@ impl Builder {
         let identity_bytes = row.key.as_ref().map_or(0, |key| key.len().saturating_mul(4));
         let row_bytes = row.values.iter().flatten().try_fold(
             256usize.saturating_add(identity_bytes).saturating_add(row.values.len().saturating_mul(16)),
-            |bytes, tokens| bytes.checked_add(tokens.value_data().len().saturating_mul(3))
-                .and_then(|bytes| bytes.checked_add(tokens.len().saturating_mul(56)))
-                .ok_or_else(|| fault("Search index allocation exceeds addressable memory")),
+            |bytes, tokens| {
+                let offsets = tokens.value_offsets();
+                let token_bytes = (offsets[tokens.len()] - offsets[0]) as usize;
+                bytes.checked_add(token_bytes.saturating_mul(3))
+                    .and_then(|bytes| bytes.checked_add(tokens.len().saturating_mul(56)))
+                    .ok_or_else(|| fault("Search index allocation exceeds addressable memory"))
+            },
         )?;
         self.estimated = self.estimated.checked_add(row_bytes).ok_or_else(|| fault("Search index allocation exceeds addressable memory"))?;
         let reservation = Arc::get_mut(reservation).expect("Search builder owns its allocation");
@@ -258,7 +277,13 @@ impl Builder {
                 }
                 let norm = stored_length(length as usize);
                 for (term, positions) in term_positions {
-                    column.postings.entry(term.to_owned()).or_default().push(doc, norm, positions, sql_id);
+                    if let Some(postings) = column.postings.get_mut(term) {
+                        postings.push(doc, norm, positions, sql_id);
+                    } else {
+                        let mut postings = PostingBuilder::default();
+                        postings.push(doc, norm, positions, sql_id);
+                        column.postings.insert(term.to_owned(), postings);
+                    }
                 }
                 let rectangles = coalesce(members.iter().flat_map(|index| visible[*index].iter().copied()).collect());
                 let (class, section) = lifespan(&rectangles, self.ceiling);
@@ -274,7 +299,7 @@ impl Builder {
                     self.doc_revisions.append_value(revision).map_err(fault)?;
                     self.doc_positions.push(members.iter().map(|&index| search_position(entity.rows[index].1))
                         .max().expect("a posting has at least one original event"));
-                    for token in tokens.iter().flatten() { self.doc_tokens.values().append_value(token); }
+                    self.doc_tokens.values().append_array(&tokens).map_err(fault)?;
                     self.doc_tokens.append(true);
                 }
                 column.runs += 1;
@@ -287,11 +312,10 @@ impl Builder {
         Ok(())
     }
 
-    fn finish(mut self, columns: &[String], version: Option<i64>, identity: &str, output: impl Write) -> Result<(Vec<Section>, TermSummaries)> {
+    fn finish(mut self, columns: &[String], version: Option<i64>, identity: &str, output: &mut Output<impl Write>) -> Result<(Vec<Section>, TermSummaries)> {
         if self.members.is_empty() { return Err(fault("A search file holds at least one member")); }
         let sections: Vec<_> = self.sections.into_values().collect();
         let mut summaries = TermSummaries::default();
-        let mut writer = Writer::new(output, self.format)?;
         let header = Table::Header.array(vec![
             Arc::new(Int32Array::from(vec![self.format])),
             Arc::new(Int32Array::from(vec![rtdb_text::ANALYZER_VERSION])),
@@ -365,23 +389,23 @@ impl Builder {
                         Arc::new(event_positions(self.erases.values().map(|(_, position, _)| *position))?),
                     ])?)
                 } else { None };
-                summaries = super::tree_file::write(&mut writer, directory, visibility, plan,
+                let Output::File(writer) = output else { unreachable!("Tree pages require durable offsets"); };
+                summaries = super::tree_file::write(writer, directory, visibility, plan,
                     (self.format >= PACKED_FORMAT_VERSION).then_some(positions), revisions, documents, erases)?;
             } else {
-                writer.page(directory)?;
-                writer.page(visibility)?;
-                plan.write(&mut writer)?;
+                output.page(directory)?;
+                output.page(visibility)?;
+                plan.emit(|table, batch| output.page([(table, batch)]))?;
             }
         } else {
             directory.extend(visibility);
-            writer.page(directory)?;
+            output.page(directory)?;
             let mut postings = postings.peekable();
             while postings.peek().is_some() {
                 let page = postings.by_ref().take(POSTING_TERMS).collect();
-                writer.page([(Table::Postings, posting_table(page, STORED_IMPACTS)?)])?;
+                output.page([(Table::Postings, posting_table(page, STORED_IMPACTS)?)])?;
             }
         }
-        writer.finish()?;
         summaries.retain(self.reservation)?;
         Ok((sections, summaries))
     }
@@ -462,15 +486,34 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 {
     if format == super::TANTIVY_FORMAT_VERSION {
         let version = version.ok_or_else(|| fault("Legacy publication requires an ordered definition version"))?;
-        let members = members.into_iter().map(|pages| pages.into_iter().map(|page| {
-            let page = page?;
-            (0..page.len()).map(|row| crate::lane::test_row(page.row(row, columns)?)).collect::<Result<Vec<_>>>()
-        }));
         let directory = tempfile::tempdir().map_err(fault)?;
         let store = tantivy::directory::MmapDirectory::open(directory.path()).map_err(fault)?;
         let sections = super::legacy11::write_versioned_group(columns, members, identity, version, ceiling, store, output)?;
         return Ok((sections.into_iter().map(super::legacy11::Section::into_arrow).collect(), TermSummaries::default()));
     }
+    let builder = build_group(columns, members, ceiling, reservation, format, mode)?;
+    let mut output = Output::File(Writer::new(output, format)?);
+    let result = builder.finish(columns, version, identity, &mut output)?;
+    let Output::File(writer) = output else { unreachable!() };
+    writer.finish()?;
+    Ok(result)
+}
+
+pub(super) fn query_batches<I: SearchPage>(columns: &[String], pages: impl IntoIterator<Item = Result<I>>,
+    ceiling: Option<i64>, reservation: Arc<MemoryReservation>) -> Result<Vec<RecordBatch>> {
+    let builder = build_group(columns, [pages], ceiling, Some(reservation), FORMAT_VERSION, BuildMode::Combined)?;
+    let mut output = Output::<std::io::Sink>::Batches(Vec::new());
+    builder.finish(columns, None, "built", &mut output)?;
+    let Output::Batches(pages) = output else { unreachable!() };
+    Ok(pages)
+}
+
+fn build_group<P, I>(
+    columns: &[String], members: impl IntoIterator<Item = P>, ceiling: Option<i64>,
+    reservation: Option<Arc<MemoryReservation>>, format: i32, mode: BuildMode,
+) -> Result<Builder>
+where P: IntoIterator<Item = Result<I>>, I: SearchPage,
+{
     let mut builder = Builder::new(columns.len(), ceiling, reservation, format, mode);
     let mut previous_member_iid = None;
     for pages in members {
@@ -479,7 +522,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
         let mut member_iid = None;
         let mut previous_time = None;
         for page in pages {
-            let page = page?;
+            let mut page = page?;
             if mode != BuildMode::Postings { builder.pages.push(builder.rows); }
             for index in 0..page.len() {
                 let row = page.row(index, columns)?;
@@ -505,6 +548,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
                 member_iid = Some(iid);
                 builder.put(&mut entities, row)?;
             }
+            page.complete();
         }
         if let Some(iid) = member_iid {
             for (key, entity) in entities {
@@ -513,5 +557,55 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
             previous_member_iid = Some(iid);
         }
     }
-    builder.finish(columns, version, identity, output)
+    if builder.members.is_empty() { return Err(fault("A search file holds at least one member")); }
+    Ok(builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arrow_build_bulk_run_tokens_keep_logical_file_bytes() -> Result<()> {
+        struct Documents(Vec<StringArray>);
+
+        impl SearchPage for Documents {
+            fn len(&self) -> usize { self.0.len() }
+
+            fn row(&mut self, row: usize, _: &[String]) -> Result<IndexedRow<'_>> {
+                let tokens = self.0[row].clone();
+                let header = EventHeader { position: None,
+                    iid: Iid([row as u8 + 1; 16]), system_from: rtdb_types::Timestamp(11), commit_position: 1,
+                    valid_time: rtdb_types::Interval::ALL, op: rtdb_types::EventOp::Put,
+                };
+                Ok(IndexedRow { header, key: None, sql_id: None, values: vec![Some(tokens)], revisions: vec![Some([row as u8; 32])] })
+            }
+        }
+
+        let columns = ["body".to_owned()];
+        let prefix = "x".repeat(1 << 16);
+        let existing = StringArray::from(vec![prefix.as_str(), "éclair", "audit", "audit", "suffix"]);
+        let documents = || Documents(vec![existing.slice(1, 3), existing.slice(3, 0), existing.slice(3, 2)]);
+        let format = super::super::LOGICAL_FORMAT_VERSION;
+        let mut old_tokens = arrow_array::builder::LargeListBuilder::new(StringBuilder::new());
+        for tokens in &documents().0 {
+            for token in tokens.iter().flatten() { old_tokens.values().append_value(token); }
+            old_tokens.append(true);
+        }
+
+        let mut previous = build_group(&columns, [[Ok(documents())]], None, None, format, BuildMode::Postings)?;
+        previous.doc_tokens = old_tokens;
+        let mut expected = Vec::new();
+        let mut output = Output::File(Writer::new(&mut expected, format)?);
+        previous.finish(&columns, Some(1), "token-fixture", &mut output)?;
+        let Output::File(writer) = output else { unreachable!() };
+        writer.finish()?;
+
+        let mut actual = Vec::new();
+        let memory = rtdb_columnar::MemoryBudget::new(4096);
+        write_group_as(&columns, [[Ok(documents())]], "token-fixture", Some(1), None, &mut actual,
+            Some(memory.reserve(4096)?), format, BuildMode::Postings)?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
 }

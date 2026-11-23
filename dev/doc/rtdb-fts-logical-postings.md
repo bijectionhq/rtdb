@@ -40,12 +40,15 @@ type TextRevision = [u8; 32];
 ```
 
 An accepted commit assigns event IDs before journaling.
+The leader installs the prepared Arrow token batch after confirming its delta on readback, and replay opens the delta's IPC buffers.
+A live posting page keeps its slice of the token list with the backing allocation's reservation.
 Replay, forks that preserve accepted Arrow, L0 sealing, and primary compaction preserve those bytes.
 An event split into disjoint fragments can have several locations at a captured cut.
 Receipts from older data can still use the original temporal coordinates when they unambiguously identify events.
 
 A table history page stores event headers and physical row coordinates.
 A separate forward page stores each field's revision, keyed by the accepted event.
+Block sealing derives the posting revision and its forward witness from the same token sequence.
 Equivalent analyzed text shares a posting revision for the same field and entity.
 A forward witness identifies whether a posting refers to the resolved event's text revision.
 The ranked verifier uses the primary row to determine the visible version's score.

@@ -497,6 +497,8 @@ rule CommitTransaction {
     -- The resolver STAGES a committed transaction onto its queue and advances its RESOLVED head.
     -- The staged transaction is then appended to the replica log.
     -- An admitted token delta travels in the accepted replica record and becomes searchable at the same basis as the corresponding events.
+    -- The leader retains the prepared token batch until readback confirms the delta.
+    -- Installed pages share token buffers while they retain the corresponding memory reservation.
     -- If a delta is absent, the existing proven posting prefix survives and ordinary SQL remains exact over the uncovered rows.
     --
     -- It does NOT advance the DURABLE head and does NOT refresh the external shared snapshot.

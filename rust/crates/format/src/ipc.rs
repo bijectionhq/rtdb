@@ -13,6 +13,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
 
 mod decoded_schema;
+mod event_projection;
 mod java_layout;
 mod nulls;
 mod projection;
@@ -21,6 +22,7 @@ mod undefined;
 pub struct ArrowFile {
     reader: Box<dyn RetainedReader>,
     buffer: Option<Buffer>,
+    event_projection: Option<event_projection::EventProjection>,
     pages: PageDecoder,
     next_page: usize,
     encoded_page_sizes: Vec<usize>,
@@ -135,10 +137,19 @@ impl ArrowFile {
             let bytes = read_block_from(buffer.as_ref(), reader.as_mut(), &block)?;
             pages.load_dictionary(index, bytes)?;
         }
-        Ok(Self { reader, buffer, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
+        Ok(Self { reader, buffer, event_projection: None, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
     }
 
-    pub fn schema(&self) -> SchemaRef { self.pages.schema() }
+    pub fn schema(&self) -> SchemaRef {
+        self.event_projection.as_ref().map_or_else(|| self.pages.schema(), |projection| Arc::clone(&projection.schema))
+    }
+
+    /// Selects event headers, the document ID, and the named direct children of the put struct.
+    pub fn project_event_payload(&mut self, columns: &[String]) {
+        if self.pages.dictionary_count() == 0 && self.pages.schema.fields().len() == self.pages.source_schema.fields().len() {
+            self.event_projection = event_projection::EventProjection::new(&self.pages.schema, columns);
+        }
+    }
     pub fn page_count(&self) -> usize { self.pages.blocks.len() }
 
     /// Encoded metadata and body bytes; compressed pages can require a larger decoded allocation.
@@ -158,15 +169,30 @@ impl ArrowFile {
     }
 
     pub fn read_page(&mut self, page: usize) -> Result<RecordBatch> {
-        let buffer = read_block_from(self.buffer.as_ref(), self.reader.as_mut(), self.pages.block(page)?)?;
-        let batch = self.pages.decode_page(page, buffer)?;
+        let block = self.pages.block(page)?;
+        let buffer = read_block_from(self.buffer.as_ref(), self.reader.as_mut(), block)?;
+        let batch = if let Some(projection) = &self.event_projection {
+            let bytes = prepare_block(block, buffer, &self.pages.source_schema, false)?;
+            let (header, body_start) = block_message(block, &bytes)?;
+            let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
+            if (message.version() == self.pages.version || self.pages.version == arrow_ipc::MetadataVersion::V1)
+                && let Some(batch) = projection.decode(&self.pages.source_schema, message, &bytes.slice(body_start)) {
+                batch
+            } else {
+                // Reference-writer undefined unions need normalization by the full decoder.
+                let batch = self.pages.decode_prepared(block, bytes)?;
+                projection.select_decoded(&batch)?
+            }
+        } else {
+            self.pages.decode_page(page, buffer)?
+        };
         self.next_page = page + 1;
         Ok(batch)
     }
 
     /// Reads an event page with only the requested children of its put leg.
     pub fn read_event_page(&mut self, page: usize, put_columns: &[String]) -> Result<RecordBatch> {
-        let buffer = read_block(self.reader.as_mut(), self.pages.block(page)?)?;
+        let buffer = read_block_from(self.buffer.as_ref(), self.reader.as_mut(), self.pages.block(page)?)?;
         let batch = self.pages.decode_event_page(page, buffer, put_columns)?;
         self.next_page = page + 1;
         Ok(batch)
@@ -179,6 +205,7 @@ pub struct PageDecoder {
     schema: SchemaRef,
     source_schema: SchemaRef,
     decoded_schema: SchemaRef,
+    version: arrow_ipc::MetadataVersion,
     blocks: Vec<arrow_ipc::Block>,
     dictionaries: Vec<arrow_ipc::Block>,
 }
@@ -203,7 +230,7 @@ impl PageDecoder {
                 return Err(invalid("Arrow block exceeds data region"));
             }
         }
-        Ok(Self { decoder, schema, source_schema, decoded_schema: decoded, blocks, dictionaries })
+        Ok(Self { decoder, schema, source_schema, decoded_schema: decoded, version: footer.version(), blocks, dictionaries })
     }
 
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
@@ -288,6 +315,10 @@ impl PageDecoder {
     pub fn decode_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
         let block = self.block(page)?;
         let bytes = prepare_block(block, bytes, &self.source_schema, false)?;
+        self.decode_prepared(block, bytes)
+    }
+
+    fn decode_prepared(&self, block: &arrow_ipc::Block, bytes: Buffer) -> Result<RecordBatch> {
         let batch = self.decoder.read_record_batch(block, &bytes).map_err(invalid)?.ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
         undefined::reinstate(batch)
     }

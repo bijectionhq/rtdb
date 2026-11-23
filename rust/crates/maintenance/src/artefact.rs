@@ -58,9 +58,9 @@ pub trait ArtefactBuilder: Send + Sync {
     fn journals_search_deltas(&self) -> bool { false }
 
     async fn prepare_search_delta(&self, _snapshot: rtdb_index::Snapshot, _write: std::sync::Arc<rtdb_index::StagedWrite>,
-        _cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> { Ok(None) }
+        _cancellation: &CancellationToken) -> Result<Option<rtdb_index::PreparedSearchDelta>> { Ok(None) }
 
-    async fn install_search_delta(&self, snapshot: rtdb_index::Snapshot, _write: &rtdb_index::StagedWrite, _delta: Option<&[u8]>,
+    async fn install_search_delta(&self, snapshot: rtdb_index::Snapshot, _write: &rtdb_index::StagedWrite, _delta: Option<rtdb_index::SearchDelta>,
         cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> {
         self.prepare_serving_search(snapshot, cancellation).await
     }

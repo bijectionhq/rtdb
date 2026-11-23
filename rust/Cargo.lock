@@ -4757,6 +4757,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
+ "bytes",
  "chrono",
  "parking_lot",
  "rtdb-columnar",

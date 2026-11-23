@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
     config.btree_map(["."]);
+    config.bytes([".xtdb.log.proto.ResolvedTx.search_delta"]);
     config.include_file("xtdb.rs");
     for field in ["Listy.el", "FixedSizeList.el", "MapType.el", "Maybe.mono", "ColumnMeta.type",
         "VecType.type.decimal", "VecType.type.timestamp", "VecType.type.date", "VecType.type.time",

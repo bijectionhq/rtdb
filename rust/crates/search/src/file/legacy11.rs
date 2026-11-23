@@ -2,12 +2,15 @@
 //! A document is a text run: every version of one entity whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible.
 //! Tokens come from `rtdb-text`, so the index and the residual `MATCH` agree.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow_array::{Array, StringArray};
+use rtdb_columnar::EntityIdRef;
 use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp};
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes, WatchCallback, WatchHandle, WritePtr};
@@ -15,6 +18,8 @@ use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextO
 use tantivy::store::Compressor;
 use tantivy::tokenizer::{PreTokenizedString, Token};
 use tantivy::{Directory, HasLen, Index, IndexSettings, TantivyDocument};
+
+use super::SearchPage;
 
 use crate::member_bounds::{MemberStart, document_member};
 use crate::rank_windows::{extend_impact, window_of};
@@ -35,7 +40,7 @@ const NULL_DOC: u32 = u32::MAX - 1;
 /// IID, three timestamps, operation, and an optional original event position.
 const KEY_BYTES: usize = 16 + 8 + 8 + 8 + 1 + 1 + EventPosition::WIDTH as usize;
 
-use super::{KeyedEvent, SearchRow};
+use super::KeyedEvent;
 
 /// Lifespans, in weeks, below which a document falls into each class but the last, which is unbounded.
 const LIFESPAN_WEEKS: [i64; 5] = [1, 4, 16, 64, 256];
@@ -121,51 +126,68 @@ fn op_of(code: u8) -> Result<EventOp> { match code { 0 => Ok(EventOp::Put), 1 =>
 
 struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, row_identity_starts: Vec<u32>, row_identities: Vec<u8>, doc_iids: Vec<[u8; 16]>, token_lengths: Vec<u32>, identity_starts: Vec<u32>, identities: Vec<u8>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
 
-/// One entity's rows while they arrive: each row's position and header, and per column, its value as an index into the column's distinct values.
 #[derive(Default)]
-struct Entity { iid: Option<[u8; 16]>, identity: Option<EntityId>, rows: Vec<(u32, EventHeader)>, values: Vec<(Vec<Option<usize>>, Vec<Vec<String>>, std::collections::HashMap<Vec<String>, usize>)> }
+struct EntityColumn {
+    rows: Vec<Option<usize>>,
+    tokens: Vec<StringArray>,
+    distinct: HashMap<u64, Vec<usize>>,
+}
+
+#[derive(Default)]
+struct Entity {
+    iid: Option<[u8; 16]>,
+    rows: Vec<(u32, EventHeader)>,
+    values: Vec<EntityColumn>,
+}
 
 impl Entity {
     fn new(columns: usize) -> Self { Self { values: (0..columns).map(|_| Default::default()).collect(), ..Self::default() } }
-    fn push(&mut self, ordinal: u32, row: SearchRow) -> Result<()> {
-        self.iid = Some(row.iid);
-        if let Some(id) = row.identity {
-            if id.iid().0 != row.iid || self.identity.as_ref().is_some_and(|previous| previous != &id) {
-                return Err(fault("Owned search input has conflicting complete identities"));
-            }
-            self.identity = Some(id);
+
+    fn push(&mut self, ordinal: u32, row: super::IndexedRow<'_>) {
+        self.iid = Some(row.header.iid.0);
+        self.rows.push((ordinal, EventHeader { commit_position: 0, ..row.header }));
+        for (column, value) in self.values.iter_mut().zip(row.values) {
+            column.rows.push(value.map(|tokens| {
+                let mut hash = DefaultHasher::new();
+                for term in tokens.iter().flatten() { term.hash(&mut hash); }
+                let positions = column.distinct.entry(hash.finish()).or_default();
+                if let Some(&position) = positions.iter().find(|&&position| column.tokens[position] == tokens) {
+                    return position;
+                }
+                let position = column.tokens.len();
+                positions.push(position);
+                column.tokens.push(tokens);
+                position
+            }));
         }
-        self.rows.push((ordinal, EventHeader { position: row.position, commit_position: 0, iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
-        for ((indices, distinct, seen), value) in self.values.iter_mut().zip(row.values) {
-            indices.push(value.map(|tokens| *seen.entry(tokens.clone()).or_insert_with(|| { distinct.push(tokens); distinct.len() - 1 })));
-        }
-        Ok(())
     }
 }
 
 /// Builds the search file over a data file's pages of rows, in order, building its segment in `directory` and writing the bundle to `output`.
 /// The bytes are a function of the rows, their pages, the columns, `identity` and `ceiling` alone, wherever the segment is built, so every builder of one job writes the same object.
 /// Builds a catalog-published file bound to an ordered definition version.
-pub(crate) fn write_versioned_group<D, W, P>(
+pub(crate) fn write_versioned_group<D, W, P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: i64,
     ceiling: Option<i64>, directory: D, output: W,
 ) -> Result<Vec<Section>>
 where
     D: Directory + Clone + 'static,
     W: std::io::Write,
-    P: IntoIterator<Item = Result<Vec<SearchRow>>>,
+    P: IntoIterator<Item = Result<I>>,
+    I: SearchPage,
 {
     write_group(columns, members, identity, Some(version), ceiling, directory, output)
 }
 
-fn write_group<D, W, P>(
+fn write_group<D, W, P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: Option<i64>,
     ceiling: Option<i64>, directory: D, output: W,
 ) -> Result<Vec<Section>>
 where
     D: Directory + Clone + 'static,
     W: std::io::Write,
-    P: IntoIterator<Item = Result<Vec<SearchRow>>>,
+    P: IntoIterator<Item = Result<I>>,
+    I: SearchPage,
 {
     let (schema, fields) = schema(columns);
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
@@ -182,37 +204,46 @@ where
         let mut previous: Option<([u8; 16], (i64, Option<EventPosition>))> = None;
         for page in pages {
             sidecar.page_starts.push(rows);
-            for row in page? {
+            let mut page = page?;
+            for index in 0..page.len() {
+                let row = page.row(index, columns)?;
+                let header = row.header;
+                let iid = header.iid.0;
+                let system = (header.system_from.0, header.position);
                 if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
-                if previous.is_none() && previous_member_iid.is_some_and(|iid| iid >= row.iid) {
+                if previous.is_none() && previous_member_iid.is_some_and(|previous| previous >= iid) {
                     return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));
                 }
-                if let Some((iid, system)) = previous {
-                    if iid > row.iid || (iid == row.iid && system < (row.system_from, row.position)) {
+                if let Some((previous_iid, previous_system)) = previous {
+                    if previous_iid > iid || (previous_iid == iid && previous_system < system) {
                         return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID and descending system-time order"));
                     }
-                    if iid != row.iid {
-                        for entity in std::mem::take(&mut entities).into_values() {
-                            runs(&mut writer, &fields, &mut sidecar, entity)?;
+                    if previous_iid != iid {
+                        for (identity, entity) in std::mem::take(&mut entities) {
+                            runs(&mut writer, &fields, &mut sidecar, identity, entity)?;
                         }
                     }
                 }
-                previous = Some((row.iid, (row.system_from, row.position)));
+                previous = Some((iid, system));
                 for docs in &mut sidecar.row_docs { docs.push(NO_DOC); }
-                sidecar.keys.extend_from_slice(&row.iid);
-                for value in [row.system_from, row.valid_from, row.valid_to] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }
-                sidecar.keys.push(op_code(row.op));
-                sidecar.keys.push(u8::from(row.position.is_some()));
-                sidecar.keys.extend_from_slice(&row.position.map_or([0; EventPosition::WIDTH as usize], EventPosition::to_bytes));
-                if let Some(id) = &row.identity { sidecar.row_identities.extend_from_slice(&id.handle_bytes()); }
+                sidecar.keys.extend_from_slice(&iid);
+                for value in [system.0, header.valid_time.lower().0, header.valid_time.upper().0] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }
+                sidecar.keys.push(op_code(header.op));
+                sidecar.keys.push(u8::from(header.position.is_some()));
+                sidecar.keys.extend_from_slice(&header.position.map_or([0; EventPosition::WIDTH as usize], EventPosition::to_bytes));
+                let identity = row.key.as_deref().map(EntityIdRef::from_handle_bytes).transpose()?.map(EntityIdRef::into_owned);
+                if let Some(id) = &identity {
+                    if id.iid().0 != iid { return Err(fault("Owned search input has conflicting complete identities")); }
+                    sidecar.row_identities.extend_from_slice(&id.handle_bytes());
+                }
                 sidecar.row_identity_starts.push(u32::try_from(sidecar.row_identities.len()).map_err(fault)?);
-                entities.entry(row.identity.clone()).or_insert_with(|| Entity::new(columns.len())).push(rows, row)?;
+                entities.entry(identity).or_insert_with(|| Entity::new(columns.len())).push(rows, row);
                 rows = rows.checked_add(1).ok_or_else(|| fault("A search file holds at most u32::MAX rows"))?;
             }
         }
         previous_member_iid = previous.map(|(iid, _)| iid).or(previous_member_iid);
-        for entity in entities.into_values() {
-            runs(&mut writer, &fields, &mut sidecar, entity)?;
+        for (identity, entity) in entities {
+            runs(&mut writer, &fields, &mut sidecar, identity, entity)?;
         }
     }
     if sidecar.member_starts.is_empty() { return Err(fault("A search file holds at least one member")); }
@@ -241,27 +272,27 @@ fn coalesce(mut rectangles: Vec<[i64; 4]>) -> Vec<[i64; 4]> {
 
 /// One entity's rows become its text runs, per column: a document for each distinct value its visible versions hold there, with every rectangle where one of them is visible.
 /// A visible version whose column is null or absent belongs to no run of that column, and is marked as null.
-fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sidecar: &mut Accumulated, entity: Entity) -> Result<()> {
+fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sidecar: &mut Accumulated, identity: Option<EntityId>, entity: Entity) -> Result<()> {
     let Some(iid) = entity.iid else { return Ok(()) };
     let mut visible: Vec<Vec<[i64; 4]>> = vec![Vec::new(); entity.rows.len()];
     for (index, rectangle) in rtdb_temporal::visibility(entity.rows.iter().enumerate().map(|(index, (_, header))| (header, index)))? {
         visible[index].push([rectangle.valid_time.lower().0, rectangle.valid_time.upper().0, rectangle.system_time.lower().0, rectangle.system_time.upper().0]);
     }
-    for (column, ((indices, distinct, _), field)) in entity.values.into_iter().zip(fields).enumerate() {
-        let mut members: Vec<Vec<usize>> = vec![Vec::new(); distinct.len()];
-        for (index, value) in indices.iter().enumerate() {
+    for (column, (values, field)) in entity.values.into_iter().zip(fields).enumerate() {
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); values.tokens.len()];
+        for (index, value) in values.rows.iter().enumerate() {
             if visible[index].is_empty() { continue; }
             match value { Some(value) => members[*value].push(index), None => sidecar.row_docs[column][entity.rows[index].0 as usize] = NULL_DOC }
         }
-        for (tokens, members) in distinct.into_iter().zip(members) {
+        for (tokens, members) in values.tokens.into_iter().zip(members) {
             if members.is_empty() { continue; }
             let doc = u32::try_from(sidecar.doc_iids.len()).map_err(fault)?;
             sidecar.token_lengths.push(u32::try_from(tokens.len()).map_err(fault)?);
             let mut document = TantivyDocument::new();
             if !tokens.is_empty() {
                 let mut offset = 0;
-                let tokens = tokens.into_iter().enumerate().map(|(position, text)| {
-                    let token = Token { offset_from: offset, offset_to: offset + text.len(), position, text, position_length: 1 };
+                let tokens = tokens.iter().flatten().enumerate().map(|(position, text)| {
+                    let token = Token { offset_from: offset, offset_to: offset + text.len(), position, text: text.to_owned(), position_length: 1 };
                     offset = token.offset_to + 1;
                     token
                 }).collect();
@@ -275,7 +306,7 @@ fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sideca
             sidecar.rectangles.extend(rectangles);
             sidecar.rectangle_starts.push(u32::try_from(sidecar.rectangles.len()).map_err(fault)?);
             sidecar.doc_iids.push(iid);
-            if let Some(id) = &entity.identity { sidecar.identities.extend_from_slice(&id.handle_bytes()); }
+            if let Some(id) = &identity { sidecar.identities.extend_from_slice(&id.handle_bytes()); }
             sidecar.identity_starts.push(u32::try_from(sidecar.identities.len()).map_err(fault)?);
             sidecar.column_docs[column] += 1;
             for index in members { sidecar.row_docs[column][entity.rows[index].0 as usize] = doc; }
@@ -694,17 +725,27 @@ impl SearchFile {
 
 }
 
-pub(super) fn decode(bytes: bytes::Bytes, columns: &[String]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    decode_to(bytes, columns, &mut output, None)?;
-    Ok(output)
+pub(super) fn decode_batches(bytes: bytes::Bytes, columns: &[String]) -> Result<Vec<arrow_array::RecordBatch>> {
+    let mut pages = Vec::new();
+    transcode(bytes, columns, None, |tables| {
+        pages.push(super::layout::record(super::LEGACY_FORMAT_VERSION, tables)?);
+        Ok(())
+    })?;
+    Ok(pages)
 }
 
 pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Write,
     memory: Option<&Arc<rtdb_columnar::MemoryBudget>>) -> Result<()> {
+    let mut writer = super::layout::Writer::new(output, super::LEGACY_FORMAT_VERSION)?;
+    transcode(bytes, columns, memory, |tables| writer.page(tables).map(|_| ()))?;
+    writer.finish()
+}
+
+fn transcode(bytes: bytes::Bytes, columns: &[String], memory: Option<&Arc<rtdb_columnar::MemoryBudget>>,
+    mut page: impl FnMut(Vec<(super::layout::Table, arrow_array::StructArray)>) -> Result<()>) -> Result<()> {
     use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array, builder::StringBuilder};
     use tantivy::{DocSet, postings::Postings as _};
-    use super::{LEGACY_FORMAT_VERSION, layout::{Table, Writer, item_of, list}, postings::{POSTING_TERMS, PostingBuilder, posting_table}, write::{Events, Runs}};
+    use super::{LEGACY_FORMAT_VERSION, layout::{Table, item_of, list}, postings::{POSTING_TERMS, PostingBuilder, posting_table}, write::{Events, Runs}};
 
     let file = SearchFile::open(bytes, columns)?;
     let sidecar = &file.sidecar;
@@ -717,7 +758,6 @@ pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Wr
         .saturating_add(usize::try_from(tokens).unwrap_or(usize::MAX).saturating_mul(20))
         .saturating_add(4096);
     let _scratch = memory.map(|memory| memory.reserve(bytes)).transpose()?;
-    let mut writer = Writer::new(output, LEGACY_FORMAT_VERSION)?;
     let header = Table::Header.array(vec![
         Arc::new(Int32Array::from(vec![LEGACY_FORMAT_VERSION])), Arc::new(Int32Array::from(vec![rtdb_text::ANALYZER_VERSION])),
         Arc::new(Int64Array::from(vec![sidecar.version])), Arc::new(FixedSizeBinaryArray::try_from_iter([sidecar.identity].iter()).map_err(fault)?),
@@ -776,7 +816,7 @@ pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Wr
     let column_table = Table::Columns.array(vec![Arc::new(StringArray::from_iter_values(columns)) as ArrayRef,
         Arc::new(UInt32Array::from(sidecar.column_docs.clone())), Arc::new(UInt64Array::from_iter_values(inverted.iter().map(|index| index.as_ref().map_or(0, |index| index.total_num_tokens()))))])?;
     let sections = sidecar.sections.iter().copied().map(Section::into_arrow).collect::<Vec<_>>();
-    writer.page([(Table::Header, header), (Table::Members, members), (Table::Pages, pages), (Table::Columns, column_table),
+    page(vec![(Table::Header, header), (Table::Members, members), (Table::Pages, pages), (Table::Columns, column_table),
         (Table::Events, events.finish()?.0), (Table::Runs, runs.finish()?), (Table::RowRuns, row_runs),
         (Table::Terms, term_table), (Table::Sections, super::sections_array(&sections)?)])?;
     let mut groups = Vec::with_capacity(POSTING_TERMS);
@@ -796,14 +836,13 @@ pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Wr
             }
             groups.push(builder);
             if groups.len() == POSTING_TERMS {
-                writer.page([(Table::Postings, posting_table(std::mem::take(&mut groups), STORED_IMPACTS as usize)?)])?;
+                page(vec![(Table::Postings, posting_table(std::mem::take(&mut groups), STORED_IMPACTS as usize)?)])?;
             }
         }
     }
     if !groups.is_empty() {
-        writer.page([(Table::Postings, posting_table(groups, STORED_IMPACTS as usize)?)])?;
+        page(vec![(Table::Postings, posting_table(groups, STORED_IMPACTS as usize)?)])?;
     }
-    writer.finish()?;
     Ok(())
 }
 

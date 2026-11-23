@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow_array::{Array, Float64Array, Int64Array, LargeListArray, StringArray, UInt32Array,
+use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, LargeListArray, StringArray, UInt32Array,
     builder::{LargeListBuilder, StringBuilder, UInt32Builder}, cast::AsArray, types::UInt32Type};
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
@@ -53,6 +53,7 @@ pub(crate) struct LivePostingPage {
     terms: StringArray,
     rows: LargeListArray,
     tokens: LargeListArray,
+    shared_tokens: bool,
     peak_scores: Float64Array,
     peak_ids: Int64Array,
     minimum_id: Option<i64>,
@@ -61,15 +62,17 @@ pub(crate) struct LivePostingPage {
 
 impl LivePostingPage {
     fn bytes(&self) -> usize {
-        self.terms.get_array_memory_size() + self.rows.get_array_memory_size() + self.tokens.get_array_memory_size()
+        self.terms.get_array_memory_size() + self.rows.get_array_memory_size()
+            + if self.shared_tokens { self.tokens.nulls().map_or(0, |nulls| nulls.buffer().capacity()) }
+              else { self.tokens.get_array_memory_size() }
             + self.peak_scores.get_array_memory_size() + self.peak_ids.get_array_memory_size() + 256
     }
 
     fn from_rows(segment: &rtdb_index::LiveTable, column: &str, from: u32, to: u32,
         available: usize, cancellation: &CancellationToken,
-        prepared: Option<&dyn Fn(u32) -> Option<StringArray>>) -> Result<Option<Self>> {
-        let mut postings = BTreeMap::<String, (Vec<u32>, crate::rank_cutoff::RankKey)>::new();
-        let mut tokens = LargeListBuilder::new(StringBuilder::new());
+        prepared: Option<(&BooleanArray, LargeListArray, std::ops::Range<usize>)>) -> Result<Option<Self>> {
+        let mut builder = prepared.is_none().then(|| LargeListBuilder::new(StringBuilder::new()));
+        let mut ids = Vec::with_capacity((to - from) as usize);
         let mut minimum_id: Option<i64> = Some(i64::MAX);
         let mut estimated = 4096 + (to - from) as usize * 32;
         for row in from..to {
@@ -81,39 +84,60 @@ impl LivePostingPage {
                 if estimated > available { return Ok(None); }
                 let id = crate::lane::integer_sql_id(&event);
                 minimum_id = minimum_id.zip(id).map(|(left, right)| left.min(right));
-                let analyzed = if let Some(prepared) = prepared {
-                    prepared(row).ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.search/invalid-delta", "Committed text row has no token sequence"))?
-                } else { rtdb_text::analyze(text) };
-                let mut frequencies = BTreeMap::<&str, u32>::new();
-                for token in analyzed.iter().flatten() {
-                    tokens.values().append_value(token);
-                    *frequencies.entry(token).or_default() += 1;
-                }
-                for (term, frequency) in frequencies {
-                    let score = rtdb_text::unit_term_score(frequency);
-                    let (rows, peak) = postings.entry(term.to_owned()).or_insert_with(|| {
-                        (Vec::new(), crate::rank_cutoff::RankKey::integer(score, id))
-                    });
-                    rows.push(row);
-                    if score > peak.score {
-                        *peak = crate::rank_cutoff::RankKey::integer(score, id);
-                    } else if score == peak.score {
-                        let minimum = peak.integer_id().zip(id).map(|(left, right)| left.min(right));
-                        *peak = crate::rank_cutoff::RankKey::integer(peak.score, minimum);
+                if let Some((present, _, range)) = &prepared {
+                    if !present.value(range.start + ids.len()) {
+                        return Err(rtdb_types::Anomaly::fault("rtdb.search/invalid-delta", "Committed text row has no token sequence"));
                     }
+                } else if let Some(builder) = &mut builder {
+                    rtdb_text::append_tokens(text, builder.values());
+                    builder.append(true);
                 }
-                tokens.append(true);
+                ids.push(Some(id));
             } else {
-                tokens.append(false);
+                if let Some(builder) = &mut builder { builder.append(false); }
+                ids.push(None);
             }
         }
-        let (terms, entries): (Vec<_>, Vec<_>) = postings.into_iter().unzip();
-        let (postings, peaks): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let shared_tokens = prepared.is_some();
+        let tokens = if let Some((_, list, _)) = prepared {
+            let nulls = ids.iter().any(Option::is_none)
+                .then(|| NullBuffer::new(BooleanBuffer::collect_bool(ids.len(), |row| ids[row].is_some())));
+            let (field, offsets, values, _) = list.into_parts();
+            LargeListArray::new(Arc::new(field.as_ref().clone().with_nullable(true)), offsets, values, nulls)
+        } else {
+            builder.expect("unprepared page has a token builder").finish()
+        };
+        let values = tokens.values().as_string::<i32>();
+        let offsets = tokens.value_offsets();
+        let mut postings = BTreeMap::<&str, (Vec<u32>, crate::rank_cutoff::RankKey)>::new();
+        for (row, id) in ids.into_iter().enumerate() {
+            if cancellation.is_cancelled() { return Ok(None); }
+            let Some(id) = id else { continue; };
+            let mut frequencies = BTreeMap::<&str, u32>::new();
+            for token in offsets[row] as usize..offsets[row + 1] as usize {
+                *frequencies.entry(values.value(token)).or_default() += 1;
+            }
+            for (term, frequency) in frequencies {
+                let score = rtdb_text::unit_term_score(frequency);
+                let (rows, peak) = postings.entry(term).or_insert_with(|| {
+                    (Vec::new(), crate::rank_cutoff::RankKey::integer(score, id))
+                });
+                rows.push(from + row as u32);
+                if score > peak.score {
+                    *peak = crate::rank_cutoff::RankKey::integer(score, id);
+                } else if score == peak.score {
+                    let minimum = peak.integer_id().zip(id).map(|(left, right)| left.min(right));
+                    *peak = crate::rank_cutoff::RankKey::integer(peak.score, minimum);
+                }
+            }
+        }
+        let terms = StringArray::from_iter_values(postings.keys().copied());
+        let (postings, peaks): (Vec<_>, Vec<_>) = postings.into_values().unzip();
         let offsets = OffsetBuffer::from_lengths(postings.iter().map(Vec::len));
         let rows = UInt32Array::from_iter_values(postings.into_iter().flatten());
         let field = Arc::new(Field::new("item", DataType::UInt32, false));
-        Ok(Some(Self { first_row: from, terms: StringArray::from(terms),
-            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens: tokens.finish(),
+        Ok(Some(Self { first_row: from, terms,
+            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens, shared_tokens,
             peak_scores: Float64Array::from_iter_values(peaks.iter().map(|peak| peak.score)),
             peak_ids: Int64Array::from_iter(peaks.into_iter().map(crate::rank_cutoff::RankKey::integer_id)), minimum_id, _reservation: None }))
     }
@@ -207,8 +231,6 @@ impl ServingPostings {
                 None => Some(postings.rows),
             };
             let Some(first) = first else { continue; };
-            let tokens = |row: u32| commit.and_then(|(delta, _)| delta.tokens(&key, (row - first) as usize));
-            let prepared = commit.map(|_| &tokens as &dyn Fn(u32) -> Option<StringArray>);
             while postings.rows < segment.row_count() {
                 if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
                 let from = postings.rows;
@@ -221,6 +243,7 @@ impl ServingPostings {
                     }
                 }
                 let Ok(mut reservation) = budget.reserve(bytes) else { break; };
+                let prepared = commit.map(|(delta, _)| delta.page(&key, (from - first) as usize..(to - first) as usize));
                 let Some(mut page) = LivePostingPage::from_rows(segment, column, from, to, bytes, cancellation, prepared)? else { break; };
                 let retained = page.bytes();
                 if retained > bytes { break; }
@@ -415,14 +438,18 @@ impl SearchRuntime {
     }
 
     pub(crate) fn prepare_delta(&self, definitions: &[SearchDefinition], write: &rtdb_index::StagedWrite,
-        cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> {
+        cancellation: &CancellationToken) -> Result<Option<rtdb_index::PreparedSearchDelta>> {
         crate::delta::prepare(definitions, write, &self.serving_admission, cancellation)
     }
 
-    pub(crate) fn install_delta(&self, snapshot: &Snapshot, write: &rtdb_index::StagedWrite, encoded: Option<&[u8]>,
+    pub(crate) fn install_delta(&self, snapshot: &Snapshot, write: &rtdb_index::StagedWrite, delta: Option<rtdb_index::SearchDelta>,
         cancellation: &CancellationToken) -> Result<rtdb_index::ServingSearch> {
-        let Some(encoded) = encoded else { return Ok(rtdb_index::ServingSearch::new(ServingPostings::preserve(snapshot))); };
-        let result = crate::delta::Delta::read(encoded, write, &self.serving_admission).and_then(|delta| {
+        let Some(delta) = delta else { return Ok(rtdb_index::ServingSearch::new(ServingPostings::preserve(snapshot))); };
+        let delta = match delta {
+            rtdb_index::SearchDelta::Prepared(delta) => crate::delta::Delta::new(delta.batch, write),
+            rtdb_index::SearchDelta::Replayed(encoded) => crate::delta::Delta::read(encoded, write, &self.serving_admission),
+        };
+        let result = delta.and_then(|delta| {
             let columns = delta.columns().cloned().collect();
             ServingPostings::extend(snapshot, columns, Some((&delta, write)), &self.serving_admission, cancellation)
         });
@@ -673,14 +700,11 @@ impl SearchRuntime {
             let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
             let (indexed, token) = (columns.to_vec(), cancellation.clone());
             let input_memory = Arc::clone(memory);
-            let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-                let mut bytes = Vec::new();
-                let pages = crate::lane::search_pages_from_reader(std::io::Cursor::new(lease), token, input_memory)?;
-                crate::file::write_query_pages(&indexed, pages, ceiling, &mut bytes, indexing)?;
-                Ok(bytes)
+            let (mut file, size) = tokio::task::spawn_blocking(move || {
+                let pages = crate::lane::search_pages_from_buffer(
+                    arrow_buffer::Buffer::from(bytes::Bytes::from_owner(lease)), &indexed, token, input_memory)?;
+                crate::file::build_query_pages(&indexed, pages, ceiling, indexing)
             }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
-            let size = bytes.len();
-            let mut file = SearchFile::open(bytes, columns)?;
             if !share { file = file.with_reservation(memory.reserve(size)?); }
             let file = Arc::new(file);
             if share { self.built.lock().insert(cache_key.clone(), (Arc::downgrade(storage), Arc::clone(&file)), size); }
@@ -844,6 +868,46 @@ impl SearchRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_build_live_pages_keep_the_delta_slice_and_its_charge() {
+        use rtdb_index::{IndexBatch, LiveIndex, StagedWrite, StoredEvent, StoredOperation, TableWrite};
+        use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value};
+
+        let table = TableRef::new("public", "docs");
+        let memory = MemoryBudget::new(8 << 20);
+        let delta_memory = MemoryBudget::new(8 << 20);
+        let cancellation = CancellationToken::new();
+        let row = |id, operation| StoredEvent { position: None, origin: None, entity_key: None, iid: EntityId::Integer(id).iid(),
+            system_from: Timestamp(2), commit_position: 0, valid_time: Interval::ALL, operation, recency: None };
+        let events = [
+            row(1, StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8("ignored prefix".into()))]))),
+            row(2, StoredOperation::Delete),
+            row(3, StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8("Audit report audit".into()))]))),
+        ];
+        let batch = IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
+        let write = StagedWrite::new(TransactionKey { tx_id: TxId(1), system_time: Timestamp(2) }, None, BlockIndex(0),
+            BTreeMap::from([(table.clone(), TableWrite::new(StructFields::new(), Some(batch)))])).unwrap();
+        let live = LiveIndex::new(BlockIndex(0), None, Default::default()).apply(&write).unwrap();
+        let segment = &live.tables()[&table];
+        let definition = SearchDefinition { name: "docs".into(), table: table.clone(), columns: vec!["body".into()], version: 1, history: true };
+        let encoded = crate::delta::prepare(&[definition], &write, &delta_memory, &cancellation).unwrap().unwrap();
+        let delta = crate::delta::Delta::new(encoded.batch, &write).unwrap();
+        let key = (table, "body".into());
+        let input = delta.page(&key, 1..3);
+        let child = input.1.values().as_string::<i32>().value_data().as_ptr();
+        let page = LivePostingPage::from_rows(segment, "body", 1, 3, 1 << 20, &cancellation, Some(input)).unwrap().unwrap();
+        drop(delta);
+        drop(encoded.encoded);
+        assert_eq!(page.tokens.values().as_string::<i32>().value_data().as_ptr(), child);
+        assert!(page.tokens.is_null(0));
+        assert!(page.tokens.value_offsets()[0] > 0);
+        assert_eq!(page.postings("audit"), Some(&[2][..]));
+        assert!(rtdb_text::Query::parse(r#""report audit""#).matches_arrow(&page.tokens(2)));
+        assert!(delta_memory.used_bytes() > 0);
+        drop(page);
+        assert_eq!(delta_memory.used_bytes(), 0);
+    }
 
     #[test]
     fn the_least_recently_used_entries_go_once_the_weight_exceeds_the_limit() {

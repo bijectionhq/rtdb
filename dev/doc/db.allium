@@ -598,7 +598,9 @@ variant ResolvedTxMessage : ReplicaMessage {
     error: Throwable?                         -- the abort reason, null if committed
     db_op: DbOp?                              -- an attach or detach side-effect, if any
     table_data: Map<String, Bytes>            -- the resolved row data per table
-    -- An admitted public history index can carry a derived token delta in the same accepted record as the table data.
+    -- An admitted public history index can carry an Arrow IPC token delta in the same accepted record as the table data.
+    -- Leader readback can install the prepared Arrow batch for that delta once the accepted field is confirmed.
+    -- Replay decodes token vectors directly from the accepted IPC buffers.
     search_delta: Bytes?
     external_source_token: ExternalSourceToken?
 

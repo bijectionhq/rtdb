@@ -279,14 +279,19 @@ impl<W: Write> HistoryWriter<W> {
 
     pub fn append_forward(&mut self, page: u32, events: &EventBatch, columns: &[String],
         mut revision: impl FnMut(crate::data::PutText<'_>) -> Result<Option<[u8; 32]>>) -> Result<()> {
-        let schema = forward_schema(columns.len());
+        self.append_forward_revisions(page, events, columns.len(), |_, event, column| revision(event.put_text(&columns[column])?))
+    }
+
+    pub fn append_forward_revisions(&mut self, page: u32, events: &EventBatch, columns: usize,
+        mut revision: impl FnMut(usize, &crate::data::EventRef<'_>, usize) -> Result<Option<[u8; 32]>>) -> Result<()> {
+        let schema = forward_schema(columns);
         for first in (0..events.len()).step_by(ROWS_PER_RANGE) {
             let end = (first + ROWS_PER_RANGE).min(events.len());
             let _scratch = self.charge.budget().reserve(16_384usize.saturating_add(
-                (end - first).saturating_mul(320usize.saturating_add(columns.len().saturating_mul(128)))))?;
+                (end - first).saturating_mul(320usize.saturating_add(columns.saturating_mul(128)))))?;
             let mut iids = FixedSizeBinaryBuilder::with_capacity(end - first, 16);
             let mut origin = FixedSizeBinaryBuilder::with_capacity(end - first, EventOrigin::WIDTH);
-            let mut revisions: Vec<_> = columns.iter().map(|_| FixedSizeBinaryBuilder::with_capacity(end - first, 32)).collect();
+            let mut revisions: Vec<_> = (0..columns).map(|_| FixedSizeBinaryBuilder::with_capacity(end - first, 32)).collect();
             let mut low = None;
             let mut high = None;
             for row in first..end {
@@ -297,8 +302,8 @@ impl<W: Write> HistoryWriter<W> {
                 high = Some(iid);
                 iids.append_value(iid.0).map_err(invalid)?;
                 if let Some(value) = events.origin(row)? { origin.append_value(value.0).map_err(invalid)?; } else { origin.append_null(); }
-                for (column, values) in columns.iter().zip(&mut revisions) {
-                    if let Some(value) = revision(event.put_text(column)?)? {
+                for (column, values) in revisions.iter_mut().enumerate() {
+                    if let Some(value) = revision(row, &event, column)? {
                         values.append_value(value).map_err(invalid)?;
                     } else { values.append_null(); }
                 }

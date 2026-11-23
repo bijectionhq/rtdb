@@ -13,7 +13,7 @@ use rtdb_types::{Anomaly, EventOp, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::{SearchRow, file::{IndexedRow, SearchPage, artefact_identity, write_versioned_group}, definitions::SearchDefinition};
-use rtdb_maintenance::input::{download, open_input, read_page};
+use rtdb_maintenance::input::{download, read_page};
 
 mod logical;
 mod forward;
@@ -85,7 +85,7 @@ impl ArtefactBuilder for SearchBuilder {
     fn journals_search_deltas(&self) -> bool { self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION }
 
     async fn prepare_search_delta(&self, snapshot: rtdb_index::Snapshot, write: Arc<rtdb_index::StagedWrite>,
-        cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> {
+        cancellation: &CancellationToken) -> Result<Option<rtdb_index::PreparedSearchDelta>> {
         if write.tables().values().all(|table| table.row_count() == 0) { return Ok(None); }
         let result = async {
             let definitions = self.runtime.definitions(&self.database, &[snapshot], &self.storage,
@@ -101,17 +101,20 @@ impl ArtefactBuilder for SearchBuilder {
     }
 
     async fn install_search_delta(&self, snapshot: rtdb_index::Snapshot, write: &rtdb_index::StagedWrite,
-        delta: Option<&[u8]>, cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> {
+        delta: Option<rtdb_index::SearchDelta>, cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> {
         if !self.journals_search_deltas() { return self.prepare_serving_search(snapshot, cancellation).await; }
-        let delta = delta.filter(|delta| delta.len() <= crate::delta::MAX_BYTES);
-        let reservation = delta.and_then(|bytes| self.memory.reserve(bytes.len()).ok());
-        let delta = delta.filter(|_| reservation.is_some()).map(<[u8]>::to_vec);
+        let reservation = match &delta {
+            Some(rtdb_index::SearchDelta::Prepared(delta)) => self.memory.reserve(delta.encoded.len()).ok(),
+            Some(rtdb_index::SearchDelta::Replayed(bytes)) if bytes.len() <= crate::delta::MAX_BYTES => self.memory.reserve(bytes.len()).ok(),
+            _ => None,
+        };
+        let delta = delta.filter(|_| reservation.is_some());
         let runtime = Arc::clone(&self.runtime);
         let write = write.clone();
         let cancellation = cancellation.clone();
         tokio::task::spawn_blocking(move || {
             let _reservation = reservation;
-            runtime.install_delta(&snapshot, &write, delta.as_deref(), &cancellation).map(Some)
+            runtime.install_delta(&snapshot, &write, delta, &cancellation).map(Some)
         }).await.map_err(fault)?
     }
 
@@ -153,8 +156,15 @@ impl ArtefactBuilder for SearchBuilder {
         for definition in definitions.into_iter().filter(|definition| &definition.table == table) {
             if definition.id.ends_with("f16w") {
                 let public = logical::LogicalIndex::from_history(&definition);
-                match self.seal_logical(&public, snapshot, trie, file, size, cancellation).await {
-                    Ok(record) => records.extend(record),
+                match self.seal_logical(&public, &definition, snapshot, trie, file, size, cancellation).await {
+                    Ok(Some((record, forward))) => {
+                        records.push(record);
+                        if let Some(forward) = forward {
+                            records.push(forward);
+                            continue;
+                        }
+                    }
+                    Ok(None) => (),
                     Err(error) if is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
                     Err(error) => return Err(error),
                 }
@@ -365,7 +375,7 @@ impl ArtefactBuilder for SearchBuilder {
         let version = definition.version;
         let owned = rtdb_types::TableRef::owned_schema(&definition.table.schema);
         let recorded_stats = tokio::task::spawn_blocking(move || -> Result<_> {
-            let opened = inputs.into_iter().map(|input| open_input(input, &memory)).collect::<Result<Vec<_>>>()?;
+            let opened = inputs.into_iter().map(|input| open_search_input(input, &columns, &memory)).collect::<Result<Vec<_>>>()?;
             let file = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
             let uuid_iids = (format >= crate::file::TREE_FORMAT_VERSION && !owned).then(|| Arc::new(AtomicBool::new(true)));
             let members = opened.into_iter().map(|(reader, opening)| {
@@ -417,19 +427,26 @@ fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool,
         let row = segment.row_of_version(header.version()).ok().flatten()?;
         Some((postings, segment, row))
     });
-    let revisions = if mode == crate::file::BuildMode::Combined { Vec::new() } else {
-        columns.iter().map(|column| Ok(match event.put_text(column)? {
-            PutText::Utf8(text) => Some(logical::text_revision(text)),
-            _ => None,
-        })).collect::<Result<_>>()?
-    };
-    let values = if mode == crate::file::BuildMode::History { Vec::new() } else { columns.iter().map(|column| Ok(match event.put_text(column)? {
-        PutText::Missing => None,
-        PutText::Other if mode == crate::file::BuildMode::Postings => None,
-        PutText::Utf8(text) => Some(cached.and_then(|(postings, segment, row)| postings.tokens_for_row(segment, column, row))
-            .unwrap_or_else(|| rtdb_text::analyze(text))),
-        PutText::Other => Some(arrow_array::StringArray::from(Vec::<&str>::new())),
-    })).collect::<Result<_>>()? };
+    let mut values = Vec::new();
+    let mut revisions = Vec::new();
+    for column in columns {
+        let text = event.put_text(column)?;
+        if mode == crate::file::BuildMode::History {
+            revisions.push(match text { PutText::Utf8(text) => Some(logical::text_revision(text)), _ => None });
+            continue;
+        }
+        let tokens = match text {
+            PutText::Missing => None,
+            PutText::Other if mode == crate::file::BuildMode::Postings => None,
+            PutText::Utf8(text) => Some(cached.and_then(|(postings, segment, row)| postings.tokens_for_row(segment, column, row))
+                .unwrap_or_else(|| rtdb_text::analyze(text))),
+            PutText::Other => Some(arrow_array::StringArray::from(Vec::<&str>::new())),
+        };
+        if mode == crate::file::BuildMode::Postings {
+            revisions.push(tokens.as_ref().map(logical::revision_of));
+        }
+        values.push(tokens);
+    }
     let key = if with_identity {
         let key = event.physical_entity_key().ok_or_else(|| fault("Owned search event is missing its complete identity"))?;
         let identity = EntityIdRef::from_handle_bytes(key)?;
@@ -485,7 +502,7 @@ pub(crate) struct ArrowSearchPage {
 impl SearchPage for ArrowSearchPage {
     fn len(&self) -> usize { self.events.len() }
 
-    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
+    fn row(&mut self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
         let event = self.events.borrow_event(row)?;
         if let Some(proof) = &self.uuid_iids
             && proof.load(Ordering::Relaxed) && !uuid_id_matches_iid(&event)
@@ -539,17 +556,29 @@ impl Iterator for PageRows {
 
 /// Reads a data file's indexed rows for diagnostics and fixtures.
 pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
-    let pages = search_pages_from_reader(std::io::Cursor::new(Arc::<[u8]>::from(data)), cancellation.clone(), MemoryBudget::new(usize::MAX))?;
+    let pages = search_pages_from_buffer(arrow_buffer::Buffer::from(data), columns, cancellation.clone(), MemoryBudget::new(usize::MAX))?;
     Ok(pages.map(move |page| {
-        let page = page?;
+        let mut page = page?;
         (0..page.len()).map(|row| page.row(row, columns).and_then(test_row)).collect()
     }))
 }
 
-pub(crate) fn search_pages_from_reader(
-    reader: impl std::io::Read + std::io::Seek + Send + 'static, cancellation: CancellationToken, memory: Arc<MemoryBudget>,
+fn open_search_input(
+    reader: impl std::io::Read + std::io::Seek + Send + 'static, columns: &[String], memory: &Arc<MemoryBudget>,
+) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
+    let (mut reader, opening) = rtdb_maintenance::input::open_input(reader, memory)?;
+    reader.project_event_payload(columns);
+    Ok((reader, opening))
+}
+
+pub(crate) fn search_pages_from_buffer(
+    buffer: arrow_buffer::Buffer, columns: &[String], cancellation: CancellationToken, memory: Arc<MemoryBudget>,
 ) -> Result<PageRows> {
-    let (reader, opening) = open_input(reader, &memory)?;
+    let mut cursor = std::io::Cursor::new(buffer.as_slice());
+    let layout = rtdb_format::ipc::inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes))?;
+    let opening = memory.reserve(layout.opening_allocation_bound()?)?;
+    let mut reader = ArrowFile::from_inspected_buffer(buffer, None, layout)?;
+    reader.project_event_payload(columns);
     Ok(PageRows::new(reader, opening, memory, cancellation, false))
 }
 

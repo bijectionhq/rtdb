@@ -112,6 +112,10 @@ impl PostingPlan {
     }
 
     pub fn write(self, writer: &mut layout::Writer<impl std::io::Write>) -> Result<Vec<layout::PageRef>> {
+        self.emit(|table, data| writer.page([(table, data)]))
+    }
+
+    pub fn emit<T>(self, mut page: impl FnMut(Table, StructArray) -> Result<T>) -> Result<Vec<T>> {
         let mut pages = Vec::new();
         for group in self.groups {
             let counts: Vec<_> = group.iter().map(PostingBuilder::len).collect();
@@ -132,8 +136,8 @@ impl PostingPlan {
             let outer = item_of(&Table::Positions.fields()[0]);
             let positions = list(Arc::new(UInt32Array::from(positions)), position_counts, item_of(&outer))?;
             let positions = Table::Positions.array(vec![list(positions, counts, outer)?])?;
-            pages.push(writer.page([(Table::Frequencies, frequencies)])?);
-            pages.push(writer.page([(Table::Positions, positions)])?);
+            pages.push(page(Table::Frequencies, frequencies)?);
+            pages.push(page(Table::Positions, positions)?);
         }
         Ok(pages)
     }

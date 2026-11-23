@@ -108,13 +108,14 @@ pub(crate) struct IndexedRow<'a> {
 
 pub(crate) trait SearchPage {
     fn len(&self) -> usize;
-    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>>;
+    fn row(&mut self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>>;
+    fn complete(self) where Self: Sized {}
 }
 
 impl SearchPage for Vec<SearchRow> {
     fn len(&self) -> usize { Vec::len(self) }
 
-    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
+    fn row(&mut self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
         let row = &self[row];
         if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the definition's columns")); }
         let header = EventHeader { position: row.position,
@@ -300,11 +301,16 @@ pub fn write_search_file(columns: &[String], pages: impl IntoIterator<Item = Res
     write_group_search_file(columns, [pages], identity, ceiling, output)
 }
 
-pub(crate) fn write_query_pages<I: SearchPage>(
-    columns: &[String], pages: impl IntoIterator<Item = Result<I>>, ceiling: Option<i64>, output: impl Write,
+pub(crate) fn build_query_pages<I: SearchPage>(
+    columns: &[String], pages: impl IntoIterator<Item = Result<I>>, ceiling: Option<i64>,
     reservation: Arc<rtdb_columnar::MemoryReservation>,
-) -> Result<Vec<Section>> {
-    write::write_group(columns, [pages], "built", None, ceiling, output, Some(reservation), FORMAT_VERSION)
+) -> Result<(SearchFile, usize)> {
+    let pages = write::query_batches(columns, pages, ceiling, reservation)?;
+    let size = pages.iter().try_fold(0usize, |bytes, page| {
+        bytes.checked_add(rtdb_columnar::shared_allocation_size(page)?)
+            .ok_or_else(|| fault("Search index allocation exceeds addressable memory"))
+    })?;
+    Ok((SearchFile::open_reader(Reader::from_checked_batches(pages, FORMAT_VERSION), columns)?, size))
 }
 
 /// Writes one Arrow search file over the members in bucket order with a shared recency ceiling.
@@ -347,10 +353,13 @@ impl AsRef<[u8]> for TranscodedSearchMap {
 impl SearchFile {
     pub fn open(bytes: impl Into<Source>, columns: &[String]) -> Result<Self> {
         let source = bytes.into();
-        let source = if legacy11::is_bundle(source.as_ref()) {
-            legacy11::decode(bytes::Bytes::from_owner(source), columns)?.into()
-        } else { source };
-        Self::open_reader(Reader::from_source(source)?, columns)
+        let reader = if legacy11::is_bundle(source.as_ref()) {
+            let pages = legacy11::decode_batches(bytes::Bytes::from_owner(source), columns)?;
+            Reader::from_checked_batches(pages, LEGACY_FORMAT_VERSION)
+        } else {
+            Reader::from_source(source)?
+        };
+        Self::open_reader(reader, columns)
     }
 
     pub(crate) fn with_reservation(mut self, reservation: Arc<rtdb_columnar::MemoryReservation>) -> Self {
@@ -894,6 +903,40 @@ mod tests {
     fn open(rows: &[SearchRow]) -> Arc<SearchFile> { Arc::new(SearchFile::open(build_search_file(&columns(), rows, "job").unwrap(), &columns()).unwrap()) }
     /// A row's run, by the rows' order in the file.
     fn run(file: &SearchFile, row: u32) -> Option<u32> { match file.manifest.row_doc(1, row) { RowDoc::Run(doc) => Some(doc), _ => None } }
+
+    #[test]
+    fn arrow_build_query_and_legacy_files_open_from_the_same_typed_pages_as_disk() -> Result<()> {
+        let columns = columns();
+        let memory = rtdb_columnar::MemoryBudget::new(8 << 20);
+        let (built, bytes) = build_query_pages(&columns, [Ok(rows())], None, memory.reserve(1 << 20)?)?;
+        let on_disk = SearchFile::open(build_search_file(&columns, &rows(), "built")?, &columns)?;
+        let compare = |typed: &SearchFile, on_disk: &SearchFile| -> Result<()> {
+            assert_eq!(typed.reader.len(), on_disk.reader.len());
+            assert_eq!(typed.reader.metadata_bytes(), 0);
+            assert_ne!(on_disk.reader.metadata_bytes(), 0);
+            for page in 0..typed.reader.len() {
+                let typed = typed.reader.page(page)?;
+                let on_disk = on_disk.reader.page(page)?;
+                assert_eq!(typed, on_disk);
+            }
+            let query = Query::parse(r#""invoice is overdue""#);
+            let scores = |file: &SearchFile| -> Result<Vec<_>> {
+                Ok(file.scored("body", &query, &query, None, all())?.into_iter()
+                    .map(|(doc, score)| (doc, score.to_bits())).collect())
+            };
+            assert_eq!(scores(typed)?, scores(on_disk)?);
+            Ok(())
+        };
+        assert!(bytes > 0);
+        compare(&built, &on_disk)?;
+
+        let mut bundle = Vec::new();
+        write_versioned_group(&columns, [[Ok(rows())]], "legacy", 1, None, &mut bundle, None, TANTIVY_FORMAT_VERSION)?;
+        let bundle = bytes::Bytes::from(bundle);
+        let mut encoded = Vec::new();
+        legacy11::decode_to(bundle.clone(), &columns, &mut encoded, None)?;
+        compare(&SearchFile::open(bundle, &columns)?, &SearchFile::open(encoded, &columns)?)
+    }
 
     #[tokio::test]
     async fn scoped_tantivy_conversion_keeps_its_arrow_map_charged_until_drop() -> Result<()> {

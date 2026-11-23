@@ -898,7 +898,7 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
 }
 
 pub const ENTITY_KEY_FIELD: &str = "_entity_key";
-const COMMIT_POSITION_FIELD: &str = "_commit_position";
+pub(crate) const COMMIT_POSITION_FIELD: &str = "_commit_position";
 pub const EVENT_ORIGIN_FIELD: &str = "_event_origin";
 
 pub fn event_origin_field() -> Field { Field::new(EVENT_ORIGIN_FIELD, DataType::FixedSizeBinary(EventOrigin::WIDTH), true) }

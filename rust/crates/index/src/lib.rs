@@ -10,7 +10,7 @@ mod tiered_publication;
 mod trie_catalog;
 
 pub use catalog::{TableCatalog, TableMeta, absent_type, declare_column_types, merge_column_types};
-pub use live::{BlockPages, IndexBatch, LiveIndex, LiveRowLineage, LiveRowProof, LiveTable, LocatedRows, RowSource, ServingSearch, StagedWrite, TableWrite, TransactionBuffer};
+pub use live::{BlockPages, IndexBatch, LiveIndex, LiveRowLineage, LiveRowProof, LiveTable, LocatedRows, PreparedSearchDelta, RowSource, SearchDelta, ServingSearch, StagedWrite, TableWrite, TransactionBuffer};
 pub use partition::{BlockPreparation, PartitionState, PartitionValue, PreparedWrite, TrieCollection};
 pub use rtdb_types::CatalogCut;
 pub use snapshot::{OwnedRoutingInventory, Snapshot};

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
-use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
+use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, PreparedSearchDelta, SearchDelta, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
 use rtdb_storage::{log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
@@ -42,9 +42,9 @@ pub trait ServingSearchBuilder: Send + Sync {
 
     fn journals_deltas(&self) -> bool { false }
 
-    async fn prepare_delta(&self, _snapshot: Snapshot, _write: Arc<StagedWrite>, _cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> { Ok(None) }
+    async fn prepare_delta(&self, _snapshot: Snapshot, _write: Arc<StagedWrite>, _cancellation: &CancellationToken) -> Result<Option<PreparedSearchDelta>> { Ok(None) }
 
-    async fn install_delta(&self, snapshot: Snapshot, _write: &StagedWrite, _delta: Option<&[u8]>,
+    async fn install_delta(&self, snapshot: Snapshot, _write: &StagedWrite, _delta: Option<SearchDelta>,
         cancellation: &CancellationToken) -> Result<Option<ServingSearch>> {
         self.prepare(snapshot, cancellation).await
     }
@@ -501,7 +501,7 @@ impl ReplicationDriver {
         self
     }
 
-    async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<&[u8]>) -> Result<()> {
+    async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>) -> Result<()> {
         let Some(builder) = &self.serving_search else { return self.partition.apply(write); };
         let prepared = self.partition.prepare_write(write)?;
         let search = builder.install_delta(prepared.snapshot(), write, search_delta, &self.cancellation).await?;
@@ -1211,7 +1211,8 @@ impl ReplicationDriver {
                         let expected = Arc::clone(expected);
                         let applied: Result<_> = async {
                             let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
-                            self.apply_transaction(head.writes(), message.search_delta.as_deref()).await?;
+                            let delta = confirmed_search_delta(pending.body.search_delta(), message.search_delta.as_ref());
+                            self.apply_transaction(head.writes(), delta).await?;
                             if head.result().committed() {
                                 self.observe_erasure(record.metadata.position, head.writes())?;
                                 if let Some(operation) = head.db_op() { self.effects.apply_db_op(operation).await?; }
@@ -1238,7 +1239,7 @@ impl ReplicationDriver {
                         }
                         let value = self.partition.value();
                         let rtdb_tx::ReplayedTransaction { writes, result, placed_attempt } = rtdb_tx::decode_replica(message, value.live().latest_completed_tx(), value.live().block_index(), &self.resolve.memory)?;
-                        self.apply_transaction(&writes, message.search_delta.as_deref()).await?;
+                        self.apply_transaction(&writes, message.search_delta.clone().map(SearchDelta::Replayed)).await?;
                         if result.committed() { self.observe_erasure(record.metadata.position, &writes)?; }
                         if !leading && message.committed.unwrap_or(false) {
                             if let Some(operation) = &message.db_op {
@@ -1985,6 +1986,13 @@ fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.replica
 fn replica_tx_id(record: &ReplicaRecord) -> Option<i64> {
     match &record.envelope.message { ReplicaBody::ResolvedTx(message) => message.tx_id, _ => None }
 }
+fn confirmed_search_delta(pending: Option<&PreparedSearchDelta>, durable: Option<&bytes::Bytes>) -> Option<SearchDelta> {
+    durable.map(|encoded| match pending {
+        Some(delta) if delta.encoded == *encoded => SearchDelta::Prepared(delta.clone()),
+        _ => SearchDelta::Replayed(encoded.clone()),
+    })
+}
+
 fn readback_mismatch(tx_id: Option<i64>) -> Anomaly {
     let error = Anomaly::fault("xtdb.indexer/leader-read-back-mismatch", "Replica transaction does not match the oldest staged transaction");
     if let Some(tx_id) = tx_id {
@@ -2001,3 +2009,24 @@ fn trie_removal_unconfirmed() -> Anomaly {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+
+#[cfg(test)]
+#[test]
+fn arrow_build_leader_installs_only_the_readback_delta_and_reuses_prepared_buffers() {
+    let memory = MemoryBudget::new(1 << 20);
+    let encoded = bytes::Bytes::from_static(b"prepared");
+    let events = rtdb_format::data::build_event_batch(&[], None, None).unwrap();
+    let batch = rtdb_columnar::OwnedBatch::new(events, &memory).unwrap();
+    let prepared = PreparedSearchDelta { encoded: encoded.clone(), batch };
+    assert!(confirmed_search_delta(Some(&prepared), None).is_none());
+    let Some(SearchDelta::Prepared(installed)) = confirmed_search_delta(Some(&prepared), Some(&encoded)) else {
+        panic!("confirmed bytes should reuse the prepared batch");
+    };
+    assert!(Arc::ptr_eq(prepared.batch.reservation(), installed.batch.reservation()));
+    let other = bytes::Bytes::from_static(b"replayed");
+    let Some(SearchDelta::Replayed(replayed)) = confirmed_search_delta(Some(&prepared), Some(&other)) else {
+        panic!("different read-back bytes must use the replay path");
+    };
+    assert_eq!(other.as_ptr(), replayed.as_ptr());
+}

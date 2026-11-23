@@ -175,9 +175,9 @@ rule SearchJobRuns {
     -- The lane builds files compaction leaves out, files for new definitions or versions, and repairs.
     -- The lane downloads the owner's data files, in bucket order for a group.
     -- Both paths read one page at a time under that page's memory reservation.
-    -- They read event headers and borrow compatible indexed text cells from the page's Arrow vectors for tokenization.
+    -- The projected decoder selects event headers, the document ID and the indexed children of the put struct.
     -- The analyzer writes token bytes and offsets directly into Arrow string builders and offers a term visitor for consumers of ordered tokens.
-    -- An on-demand build reads its input directly from the retained data-file cache lease.
+    -- An on-demand build decodes page buffers from its retained data-file cache lease and serves the typed search pages it builds.
     -- Both reserve the segment's indexing heap up front in proportion to the input size, build the segment on disk, and stream the bundle to the object store.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.
@@ -185,6 +185,8 @@ rule SearchJobRuns {
     -- A format 16 writer seals forward witnesses for the indexed fields with the primary block.
     -- The seal can publish a posting run for its L0 extent, and the independent lane fills gaps after block adoption.
     -- Queries account for that extent from primary history until the run is adopted.
+    -- The posting revision and the forward witness at sealing derive from the same analyzer tokens.
+    -- An independent forward build computes the revision as the analyzer visits each term.
     -- The table directory covers a sealed prefix of accepted events and carries each erased entity's latest erase frontier.
     -- The table also owns event header pages for individual primary tries.
     -- A point read takes a primary trie without entity history from the data pages its metadata routes the requested keys to, so older data narrows the read rather than sending it to a scan.
@@ -484,6 +486,7 @@ contract SearchCorrectness {
 
     @invariant LiveSearchSharesTheCommitCut
         -- A committed native snapshot holds its admitted search postings alongside the primary live rows of that cut.
+        -- A live posting page can retain its token list as a slice of the accepted delta under the delta buffers' reservation.
         -- A newer commit or block boundary does not advance search evidence held by an earlier snapshot.
         -- A partially admitted segment keeps its coverage frontier.
         -- If a query cannot cover the frontier within the accelerated tail budget, ordinary SQL evaluation supplies the answer.
@@ -493,7 +496,8 @@ contract SearchCorrectness {
         -- A node keeps recorded files by object key, and the files it builds by data-file key and columns, each naming immutable bytes, and uses one only while the database's storage is the one it was read through, so a kept file is never stale.
         -- A recorded file the object store holds on this node's disk, its local store or disk cache, is mapped from there rather than read into memory, so the files kept open are bounded by disk and only the pages a query reads are resident.
         -- A file read into memory holds its buffer-pool lease, so when the pool refuses a read for want of room, the node drops the files it keeps that way and reads again.
-    -- An Arrow map converted from a Tantivy bundle under a prepaid query budget retains its allocation charge until the map is released.
+        -- In-memory Tantivy conversion serves the Arrow batches built by the transcode.
+        -- An Arrow map converted from a Tantivy bundle under a prepaid query budget retains its allocation charge until the map is released.
 }
 
 ------------------------------------------------------------
