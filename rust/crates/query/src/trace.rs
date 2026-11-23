@@ -59,7 +59,7 @@ impl Drop for CursorTrace {
         }
     }
 }
-fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -> Option<CursorTrace> {
+pub(crate) fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -> Option<CursorTrace> {
     context.trace_parent?;
     let kind = crate::analysis::operator(relation);
     let extra = match relation.node() { RelationNode::Scan(scan) => scan.table.name.table.schema.len().saturating_add(scan.table.name.table.table.len()), _ => 0 };

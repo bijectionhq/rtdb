@@ -11,6 +11,8 @@ import org.apache.arrow.adbc.core.AdbcConnection;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.BulkIngestMode;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -84,6 +86,22 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     @Override public String getCurrentDbSchema() { return "public"; }
     @Override public void setCurrentCatalog(String catalog) throws AdbcException {
         try (Arena arena = Arena.ofConfined()) { MemorySegment text = NativeAbi.text(arena, catalog); abi.call("session_set_catalog", handle(), text, text.byteSize()); this.catalog = catalog; }
+    }
+    public void setApplicationName(String name) throws AdbcException {
+        if (!abi.supports("session_set_application_name")) {
+            try (var statement = createStatement("SET application_name = ?");
+                 var arguments = VectorSchemaRoot.of(new VarCharVector("application_name", allocator))) {
+                ((VarCharVector) arguments.getVector(0)).setSafe(0, name.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                arguments.setRowCount(1);
+                statement.bind(arguments);
+                statement.executeUpdate();
+            }
+            return;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment text = NativeAbi.text(arena, name);
+            abi.call("session_set_application_name", handle(), text, text.byteSize());
+        }
     }
     @Override public ArrowReader getInfo(int[] codes) throws AdbcException {
         String values = codes == null ? "null" : Arrays.stream(codes).mapToObj(Integer::toUnsignedString).collect(Collectors.joining(",", "[", "]"));

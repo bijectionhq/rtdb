@@ -2447,8 +2447,8 @@ mod tests {
         let modulo = Expr::binary(BinaryOp::Modulo, schema.fields()[0].expression(), Expr::Literal(Value::I64(3)));
         let mut cursor = BatchExpressions::new(Box::new(Input(Some(batch))), schema, vec![modulo], execution);
         let page = cursor.next_batch().await.unwrap().unwrap();
-        let [Column::Values(values)] = page.columns.as_slice() else { panic!("Expected the evaluator's modulo results"); };
-        assert_eq!(values, &[Value::I64(1), Value::I64(2)]);
+        let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected typed Arrow modulo results"); };
+        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[1, 2]);
     }
 
     #[test]

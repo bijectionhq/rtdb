@@ -49,9 +49,8 @@ fn reader(value: &Value, depth: usize) -> Result<String> {
         Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) => value.to_string(),
         Value::F16(bits) => { let value = half::f16::from_bits(*bits).to_f32(); printed_float(f64::from(value), Some(value)) }
         Value::F32(value) => printed_float(f64::from(*value), Some(*value)), Value::F64(value) => printed_float(*value, None),
-        Value::Utf8(value) => quoted(value), Value::Keyword(value) => quoted(value.as_str()),
+        Value::Utf8(value) => quoted(value),
         Value::Binary(value) | Value::FixedSizeBinary(value) => format!("#bytes {}", quoted(&hex(value))),
-        Value::Uuid(value) => format!("#bytes {}", quoted(&hex(value))),
         Value::Uri(value) => format!("#xt/uri {}", quoted(&rtdb_types::UriParts::parse(value)?.to_ascii_string())),
         Value::Decimal(value) => format!("{}M", crate::decimal_text(value)),
         Value::Date(value) => tagged("time/date", &value.date().to_string()),
@@ -62,8 +61,8 @@ fn reader(value: &Value, depth: usize) -> Result<String> {
         Value::Duration { value, unit } => tagged("time/duration", &crate::temporal_text::duration_text(nanos(*value, *unit))),
         value if IntervalParts::of(value).is_some() => tagged("xt/interval", &crate::temporal_text::interval_text(IntervalParts::of(value).ok_or_else(overflow)?)),
         Value::TimestampTzRange { lower, upper } => format!("[{} {}]", tagged("time/zoned-date-time", &timestamp(nanos(*lower, TimeUnit::Microsecond), Some("UTC"))?), tagged("time/zoned-date-time", &timestamp(nanos(*upper, TimeUnit::Microsecond), Some("UTC"))?)),
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| reader(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-        Value::Struct(fields) => format!("{{{}}}", fields.iter().map(|(name, value)| Ok(format!("{} {}", quoted(name), reader(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| object(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+        Value::Struct(fields) => record(fields.iter(), depth)?,
         Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", object(key, depth + 1)?, object(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Transit(bytes) => crate::transit_object::printed_text(bytes, Admission::Standalone)?,
         _ => return Err(crate::numeric::inapplicable("text", &[value])),
@@ -75,9 +74,20 @@ fn object(value: &Value, depth: usize) -> Result<String> {
     Ok(match value {
         Value::Keyword(value) => value.to_string(), Value::Uuid(value) => tagged("uuid", &uuid::Uuid::from_bytes(*value).to_string()),
         Value::Set(values) => format!("#{{{}}}", values.iter().map(|value| object(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-        Value::List(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| object(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+        Value::Struct(fields) => record(fields.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)), depth)?,
+        Value::TimestampTzRange { lower, upper } => {
+            let endpoint = |value, unbounded| if value == unbounded { Ok("nil".into()) }
+                else { timestamp(nanos(value, TimeUnit::Microsecond), Some("UTC")).map(|text| tagged("time/zoned-date-time", &text)) };
+            format!("#xt/tstz-range [{} {}]", endpoint(*lower, i64::MIN)?, endpoint(*upper, i64::MAX)?)
+        }
         value => reader(value, depth)?,
     })
+}
+
+fn record<'a>(fields: impl Iterator<Item = (&'a String, &'a Value)>, depth: usize) -> Result<String> {
+    let fields = fields.map(|(name, value)| Ok(format!("{} {}", quoted(name), object(value, depth + 1)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{{{}}}", fields.join(", ")))
 }
 
 fn quoted(value: &str) -> String {

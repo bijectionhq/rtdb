@@ -214,6 +214,16 @@ pub unsafe extern "C" fn rtdb_v1_session_action(handle: u64, operation: u64, act
 pub unsafe extern "C" fn rtdb_v1_session_set_catalog(handle: u64, name: *const u8, length: usize, error: *mut u64) -> i32 {
     unsafe { call(error, || { let session = handles::session(handle)?; let _admitted = session.region.enter()?; session.state.lock().state_mut().set_database(text(name, length)?)?; Ok(()) }) }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_set_application_name(handle: u64, name: *const u8, length: usize, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let session = handles::session(handle)?;
+        let _admitted = session.region.enter()?;
+        session.state.lock().state_mut().set_application_name(text(name, length)?)?;
+        Ok(())
+    }) }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_await_token(handle: u64, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || {

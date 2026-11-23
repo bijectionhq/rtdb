@@ -37,7 +37,7 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
     let fields = match name.as_str() {
         "clock_time" => vec![(name.as_str(), instant)],
-        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier" | "rtdb_hosted_source_barrier" => vec![(name.as_str(), text)],
+        "snapshot_token" | "timezone" | "transaction_isolation" | "application_name" | "rtdb_ordered_system_time" | "rtdb_source_barrier" | "rtdb_hosted_source_barrier" => vec![(name.as_str(), text)],
         "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
         "latest_submitted_tx" => vec![("tx_id", integer), ("system_time", instant.maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.maybe())],
         "latest_completed_txs" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("tx_id", integer), ("system_time", instant.maybe())],
@@ -52,7 +52,7 @@ impl NativeSession {
     pub(crate) fn instrument_query_context(&self, context: Arc<QueryContext>) -> Arc<QueryContext> {
         context.with_observer(crate::SessionService::execution_observer(self.service.as_ref()))
             .with_tracer(self.service.node.tracer(), None)
-            .with_application_name(self.state.parameter("application_name"))
+            .with_application_name(Some(self.state.application_name()))
     }
 
     /// `cancellation` must descend from `state().cancellation()`; dropping preparation never pins a bare BEGIN.
@@ -212,7 +212,7 @@ impl NativeSession {
             ControlStatement::SetRole => Ok(command("SET ROLE", allocation)),
             ControlStatement::Discard(target) => {
                 if *target == DiscardTarget::All {
-                    self.state.reset_for_frontend(options.frontend == ControlFrontend::PostgreSql)?;
+                    self.state.reset()?;
                 }
                 Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
             }
@@ -308,6 +308,7 @@ impl NativeSession {
                  vec![vec![Value::Timestamp { value: basis.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
+            "application_name" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.application_name().into())]]),
             "rtdb_ordered_system_time" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
             "rtdb_hosted_source_barrier" => {
                 let history = hosted_history.ok_or_else(|| Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source barrier has no history"))?;

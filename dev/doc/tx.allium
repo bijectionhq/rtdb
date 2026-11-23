@@ -47,7 +47,11 @@
 -- Every reference has its own replay position and every outstanding page retains its own memory.
 -- Measured operators reserve against sibling scopes of the same query budget.
 -- Each operator can report its own retained-allocation peak and the query reports the peak across all operators.
--- Native pgwire query spans use the connection application name supplied at startup or by SET.
+-- EXPLAIN ANALYZE measures the opened Arrow operators when the query uses Arrow execution.
+-- A direct Arrow parameter projection charges its own operator scope when traced.
+-- Native query spans use the application name of their connection.
+-- Pgwire uses the application name supplied at startup or by SET.
+-- Flight SQL connections default to XTDB Flight SQL and embedded connections default to XTDB.
 -- The application name survives DISCARD ALL.
 -- Those spill pages retain each record's fields and preserve their original page boundaries.
 -- A batch join can gather matching payload positions from selected Arrow vectors.

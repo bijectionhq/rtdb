@@ -126,7 +126,9 @@ The captured policy reaches prepared SQL, direct queries, static transaction exp
 
 Native `EXPLAIN ANALYZE` reports the peak accounted memory for each operator in `peak_memory_bytes` and the whole query's peak in `query_peak_memory_bytes`.
 Operator scopes share the query limit, so their individual peaks can occur at different times.
-Query spans opened through pgwire carry the connection's `application.name` and operator spans carry `cursor.peak_memory_bytes`.
+The report includes optimized Arrow operators, and operator spans carry the same `cursor.peak_memory_bytes` measurements.
+Query spans opened through pgwire, Flight SQL, and the embedded API carry the session's `application.name`.
+Flight SQL defaults to `XTDB Flight SQL`, and Clojure queries opened on a native database default to `XTDB Clojure API`.
 The OTLP exporter emits numeric and Boolean attributes with their corresponding wire types.
 
 Native materialized CTEs reuse small results in memory.

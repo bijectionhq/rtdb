@@ -289,6 +289,11 @@ impl QueryContext {
     pub(crate) fn execution_child_with_memory(&self, memory: Arc<MemoryBudget>) -> Arc<Self> {
         Arc::new(Self { memory, cancellation: self.cancellation.child_token(), ..self.clone() })
     }
+
+    pub(crate) fn operator_scope(self: &Arc<Self>) -> Arc<Self> {
+        debug_assert!(self.operator_root.is_none());
+        Arc::new(Self { memory: self.memory.scope(), operator_root: Some(Arc::clone(self)), ..(**self).clone() })
+    }
 }
 
 pub(crate) fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/query-cancelled", "Query execution was cancelled") }
@@ -343,12 +348,7 @@ impl Execution {
     }
     pub fn in_operator(mut self) -> Self {
         if self.context.operator_root.is_none() && (self.analysis.is_some() || self.context.trace_parent.is_some()) {
-            let root = Arc::clone(&self.context);
-            self.context = Arc::new(QueryContext {
-                memory: root.memory.scope(),
-                operator_root: Some(Arc::clone(&root)),
-                ..(*root).clone()
-            });
+            self.context = self.context.operator_scope();
         }
         self
     }

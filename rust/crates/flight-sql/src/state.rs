@@ -84,7 +84,8 @@ impl Session {
     }
     pub fn open_native(&self, database: &str, node: &Node) -> Result<NativeSession, Status> {
         self.require_database(database, node)?;
-        let native = node.session(database, self.caller.principal.clone()).map_err(status)?;
+        let mut native = node.session(database, self.caller.principal.clone()).map_err(status)?;
+        native.state_mut().set_application_name("XTDB Flight SQL").map_err(status)?;
         self.require_database(database, node)?;
         Ok(native)
     }

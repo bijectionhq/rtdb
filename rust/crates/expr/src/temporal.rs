@@ -173,8 +173,9 @@ fn arithmetic_value(op: BinaryOp, left: &Value, right: &Value, target: &ScalarTy
     if let Some(parts) = IntervalParts::of(right) { return add_interval(left, parts, target, if op == B::Add { 1 } else { -1 }); }
     if let Some(parts) = IntervalParts::of(left) { return add_interval(right, parts, target, 1); }
     if *target == ScalarType::I32 {
-        let (a, b) = (date_days(left).ok_or_else(overflow)?, date_days(right).ok_or_else(overflow)?);
-        return Ok(Value::I32(i32::try_from(a - b).map_err(|_| overflow())?));
+        let overflow = || rtdb_types::Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error");
+        let day = |value| date_days(value).and_then(|day| i32::try_from(day).ok()).ok_or_else(overflow);
+        return Ok(Value::I32(day(left)?.checked_sub(day(right)?).ok_or_else(overflow)?));
     }
     let unit = match target { ScalarType::Timestamp { unit, .. } | ScalarType::Duration(unit) => *unit, _ => return Err(inapplicable("temporal arithmetic", &[left, right])) };
     let zoned = |value: &Value| matches!(value, Value::Timestamp { timezone: Some(_), .. });

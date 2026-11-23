@@ -118,17 +118,31 @@ fn default_interval_casts_preserve_source_metadata_and_pinned_unanchored_text_pa
 }
 
 #[test]
-fn imported_millisecond_dates_cast_from_whole_epoch_days() {
+fn imported_millisecond_dates_preserve_raw_values_until_cast_to_another_type() {
     for (raw, days) in [(-86_400_001, -2), (-86_400_000, -1), (-86_399_999, -1), (-1, -1), (1, 0), (86_400_001, 1)] {
         let source = V::DateMilli(raw);
         assert_eq!(cast(&source, &T::Scalar(S::DateDay), "UTC").unwrap(), V::DateDay(days));
-        assert_eq!(cast(&source, &T::Scalar(S::DateMilli), "UTC").unwrap(), V::DateMilli(i64::from(days) * 86_400_000));
+        assert_eq!(cast(&source, &T::Scalar(S::DateMilli), "UTC").unwrap(), source);
         for timezone in [None, Some("UTC".into())] {
             let target = T::Scalar(S::Timestamp { unit: U::Microsecond, timezone: timezone.clone() });
             assert_eq!(cast(&source, &target, "UTC").unwrap(), V::Timestamp { value: i64::from(days) * 86_400_000_000, unit: U::Microsecond, timezone });
         }
     }
     assert_eq!(cast(&V::DateMilli(86_400_000_000_000_000), &T::Scalar(S::DateDay), "UTC").unwrap(), V::DateDay(1_000_000_000));
+}
+
+#[test]
+fn date_subtraction_checks_each_epoch_day_and_the_difference() {
+    let out_of_range = (i64::from(i32::MAX) + 1) * 86_400_000;
+    for (left, right) in [
+        (V::DateMilli(out_of_range), V::DateDay(i32::MAX)),
+        (V::DateDay(i32::MAX), V::DateMilli(out_of_range)),
+        (V::DateDay(i32::MAX), V::DateDay(i32::MIN)),
+    ] {
+        assert_eq!(rtdb_expr::arithmetic(B::Subtract, &left, &right).unwrap_err().code, "xtdb.expression/overflow-error");
+    }
+    arithmetic(B::Subtract, V::DateMilli(-1), V::DateDay(0), V::I32(-1));
+    arithmetic(B::Subtract, V::DateDay(0), V::DateMilli(-1), V::I32(1));
 }
 
 #[test]
