@@ -141,26 +141,41 @@ Existing installed journals require a cutover to a freshly installed stream for 
 
 ### Clean checkpoint and erasure commit interface
 
-The R7 erasure coordinator still needs clean successor construction and a durable erasure commit.
-Its input is the erasure identity, custody domain, exact incumbent grant, quiesced journal cut, and the clean root and provider manifest for that cut.
-The coordinator provisions the next journal key generation before ordering rotation.
-The custodian publishes the clean checkpoint at the quiesced head and certifies its full storage closure.
-An ordinary checkpoint cut precedes its upload record, so that ordinary publication needs a separate adaptation to represent the clean state at the quiesced head.
+The installed custodian's erasure coordinator accepts an operation identity, custody domain and exact incumbent grant.
+Its custody adapter closes new copy and serving admissions and drains writes, including unfinished appends and offloaded writes.
+The adapter retains that fence through restart until the attempt has a durable resolution.
+Ordinary checkpoint maintenance must leave the erasure preparation and its provider allocation to this authority.
 
-The holder orders Logkeeper's `RotateKey { grant, checkpoint }` against the exact selected checkpoint.
-The accepted decision returns the new grant and its held recovery basis at the checkpoint cut.
-A concurrent append changes the head and requires selecting a new cut and checking the clean closure again.
-A retry after an uncertain decision uses the same request identity and exact command.
-Recovery adopts the new grant and appends only under its generation from the cut.
-Any historical confirmation evidence needed by recovery must be carried into that clean closure before revocation.
+The adapter orders a preparation and stages a clean successor at the quiesced journal head.
+The coordinator provisions the next journal key and checks the whole cut, including its history fingerprint, against the current head.
+It checks the preparation against the selected base, cut, incumbent grant, root and allocation before using the installed custodian credential to publish.
+An ordinary checkpoint ends at the native block boundary before the upload record.
+A clean successor must account for the upload and any later records through the quiesced head.
+Its recovery metadata must let replay start at that head and recognize the selected catalog as confirmed without reopening older catalogs or records.
 
-The erasure commit consumes durable evidence for every selectable slot, binding each slot's identity, clean root, cut, and suffix key obligations.
-The publication authority must continue to exclude older selectable roots once it has issued that evidence.
-The commit must durably bind the erasure identity, the retired key generation, the clean cut, and the provider's armed deadline as one observable result.
-Retries reconcile to the same commit and expiry.
-Existing holds keep their entitlement until the deadline, at most 120 seconds from the commit.
-Clean publication and revocation must account for offloaded record bodies, retained plaintext and dependent storage in the custody domain.
-The resulting provider and clock guarantees have to cover all outstanding key operations and grants.
+The producer must preserve surviving history and rebuild or remove every primary trie, retained replay input, index artefact and metadata object that carries the targeted history.
+The immutable provider manifest must cover the clean recovery closure, including confirmation evidence.
+A replacement opens that manifest under the exact chosen checkpoint and reconciles ambiguous staging outcomes against the same allocation.
+Provider closure verification establishes availability and integrity.
+The producer is responsible for determining which objects contain the targeted history and ensuring their exclusion.
+
+The incumbent sends Logkeeper's `RotateKey { grant, checkpoint }` using the request identity persisted with the erasure preparation.
+The accepted result gives the next writer epoch and key generation and a held recovery basis with an empty suffix at the checkpoint cut.
+An intervening append changes the head and the journal refuses rotation.
+A retry of an uncertain outcome reuses the exact command and its original receipt horizon.
+If that horizon is exhausted, custody must reconcile the operation before admitting a fresh attempt.
+
+The coordinator checks both durable recovery slot attestations against the exact clean checkpoint and the successor suffix generation.
+Once issued, those attestations must keep any older recovery root from becoming selectable, including after a torn write, restart or cohort repair.
+The custody authority consumes the checked evidence and makes the erasure receipt and the old generation's irrevocable expiry one durable result.
+Its deadline is positive and at most 120 seconds from committed time.
+Existing holds keep their entitlement through that deadline, and an old view requiring revoked material then receives `rtdb/erased-under-view`.
+The authority covers offloaded record bodies, retained plaintext and dependent storage in the custody domain.
+
+The coordinator and its native acceptance tests exercise real Logkeeper application decisions and local journal encryption.
+The tests supply the clean root, admission fence, slot evidence and commit authority through a custody double.
+Live activation requires production implementations for those operations, including authenticated evidence from both recoverable slots and a qualified key service with atomic commit and expiry.
+The local scheduled vault demonstrates key-operation expiry and needs a qualified clock, idle revocation and custody-wide grant handling before it can provide this deadline.
 
 ### Queue reclamation inside the current writer's prefix
 

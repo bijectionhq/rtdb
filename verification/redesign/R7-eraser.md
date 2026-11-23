@@ -73,6 +73,10 @@ An installed Logkeeper grant identifies the journal payload key generation.
 Chosen replay uses that generation and reports `rtdb/erased-under-view` when the required key is durably revoked.
 The Logkeeper rotation compares the exact writer grant, exact published checkpoint and journal head.
 RTDB owns the clean successor, the evidence for all selectable roots, the ordered erasure commit, and the deadline checks for held material.
+The installed custodian's coordinator checks the exact prepared and published head, validates the rotation receipt, and requires both recovery slots to attest the clean root and successor suffix generation before it calls the custody commit authority.
+The custody adapter owns the durable admission fence, construction and staging of the clean closure, recovery slot attestations, and the atomic commit and expiry.
+The native tests exercise the coordinator with Logkeeper application decisions and a local vault under an injected custody adapter.
+Physical slot attestation, trie and artefact rewriting, and atomic deadline qualification remain implementation requirements.
 The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
 
 ## Verification

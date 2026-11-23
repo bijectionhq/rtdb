@@ -29,7 +29,7 @@ impl JournalKey {
         }
     }
 
-    pub(super) fn id(self) -> String {
+    pub(crate) fn id(self) -> String {
         format!("journal-{}-{}-{}", self.deployment, self.incarnation, self.generation)
     }
 
