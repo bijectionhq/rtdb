@@ -171,16 +171,30 @@ pub async fn copy_retained(source: StreamConfig, destination: StreamConfig, epoc
 pub async fn bootstrap_committed(
     config: &StreamConfig, epoch: u64, checkpoint: LogOffset, entries: &[crate::protocol::Entry],
 ) -> rtdb_types::Result<()> {
+    let first = checkpoint.0.checked_add(1)
+        .ok_or_else(|| Anomaly::incorrect("rtdb.logkeeper/bootstrap", "The checkpoint has no replica successor"))?;
+    bootstrap_committed_page(config, epoch, checkpoint, LogOffset(first), entries, true).await
+}
+
+/// Quorum-commits one page of a reserved target genesis. A replayed page is
+/// accepted only if its stored overlap agrees byte for byte. Only the terminal
+/// page asserts that the destination ends at this page's last offset.
+pub async fn bootstrap_committed_page(
+    config: &StreamConfig, epoch: u64, checkpoint: LogOffset, first: LogOffset,
+    entries: &[crate::protocol::Entry], terminal: bool,
+) -> rtdb_types::Result<()> {
     validate(config)?;
-    if epoch == 0 || checkpoint.0 < -1 || entries.len() > 4096
-        || checkpoint.0.checked_add(entries.len() as i64 + 1).is_none()
+    if epoch == 0 || checkpoint.0 < -1 || first.0 <= checkpoint.0 || entries.len() > 4096
+        || first.0.checked_add(entries.len() as i64).is_none() || (entries.is_empty() && !terminal)
         || entries.iter().enumerate().any(|(offset, entry)|
-            entry.lsn != checkpoint.0 + 1 + offset as i64 || entry.epoch == 0
+            entry.lsn != first.0 + offset as i64 || entry.epoch == 0
                 || entry.epoch > epoch || entry.payload.len() > config.maximum_message_bytes)
     {
-        return Err(Anomaly::incorrect("rtdb.logkeeper/bootstrap", "The replica genesis does not follow its checkpoint"));
+        return Err(Anomaly::incorrect("rtdb.logkeeper/bootstrap", "The replica genesis page does not follow its checkpoint"));
     }
-    Writer::bootstrap_committed(&Ensemble::new(config.clone()), epoch, checkpoint.0, entries).await?;
+    Writer::bootstrap_committed_page(
+        &Ensemble::new(config.clone()), epoch, checkpoint.0, first.0, entries, terminal,
+    ).await?;
     Ok(())
 }
 

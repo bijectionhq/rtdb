@@ -237,6 +237,67 @@ fn sealed_history(replies: &[(usize, Sealed)]) -> (usize, Holding) {
     (*source, Holding::from(winning))
 }
 
+async fn bootstrap_replica_page(
+    ensemble: &Ensemble, server: usize, sealed: &Sealed, epoch: u64,
+    checkpoint: i64, first: i64, entries: &[Entry], terminal: bool,
+) -> Result<()> {
+    let through = first + entries.len() as i64 - 1;
+    let conflict = || Error::ConflictingObject(ensemble.config.stream.clone());
+    let unavailable = || Error::Remote { key: ensemble.config.stream.clone(), message: "the replica is missing an earlier genesis page".into() };
+    if sealed.promised > epoch { return Err(Error::Deposed { epoch, promised: sealed.promised }); }
+    if sealed.promised != epoch || (terminal && sealed.last_lsn > through) {
+        return Err(conflict());
+    }
+    if sealed.trim_lsn != checkpoint {
+        if sealed.trim_lsn != -1 || sealed.last_lsn != -1 || sealed.commit_lsn != -1 {
+            return Err(conflict());
+        }
+        if first != checkpoint + 1 { return Err(unavailable()); }
+        deposed_by(epoch, ensemble.trim(server, checkpoint).await?)?;
+    } else if sealed.commit_lsn < first - 1 || sealed.last_lsn < first - 1 {
+        return Err(unavailable());
+    }
+
+    let overlap = sealed.last_lsn.min(through);
+    let mut next = first;
+    while next <= overlap {
+        let prefix = ensemble.fetch(server, next, overlap + 1, MAXIMUM_BATCH_ENTRIES).await?;
+        let begin = (next - first) as usize;
+        let end = begin.saturating_add(prefix.entries.len());
+        if prefix.trim_lsn != checkpoint || prefix.entries.is_empty()
+            || prefix.entries.last().is_some_and(|entry| entry.lsn > overlap)
+            || entries.get(begin..end) != Some(prefix.entries.as_slice())
+        {
+            return Err(conflict());
+        }
+        next += prefix.entries.len() as i64;
+    }
+
+    let missing = &entries[(next - first) as usize..];
+    for entry in missing {
+        // Each append also establishes the peer's sync at this epoch. An
+        // overlapping writer can only append next or fail and re-observe.
+        deposed_by(epoch, ensemble.overwrite(server, epoch, entry.lsn, vec![entry.clone()], true).await?)?;
+    }
+    if missing.is_empty() && sealed.synced != epoch {
+        if sealed.last_lsn > through { return Err(conflict()); }
+        deposed_by(epoch, ensemble.overwrite(server, epoch, through + 1, Vec::new(), true).await?)?;
+    }
+    let committed = deposed_by(epoch, ensemble.commit(server, epoch, through).await?)?;
+    if terminal {
+        let final_state = ensemble.seal(server, epoch).await?;
+        if final_state.promised > epoch { return Err(Error::Deposed { epoch, promised: final_state.promised }); }
+        if final_state.promised != epoch || final_state.synced != epoch || final_state.trim_lsn != checkpoint
+            || final_state.last_lsn != through || final_state.commit_lsn != through
+        {
+            return Err(conflict());
+        }
+    } else if committed.last_lsn < through || committed.commit_lsn < through {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+
 impl Writer {
     pub async fn open(ensemble: Arc<Ensemble>, epoch: u64) -> Result<Arc<Self>> {
         let replies = seal_quorum(&ensemble, epoch).await?;
@@ -281,43 +342,21 @@ impl Writer {
         Ok(())
     }
 
-    pub(super) async fn bootstrap_committed(
-        ensemble: &Ensemble, epoch: u64, checkpoint: i64, entries: &[Entry],
+    pub(super) async fn bootstrap_committed_page(
+        ensemble: &Ensemble, epoch: u64, checkpoint: i64, first: i64, entries: &[Entry], terminal: bool,
     ) -> Result<()> {
         let replies = seal_quorum(ensemble, epoch).await?;
-        let last = checkpoint + entries.len() as i64;
-        let failure = |message| Error::Remote { key: ensemble.config.stream.clone(), message };
-        let mut seeds = replies.into_iter().map(|(server, sealed)| async move {
-            if sealed.last_lsn > last
-                || (sealed.trim_lsn != checkpoint && (sealed.trim_lsn != -1 || sealed.last_lsn != -1))
-            {
-                return Err(Error::ConflictingObject(ensemble.config.stream.clone()));
-            }
-            if sealed.trim_lsn != checkpoint {
-                deposed_by(epoch, ensemble.trim(server, checkpoint).await?)?;
-            }
-            let mut offset = checkpoint + 1;
-            while offset <= sealed.last_lsn {
-                let prefix = ensemble.fetch(server, offset, sealed.last_lsn + 1, MAXIMUM_BATCH_ENTRIES).await?;
-                let index = usize::try_from(offset - checkpoint - 1).unwrap_or(usize::MAX);
-                let end = index.saturating_add(prefix.entries.len());
-                if prefix.entries.is_empty() || entries.get(index..end) != Some(prefix.entries.as_slice()) {
-                    return Err(Error::ConflictingObject(ensemble.config.stream.clone()));
+        let mut seeds = replies.into_iter().map(|(server, mut sealed)| async move {
+            // Lost replies or an identical concurrent bootstrap can race an
+            // overwrite. Re-read the peer before retrying any append.
+            for _ in 0..8 {
+                match bootstrap_replica_page(ensemble, server, &sealed, epoch, checkpoint, first, entries, terminal).await {
+                    Ok(()) => return Ok(()),
+                    Err(error @ (Error::Deposed { .. } | Error::ConflictingObject(_))) => return Err(error),
+                    Err(_) => sealed = ensemble.seal(server, epoch).await?,
                 }
-                offset += prefix.entries.len() as i64;
             }
-            for entry in &entries[(offset - checkpoint - 1) as usize..] {
-                let complete = entry.lsn == last;
-                deposed_by(epoch, ensemble.overwrite(server, epoch, entry.lsn, vec![entry.clone()], complete).await?)?;
-            }
-            if offset > last && sealed.synced != epoch {
-                deposed_by(epoch, ensemble.overwrite(server, epoch, last + 1, Vec::new(), true).await?)?;
-            }
-            let accepted = deposed_by(epoch, ensemble.commit(server, epoch, last).await?)?;
-            if accepted.commit_lsn != last {
-                return Err(failure("the seeded replica did not commit its exact terminal offset".into()));
-            }
-            Ok(())
+            Err(Error::Remote { key: ensemble.config.stream.clone(), message: "replica genesis page did not settle".into() })
         }).collect::<FuturesUnordered<_>>();
         let mut committed = 0;
         while let Some(reply) = seeds.next().await {
@@ -328,7 +367,8 @@ impl Writer {
             }
         }
         if committed < ensemble.config.write_quorum {
-            return Err(failure("a quorum did not commit the reserved replica genesis".into()));
+            return Err(Error::Remote { key: ensemble.config.stream.clone(),
+                message: "a quorum did not commit the reserved replica genesis page".into() });
         }
         Ok(())
     }
