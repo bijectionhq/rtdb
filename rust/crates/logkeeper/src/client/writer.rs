@@ -773,8 +773,12 @@ impl Writer {
         let first = (previous + 1 - pipeline.buffer_first).max(0) as usize;
         let last = (quorum - pipeline.buffer_first) as usize;
         for buffered in pipeline.buffer.range_mut(first..=last) {
-            if let Some(receipt) = buffered.receipt.take() {
-                let _ = receipt.send(Ok(record(&buffered.entry).metadata));
+            if let Some(receipt) = buffered.receipt.take()
+                && receipt.send(Ok(record(&buffered.entry).metadata)).is_ok()
+            {
+                rtdb_types::residence_trace::logkeeper_receipt(
+                    &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), buffered.entry.lsn, quorum,
+                );
             }
         }
         while pipeline.buffer.front().is_some_and(|buffered| buffered.entry.lsn <= pipeline.commit)

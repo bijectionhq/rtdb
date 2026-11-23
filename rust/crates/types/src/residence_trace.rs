@@ -57,3 +57,10 @@ pub fn logkeeper_publication(
         "quorum": quorum, "installed": installed(),
     }));
 }
+
+pub fn logkeeper_receipt(stream: &str, epoch: u64, ensemble: &[u8], through: i64, decision_through: i64) {
+    record("quorum-receipt", || serde_json::json!({
+        "stream": stream, "epoch": epoch, "ensemble": ensemble, "through": through,
+        "decision_through": decision_through,
+    }));
+}

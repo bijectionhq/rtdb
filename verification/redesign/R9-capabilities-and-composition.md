@@ -145,6 +145,7 @@ The shared bounded model now requires a matching certificate with a publication 
 A successor loglet retains the installed decision floor.
 Trimming and exact deletion require an installed recovery fence after replacement publication and older replay drain.
 The native checker joins observed checkpoint, trim and offloaded-object retirement decisions by scope, revision, root, manifest and journal anchor.
+It also checks that each logged receipt follows the observed covering quorum publication for the same stream, epoch and ensemble.
 This join covers the recorded recovery and retirement owners.
 The full native capture still needs the production T1 certificate-to-query handoff, T2's exact reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
 The new model, controls and native joins have source review only.

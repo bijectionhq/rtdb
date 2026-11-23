@@ -4967,7 +4967,7 @@ def verify_native_recovery_trace(args, source):
         capture_native_recovery(args, source, label, trace, observations)
         native = [json.loads(line) for line in observations.read_text().splitlines()]
         shutil.copyfile(observations, args.evidence / "rust-residence-observations.jsonl")
-    required = {"publish-checkpoint", "admit-recovery", "authorize-trim", "apply-trim"}
+    required = {"quorum-publication", "quorum-receipt", "publish-checkpoint", "admit-recovery", "authorize-trim", "apply-trim"}
     if not required.issubset(event["event"] for event in native):
         raise ValueError(f"{label}: the native residence capture omitted a checkpoint, hold, or trim observation")
     verify_native(native)
@@ -4982,6 +4982,16 @@ def verify_native_recovery_trace(args, source):
             raise
     else:
         raise ValueError(f"{label}: native residence validator accepted a substituted recovery manifest")
+    bad_decision = copy.deepcopy(native)
+    receipt = next(event for event in bad_decision if event["event"] == "quorum-receipt")
+    receipt["ensemble"][0] ^= 1
+    try:
+        verify_native(bad_decision)
+    except ValueError as error:
+        if "append receipt precedes its observed quorum publication" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted another publication ensemble")
     bad_scope = copy.deepcopy(native)
     applied = next(event for event in bad_scope if event["event"] == "apply-trim")
     applied["epoch"] += 1

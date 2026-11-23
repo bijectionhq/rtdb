@@ -30,6 +30,7 @@ def trim_scope(event):
 def verify_native(events):
     require(events, "the native trace is empty")
     deletes, trims, catalogs, captures, holds, attempts, reads = {}, set(), {}, {}, {}, {}, set()
+    published_decisions = set()
     for index, event in enumerate(events):
         try:
             kind = event["event"]
@@ -48,6 +49,11 @@ def verify_native(events):
                 require(digest(event["ensemble"]) and event["epoch"] > 0 and event["through"] >= 0
                         and event["quorum"] > 0 and len(peers) == len(set(peers)) and len(peers) >= event["quorum"],
                         "publication lacks its durable quorum")
+                published_decisions.add((event["stream"], event["epoch"], tuple(event["ensemble"]), event["through"]))
+            elif kind == "quorum-receipt":
+                decision = (event["stream"], event["epoch"], tuple(event["ensemble"]), event["decision_through"])
+                require(decision in published_decisions and 0 <= event["through"] <= event["decision_through"],
+                        "append receipt precedes its observed quorum publication")
             elif kind == "retirement-recovery-dependency":
                 require(digest(event["anchor"]) and event["position"] <= event["trim_through"],
                         "retirement has no matching recovery exclusion")
