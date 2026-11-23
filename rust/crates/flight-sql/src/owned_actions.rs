@@ -186,6 +186,7 @@ pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHist
 pub(crate) const HELD_OWNED_POSITION_POINT_V1: &str = "rtdb.owned.ReadHeldPositionPoint.v1";
 pub(crate) const HELD_OWNED_POSITION_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldPositionValidDuring.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
+pub(crate) const HELD_WORLD_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldValidDuringAt.v1";
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
@@ -2383,16 +2384,20 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, body: &[u8], historical: bool) -> Result<ActionResult, Status> {
         use rtdb_types::Interval;
 
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (system, body) = if historical {
+            let (system, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world schedule has no revision"))?;
+            (Some(Timestamp(i64::from_be_bytes(*system))), rest)
+        } else { (None, body) };
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world history has no source"))?;
         let parent_only = match *mode {
             0 => false,
-            1 => true,
+            1 if !historical => true,
             _ => return Err(invalid("Invalid owned world history source")),
         };
         let (relation, arrow_bytes) = split_relation(body)?;
@@ -2406,10 +2411,14 @@ impl Service {
         let to = history_request_endpoint(batch, "valid_to_micros")?;
         let valid = Interval::new(from, to).map_err(status)?;
         if valid.is_empty() { return Err(invalid("Owned world history requires a nonempty valid window")); }
-        let (slices, witness) = held.snapshot.valid_during(&relation, &id, valid, parent_only).await.map_err(status)?;
+        let (slices, witness) = if let Some(system) = system {
+            (held.snapshot.valid_during_at(&relation, &id, valid, system).await.map_err(status)?, None)
+        } else {
+            held.snapshot.valid_during(&relation, &id, valid, parent_only).await.map_err(status)?
+        };
         let _rows = call.reserve(4096 + slices.len() * 128)?;
         let mut metadata = std::collections::HashMap::from([
-            (OWNED_PRESENT.into(), held.snapshot.present().0.to_string()),
+            (OWNED_PRESENT.into(), system.unwrap_or_else(|| held.snapshot.present()).0.to_string()),
             (OWNED_VALID_FROM.into(), from.0.to_string()),
             (OWNED_VALID_TO.into(), to.0.to_string()),
         ]);

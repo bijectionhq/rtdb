@@ -294,6 +294,13 @@ impl HeldCheckpointWorld {
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         self.require_archive_coverage(vec![(relation.clone(), 0)], guard).await?;
         self.open.snapshot.check_point_purge_floor(relation, id, self.parent_basis().system_time).await?;
+        self.point_at_accepted_cut(relation, id, valid, &cut, schema).await
+    }
+
+    async fn point_at_accepted_cut(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
+        cut: &rtdb_node::OwnedWorldAcceptedCut<'_>, schema: &rtdb_types::OwnedSchema,
+    ) -> Result<(Option<WorldFact>, bool)> {
         let local = cut.shadow(id, valid).await?;
         let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
         let shadowed = local.is_some();
@@ -307,7 +314,7 @@ impl HeldCheckpointWorld {
             None => self.archive_point_checked(relation, id, valid, None, Some(schema)).await?,
         };
         if let Some(fact) = &fact {
-            let upper = if shadowed { system } else { self.parent_basis().system_time };
+            let upper = if shadowed { cut.system_time() } else { self.parent_basis().system_time };
             if fact.revision > upper { return Err(OwnedWorld::unavailable()); }
             schema.validate_row(&fact.row)?;
         }
@@ -645,23 +652,50 @@ impl HeldCheckpointWorld {
     pub async fn valid_during(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, parent_only: bool,
     ) -> Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)> {
+        self.valid_during_on_cut(relation, id, valid, parent_only, None).await
+    }
+
+    pub async fn valid_during_at(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, system: Timestamp,
+    ) -> Result<Vec<(Interval, Timestamp)>> {
+        let (visible, _) = self.valid_during_on_cut(relation, id, valid, false, Some(system)).await?;
+        Ok(visible)
+    }
+
+    async fn valid_during_on_cut(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+        parent_only: bool, system: Option<Timestamp>,
+    ) -> Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)> {
         self.check_relation(relation)?;
         if valid.is_empty() { return Err(OwnedWorld::unavailable()); }
         if parent_only && self.open.snapshot.lifetime_point_policy(relation).await?.is_some() {
             return Err(OwnedWorld::unavailable());
         }
         self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
-        let local = if parent_only {
+        let earlier = if let Some(system) = system {
+            let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
+            let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+            let guard = self.open.snapshot.relation_release_guard([relation])?;
+            self.require_archive_coverage(vec![(relation.clone(), 0)], guard).await?;
+            Some((cut, schema))
+        } else {
+            None
+        };
+        let local = if let Some((cut, _)) = &earlier {
+            read_boundaries(cut.boundaries(id, valid).await?, valid).await?
+        } else if parent_only {
             Vec::new()
         } else {
             let scan = self.open.snapshot.open_world_shadow_boundaries(self.open.record.id, relation, id, valid).await?;
             read_boundaries(scan, valid).await?
         };
-        let parent = self.archive_boundaries(relation, id, valid, None).await?;
+        let parent = self.archive_boundaries(relation, id, valid, earlier.as_ref().map(|(_, schema)| (**schema).clone())).await?;
         let boundaries = merge_boundaries(parent, local, valid)?;
         let mut visible = Vec::with_capacity(boundaries.len().saturating_sub(1));
         for window in boundaries.windows(2) {
-            let fact = if parent_only {
+            let fact = if let Some((cut, schema)) = &earlier {
+                self.point_at_accepted_cut(relation, id, window[0], cut, schema).await?.0
+            } else if parent_only {
                 self.archive_point(relation, id, window[0], None).await?
             } else {
                 self.point(relation, id, window[0], false).await?.fact
@@ -670,7 +704,7 @@ impl HeldCheckpointWorld {
                 visible.push((Interval::new(window[0], window[1])?, fact.revision));
             }
         }
-        let witness = if self.evidence_until() > self.present().system_time {
+        let witness = if earlier.is_none() && self.evidence_until() > self.present().system_time {
             Some(if parent_only {
                 self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?
             } else {
