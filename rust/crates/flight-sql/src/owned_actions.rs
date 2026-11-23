@@ -8,7 +8,7 @@ pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -302,6 +302,16 @@ fn measure_batch(count: u64, sum: i128) -> Result<RecordBatch, Status> {
     RecordBatch::try_from_iter([
         ("count", Arc::new(UInt64Array::from(vec![count])) as arrow_array::ArrayRef),
         ("sum_i128", Arc::new(BinaryArray::from_iter_values([sum.as_slice()]))),
+    ]).map_err(arrow)
+}
+
+fn decimal_measure_batch(count: u64, sum: rtdb_node::OwnedDecimalSum) -> Result<RecordBatch, Status> {
+    let coefficient = arrow_buffer::i256::from_be_bytes(sum.coefficient);
+    let sum = Decimal256Array::from(vec![coefficient])
+        .with_precision_and_scale(76, sum.scale).map_err(arrow)?;
+    RecordBatch::try_from_iter([
+        ("count", Arc::new(UInt64Array::from(vec![count])) as arrow_array::ArrayRef),
+        ("sum_decimal", Arc::new(sum)),
     ]).map_err(arrow)
 }
 
@@ -1385,7 +1395,11 @@ impl Service {
             held.snapshot.count_range_observed(&relation, &path, request).await
         }.map_err(status)?;
         let batch = if measured {
-            measure_batch(counted.count, counted.sum.ok_or_else(|| invalid("Owned measure has no covered sum"))?)?
+            match (counted.sum, counted.decimal_sum) {
+                (Some(sum), None) => measure_batch(counted.count, sum)?,
+                (None, Some(sum)) => decimal_measure_batch(counted.count, sum)?,
+                _ => return Err(invalid("Owned measure has no covered sum")),
+            }
         } else {
             count_batch(counted.count)?
         };

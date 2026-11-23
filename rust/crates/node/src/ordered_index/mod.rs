@@ -26,7 +26,7 @@ pub(crate) use maintenance::OrderedIndexMaintenance;
 pub(crate) use usage::Inventory;
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
-const PAGE_LAYOUT_VERSION: u8 = 8;
+const PAGE_LAYOUT_VERSION: u8 = 9;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -199,9 +199,15 @@ pub struct OwnedCountRequest<'a> {
     pub valid_at: rtdb_types::Timestamp,
 }
 
+pub struct OwnedDecimalSum {
+    pub coefficient: [u8; 32],
+    pub scale: i8,
+}
+
 pub struct OwnedRangeCount {
     pub count: u64,
     pub sum: Option<i128>,
+    pub decimal_sum: Option<OwnedDecimalSum>,
     pub present: rtdb_types::Timestamp,
     pub valid_at: rtdb_types::Timestamp,
     pub expiry: Option<rtdb_types::Timestamp>,
@@ -299,19 +305,26 @@ pub(crate) async fn owned_total_at(
     measured: bool,
 ) -> Result<OwnedRangeCount> {
     let definition = owned_definition(&context, owner, relation, path).await?;
-    if measured {
+    let domain = if measured {
         let [.., measure, identity] = definition.columns.as_slice() else {
             return Err(uncovered_owned_range());
         };
         let (schema, _charge) =
             rtdb_query::read_owned_relation_schema(Arc::clone(&context), owner, relation)
                 .await?.ok_or_else(uncovered_owned_range)?;
-        if identity != "_id"
-            || schema.path_column_logical_type(measure) != Some(LogicalType::Scalar(ScalarType::I64))
-        {
-            return Err(uncovered_owned_range());
-        }
-    }
+        if identity != "_id" { return Err(uncovered_owned_range()); }
+        Some(match schema.path_column_logical_type(measure) {
+            Some(LogicalType::Scalar(ScalarType::I64)) => tree::MeasureDomain::Int64,
+            Some(LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width: 128 })) =>
+                tree::MeasureDomain::Decimal128(
+                    precision.try_into().map_err(|_| uncovered_owned_range())?,
+                    scale.try_into().map_err(|_| uncovered_owned_range())?,
+                ),
+            _ => return Err(uncovered_owned_range()),
+        })
+    } else {
+        None
+    };
     let database = context
         .catalog
         .database(context.catalog.default_database())?;
@@ -324,7 +337,7 @@ pub(crate) async fn owned_total_at(
         .find_map(|key| key.get("_id"));
     let projection = owned_projection(&context, snapshot, &definition, owner, relation, identity).await?;
     let work = accelerate::owned_count(
-        &context, snapshot, &database.storage, &definition, projection, request, lifetime, measured,
+        &context, snapshot, &database.storage, &definition, projection, request, lifetime, domain,
     );
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
 }
