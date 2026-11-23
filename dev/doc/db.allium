@@ -38,6 +38,7 @@
 -- A same-type Date64 cast and a Date64 extremum preserve the selected raw milliseconds.
 -- Date subtraction checks that both epoch days and their difference fit the signed 32-bit result type.
 -- New Date64 statistics use the UTC day containing the value.
+-- Arrow sorting compares Date64 values by the same UTC day as scalar sorting.
 -- A native scan widens a potentially legacy pre-epoch lower bound by one day when it reads Date64 statistics.
 -- Ordered indexes use a new page namespace when their Date64 key encoding switches to UTC day flooring.
 -- Native writes derive a keyword IID from the bare name.
