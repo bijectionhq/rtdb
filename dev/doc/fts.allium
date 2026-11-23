@@ -417,6 +417,7 @@ contract SearchCorrectness {
         -- The prefix includes the rows skipped by OFFSET and the rows requested by LIMIT.
         -- A tie at the cutoff remains eligible until the optimizer can prove its position.
         -- Partitions at a shared basis can admit the highest announced bound first and share a cutoff supplied by verified winners.
+        -- Only the verifier's scores of resolved rows that pass the scan's predicates enter that cutoff; a score certified by a forward witness waits until its payload agrees.
         -- Pending gap work has an unbounded score until it yields candidates for exact verification.
         -- A partition prunes on the shared cutoff only when its remaining score bound is strictly lower.
         -- A bitemporal point scan on one partition may break score ties by ascending UUID _id when the captured table stores UUIDs as their canonical IIDs.

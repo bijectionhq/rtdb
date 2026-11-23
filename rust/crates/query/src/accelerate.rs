@@ -171,7 +171,10 @@ impl PartitionRanking {
         Some(PartitionRankWork { ranking: self, partition, _charge: charge })
     }
 
-    pub fn add_verified(&self, limit: usize, rows: impl IntoIterator<Item = (Iid, f64)>) {
+    /// Only the verifier's scores of resolved, predicate-checked rows enter the cutoff that every partition prunes on.
+    pub fn add_verified(&self, limit: usize, scores: &CandidateScores) { self.admit(limit, scores.iter()); }
+
+    fn admit(&self, limit: usize, rows: impl IntoIterator<Item = (Iid, f64)>) {
         if !(1..=4096).contains(&limit) { return; }
         let mut winners = self.winners.lock();
         if winners.charge.is_none() {
@@ -453,11 +456,11 @@ mod tests {
     fn a_shared_cutoff_counts_distinct_finite_winners_from_each_partition() {
         let ranking = PartitionRanking::new(MemoryBudget::new(4096));
         let (first, second, third) = (Iid([1; 16]), Iid([2; 16]), Iid([3; 16]));
-        ranking.add_verified(2, [(first, 3.0), (first, 4.0), (second, f64::NAN)]);
+        ranking.admit(2, [(first, 3.0), (first, 4.0), (second, f64::NAN)]);
         assert_eq!(ranking.cutoff(2), None);
-        ranking.add_verified(2, [(second, -0.0)]);
+        ranking.admit(2, [(second, -0.0)]);
         assert_eq!(ranking.cutoff(2).unwrap().to_bits(), 0.0f64.to_bits());
-        ranking.add_verified(2, [(third, 5.0), (first, 2.0)]);
+        ranking.admit(2, [(third, 5.0), (first, 2.0)]);
         assert_eq!(ranking.cutoff(2), Some(4.0));
     }
 }

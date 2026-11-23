@@ -379,7 +379,6 @@ impl SearchAccelerator {
                             let iid = version.row.version.iid;
                             let (key, witness) = pending[&iid];
                             if trusted && witness.is_some() && witness == version.witness {
-                                if let Some(rank) = shared_rank { rank.add_verified(limit, [(iid, key.score)]); }
                                 verified.push((key, iid));
                                 deferred.insert(iid, version.row);
                                 work.deferred_payloads += 1;
@@ -398,7 +397,7 @@ impl SearchAccelerator {
                     Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
                     Err(_) => request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?,
                 };
-                if let Some(rank) = shared_rank { rank.add_verified(limit, scores.iter()); }
+                if let Some(rank) = shared_rank { rank.add_verified(limit, &scores); }
                 for (iid, score, id) in scores.ranked() {
                     let key = if order == TreeRankOrder::Uuid { RankKey::uuid(score, iid.0) } else { RankKey::integer(score, id) };
                     if deferred.remove(&iid).is_some() {
@@ -569,7 +568,7 @@ impl SearchAccelerator {
                 let Some(row) = scores.row(*iid) else { work.tree_decline = Some("winner-payload"); return Ok(None); };
                 rows.insert(*iid, row);
             }
-            if let Some(rank) = shared_rank { rank.add_verified(limit, scores.iter()); }
+            if let Some(rank) = shared_rank { rank.add_verified(limit, &scores); }
         }
         let iids = verified.iter().map(|&(_, iid)| iid).collect();
         if request.scan.top_k.as_ref().is_some_and(|top| top.score.is_some()) {
