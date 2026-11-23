@@ -30,6 +30,7 @@ The current placed outcome implementation and the [serving authority](../tla/Pla
 Each placed intake has a local byte limit before it accepts provisional work.
 That credit remains with its payload through trim and any outstanding source readers.
 Replica installation checks that the terminal witness agrees with the envelope's exact identity, transaction key and disposition.
+Redemption checks the installed original disposition before mapping any retry to an earlier command result.
 Durable reservation, fencing and succession are implementation and proof obligations for the receiver slot contract.
 
 Current source paths are [Multi intake](../../rust/crates/multi/src/logs.rs), [node submit and await](../../rust/crates/node/src/node.rs), [session basis](../../rust/crates/node/src/session.rs), and [installed progress](../../rust/crates/replication/src/driver.rs).

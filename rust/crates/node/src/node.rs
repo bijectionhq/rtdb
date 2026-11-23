@@ -26,7 +26,7 @@ use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::{BufferPool, CacheBudget};
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, Interval, LogicalType, PlacedAttempt, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -736,11 +736,11 @@ impl Node {
         }
         Ok(None)
     }
-    async fn placed_outcome_key(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
+    async fn placed_outcome(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<PlacedDecision>> {
         let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let sql = "SELECT tx_id, tx_system_time FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
+        let sql = "SELECT tx_id, tx_system_time, committed FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
         let prepared = match prepare_query(sql, &context, &options) {
             Ok(prepared) => prepared,
             Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
@@ -752,10 +752,15 @@ impl Node {
             if batch.num_rows() == 0 { continue; }
             let tx_id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
             let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
-            if let (Value::I64(tx_id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (tx_id, time)
+            let committed = read_value(batch.schema().field(2), batch.column(2).as_ref(), 0)?;
+            if let (Value::I64(tx_id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }, Value::Bool(committed)) =
+                (tx_id, time, committed)
                 && tx_id == attempt.position().0
             {
-                return Ok(Some(TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(value) }));
+                return Ok(Some(PlacedDecision {
+                    key: TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(value) },
+                    committed,
+                }));
             }
             return Err(bad_attempt_outcome());
         }
@@ -801,18 +806,18 @@ impl Node {
             _ => return Err(invalid_token()),
         };
         self.check_placed_receipt_window(db.name(), submitted_at, identity, placement, cancellation).await?;
-        let key = match db.progress().current().placed_outcome(attempt) {
-            Some(key) => Some(key),
-            None => self.placed_outcome_key(db.name(), attempt, identity, placement, cancellation).await?,
+        let outcome = match db.progress().current().placed_outcome(attempt) {
+            Some(outcome) => Some(outcome),
+            None => self.placed_outcome(db.name(), attempt, identity, placement, cancellation).await?,
         };
-        let Some(key) = key else {
+        let Some(outcome) = outcome else {
             return Err(match db.await_authority {
                 AwaitAuthority::Checkpoint { .. } => receipt_checkpoint_behind(db.name()),
                 _ if epoch < current => Anomaly::incorrect("rtdb/attempt-unresolved", "The closed writer epoch has no outcome for this transaction attempt"),
                 _ => Anomaly::new(AnomalyCategory::Unavailable, "rtdb/attempt-pending", "The transaction attempt has no installed outcome"),
             });
         };
-        let result = self.await_transaction_result(db.name(), key.tx_id, Some(key), identity, placement, cancellation).await?;
+        let result = self.await_transaction_result(db.name(), outcome.key.tx_id, Some(outcome), identity, placement, cancellation).await?;
         let token = PlacedToken::Applied { attempt, through }.seal(codec)?;
         Ok((result, token))
     }
@@ -821,13 +826,16 @@ impl Node {
         self.await_transaction_result(database, tx_id, None, identity, None, cancellation).await
     }
 
-    async fn await_transaction_result(&self, database: &str, tx_id: TxId, expected: Option<TransactionKey>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
+    async fn await_transaction_result(&self, database: &str, tx_id: TxId, expected: Option<PlacedDecision>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
         let db = self.attached_database(database, placement)?;
         if expected.is_none() && !matches!(db.await_authority, AwaitAuthority::SourcePosition) { return Err(invalid_token()); }
         let latest = db.replication.await_tx(tx_id, cancellation).await?
-            .filter(|result| expected.is_none_or(|key| key == result.tx_key()));
+            .filter(|result| expected.is_none_or(|outcome| outcome.key == result.tx_key()));
+        if expected.zip(latest.as_deref()).is_some_and(|(outcome, result)| outcome.committed != result.committed()) {
+            return Err(bad_attempt_outcome());
+        }
         if let Some(result) = &latest && !result.error().is_some_and(is_historical_guard_abort) {
             if !db.external_source()
                 && let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten()
@@ -854,8 +862,11 @@ impl Node {
         };
         let system_time = match cell("system_time")? { Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Timestamp(value), _ => return Err(Anomaly::fault("rtdb.node/tx-result-time", "Stored transaction result has no microsecond system-time")) };
         let tx_key = TransactionKey { tx_id, system_time };
-        if expected.is_some_and(|key| key != tx_key) { return Err(bad_attempt_outcome()); }
-        match cell("committed")? {
+        let committed = cell("committed")?;
+        if expected.is_some_and(|outcome| outcome.key != tx_key || committed != Value::Bool(outcome.committed)) {
+            return Err(bad_attempt_outcome());
+        }
+        match committed {
             Value::Bool(true) => Ok(TransactionResult::Committed { tx_key }),
             Value::Bool(false) => {
                 let error = if let Some(TransactionResult::Aborted { error, .. }) = latest.as_deref() {
