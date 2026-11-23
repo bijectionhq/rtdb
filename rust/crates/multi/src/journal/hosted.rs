@@ -147,10 +147,15 @@ pub(crate) fn attachment_identity(value: &Any) -> Result<(String, u64)> {
 }
 
 impl Routes {
-    pub fn read(path: &Path) -> Result<Self> {
+    pub(crate) fn read(path: &Path, serving: &crate::deployment::CellStorage) -> Result<Self> {
         let entries: Vec<Definition> = read_manifest(path)?;
         let mut routes = BTreeMap::new();
         for entry in entries {
+            if serving.overlaps(&entry.archive)? {
+                return Err(invalid(
+                    "The checkpoint archive overlaps the serving storage",
+                ));
+            }
             let worker = InstalledJournal::open(entry.worker)?;
             let custodian = entry.custody.map(InstalledJournal::open).transpose()?;
             let Authority::Worker { enrollment } = worker.authority() else {

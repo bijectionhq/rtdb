@@ -239,15 +239,9 @@ impl InstalledJournal {
     }
 
     pub async fn release(&self, hold: Hold) -> Result<()> {
-        let route = self.route().await?;
-        let request = self.request(&route, Command::Release { hold })?;
-        let decision = self.execute(&request).await?;
-        match decision.receipt.outcome {
-            Ok(Outcome::Released) | Err(Refusal::Stale) => Ok(()),
-            Err(reason) => Err(refused(reason)),
-            Ok(_) => Err(mismatch(
-                "The peer returned a different replay release result",
-            )),
+        match self.call(Operation::Release { hold }).await? {
+            Reply::Released(closed) if closed == hold => Ok(()),
+            _ => Err(mismatch("The peer released a different replay hold")),
         }
     }
 

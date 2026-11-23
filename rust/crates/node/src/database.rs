@@ -99,6 +99,7 @@ impl Database {
             let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?;
             let mut status = self.watch_status();
             let applied = status.wait_for(|status| status.role == Role::Stopped
+                || barrier.offset.0 == -1
                 || status.installed.is_some_and(|prefix| prefix.replica >= position));
             let status = tokio::time::timeout(barrier.wait, applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
             if status.role == Role::Stopped { return Err(behind()); }
