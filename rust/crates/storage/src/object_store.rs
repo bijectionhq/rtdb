@@ -146,6 +146,8 @@ pub trait IndexPageLifecycle: Send + Sync {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Whether returned bytes may be reused across reads without returning to this owner.
+    fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
     /// Opens the read-only objects owned by an authenticated replica delivery.
     async fn open_replica_objects(&self, _scope: crate::log::ReplicaObjectScope) -> Result<Arc<dyn ObjectStore>> {
@@ -159,15 +161,23 @@ pub trait ObjectStore: Send + Sync {
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
-    /// Whether physical trie retirement waits for an installed receipt and the catalog floor.
+    /// Registers complete paths for the compacted primary files in this captured catalog.
+    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, _paths: Arc<[String]>)
+        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        self.retain_catalog(cut).await
+    }
+    /// Whether physical trie retirement belongs to a coordinated storage authority.
     fn defers_trie_releases(&self) -> bool { false }
+    /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.
+    fn releases_receipt_l0(&self) -> bool { false }
     /// Records an installed retirement as a lower bound for new catalog captures.
     /// Returns false while a reader still needs a catalog before the proposed floor.
     async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         Ok(true)
     }
-    /// Releases the files selected by an installed trie-removal receipt.
-    async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<()> {
+    /// Submits the files selected by an installed trie-removal receipt to their storage authority.
+    /// Returns false while the authority retains the files and expects the caller to retry.
+    async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<bool> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
     }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
@@ -316,6 +326,7 @@ fn checked_range(key: &ObjectKey, range: Range<u64>, length: u64) -> Result<Rang
 
 #[async_trait]
 impl ObjectStore for MemoryStore {
+    fn permits_shared_read_cache(&self) -> bool { true }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let objects = self.objects.read();
         let bytes = objects.get(key).ok_or_else(|| Error::MissingObject(key.to_string()))?;
@@ -398,6 +409,15 @@ struct AdmittedFile {
 
 impl LocalStore {
     pub fn root(&self) -> &Path { &self.root }
+
+    pub(crate) fn io_region(&self) -> &Arc<IoRegion> { &self.io }
+
+    /// Settles the prefixes selected by the verified offline repair anchor.
+    pub async fn retire_classic_log_prefixes(&self, anchor: crate::LocalRepairAnchor,
+        replica: &Path, maximum: usize,
+    ) -> rtdb_types::Result<()> {
+        crate::classic_retirement::retire_log_prefixes(self, anchor, replica, maximum).await
+    }
     /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         Self::open_in(root, IoRegion::new())
@@ -425,6 +445,20 @@ impl LocalStore {
             crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
             sync_parents(&path, &root)
         }).await
+    }
+
+    /// Retains local recovery media while startup opens its checkpoint and replica cursor.
+    pub async fn hold_recovery_open(&self) -> rtdb_types::Result<Arc<dyn Send + Sync>> {
+        let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
+        Ok(Arc::new(self.io.run(move || Ok(ledger.hold_recovery_open())).await??))
+    }
+
+    pub(crate) async fn try_lock_recovery_deletion(&self) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
+        let gate = self.io.run(move || Ok(ledger.try_lock_recovery_deletion())).await??;
+        Ok(gate.map(|gate| Arc::new(gate) as Arc<dyn Send + Sync>))
     }
 
     /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
@@ -529,6 +563,7 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 
 #[async_trait]
 impl ObjectStore for LocalStore {
+    fn permits_shared_read_cache(&self) -> bool { true }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { Some(self) }
     fn syncs_checkpoints(&self) -> bool { true }
 
@@ -538,29 +573,15 @@ impl ObjectStore for LocalStore {
     }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
+    fn releases_receipt_l0(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         let Some(ledger) = self.catalog.clone() else { return Ok(true); };
         self.io.run(move || Ok(ledger.advance(installed))).await?
     }
 
-    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<()> {
-        use rtdb_format::trie_retirement::InstalledRetirement;
-        let unavailable = || rtdb_types::Anomaly::incorrect("rtdb.storage/trie-release",
-            "The local catalog floor does not authorize this installed trie release");
-        let ledger = self.catalog.clone().ok_or_else(unavailable)?;
-        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
-        let cut = installed.cut();
-        if self.get_fresh_exact(receipt, contents.len()).await? != contents
-            || !self.io.run(move || Ok(ledger.permits_retirement(cut))).await??
-        {
-            return Err(unavailable());
-        }
-        let mut files = installed.files().iter().collect::<Vec<_>>();
-        files.sort_by_key(|file| file.release_order());
-        let files = files.into_iter().map(|file| ObjectKey::new(&file.key)).collect::<Result<Vec<_>>>()?;
-        for file in files { self.delete(&file).await?; }
-        Ok(())
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
+        crate::classic_retirement::retire(self, receipt, contents).await
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {

@@ -2,13 +2,13 @@
 
 [HeldWorldsOrder.lean](lean/HeldWorldsOrder.lean) projects the hosted actions onto the chosen data cuts of [OrderedJournal.lean](lean/OrderedJournal.lean).
 It distinguishes the source position from the assigned system revision.
-The projection covers the five admitted Flight actions, including the kind-6 primary and constraint-refusal outcomes and the hosted staging refusal.
+The projection covers the six Flight actions, including the kind-6 prepared switch and constraint refusal and the hosted staging refusal.
 A publication requires equality with the installation authority at its ordered predecessor.
 The publication contains one marker per submitted live context at its assigned revision with the submitted fingerprint.
 The recovery laws preserve the chosen cut through every modeled journal step and exclude a different cut digest at the same index in the same history.
 These model laws leave the correspondence from native recovery to the modeled chosen cut open.
 
-[The Verus area](../verus/held_worlds_order/proof.rs) checks the shipping equality, refusal selection, staging cutoff, marker byte copy and equality, event revision, and source order decisions.
+[The Verus area](../verus/held_worlds_order/proof.rs) checks the shipping prepared switch and clock-slot selector, equality, refusal selection, staging cutoff, marker byte copy and equality, event revision, and source order decisions.
 The [laws](../verus/held_worlds_order/laws.rs) use those implementations by path.
 The [defect controls](../verus/held_worlds_order/area.json) change the shipped decision bodies.
 The bindings below identify the async callers, codec, catalog, and journal work that the harness does not compile.
@@ -18,7 +18,7 @@ The bindings below identify the async callers, codec, catalog, and journal work 
 | Flight action | Resolver input and effects |
 | --- | --- |
 | `DecideHosted.v1` | `commit_hosted_with_reads` appends the decoded hosted controls to the primary operation list. A cutoff selects a strict durable predecessor and a failed staging check discards the candidate. An optional constraint alternative is separated at `HostedConstraintRefusal`. |
-| `DecideHeldWorlds.v1` | `decide_held_worlds_action` sends the decoded primary controls, world sections and one fingerprint through `PlacedWorldHost::commit_world_batch` to `commit_owned_world_batch`. Kind 6 shares the Proposal section's attempt with the Root and emits one embedded marker on success. Its refusal uses that same context and fingerprint and retains the Proposal. |
+| `DecideHeldWorlds.v1` and `SwitchPreparedProposal.v1` | Both enter `decide_held_worlds_action`. Kind 6 requires the prepared action and its original offered clock slot. The action sends the primary controls, world sections and one fingerprint through `PlacedWorldHost::commit_world_batch` to `commit_owned_world_batch`. The prepared switch shares the Proposal section's attempt with the Root and emits one embedded marker on success. Its refusal uses that same context and fingerprint and retains the Proposal. |
 | `PublishHeldWorldRetention.v3` | `publish_held_world_retention_action` passes decoded check-only controls and the exact attempt and fingerprint to `PlacedWorldHost::fork_world_checked`. |
 | `PublishWorldCut.v1` and `DecideWorldCut.v1` | `publish_world_cut_action` carries the original controls, attempt and fingerprint through `fork_world_checked` to `register_owned_world_checked`. Only the decide form can carry a Root publication and a paired refusal. |
 
@@ -27,8 +27,10 @@ The source operation preserves the check variant and expected stamp across `sour
 `TxResolver::resolving_snapshot` combines the durable snapshot with its ordered staged queue and checks the resulting basis against its head.
 `check_hosted_controls` looks up the exact table and ID in that base snapshot and compares the row's physical revision or covered absence with the decoded expectation.
 The primary loop starts after preconditions succeed.
-On constraint refusal, the resolver drops the primary buffer, reopens the same base, selects the original primary checks, and calls `apply_constraint_refusal`.
-That method checks its preconditions before applying the refusal operations.
+On constraint refusal, the resolver drops the primary buffer, reopens the same base, calls `apply_selected_refusal`, and retains the original primary writer check.
+That method can omit a scope-only world check when it has no corresponding observation.
+It runs the selected preconditions before applying refusal operations.
+The prepared-generation candidate's own validation and installation still need a proof from the checked predecessor through the exact chosen replica body.
 The staging deadline can refuse that selected transaction after resolution but cannot replace its checked predecessor.
 
 `reserve_owned_attempt` and the node's refusal builder use the same marker document constructor.

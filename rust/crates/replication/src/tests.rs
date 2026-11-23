@@ -268,14 +268,24 @@ async fn admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applie
 }
 
 #[tokio::test]
-async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
+async fn skipped_malformed_arrow_keeps_diagnostics_and_orders_the_original_attempt() {
     let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
     let seed = rtdb_types::PlacedAttemptScope::new("deployment/1/replica", 7).unwrap().issue();
-    let message = rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(proto::Tx {
+    use rtdb_format::envelope::{SourceBody, SourceMessage};
+
+    let diagnostic = proto::Tx {
         tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100),
-        user: Some("alice".into()), placed_attempt_seed: Some(seed.encode().to_vec()), ..Default::default()
+        user: Some("alice".into()), ..Default::default()
+    };
+    let message = SourceMessage::Protobuf(SourceBody::Tx(proto::Tx {
+        user_metadata: Some(vec![4, 5, 6]), placed_attempt_seed: Some(seed.encode().to_vec()),
+        bounded_retry: Some(proto::BoundedRetry {
+            nonce: Some(b"0123456789abcdef0123456789abcdef".to_vec()),
+            not_after_micros: Some(100_000),
+        }),
+        ..diagnostic.clone()
     }));
-    let expected = message.encode().unwrap();
+    let expected = SourceMessage::Protobuf(SourceBody::Tx(diagnostic)).encode().unwrap();
     let handle = fixture.handle.clone();
     let driver = tokio::spawn(fixture.driver.run());
     let position = handle.submit_source(&message, Timestamp(100)).await.unwrap();
@@ -2717,6 +2727,35 @@ fn produced_upload(produced: &ProducedBlock, index: i64, source: i64) -> Replica
         tries: produced.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
         external_source_token: None, catalog_sha256: Some(produced.catalog.publication_sha256().unwrap().to_vec()),
     })
+}
+
+#[tokio::test]
+async fn native_coordinated_startup_refuses_a_checkpoint_missing_primary_data() {
+    use rtdb_storage::LocalStore;
+
+    let replay = replayed_suffix(false).await;
+    let (root, tables) = replay.blocks.load(BlockIndex(0)).await.unwrap();
+    let objects = checkpoint_dependencies(&root, &tables).unwrap();
+    let primary_data = objects.iter().find(|key| key.as_str().contains("/data/")).unwrap().clone();
+    let path = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalStore::open(path.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+    for object in objects {
+        let bytes = replay.blocks.object_store().get_fresh(&object).await.unwrap();
+        local.put(&object, bytes).await.unwrap();
+    }
+    let store: Arc<dyn ObjectStore> = local.clone();
+    let blocks = BlockStore::new(store.clone(), Arc::new(BufferPool::new(store, 1 << 20)),
+        MemoryBudget::new(1 << 26), 100_000_000).unwrap();
+    let ready = || blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), BlockDiscovery::At(BlockIndex(0)));
+    let hold = local.hold_recovery_open().await.unwrap();
+    assert!(ready().await.is_ok());
+    local.delete(&primary_data).await.unwrap();
+    let missing = ready().await.err().unwrap();
+    assert_eq!(missing.code, "rtdb.storage/missing-object");
+    local.put(&primary_data, Bytes::from_static(b"x")).await.unwrap();
+    let damaged = ready().await.err().unwrap();
+    assert_eq!(damaged.code, "rtdb.replication/checkpoint-primary-extent");
+    drop(hold);
 }
 
 async fn offloaded(store: &MemoryStore, position: i64, sequence: i64, body: ReplicaBody, block: BlockIndex) -> (LogRecord, rtdb_storage::ObjectKey) {

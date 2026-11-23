@@ -12,6 +12,7 @@ structure Key where
 inductive Action where
   | decideHosted (staging : Bool)
   | decideHeldWorlds (rootKind : Nat)
+  | switchPreparedProposal (hasClockSlot : Bool)
   | publishHeldWorldRetention
   | publishWorldCut
   | decideWorldCut
@@ -41,9 +42,14 @@ structure Publication where
 def submittedMarkers (request : Submission) (key : Key) : List Marker :=
   request.contexts.map (fun ctx => ⟨ctx, key.revision, request.fingerprint⟩)
 
+def Action.admits : Action → Bool
+  | .decideHeldWorlds 6 => false
+  | .switchPreparedProposal hasClockSlot => hasClockSlot
+  | _ => true
+
 def Action.permitsRefusal : Action → Bool
-  | .decideHosted _ | .decideWorldCut => true
-  | .decideHeldWorlds kind => 4 ≤ kind && kind ≤ 7
+  | .decideHosted _ | .decideWorldCut | .switchPreparedProposal _ => true
+  | .decideHeldWorlds kind => kind == 4 || kind == 5 || kind == 7
   | .publishHeldWorldRetention | .publishWorldCut => false
 
 /--
@@ -53,7 +59,7 @@ and starts from the same ordered predecessor. The outcome includes the staging c
 -/
 def resolve (authority : Option Int) (request : Submission) (key : Key)
     (outcome : Outcome) : Option Publication :=
-  if authority = some request.expected then
+  if request.action.admits = true ∧ authority = some request.expected then
     match outcome with
     | .primary => some ⟨key, false, submittedMarkers request key⟩
     | .constraintRefusal =>
@@ -61,12 +67,17 @@ def resolve (authority : Option Int) (request : Submission) (key : Key)
     | .rejected | .stagingRejected => none
   else none
 
+private theorem admitted_shape_before_publication
+    (accepted : resolve authority request key outcome = some publication) :
+    request.action.admits = true ∧ authority = some request.expected := by
+  by_cases admitted : request.action.admits = true ∧ authority = some request.expected
+  · exact admitted
+  · simp [resolve, admitted] at accepted
+
 theorem placed_action_checks_ordered_predecessor
     (accepted : resolve authority request key outcome = some publication) :
     authority = some request.expected := by
-  by_cases matched : authority = some request.expected
-  · exact matched
-  · simp [resolve, matched] at accepted
+  exact (admitted_shape_before_publication accepted).2
 
 theorem staged_or_ordinary_rejection_has_no_publication (authority : Option Int)
     (request : Submission) (key : Key) :
@@ -78,7 +89,7 @@ theorem accepted_markers_are_exact
     (accepted : resolve authority request key outcome = some publication) :
     publication.key = key ∧
     publication.markers = submittedMarkers request key := by
-  have matched := placed_action_checks_ordered_predecessor accepted
+  have matched := admitted_shape_before_publication accepted
   cases outcome with
   | rejected | stagingRejected => simp [resolve, matched] at accepted
   | primary =>
@@ -90,16 +101,22 @@ theorem accepted_markers_are_exact
     subst publication
     exact ⟨rfl, rfl⟩
 
-theorem current_writer_can_publish (request : Submission) (key : Key) :
+theorem current_writer_can_publish (request : Submission) (key : Key)
+    (supported : request.action.admits = true) :
     resolve (some request.expected) request key .primary =
       some ⟨key, false, submittedMarkers request key⟩ := by
-  simp [resolve]
+  simp [resolve, supported]
 
 theorem kind_six_can_settle_under_its_original_check (request : Submission) (key : Key)
-    (landing : request.action = .decideHeldWorlds 6) :
+    (landing : request.action = .switchPreparedProposal true) :
     resolve (some request.expected) request key .constraintRefusal =
       some ⟨key, true, submittedMarkers request key⟩ := by
-  simp [resolve, landing, Action.permitsRefusal]
+  simp [resolve, landing, Action.admits, Action.permitsRefusal]
+
+theorem legacy_kind_six_and_clockless_switch_cannot_publish (request : Submission)
+    (legacy : request.action = .decideHeldWorlds 6 ∨ request.action = .switchPreparedProposal false) :
+    resolve authority request key outcome = none := by
+  rcases legacy with legacy | legacy <;> simp [resolve, legacy, Action.admits]
 
 theorem every_live_context_has_its_submitted_fingerprint
     (accepted : resolve authority request key outcome = some publication) (context : Nat) :
@@ -218,6 +235,7 @@ theorem reopened_action_uses_the_recovered_installation_history
 #print axioms accepted_markers_are_exact
 #print axioms current_writer_can_publish
 #print axioms kind_six_can_settle_under_its_original_check
+#print axioms legacy_kind_six_and_clockless_switch_cannot_publish
 #print axioms every_live_context_has_its_submitted_fingerprint
 #print axioms reopen_uses_one_chosen_history
 #print axioms chosen_recovery_basis_survives_resolution_on_its_history

@@ -224,7 +224,7 @@ impl S3Config {
         };
         let client = build_client(ordinary)?;
         if !cell {
-            return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
+            return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io).with_catalog_ledger()?));
         }
         #[cfg(feature = "versioning")]
         let store = match uploads {

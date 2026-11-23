@@ -253,6 +253,9 @@ impl DiskCache {
     /// Its owner closes and joins that region after consumers finish; other cache scopes remain usable.
     /// The remote capability must retain any offloaded provider work in the same region.
     pub fn scope_in(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        if !remote.permits_shared_read_cache() {
+            return Err(Error::Closed("The object owner requires a fresh read for each use".into()));
+        }
         Ok(Arc::new(DiskCachedStore { cache: Arc::clone(self), namespace, remote, io }))
     }
 
@@ -304,17 +307,23 @@ impl DiskCachedStore {
 }
 #[async_trait]
 impl ObjectStore for DiskCachedStore {
+    fn permits_shared_read_cache(&self) -> bool { self.remote.permits_shared_read_cache() }
     fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
         self.remote.index_page_lifecycle()
     }
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.remote.retain_catalog(cut).await
     }
+    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
+        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        self.remote.retain_catalog_with_primary(cut, paths).await
+    }
     fn defers_trie_releases(&self) -> bool { self.remote.defers_trie_releases() }
+    fn releases_receipt_l0(&self) -> bool { self.remote.releases_receipt_l0() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         self.remote.advance_catalog_floor(installed).await
     }
-    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<()> {
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
         self.remote.release_trie_files(receipt, contents).await
     }
     async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,

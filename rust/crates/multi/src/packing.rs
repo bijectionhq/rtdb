@@ -17,7 +17,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, StoredObject};
-use rtdb_types::PhysicalObjectVersion;
+use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion};
 use serde::{Deserialize, Serialize};
 
 mod extent;
@@ -66,9 +66,10 @@ pub fn pack_block(pack: &str) -> Option<i64> {
     rtdb_format::keys::block_index_from_key(&format!("{stem}.binpb")).ok().map(|block| block.0)
 }
 
-/// Whether a flush writes `key` before its block catalog: a level-0 trie file or a per-table block file.
+/// Whether to hold a flush object for its block pack.
 pub fn held_back(key: &str) -> bool {
     key.starts_with("tables/") && (key.contains("/data/l00-") || key.contains("/meta/l00-") || key.contains("/blocks/b"))
+        && !rtdb_format::keys::is_receipt_l0_file(key)
 }
 
 fn is_catalog(key: &str) -> bool { key.starts_with("blocks/b") && key.ends_with(".binpb") }
@@ -366,7 +367,7 @@ impl PackingStore {
     }
 
     /// Observes the owned publication named by this member's admitted index.
-    pub(crate) async fn retirement_pack(&self, member: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PhysicalObjectVersion)>> {
+    pub(crate) async fn retirement_pack(&self, member: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PhysicalObjectPublication)>> {
         let Some(location) = self.locate(member).await? else { return Ok(None); };
         if pack_block(location.pack.as_str()).is_none() { return Ok(None); }
         let location = match self.observe_location(member, location).await {
@@ -374,9 +375,11 @@ impl PackingStore {
             Err(Error::MissingObject(_)) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let Some(version) = location.version else { return Ok(None); };
-        let owned = self.inner.retirement_version(&location.pack).await?;
-        Ok((owned.as_ref() == Some(version.as_ref())).then(|| (location.pack, (*version).clone())))
+        let publication = self.inner.retirement_publication(&location.pack).await?;
+        Ok(publication.filter(|publication| match publication {
+            PhysicalObjectPublication::Version(version) => location.version.as_deref() == Some(version),
+            PhysicalObjectPublication::Terminal(_) => location.version.is_none(),
+        }).map(|publication| (location.pack, publication)))
     }
 
     async fn read_packed(&self, object: &ObjectKey, location: LocatedEntry, read: PackRead) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
@@ -407,6 +410,7 @@ fn key(name: &str) -> rtdb_storage::Result<ObjectKey> { ObjectKey::new(name).map
 
 #[async_trait]
 impl ObjectStore for PackingStore {
+    fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn head(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         if IoRegion::requires_audience_transport() { return Ok(self.observe_head(object).await?.value); }

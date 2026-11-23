@@ -1,9 +1,9 @@
 {
-  "summary": "Checks the shipped hosted revision comparison, exact selection of original refusal checks, marker payload and event revision decisions, and placement of a publication after its recovered predecessor.",
+  "summary": "Checks the shipped prepared landing action selection, hosted revision comparison, exact selection of original refusal checks, marker payload and event revision decisions, and placement of a publication after its recovered predecessor.",
   "flags": [
     "--no-external-by-default"
   ],
-  "min_verified_functions": 19,
+  "min_verified_functions": 21,
   "controls": {
     "accept_a_different_writer_revision": {
       "defect": "Treat any live installation authority as the submitted revision.",
@@ -21,7 +21,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 18
+      "min_verified_functions": 20
     },
     "omit_the_primary_writer_check_from_refusal": {
       "defect": "Discard the primary check-only operation when selecting the refusal.",
@@ -39,7 +39,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 18
+      "min_verified_functions": 20
     },
     "substitute_the_refusal_fingerprint": {
       "defect": "Accept a refusal marker with altered bytes.",
@@ -57,7 +57,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 18
+      "min_verified_functions": 20
     },
     "write_a_different_fingerprint": {
       "defect": "Flip a bit when building the marker document.",
@@ -75,7 +75,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 18
+      "min_verified_functions": 20
     },
     "stage_a_marker_at_another_revision": {
       "defect": "Stage an event whose revision is earlier than the transaction's.",
@@ -93,7 +93,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 18
+      "min_verified_functions": 20
     },
     "reuse_the_predecessor_source_position": {
       "defect": "Allow the first placed publication to reuse its predecessor's position.",
@@ -111,7 +111,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 18
+      "min_verified_functions": 20
     },
     "stage_at_the_exclusive_bound": {
       "defect": "Treat the exclusive staging deadline as inclusive.",
@@ -129,7 +129,25 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 18
+      "min_verified_functions": 20
+    },
+    "allow_kind_six_on_ordinary_world_action": {
+      "defect": "Accept a kind-6 landing under DecideHeldWorlds with an offered clock slot.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_actions/prepared_landing.rs",
+          "find": "    kind_six == prepared_action && (!kind_six || has_clock_slot)",
+          "replace": "    (!prepared_action || kind_six) && (!kind_six || has_clock_slot)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_actions/prepared_landing.rs",
+          "function": "admits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 20
     }
   }
 }

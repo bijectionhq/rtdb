@@ -1,5 +1,6 @@
 pub mod directory_io;
 pub mod readset;
+pub mod residence_trace;
 mod error;
 mod calendar;
 mod zone;
@@ -18,7 +19,7 @@ pub use journal::{JournalEndpoint, valid_journal_identity};
 mod journal_evidence;
 pub use journal_evidence::journal_frame_matches;
 mod placed_attempt;
-pub use placed_attempt::{PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed};
+pub use placed_attempt::{PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed, PlacedDecision};
 mod pg;
 mod type_edn;
 mod time;

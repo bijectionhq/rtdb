@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_tx::TransactionResult;
-use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttempt, Result, SourcePosition, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttempt, PlacedDecision, Result, SourcePosition, Timestamp, TransactionKey, TxId};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -32,9 +32,12 @@ pub struct AppliedProgress {
 }
 impl AppliedProgress {
     pub fn tx_id(&self) -> TxId { self.tx_key.map_or(TxId(-1), |key| key.tx_id) }
-    pub fn placed_outcome(&self, attempt: PlacedAttempt) -> Option<TransactionKey> {
+    pub fn placed_outcome(&self, attempt: PlacedAttempt) -> Option<PlacedDecision> {
         self.latest_result.as_ref().filter(|completed| completed.attempt == Some(attempt))
-            .map(|completed| completed.result.tx_key())
+            .map(|completed| PlacedDecision {
+                key: completed.result.tx_key(),
+                committed: completed.result.committed(),
+            })
     }
 }
 

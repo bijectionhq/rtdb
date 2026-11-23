@@ -32,7 +32,7 @@ pub(crate) struct FileRelease {
 }
 
 impl FileRelease {
-    async fn queue(&self, store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+    async fn submit(&self, store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
         let _permit = self.slots.acquire().await.map_err(crate::invalid)?;
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         store.release_trie_files(receipt, contents).await
@@ -132,8 +132,10 @@ impl PendingRetirement {
 
     fn keys(&self) -> Result<Vec<TrieKey>> {
         let keys = self.plan.tries.iter().map(|key| key.parse()).collect::<Result<Vec<TrieKey>>>()?;
-        if keys.is_empty() || keys.iter().any(|key| key.level() == 0) {
-            return Err(crate::invalid("A trie retirement intent must name at least one non-L0 trie and no L0 trie"));
+        if keys.is_empty() || (keys.iter().any(|key| key.level() == 0)
+            && !self.plan.table.stores_expiring_transaction_metadata())
+        {
+            return Err(crate::invalid("Only receipt tables can include L0 in a trie retirement intent"));
         }
         Ok(keys)
     }
@@ -184,13 +186,10 @@ impl PendingRetirement {
     }
 
     async fn release_intent(&self, store: &dyn ObjectStore, installed: ReplicaPosition, release: &FileRelease) -> Result<()> {
-        let cut = CatalogCut { through: installed, ..self.plan.selected };
-        if store.advance_catalog_floor(cut).await? {
-            if store.defers_trie_releases() {
-                release.queue(store, &self.receipt, self.receipt_bytes(installed)).await?;
-            }
-            store.delete(&self.intent).await?;
+        if store.defers_trie_releases() && !release.submit(store, &self.receipt, self.receipt_bytes(installed)).await? {
+            return Ok(());
         }
+        store.delete(&self.intent).await?;
         Ok(())
     }
 }

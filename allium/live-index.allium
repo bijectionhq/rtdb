@@ -33,6 +33,12 @@
 --   Staged rows ARE read, by the transactions resolving behind them (read-your-writes), and that stays within the discipline only because the reader is the same owner — the term's own coroutine.
 --   Nothing else may read staged rows.
 --
+-- A hosted Proposal landing prepares private immutable table segments from its complete admitted footprint at the offered clock.
+-- The source record seals this generation with the exact footprint and its installed predecessor transaction, block and catalog cut.
+-- The resolver drains earlier writes and admits the generation only at that predecessor and clock.
+-- The normal replica read-back installs the generation, Proposal drop, receipt and admitted task controls in a single live value.
+-- The selected refusal has only its attempt and receipt effects and leaves the Root publication and Proposal in place.
+
 -- Pipelining — resolve, append, read back, apply:
 --   A LEADER applies its own writes to the durable live tables only once it has read them BACK off its own replica log, at its own term.
 --   That read-back is the fence — Raft's ReadIndex. The four stages:

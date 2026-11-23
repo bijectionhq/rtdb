@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
+use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool, log::LogTail};
 use rtdb_trie::{TrieConfig, TrieNode};
@@ -46,7 +46,7 @@ impl RecoveredPartition {
         let rtdb_tx::ReplayedTransaction { writes, result, .. } =
             rtdb_tx::decode_replica(message, latest, value.live().block_index(), memory)?;
         if latest.is_some_and(|previous| result.tx_key().tx_id <= previous.tx_id
-            || result.tx_key().system_time <= previous.system_time)
+            || result.tx_key().system_time < previous.system_time)
         {
             return Err(invalid("Archived transaction regressed its basis"));
         }
@@ -454,7 +454,32 @@ impl BlockStore {
             return Err(invalid("The stored checkpoint does not match or advance the admitted checkpoint in its replica journal"));
         }
         let tables = self.load_tables(&block).await?;
+        if self.store.local_maintenance_store().is_some_and(|local| local.defers_trie_releases()) {
+            self.verify_primary_inventory(&block, &tables).await?;
+        }
         Ok((block, tables))
+    }
+
+    pub(crate) async fn verify_primary_inventory(&self, root: &BlockCatalog,
+        tables: &BTreeMap<rtdb_types::TableRef, TableBlock>,
+    ) -> Result<()> {
+        let invalid_extent = |key| Anomaly::fault("rtdb.replication/checkpoint-primary-extent",
+            format!("The checkpoint primary file has the wrong length: {key}"));
+        for entry in root.table_entries()? {
+            let table = tables.get(&entry.table).ok_or_else(|| invalid("The checkpoint has no table block"))?;
+            for trie in table.trie_details() {
+                for path in trie.checkpoint_files(&entry.slug, CheckpointContents::Primary)? {
+                    let key = ObjectKey::new(path)?;
+                    let size = self.store.head_fresh(&key).await?.size;
+                    if size == 0 || key.as_str().contains("/data/")
+                        && trie.data_file_size.is_some_and(|expected| u64::try_from(expected) != Ok(size))
+                    {
+                        return Err(invalid_extent(key));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn load_tables(&self, block: &BlockCatalog) -> Result<BTreeMap<rtdb_types::TableRef, TableBlock>> {
@@ -512,12 +537,26 @@ impl BlockStore {
             let file = writer.ok_or_else(|| invalid("Nonempty live table produced no pages"))?.finish()?;
             rtdb_storage::sync_file(&file).map_err(io_error)?;
             let size = i64::try_from(file.metadata().map_err(io_error)?.len()).map_err(io_error)?;
-            self.store.put_file(&ObjectKey::new(entry.slug.data_key(&trie))?, temporary.path()).await?;
+            let data_key = ObjectKey::new(entry.slug.data_key(&trie))?;
+            let release_receipt_l0 = self.store.releases_receipt_l0() && table.stores_expiring_transaction_metadata()
+                && rtdb_format::keys::is_receipt_l0_file(data_key.as_str());
+            let data = if release_receipt_l0 {
+                self.store.put_file_with_publication(&data_key, temporary.path()).await?
+            } else {
+                self.store.put_file(&data_key, temporary.path()).await?;
+                None
+            };
             check_cancelled(cancellation)?;
             let _metadata_serialization = self.memory.reserve(metadata.serialization_bound()?)?;
             let (metadata_file, summary) = metadata.finish()?;
             let bytes = metadata_file.write()?;
-            self.store.put(&ObjectKey::new(entry.slug.metadata_key(&trie))?, Bytes::from(bytes)).await?;
+            let metadata_key = ObjectKey::new(entry.slug.metadata_key(&trie))?;
+            let metadata = if release_receipt_l0 {
+                self.store.put_with_publication(&metadata_key, Bytes::from(bytes)).await?
+            } else {
+                self.store.put(&metadata_key, Bytes::from(bytes)).await?;
+                None
+            };
             let artefacts = match (self.staged_table_artefacts(entry, index).await?, search) {
                 (Some(records), _) => records,
                 (None, Some(search)) => search.seal(prepared.value(), table, &trie, temporary.path(), size as u64, cancellation).await?,
@@ -525,6 +564,21 @@ impl BlockStore {
             };
             let mut notification = CatalogTrie::notification(trie, size, Some(summary))?;
             notification.artefacts = artefacts;
+            if release_receipt_l0 {
+                let data = match data {
+                    Some(publication) => Some(publication),
+                    None => self.store.retirement_publication(&data_key).await?,
+                };
+                let metadata = match metadata {
+                    Some(publication) => Some(publication),
+                    None => self.store.retirement_publication(&metadata_key).await?,
+                };
+                if data.is_some() || metadata.is_some() {
+                    notification.published_files = Some(proto::TrieFileVersions {
+                        data: data.map(Into::into), metadata: metadata.map(Into::into),
+                    });
+                }
+            }
             tries.insert(table.clone(), vec![notification]);
             tokio::task::yield_now().await;
         }

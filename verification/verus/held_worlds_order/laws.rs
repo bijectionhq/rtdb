@@ -1,9 +1,15 @@
 use crate::control_order::{SourceOrder, fingerprint_bytes, fingerprint_matches, hosted_check_for_refusal, revision_matches, source_order, staging_clock_upper};
 use crate::event_revision::matches_transaction;
+use crate::prepared_landing;
 use crate::system_time::advances;
 use vstd::prelude::*;
 
 verus! {
+
+pub fn kind_six_requires_the_prepared_action_and_clock_slot(prepared_action: bool, slot: bool) {
+    let admitted = prepared_landing::admits(true, prepared_action, slot);
+    assert(admitted == (prepared_action && slot));
+}
 
 pub fn ordered_writer_stamp_is_exact(predecessor: Option<i64>, submitted: i64) {
     let admitted = revision_matches(predecessor, Some(submitted));

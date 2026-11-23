@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rtdb_format::{keys::{ArtefactOwner, ArtefactPack, TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactScope, ArtefactsAdded, ArtefactsRemoved}};
 use rtdb_index::{PartitionValue, TrieCatalog, TrieState};
-use rtdb_storage::{ObjectKey, ObjectStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, StorageEpoch, StorageVersion, TableRef};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -222,9 +222,22 @@ fn input_collected(error: &Anomaly, catalog: &TrieCatalog, table: &TableRef, slu
         && catalog.trie(table, key).is_none_or(|trie| matches!(trie.state, TrieState::Garbage { .. }))
 }
 
-async fn build_entries(job: &ArtefactJob, builder: &dyn ArtefactBuilder, snapshots: &dyn SnapshotSource, cancellation: &CancellationToken) -> Result<Vec<ArtefactEntry>> {
+async fn build_stored(
+    builder: &dyn ArtefactBuilder, store: &dyn ObjectStore, job: &ArtefactJob,
+    snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken,
+) -> Result<ArtefactRecord> {
+    let work = builder.build(job, ArtefactSource::Stored, snapshot, cancellation);
+    if !store.defers_trie_releases() { return work.await; }
+    let hold = store.retain_catalog(snapshot.snapshot().catalog_cut()).await?
+        .ok_or_else(|| crate::invalid("Coordinated storage returned no artefact input hold"))?;
+    IoRegion::retaining(hold, work).await
+}
+
+async fn build_entries(job: &ArtefactJob, builder: &dyn ArtefactBuilder, store: &dyn ObjectStore,
+    snapshots: &dyn SnapshotSource, cancellation: &CancellationToken,
+) -> Result<Vec<ArtefactEntry>> {
     let snapshot = snapshots.snapshot();
-    let error = match builder.build(job, ArtefactSource::Stored, &snapshot, cancellation).await {
+    let error = match build_stored(builder, store, job, &snapshot, cancellation).await {
         Ok(record) => return Ok(job.entries(record)),
         Err(error) => error,
     };
@@ -246,7 +259,7 @@ async fn build_entries(job: &ArtefactJob, builder: &dyn ArtefactBuilder, snapsho
         }
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let replacement = ArtefactJob { definition: job.definition.clone(), owner: ArtefactOwner::Trie(trie.key.clone()) };
-        match builder.build(&replacement, ArtefactSource::Stored, &snapshot, cancellation).await {
+        match build_stored(builder, store, &replacement, &snapshot, cancellation).await {
             Ok(record) => entries.extend(replacement.entries(record)),
             // GC can collect another sibling while we build the replacements.
             Err(error) if input_collected(&error, snapshots.snapshot().trie_catalog(), table, slug, &trie.key) => continue,
@@ -382,9 +395,10 @@ impl ArtefactDriver {
                 if active.contains(&job) || failed.contains_key(&job) { continue; }
                 active.insert(job.clone());
                 let (builder, publisher, snapshots, token, storage) = (Arc::clone(&self.builder), Arc::clone(&self.publisher), Arc::clone(&self.snapshots), workers.clone(), self.storage);
+                let store = Arc::clone(&self.retirement.store);
                 running.push(async move {
                     let result = async {
-                        let entries = build_entries(&job, builder.as_ref(), snapshots.as_ref(), &token).await?;
+                        let entries = build_entries(&job, builder.as_ref(), store.as_ref(), snapshots.as_ref(), &token).await?;
                         if entries.is_empty() { return Ok(()); }
                         let message = ArtefactsAdded {
                             storage_version: Some(storage.0.0), storage_epoch: Some(storage.1.0), table_name: Some(job.definition.table.schema_and_table()),

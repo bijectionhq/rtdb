@@ -209,7 +209,7 @@ async fn placed_flight_sessions_scope_catalogs_tickets_and_handles_to_their_atta
 
     let info = first.info("SELECT 42::BIGINT AS n", None).await;
     let ticket = info.endpoint[0].ticket.clone().unwrap();
-    assert_eq!(second.client.do_get(second.request(ticket)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(second.client.do_get(second.request(ticket)).await.unwrap_err().code(), tonic::Code::NotFound);
     assert_eq!(integer(&first.redeem(&info).await[0], 0, 0), 42);
 
     let transaction = first.begin().await;
@@ -338,6 +338,22 @@ async fn query_info_pins_read_only_and_announced_schema_matches_redeemed_rows() 
     let request = client.request(futures::stream::iter(vec![arrow_flight::FlightData { flight_descriptor: Some(descriptor), ..Default::default() }]));
     let result = match client.client.do_put(request).await { Ok(response) => response.into_inner().try_collect::<Vec<_>>().await.map(|_| ()), Err(error) => Err(error) };
     assert!(result.is_err()); client.end(transaction, false).await.unwrap(); running.stop().await;
+}
+
+#[tokio::test]
+async fn query_ticket_keeps_an_empty_cut_and_the_original_clock() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let clock = client.info("SELECT CURRENT_TIMESTAMP(6) AS now", None).await;
+    let before = client.redeem(&clock).await;
+    let query = "SELECT count(*) AS n FROM xt.txs FOR ALL VALID_TIME";
+    let empty = client.info(query, None).await;
+    client.update("INSERT INTO docs (_id,n) VALUES (1,10)", None).await;
+    let replayed = client.redeem(&clock).await;
+    assert_eq!(before, replayed);
+    assert_eq!(integer(&client.redeem(&empty).await[0], 0, 0), 0);
+    assert_eq!(integer(&client.query(query).await[0], 0, 0), 1);
+    running.stop().await;
 }
 
 #[tokio::test]

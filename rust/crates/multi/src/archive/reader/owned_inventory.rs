@@ -121,10 +121,9 @@ pub(crate) async fn verify_checkpoint_transfer_target(
             },
             |current, _, region| async move {
                 let bucket = storage.bucket(Arc::clone(&region)).await?;
-                let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &current, held_terminal).await?;
+                let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &current, held_terminal, Arc::clone(&region)).await?;
                 if let Some(prior) = current.checkpoint_transfer_bootstrap.as_deref() {
-                    let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
-                    artifact.read_ordered_transfer(&current, held_terminal, prior.ciphertext_sha256, &memory).await?;
+                    artifact.read_ordered_transfer(prior.ciphertext_sha256).await?;
                     return Ok(prior.ciphertext_sha256);
                 }
                 let (mut recovered, _, pool, memory, options) =
@@ -136,7 +135,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                     let (replay, recovered, memory, artifact, chain) = (&mut replay, &mut recovered, &memory, &artifact, &mut chain);
                     replica_suffix::with_terminal_source(
                         owner, storage, keys, hosted, fence, held_terminal.replica_through, Some(held_terminal),
-                        |source, source_io| async move {
+                        |source, source_region, source_io| async move {
                             let stream = administration_stream(owner, &source, 4 << 20).await?;
                             let first = transfer_first(&fence.destination)?;
                             let certificate = rtdb_logkeeper::JournalDigest::from_digest_bytes(
@@ -145,7 +144,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                             let _pages = memory.reserve(32 << 20)?;
                             let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                             let source_cipher = replica_suffix::TerminalReplicaCipher::open(&source, keys).await?;
-                            let payloads = replica_suffix::ServingPayloads::new(&source, storage, keys, source_io, memory);
+                            let payloads = replica_suffix::ServingPayloads::new(&source, source_region, &certificate, storage, keys, source_io, memory)?;
                             while let Some(mut entries) = segments.next().await? {
                                 let first = entries.first().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
                                 let through = entries.last().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
@@ -157,7 +156,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                                 for entry in entries {
                                     let Some(envelope) = replay.admit(&entry, fence, recovered)? else { continue; };
                                     if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                        let (resolved, payload) = payloads.resolve_verified(&envelope).await?;
+                                        let (resolved, payload) = payloads.resolve_verified(entry.lsn, &envelope).await?;
                                         replay.apply(resolved, recovered, memory)?;
                                         artifact.put_payload(entry.lsn, &payload.bytes, chain).await?;
                                     } else {
@@ -224,7 +223,6 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     };
     use rtdb_directory::CheckpointTransferReplica;
     use rtdb_storage::log::LogOffset;
-    use super::super::replica_artifact::OrderedTransfer;
 
     let bootstrap = verify_checkpoint_transfer_target(
         Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
@@ -252,11 +250,10 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     Box::pin(with_region(
         owner, keys, &target_id, storage, task, None, None, admit_target,
         |target, _, region| async move {
-            let bucket = storage.bucket(region).await?;
-            let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &target, terminal).await?;
+            let bucket = storage.bucket(Arc::clone(&region)).await?;
+            let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &target, terminal, region).await?;
             let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
-            let replay = artifact.read_ordered_transfer(&target, terminal, ordered.ciphertext_sha256, &memory).await?;
-            let detached = matches!(&replay, OrderedTransfer::Segments(_));
+            let expected_chain = artifact.read_ordered_transfer(ordered.ciphertext_sha256).await?;
             let start = transfer_first(stage)?;
             let through = terminal.replica_through;
             let root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
@@ -284,15 +281,15 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             // first journal. The streaming write pass reauthenticates each page.
             while next <= through {
                 let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
-                let entries = replay.read_page(&artifact, next, through, &mut chain).await?;
+                let entries = artifact.read_segment(next, through, &mut chain).await?;
                 for entry in &entries {
                     if let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? {
-                        observe_transfer_payload(&artifact, entry.lsn, &envelope, detached, &mut chain, &memory).await?;
+                        observe_transfer_payload(&artifact, entry.lsn, &envelope, &mut chain, &memory).await?;
                     }
                 }
                 next += entries.len() as i64;
             }
-            replay.finish(chain)?;
+            super::super::replica_artifact::require_chain(chain, expected_chain)?;
 
             let reserved = if let Some(existing) = target.checkpoint_transfer_replica.as_deref() {
                 existing.clone()
@@ -319,6 +316,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 return Ok(reserved);
             }
             let scope = target.replica_seal_scope();
+            let journal_cipher = crate::cipher::Cipher::new(&media)?;
             let mut fence = initial_fence;
             let mut writer = None;
             let mut next = start;
@@ -326,11 +324,10 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             while next <= through {
                 let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
                 let first = next;
-                let mut entries = replay.read_page(&artifact, first, through, &mut chain).await?;
+                let mut entries = artifact.read_segment(first, through, &mut chain).await?;
                 for entry in &mut entries {
                     let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? else { continue; };
-                    if !detached { continue; }
-                    let offloaded = observe_transfer_payload(&artifact, entry.lsn, &envelope, detached, &mut chain, &memory).await?;
+                    let offloaded = observe_transfer_payload(&artifact, entry.lsn, &envelope, &mut chain, &memory).await?;
                     let resolved = offloaded.as_ref().map_or(&envelope, |payload| &payload.resolved);
                     if let Some(control) = replica_suffix::transfer_control(resolved, stage.checkpoint)? {
                         entry.payload = control;
@@ -344,14 +341,16 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 let last = next - 1;
                 // Preserve the source transaction IDs and term sequences under
                 // the target's own seal.
-                artifact.reseal(&scope, &mut entries).await?;
+                for entry in &mut entries {
+                    entry.payload = journal_cipher.seal_deterministic(&scope, &entry.payload)?;
+                }
                 rtdb_logkeeper::bootstrap_committed_page(
                     &stream, epoch, checkpoint, LogOffset(first), &entries, last == through,
                 ).await?;
                 let proof = rtdb_logkeeper::certify_committed_range(&stream, first, last).await?;
                 rtdb_logkeeper::verify_certified_range(&proof, &entries)?;
             }
-            replay.finish(chain)?;
+            super::super::replica_artifact::require_chain(chain, expected_chain)?;
             Ok(reserved)
         },
     )).await
@@ -364,13 +363,12 @@ struct DetachedTransferPayload {
 }
 
 async fn observe_transfer_payload(
-    artifact: &ReplicaArtifact<'_>, offset: i64, envelope: &ReplicaEnvelope, detached: bool, chain: &mut Context,
+    artifact: &ReplicaArtifact<'_>, offset: i64, envelope: &ReplicaEnvelope, chain: &mut Context,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<DetachedTransferPayload>> {
     let Some(relative) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? else {
         return Ok(None);
     };
-    if !detached { return Err(inconsistent("A legacy target bootstrap cannot contain detached payloads")); }
     let body = artifact.read_payload(offset, chain, memory).await?;
     let resolved = envelope.unwrap_payload(&body.bytes)?;
     Ok(Some(DetachedTransferPayload { path: crate::reference::key(&relative)?, resolved, body }))
@@ -379,10 +377,9 @@ async fn observe_transfer_payload(
 pub(super) async fn verify_seeded_payloads(
     bucket: &dyn ObjectStore, serving: &dyn ObjectStore, staged: &dyn ObjectStore,
     keys: &dyn KeyService, record: &rtdb_directory::DeploymentRecord, stage: &rtdb_directory::CheckpointStage,
-    mut extras: std::collections::BTreeSet<ObjectKey>,
+    mut extras: std::collections::BTreeSet<ObjectKey>, region: Arc<IoRegion>,
 ) -> Result<()> {
     use crate::archive::{admits_seeded_transfer_payload, replica_suffix, verify_cut};
-    use super::super::replica_artifact::OrderedTransfer;
     use crate::reference::key;
 
     if extras.iter().any(|path| !admits_seeded_transfer_payload(record, stage, path.as_str())) {
@@ -391,10 +388,9 @@ pub(super) async fn verify_seeded_payloads(
     let bootstrap = record.checkpoint_transfer_bootstrap.as_deref()
         .ok_or_else(|| inconsistent("The staged payloads need an ordered bootstrap"))?;
     let terminal = &bootstrap.terminal;
-    let artifact = ReplicaArtifact::open_transfer(bucket, keys, record, terminal).await?;
+    let artifact = ReplicaArtifact::open_transfer(bucket, keys, record, terminal, region).await?;
     let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
-    let OrderedTransfer::Segments(expected) = artifact.read_ordered_transfer(record, terminal, bootstrap.ciphertext_sha256, &memory).await?
-    else { return Err(inconsistent("A legacy target bootstrap has no detached payloads")); };
+    let expected = artifact.read_ordered_transfer(bootstrap.ciphertext_sha256).await?;
     let root_key = key(&block_key(BlockIndex(stage.checkpoint.block))?)?;
     let root = PayloadBytes::read(staged, &root_key, &memory).await?;
     let catalog = BlockCatalog::decode(&root.bytes)?;
@@ -408,7 +404,7 @@ pub(super) async fn verify_seeded_payloads(
         let entries = artifact.read_segment(next, terminal.replica_through, &mut chain).await?;
         for entry in &entries {
             let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, terminal.fence.source_writer_epoch)? else { continue; };
-            let Some(payload) = observe_transfer_payload(&artifact, entry.lsn, &envelope, true, &mut chain, &memory).await? else { continue; };
+            let Some(payload) = observe_transfer_payload(&artifact, entry.lsn, &envelope, &mut chain, &memory).await? else { continue; };
             if replica_suffix::transfer_control(&payload.resolved, stage.checkpoint)?.is_none() && extras.remove(&payload.path)
                 && serving.get_fresh_exact(&payload.path, payload.body.bytes.len()).await? != payload.body.bytes
             {

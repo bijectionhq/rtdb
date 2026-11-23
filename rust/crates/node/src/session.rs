@@ -23,7 +23,9 @@ pub trait SessionService: Send + Sync {
     /// Supplies the query clock; implementations with finer precision override the microsecond clock lift.
     fn query_instant(&self) -> Instant { self.now().into() }
     fn snapshot_basis(&self) -> Result<TimeBasis>;
-    async fn fresh_snapshot_basis(&self, _cancellation: &CancellationToken) -> Result<TimeBasis> { self.snapshot_basis() }
+    async fn fresh_snapshot_basis(&self, _cancellation: &CancellationToken) -> Result<(TimeBasis, Option<ReplicaQueryCapture>)> {
+        Ok((self.snapshot_basis()?, None))
+    }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()>;
     async fn await_client_token(&self, token: Option<&str>, timeout: Duration, cancellation: &CancellationToken) -> Result<Option<String>> {
         self.await_basis(token.map(decode_tx_basis).transpose()?, timeout, cancellation).await?;
@@ -40,9 +42,24 @@ pub trait SessionService: Send + Sync {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ReplicaQueryCapture {
+    pub(crate) attachment: std::sync::Weak<crate::Database>,
+    pub(crate) snapshot: Arc<rtdb_index::Snapshot>,
+}
+
+impl PartialEq for ReplicaQueryCapture {
+    fn eq(&self, other: &Self) -> bool {
+        self.attachment.ptr_eq(&other.attachment) && Arc::ptr_eq(&self.snapshot, &other.snapshot)
+    }
+}
+
+impl Eq for ReplicaQueryCapture {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryBasis {
     pub snapshot: TimeBasis,
+    pub replica_capture: Option<ReplicaQueryCapture>,
     pub snapshot_time: Option<Timestamp>,
     pub current_time: Instant,
     pub timezone: String,
@@ -525,13 +542,13 @@ impl Session {
     async fn pin(&self, options: &ReadOptions) -> Result<(QueryBasis, Option<String>)> {
         let token = options.await_token.as_deref().or(self.await_token.as_deref());
         let applied = self.service.await_client_token(token, Duration::from_secs(60), &self.cancellation).await?;
-        let snapshot = match &options.snapshot_token {
-            Some(token) => decode_time_basis(token)?,
+        let (snapshot, replica_capture) = match &options.snapshot_token {
+            Some(token) => (decode_time_basis(token)?, None),
             None => self.service.fresh_snapshot_basis(&self.cancellation).await?,
         };
         let world_time = self.parameter("bijection.at").map(world_clock).transpose()?;
         let current_time = world_time.or(options.clock_time).unwrap_or_else(|| self.service.query_instant());
-        Ok((QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time, timezone: self.effective_timezone().to_owned() }, applied))
+        Ok((QueryBasis { snapshot, replica_capture, snapshot_time: options.snapshot_time, current_time, timezone: self.effective_timezone().to_owned() }, applied))
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {
         self.revalidate().await?;
@@ -590,7 +607,7 @@ impl Session {
         }
         let current_time = self.parameter("bijection.at").map(world_clock).transpose()?
             .unwrap_or_else(|| self.service.query_instant());
-        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, snapshot_time: None, current_time, timezone: self.effective_timezone().to_owned() })
+        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time, timezone: self.effective_timezone().to_owned() })
     }
     pub(crate) fn require_open_world(&self) -> Result<()> {
         if self.parameter("bijection.at").is_some() {

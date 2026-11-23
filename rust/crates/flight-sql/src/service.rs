@@ -30,6 +30,8 @@ pub(crate) struct Inner {
     pub sessions: Registry<String, Session>,
     pub transactions: Registry<Bytes, Transaction>,
     pub prepared: Registry<Bytes, Prepared>,
+    pub query_tickets: Registry<Uuid, crate::execute::QueryTicket>,
+    pub query_ticket_slots: Arc<Semaphore>,
     pub owned_reads: Registry<Bytes, crate::owned_actions::OwnedReadResource>,
     pub owned_world_reads: Registry<Bytes, crate::owned_actions::OwnedWorldReadResource>,
     pub owned_read_slots: Arc<Semaphore>,
@@ -136,7 +138,7 @@ impl Service {
                 transport,
             })
         } else { None };
-        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
     fn sessions(&self, reserved: bool) -> &Registry<String, Session> {
@@ -155,14 +157,14 @@ impl Service {
         if let Some(audience) = &self.0.audience {
             audience.sessions.sweep();
         }
-        self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
+        self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.query_tickets.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
         self.publish();
     }
     pub fn close(&self) {
         if let Some(audience) = &self.0.audience {
             audience.sessions.close();
         }
-        self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
+        self.0.query_tickets.close(); self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
         self.publish();
     }
     pub fn publish(&self) {
@@ -462,8 +464,8 @@ impl FlightService for Service {
         let descriptor = request.into_inner(); let cmd = command(&descriptor.cmd).map_err(|error| call.error(error))?;
         let work = async {
             let (schema, ticket) = match cmd {
-                Command::CommandStatementQuery(command) => { let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?; self.query_info(connection, &command.query, None).await? }
-                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let params = prepared.params.lock().expect("parameters lock").clone(); let connection = self.scoped(&call, &prepared.scope).await?; self.query_info(connection, &prepared.sql, params).await? }
+                Command::CommandStatementQuery(command) => { let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?; self.query_info(&call, connection, &command.query, None).await? }
+                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let params = prepared.params.lock().expect("parameters lock").clone(); let connection = self.scoped(&call, &prepared.scope).await?; self.query_info(&call, connection, &prepared.sql, params).await? }
                 command => (self.metadata_schema(&command)?, command.into_any().encode_to_vec().into()),
             };
             Ok::<_, Status>(flight::FlightInfo { schema: wire::schema_message(&schema, self.memory())?, flight_descriptor: Some(descriptor), endpoint: vec![flight::FlightEndpoint { ticket: Some(flight::Ticket { ticket }), ..Default::default() }], total_records: -1, total_bytes: -1, ordered: false, app_metadata: Bytes::new() })

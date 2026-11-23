@@ -263,7 +263,7 @@ pub(crate) async fn owned_range(
     let work = accelerate::owned_page(
         &context, snapshot, &database.storage, &definition, projection, bounds, valid_at,
     );
-    rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
+    context.reading(work).await
 }
 
 pub async fn owned_count(
@@ -342,7 +342,7 @@ pub(crate) async fn owned_total_at(
     let work = accelerate::owned_count(
         &context, snapshot, &database.storage, &definition, projection, request, lifetime, domain,
     );
-    rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
+    context.reading(work).await
 }
 
 async fn owned_projection(

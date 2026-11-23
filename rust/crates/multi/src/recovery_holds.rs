@@ -27,6 +27,7 @@ pub(crate) struct RecoveryAdmission {
     deployment: String,
     stream: String,
     log_epoch: i32,
+    writer_epoch: u64,
 }
 
 pub(crate) struct ReplayHold {
@@ -50,7 +51,7 @@ impl ReplayHold {
 
 impl RecoveryAdmission {
     pub fn new(holds: Arc<RecoveryHolds>, config: &LogkeeperLogConfig) -> Self {
-        Self { holds, deployment: config.deployment.clone(), stream: config.replica_stream.clone(), log_epoch: config.log_epoch }
+        Self { holds, deployment: config.deployment.clone(), stream: config.replica_stream.clone(), log_epoch: config.log_epoch, writer_epoch: config.epoch }
     }
 
     pub async fn hold(&self, after: LogOffset, through: LogOffset) -> Result<Option<ReplayHold>> {
@@ -71,7 +72,7 @@ impl RecoveryAdmission {
                 }
             } else { None };
             let mut attempted = false;
-            let outcome = worker.register(id, after, &mut attempted).await;
+            let outcome = worker.register(id, after, through, &mut attempted).await;
             let opened = outcome.is_ok();
             if ready.send(outcome).is_ok() && opened {
                 let _ = closed.await;
@@ -79,7 +80,12 @@ impl RecoveryAdmission {
             if attempted {
                 loop {
                     match crate::store::release_region(worker.holds.directory.as_ref(), &worker.deployment, id, !opened).await {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            crate::residence_trace::record("finish-recovery", || serde_json::json!({
+                                "installation": worker.deployment, "stream": worker.stream, "epoch": worker.log_epoch, "hold": id,
+                            }));
+                            break;
+                        }
                         Err(error) => eprintln!("Recovery hold {id} for {} is pending release: {}", worker.deployment, error.code),
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -114,6 +120,21 @@ impl RecoveryAdmission {
         Ok(())
     }
 
+    pub(crate) async fn confirms_checkpoint(&self, block: i64, through: LogOffset, root: [u8; 32]) -> Result<bool> {
+        let (record, _) = self.checked_record(through).await?;
+        if record.epoch != self.writer_epoch || record.holder.is_none() { return Ok(false); }
+        let (Some(checkpoint), Some(manifest)) = (record.checkpoint, record.recovery_manifest_sha256) else { return Ok(false); };
+        if checkpoint.block != block || checkpoint.boundary != through.0 || checkpoint.root_sha256 != Some(root) {
+            return Ok(false);
+        }
+        crate::residence_trace::record("hosted-recovery-closure", || serde_json::json!({
+            "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation,
+            "epoch": record.log_epoch, "stream": self.stream, "revision": record.version,
+            "block": block, "through": through.0, "root": root, "manifest": manifest,
+        }));
+        Ok(true)
+    }
+
     pub(crate) async fn check_start(&self, after: LogOffset) -> Result<()> {
         self.checked_record(after).await.map(|_| ())
     }
@@ -128,13 +149,17 @@ impl RecoveryAdmission {
         Ok((record, first_required))
     }
 
-    async fn register(&self, id: Uuid, after: LogOffset, attempted: &mut bool) -> Result<()> {
+    async fn register(&self, id: Uuid, after: LogOffset, through: LogOffset, attempted: &mut bool) -> Result<()> {
         for _ in 0..8 {
             let (mut record, first_required) = self.checked_record(after).await?;
             let version = record.version;
-            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required, custody: self.holds.custody.clone() });
+            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required, through: through.0, custody: self.holds.custody.clone() });
             *attempted = true;
-            if let Cas::Applied(_) = self.holds.directory.replace_deployment(record, version).await.map_err(|error| self.directory_error(error))? {
+            if let Cas::Applied(stored) = self.holds.directory.replace_deployment(record, version).await.map_err(|error| self.directory_error(error))? {
+                crate::residence_trace::record("admit-recovery", || serde_json::json!({
+                    "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation, "revision": stored.version,
+                    "stream": self.stream, "epoch": self.log_epoch, "hold": id, "first_required": first_required, "through": through.0,
+                }));
                 return Ok(());
             }
         }

@@ -9,7 +9,20 @@ mod provider_task;
 tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
     static READ_LEASE: Arc<ReadLease>;
+    static HELD_VIEW: Arc<HeldView>;
     static AUDIENCE_OBJECT_READ: ();
+}
+
+/// Registrations covering the physical catalogs used by one execution.
+pub struct HeldView {
+    _owners: Arc<[Arc<dyn Send + Sync>]>,
+}
+
+impl HeldView {
+    pub fn new(catalog: Arc<dyn Send + Sync>, registrations: Vec<Arc<crate::cache::HeldCatalogRead>>) -> Self {
+        let owners = std::iter::once(catalog).chain(registrations.into_iter().map(|hold| hold as Arc<dyn Send + Sync>)).collect();
+        Self { _owners: owners }
+    }
 }
 
 pub struct IoRegion {
@@ -50,6 +63,16 @@ impl IoRegion {
         }}; }
         scope_io_owner!(RETAINED_OWNER, owner, work; combine).await
     }
+    /// Carries a held view into both synchronous and provider-backed reads in this execution.
+    pub fn reading<F: std::future::Future>(view: Arc<HeldView>, work: F) -> impl std::future::Future<Output = F::Output> {
+        macro_rules! combine { ($parent:ident, $view:ident) => {{
+            if Arc::ptr_eq(&$parent, &$view) { $view } else {
+                Arc::new(HeldView { _owners: Arc::from([$parent as Arc<dyn Send + Sync>, $view]) })
+            }
+        }}; }
+        scope_io_owner!(HELD_VIEW, view, work; combine)
+    }
+
     /// Checks the lease when each provider operation is admitted while polling the work.
     /// A nested lease narrows the one in scope where `leased` is called.
     /// Returns the work itself or its scoped future, so a lease adds no copy of the work to the caller's future.
@@ -103,7 +126,11 @@ impl IoRegion {
         let lease = if self.parent.is_none() { READ_LEASE.try_with(Arc::clone).ok() } else { None };
         if let Some(lease) = &lease { lease.check()?; }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
-            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: retain_admitted_owner!(RETAINED_OWNER).into_iter().collect(), lease });
+            .unwrap_or_else(|| {
+                let mut lifetimes: Vec<Arc<dyn Send + Sync>> = retain_admitted_owner!(RETAINED_OWNER).into_iter().collect();
+                if let Ok(view) = HELD_VIEW.try_with(Arc::clone) { lifetimes.push(view); }
+                IoAdmission { tokens: Vec::new(), lifetimes, lease }
+            });
         admission.tokens.push(self.tasks.token());
         admission.lifetimes.extend(self.lifetime.iter().cloned());
         Ok(admission)

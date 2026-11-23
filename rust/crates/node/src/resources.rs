@@ -21,7 +21,7 @@ pub trait ReplicaReadIndex: Send + Sync {
     async fn confirm(&self) -> Result<rtdb_storage::log::LogOffset>;
 
     /// Keeps the protected source basis alive until the database applies it.
-    async fn protect(&self) -> Result<ProtectedReadIndex> {
+    async fn protect(&self, _applied: rtdb_storage::log::LogOffset) -> Result<ProtectedReadIndex> {
         Ok(ProtectedReadIndex {
             offset: self.confirm().await?,
             wait: std::time::Duration::from_millis(20),
@@ -114,6 +114,9 @@ pub trait RemoteStorageFactory: Send + Sync {
         let blocks = self.block_discovery(configuration).await?;
         Ok(OpenedRecoveryStore { store, audience: None, blocks, checkpoint_metadata: None, fragment_storage: None })
     }
+    /// These provider configurations use the Classic installation's key authority.
+    fn uses_classic_custody(&self) -> bool { false }
+
     /// A remote store normally uses a disk cache. An isolated read-only
     /// factory may opt out to avoid retaining an extra physical copy.
     fn use_disk_cache(&self) -> bool { true }
@@ -163,6 +166,7 @@ pub struct NativeResources {
     log_factories: BTreeMap<String, Arc<dyn LogFactory>>,
     storage_factories: BTreeMap<String, Arc<dyn RemoteStorageFactory>>,
     disk_cache: Option<Arc<DiskCache>>,
+    classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
@@ -172,13 +176,18 @@ pub struct NativeResources {
 impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
-            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, io: IoRegion::new(),
+            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, io: IoRegion::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false }
     }
 }
 
 impl NativeResources {
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
+    pub fn with_classic_key_vault(mut self, vault: rtdb_storage::sealing::ClassicKeyVault) -> Self {
+        self.classic_vault = Some(vault);
+        self
+    }
+
     /// Samples this clock for each transaction appended to an in-memory or local source log.
     /// Calls into a shared clock can originate from different databases concurrently.
     pub fn with_log_clock(mut self, clock: Arc<TransactionClock>) -> Self {
@@ -202,9 +211,16 @@ impl NativeResources {
         Ok(self)
     }
     fn local_log(&self, path: PathBuf, source: bool, read_only: bool, cancellation: CancellationToken, io: Arc<IoRegion>) -> Result<(Arc<dyn Log>, Option<ResourceDriver>)> {
-        if read_only { return Ok((ReadOnlyLocalLog::open_in(path, self.read_only_log.clone(), io)?, None)); }
+        let keys = self.classic_vault.as_ref().map(|vault| vault.log_keys(&path, !read_only, Arc::clone(&io))).transpose()?;
+        if read_only {
+            let log = match keys {
+                Some(keys) => ReadOnlyLocalLog::open_with_key_slots(path, self.read_only_log.clone(), io, keys)?,
+                None => ReadOnlyLocalLog::open_in(path, self.read_only_log.clone(), io)?,
+            };
+            return Ok((log, None));
+        }
         let timestamps = Arc::new(NativeLogTimestamps { clock: Arc::clone(&self.local_log_clock), source, use_for_non_transactions: self.local_log_uses_clock_for_non_transactions });
-        let (log, driver) = LocalLog::open_with_timestamp_source_in(path, LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity }, timestamps, io)?;
+        let (log, driver) = LocalLog::open_with_key_slots(path, LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity }, timestamps, io, keys)?;
         Ok((log, Some(async move { driver.run(cancellation).await.map_err(Into::into) }.boxed())))
     }
 }
@@ -298,6 +314,7 @@ impl ResourceFactory for NativeResources {
             }.unwrap_or(0);
             let storage_epoch = StorageEpoch(epoch);
             let root = ObjectKey::new(StorageRoot::new(CURRENT_STORAGE_VERSION, storage_epoch)?.key())?;
+            let allow_enrollment = configuration.mode.unwrap_or(0) != 1;
             let mut blocks = rtdb_replication::BlockDiscovery::List;
             let mut checkpoint_metadata = None;
             let mut fragment_storage = None;
@@ -305,22 +322,40 @@ impl ResourceFactory for NativeResources {
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
                 Some(database_config::Storage::LocalStorage(storage)) => {
-                    let store = LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?)
-                        .join(root.as_str()), Arc::clone(&io))?;
+                    let payload = PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?);
+                    let store = LocalStore::open_in(payload.join(root.as_str()), Arc::clone(&io))?;
                     let store = if let Some(database_config::Log::LocalLog(log)) = &configuration.log {
                         store.with_catalog_ledger(StorageEpoch(log.epoch.unwrap_or_default()))
                     } else { store };
-                    Arc::new(store)
+                    let store: Arc<dyn ObjectStore> = Arc::new(store);
+                    if let Some(vault) = &self.classic_vault {
+                        vault.require_separate_path(&payload)?;
+                        let keys = vault.units(store.as_ref(), Arc::clone(&io), allow_enrollment).await?;
+                        Arc::new(rtdb_storage::sealing::ClassicKeyVault::wrap(store, keys)?)
+                    } else {
+                        rtdb_storage::sealing::ClassicKeyVault::require_unenrolled(store.as_ref()).await?;
+                        store
+                    }
                 }
                 Some(database_config::Storage::RemoteStorage(storage)) => {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
                     let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
                     let opened = factory.open_for_recovery(configuration, &root, Arc::clone(&io)).await?;
                     let remote = opened.store;
+                    let classic_keys = match &self.classic_vault {
+                        Some(vault) if factory.uses_classic_custody() => {
+                            Some(vault.units(remote.as_ref(), Arc::clone(&io), allow_enrollment).await?)
+                        }
+                        None if factory.uses_classic_custody() => {
+                            rtdb_storage::sealing::ClassicKeyVault::require_unenrolled(remote.as_ref()).await?;
+                            None
+                        }
+                        _ => None,
+                    };
                     blocks = opened.blocks;
                     checkpoint_metadata = opened.checkpoint_metadata;
                     fragment_storage = opened.fragment_storage;
-                    let storage = if factory.use_disk_cache() {
+                    let storage = if factory.use_disk_cache() && remote.permits_shared_read_cache() {
                         let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
                         let identity = factory.cache_identity(configuration)?;
                         let namespace = cache_namespace(&configuration.type_url, &identity, storage_epoch)?;
@@ -330,7 +365,10 @@ impl ResourceFactory for NativeResources {
                     };
                     let opened = factory.wrap_stores(configuration, storage, opened.audience).await?;
                     audience_storage = opened.audience;
-                    opened.ordinary
+                    match classic_keys {
+                        Some(keys) => Arc::new(rtdb_storage::sealing::ClassicKeyVault::wrap(opened.ordinary, keys)?),
+                        None => opened.ordinary,
+                    }
                 }
             };
             Ok(DatabaseStorage { store, audience_storage, blocks, checkpoint_metadata, fragment_storage, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })

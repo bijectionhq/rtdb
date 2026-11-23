@@ -99,6 +99,34 @@ pub fn require_readable_version(version: StorageVersion) -> Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub struct TableSlug(String);
 
+pub fn skipped_tx_key(position: rtdb_types::SourcePosition) -> String {
+    let digits = position.0.to_string();
+    format!("skipped-txs/{}{digits}", digits.len() - 1)
+}
+
+pub fn skipped_tx_position(path: &str) -> Option<rtdb_types::SourcePosition> {
+    let name = path.strip_prefix("skipped-txs/")?;
+    (1..=2).find_map(|width| {
+        let (_, digits) = name.split_at_checked(width)?;
+        let position = digits.parse::<i64>().ok().filter(|position| *position >= 0)?;
+        let source = rtdb_types::SourcePosition(position);
+        (skipped_tx_key(source) == path).then_some(source)
+    })
+}
+
+/// The dedicated L0 data and metadata objects of an engine receipt table.
+pub fn is_receipt_l0_file(key: &str) -> bool {
+    let Some((slug, file)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else {
+        return false;
+    };
+    let Some(table) = slug.strip_prefix("xt$") else { return false; };
+    TableRef::new("xt", table).stores_expiring_transaction_metadata()
+        && file.strip_prefix("data/").or_else(|| file.strip_prefix("meta/"))
+            .and_then(|file| file.strip_suffix(".arrow"))
+            .and_then(|name| name.parse::<TrieKey>().ok())
+            .is_some_and(|trie| trie.level() == 0)
+}
+
 impl TableSlug {
     pub fn recorded(slug: impl Into<String>) -> Result<Self> {
         let slug = slug.into();

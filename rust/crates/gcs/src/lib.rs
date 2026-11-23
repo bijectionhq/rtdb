@@ -31,7 +31,7 @@ impl GcsConfig {
         let client = GoogleCloudStorageBuilder::new().with_bucket_name(&self.bucket).with_skip_signature(false)
             .with_credentials(Arc::new(bridge.clone())).with_http_connector(bridge).build()
             .map_err(|error| Anomaly::incorrect("xtdb.gcp/invalid-config", error.to_string()))?;
-        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
+        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io).with_catalog_ledger()?))
     }
 
     pub fn to_proto(&self) -> GcsObjectStoreConfig {

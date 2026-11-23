@@ -576,6 +576,19 @@ impl StagedWrite {
     pub fn tables(&self) -> &BTreeMap<TableRef, TableWrite> { &self.tables }
     pub fn row_count(&self) -> Result<u64> { self.tables.values().try_fold(0u64, |count, write| count.checked_add(write.row_count() as u64).ok_or_else(|| invalid("Transaction row count overflow"))) }
 
+    /// Attach sealed application tables to the order-assigned transaction metadata.
+    /// Their system clock and predecessor were fixed before the source ID was assigned.
+    pub fn install_prepared_generation(&mut self, prepared: Self) -> Result<()> {
+        if prepared.predecessor != self.predecessor || prepared.block_index != self.block_index
+            || prepared.tx_key.system_time != self.tx_key.system_time
+            || prepared.tables.keys().any(|table| self.tables.contains_key(table))
+        {
+            return Err(invalid("Prepared generation differs from the ordered transaction"));
+        }
+        self.tables.extend(prepared.tables);
+        Ok(())
+    }
+
     pub fn assign_event_origins(mut self, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let commit = rtdb_types::EventOrigin::new_commit();
         let block = self.block_index;
@@ -822,6 +835,31 @@ impl TransactionBuffer {
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
         self.append(table, StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
+    pub fn puts_metadata_unit(&self, table: &TableRef, iid: Iid, key: Option<&[u8]>) -> Result<bool> {
+        let Some(pending) = self.tables.get(table) else { return Ok(false); };
+        let mut put = false;
+        for event in &pending.events {
+            if event.iid != iid || event.entity_key.as_deref() != key { continue; }
+            match &event.operation {
+                StoredOperation::Erase => return Ok(false),
+                StoredOperation::Put(_) => put = true,
+                _ => {}
+            }
+        }
+        for (_, batch) in &pending.batches {
+            for row in 0..batch.len() {
+                let header = batch.header(row)?;
+                if header.iid != iid || batch.view().entity_key(row)? != key { continue; }
+                match header.op {
+                    EventOp::Erase => return Ok(false),
+                    EventOp::Put => put = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(put)
+    }
+
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event).map(drop) }
     /// As `append`, copying the table reference only for the table's first write.
     pub fn append_to(&mut self, table: &TableRef, event: StoredEvent) -> Result<Option<NonZeroU32>> {

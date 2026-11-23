@@ -416,6 +416,9 @@ pub struct CatalogReader {
     pub replica_epoch: i32,
     /// Exact and restored captures can have no installed replica cut.
     pub cut: Option<rtdb_types::CatalogCut>,
+    /// Complete for compacted primary paths within this captured catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_primary_paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +476,7 @@ pub enum StorageRegion {
     },
     ReplicaReplay {
         first_required: i64,
+        through: i64,
         custody: ReplayCustody,
     },
     /// A fork has admitted provider I/O against this physical residence.
@@ -557,6 +561,13 @@ impl StorageRegion {
             Self::Remote { closed: true, .. } | Self::ReferenceRead { .. }
             | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => None,
             Self::ReplicaReplay { first_required, .. } => Some(*first_required),
+        }
+    }
+
+    pub fn requires_replica_offset(&self, offset: i64) -> bool {
+        match self {
+            Self::ReplicaReplay { first_required, through, .. } => (*first_required..=*through).contains(&offset),
+            region => region.first_required_replica().is_some_and(|first| first <= offset),
         }
     }
 
@@ -901,6 +912,8 @@ pub struct ReplicaPayloadTrim {
 pub struct ReplicaPayloadCandidate {
     pub key: String,
     pub position: i64,
+    /// Digest of the sealed frame at this position in the certified journal.
+    pub frame_sha256: [u8; 32],
     pub version: rtdb_types::PhysicalObjectVersion,
 }
 
@@ -1090,10 +1103,20 @@ impl DeploymentRecord {
     /// First replica offsets retained by open regions and captures that still need the journal.
     pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
         self.storage_regions.values().filter_map(StorageRegion::first_required_replica)
-            .chain(self.checkpoint_captures.values().filter(|capture| {
-                capture.world_replay.is_some() && capture.incarnation == self.incarnation
-                    && capture.log_epoch == self.log_epoch && self.lifecycle != Lifecycle::Deleted
-            }).map(|capture| capture.checkpoint.boundary.checked_add(1).filter(|offset| *offset >= 0).unwrap_or(0)))
+            .chain(self.checkpoint_replica_offsets(now_ms))
+    }
+
+    /// Whether an eligible recovery dependency can still open this position.
+    pub fn requires_replica_offset(&self, offset: i64, now_ms: i64) -> bool {
+        self.storage_regions.values().any(|region| region.requires_replica_offset(offset))
+            || self.checkpoint_replica_offsets(now_ms).any(|first| first <= offset)
+    }
+
+    fn checkpoint_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
+        self.checkpoint_captures.values().filter(|capture| {
+            capture.world_replay.is_some() && capture.incarnation == self.incarnation
+                && capture.log_epoch == self.log_epoch && self.lifecycle != Lifecycle::Deleted
+        }).map(|capture| capture.checkpoint.boundary.checked_add(1).filter(|offset| *offset >= 0).unwrap_or(0))
             .chain(self.checkpoint_suffix_pins.values()
                 .filter(move |pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none())
                 .map(|pin| {
@@ -1273,7 +1296,7 @@ fn fork_conflict() -> Anomaly {
 
 mod reference_revision;
 mod lineage;
-pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
+pub use lineage::{ExactRetirementGrant, ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
 use lineage::{StoredLineage, lineage_busy};
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";

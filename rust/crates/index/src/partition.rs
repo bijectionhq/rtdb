@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, TransactionKey, TxId};
 
 use crate::{CatalogCut, CatalogTrie, LiveIndex, ServingSearch, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
@@ -120,6 +120,14 @@ impl TrieCollection {
             .map(|trie| trie.key.clone()).collect()
     }
 
+    pub fn eligible_receipt_l0(&self, table: &TableRef, as_of: Timestamp) -> impl Iterator<Item = &TrieKey> {
+        self.current.trie_catalog().iter_tries(table).filter(move |trie| {
+            table.stores_expiring_transaction_metadata() && trie.key.level() == 0
+                && matches!(trie.state, TrieState::Garbage { as_of: time } if time <= as_of)
+                && !self.protected(table, &trie.key)
+        }).map(|trie| &trie.key)
+    }
+
     pub fn eligible_l0_artefacts(&self, table: &TableRef, as_of: Timestamp) -> impl Iterator<Item = &TrieKey> {
         self.current.trie_catalog().iter_tries(table).filter(move |trie| {
             trie.key.level() == 0 && matches!(trie.state, TrieState::Garbage { as_of: time } if time <= as_of)
@@ -152,6 +160,7 @@ impl TrieCollection {
 #[derive(Debug)]
 pub struct PartitionState {
     value: RwLock<Arc<PartitionValue>>,
+    published: Mutex<Option<Arc<PartitionValue>>>,
     retention: Mutex<Retention>,
 }
 
@@ -167,7 +176,11 @@ impl PreparedWrite {
 
 impl PartitionState {
     pub fn new(initial: PartitionValue) -> Self {
-        Self { value: RwLock::new(Arc::new(initial)), retention: Mutex::new(Retention::default()) }
+        Self {
+            value: RwLock::new(Arc::new(initial)),
+            published: Mutex::new(None),
+            retention: Mutex::new(Retention::default()),
+        }
     }
     pub fn empty(config: TrieConfig) -> Result<Self> {
         Ok(Self::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::default().with_system_tables()?, config)?))
@@ -199,6 +212,19 @@ impl PartitionState {
         value.snapshot()
     }
 
+    /// Captures the version published by the driver at this exact cut.
+    /// Mutable state between replica application and publication carries no capture authority.
+    pub fn published_snapshot(&self, cut: CatalogCut) -> Option<Snapshot> {
+        let value = self.value.read();
+        if !matches!(value.catalog_publication, CatalogPublication::Installed(current) if current == cut) {
+            return None;
+        }
+        let published = self.published.lock();
+        let published = published.as_ref()?;
+        self.retain_catalog(published);
+        Some(published.snapshot())
+    }
+
     /// Publishes a prefix after the replica driver has finished installing it.
     /// A reset suspends publication until adoption of its new naming epoch.
     pub fn publish_catalog_cut(&self, cut: CatalogCut) -> Result<()> {
@@ -217,13 +243,18 @@ impl PartitionState {
         }
         let mut next = value.as_ref().clone();
         next.catalog_publication = CatalogPublication::Installed(cut);
-        *value = Arc::new(next);
+        let next = Arc::new(next);
+        self.retain_catalog(&next);
+        *self.published.lock() = Some(Arc::clone(&next));
+        *value = next;
         Ok(())
     }
 
     /// The caller's basis barrier runs before this capture; this passive object never waits for log progress.
-    pub fn open_snapshot(&self, min_system_time: Option<Timestamp>) -> Snapshot {
-        let fresh = |live: &LiveIndex| min_system_time.is_none_or(|minimum| live.latest_completed_tx().is_some_and(|basis| basis.system_time >= minimum));
+    pub fn open_snapshot(&self, minimum: Option<TxId>) -> Snapshot {
+        let fresh = |live: &LiveIndex| minimum.is_none_or(|minimum| {
+            live.latest_completed_tx().is_some_and(|basis| basis.tx_id >= minimum)
+        });
         {
             let value = self.value.read();
             if let Some(live) = &value.live_snapshot {
@@ -329,25 +360,18 @@ impl PartitionState {
         next.trie_catalog = Arc::new(trie_catalog);
         *value = Arc::new(next);
     }
-    pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<()> {
-        let mut value = self.value.write();
-        let mut next = value.as_ref().clone();
-        next.trie_catalog = Arc::new(value.trie_catalog.reset_to_l0(replacements)?);
-        next.catalog_publication = CatalogPublication::Suspended;
-        *value = Arc::new(next);
-        Ok(())
-    }
-    pub fn reset_to_replayed_primary(&self, catalog: TrieCatalog, target: TransactionKey) -> Result<()> {
+    pub fn install_reset_primary(&self, catalog: TrieCatalog, target: TransactionKey) -> Result<()> {
         let mut value = self.value.write();
         if value.table_catalog.block().and_then(BlockCatalog::latest_completed_tx) != Some(target)
             || value.live.latest_completed_tx() != Some(target) || value.live.block_row_count() != 0
             || value.trie_catalog.naming_epoch().checked_add(1) != Some(catalog.naming_epoch())
         {
-            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/catalog-moved", "The recovered primary no longer covers the installed reset cut"));
+            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/catalog-moved", "The replacement primary no longer covers the installed reset cut"));
         }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(catalog);
         next.catalog_publication = CatalogPublication::Suspended;
+        *self.published.lock() = None;
         *value = Arc::new(next);
         Ok(())
     }

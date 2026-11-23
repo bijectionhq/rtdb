@@ -193,6 +193,7 @@ impl JournalLog {
         if current.writer.grant != Some(writer.grant) || current.head != writer.head {
             return Err(deposed(writer.grant, &current));
         }
+        let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
         let key = JournalKey::new(current.placement, writer.grant.key_generation);
         let payload = self.reads.keys.seal_journal_payload(key, &self.reads.io, payload).await?;
         let timestamp = sample()?;
@@ -210,6 +211,7 @@ impl JournalLog {
                 .map_err(storage)?,
         );
         let committed = self.finish_append(&mut writer).await?;
+        if let Some(outcome) = outcome { outcome.observe(committed); }
         Ok(AppendReceipt::observed(async move { Ok(committed) }))
     }
 
@@ -296,10 +298,10 @@ impl JournalLog {
 #[async_trait]
 impl ReplicaReadIndex for JournalLog {
     async fn confirm(&self) -> rtdb_types::Result<LogOffset> {
-        Ok(self.protect().await?.offset)
+        Ok(self.protect(LogOffset(-1)).await?.offset)
     }
 
-    async fn protect(&self) -> rtdb_types::Result<ProtectedReadIndex> {
+    async fn protect(&self, _applied: LogOffset) -> rtdb_types::Result<ProtectedReadIndex> {
         let mut writer = self.writer.lock().await;
         let mut retried = false;
         loop {
@@ -324,8 +326,14 @@ impl ReplicaReadIndex for JournalLog {
                     writer.unsettled_reads.retain(|read| *read != invocation.id);
                     let hold = proof.claim.read();
                     let retention = self.reads.retain(hold);
+                    let offset = latest(hold.through)?;
+                    crate::residence_trace::record("ordered-read-index", || serde_json::json!({
+                        "deployment": current.placement.deployment, "incarnation": current.placement.incarnation,
+                        "group": current.placement.group, "generation": current.placement.generation,
+                        "epoch": writer.grant.epoch, "invocation": hold.id.nonce, "through": offset.0,
+                    }));
                     return Ok(ProtectedReadIndex {
-                        offset: latest(hold.through)?,
+                        offset,
                         wait: Duration::from_secs(2),
                         retention: Some(retention),
                     });
@@ -575,6 +583,24 @@ impl AsRef<[u8]> for Delivery {
 
 #[async_trait]
 impl Log for JournalLog {
+    fn needs_published_recovery_checkpoint(&self) -> bool { true }
+
+    async fn confirms_recovery_checkpoint(&self, block: i64, through: LogOffset, root: [u8; 32]) -> Result<bool> {
+        let grant = self.writer.lock().await.grant;
+        let route = self.reads.route().await?;
+        let checkpoint = route.checkpoint;
+        if route.writer.grant != Some(grant) || checkpoint.root != root || latest(checkpoint.cut).map_err(storage)? != through {
+            return Ok(false);
+        }
+        crate::residence_trace::record("ordered-recovery-closure", || serde_json::json!({
+            "deployment": route.placement.deployment, "incarnation": route.placement.incarnation,
+            "group": route.placement.group, "generation": route.placement.generation,
+            "epoch": grant.epoch, "revision": checkpoint.custody.revision,
+            "block": block, "through": through.0, "root": root,
+        }));
+        Ok(true)
+    }
+
     fn requires_checkpoint_digest(&self) -> bool {
         true
     }

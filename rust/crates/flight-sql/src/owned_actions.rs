@@ -1,4 +1,5 @@
 mod hosted_control;
+mod prepared_landing;
 mod hosted_observation;
 mod unique;
 
@@ -281,6 +282,7 @@ pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V3: &str = "rtdb.owned.PublishHeld
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const DECIDE_WORLD_CUT_V1: &str = "rtdb.owned.DecideWorldCut.v1";
 pub(crate) const DECIDE_HELD_WORLDS_V1: &str = "rtdb.owned.DecideHeldWorlds.v1";
+pub(crate) const SWITCH_PREPARED_PROPOSAL_V1: &str = "rtdb.owned.SwitchPreparedProposal.v1";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -645,7 +647,7 @@ fn audience_point_admitted(
     relation == projection
         || (recovering && relation.name() == "fact_layout_readiness")
         || (relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
-            && matches!(id, EntityId::String(id) if id == "head" || id == "sync_receipt_head"
+            && matches!(id, EntityId::String(id) if id == "sync_receipt_head"
                 || id.strip_prefix("fact_partition_head:") == Some(projection.name())))
 }
 
@@ -4041,7 +4043,7 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
@@ -4196,6 +4198,9 @@ impl Service {
         let delete_root = *root_kind == 4;
         let proposal_overlay = *root_kind == 5;
         let proposal_land = *root_kind == 6;
+        if !prepared_landing::admits(proposal_land, prepared_proposal, slot.is_some()) {
+            return Err(invalid("A prepared Proposal switch requires its landing and offered clock"));
+        }
         if !proposal_land && counts.iter().any(|condition| matches!(
             condition, TxOp::OwnedCheckCapacity { at_most, .. } if *at_most < 0
         )) {
@@ -4298,7 +4303,7 @@ impl Service {
         } else {
             None
         };
-        if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls) {
+        if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls, !terminal_proposal) {
             return Err(invalid("A Proposal overlay requires checked hosted settlement"));
         }
         if proposal_close && !rtdb_tx::proposal_close_controls(&controls) {
@@ -4315,7 +4320,7 @@ impl Service {
         }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
-        if let Some(tick) = slot {
+        if let Some(tick) = slot.filter(|_| !proposal_land) {
             self.wait_for_clock_slot(call, tick).await?;
         }
         let connection = self.connection(call, &call.database).await?;
@@ -4806,6 +4811,7 @@ mod audience_projection_tests {
         assert!(audience_point_admitted(&visible, &visible, &id("doc"), false));
         assert!(!audience_point_admitted(&visible, &hidden, &id("doc"), false));
         assert!(audience_point_admitted(&visible, &markers, &id("fact_partition_head:visible"), false));
+        assert!(!audience_point_admitted(&visible, &markers, &id("head"), false));
         assert!(!audience_point_admitted(&visible, &markers, &id("fact_partition_head:hidden"), false));
         assert!(!audience_point_admitted(&visible, &readiness, &id("layout"), false));
         assert!(audience_point_admitted(&visible, &readiness, &id("layout"), true));

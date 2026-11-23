@@ -150,6 +150,7 @@ impl PrefixedStore {
 
 #[async_trait]
 impl ObjectStore for PrefixedStore {
+    fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.full(key).is_ok_and(|key| self.bucket.supports_scan_ranges(&key)) }
     fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool {
         self.full(key).is_ok_and(|key| self.bucket.supports_observed_scan_ranges(&key))
@@ -256,6 +257,7 @@ impl ReferencingStore {
 
 #[async_trait]
 impl ObjectStore for ReferencingStore {
+    fn permits_shared_read_cache(&self) -> bool { self.own.permits_shared_read_cache() && self.bucket.permits_shared_read_cache() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.own.supports_scan_ranges(key) && self.base.objects.get(key.as_str()).is_none_or(|owner| {
             self::key(&format!("{owner}/{key}")).is_ok_and(|key| self.bucket.supports_scan_ranges(&key))
         }) }

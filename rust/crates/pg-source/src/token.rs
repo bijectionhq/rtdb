@@ -36,6 +36,12 @@ impl ResumeToken {
     }
 }
 
+pub(crate) struct UpstreamAcknowledgement(Lsn);
+
+impl UpstreamAcknowledgement {
+    pub(crate) fn through(&self) -> Lsn { self.0 }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfirmationState { held: Lsn, received: Lsn, durable: Option<Lsn>, replayable: Option<Lsn>, confirmed: Lsn }
 impl ConfirmationState {
@@ -53,5 +59,9 @@ impl ConfirmationState {
         if self.durable.is_some_and(|durable| durable >= self.held) { self.received }
         else { self.durable.max(self.replayable).unwrap_or_default() }
     }
+    pub(crate) fn acknowledgement(&self) -> UpstreamAcknowledgement {
+        UpstreamAcknowledgement(self.confirmable().max(self.confirmed))
+    }
+
     pub fn confirmed_through(&mut self, lsn: Lsn) { self.confirmed = self.confirmed.max(lsn); }
 }

@@ -5,6 +5,8 @@ use crate::{HostedControlWrite, TxOp, source::Operation};
 use super::control_order::{fingerprint_matches, hosted_check_for_refusal};
 
 const BUSINESS: &str = "bj_fact_root_receipts";
+const RECEIPT_BUDGET: &str = "receipt_budget:";
+const PROPOSAL_RECEIPT: &str = "root_proposal_receipt:";
 const EXECUTION: &str = "bj_private_execution_receipts";
 const ADMISSION: &str = "bj_fact_root_admission";
 const ATTEMPTS: &str = "fact_attempts";
@@ -55,7 +57,8 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
         root_partition_frontiers_match,
     };
 
-    let world = hosted_proposal_overlay(primary).is_some()
+    let proposal = hosted_proposal_overlay(primary).is_some();
+    let world = proposal
         || retained_release_world(primary).is_some()
         || hosted_proposal_land(primary).is_some_and(|landing| landing.effect == ProposalLandingEffect::Close);
     let embedded = primary.iter().find_map(|op| match op {
@@ -81,20 +84,18 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
         return Err(invalid());
     }
     let mut copied_attempts = std::collections::BTreeSet::new();
-    let written_relations = primary
-        .iter()
-        .filter_map(write_relation)
-        .map(|relation| relation.name())
-        .collect::<std::collections::BTreeSet<_>>();
-    let primary_head = if written_relations
-        .iter()
-        .any(|relation| !matches!(*relation, ATTEMPTS | PUBLICATIONS))
-    {
+    let writes_data = primary.iter().filter_map(write_relation)
+        .any(|relation| !matches!(relation.name(), ATTEMPTS | PUBLICATIONS));
+    let has_count = primary.iter().any(|op| matches!(op,
+        Operation::Public(TxOp::OwnedCheckCapacity { .. })
+    ));
+    let offers_root_head = primary.iter().any(|op| matches!(op,
+        Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, .. })
+            if relation.name() == PUBLICATIONS && marker(documents.rows(), ROOT_HEAD)
+    ));
+    let primary_head = if writes_data || (has_count && offers_root_head) {
         ROOT_HEAD
-    } else if embedded.is_some() || primary
-        .iter()
-        .any(|op| matches!(op, Operation::Public(TxOp::OwnedCheckCapacity { .. })))
-    {
+    } else if embedded.is_some() || has_count {
         RECEIPT_HEAD
     } else {
         return Err(invalid());
@@ -102,7 +103,11 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
     let mut expected_types = 1 | 2 | 32;
     for control in &offered_controls {
         if let EntityId::String(id) = control.id() {
+            if control.name() == BUSINESS && id.starts_with(RECEIPT_BUDGET) {
+                expected_types |= 16;
+            }
             if control.name() == ADMISSION {
+                if proposal && id.starts_with(PROPOSAL_RECEIPT) { expected_types |= 128; }
                 if id.starts_with("sync_dispatch:") { expected_types |= 4; }
                 if id == "sync_public_pending" { expected_types |= 8; }
                 if id.starts_with(DECISION_PREFIX) { expected_types |= 64; }
@@ -112,6 +117,8 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
     let impact_count = offered_controls.iter().filter(|control| decision_impact(control)).count();
     let mut types = 0;
     let mut impact_ids = std::collections::BTreeSet::new();
+    let mut receipts = None;
+    let mut charges = None;
     for alternative in refusal {
         let bit = match alternative {
             Operation::Public(TxOp::HostedControl(control)) => {
@@ -132,7 +139,13 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
                     }
                     continue;
                 }
-                control_choice(original, control)?
+                let choice = control_choice(original, control)?;
+                match choice {
+                    1 => receipts = original.replacement().zip(control.replacement()),
+                    16 => charges = original.replacement().zip(control.replacement()),
+                    _ => (),
+                }
+                choice
             }
             Operation::Public(TxOp::OwnedInsertDocs {
                 relation,
@@ -180,6 +193,7 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
     if types != expected_types
         || copied_attempts.len() != attempts.len() + usize::from(embedded.is_some())
         || impact_ids.len() != impact_count
+        || !receipts.is_some_and(|receipts| receipt_charge_matches(receipts, charges))
     {
         return Err(invalid());
     }
@@ -368,8 +382,26 @@ fn admission_json(document: &StructFields<Value>) -> Option<serde_json::Value> {
     serde_json::from_slice(body).ok()
 }
 
+fn clock_command_matches(record: &serde_json::Value) -> bool {
+    use sha2::{Digest, Sha256};
+
+    match record.pointer("/task/command") {
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(command)) => {
+            let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+            command.starts_with("[\"bijection.task.emit.v2\",")
+                && record.pointer("/task/digest").and_then(serde_json::Value::as_str)
+                    == Some(digest.as_str())
+        }
+        Some(_) | None => false,
+    }
+}
+
 fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<Value>, clock: bool) -> bool {
     let (Some(mut original), Some(refusal)) = (admission_json(original), admission_json(refusal)) else { return false; };
+    if clock && !clock_command_matches(&original) {
+        return false;
+    }
     let path = if !clock {
         "/continuation/completion"
     } else if original.get("previous_delivery").is_some() && original.get("delivered").is_none() {
@@ -385,7 +417,7 @@ fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<V
 
 fn refused_run_followup(document: &StructFields<Value>) -> bool {
     admission_json(document).is_some_and(|body| {
-        body.pointer("/task/continuation/run_fate/outcome").is_some_and(|outcome| {
+        clock_command_matches(&body) && body.pointer("/task/continuation/run_fate/outcome").is_some_and(|outcome| {
             outcome.get("status").and_then(serde_json::Value::as_str) == Some("refused")
                 && outcome.get("reason").and_then(serde_json::Value::as_str) == Some("ConstraintRefused")
         })
@@ -448,8 +480,9 @@ fn control_choice(original: &HostedControlWrite, refusal: &HostedControlWrite) -
         return Err(invalid());
     };
     match refusal.name() {
+        BUSINESS if id.starts_with(RECEIPT_BUDGET) && same_binding(before, after, &["outcome"]) => Ok(16),
         BUSINESS
-            if refusal.expected().is_none()
+            if !id.starts_with(RECEIPT_BUDGET) && refusal.expected().is_none()
                 && matches!(after.get("outcome"), Some(Value::Binary(body)) if !body.is_empty())
                 && same_binding(before, after, &["outcome"]) =>
         {
@@ -488,7 +521,61 @@ fn control_choice(original: &HostedControlWrite, refusal: &HostedControlWrite) -
         {
             Ok(64)
         }
+        ADMISSION
+            if refusal.expected().is_none() && id.starts_with(PROPOSAL_RECEIPT)
+                && same_binding(before, after, &["admission"])
+                && proposal_refusal(before, after) =>
+        {
+            Ok(128)
+        }
         _ => Err(invalid()),
+    }
+}
+
+fn proposal_refusal(before: &StructFields<Value>, after: &StructFields<Value>) -> bool {
+    let Some(bytes) = admission_bytes(before).filter(|body| body.len() <= MAX_DECISION_BYTES) else {
+        return false;
+    };
+    let (Ok(mut before), Some(after)) = (serde_json::from_slice::<serde_json::Value>(bytes), admission_json(after))
+    else {
+        return false;
+    };
+    if before.get("writes_root").and_then(serde_json::Value::as_bool) != Some(false) {
+        return false;
+    }
+    let Some(root) = before.get_mut("root") else { return false; };
+    *root = serde_json::Value::Null;
+    let Some(approval) = before.get_mut("approval") else { return false; };
+    *approval = serde_json::Value::Null;
+    before == after
+}
+
+fn receipt_charge_matches(
+    (before, after): (&StructFields<Value>, &StructFields<Value>),
+    charges: Option<(&StructFields<Value>, &StructFields<Value>)>,
+) -> bool {
+    let Some((reserved, refused)) = charges else {
+        return before.get("budget_label").is_none();
+    };
+    let Some(Value::Utf8(label)) = before.get("budget_label") else { return false; };
+    let bytes = |document: &StructFields<Value>| match document.get("outcome") {
+        Some(Value::Binary(body)) => Some(body.len() as i128),
+        _ => None,
+    };
+    let total = |charge: &StructFields<Value>| match charge.get("outcome") {
+        Some(Value::Binary(body)) if matches!(charge.get("fingerprint"),
+            Some(Value::Binary(fingerprint)) if fingerprint.as_slice() == [0; 32])
+            && matches!(charge.get("until_nanos"), Some(Value::I64(0)))
+            && matches!(charge.get("budget_label"), Some(Value::Utf8(bound)) if bound == label) =>
+        {
+            Some(i128::from(u64::from_be_bytes(body.as_slice().try_into().ok()?)))
+        }
+        _ => None,
+    };
+    match (bytes(before), bytes(after), total(reserved), total(refused)) {
+        (Some(before), Some(after), Some(reserved), Some(refused)) =>
+            reserved >= before && refused >= after && refused - reserved == after - before,
+        _ => false,
     }
 }
 
@@ -793,6 +880,47 @@ mod tests {
 
         ops.insert(0, delete_row("fact_partition"));
         assert!(split(&ops, true).is_err());
+    }
+
+    #[test]
+    fn receipt_charge_follows_the_selected_body_and_label() {
+        let receipt = |len| StructFields::from([
+            ("budget_label".into(), Value::Utf8("public".into())),
+            ("outcome".into(), Value::Binary(vec![1; len])),
+        ]);
+        let charge = |total: u64, label: &str| StructFields::from([
+            ("budget_label".into(), Value::Utf8(label.into())),
+            ("fingerprint".into(), Value::Binary(vec![0; 32])),
+            ("until_nanos".into(), Value::I64(0)),
+            ("outcome".into(), Value::Binary(total.to_be_bytes().to_vec())),
+        ]);
+        let offered = receipt(10);
+        let refused = receipt(4);
+        let reserved = charge(100, "public");
+        assert!(receipt_charge_matches((&offered, &refused), Some((&reserved, &charge(94, "public")))));
+        assert!(!receipt_charge_matches((&offered, &refused), Some((&reserved, &charge(93, "public")))));
+        assert!(!receipt_charge_matches((&offered, &refused), Some((&reserved, &charge(94, "other")))));
+        assert!(!receipt_charge_matches((&offered, &refused), None));
+    }
+
+    #[test]
+    fn proposal_refusal_keeps_world_and_request_without_any_review_effect() {
+        let admission = |body: serde_json::Value| StructFields::from([
+            ("admission".into(), Value::Binary(serde_json::to_vec(&body).unwrap())),
+        ]);
+        let mut body = serde_json::json!({
+            "world": [1],
+            "fingerprint": [2],
+            "writes_root": false,
+            "root": {"position": 0},
+            "approval": null,
+        });
+        let offered = admission(body.clone());
+        assert!(!proposal_refusal(&offered, &offered));
+        body["root"] = serde_json::Value::Null;
+        assert!(proposal_refusal(&offered, &admission(body.clone())));
+        body["world"] = serde_json::json!([3]);
+        assert!(!proposal_refusal(&offered, &admission(body)));
     }
 
     #[test]

@@ -911,7 +911,7 @@ async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_wi
     assert_eq!(error.code, "rtdb/idempotency-duplicate");
     assert_eq!(error.context["original-tx-id"], original.result().tx_key().tx_id.0);
     assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "idempotency_receipts"), &TableRef::new("xt", "txs")], "a duplicate writes only its own outcome and expiring metadata");
-    let conflict = resolve(keyed("alice", 2), 300).await;
+    let conflict = resolve(keyed("alice", 2), RECEIPT_WINDOW_MICROS).await;
     assert_eq!(conflict.result().error().unwrap().code, "rtdb/idempotency-conflict");
     assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
     let regressed = resolve(keyed("alice", 1), 99).await;
@@ -1453,7 +1453,7 @@ impl TransactionWriter for ClocklessRecord {
 }
 
 #[tokio::test]
-async fn a_clockless_successor_cannot_reopen_an_expired_bounded_retry() {
+async fn an_external_successor_cannot_reopen_an_expired_bounded_retry() {
     let context = context();
     let state = PartitionState::empty(Default::default()).unwrap();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
@@ -1479,12 +1479,49 @@ async fn a_clockless_successor_cannot_reopen_an_expired_bounded_retry() {
     let StoredOperation::Put(history) = history.batch().unwrap().view().read_event(0).unwrap().operation else {
         panic!("expected clockless transaction history");
     };
-    assert_eq!(history.get("receipt_time"), Some(&Value::Null));
+    assert_eq!(history.get("source_log_time"), Some(&Value::Null));
+    assert!(matches!(history.get("receipt_time"), Some(Value::Timestamp { value: 1_000_001, .. })));
     state.apply(resolver.take_head().unwrap().writes()).unwrap();
 
     let mut reopened = TxResolver::new(Some(clockless.result().tx_key()), SourcePosition(2), None, &context.memory).unwrap();
     let retry = reopened.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(99), source(), &context).await.unwrap();
     assert_eq!(retry.result().error().unwrap().code, "rtdb/idempotency-expired");
+}
+
+#[tokio::test]
+async fn erasing_a_record_retires_only_metadata_bound_to_that_record() {
+    use rtdb_types::EntityId;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let bound = |entity| {
+        let metadata = Value::Struct(StructFields::from([(
+            "rtdb_erasure_unit_v1".into(), Value::Struct(StructFields::from([
+                ("table".into(), Value::Utf8("public.docs".into())),
+                ("id".into(), Value::I64(entity)),
+            ])),
+        )]));
+        SourceTransaction::new(vec![put(&context, 42, 0, i64::MAX)], SubmitOptions {
+            user_metadata: Some(UserMetadata::new(metadata, &context.memory).unwrap()),
+            ..Default::default()
+        }, &context.memory).unwrap()
+    };
+    let sidecar = TableRef::new("xt", "idempotency_receipts");
+    for (position, request, retained) in [(0, bound(1), true), (1, bound(2), false)] {
+        let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(position), Timestamp(100), request, &context).await.unwrap();
+        assert!(accepted.result().committed(), "{:?}", accepted.result().error());
+        assert_eq!(accepted.writes().tables().contains_key(&sidecar), retained);
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    }
+    let erase = request(vec![sql("ERASE FROM docs WHERE _id = 1")], &context);
+    let erased = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(101), erase, &context).await.unwrap();
+    assert!(erased.result().committed(), "{:?}", erased.result().error());
+    let events = erased.writes().tables()[&sidecar].batch().unwrap();
+    assert_eq!(events.len(), 1);
+    let event = events.view().read_event(0).unwrap();
+    assert_eq!(event.iid, EntityId::Integer(0).iid());
+    assert!(matches!(event.operation, StoredOperation::Erase));
 }
 
 #[tokio::test]
@@ -1600,6 +1637,12 @@ async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_cur
     let body = resolved.to_replica_body(&context.memory).unwrap();
     let ReplicaBody::ResolvedTx(tx) = body.body() else { panic!("expected versioned placed frame"); };
     assert!(PlacedAttempt::decode(tx.placed_attempt.as_deref().unwrap()).is_err());
+    let mut wrong_decision = tx.clone();
+    wrong_decision.committed = tx.committed.map(|committed| !committed);
+    assert!(decode_replica(&wrong_decision, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+    wrong_decision.committed = None;
+    assert!(decode_replica(&wrong_decision, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+
     let mut unmarked = tx.clone();
     unmarked.placed_attempt = Some(attempt.encode().to_vec());
     assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());

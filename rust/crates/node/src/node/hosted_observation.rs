@@ -1,7 +1,7 @@
 use std::{sync::{Arc, Mutex, Weak}, time::Duration};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_storage::cache::BufferPool;
+use rtdb_storage::cache::{BufferPool, HeldCatalogRead};
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
 
@@ -14,7 +14,7 @@ pub(super) struct PreparedAppliedCatalog {
     attachment: Weak<Database>,
     floor: CatalogCut,
     storage: Arc<BufferPool>,
-    registration: Arc<Mutex<Option<Arc<dyn Send + Sync>>>>,
+    registration: Arc<Mutex<Option<Arc<HeldCatalogRead>>>>,
     expires_at: tokio::time::Instant,
     expiry: tokio::task::JoinHandle<()>,
     _reservation: Arc<MemoryReservation>,
@@ -26,7 +26,8 @@ impl PreparedAppliedCatalog {
         let database = read.context.catalog.database(&read.database)?;
         let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
         let floor = snapshot.catalog_cut().ok_or_else(unavailable)?;
-        let registration = snapshot.catalog_read_permit().ok_or_else(unavailable)?;
+        let registration = snapshot.catalog_read_permit::<HeldCatalogRead>()
+            .filter(|hold| hold.is_registered() && database.storage.holds_catalog(hold, Some(floor))).ok_or_else(unavailable)?;
         let registration = Arc::new(Mutex::new(Some(registration)));
         let weak = Arc::downgrade(&registration);
         let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
@@ -56,7 +57,7 @@ impl PreparedAppliedCatalog {
         Ok(())
     }
 
-    pub(super) fn pin(&self, database: &Arc<Database>, cut: CatalogCut) -> Result<Arc<dyn Send + Sync>> {
+    pub(super) fn pin(&self, database: &Arc<Database>, cut: CatalogCut) -> Result<Arc<HeldCatalogRead>> {
         self.check_live()?;
         if !self.attachment.upgrade().is_some_and(|original| Arc::ptr_eq(&original, database))
             || !covers_catalog(self.floor, cut)
@@ -245,6 +246,7 @@ impl OwnedReadSession {
         }
         let basis = QueryBasis {
             snapshot: TimeBasis::default(),
+            replica_capture: None,
             snapshot_time: None,
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),
@@ -337,6 +339,7 @@ impl OwnedReadSession {
         }
         let basis = QueryBasis {
             snapshot: TimeBasis::default(),
+            replica_capture: None,
             snapshot_time: None,
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),

@@ -6,6 +6,23 @@ use uuid::Uuid;
 
 use crate::{Checkpoint, DeploymentRecord, HostedTask, Lifecycle, StorageRegion, Version, next_reference_revision, reference_revision};
 
+/// Permission to remove the exact publications in one durable retirement.
+///
+/// ```compile_fail
+/// fn forge(retirement: &rtdb_directory::LineageRetirement) -> rtdb_directory::ExactRetirementGrant<'_> {
+///     rtdb_directory::ExactRetirementGrant { retirement, revision: 0 }
+/// }
+/// ```
+pub struct ExactRetirementGrant<'a> {
+    retirement: &'a LineageRetirement,
+    revision: Version,
+}
+
+impl<'a> ExactRetirementGrant<'a> {
+    pub fn retirement(&self) -> &'a LineageRetirement { self.retirement }
+    pub fn revision(&self) -> Version { self.revision }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageRetirement {
     pub token: Uuid,
@@ -242,6 +259,13 @@ impl LineageState {
         }
     }
     pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_) | Admission::ErasingTombstones { .. }) }
+
+    /// An observation of the authorized lineage also suffices after a lost reply.
+    pub fn exact_retirement_grant(&self, requested: &LineageRetirement) -> Option<ExactRetirementGrant<'_>> {
+        let retirement = self.retirement()?;
+        (self.exact_erasure_authorized() && retirement == requested)
+            .then_some(ExactRetirementGrant { retirement, revision: self.version })
+    }
 
     pub fn tombstone_upload(&self, token: Uuid, key: &str) -> Result<Option<&str>> {
         Ok(self.tombstone_uploads(token, key)?.get(key).map(String::as_str))

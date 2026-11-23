@@ -778,6 +778,11 @@ impl HostedControlWrite {
         Ok((result.retained_bytes()? <= 1024 * 1024).then_some(result))
     }
 
+    pub(crate) fn is_landing_receipt_insert(&self) -> bool {
+        self.name() == "bj_fact_root_admission" && !self.is_check() && self.expected().is_none()
+            && matches!(self.id(), EntityId::String(id) if landing_control_id(id, "root_proposal_landing:"))
+    }
+
     pub fn is_check(&self) -> bool {
         self.check_only
     }
@@ -1446,18 +1451,41 @@ mod retained_release_tests {
     }
 }
 
-/// Proposal content settlements may also replace their exact generation row.
-pub fn proposal_overlay_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
+/// A Proposal settlement includes its registered receipt and may advance its review projection.
+pub fn proposal_overlay_controls<'a>(
+    controls: impl IntoIterator<Item = &'a HostedControlWrite>, writes: bool,
+) -> bool {
     let mut checks = 0;
     let mut existing = 0;
     let mut replacements = 0;
+    let mut budget = false;
     for control in controls {
         if control.is_check() {
             checks += 1;
-        } else {
-            existing += usize::from(control.expected().is_some());
-            replacements += 1;
+            continue;
         }
+        if let EntityId::String(id) = control.id() {
+            if control.name() == "bj_fact_root_receipts" && landing_control_id(id, "receipt_budget:") {
+                if std::mem::replace(&mut budget, true) { return false; }
+                continue;
+            }
+            if control.name() == "bj_fact_root_admission" {
+                if ["root_proposal_review_head:", "root_proposal_review_table_head:"]
+                    .iter().any(|prefix| landing_control_id(id, prefix))
+                {
+                    if !writes { return false; }
+                    continue;
+                }
+                if ["root_proposal_review_root:", "root_proposal_review_table_root:"]
+                    .iter().any(|prefix| landing_control_id(id, prefix))
+                {
+                    if !writes || control.expected().is_some() { return false; }
+                    continue;
+                }
+            }
+        }
+        existing += usize::from(control.expected().is_some());
+        replacements += 1;
     }
     checks > 0 && (1..=6).contains(&replacements)
         && existing >= if replacements == 6 { 2 } else { 1 }
@@ -1505,7 +1533,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
         }
     }
     let world = world?;
-    let controls_allowed = if terminal { retained_delete_controls(controls) } else { proposal_overlay_controls(controls) };
+    let controls_allowed = proposal_overlay_controls(controls, !terminal);
     (terminal == writes.is_empty() && controls_allowed && writes.into_iter().all(|(relation, id, start, create_only)| {
         relation.world() == Some(world)
             && points.remove(&(relation, id)).is_some_and(|instants| {
@@ -1553,39 +1581,80 @@ pub const MAX_PROPOSAL_LAND_TASKS: usize = 16;
 /// reservation carrier is inserted beside it, so the intent exists exactly
 /// when the landing receipt does.
 pub fn proposal_land_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
-    let mut checks = 0;
+    let mut checked = false;
+    let mut mutations = Vec::new();
+    for control in controls {
+        if control.is_check() {
+            checked = true;
+            continue;
+        }
+        let EntityId::String(id) = control.id() else { return false; };
+        if control.name() != "bj_fact_root_admission"
+            || match control.expected() {
+                Some(_) => !landing_control_id(id, "root_proposal_head:") && landing_reservation(id).is_none(),
+                None => landing_control_id(id, "root_proposal_head:"),
+            }
+        {
+            return false;
+        }
+        mutations.push(id.as_str());
+    }
+    checked && proposal_landing_replacements(mutations)
+}
+
+/// The source and read-back enforce the same bounded control inventory.
+pub(crate) fn proposal_landing_replacements<'a>(ids: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
     let mut head = false;
     let mut receipt = false;
     let mut proof = false;
     let mut carrier = false;
     let mut action = false;
-    let mut tasks = 0;
-    for control in controls {
-        if control.is_check() {
-            checks += 1;
-            continue;
+    let mut clock_charge = false;
+    let mut send_charge = false;
+    let mut mount_budget = false;
+    let mut lane_tail = false;
+    let mut clocks = 0;
+    for id in ids {
+        if !seen.insert(id) {
+            return false;
         }
-        let EntityId::String(id) = control.id() else { return false; };
-        if control.name() != "bj_fact_root_admission" { return false; }
-        let slot = match control.expected() {
-            Some(_) if landing_control_id(id, "root_proposal_head:") => &mut head,
-            None if landing_control_id(id, "root_proposal_landing:") => &mut receipt,
-            None if landing_control_id(id, "root_proposal_landing_proof:") => &mut proof,
-            None if landing_control_id(id, "task-acceptance:") => &mut carrier,
-            None if landing_action_task_id(id) => {
-                tasks += 1;
-                &mut action
+        let slot = if landing_control_id(id, "root_proposal_head:") { &mut head }
+        else if landing_control_id(id, "root_proposal_landing:") { &mut receipt }
+        else if landing_control_id(id, "root_proposal_landing_proof:") { &mut proof }
+        else if landing_control_id(id, "task-acceptance:") { &mut carrier }
+        else if landing_action_task_id(id) { &mut action }
+        else if landing_control_id(id, "clock-task:") {
+            clocks += 1;
+            if clocks > MAX_PROPOSAL_LAND_TASKS { return false; }
+            continue;
+        } else {
+            match landing_reservation(id) {
+                Some(LandingReservation::Clock) => &mut clock_charge,
+                Some(LandingReservation::Send) => &mut send_charge,
+                Some(LandingReservation::MountBudget) => &mut mount_budget,
+                Some(LandingReservation::LaneTail) => &mut lane_tail,
+                None => return false,
             }
-            None if landing_control_id(id, "clock-task:") => {
-                tasks += 1;
-                if tasks > MAX_PROPOSAL_LAND_TASKS { return false; }
-                continue;
-            }
-            _ => return false,
         };
-        if std::mem::replace(slot, true) { return false; }
+        if std::mem::replace(slot, true) {
+            return false;
+        }
     }
-    checks > 0 && head && receipt && proof && carrier == action && tasks <= MAX_PROPOSAL_LAND_TASKS
+    head && receipt && proof && carrier == action
+        && clocks + usize::from(action) <= MAX_PROPOSAL_LAND_TASKS
+        && (!clock_charge || clocks > 0)
+        && (!(send_charge || mount_budget || lane_tail) || action)
+}
+
+enum LandingReservation { Clock, Send, MountBudget, LaneTail }
+
+fn landing_reservation(id: &str) -> Option<LandingReservation> {
+    if landing_control_id(id, "static_label_pool:clocks:") { Some(LandingReservation::Clock) }
+    else if landing_control_id(id, "static_label_pool:sends:") { Some(LandingReservation::Send) }
+    else if id.strip_prefix("mount-budget:").is_some_and(|mount| !mount.is_empty()) { Some(LandingReservation::MountBudget) }
+    else if id.strip_suffix(":tail").is_some_and(|lane| landing_control_id(lane, "action-lane:")) { Some(LandingReservation::LaneTail) }
+    else { None }
 }
 
 /// `action-task:` followed by the occurrence's encoded document id.

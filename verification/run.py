@@ -12,6 +12,8 @@ import subprocess
 import tarfile
 import tempfile
 
+from residence_trace import project, verify_joined, verify_native
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -387,13 +389,13 @@ def verify_lean_model(args, scratch, path, study, controls, theorems, env=None):
 def verify_read_index_frontiers(args, scratch):
     path = Path("verification/lean/ReadIndexFrontiers.lean")
     controls = {
-        "ignore-unobserved-slot": (
-            "observedVotes replies + missingVotes replies",
-            "observedVotes replies",
-            ["completed_position_is_below_the_read_bound", "missing_reply_can_hide_a_completed_position"],
+        "offset-without-history": (
+            "later.history = earlier.history ∧ ∃ suffix, later.entries = earlier.entries ++ suffix",
+            "∃ suffix, later.entries = earlier.entries ++ suffix",
+            ["extension_transitive", "handoff_preserves_installed_prefix", "matching_offsets_do_not_bind_history"],
         ),
     }
-    verify_lean_model(args, scratch, path, "read-index-frontiers", controls, 3)
+    verify_lean_model(args, scratch, path, "read-index-frontiers", controls, 6)
 
 
 def verify_search_member_bounds(args, scratch):
@@ -2104,20 +2106,40 @@ TLA_CASES = (
      ("INVARIANTS WitnessesCoverInstalledPrefix LookupNamesExactAttempt",
       "INVARIANT NeverRecoversWitness"), "NeverRecoversWitness"),
     ("ActiveLogletReadIndex", "active-loglet-read-index", None, None),
-    ("ActiveLogletReadIndex", "read-index-trusts-synced-predecessor",
-     ('Mutation = "none"', 'Mutation = "synced_is_active"'), "BoundCoversAcknowledgements"),
-    ("ActiveLogletReadIndex", "read-index-uses-only-published-tips",
-     ('Mutation = "none"', 'Mutation = "published_only"'), "BoundCoversAcknowledgements"),
-    ("ActiveLogletReadIndex", "read-index-skips-the-apply-wait",
-     ('Mutation = "none"', 'Mutation = "skip_apply_wait"'), "ServedReadCoversAcknowledgements"),
-    ("ActiveLogletReadIndex", "read-index-captures-basis-before-confirmation",
-     ('Mutation = "none"', 'Mutation = "basis_before_fence"'), "ServedReadCoversAcknowledgements"),
-    ("ActiveLogletReadIndex", "read-index-serves-after-move-witness",
-     ("INVARIANTS BoundCoversAcknowledgements ServedReadCoversAcknowledgements",
-      "INVARIANT NeverServesOnNewLoglet"), "NeverServesOnNewLoglet"),
-    ("ActiveLogletReadIndex", "read-index-waits-for-speculative-tail-witness",
-     ("INVARIANTS BoundCoversAcknowledgements ServedReadCoversAcknowledgements",
-      "INVARIANT NeverSamplesPastPublished"), "NeverSamplesPastPublished"),
+    ("ActiveLogletReadIndex", "read-index-surviving-quorum-progress",
+     ("SPECIFICATION Spec", "SPECIFICATION ProgressSpec\nPROPERTY SurvivingQuorumProgress"), None),
+    ("ActiveLogletReadIndex", "read-index-ack-payload",
+     ('Mutation = "none"', 'Mutation = "ack_payload"'), "StableCutCovered"),
+    ("ActiveLogletReadIndex", "read-index-single-install",
+     ('Mutation = "none"', 'Mutation = "single_install"'), "ReadStabilized"),
+    ("ActiveLogletReadIndex", "read-index-unbound-digest",
+     ('Mutation = "none"', 'Mutation = "wrong_digest"'), "ExactDecision"),
+    ("ActiveLogletReadIndex", "read-index-skips-apply",
+     ('Mutation = "none"', 'Mutation = "skip_apply"'), "ProtectedAppliedCapture"),
+    ("ActiveLogletReadIndex", "read-index-skips-hold",
+     ('Mutation = "none"', 'Mutation = "skip_hold"'), "HoldAtExposure"),
+    ("ActiveLogletReadIndex", "read-index-prepared-vote",
+     ('Mutation = "none"', 'Mutation = "prepared_vote"'), "ActiveAuthority"),
+    ("ActiveLogletReadIndex", "read-index-probe-replay",
+     ('Mutation = "none"', 'Mutation = "replay_probe"'), "StableCutCovered"),
+    ("ActiveLogletReadIndex", "read-index-activation-loses-floor",
+     ('Mutation = "none"', 'Mutation = "lose_floor"'), "ActivationContinuity"),
+    ("ActiveLogletReadIndex", "read-index-trim-loses-witness",
+     ('Mutation = "none"', 'Mutation = "forget_witness"'), "StableWitnessRetained"),
+    ("ActiveLogletReadIndex", "read-index-copy-votes",
+     ('Mutation = "none"', 'Mutation = "copy_votes"'), "StrictOriginalAcceptance"),
+    ("ActiveLogletReadIndex", "read-index-cutoff-equal-votes",
+     ('Mutation = "none"', 'Mutation = "equal_cutoff_votes"'), "StrictOriginalAcceptance"),
+    ("ActiveLogletReadIndex", "read-index-silence-excludes",
+     ('Mutation = "none"', 'Mutation = "silence_excludes"'), "PermanentExclusion"),
+    ("ActiveLogletReadIndex", "read-index-activate-unknown",
+     ('Mutation = "none"', 'Mutation = "activate_unknown"'), "ClosedWhileUnknown"),
+    ("ActiveLogletReadIndex", "read-index-stalled-tail-witness",
+     ("CHECK_DEADLOCK FALSE", "INVARIANT NoStalledTailRead\nCHECK_DEADLOCK FALSE"), "NoStalledTailRead"),
+    ("ActiveLogletReadIndex", "read-index-reader-stabilization-witness",
+     ("CHECK_DEADLOCK FALSE", "INVARIANT NoReaderStabilization\nCHECK_DEADLOCK FALSE"), "NoReaderStabilization"),
+    ("ActiveLogletReadIndex", "read-index-expired-unknown-witness",
+     ("CHECK_DEADLOCK FALSE", "INVARIANT NoExpiredUnknown\nCHECK_DEADLOCK FALSE"), "NoExpiredUnknown"),
     ("FrozenReceiptCut", "frozen-receipt-cut", None, None),
     ("FrozenReceiptCut", "frozen-receipt-trusts-matching-position",
      ('Mutation = "none"', 'Mutation = "trust_same_position"'), "ConfirmedAgainstSelectedRoot"),
@@ -3213,8 +3235,48 @@ TLA_CASES = (
 )
 
 
+RESIDENCE_AUTHORITY_CONTROLS = (
+    ("accept_future_time", "BoundedAppend"),
+    ("unclamped_external", "ExternalClamp"),
+    ("reuse_names", "DistinctNamingEpoch"),
+    ("ignore_floor_readers", "FloorKeepsHeldCatalogs"),
+    ("rewind_receipt_clock", "ReceiptExpiry"),
+    ("collect_live_receipt", "ReceiptExpiry"),
+    ("replace_receipt_outcome", "ReceiptReplay"),
+    ("use_stale_index", "FreshCapture"),
+    ("ack_before_closure", "AcknowledgedClosure"),
+    ("arm_before_successor", "ErasureHasSuccessor"),
+    ("use_revoked_cache", "RevokedCacheClosed"),
+    ("ack_payload_quorum", "AcknowledgedDecision"),
+    ("read_unpublished_decision", "FreshIndexHasPublication"),
+    ("lose_decision_on_activation", "DecisionSurvivesActivation"),
+    ("grant_without_fence", "RecoveryFenceProtectsDeletion"),
+    ("trim_without_fence", "RecoveryFenceProtectsDeletion"),
+)
+RESIDENCE_AUTHORITY_CASES = (
+    ("ResidenceComposition", "residence-authorities",
+     ("ExtendAuthorities = FALSE", "ExtendAuthorities = TRUE"), None),
+    *(("ResidenceComposition", f"residence-{mutation.replace('_', '-')}",
+       ('Mutation = "none"\nCONSTANT ExtendAuthorities = FALSE\nINVARIANT Safe',
+        f'Mutation = "{mutation}"\nCONSTANT ExtendAuthorities = TRUE\nINVARIANT {invariant}'), invariant)
+      for mutation, invariant in RESIDENCE_AUTHORITY_CONTROLS),
+)
+
+
+def replay_bounded_worker_stack(args, source):
+    test = "a_thousand_unpushable_conjuncts_plan_and_run_on_a_worker_stack"
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    result = run_case(["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "statement", test, "--", "--exact"],
+                      source / "rust", args.evidence, "rust-residence-worker-stack", env)
+    if result.returncode or f"{test} ... ok" not in result.stdout:
+        raise ValueError("the deep statement did not execute through cursor disposal on the worker stack")
+
+
 def verify_tla(args, scratch):
-    for module, name, mutation, invariant in TLA_CASES:
+    for module, name, mutation, invariant in (*TLA_CASES, *RESIDENCE_AUTHORITY_CASES):
         case = f"tlc-{name}"
         directory = scratch / case
         clone_file(Path(f"verification/tla/{module}.tla"), directory)
@@ -3246,25 +3308,30 @@ def verify_tla(args, scratch):
             print(f"{case}: {states[1]} distinct states, no violation")
 
 
-def check_residence_trace(args, scratch, case, trace, refusal=None, disposal_effects_only=False):
+def check_residence_trace(args, scratch, case, trace, refusal=None, disposal_effects_only=False, *, extended=False):
     directory = scratch / case
     for module in ("ResidenceComposition", "ResidenceCompositionReplay"):
         clone_file(Path(f"verification/tla/{module}.tla"), directory)
     source = directory / "verification/tla/ResidenceCompositionReplay.tla"
-    encoded = ", ".join(f"<<{json.dumps(kind)}, {cut}, {json.dumps(publication)}>>" for kind, cut, publication in trace)
+    if not extended:
+        trace = [[kind, cut, publication, -1, "", -1] for kind, cut, publication in trace]
+    encoded = ", ".join("<<" + ", ".join(json.dumps(field) for field in event) + ">>" for event in trace)
     mode = "TRUE" if disposal_effects_only else "FALSE"
     source.with_name("ResidenceCompositionEvents.tla").write_text(
         "---- MODULE ResidenceCompositionEvents ----\nEXTENDS Integers\n"
         f"Events == <<{encoded}>>\nDisposalEffectsOnly == {mode}\n====\n"
     )
     config = source.with_suffix(".cfg")
-    config.write_text("SPECIFICATION TraceSpec\nCONSTANT Mutation = \"none\"\nINVARIANT Safe\nPROPERTY ReplayTerminates\n")
-    checked = run_case(
-        [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
-         "-workers", "1", "-metadir", str(directory / "states"), "-noGenerateSpecTE",
-         "-config", config.name, source.name],
-        source.parent, args.evidence, case,
-    )
+    authorities = "TRUE" if extended else "FALSE"
+    config.write_text('SPECIFICATION TraceSpec\nCONSTANT Mutation = "none"\n'
+                      f"CONSTANT ExtendAuthorities = {authorities}\nINVARIANT Safe\nPROPERTY ReplayTerminates\n")
+    with tempfile.TemporaryDirectory(prefix="states-", dir=directory) as metadir:
+        checked = run_case(
+            [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
+             "-workers", "1", "-metadir", metadir, "-noGenerateSpecTE",
+             "-config", config.name, source.name],
+            source.parent, args.evidence, case,
+        )
     if refusal is None:
         if checked.returncode or "No error has been found." not in checked.stdout:
             raise ValueError(f"{case}: accepted trace did not reach its terminal state")
@@ -3299,6 +3366,74 @@ def verify_residence_trace(args, scratch, events, disposal_effects_only=False):
         reordered = list(events)
         reordered[left], reordered[right] = reordered[right], reordered[left]
         check_residence_trace(args, scratch, f"{prefix}-{name}", reordered, min(left, right), disposal_effects_only)
+
+
+def verify_composed_residence_trace(args, scratch):
+    from copy import deepcopy
+
+    observed = json.loads((ROOT / "verification/traces/residence-authorities.json").read_text())
+    events = project(observed)
+    check_residence_trace(args, scratch, "tlc-residence-authorities-trace", events, extended=True)
+    positions = {}
+    for index, event in enumerate(events):
+        positions.setdefault(event[0], index)
+    swaps = {
+        "uncovered-acknowledgement": ("acknowledge", "publish-checkpoint"),
+        "ack-before-publication": ("ack-commit", "publish-decision"),
+        "delete-before-recovery-fence": ("authorize-version", "install-recovery-fence"),
+        "successor-missing": ("arm-erasure", "publish-checkpoint"),
+        "retained-catalog": ("advance-floor", "drain-provider-read"),
+        "retained-suffix": ("trim", "finish-recovery"),
+        "uncopied-fork": ("erase-residence", "copy-fork"),
+    }
+    for name, (first, second) in swaps.items():
+        left, right = positions[first], positions[second]
+        reordered = list(events)
+        reordered[left], reordered[right] = reordered[right], reordered[left]
+        check_residence_trace(args, scratch, f"tlc-residence-authorities-{name}", reordered, min(left, right), extended=True)
+
+    replacements = {
+        "future-time": ("attempt-outcome", 1, 3),
+        "rewound-receipt-clock": ("receipt-clock", 3, 2),
+        "reused-naming-epoch": ("install", 3, 0),
+        "early-receipt-collection": ("collect-receipt", 1, 2),
+        "changed-receipt": ("redeem-receipt", 4, "accepted"),
+        "stale-loglet": ("capture-fresh", 3, 0),
+        "revoked-cache": ("read-old-cache", 4, "page"),
+        "wrong-retirement": ("remove-version", 2, "new"),
+    }
+    for name, (kind, field, value) in replacements.items():
+        altered = [event.copy() for event in events]
+        index = positions[kind]
+        altered[index][field] = value
+        check_residence_trace(args, scratch, f"tlc-residence-authorities-{name}", altered, index, extended=True)
+
+    external = [event.copy() for event in events]
+    index = positions["attempt-outcome"]
+    external[index][1:3] = [3, "external"]
+    external[index][5] = 2
+    check_residence_trace(args, scratch, "tlc-residence-authorities-external-clamp", external, extended=True)
+    external[index][5] = 3
+    check_residence_trace(args, scratch, "tlc-residence-authorities-unclamped", external, index, extended=True)
+
+    for kind, field, value in (
+        ("capture-fresh", "loglet", "unknown-ensemble"),
+        ("capture-fresh", "decision", "other-prefix"),
+        ("authorize-version", "recovery_root", "other-closure"),
+        ("revoke-key", "key_slot", "different-key"),
+        ("remove-version", "publication", {"key": "outside", "version": "replacement", "epoch": 0}),
+        ("copy-fork", "destination", "another-fork"),
+        ("collect-receipt", "attempt", "other-attempt"),
+    ):
+        altered = deepcopy(observed)
+        altered["events"][positions[kind]][field] = value
+        try:
+            project(altered)
+        except ValueError as error:
+            if f"observation {positions[kind] + 1}:" not in str(error):
+                raise
+        else:
+            raise ValueError(f"the trace projection accepted a substituted {field}")
 
 
 def verify_alloy(args, scratch):
@@ -4823,22 +4958,73 @@ def verify_native_residence_trace(args, source, scratch):
 
 def verify_native_recovery_trace(args, source):
     import copy
-    import sys
 
     label = "rust-recovery-trace"
     trace = args.evidence / f"{label}.json"
+    # The process recorder creates a new file on each capture.
+    with tempfile.TemporaryDirectory(prefix="rtdb-residence-observations-") as temporary:
+        observations = Path(temporary) / "residence.jsonl"
+        capture_native_recovery(args, source, label, trace, observations)
+        native = [json.loads(line) for line in observations.read_text().splitlines()]
+        shutil.copyfile(observations, args.evidence / "rust-residence-observations.jsonl")
+    required = {"quorum-publication", "quorum-receipt", "publish-checkpoint", "admit-recovery", "authorize-trim", "apply-trim"}
+    if not required.issubset(event["event"] for event in native):
+        raise ValueError(f"{label}: the native residence capture omitted a checkpoint, hold, or trim observation")
+    verify_native(native)
+    verify_joined([native])
+    bad_root = copy.deepcopy(native)
+    published = next(event for event in bad_root if event["event"] == "authorize-trim")
+    published["manifest"][0] ^= 1
+    try:
+        verify_joined([bad_root])
+    except ValueError as error:
+        if "authorize-trim lacks the exact published recovery closure" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted a substituted recovery manifest")
+    bad_decision = copy.deepcopy(native)
+    receipt = next(event for event in bad_decision if event["event"] == "quorum-receipt")
+    receipt["ensemble"][0] ^= 1
+    try:
+        verify_native(bad_decision)
+    except ValueError as error:
+        if "append receipt precedes its observed quorum publication" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted another publication ensemble")
+    bad_scope = copy.deepcopy(native)
+    applied = next(event for event in bad_scope if event["event"] == "apply-trim")
+    applied["epoch"] += 1
+    try:
+        verify_native(bad_scope)
+    except ValueError as error:
+        if "physical trim lacks its exact authorization" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted another journal epoch")
+
+    validate_recovery_revisions(args, label, trace)
+
+
+def capture_native_recovery(args, source, label, trace, observations):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
         "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0",
         "CARGO_INCREMENTAL": "0",
         "RTDB_RECOVERY_TRACE_PATH": str(trace.resolve()),
+        "RTDB_RESIDENCE_TRACE_PATH": str(observations),
     }
     test = "a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim"
     command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell", test, "--", "--exact"]
     baseline = run_case(command, source / "rust", args.evidence, f"{label}-capture", env)
     if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
         raise ValueError(f"{label}: the native cell did not produce its recovery trace")
+
+
+def validate_recovery_revisions(args, label, trace):
+    import copy
+    import sys
 
     validator = [sys.executable, str(ROOT / "verification/recovery_trace.py")]
     result = run_case([*validator, str(trace)], ROOT, args.evidence, f"{label}-baseline")
@@ -5755,6 +5941,7 @@ def main():
         "rust/crates/conformance/tests/node_faults.rs",
         "rust/crates/conformance/tests/recovery.rs",
         "rust/crates/node/tests/native.rs",
+        "rust/crates/node/tests/statement.rs",
         "rust/crates/node/src/database.rs",
         "rust/crates/tx/src/resolver.rs",
         "rust/crates/azure/src/copy.rs",
@@ -5796,6 +5983,15 @@ def main():
         "rust/crates/logkeeper/src/client/mod.rs",
         "rust/crates/multi/src/logs.rs",
         "rust/crates/multi/src/recovery_holds.rs",
+        "rust/crates/multi/src/residence_trace.rs",
+        "rust/crates/types/src/residence_trace.rs",
+        "rust/crates/logkeeper/src/client/writer.rs",
+        "rust/crates/storage/src/cache.rs",
+        "rust/crates/multi/src/hosted_recovery.rs",
+        "rust/crates/multi/src/journal/log.rs",
+        "rust/crates/pg-source/src/driver.rs",
+        "rust/crates/pg-source/src/stream.rs",
+        "rust/crates/pg-source/src/token.rs",
         "rust/crates/multi/src/store.rs",
         "rust/crates/multi/src/store/exact_retirement.rs",
         "rust/crates/multi/src/catalog_readers.rs",
@@ -5833,6 +6029,7 @@ def main():
         verify_lean(args, directory)
         verify_tla(args, directory)
         verify_residence_trace(args, directory, json.loads((ROOT / "verification/traces/residence-composition.json").read_text()))
+        verify_composed_residence_trace(args, directory)
         verify_verus(args, directory)
         if args.openjml:
             verify_jvm_leaf_merge(args, directory)
@@ -5884,6 +6081,7 @@ def main():
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_native_recovery_trace(args, source)
+            replay_bounded_worker_stack(args, source)
             verify_placed_receipt_replay(args, source)
             verify_recovery_hold_replay(args, source)
             verify_checkpoint_receipts(args, source)

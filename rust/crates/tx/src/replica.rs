@@ -24,7 +24,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
     let placed = if let Some(placed) = message.placed_attempt.as_deref() {
         let (attempt, retirement) = decode_replica_outcome_attempt(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
         let position = Some(attempt.position().0);
-        if message.src_msg_id != position || message.tx_id != position
+        if message.src_msg_id != position || message.tx_id != position || message.committed.is_none()
             || !message.table_data.contains_key(&format!("xt/{PLACED_ATTEMPT_OUTCOME_TABLE}"))
         {
             return Err(invalid("Placed attempt and transaction outcome disagree"));
@@ -80,7 +80,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         }
         tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
     }
-    let outcome = placed.map(|(attempt, retirement)| read_placed_outcome(&tables, attempt, retirement, key, memory)).transpose()?;
+    let outcome = placed.map(|(attempt, retirement)| read_placed_outcome(&tables, attempt, retirement, &result, memory)).transpose()?;
     let proof = outcome.as_ref().map(|(proof, _)| proof);
     let world_effects = proof.and_then(|proof| proof.get(worlds::WORLD_EFFECTS));
     let archive_replay = match proof.and_then(|proof| proof.get(crate::hosted_control::RESOLVED_ARCHIVE_REPLAY)) {
@@ -121,9 +121,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                     worlds::HostedEffects::ProposalClose if !(4..=7).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved Proposal close lacks its bounded custody and receipt effects")),
-                    worlds::HostedEffects::ProposalLanding if controls.iter()
-                        .filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>() != 3 =>
-                        return Err(invalid("Resolved Proposal landing requires its replay head, receipt and proof")),
+                    worlds::HostedEffects::ProposalLanding => verify_proposal_landing_controls(&controls, memory)?,
                     worlds::HostedEffects::RequiredReplacements if controls.is_empty() =>
                         return Err(invalid("Resolved control-only retained fork has no hosted replacements")),
                     worlds::HostedEffects::RetainedRelease if !(1..=2).contains(
@@ -238,10 +236,11 @@ fn verify_archive_replay(
 }
 
 fn read_placed_outcome(
-    tables: &BTreeMap<TableRef, TableWrite>, attempt: PlacedAttempt, retirement: bool, key: TransactionKey,
+    tables: &BTreeMap<TableRef, TableWrite>, attempt: PlacedAttempt, retirement: bool, result: &TransactionResult,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(StructFields<Value>, Arc<rtdb_columnar::MemoryReservation>)> {
-    let mismatch = || invalid("Resolved owned effects differ from their ordered placed attempt");
+    let key = result.tx_key();
+    let mismatch = || invalid("Resolved transaction differs from its ordered placed attempt");
     let outcome = tables
         .get(&TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE))
         .and_then(TableWrite::batch)
@@ -273,12 +272,39 @@ fn read_placed_outcome(
     }
     let proof = proof.ok_or_else(mismatch)?;
     if !matches!(proof.get("_id"), Some(Value::Utf8(id)) if id == &attempt.outcome_key())
+        || proof.get("committed") != Some(&Value::Bool(result.committed()))
         || proof.get("tx_id") != Some(&Value::I64(key.tx_id.0))
         || !matches!(proof.get("tx_system_time"), Some(Value::Timestamp { value, unit: rtdb_types::TimeUnit::Microsecond, .. }) if *value == key.system_time.0)
     {
         return Err(mismatch());
     }
     Ok((proof, decode))
+}
+
+fn verify_proposal_landing_controls(
+    controls: &[(&TableRef, &TableWrite)], memory: &Arc<MemoryBudget>,
+) -> Result<()> {
+    use crate::hosted_control::{MAX_PROPOSAL_LAND_TASKS, proposal_landing_replacements};
+
+    let mismatch = || invalid("Resolved Proposal landing differs from its exact control inventory");
+    let [(table, write)] = controls else { return Err(mismatch()); };
+    if table.schema != "public" || table.table != "bj_fact_root_admission" {
+        return Err(mismatch());
+    }
+    let batch = write.batch().filter(|batch| batch.len() <= MAX_PROPOSAL_LAND_TASKS + 8).ok_or_else(mismatch)?;
+    let bytes = batch.arrow().get_array_memory_size().checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(mismatch)?;
+    let _charge = memory.reserve(bytes)?;
+    let mut ids = Vec::new();
+    for index in 0..batch.len() {
+        let StoredOperation::Put(mut row) = batch.view().read_event(index)?.operation else { return Err(mismatch()); };
+        let Some(Value::Utf8(id)) = row.remove("_id") else { return Err(mismatch()); };
+        ids.push(id);
+    }
+    if !proposal_landing_replacements(ids.iter().map(String::as_str)) {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 fn verify_hosted_controls(

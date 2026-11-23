@@ -217,3 +217,10 @@ Lean checked eleven receipt-clock and quorum-bound theorems with their controls.
 Verus matched the selected receipt, rank, limit, compaction, checkpoint, and replay handoff manifests with 73 verified functions across their baselines.
 The changed Allium specs added no diagnostics relative to `c33f341252`.
 Hosted provider checks that require a live S3 endpoint remain outside this local qualification.
+
+== R9 residence authority and replay sources
+
+The R9 model and ordered fixture represent the R1–R8 decisions in one bounded residence.
+The native reader, retirement, trim and PostgreSQL feedback paths carry typed evidence at the boundaries described in link:../redesign/R9-capabilities-and-composition.md[R9].
+The runner includes native checkpoint, recovery hold and trim observations and a rejected-epoch control, plus the existing bounded worker-stack fixture.
+This entry records source inspection. Compilation, tests, and model and trace execution are pending.

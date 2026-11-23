@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 
 use sha2::{Digest, Sha256};
 
-use crate::{Anomaly, Result, SourcePosition};
+use crate::{Anomaly, Result, SourcePosition, TransactionKey};
 
 const SCOPE_BYTES: usize = 40;
 const SEED_BYTES: usize = SCOPE_BYTES + 16;
@@ -132,6 +132,13 @@ impl PlacedAttempt {
         digest.update(self.encode());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize())
     }
+}
+
+/// Original disposition at the deciding receiver, before retry remapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacedDecision {
+    pub key: TransactionKey,
+    pub committed: bool,
 }
 
 fn invalid() -> Anomaly {

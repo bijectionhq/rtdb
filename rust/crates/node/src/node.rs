@@ -26,7 +26,7 @@ use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::{BufferPool, CacheBudget};
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, Interval, LogicalType, PlacedAttempt, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -136,7 +136,7 @@ enum AppliedCatalogAdmission<'a> {
 
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
     selected == floor
-        || (selected.tx_id > floor.tx_id && selected.system_time > floor.system_time)
+        || (selected.tx_id > floor.tx_id && selected.system_time >= floor.system_time)
 }
 
 #[derive(Clone)]
@@ -452,6 +452,27 @@ impl Node {
         Ok(current)
     }
 
+    /// Re-admit access to the databases of an already held catalog.
+    pub async fn admit_retained_catalog(
+        &self, catalog: &CatalogSnapshot, identity: &dyn SessionIdentity, cancellation: &CancellationToken,
+    ) -> Result<()> {
+        for name in catalog.database_names() {
+            self.admit(name, DatabaseAccess::Read, identity, cancellation).await?;
+            if let Some(fence) = &self.read_fence {
+                fence.confirm(name).await?;
+            }
+            let captured = catalog.database(name)?;
+            let current = self.catalog.database(name)?;
+            if !Arc::ptr_eq(&captured.storage, &current.storage) {
+                return Err(lost_placement(name));
+            }
+        }
+        if let Some(lease) = catalog.read_lease() {
+            lease.check()?;
+        }
+        Ok(())
+    }
+
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.query_context_in_placement(database, basis, identity, None, CatalogReadCut::Current, cancellation).await
     }
@@ -460,6 +481,13 @@ impl Node {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
         let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
+        let replica_capture = basis.replica_capture.as_ref();
+        if let Some(capture) = replica_capture {
+            let same_attachment = held.as_ref().is_some_and(|database| {
+                std::ptr::eq(capture.attachment.as_ptr(), Arc::as_ptr(database))
+            });
+            if !same_attachment { return Err(lost_placement(database)); }
+        }
         let hosted_fence = match cut {
             CatalogReadCut::HostedApplied { history, admission, .. } => {
                 self.ensure_indexing()?;
@@ -467,7 +495,7 @@ impl Node {
                 Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, admission))
             }
             CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
-                if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+                if replica_capture.is_none() && let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
                 None
             }
         };
@@ -493,10 +521,7 @@ impl Node {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let snapshot = match cut {
-                CatalogReadCut::Current => {
-                    let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
-                    database.partition.open_snapshot(head)
-                }
+                CatalogReadCut::Current => database.partition.snapshot(),
                 CatalogReadCut::Reserved(reserved) => {
                     let snapshot = database.partition.snapshot();
                     if snapshot.tx_basis() != Some(reserved) {
@@ -526,10 +551,11 @@ impl Node {
                 let permit = match admission {
                     AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
                     AppliedCatalogAdmission::PrepareAudience(storage) =>
-                        storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
+                        storage.hold_catalog(Some(cut)).await?,
                     AppliedCatalogAdmission::Ordinary =>
-                        database.storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
+                        database.storage.hold_catalog_with_primary(Some(cut), snapshot.compacted_primary_paths()).await?,
                 };
+                if !permit.is_registered() { return Err(applied_catalog_unretained()); }
                 let history = match admission {
                     AppliedCatalogAdmission::Ordinary => fence.confirm_hosted(&database).await?,
                     AppliedCatalogAdmission::PrepareAudience(_) | AppliedCatalogAdmission::PreparedAudience(_) =>
@@ -553,6 +579,7 @@ impl Node {
         crate::read_currency::require_current(database, lease.as_deref())?;
         let applied_basis = applied.map(|selected| QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(selected.system_time.into())])]) },
+            replica_capture: None,
             snapshot_time: Some(selected.system_time),
             current_time: selected.system_time.into(),
             timezone: basis.timezone.clone(),
@@ -574,7 +601,9 @@ impl Node {
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
-        if !self.factory.options.replication.enabled { return Ok(None); }
+        if !self.factory.options.replication.enabled || database.storage.object_store().defers_trie_releases() {
+            return Ok(None);
+        }
         database.read_lease(&self.factory.clock, &self.factory.options.garbage).await.map(Some)
     }
 
@@ -600,7 +629,7 @@ impl Node {
             cancellation.run_until_cancelled(tokio::time::sleep(Duration::from_millis(5))).await.ok_or_else(cancelled)?;
         }
         let lease = self.catalog_read_lease(&database).await?;
-        let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
+        let snapshot = database.partition.open_snapshot(Some(fragment.basis.tx_id));
         let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
         crate::read_currency::require_current(database.name(), lease.as_deref())?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
@@ -642,11 +671,25 @@ impl Node {
         let seed = authority.map(|authority| authority.scope().issue());
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
             .with_placed_seed(seed);
-        let (source, submitted_at) = match replay {
+        let (mut source, submitted_at) = match replay {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
             None => (source, None),
         };
+        let prepared_clock = cancellation.run_until_cancelled(
+            source.prepare_proposal_generation(|| database.snapshot(), &database.resolve)
+        ).await.ok_or_else(cancelled)??;
         let payload = source.encode()?.into_bytes();
+        drop(source);
+        if let Some(reading) = prepared_clock {
+            let delay = reading.0.saturating_sub(self.now().0);
+            if delay > 1_000_000 {
+                return Err(Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"));
+            }
+            if delay > 0 {
+                let wait = tokio::time::sleep(std::time::Duration::from_micros(delay as u64));
+                cancellation.run_until_cancelled(wait).await.ok_or_else(cancelled)?;
+            }
+        }
         let submitted_bytes = payload.len() as u64;
         let append_time = submitted_at.unwrap_or_else(|| self.now());
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, append_time)).await.ok_or_else(cancelled)??;
@@ -664,7 +707,7 @@ impl Node {
 
     /// The committed outcome visible to the retry when its duplicate guard ran.
     async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
@@ -693,11 +736,11 @@ impl Node {
         }
         Ok(None)
     }
-    async fn placed_outcome_key(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
-        let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+    async fn placed_outcome(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<PlacedDecision>> {
+        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let sql = "SELECT tx_id, tx_system_time FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
+        let sql = "SELECT tx_id, tx_system_time, committed FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
         let prepared = match prepare_query(sql, &context, &options) {
             Ok(prepared) => prepared,
             Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
@@ -709,10 +752,15 @@ impl Node {
             if batch.num_rows() == 0 { continue; }
             let tx_id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
             let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
-            if let (Value::I64(tx_id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (tx_id, time)
+            let committed = read_value(batch.schema().field(2), batch.column(2).as_ref(), 0)?;
+            if let (Value::I64(tx_id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }, Value::Bool(committed)) =
+                (tx_id, time, committed)
                 && tx_id == attempt.position().0
             {
-                return Ok(Some(TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(value) }));
+                return Ok(Some(PlacedDecision {
+                    key: TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(value) },
+                    committed,
+                }));
             }
             return Err(bad_attempt_outcome());
         }
@@ -720,7 +768,7 @@ impl Node {
     }
 
     async fn check_placed_receipt_window(&self, database: &str, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<()> {
-        let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let [installed] = context.catalog.database(database)?.partitions.as_slice() else {
             return Err(bad_attempt_outcome());
@@ -748,7 +796,7 @@ impl Node {
                 if epoch == current {
                     db.await_installed(|prefix| prefix.source >= attempt.position(), cancellation).await?
                 } else {
-                    // Only the recovered end of the closed epoch authorizes a negative outcome.
+                    // Search the authentic closed prefix before reporting an unresolved attempt.
                     let offset = cancellation.run_until_cancelled(recovery.confirm()).await.ok_or_else(cancelled)?
                         .map_err(|error| receipt_replica_behind(db.name()).with_context("cause", error.code.into()))?;
                     let recovered = ReplicaPosition::from_epoch_offset(db.logs.replica_epoch, offset.0)?;
@@ -758,18 +806,18 @@ impl Node {
             _ => return Err(invalid_token()),
         };
         self.check_placed_receipt_window(db.name(), submitted_at, identity, placement, cancellation).await?;
-        let key = match db.progress().current().placed_outcome(attempt) {
-            Some(key) => Some(key),
-            None => self.placed_outcome_key(db.name(), attempt, identity, placement, cancellation).await?,
+        let outcome = match db.progress().current().placed_outcome(attempt) {
+            Some(outcome) => Some(outcome),
+            None => self.placed_outcome(db.name(), attempt, identity, placement, cancellation).await?,
         };
-        let Some(key) = key else {
+        let Some(outcome) = outcome else {
             return Err(match db.await_authority {
                 AwaitAuthority::Checkpoint { .. } => receipt_checkpoint_behind(db.name()),
                 _ if epoch < current => Anomaly::incorrect("rtdb/attempt-unresolved", "The closed writer epoch has no outcome for this transaction attempt"),
                 _ => Anomaly::new(AnomalyCategory::Unavailable, "rtdb/attempt-pending", "The transaction attempt has no installed outcome"),
             });
         };
-        let result = self.await_transaction_result(db.name(), key.tx_id, Some(key), identity, placement, cancellation).await?;
+        let result = self.await_transaction_result(db.name(), outcome.key.tx_id, Some(outcome), identity, placement, cancellation).await?;
         let token = PlacedToken::Applied { attempt, through }.seal(codec)?;
         Ok((result, token))
     }
@@ -778,13 +826,16 @@ impl Node {
         self.await_transaction_result(database, tx_id, None, identity, None, cancellation).await
     }
 
-    async fn await_transaction_result(&self, database: &str, tx_id: TxId, expected: Option<TransactionKey>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
+    async fn await_transaction_result(&self, database: &str, tx_id: TxId, expected: Option<PlacedDecision>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
         let db = self.attached_database(database, placement)?;
         if expected.is_none() && !matches!(db.await_authority, AwaitAuthority::SourcePosition) { return Err(invalid_token()); }
         let latest = db.replication.await_tx(tx_id, cancellation).await?
-            .filter(|result| expected.is_none_or(|key| key == result.tx_key()));
+            .filter(|result| expected.is_none_or(|outcome| outcome.key == result.tx_key()));
+        if expected.zip(latest.as_deref()).is_some_and(|(outcome, result)| outcome.committed != result.committed()) {
+            return Err(bad_attempt_outcome());
+        }
         if let Some(result) = &latest && !result.error().is_some_and(is_historical_guard_abort) {
             if !db.external_source()
                 && let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten()
@@ -798,7 +849,7 @@ impl Node {
             }
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let mut cursor = prepare_query("SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
@@ -811,8 +862,11 @@ impl Node {
         };
         let system_time = match cell("system_time")? { Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Timestamp(value), _ => return Err(Anomaly::fault("rtdb.node/tx-result-time", "Stored transaction result has no microsecond system-time")) };
         let tx_key = TransactionKey { tx_id, system_time };
-        if expected.is_some_and(|key| key != tx_key) { return Err(bad_attempt_outcome()); }
-        match cell("committed")? {
+        let committed = cell("committed")?;
+        if expected.is_some_and(|outcome| outcome.key != tx_key || committed != Value::Bool(outcome.committed)) {
+            return Err(bad_attempt_outcome());
+        }
+        match committed {
             Value::Bool(true) => Ok(TransactionResult::Committed { tx_key }),
             Value::Bool(false) => {
                 let error = if let Some(TransactionResult::Aborted { error, .. }) = latest.as_deref() {
@@ -861,7 +915,7 @@ impl Node {
     async fn read_bounded_outcome(&self, database: &str, retry: TxId, original: TransactionKey, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
         let invalid = || Anomaly::fault("rtdb.node/bounded-retry-outcome", "The bounded retry has no matching original outcome");
         if original.tx_id >= retry { return Err(invalid()); }
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions {
             parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]),
@@ -2121,7 +2175,7 @@ impl OwnedReadSession {
     ) -> Result<rtdb_text::Corpus> {
         self.admit_read().await?;
         let work = rtdb_search::owned_corpus(self.relation_context(relation)?, &self.owner, relation, path, query);
-        let corpus = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
+        let corpus = self.context.reading(work).await?;
         self.check_relation(relation)?;
         Ok(corpus)
     }
@@ -2151,7 +2205,7 @@ impl OwnedReadSession {
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let work = rtdb_search::owned_ranked_with_overlay(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit, valid, overlay);
-        let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
+        let hits = self.context.reading(work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {
             for (relation, _) in partitions {
@@ -2220,9 +2274,8 @@ impl OwnedReadSession {
     pub async fn spatial_path_ready(&self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation) -> Result<bool> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let work = rtdb_spatial::path_ready(Arc::clone(&context), &self.owner, relation, path);
-        let ready = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let ready = context.reading(work).await?;
         self.check_relation(relation)?;
         Ok(ready)
     }
@@ -2250,7 +2303,6 @@ impl OwnedReadSession {
     ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let work = async {
             if let Some(prepared) = prepared {
                 rtdb_spatial::read_prepared(Arc::clone(&context), &self.owner, relation, path, prepared, request, projection).await
@@ -2258,7 +2310,7 @@ impl OwnedReadSession {
                 rtdb_spatial::read_held(Arc::clone(&context), &self.owner, relation, path, request, projection).await
             }
         };
-        let page = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let page = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))
@@ -2270,14 +2322,13 @@ impl OwnedReadSession {
     ) -> Result<(HeldSpatialNearest, rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let limit = request.limit;
         let work = async {
             let ranking = rtdb_spatial::PreparedNearest::prepare(Arc::clone(&context), &self.owner, relation, path, request, after_radius).await?;
             let page = ranking.page(Arc::clone(&context), &self.owner, None, limit, projection).await?;
             Ok::<_, Anomaly>((ranking, page))
         };
-        let (ranking, page) = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let (ranking, page) = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((HeldSpatialNearest { held_context: Arc::downgrade(&self.context), ranking }, page, witness))
@@ -2293,9 +2344,8 @@ impl OwnedReadSession {
         self.admit_read().await?;
         let relation = held.ranking.relation();
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let work = held.ranking.page(Arc::clone(&context), &self.owner, Some(after), limit, projection);
-        let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let page = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))
@@ -3164,8 +3214,8 @@ impl NativeSession {
         }
         if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
             || match &sections[0].1.effect {
-                OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls),
-                OwnedWorldEffect::SettleProposal => !rtdb_tx::retained_delete_controls(&controls),
+                OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls, true),
+                OwnedWorldEffect::SettleProposal => !rtdb_tx::proposal_overlay_controls(&controls, false),
                 _ => true,
             })
         {
@@ -3459,6 +3509,7 @@ impl NativeSession {
         };
         let basis = QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![reserved.map(Into::into)])]) },
+            replica_capture: None,
             snapshot_time: reserved,
             current_time: reserved.map_or_else(|| node.query_instant(), Into::into),
             timezone: self.state.session_timezone().to_owned(),
@@ -3636,11 +3687,22 @@ impl SessionService for NativeSessionService {
         let time = database.partition.value().live().latest_completed_tx().map(|key| key.system_time.into());
         Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
-    async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken) -> Result<TimeBasis> {
-        if self.node.catalog.is_placed() {
-            self.database()?.confirm_replica_snapshot(cancellation).await?;
+    async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken)
+        -> Result<(TimeBasis, Option<crate::ReplicaQueryCapture>)>
+    {
+        if !self.node.catalog.is_placed() { return Ok((self.snapshot_basis()?, None)); }
+        self.node.ensure_open()?;
+        let database = self.database()?;
+        if !database.has_replica_read_index() { return Ok((self.snapshot_basis()?, None)); }
+        let snapshot = database.capture_replica_snapshot(cancellation).await?;
+        if !Arc::ptr_eq(&database, &self.database()?) {
+            return Err(hosted_source_unavailable());
         }
-        self.snapshot_basis()
+        let time = snapshot.tx_basis().map(|key| key.system_time.into());
+        let basis = TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) };
+        Ok((basis, Some(crate::ReplicaQueryCapture {
+            attachment: Arc::downgrade(&database), snapshot: Arc::new(snapshot),
+        })))
     }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }

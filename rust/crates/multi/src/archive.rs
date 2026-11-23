@@ -388,6 +388,10 @@ impl ArchivedCheckpoint {
         Ok(ObjectObservation { value: value.into(), version: archived.version })
     }
 
+    pub(crate) fn contains_original(&self, name: &ObjectKey) -> bool {
+        self.objects.contains_key(name)
+    }
+
     pub(crate) async fn matches_original(&self, name: &ObjectKey, original: &Bytes) -> rtdb_storage::Result<bool> {
         let Some(object) = self.objects.get(name) else { return Ok(false); };
         let plaintext = self.serving_cipher.open_retained_object(name, original)?;
@@ -1266,7 +1270,7 @@ async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, co
         if closure.insert(path, Some(observed)).is_some() {
             return Err(inconsistent("Two checkpoint tables use the same storage path"));
         }
-        for object in metadata.checkpoint_trie_files(&table.slug, contents)? {
+        for object in metadata.checkpoint_trie_files(&table, contents)? {
             closure.entry(key(&object)?).or_insert(None);
         }
     }
@@ -2202,7 +2206,7 @@ pub(crate) async fn seal_checkpoint_transfer(
     let cancellation = tokio_util::sync::CancellationToken::new();
     let (basis, source_through, lifetime_floors_sha256, replica_sha256) = replica_suffix::with_terminal_source(
         directory, storage, keys, hosted_task, fence, sealed, None,
-        |_, source_io| async move {
+        |_, source_region, source_io| async move {
             let first = stage.checkpoint.boundary.checked_add(1)
                 .ok_or_else(|| inconsistent("The checkpoint has no replica successor"))?;
             let certificate = if sealed >= first {
@@ -2223,7 +2227,7 @@ pub(crate) async fn seal_checkpoint_transfer(
                     manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None, require_replay: false,
                 },
                 CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
-                Some(read_world::TerminalReplay { storage, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
+                Some(read_world::TerminalReplay { storage, source_region, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
                 |context, basis, source_through| async move {
                     let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
                     Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))
@@ -3156,7 +3160,7 @@ mod tests {
             Err(Error::ConflictingObject(_))));
         keys.withdraw_archive_key(id).await?;
         assert!(matches!(store.get_range(&name, range.start as u64..range.end as u64).await,
-            Err(Error::PermissionDenied { .. })));
+            Err(Error::ErasedUnderView)));
         Ok(())
     }
 

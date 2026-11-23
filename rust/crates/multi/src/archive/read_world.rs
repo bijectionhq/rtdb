@@ -190,6 +190,7 @@ where
 
 pub(super) struct TerminalReplay<'a> {
     pub storage: &'a CellStorage,
+    pub source_region: Uuid,
     pub source_io: Arc<rtdb_storage::IoRegion>,
     pub fence: &'a rtdb_directory::CheckpointTransferFence,
     pub stream: &'a rtdb_logkeeper::StreamConfig,
@@ -364,7 +365,7 @@ where
                 }
                 let terminal_source = if let Some(terminal) = terminal {
                     Some(replica_suffix::replay_certified_terminal(
-                        &record, terminal.storage, Arc::clone(&terminal.source_io), keys, terminal.stream, terminal.certificate, terminal.fence,
+                        &record, terminal.storage, terminal.source_region, Arc::clone(&terminal.source_io), keys, terminal.stream, terminal.certificate, terminal.fence,
                         terminal.through, &mut recovered, &memory,
                     ).await?)
                 } else {

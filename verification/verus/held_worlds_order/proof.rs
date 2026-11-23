@@ -7,6 +7,9 @@ mod system_time;
 #[path = "../../../rust/crates/index/src/event_revision.rs"]
 mod event_revision;
 
+#[path = "../../../rust/crates/flight-sql/src/owned_actions/prepared_landing.rs"]
+mod prepared_landing;
+
 mod laws;
 
 fn main() {}

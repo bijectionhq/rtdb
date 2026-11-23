@@ -12,6 +12,65 @@ use rtdb_types::{BlockIndex, Iid, Interval, LogicalType, ScalarType, StorageEpoc
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn receipt_compaction_removes_an_older_payload_and_keeps_its_surviving_peer() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let table = TableRef::new("xt", "bounded_retry_receipts");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+    let slug = tables.entry(&table).unwrap().slug.clone();
+    let old = TrieKey::new(1, None, Vec::new(), BlockIndex(0)).unwrap();
+    let input = TrieKey::l0(BlockIndex(1)).unwrap();
+    let put = |iid, value| StoredEvent {
+        origin: None, commit_position: 0, entity_key: None,
+        iid, system_from: Timestamp(10), valid_time: Interval::from_micros(10, 20).unwrap(),
+        operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(value))])),
+        recency: None,
+    };
+    let expired = put(Iid([1; 16]), 100);
+    let retained = put(Iid([2; 16]), 200);
+    let erase = StoredEvent {
+        system_from: Timestamp(20), valid_time: Interval::ALL, operation: StoredOperation::Erase,
+        ..expired.clone()
+    };
+    let fields = StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let mut catalog = TrieCatalog::new(1).unwrap();
+    for (key, events) in [(old.clone(), vec![expired, retained.clone()]), (input.clone(), vec![erase])] {
+        let data = build_event_batch(&events, Some(fields.clone()), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, true);
+        metadata.write_leaf(&data).unwrap();
+        let (metadata, _) = metadata.finish().unwrap();
+        let bytes = write_file(&data.schema(), &[data]).unwrap();
+        let size = bytes.len() as i64;
+        store.put(&ObjectKey::new(slug.data_key(&key)).unwrap(), bytes.into()).await.unwrap();
+        store.put(&ObjectKey::new(slug.metadata_key(&key)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        let trie = rtdb_index::CatalogTrie::notification(key, size, None).unwrap();
+        catalog = catalog.with_tries(table.clone(), [trie], Timestamp(20)).unwrap();
+    }
+    let jobs = rtdb_maintenance::available_jobs(&catalog).unwrap();
+    let [job] = jobs.as_slice() else { panic!("expected one receipt compaction"); };
+    assert!(job.inputs.contains(&old));
+    assert!(job.inputs.contains(&input));
+
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog.clone(), tables, TrieConfig::default()).unwrap()));
+    let executor = SegmentCompactor::new(store.clone(), state, MemoryBudget::new(64 * 1024 * 1024),
+        StorageVersion(6), StorageEpoch(0), MergeConfig {
+            temporary_directory: temporary.path().into(), ..Default::default()
+        }).unwrap();
+    let notice = executor.execute(job, &CancellationToken::new()).await.unwrap();
+    let next = rtdb_index::CatalogTrie::from_proto(&notice.tries[0]).unwrap();
+    let catalog = catalog.with_tries(table.clone(), [next], Timestamp(30)).unwrap();
+    let current = catalog.current_tries(&table);
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].key, job.output);
+    let bytes = store.get(&ObjectKey::new(slug.data_key(&job.output)).unwrap()).await.unwrap();
+    let mut reader = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
+    assert_eq!(reader.page_count(), 1);
+    let page = EventBatch::new(reader.read_page(0).unwrap()).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.read_event(0).unwrap(), retained);
+}
+
+#[tokio::test]
 async fn mixed_trie_depths_preserve_every_row_in_the_requested_partition() {
     use rtdb_format::data::build_event_batch_with_recency;
 

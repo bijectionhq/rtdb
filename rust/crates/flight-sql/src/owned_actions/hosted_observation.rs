@@ -104,6 +104,11 @@ impl Service {
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
         let (controls, _control_charges) =
             self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+        for control in &controls {
+            if let EntityId::String(id) = control.id() {
+                hosted_control::require_audience_control(&call.session, &control.table().table, id)?;
+            }
+        }
         let until = Timestamp(i64::from_be_bytes(*deadline));
         let covered = held.snapshot.confirm_applied_hosted_read(scope, &floor, until, &controls, point.as_ref())
             .await.map_err(status)?;

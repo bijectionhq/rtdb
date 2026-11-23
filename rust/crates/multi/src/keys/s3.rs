@@ -1,6 +1,6 @@
 //! Current deployment keys in a dedicated, never-versioned S3 bucket.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use aws_sdk_s3::{Client, primitives::ByteStream, types::ServerSideEncryption};
 use bytes::Bytes;
@@ -9,10 +9,15 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use uuid::Uuid;
 
 use super::{
-    AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
-    KeyService, NAMESPACE_KEY_ID, malformed, new_key, require_matching_key,
+    ArchiveKey, ArchiveKeyWithdrawal, AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
+    KeyService, NAMESPACE_KEY_ID, UnitOperation, UnitOutput, UnitScope, UnitSlot, malformed, new_key,
+    require_matching_key, journal::key_error, unit::{self, OPERATION_LIMIT},
 };
 
+mod captures;
+mod units;
+
+#[derive(Clone)]
 pub struct S3KeyService {
     client: Client,
     bucket: String,
@@ -58,7 +63,7 @@ impl S3KeyService {
         Ok(())
     }
 
-    async fn current(&self, path: &str) -> Result<Current> {
+    async fn read_vault_object(&self, path: &str, maximum: usize) -> Result<Option<(Bytes, String)>> {
         let reply = match self
             .client
             .get_object()
@@ -74,7 +79,7 @@ impl S3KeyService {
                     .is_some_and(|r| r.status().as_u16() == 404)
                     && error.as_service_error().is_some_and(|e| e.is_no_such_key()) =>
             {
-                return Ok(Current::Absent);
+                return Ok(None);
             }
             Err(_) => return Err(unavailable("read current key")),
         };
@@ -85,7 +90,7 @@ impl S3KeyService {
             return Err(malformed());
         }
         let length = reply.content_length().ok_or_else(malformed)?;
-        if length != 0 && length != KEY_BYTES as i64 {
+        if length < 0 || length as u64 > maximum as u64 {
             return Err(malformed());
         }
         let etag = reply
@@ -102,11 +107,18 @@ impl S3KeyService {
         if body.len() as i64 != length {
             return Err(malformed());
         }
-        if body.is_empty() {
-            return Ok(Current::Withdrawn);
+        Ok(Some((body, etag)))
+    }
+
+    async fn current(&self, path: &str) -> Result<Current> {
+        match self.read_vault_object(path, KEY_BYTES).await? {
+            None => Ok(Current::Absent),
+            Some((body, _)) if body.is_empty() => Ok(Current::Withdrawn),
+            Some((body, etag)) => {
+                let key = body.as_ref().try_into().map_err(|_| malformed())?;
+                Ok(Current::Live { key, etag })
+            }
         }
-        let key = body.as_ref().try_into().map_err(|_| malformed())?;
-        Ok(Current::Live { key, etag })
     }
 
     async fn put(&self, path: &str, body: &[u8], condition: Precondition<'_>) -> Result<bool> {
@@ -182,7 +194,40 @@ impl KeyService for S3KeyService {
     }
 
     async fn destroy(&self, id: &str) -> Result<()> {
-        self.withdraw_current(&object_path(id)?).await
+        self.withdraw_current(&object_path(id)?).await?;
+        if id.starts_with("stage-") {
+            self.withdraw_registered_scope(UnitScope::archive(id)).await?;
+        }
+        Ok(())
+    }
+
+    async fn use_unit_key(&self, slot: UnitSlot, name: rtdb_storage::ObjectKey, operation: UnitOperation,
+        _io: &Arc<IoRegion>) -> rtdb_storage::Result<UnitOutput> {
+        let deadline = Instant::now() + OPERATION_LIMIT;
+        tokio::time::timeout_at(deadline.into(), async {
+            self.require_never_versioned().await.map_err(key_error)?;
+            let material = self.load_unit_slot(&slot, operation.provisions()).await?;
+            unit::with_material(material, deadline, |cipher| operation.apply(cipher, &name))
+        }).await.map_err(|_| unit::expired())?
+    }
+
+    async fn withdraw_unit_key(&self, slot: UnitSlot, _io: &Arc<IoRegion>) -> Result<()> {
+        self.require_never_versioned().await?;
+        self.withdraw_current(&format!("keys/{}", slot.id())).await
+    }
+
+    async fn withdraw_unit_scope(&self, scope: UnitScope, _io: &Arc<IoRegion>) -> Result<()> {
+        self.withdraw_registered_scope(scope).await
+    }
+
+    async fn archive_key(&self, id: &str, provision: bool, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        self.open_capture(id, provision, region).await
+    }
+
+    async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
+        self.destroy(id).await?;
+        self.withdraw_registered_scope(UnitScope::archive(id)).await?;
+        Ok(ArchiveKeyWithdrawal::Vault)
     }
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {

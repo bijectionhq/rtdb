@@ -6,11 +6,21 @@ This inventory follows the native geospatial path from Bijection's clear Root in
 |===
 | Path | Avoidable conversion | Current path
 
+| Bijection spatial schema authoring
+| The current table builder could not declare a spatial path from the SDK.
+| The SDK exports the native geometry field validator independently of the `spatialIndex` recipe.
+Adding the recipe to an installed eligible table keeps the validator and the stored geometry carrier fixed, so Root publication can stage and backfill the new path.
+
 | Bijection write admission
 | The admission check serialized admitted geometry to WKB and discarded the bytes.
 | Admission checks the geometry model.
 New paths index the canonical Binary document field directly.
 Existing declarations keep their original tagged WKB carrier.
+
+| Bijection spatial query admission
+| The host assembled a generic JSON query from the decoded request and parsed that query into the engine's typed plan.
+| It decodes the guest's partition values and predicates directly into the spatial source and its operators.
+The planner keeps the restriction on the source, applies the application filter to candidate rows, and leaves the nearest result limit to the ranker.
 
 | Bijection spatial pagination
 | Every page encoded the same query geometry and canonical scalar partition values and rebuilt Arrow filters.
@@ -75,11 +85,17 @@ The projected reply carries the identity once and associates the document by its
 | A held result was rebuilt as a fact image and then as a complete document before filters or staged effects could reject it.
 | Bijection measures the logical charge directly from the canonical Arrow cells and decodes only the fields each filter reaches.
 The application result materializes after the row is selected.
+The host checks the SDK reply's encoded size with a bounded byte counter.
 
 | Clear Root geometry writes
 | Create and commit converted geometry and partition columns to document maps before rebuilding the source Arrow vectors.
 | Compatible payload columns pass from the upload through source IPC and ordered resolution into the Arrow event batch.
 Transaction resolution still orders admission, locality, and final-state checks.
+
+| Bijection deploy-hook catalog
+| Hook setup decoded the staged declaration bodies, re-encoded them while opening the Root, and parsed the successor schema again.
+| Hook setup uses the prepared typed schema, its digest, and the typed relation declarations.
+The ordered publication builds its Arrow declaration batch from the prepared durable bodies.
 
 | Hosted Root catalog replacement
 | The Flight decoder materialized the hosted catalog payload as generic document fields before source encoding and resolution.
@@ -102,6 +118,16 @@ IPC decompression and alignment, legacy metadata normalization, and ordered gath
 The geometry kernel consumes the geometry carrier for coverings and exact predicates.
 Bijection converts application values at its API boundary and preserves their canonical images for document semantics.
 Owned action headers carry authorization, framing, and held-read controls.
+
+== Remaining control-plane conversions
+
+Bijection's `schema_predecessor` and `open_root_facts` read the installed owner, schema digest, and relation inventory over PostgreSQL before staging or opening deploy hooks.
+`read_accepted_layouts` receives row records and decodes each declaration body in that transaction.
+The Arrow hosted-control point action can read one declared key at a held cut.
+The preparation path still needs a held Arrow inventory that returns all active declarations under the same owner and program observation.
+
+The schema preparation caller also encodes the analyzed successor schema as JSON before the native runtime decodes it to compare table definitions.
+The persisted program schema and its digest already use those exact bytes.
 
 == Bijection and RTDB Flight integration tests
 

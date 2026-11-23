@@ -23,6 +23,8 @@ use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
+mod prepared_landing;
+pub(crate) use prepared_landing::PreparedLanding;
 mod constraint_receipt;
 mod control_order;
 mod retry;
@@ -267,10 +269,10 @@ impl TxResolver {
         let clock = tx.observe_retention_clock(log_time).await?;
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
-        tx.write_result(&result, None, Some((log_time, receipt_time)))?;
+        tx.write_result(&result, None, Some(log_time), receipt_time)?;
         if let Some(attempt) = attempt {
             tx.retire_placed_outcomes(clock).await?;
-            tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new(), false)?;
+            tx.write_attempt_outcome(attempt, &result, log_time, Default::default(), Vec::new(), false)?;
         }
         let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
             attempt, retirement: context.placed_receipt_retirement,
@@ -288,7 +290,7 @@ impl TxResolver {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
-        if request.uses_staging_deadline() && !self.queue.is_empty() {
+        if request.requires_durable_predecessor() && !self.queue.is_empty() {
             return Err(Anomaly::fault("rtdb.tx/strict-predecessor", "A strict source transaction requires a durable predecessor"));
         }
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
@@ -374,6 +376,8 @@ impl TxResolver {
             _ => None,
         });
         let mut constraint_failed = false;
+        let mut prepared_writes = None;
+        let mut settled = false;
         let mut outcome = if let Some(error) = slot_time.err().or(placement.err()).or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
@@ -398,6 +402,17 @@ impl TxResolver {
         } else if staging_deadline.is_some() && (attempt.is_none() || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
             || request.guard.is_some() || request.idempotency_key().is_some()) {
             Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
+        } else if let Some(generation) = request.prepared_landing.take() {
+            if request.guard.is_some() || request.options.user_metadata.is_some() || request.options.system_time.is_some() {
+                return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options"));
+            }
+            generation.choose(&base, key, slot, primary, refusal, attempt.map(PlacedAttempt::scope), context)
+                .map(|(writes, refused)| {
+                    prepared_writes = Some(writes);
+                    settled = refused;
+                })
+        } else if prepared_landing::is_landing(primary) {
+            Err(Anomaly::incorrect("rtdb.owned/prepared-generation-required", "Proposal landing requires a prepared generation"))
         } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay, receipt_time).await {
             Err(error)
         } else {
@@ -451,21 +466,9 @@ impl TxResolver {
             }
             let evaluated = has_owned_operations && outcome.is_ok();
             if evaluated {
-                outcome = tx.finish_owned_unique().await;
-            }
-            if outcome.is_ok() {
+                outcome = tx.finish_owned_effects(primary).await;
+            } else if outcome.is_ok() {
                 outcome = tx.finish_owned_capacity().await;
-            }
-            if outcome.is_ok() {
-                if let Some(replay) = &tx.hosted_replay {
-                    outcome = replay.require_constraints_matched().and_then(|()| replay.require_expiries_matched());
-                }
-            }
-            if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_final_constraints(primary).await;
-            }
-            if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_spatial_readiness(primary).await;
             }
             constraint_failed = evaluated && outcome.as_ref().err().is_some_and(constraint_receipt::may_settle);
             if outcome.is_ok() {
@@ -480,18 +483,11 @@ impl TxResolver {
                 (None, None) => Ok(()),
             })
         };
-        let mut settled = false;
         if constraint_failed && !refusal.is_empty() {
             drop(tx);
             tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
             tx.trace_parent = span.as_ref().map(|span| span.context());
-            let _checks = context.memory.reserve(
-                (primary.len() + refusal.len()).checked_mul(std::mem::size_of::<Operation>() + 128)
-                    .ok_or_else(overflow)?,
-            )?;
-            let operations = primary.iter().filter_map(constraint_receipt::shared_check)
-                .chain(refusal).cloned().collect::<Vec<_>>();
-            outcome = tx.apply_constraint_refusal(&operations, attempt.map(PlacedAttempt::scope)).await;
+            outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
         }
         let result = match outcome {
@@ -510,7 +506,7 @@ impl TxResolver {
             attempt, retirement: context.placed_receipt_retirement,
         });
         let selected = if settled { refusal } else { primary };
-        let mut resolved = tx.finish_source(result, input, log_time, clock, selected).await?;
+        let mut resolved = tx.finish_source(result, input, log_time, clock, selected, prepared_writes).await?;
         if resolved.result().committed() && let Some((until, journal_before)) = staging_deadline
             && let Err(error) = resolved.prepare_inline_replica(writer.as_ref(), until, journal_before, &context.memory)
         {
@@ -519,7 +515,7 @@ impl TxResolver {
             if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
             let tx = OpenTransaction::new(base, key, &request.options, context)?;
             let result = TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) };
-            resolved = tx.finish_source(result, input, log_time, clock, &[]).await?;
+            resolved = tx.finish_source(result, input, log_time, clock, &[], None).await?;
         }
         context.check_cancelled()?;
         self.stage_resolved(resolved)
@@ -541,7 +537,9 @@ impl TxResolver {
                 (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, user_metadata)
             }
         };
-        tx.write_result(&result, metadata.as_ref(), None)?;
+        let clock = tx.observe_retention_clock(now).await?;
+        tx.retire_expired_receipts(clock).await?;
+        tx.write_result(&result, metadata.as_ref(), None, clock.time)?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(self.source_position), token, None, context)
     }
@@ -560,7 +558,7 @@ impl TxResolver {
         let clock = tx.observe_retention_clock(log_time).await?;
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
-        tx.write_result(&result, None, Some((log_time, receipt_time)))?;
+        tx.write_result(&result, None, Some(log_time), receipt_time)?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
     }
@@ -681,10 +679,10 @@ impl<'a> OpenTransaction<'a> {
 
     async fn finish_source(
         mut self, result: TransactionResult, input: ResolvedInput, log_time: Timestamp,
-        clock: retention::RetentionClock, selected: &[Operation],
+        clock: retention::RetentionClock, selected: &[Operation], prepared: Option<StagedWrite>,
     ) -> Result<ResolvedTx> {
         let options = self.options;
-        self.write_result(&result, options.user_metadata.as_ref(), Some((log_time, clock.time)))?;
+        self.write_result(&result, options.user_metadata.as_ref(), Some(log_time), clock.time)?;
         if let ResolvedInput::Placed { attempt, .. } = input {
             let controls = selected.iter().filter_map(|operation| match operation {
                 Operation::Public(TxOp::HostedControl(control)) if result.committed() && !control.is_check() => Some(control.name()),
@@ -693,9 +691,24 @@ impl<'a> OpenTransaction<'a> {
             let worlds = if result.committed() { crate::replica::worlds::source_inventory(selected)? } else { Vec::new() };
             self.retire_placed_outcomes(clock).await?;
             let archive_replay = result.committed() && self.hosted_replay.is_some();
-            self.write_attempt_outcome(attempt, log_time, controls, worlds, archive_replay)?;
+            self.write_attempt_outcome(attempt, &result, log_time, controls, worlds, archive_replay)?;
         }
-        ResolvedTx::new(self.buffer.stage()?, result, input, None, None, self.context)
+        let mut writes = self.buffer.stage()?;
+        if let Some(prepared) = prepared {
+            writes.install_prepared_generation(prepared)?;
+        }
+        ResolvedTx::new(writes, result, input, None, None, self.context)
+    }
+
+    async fn finish_owned_effects(&mut self, operations: &[Operation]) -> Result<()> {
+        self.finish_owned_unique().await?;
+        self.finish_owned_capacity().await?;
+        if let Some(replay) = &self.hosted_replay {
+            replay.require_constraints_matched()?;
+            replay.require_expiries_matched()?;
+        }
+        self.check_final_constraints(operations).await?;
+        self.check_spatial_readiness(operations).await
     }
 
     /// Constraint checks interpret mutations at their authored valid time.
@@ -774,9 +787,10 @@ impl<'a> OpenTransaction<'a> {
     /// Whether a live receipt names this retry identity: the same body is a duplicate of the original, a different one a conflict.
     async fn receipt_outcome(&self, id: &str, digest: &str, log_time: Timestamp) -> Result<Result<()>> {
         if !self.snapshot()?.contains_table(&receipts_table()) { return Ok(Ok(())); }
+        let bucket = receipt_bucket(log_time);
         let mut query = self.open_query(
-            "SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts FOR ALL VALID_TIME               WHERE _id = ? AND (_valid_to IS NULL OR _valid_to > ?) ORDER BY tx_system_time DESC LIMIT 1",
-            vec![Value::Utf8(id.into()), time_value(log_time)],
+            "SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts FOR ALL VALID_TIME WHERE _id IN (?, ?) AND (_valid_to IS NULL OR _valid_to > ?) ORDER BY tx_system_time DESC LIMIT 1",
+            vec![receipt_id(id, bucket), receipt_id(id, bucket - 1), time_value(log_time)],
         ).await?;
         while let Some(batch) = query.next_batch().await? {
             let batch = batch.batch();
@@ -800,7 +814,7 @@ impl<'a> OpenTransaction<'a> {
     fn put_receipt(&mut self, id: &str, digest: &str, log_time: Timestamp) -> Result<()> {
         let key = self.tx_key();
         let document = StructFields::from([
-            ("_id".into(), Value::Utf8(id.into())), ("digest".into(), Value::Utf8(digest.into())),
+            ("_id".into(), receipt_id(id, receipt_bucket(log_time))), ("digest".into(), Value::Utf8(digest.into())),
             ("tx_id".into(), Value::I64(key.tx_id.0)), ("tx_system_time".into(), time_value(key.system_time)),
         ]);
         let expires = Timestamp(log_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
@@ -808,12 +822,13 @@ impl<'a> OpenTransaction<'a> {
     }
 
     fn write_attempt_outcome(
-        &mut self, attempt: PlacedAttempt, log_time: Timestamp,
+        &mut self, attempt: PlacedAttempt, result: &TransactionResult, log_time: Timestamp,
         controls: std::collections::BTreeSet<&str>, worlds: Vec<Value>, archive_replay: bool,
     ) -> Result<()> {
         let key = self.tx_key();
         let mut document = StructFields::from([
             ("_id".into(), Value::Utf8(attempt.outcome_key())),
+            ("committed".into(), Value::Bool(result.committed())),
             ("tx_id".into(), Value::I64(key.tx_id.0)),
             ("tx_system_time".into(), time_value(key.system_time)),
         ]);
@@ -930,7 +945,14 @@ impl<'a> OpenTransaction<'a> {
             let batch = batch.batch();
             match kind {
                 MutationKind::Put => self.stage_mutation_puts(&table.table, batch, system_time)?,
-                _ => mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?,
+                MutationKind::Erase => {
+                    mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?;
+                    let iids = mutation_column(batch, "_iid")?;
+                    for row in 0..batch.num_rows() {
+                        self.retire_unit_metadata(&table.table, iids.iid(row)?, None).await?;
+                    }
+                }
+                MutationKind::Delete => mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?,
             }
         }
         Ok(())
@@ -1106,7 +1128,14 @@ impl<'a> OpenTransaction<'a> {
                 for id in ids.ids() { self.buffer.delete(table.clone(), id, interval)?; }
                 Ok(())
             }
-            Operation::Public(TxOp::EraseDocs { table, ids }) => { check_table(table)?; for id in ids.ids() { self.buffer.erase(table.clone(), id)?; } Ok(()) }
+            Operation::Public(TxOp::EraseDocs { table, ids }) => {
+                check_table(table)?;
+                for id in ids.ids() {
+                    self.buffer.erase(table.clone(), id)?;
+                    self.retire_unit_metadata(table, id.iid(), None).await?;
+                }
+                Ok(())
+            }
             Operation::Public(TxOp::PatchDocs { table, documents, valid_from, valid_to }) => self.patch_documents(table, documents, None, *valid_from, *valid_to).await,
             Operation::PatchIids { table, documents, iids, valid_from, valid_to } => self.patch_documents(table, documents, Some(iids), *valid_from, *valid_to).await,
             Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => self.patch_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to).await,
@@ -1429,11 +1458,26 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.append_batch(&catalog, batch)
     }
 
-    async fn apply_constraint_refusal(
+    async fn apply_selected_refusal(
         &mut self,
-        operations: &[Operation],
+        primary: &[Operation],
+        refusal: &[Operation],
         scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> Result<()> {
+        let _checks = self.context.memory.reserve(
+            (primary.len() + refusal.len()).checked_mul(std::mem::size_of::<Operation>() + 128)
+                .ok_or_else(overflow)?,
+        )?;
+        let reads_worlds = primary.iter().any(|op| matches!(op,
+            Operation::Public(TxOp::OwnedCheckWorldPurge { .. }
+                | TxOp::OwnedCheckWorldScope { clock: Some(_), .. })
+        ));
+        let operations = primary.iter().filter_map(constraint_receipt::shared_check)
+            .filter(|op| reads_worlds || !matches!(op,
+                Operation::Public(TxOp::OwnedCheckWorldScope { clock: None, .. })
+            ))
+            .chain(refusal).cloned().collect::<Vec<_>>();
+        let operations = operations.as_slice();
         self.check_owned_preconditions(operations, scope, false).await?;
         for operation in operations {
             self.context.check_cancelled()?;
@@ -1462,9 +1506,8 @@ impl<'a> OpenTransaction<'a> {
                     final_context
                 }
             };
-            let lease = context.catalog.read_lease();
             let check = rtdb_spatial::require_path_ready(Arc::clone(&context), owner, relation, name, columns, *encoding);
-            rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, check)).await?;
+            context.reading(check).await?;
         }
         Ok(())
     }
@@ -1964,6 +2007,9 @@ impl<'a> OpenTransaction<'a> {
                     }
                     Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
                         if relation.world().is_none() && !relation.is_world_catalog() => 1,
+                    Operation::Public(TxOp::OwnedCheckCapacity { relation, .. })
+                        if !relation.is_world_catalog()
+                            && relation.world().is_none_or(|world| Some(world) == proposal_overlay) => 1,
                     Operation::Public(TxOp::OwnedCheck { relation, .. }) => {
                         if !index.checked_sub(1).is_some_and(|previous|
                             matches!(&operations[previous], Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, .. }) if guarded == relation))
@@ -2034,7 +2080,10 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         self.check_hosted_controls(operations, source_scope, replay).await?;
-        self.check_capacity_source(operations).await?;
+        let signed_root_count = has_clock_slot && proposal_land.is_some_and(|landing| {
+            landing.effect != crate::hosted_control::ProposalLandingEffect::Close
+        });
+        self.check_capacity_source(operations, proposal_overlay, signed_root_count).await?;
         let publishes_catalog = operations.iter().any(|operation| matches!(operation,
             Operation::Public(TxOp::HostedControl(control)) if control.replaces_root_catalog()
         ));
@@ -2382,6 +2431,7 @@ impl<'a> OpenTransaction<'a> {
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Erase, recency: None,
         })?;
+        self.retire_unit_metadata(&table, id.iid(), Some(&id.handle_bytes())).await?;
         let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
         self.record_owned_change(relation, id.clone(), kind, Interval::ALL, position, fixed)?;
         let floors = relation.purge_floor_table(owner);
@@ -3113,7 +3163,7 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(replay_table(), document, interval(replay.submitted_at(), replay.expires_at())?)
     }
 
-    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>, source_times: Option<(Timestamp, Timestamp)>) -> Result<()> {
+    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>, appended: Option<Timestamp>, observed: Timestamp) -> Result<()> {
         let key = result.tx_key();
         let error = result.encoded_error()?;
         let bound = error.as_ref().map_or(0, |error| error.as_slice().len()).checked_add(metadata.map(|value| value.value().retained_bytes()).transpose()?.unwrap_or(0)).and_then(|bytes| bytes.checked_add(16_384)).ok_or_else(overflow)?;
@@ -3125,25 +3175,38 @@ impl<'a> OpenTransaction<'a> {
             || LogicalType::Struct(StructFields::new()).maybe(),
             |metadata| metadata.value().logical_type().maybe(),
         );
-        let embedded_metadata = match (source_times, metadata) {
-            (Some((_, observed)), Some(metadata)) => {
+        if let Some(metadata) = metadata {
+            use crate::values::MetadataErasureUnit;
+
+            let unit = metadata.erasure_unit()?;
+            let linked = match &unit {
+                Some(MetadataErasureUnit::Table { table, id }) => Some((table.clone(), id.iid(), None)),
+                Some(MetadataErasureUnit::Owned { relation, id }) => self.options.user.as_deref()
+                    .filter(|owner| !owner.is_empty()).map(|owner| (relation.table(owner), id.iid(), Some(id.handle_bytes()))),
+                None => None,
+            };
+            let mut retained = StructFields::new();
+            let keep = match linked {
+                Some((table, iid, entity)) if result.committed() && self.buffer.puts_metadata_unit(&table, iid, entity.as_deref())? => {
+                    let erased_with = retention::metadata_erasure_key(&table, iid, entity.as_deref());
+                    retained.insert(retention::METADATA_ERASURE_UNIT.into(), Value::Utf8(erased_with));
+                    true
+                }
+                _ => unit.is_none(),
+            };
+            if keep {
                 let expiry = Timestamp(observed.0.saturating_add(RECEIPT_WINDOW_MICROS));
-                let retained = StructFields::from([
-                    ("_id".into(), Value::I64(key.tx_id.0)),
-                    (metadata_column.clone(), metadata.value().clone()),
-                ]);
+                retained.insert("_id".into(), Value::I64(key.tx_id.0));
+                retained.insert(metadata_column.clone(), metadata.value().clone());
                 self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
-                Value::Null
             }
-            (None, Some(metadata)) => metadata.value().clone(),
-            (_, None) => Value::Null,
-        };
+        }
         let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
-            ("source_log_time".into(), source_times.map(|(appended, _)| time_value(appended)).unwrap_or(Value::Null)),
-            ("receipt_time".into(), source_times.map(|(_, observed)| time_value(observed)).unwrap_or(Value::Null)),
+            ("source_log_time".into(), appended.map(time_value).unwrap_or(Value::Null)),
+            ("receipt_time".into(), time_value(observed)),
             ("committed".into(), Value::Bool(result.committed())),
-            (metadata_column.clone(), embedded_metadata),
+            (metadata_column.clone(), Value::Null),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
@@ -3155,6 +3218,8 @@ pub const HISTORICAL_KEYED_TRANSACTION_SQL: &str = "SELECT _id, system_time FROM
 
 /// How long, from source-log admission, a receipt answers retries of its identity.
 pub const RECEIPT_WINDOW_MICROS: i64 = 3_600_000_000;
+fn receipt_bucket(time: Timestamp) -> i64 { time.0.div_euclid(RECEIPT_WINDOW_MICROS) }
+fn receipt_id(id: &str, bucket: i64) -> Value { Value::Utf8(format!("{bucket}/{id}")) }
 
 pub fn attempt_marker_document(attempt: &str, fingerprint: [u8; 32]) -> StructFields<Value> {
     StructFields::from([
