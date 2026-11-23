@@ -313,6 +313,7 @@ impl DatabaseFactory {
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let resolve = Arc::new(ResolveContext {
+                placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),
                 owned_witness_scope: match &opened_logs.await_authority {
                     crate::AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
                     _ => None,

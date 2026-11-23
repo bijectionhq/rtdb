@@ -52,7 +52,7 @@ async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: 
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
+    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
     let effects = Arc::new(NoEffects);
     let cancellation = CancellationToken::new();
     let (handle, driver) = match clock {
@@ -887,7 +887,7 @@ async fn local_recovery_driver(
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
+    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
         scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
@@ -2276,7 +2276,7 @@ async fn placed_driver(replica: Arc<MemoryLog>, config: ReplicationConfig) -> (R
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
+    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
     ReplicationDriver::new(config, logs, blocks, recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap()

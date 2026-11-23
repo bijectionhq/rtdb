@@ -47,6 +47,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
+       rtdb-multi enable-placed-receipt-retirement --directory DIR --name NAME\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--org ORG] [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
@@ -325,12 +326,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             standalone_protocol: u32,
             hosted_protocol: u32,
             pgwire_arrow_copy_out: bool,
+            placed_receipt_retirement: bool,
         }
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             hosted_protocol: if cfg!(feature = "s3-key-vault") { 36 } else { 13 },
             pgwire_arrow_copy_out: true,
+            placed_receipt_retirement: true,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -638,6 +641,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             for member in admin::roll_engine(directory.as_ref(), arguments.required("version")?).await? { println!("{member}"); }
             Ok(())
+        }
+        "enable-placed-receipt-retirement" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::enable_placed_receipt_retirement(directory.as_ref(), arguments.required("name")?).await.map(|_| ())
         }
         "read-width" => {
             let directory = directory(arguments.required("directory")?).await?;

@@ -199,7 +199,8 @@ impl LogFactory for LogkeeperLogFactory {
             } else {
                 ClosedEpochRecovery::ReadIndex(Box::new(LogletReadIndex { log: Arc::clone(&quorum), epoch: config.epoch }))
             };
-            AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery }
+            AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery,
+                placed_receipt_retirement: config.placed_receipt_retirement }
         } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
         let mut next = next_source_offset_from_cut(replica.as_ref(), epoch, config.transfer_intake_cut).await?;
@@ -547,6 +548,7 @@ mod tests {
             write_quorum: 1,
             epoch: record.epoch,
             require_read_index: false,
+            placed_receipt_retirement: false,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
             transfer_intake_cut: None,
@@ -579,6 +581,7 @@ mod tests {
             previous_servers: None,
             epoch: record.epoch,
             require_read_index: true,
+            placed_receipt_retirement: false,
             frozen_at: None,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
@@ -640,6 +643,7 @@ mod tests {
             replica_stream: record.stream("replica"), replica_seal_scope: record.replica_seal_scope(),
             write_quorum: 1, epoch: record.epoch, require_read_index: false, log_epoch: record.log_epoch,
             transferred_source_through: None, transfer_intake_cut: None, frozen_at: None, previous_servers: None,
+            placed_receipt_retirement: false,
         };
         let directory_files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {

@@ -41,6 +41,8 @@ struct ParkedDeployment {
     s3_write_lease_until_ms: Option<i64>,
     #[prost(string, optional, tag = "16")]
     engine_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    placed_receipt_retirement: bool,
     #[prost(string, repeated, tag = "17")]
     replica_journals: Vec<String>,
     #[prost(sint64, optional, tag = "18")]
@@ -111,7 +113,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, resident_idle: _, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, recovery_manifest_sha256, replica_anchor, replica_payload_trim, storage_generation,
-        storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
+        storage_namespaces, s3_write_lease_until_ms, engine_pin, placed_receipt_retirement, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
         source_cleanup, deletion_record, replica_journals, storage_regions, catalog_readers, catalog_admission_floors, ordered_indexes, ordered_index_catalogs,
         cell_transfer, disposal, checkpoint_recovery,
         checkpoint_stage, checkpoint_transfer_fence, checkpoint_transfer_terminal, checkpoint_transfer_bootstrap, checkpoint_transfer_replica, checkpoint_transfer_activation, hosted_fork_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_worlds, checkpoint_suffix_pins, checkpoint_capture_retirements,
@@ -188,6 +190,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         compaction_replay_cutoff: *compaction_replay_cutoff,
         s3_write_lease_until_ms: *s3_write_lease_until_ms,
         engine_pin: engine_pin.clone(),
+        placed_receipt_retirement: *placed_receipt_retirement,
     };
     let mut encoded = Vec::with_capacity(1 + packed.encoded_len());
     encoded.push(wire_version);
@@ -292,6 +295,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         s3_write_lease_until_ms: packed.s3_write_lease_until_ms,
         deletion_observation: None,
         engine_pin: packed.engine_pin,
+        placed_receipt_retirement: packed.placed_receipt_retirement,
         deletion_record: None,
         replica_journals,
         storage_regions: Default::default(),
@@ -361,9 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn parking_preserves_the_engine_pin() {
+    fn parking_preserves_the_engine_pin_and_placed_receipt_format() {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
         record.engine_pin = Some("rtdb-2026.11.2".into());
+        record.placed_receipt_retirement = true;
         let bytes = encode(&record).unwrap();
         assert_eq!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap(), record);
     }

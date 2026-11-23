@@ -15,7 +15,7 @@ impl TransactionAuthorization for Denied {
     fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
 }
 fn context() -> ResolveContext {
-    ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
+    ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn document(value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
@@ -1239,4 +1239,64 @@ async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome
     state.apply(resolver.take_head().unwrap().writes()).unwrap();
     assert_eq!(query(state.snapshot(), history).await, [vec![Value::Bool(true), Value::Null]]);
     assert!(query(state.snapshot(), predicate).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_current_proof() {
+    use rtdb_format::envelope::ReplicaBody;
+    use rtdb_types::{EntityId, PlacedAttempt, PlacedAttemptScope, PLACED_ATTEMPT_OUTCOME_TABLE};
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let placed = |epoch, context: &ResolveContext| {
+        request(vec![], context).with_placed_seed(Some(PlacedAttemptScope::new("same/history", epoch).unwrap().issue()))
+    };
+    let table = TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE);
+    let mut old = Vec::new();
+    for position in 0..2 {
+        let predecessor = state.snapshot().tx_basis();
+        let resolved = resolver.resolve_source(
+            state.snapshot(), SourcePosition(position), Timestamp(100 + position), placed(1, &context), &context,
+        ).await.unwrap();
+        let body = resolved.to_replica_body(&context.memory).unwrap();
+        let ReplicaBody::ResolvedTx(tx) = body.body() else { panic!("expected legacy placed frame"); };
+        let attempt = PlacedAttempt::decode(tx.placed_attempt.as_deref().unwrap()).unwrap();
+        old.push(EntityId::String(attempt.outcome_key()).iid());
+        let recovered = decode_replica(tx, predecessor, state.snapshot().block_index(), &context.memory).unwrap();
+        state.apply(&recovered.writes).unwrap();
+        resolver.take_head().unwrap();
+    }
+
+    let predecessor = state.snapshot().tx_basis();
+    let mut resolver = TxResolver::new(predecessor, SourcePosition(1), None, &context.memory).unwrap();
+    context.placed_receipt_retirement = true;
+    let resolved = resolver.resolve_source(
+        state.snapshot(), SourcePosition(2), Timestamp(101 + RECEIPT_WINDOW_MICROS), placed(2, &context), &context,
+    ).await.unwrap();
+    let attempt = resolved.placed_attempt().unwrap();
+    let body = resolved.to_replica_body(&context.memory).unwrap();
+    let ReplicaBody::ResolvedTx(tx) = body.body() else { panic!("expected versioned placed frame"); };
+    assert!(PlacedAttempt::decode(tx.placed_attempt.as_deref().unwrap()).is_err());
+    let mut unmarked = tx.clone();
+    unmarked.placed_attempt = Some(attempt.encode().to_vec());
+    assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+    unmarked.placed_attempt = None;
+    assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+
+    let recovered = decode_replica(tx, predecessor, state.snapshot().block_index(), &context.memory).unwrap();
+    assert_eq!(recovered.placed_attempt, Some(attempt));
+    let rows = recovered.writes.tables()[&table].batch().unwrap();
+    let retired: std::collections::BTreeSet<_> = (0..rows.len()).filter_map(|row| {
+        let event = rows.view().read_event(row).unwrap();
+        matches!(event.operation, StoredOperation::Erase).then_some(event.iid)
+    }).collect();
+    assert_eq!(retired, old.into_iter().collect());
+    state.apply(&recovered.writes).unwrap();
+    let mut reopened = TxResolver::new(Some(recovered.result.tx_key()), SourcePosition(2), None, &context.memory).unwrap();
+    let assertion = format!("ASSERT (SELECT COUNT(*) FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME) = 1 AND EXISTS (SELECT 1 FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = '{}')", attempt.outcome_key());
+    let read = reopened.resolve_source(
+        state.snapshot(), SourcePosition(3), Timestamp(99), request(vec![sql(&assertion)], &context), &context,
+    ).await.unwrap();
+    assert!(read.result().committed(), "{:?}", read.result().error());
 }

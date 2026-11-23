@@ -3073,6 +3073,10 @@ invariant ObjectsStayInTheirLineage {
 
 invariant OneDatabasePerSession {
     -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
+    -- A parked deployment with a pinned compatible engine can opt into the versioned placed outcome format.
+    -- The directory preserves this setting through placement changes and parking.
+    -- The pinned engine must support the format on every attachment that replays the deployment.
+    -- Original-format readers refuse the versioned attempt identity before installing that record.
     -- Placed session transaction inspection reports only the deployment's progress.
     -- A node session is bound to the placement it opened against.
     -- A replacement with the same name requires a new backend session.

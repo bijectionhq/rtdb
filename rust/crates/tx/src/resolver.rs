@@ -48,6 +48,7 @@ pub trait TransactionAuthorization: Send + Sync {
 }
 
 pub struct ResolveContext {
+    pub placed_receipt_retirement: bool,
     pub owned_witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     pub world_constraints: Option<Arc<dyn WorldConstraintArchive>>,
     pub database: String,
@@ -82,12 +83,12 @@ impl OwnedReplicaBody { pub fn body(&self) -> &ReplicaBody { &self.body } }
 #[derive(Clone, Copy)]
 enum ResolvedInput {
     Position(SourcePosition),
-    Placed(PlacedAttempt),
+    Placed { attempt: PlacedAttempt, retirement: bool },
 }
 
 impl ResolvedInput {
     fn position(self) -> SourcePosition {
-        match self { Self::Position(position) => position, Self::Placed(attempt) => attempt.position() }
+        match self { Self::Position(position) => position, Self::Placed { attempt, .. } => attempt.position() }
     }
 }
 
@@ -104,7 +105,7 @@ impl ResolvedTx {
     pub fn result(&self) -> &TransactionResult { &self.result }
     pub fn source_position(&self) -> SourcePosition { self.input.position() }
     pub fn placed_attempt(&self) -> Option<PlacedAttempt> {
-        match self.input { ResolvedInput::Placed(attempt) => Some(attempt), ResolvedInput::Position(_) => None }
+        match self.input { ResolvedInput::Placed { attempt, .. } => Some(attempt), ResolvedInput::Position(_) => None }
     }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
@@ -125,7 +126,10 @@ impl ResolvedTx {
         bound = bound.checked_add(error.as_ref().map_or(0, |error| error.as_slice().len())).and_then(|bound| bound.checked_add(self.external_token.as_ref().map_or(0, Vec::capacity))).ok_or_else(overflow)?;
         let reservation = memory.reserve(bound)?;
         let key = self.result.tx_key();
-        let placed_attempt = self.placed_attempt().map(|attempt| attempt.encode().to_vec());
+        let placed_attempt = match self.input {
+            ResolvedInput::Placed { attempt, retirement } => Some(crate::replica::encode_outcome_attempt(attempt, retirement)),
+            ResolvedInput::Position(_) => None,
+        };
         let body = ReplicaBody::ResolvedTx(WireResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
             table_data: tables.into_iter().map(|(name, bytes)| (name, bytes.as_slice().to_vec())).collect(),
@@ -191,8 +195,14 @@ impl TxResolver {
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
         tx.write_result(&result, None, Some((log_time, receipt_time)))?;
-        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new())?; }
-        self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
+        if let Some(attempt) = attempt {
+            tx.retire_placed_outcomes(clock).await?;
+            tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new())?;
+        }
+        let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
+            attempt, retirement: context.placed_receipt_retirement,
+        });
+        self.stage(tx.buffer.stage()?, result, input, None, None, context)
     }
 
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -382,10 +392,14 @@ impl TxResolver {
             } else {
                 Vec::new()
             };
+            tx.retire_placed_outcomes(clock).await?;
             tx.write_attempt_outcome(attempt, log_time, controls, worlds)?;
         }
         context.check_cancelled()?;
-        self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
+        let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
+            attempt, retirement: context.placed_receipt_retirement,
+        });
+        self.stage(tx.buffer.stage()?, result, input, None, None, context)
     }
 
     pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -440,7 +454,7 @@ impl TxResolver {
         let position = input.position();
         if position < self.source_position { return Err(Anomaly::fault("rtdb.tx/source-watermark", "Resolve-side source watermark moved backwards")); }
         let key = result.tx_key();
-        if matches!(input, ResolvedInput::Placed(_)) && key.tx_id.0 != position.0 {
+        if matches!(input, ResolvedInput::Placed { .. }) && key.tx_id.0 != position.0 {
             return Err(Anomaly::fault("rtdb.tx/placed-attempt-position", "A placed attempt must match its transaction result"));
         }
         if self.resolved_head.is_some_and(|head| head.tx_id >= key.tx_id) {
@@ -2684,6 +2698,7 @@ mod tests {
         state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(0), ..writer.proposed_floor }).unwrap();
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "xtdb".into(),
@@ -2719,6 +2734,7 @@ mod tests {
     async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
         let memory = MemoryBudget::new(1 << 24);
         let resolve = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
@@ -2801,6 +2817,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-capacity", 1)?),
             world_constraints: None,
             database: "application".into(),
@@ -2850,6 +2867,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "application".into(),
@@ -2919,6 +2937,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-capacity", 1)?),
             world_constraints: None,
             database: "application".into(),
@@ -3147,6 +3166,7 @@ mod tests {
     async fn a_mutation_read_a_column_at_a_time_writes_the_events_a_row_by_row_read_does() {
         let memory = MemoryBudget::new(1 << 26);
         let resolve = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),

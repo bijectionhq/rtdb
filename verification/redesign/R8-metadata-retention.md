@@ -100,7 +100,16 @@ Current reads of `xt.txs.user_metadata` select the payload at the installed rece
 Bounded collection emits exact logical erase events for expired metadata, application receipts and private replay markers.
 The collector retains a legacy key's predecessors while a newer interval of that key is still active.
 Formerly embedded metadata and metadata from external writers lack the new source admission record and need migration.
-The current placed outcome proof remains materialized for replica validation and still needs a physical retirement transition.
+For a placed deployment enrolled in the versioned outcome format, each frame carries its exact current outcome and at most 128 distinct older erasures per collection step.
+An operator confirms format support in every eligible serving and recovery image and parks the deployment before pinning a compatible engine.
+Check `rtdb-multi --build-info` for `placed_receipt_retirement: true`.
+On the parked deployment, run `rtdb-multi enable-placed-receipt-retirement --directory DIR --name NAME`.
+The directory persists the opt-in across restarts.
+Writers emit the marked encoding on the next activation.
+Legacy readers fail before applying a marked record.
+Keep a compatible engine pinned for attachments that replay that history, including restore images.
+The logical erasures enter successor compaction.
+Earlier immutable copies retain their own custody obligations.
 
 The durable receipt clock and erase events identify logical retirement and its ordered point.
 They grant no authority to delete an immutable source-log segment, a replica segment, a checkpoint, an archive, a skipped payload, or a held trie.

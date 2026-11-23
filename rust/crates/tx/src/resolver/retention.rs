@@ -136,6 +136,20 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
+    pub(super) async fn retire_placed_outcomes(&mut self, clock: RetentionClock) -> Result<()> {
+        let outcomes = rtdb_types::TableRef::new("xt", rtdb_types::PLACED_ATTEMPT_OUTCOME_TABLE);
+        if !self.context.placed_receipt_retirement || !clock.collect_at(self.tx_key().tx_id)
+            || !self.snapshot()?.contains_table(&outcomes)
+        {
+            return Ok(());
+        }
+        self.retire_receipt_rows(
+            outcomes,
+            "SELECT _id FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _valid_to <= ? ORDER BY _id LIMIT 128",
+            clock.time,
+        ).await
+    }
+
     async fn retire_receipt_rows(&mut self, table: rtdb_types::TableRef, sql: &str, observed: Timestamp) -> Result<()> {
         let mut cursor = self.open_query(sql, vec![super::time_value(observed)]).await?;
         while let Some(page) = cursor.next_batch().await? {

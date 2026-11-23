@@ -2009,6 +2009,9 @@ open question "How should operator-selected skipped transactions be represented 
     -- The receipt clock advances atomically with the transaction outcome in the replica record and is restored at checkpoint recovery.
     -- Source-log metadata is stored in finite-lived rows outside durable transaction-result history.
     -- Ordered erasures remove eligible payloads from later reads and compaction products without changing the transaction coordinate.
+    -- A placed outcome record contains exactly one put naming the current attempt.
+    -- A deployment admitted to the versioned outcome format may also carry bounded erasures of distinct expired outcomes.
+    -- Read-back rejects erasure of the current attempt, an extra outcome, and any multi-row outcome in the original format.
     -- Physical retirement also requires successor coverage and release or revocation of each earlier immutable copy.
     -- Its transaction ID is the source position and its system time is smoothed against the resolved head.
     -- The skip takes effect before decoding transaction operations and uses the ordinary append, read-back and apply pipeline.

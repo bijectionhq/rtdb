@@ -421,6 +421,10 @@ pub async fn pin_engine(directory: &dyn Directory, name: &str, version: Option<&
     update(directory, name, |record| {
         if !record.can_fork() { return Err(Anomaly::incorrect("rtdb.multi/engine-pin", format!("{name} cannot change its engine pin in its current state"))); }
         if record.engine_pin.as_deref() == version { return Ok(()); }
+        if record.placed_receipt_retirement && (version.is_none() || record.lifecycle != Lifecycle::Live || record.holder.is_some()) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/placed-receipt-cutover",
+                "Keep a compatible engine pinned for a history using placed receipt retirement"));
+        }
         if let Some(version) = version {
             let now = now_ms();
             let serves_version = |id| members.get(id).is_some_and(|member| member.engine_version == version);
@@ -437,6 +441,21 @@ pub async fn pin_engine(directory: &dyn Directory, name: &str, version: Option<&
             }
         }
         record.engine_pin = version.map(str::to_owned);
+        Ok(())
+    }).await
+}
+
+/// Starts emitting the versioned outcome format at the next activation.
+pub async fn enable_placed_receipt_retirement(directory: &dyn Directory, name: &str) -> Result<DeploymentRecord> {
+    update(directory, name, |record| {
+        if record.placed_receipt_retirement { return Ok(()); }
+        if record.lifecycle != Lifecycle::Live || record.holder.is_some()
+            || record.move_intent.is_some() || record.active_move(now_ms()).is_some() || record.engine_pin.is_none()
+        {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/placed-receipt-cutover",
+                "Park the deployment, finish its move, and pin a compatible engine before enabling placed receipt retirement"));
+        }
+        record.placed_receipt_retirement = true;
         Ok(())
     }).await
 }
@@ -2669,5 +2688,36 @@ mod tests {
         assert_eq!(error.code, "rtdb.multi/move-in-progress");
         assert_eq!(directory.deployment(&deployment.id).await.unwrap().as_ref(), Some(&deployment));
         assert_eq!(keys.key(&deployment.key_id()).await.unwrap(), key);
+    }
+}
+
+
+#[cfg(test)]
+mod receipt_cutover_tests {
+    use super::*;
+    use rtdb_directory::MemoryDirectory;
+
+    #[tokio::test]
+    async fn receipt_format_cutover_requires_a_parked_pinned_owner() {
+        let directory = MemoryDirectory::new();
+        directory.create_deployment(DeploymentRecord::new("unpinned", "acme", vec![], 0)).await.unwrap();
+        assert_eq!(
+            enable_placed_receipt_retirement(directory.as_ref(), "unpinned").await.unwrap_err().code,
+            "rtdb.multi/placed-receipt-cutover",
+        );
+        let mut installed = DeploymentRecord::new("active", "acme", vec![], 0);
+        installed.engine_pin = Some("installed-compatible-version".into());
+        installed.holder = Some(MemberId("holder".into()));
+        directory.create_deployment(installed).await.unwrap();
+        assert_eq!(
+            enable_placed_receipt_retirement(directory.as_ref(), "active").await.unwrap_err().code,
+            "rtdb.multi/placed-receipt-cutover",
+        );
+        let mut parked = DeploymentRecord::new("parked", "acme", vec![], 0);
+        parked.engine_pin = Some("installed-compatible-version".into());
+        directory.create_deployment(parked).await.unwrap();
+        assert!(enable_placed_receipt_retirement(directory.as_ref(), "parked").await.unwrap().placed_receipt_retirement);
+        assert!(directory.deployment_by_name("parked").await.unwrap().unwrap().placed_receipt_retirement);
+        assert_eq!(pin_engine(directory.as_ref(), "parked", None).await.unwrap_err().code, "rtdb.multi/placed-receipt-cutover");
     }
 }

@@ -243,6 +243,8 @@ pub struct LogkeeperLogConfig {
     pub epoch: u64,
     #[serde(default)]
     pub require_read_index: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub placed_receipt_retirement: bool,
     /// A snapshot reader's checkpoint: its logs end there and never advance, so it reads no logkeeper.
     #[serde(default)]
     pub frozen_at: Option<rtdb_directory::Checkpoint>,
@@ -327,6 +329,7 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
         replica_seal_scope: record.replica_seal_scope(),
         epoch: record.epoch,
         require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
+        placed_receipt_retirement: record.placed_receipt_retirement,
         log_epoch: record.log_epoch,
         transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
             let terminal = activation.replica.bootstrap.terminal.source_through;
