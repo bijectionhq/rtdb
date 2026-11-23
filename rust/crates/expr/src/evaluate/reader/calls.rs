@@ -70,6 +70,22 @@ pub(super) fn call<'a>(name: &'a str,args: &'a [Expr],frame: &'a EvaluationFrame
         let name = name.to_lowercase().replace('-',"_");
         frame.context.reserve(args.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
         rtdb_plan::function_type_with_args(&name,args)?;
+        if name == "_id_eq_any" {
+            let id = evaluate(&args[0], frame)?.await?;
+            let array = evaluate(&args[1], frame)?.await?;
+            if is_null(&array) { return Ok(scalar(Value::Null)); }
+            if !matches!(&array, EvalValue::List(Kind::List | Kind::Fixed, _)) { return Err(invalid(&name)); }
+            let mut answer = Some(false);
+            for index in 0..len(&array)? {
+                let value = nth(clone_value(&array, frame)?, index, frame)?.await?;
+                match compare::equal(clone_value(&id, frame)?, value, false, frame)?.await? {
+                    Some(true) => return Ok(scalar(Value::Bool(true))),
+                    None => answer = None,
+                    Some(false) => (),
+                }
+            }
+            return Ok(scalar(boolean(answer)));
+        }
         if name == "set" { return make_list(Kind::Set,ListReader::Expressions(args),frame); }
         if name == "coalesce" {
             for expr in args { let value = evaluate(expr,frame)?.await?;if !is_null(&value) { return Ok(value); } }

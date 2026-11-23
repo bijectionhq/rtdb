@@ -391,6 +391,16 @@ impl Context<'_> {
 
     pub(crate) fn quantified_array(&mut self, needle: &ast::Expr, array: &ast::Expr, op: BinaryOp, all: bool, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
         let needle = self.expr_bound(needle, input, replacements)?;
+        if !all && op == BinaryOp::Eq
+            && matches!(array, ast::Expr::Value(value) if matches!(value.value, ast::Value::Placeholder(_)))
+            && let Expr::Column { id, data_type } = &needle
+            && id_domain(data_type).is_some()
+            && input.relational_schema().ok().and_then(|schema| schema.get(*id)).is_some_and(|field| field.name == "_id")
+        {
+            let args = vec![needle, self.expr_bound(array, input, replacements)?];
+            let return_type = rtdb_plan::function_type_with_args("_id_eq_any", &args)?;
+            return Ok(Expr::Call { name: "_id_eq_any".into(), args, return_type });
+        }
         let needle = self.materialize(needle, input)?;
         let array = self.expr_bound(array, input, replacements)?;
         let array = self.materialize(array, input)?;

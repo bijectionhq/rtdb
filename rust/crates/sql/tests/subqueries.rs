@@ -206,6 +206,19 @@ async fn quantified_arrays_keep_null_and_empty_distinct_and_capture_each_outer_r
 }
 
 #[tokio::test]
+async fn id_array_parameters_preserve_the_quantified_truth_table() {
+    let sql = "SELECT _id = ANY($1) FROM (VALUES (1), (2)) AS t(_id)";
+    for (parameter, expected) in [
+        (Value::list(vec![Value::I64(1), Value::Null]), vec![Value::Bool(true), Value::Null]),
+        (Value::list(vec![Value::F64(2.0)]), vec![Value::Bool(false), Value::Bool(true)]),
+        (Value::list(vec![]), vec![Value::Bool(false), Value::Bool(false)]),
+        (Value::Null, vec![Value::Null, Value::Null]),
+    ] {
+        assert_eq!(query(sql, vec![parameter]).await.unwrap(), expected.into_iter().map(|value| vec![value]).collect::<Vec<_>>());
+    }
+}
+
+#[tokio::test]
 async fn subqueries_in_values_aggregates_having_and_order_by_use_the_correct_input() {
     assert_eq!(query("VALUES ((SELECT 1)), ((SELECT 2))", vec![]).await.unwrap(), vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
     assert_eq!(query("SELECT SUM((SELECT t.x)) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), vec![vec![Value::I64(3)]]);

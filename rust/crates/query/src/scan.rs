@@ -316,10 +316,7 @@ fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<st
             }
             _ => return None,
         };
-        match value {
-            Value::Keyword(value) => Some(keyword_iids(value.as_str())),
-            _ => value.entity_id().ok().map(|entity| (entity.iid(), None)),
-        }
+        value_iids(value)
     };
     let equality = |expr: &Expr| {
         let Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } = expr else { return None };
@@ -336,12 +333,54 @@ fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<st
         disjuncts(predicate, &mut clauses);
         let mut iids = std::collections::BTreeSet::new();
         for clause in clauses {
+            if let Expr::Call { name, args, .. } = clause
+                && name == "_id_eq_any"
+                && let [Expr::Column { id: column, .. }, Expr::Parameter { index, .. }] = args.as_slice()
+                && *column == id
+            {
+                collect_array_iids(parameters, *index, &mut iids)?;
+                continue;
+            }
             let (iid, reference) = equality(clause)?;
             iids.insert(iid);
             iids.extend(reference);
         }
         Some(iids)
     })
+}
+
+fn value_iids(value: &Value) -> Option<(Iid, Option<Iid>)> {
+    match value {
+        Value::Keyword(value) => Some(keyword_iids(value.as_str())),
+        _ => value.entity_id().ok().map(|entity| (entity.iid(), None)),
+    }
+}
+
+fn collect_array_iids(parameters: rtdb_expr::Parameters<'_>, index: usize, iids: &mut BTreeSet<Iid>) -> Option<()> {
+    const LIMIT: usize = 4096;
+    let mut insert = |(iid, alternate)| {
+        iids.insert(iid);
+        iids.extend(alternate);
+    };
+    if let Some(array) = parameters.arrow_cell(index) {
+        if array.is_null().ok()? { return Some(()); }
+        let cells = array.list()?;
+        if cells.len() > LIMIT { return None; }
+        for cell in cells {
+            let cell = cell.physical().ok()?;
+            if !cell.is_null().ok()? { insert(arrow_parameter_iids(cell)?); }
+        }
+    } else {
+        let parameter = parameters.known(index)?;
+        if matches!(parameter, Value::Null | Value::Undefined) { return Some(()); }
+        let Value::List(_) = parameter else { return None; };
+        let values = parameter.list_view()?;
+        if values.len() > LIMIT { return None; }
+        for value in values.iter() {
+            if !matches!(value.as_ref(), Value::Null | Value::Undefined) { insert(value_iids(&value)?); }
+        }
+    }
+    Some(())
 }
 /// The order of a scan's rows by IID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,6 +431,8 @@ fn arrow_parameter_iids(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<(Iid,
     if cell.array.is_null(cell.row) { return None; }
     let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
     match (cell.field.data_type(), extension) {
+        (DataType::FixedSizeBinary(16), Some("uuid")) =>
+            Some((Iid(cell.array.as_fixed_size_binary().value(cell.row).try_into().ok()?), None)),
         (DataType::Utf8, None) => Some((EntityId::string_iid(cell.array.as_string::<i32>().value(cell.row)), None)),
         (DataType::Utf8, Some("xt/clj-keyword")) => Some(keyword_iids(cell.array.as_string::<i32>().value(cell.row))),
         _ => cell.signed_integer().map(|value| (EntityId::Integer(value).iid(), None)),
@@ -1941,6 +1982,14 @@ mod tests {
         assert_eq!(id_selection(&scan(either), rtdb_expr::Parameters::Values(&[Value::Null])), None);
         let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
         assert_eq!(id_selection(&scan(range), rtdb_expr::Parameters::Values(&[])), None);
+
+        let any = scan(Expr::Call { name: "_id_eq_any".into(), args: vec![id.expression(), parameter],
+            return_type: LogicalType::Scalar(ScalarType::Bool).maybe() });
+        let select = |values| id_selection(&any, rtdb_expr::Parameters::Values(&[Value::list(values)]));
+        assert_eq!(select(vec![Value::I64(7), Value::Null, Value::I64(7), Value::I64(9)]),
+            Some([iid(Value::I64(7)), iid(Value::I64(9))].into()));
+        assert_eq!(select(vec![Value::Null]), Some(BTreeSet::new()));
+        assert_eq!(select(vec![Value::F64(7.0)]), None);
     }
 
     #[test]

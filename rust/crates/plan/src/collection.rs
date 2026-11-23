@@ -1,6 +1,22 @@
 use rtdb_types::{Anomaly, ListKind, LogicalType as L, Result, ScalarType as S};
 
 pub(crate) fn signature(name: &str, arguments: &[L]) -> Option<Result<L>> {
+    if name == "_id_eq_any" {
+        return Some((|| {
+            let [id, array] = arguments else {
+                return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "_id_eq_any requires two arguments"));
+            };
+            for leg in array.legs() {
+                match leg {
+                    L::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } =>
+                        crate::validate_equality_types(id, &element)?,
+                    L::Null | L::Nothing => (),
+                    _ => return Err(Anomaly::incorrect("xtdb/sql-error", "Quantified comparison requires an array or subquery")),
+                }
+            }
+            Ok(L::Scalar(S::Bool).maybe())
+        })());
+    }
     if !matches!(name, "array_upper" | "array_lower" | "array_length" | "trim_array" | "nth") { return None; }
     Some((|| {
         if arguments.len() != 2 {
