@@ -3,7 +3,8 @@ use rtdb_node::Database;
 use rtdb_types::{Anomaly, Result};
 
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
-pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v18";
+pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v19";
+pub const AUDIENCE_SEAT_HEADER: &str = "x-rtdb-audience-reader-seat";
 
 pub(crate) const AUDIENCE_READ_LIMITS: rtdb_storage::audience_work::Limits = rtdb_storage::audience_work::Limits {
     provider_requests: 256,
@@ -24,6 +25,24 @@ impl std::fmt::Display for AudienceFlightConfig {
     }
 }
 
+/// One of two provider-owned session positions for a prepaid observation turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudienceSeat {
+    turn: usize,
+    alternate: bool,
+    attempt: uuid::Uuid,
+}
+
+impl std::fmt::Display for AudienceSeat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}/{}", self.turn, u8::from(self.alternate), self.attempt)
+    }
+}
+
+impl AudienceSeat {
+    pub(crate) fn index(self) -> usize { self.turn * 2 + usize::from(self.alternate) }
+}
+
 impl AudienceFlightConfig {
     pub fn parse(value: &str) -> Result<Self> {
         let invalid = || Anomaly::incorrect("rtdb.flight-sql/audience", "Expected an audience source UUID and one to 64 observation turns as UUID/TURNS");
@@ -32,6 +51,21 @@ impl AudienceFlightConfig {
         let turns = turns.parse::<usize>().ok().filter(|turns| (1..=64).contains(turns)).ok_or_else(invalid)?;
         Ok(Self { source, turns })
     }
+
+    pub fn parse_seat(self, value: &str) -> Result<AudienceSeat> {
+        let invalid = || Anomaly::incorrect("rtdb.flight-sql/audience-seat", "Invalid audience reader seat");
+        if value.len() > 41 { return Err(invalid()); }
+        let (turn, rest) = value.split_once('/').ok_or_else(invalid)?;
+        let (alternate, attempt) = rest.split_once('/').ok_or_else(invalid)?;
+        let turn = turn.parse::<usize>().ok().filter(|turn| *turn < self.turns).ok_or_else(invalid)?;
+        let alternate = match alternate { "0" => false, "1" => true, _ => return Err(invalid()) };
+        let attempt = uuid::Uuid::parse_str(attempt).ok().filter(|attempt| !attempt.is_nil()).ok_or_else(invalid)?;
+        let seat = AudienceSeat { turn, alternate, attempt };
+        if seat.to_string() != value { return Err(invalid()); }
+        Ok(seat)
+    }
+
+    pub(crate) fn session_seats(self) -> usize { 2 * self.turns }
 
     pub fn source(self) -> uuid::Uuid { self.source }
     pub fn permits(self) -> usize { 2 * (self.turns + 1) }
@@ -96,5 +130,26 @@ impl FlightConfig {
             return Err(Anomaly::incorrect("rtdb.flight-sql/configuration", "Invalid hosted control principal or relation allowlist"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AudienceFlightConfig;
+
+    #[test]
+    fn reader_seats_only_address_the_two_installed_sessions_per_turn() {
+        let attempt = "01234567-89ab-4def-8000-000000000001";
+        let profile = AudienceFlightConfig::parse(&format!("{attempt}/2")).unwrap();
+        assert_eq!(profile.session_seats(), 4);
+        for (position, index) in [("0/0", 0), ("0/1", 1), ("1/0", 2), ("1/1", 3)] {
+            let requested = format!("{position}/{attempt}");
+            let seat = profile.parse_seat(&requested).unwrap();
+            assert_eq!(seat.index(), index);
+            assert_eq!(seat.to_string(), requested);
+        }
+        for position in ["2/0", "0/2", "00/0"] {
+            assert!(profile.parse_seat(&format!("{position}/{attempt}")).is_err());
+        }
     }
 }

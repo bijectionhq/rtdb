@@ -136,6 +136,8 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     let mut unavailable = Request::new(futures::stream::iter([HandshakeRequest::default()]));
     unavailable.metadata_mut().insert("x-xtdb-database", selector.parse().unwrap());
     unavailable.metadata_mut().insert(rtdb_flight_sql::AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().unwrap());
+    unavailable.metadata_mut().insert(rtdb_flight_sql::AUDIENCE_SEAT_HEADER,
+        format!("0/0/{}", uuid::Uuid::new_v4()).parse().unwrap());
     assert_eq!(audience_client.handshake(unavailable).await.unwrap_err().code(), Code::Unavailable);
     let unchanged = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
     assert!(unchanged.holder.is_none());

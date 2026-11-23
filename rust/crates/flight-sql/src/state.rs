@@ -52,6 +52,7 @@ struct Placement { name: String, attachment: Weak<Database> }
 
 pub(crate) struct AudienceSession {
     pub source: Uuid,
+    pub seat: crate::AudienceSeat,
     pub cache: Arc<CacheBudget>,
     pub expires_at: tokio::time::Instant,
     pub _permit: OwnedSemaphorePermit,
@@ -60,21 +61,24 @@ pub(crate) struct AudienceSession {
 pub(crate) struct Session {
     pub id: String,
     pub caller: Arc<Caller>,
-    audience: Option<AudienceSession>,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
+    // Drop the seat permit after the registered session state and its charge.
+    audience: Option<AudienceSession>,
 }
 impl Session {
     pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, audience: Option<AudienceSession>, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
         Self {
-            id, caller, audience, placement,
+            id, caller, placement,
             state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None, audience_generation: 0, audience_read: None }),
             _reservation: reservation,
+            audience,
         }
     }
     pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|audience| audience.source) }
+    pub fn audience_seat(&self) -> Option<crate::AudienceSeat> { self.audience.as_ref().map(|audience| audience.seat) }
 
     pub fn audience_remaining_micros(&self) -> Option<u64> {
         let remaining = self.audience.as_ref()?.expires_at.saturating_duration_since(tokio::time::Instant::now());

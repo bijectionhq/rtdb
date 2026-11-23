@@ -7,7 +7,7 @@ use http_body_util::{Either, Empty};
 use hyper::{body::{Body, Frame, Incoming, SizeHint}, server::conn::http2, service::service_fn};
 use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExecutor, TokioIo, TokioTimer}};
 use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, now_ms};
-use rtdb_flight_sql::{AUDIENCE_FLIGHT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig};
+use rtdb_flight_sql::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpListener, sync::{OwnedSemaphorePermit, Semaphore}};
@@ -281,6 +281,15 @@ impl Router {
         if audience != self.audience.map(|route| route.profile) {
             return Err(Status::permission_denied("The Flight route belongs to another listener"));
         }
+        let requested_seat = single_header(request.headers(), AUDIENCE_SEAT_HEADER)?;
+        let seat = match (requested_audience, requested_seat) {
+            (Some(profile), Some(value)) => Some(profile.parse_seat(value)
+                .map_err(|_| Status::invalid_argument("Invalid Flight audience reader seat"))?),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Status::permission_denied("The reader seat belongs to the audience handshake"));
+            }
+            (None, None) => None,
+        };
         if routed_audience.is_some() && request.uri().path() != DO_ACTION {
             return Err(Status::permission_denied("The Flight audience only routes observation actions"));
         }
@@ -321,6 +330,10 @@ impl Router {
         headers.remove(header::COOKIE);
         headers.remove(FORWARDED_PEER_HEADER);
         headers.remove(AUDIENCE_FLIGHT_HEADER);
+        headers.remove(AUDIENCE_SEAT_HEADER);
+        if let Some(seat) = seat {
+            headers.insert(AUDIENCE_SEAT_HEADER, header_value(&seat.to_string())?);
+        }
         headers.insert(DATABASE_HEADER, header_value(&target.name)?);
         if let Some(source) = audience {
             headers.insert(AUDIENCE_FLIGHT_HEADER, header_value(&source.to_string())?);
@@ -335,11 +348,11 @@ impl Router {
         *request.uri_mut() = Uri::builder().scheme("http").authority(target.address.as_str()).path_and_query(path)
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
         let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL writer disconnected"))?;
-        self.rewrite_response(response.headers_mut(), target, audience)?;
+        self.rewrite_response(response.headers_mut(), target, audience, seat)?;
         Ok(response.map(|body| Either::Right(RoutedBody { body, _call: call, _deployment: deployment })))
     }
 
-    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, audience: Option<AudienceFlightConfig>) -> std::result::Result<(), Status> {
+    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, audience: Option<AudienceFlightConfig>, seat: Option<AudienceSeat>) -> std::result::Result<(), Status> {
         let Some(cookie) = headers.remove(header::SET_COOKIE) else { return Ok(()); };
         let cookie = cookie.to_str().map_err(|_| Status::internal("Invalid private Flight SQL cookie"))?;
         if cookie.contains("Max-Age=0") {
@@ -352,6 +365,10 @@ impl Router {
         let audience = audience.map(|profile| profile.to_string());
         if audience.as_deref() != single_header(headers, AUDIENCE_FLIGHT_HEADER)? {
             return Err(Status::unavailable("The holder did not acknowledge the exact Flight audience"));
+        }
+        let seat = seat.map(|seat| seat.to_string());
+        if seat.as_deref() != single_header(headers, AUDIENCE_SEAT_HEADER)? {
+            return Err(Status::unavailable("The holder did not acknowledge the exact Flight audience seat"));
         }
         let route = self.encode(&SessionRoute { target, session, audience })?;
         headers.insert(header::SET_COOKIE, header_value(&format!("{COOKIE}={route}"))?);

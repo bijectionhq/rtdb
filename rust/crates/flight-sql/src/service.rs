@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{pin::Pin, sync::{Arc, Mutex, Weak}, time::Duration};
 use arrow_flight::{self as flight, flight_service_server::FlightService, sql::{Any, Command, ProstMessageExt, TicketStatementQuery}};
 use bytes::Bytes;
 use futures::Stream;
@@ -11,7 +11,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-use crate::{AUDIENCE_FLIGHT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
@@ -34,10 +34,15 @@ pub(crate) struct Inner {
 
 pub(crate) struct AudienceAdmission {
     calls: Arc<Semaphore>,
-    session_slots: Arc<Semaphore>,
+    seats: Vec<AudienceSessionSeat>,
     memory: Arc<MemoryBudget>,
     cache: Arc<CacheBudget>,
     sessions: Registry<String, Session>,
+}
+
+struct AudienceSessionSeat {
+    permit: Arc<Semaphore>,
+    original: Mutex<Weak<Session>>,
 }
 
 #[derive(Clone, Copy)]
@@ -79,7 +84,9 @@ impl Call {
             if let Some(source) = self.session.audience_source() {
                 let audience = self.service.0.config.audience.filter(|profile| profile.source() == source)
                     .ok_or_else(unsupported)?;
+                let seat = self.session.audience_seat().ok_or_else(unsupported)?;
                 response.metadata_mut().insert(AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().map_err(arrow)?);
+                response.metadata_mut().insert(AUDIENCE_SEAT_HEADER, seat.to_string().parse().map_err(arrow)?);
             }
         }
         Ok(response)
@@ -103,7 +110,9 @@ impl Service {
             let memory = memory.prepay(profile.execution_bytes())?;
             Some(AudienceAdmission {
                 calls: Arc::new(Semaphore::new(profile.permits())),
-                session_slots: Arc::new(Semaphore::new(profile.permits())),
+                seats: (0..profile.session_seats()).map(|_| AudienceSessionSeat {
+                    permit: Arc::new(Semaphore::new(1)), original: Mutex::new(Weak::new()),
+                }).collect(),
                 sessions: Registry::new(clock.clone(), memory.clone()),
                 cache,
                 memory,
@@ -160,6 +169,20 @@ impl Service {
             return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
         }
         let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
+        let seat_headers = request.metadata().get_all(AUDIENCE_SEAT_HEADER);
+        let mut seats = seat_headers.iter();
+        let seat = match (audience.is_some(), kind, seats.next(), seats.next()) {
+            (true, CallKind::Handshake, Some(value), None) => {
+                let profile = self.0.config.audience.ok_or_else(unsupported)?;
+                let seat = value.to_str().ok().and_then(|value| profile.parse_seat(value).ok())
+                    .ok_or_else(|| Status::permission_denied("Invalid audience reader seat"))?;
+                Some(seat)
+            }
+            (true, CallKind::Handshake, _, _) | (_, _, Some(_), _) => {
+                return Err(Status::permission_denied("An audience seat is fixed at its authenticated handshake"));
+            }
+            _ => None,
+        };
         let sessions = self.sessions(audience.is_some());
         let permits = audience.map_or(&self.0.permits, |audience| &audience.calls);
         let permit = Arc::clone(permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
@@ -221,7 +244,7 @@ impl Service {
                 caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
                 match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
             } else { None };
-            if audience_source.is_some() && (placement.is_none() || self.0.config.hosted_controls.as_ref()
+            if audience_source.is_some() && (placement.is_none() || caller.mac.is_none() || self.0.config.hosted_controls.as_ref()
                 .is_none_or(|controls| caller.principal.user_id() != Some(controls.owner.as_str())))
             {
                 return Err(Status::permission_denied("An audience session requires the installed hosted principal"));
@@ -233,14 +256,39 @@ impl Service {
             }
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
             let memory = audience.map_or(self.memory(), |audience| &audience.memory);
-            let audience_slot = audience.zip(audience_source).map(|(audience, source)| {
-                let permit = Arc::clone(&audience.session_slots).try_acquire_owned()
-                    .map_err(|_| Status::resource_exhausted("Flight audience session slots are occupied"))?;
-                let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
-                Ok::<_, Status>(AudienceSession { source, cache: Arc::clone(&audience.cache), expires_at, _permit: permit })
-            }).transpose()?;
-            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_slot, memory.reserve(capacity).map_err(status)?));
-            sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
+            let mint = |audience_slot| -> Result<Arc<Session>, Status> {
+                let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
+                    placement.as_ref(), audience_slot, memory.reserve(capacity).map_err(status)?));
+                sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
+                    self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
+                Ok(session)
+            };
+            let session = if let Some(((audience, source), requested)) = audience.zip(audience_source).zip(seat) {
+                let slot = &audience.seats[requested.index()];
+                let mut original = slot.original.lock().expect("audience session seat lock");
+                let occupied = || Status::resource_exhausted("The audience reader seat still owns a session");
+                if let Some(session) = original.upgrade() {
+                    let same_credential = session.caller.mac.as_ref().zip(caller.mac.as_ref())
+                        .is_some_and(|(left, right)| auth::equal(left, right));
+                    if session.audience_seat() != Some(requested) || !same_credential
+                    {
+                        return Err(occupied());
+                    }
+                    match sessions.lookup(&session.id, true) {
+                        Lookup::Found(session) => session,
+                        _ => return Err(occupied()),
+                    }
+                } else {
+                    let permit = Arc::clone(&slot.permit).try_acquire_owned().map_err(|_| occupied())?;
+                    let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
+                    let session = mint(Some(AudienceSession { source, seat: requested,
+                        cache: Arc::clone(&audience.cache), expires_at, _permit: permit }))?;
+                    *original = Arc::downgrade(&session);
+                    session
+                }
+            } else {
+                mint(None)?
+            };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
         };

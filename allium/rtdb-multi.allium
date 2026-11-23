@@ -3260,6 +3260,9 @@ actor Gateway {
     -- An audience handshake uses the installed read-only directory transport to locate the existing holder by exact deployment identity.
     -- The audience route derives the holder endpoint from that member's advertised host and the installed audience port.
     -- It cannot activate or warm a deployment or ask the ordinary control endpoint for a route.
+    -- An audience handshake names one of two session seats per prepaid turn and an exact mint attempt.
+    -- Only a retry of the live attempt under the same authenticated credential can recover that occupied seat.
+    -- Close and expiry end session admission, while the seat stays charged until the session and its retained I/O drain.
     -- The writer authenticates the session with the peer in that proof.
     -- Each Flight SQL call using a session token resolves its original writer placement.
     -- A displaced Flight SQL session must establish a new authenticated session.

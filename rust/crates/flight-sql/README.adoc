@@ -270,10 +270,13 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v18` on the audience gateway during its handshake.
-The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
-The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
-The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v19` on the audience gateway during its handshake.
+The handshake also sends `x-rtdb-audience-reader-seat` as `TURN/ALTERNATE/ATTEMPT`, with a zero-based turn, 0 or 1 and a canonical UUID.
+The gateway and holder acknowledge the exact reservation and mint attempt. Ordinary and audience routes are accepted on their own listeners.
+The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session seats.
+Each turn has two seats. An exact retry under the same credential can recover the live session in that seat.
+Another mint cannot take the seat until the original session and its retained I/O release it, including when a close reply is lost.
+The connection and call limits set aside two permits per turn plus two for preparation and cleanup.
 Before serving, the holder reserves 16 MiB of execution memory and 16 MiB of cache memory per permit. Both reservations are deducted before the ordinary allocation splits between cache and execution. It refuses startup if the node cannot fund both pools.
 Each session uses its own buffer pool on the audience cache budget from initial preparation through applied confirmation.
 Audience queries use local scans. The holder requires an uncached view of the live writer's exact S3 storage attachment for the installed source.
