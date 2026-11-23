@@ -158,7 +158,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     });
     let receiver_clock = crate::receiver_clock::ReceiverClock::new(Arc::clone(&directory), storage_namespaces.objects);
     let decision_clock: Arc<dyn rtdb_node::DecisionClock> = receiver_clock.clone();
-    let publish_clock = settings.pool == rtdb_directory::MemberPool::General && audience.is_none();
+    let publish_clock = settings.pool == rtdb_directory::MemberPool::General;
     let placed = PlacedOptions {
         decision_clock: Some(decision_clock),
         log_factories: vec![
@@ -212,8 +212,12 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let mut tasks = JoinSet::new();
     tasks.spawn(driver.run());
     if publish_clock {
-        let cancellation = cancellation.clone();
-        tasks.spawn(async move { receiver_clock.publish(cancellation).await; Ok(()) });
+        let cancellation = lease_cancellation.clone();
+        tasks.spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(io)?;
+            runtime.block_on(receiver_clock.publish(cancellation));
+            Ok(())
+        });
     }
     { let lease = Arc::clone(&lease); let cancellation = lease_cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     { let agent = Arc::clone(&agent); let cancellation = cancellation.clone(); tasks.spawn(async move { agent.run(cancellation).await; Ok(()) }); }
