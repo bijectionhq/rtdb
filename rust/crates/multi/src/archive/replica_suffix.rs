@@ -263,13 +263,15 @@ pub(super) async fn apply_archived(
     }
     progress.finish(pin)?;
     require_chain(chain, expected)?;
-    let epoch = StorageEpoch(pin.log_epoch);
+    let source = SourcePosition::from_epoch_offset(StorageEpoch(pin.log_epoch), pin.source_through)?;
     if recovered.progress.tx_key != Some(pin.basis)
-        || recovered.progress.source_position.after_offset(epoch) != pin.source_through
+        || recovered.progress.source_position > source
         || recovered.partition.snapshot().tx_basis() != Some(pin.basis)
     {
         return Err(suffix_unavailable());
     }
+    // The certified cut can include source maintenance after its last transaction.
+    recovered.progress.source_position = source;
     Ok(())
 }
 
@@ -504,7 +506,7 @@ impl SuffixProgress {
     }
 
     fn admit(&mut self, entry: &ArchivedReplicaEntry, pin: &CheckpointSuffixPin) -> Result<ReplicaEnvelope> {
-        if entry.lsn != self.next || entry.lsn > pin.replica_through || self.tx == pin.basis {
+        if entry.lsn != self.next || entry.lsn > pin.replica_through {
             return Err(suffix_unavailable());
         }
         let admitted = admit_record(entry, &mut self.fence, &mut self.writer_epoch, pin.writer_epoch)?;
@@ -538,6 +540,7 @@ impl SuffixProgress {
     fn finish(self, pin: &CheckpointSuffixPin) -> Result<()> {
         if self.next.checked_sub(1) != Some(pin.replica_through)
             || self.tx != pin.basis || self.replay.source != pin.source_through
+            || self.replay.pending.is_some()
         {
             return Err(suffix_unavailable());
         }
