@@ -7,6 +7,7 @@ use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub(crate) const MAXIMUM_FRAME_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const AUTHORITY_FRAME_BYTES: usize = 4096;
 
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct Entry {
@@ -209,13 +210,15 @@ pub(crate) enum RequestBody {
     ReadIndex(LogletCheck),
     #[prost(message, tag = "16")]
     Identify(Identify),
+    #[prost(message, tag = "18")]
+    ConfirmAuthority(LogletCheck),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -283,6 +286,10 @@ pub struct PageDigest {
     pub digest: Bytes,
 }
 
+/// Confirms only the promised writer. It conveys no append or commit position.
+#[derive(Clone, PartialEq, Message)]
+pub struct AuthorityConfirmed {}
+
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum ResponseBody {
     #[prost(message, tag = "2")]
@@ -299,13 +306,15 @@ pub enum ResponseBody {
     PageDigest(PageDigest),
     #[prost(message, tag = "8")]
     JournalIdentity(JournalIdentity),
+    #[prost(message, tag = "9")]
+    AuthorityConfirmed(AuthorityConfirmed),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8, 9")]
     pub body: Option<ResponseBody>,
 }
 
@@ -322,13 +331,19 @@ pub(crate) async fn read_frame<M: Message + Default>(reader: &mut (impl AsyncRea
 }
 
 pub(crate) async fn read_sized_frame<M: Message + Default>(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<(M, usize)>> {
+    read_bounded_frame(reader, MAXIMUM_FRAME_BYTES).await
+}
+
+pub(crate) async fn read_bounded_frame<M: Message + Default>(
+    reader: &mut (impl AsyncRead + Unpin), limit: usize,
+) -> std::io::Result<Option<(M, usize)>> {
     let length = match reader.read_u32().await {
         Ok(length) => length as usize,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     };
-    if length > MAXIMUM_FRAME_BYTES {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("frame of {length} bytes exceeds {MAXIMUM_FRAME_BYTES}")));
+    if length > limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("frame of {length} bytes exceeds {limit}")));
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).await?;

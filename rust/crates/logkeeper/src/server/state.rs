@@ -67,6 +67,21 @@ pub struct StreamState<P = Bytes> {
     pub(super) retained_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WriterAuthority {
+    pub(super) promised: u64,
+    synced: Option<u64>,
+    active_ensemble: Option<[u8; 32]>,
+    dropped: bool,
+}
+
+impl WriterAuthority {
+    pub(super) fn confirms(self, epoch: u64, ensemble: [u8; 32]) -> bool {
+        !self.dropped && self.promised == epoch && self.synced == Some(epoch)
+            && self.active_ensemble == Some(ensemble)
+    }
+}
+
 pub struct Decision {
     pub events: Vec<Event>,
     pub reply: ResponseBody,
@@ -87,6 +102,10 @@ impl<P> Default for StreamState<P> {
 }
 
 impl<P: Payload> StreamState<P> {
+    pub(super) fn writer_authority(&self) -> WriterAuthority {
+        WriterAuthority { promised: self.promised, synced: self.synced, active_ensemble: self.active_ensemble, dropped: self.dropped }
+    }
+
     pub fn last(&self) -> i64 { self.trim + self.entries.len() as i64 }
 
     pub fn retained_bytes(&self) -> usize { self.retained_bytes }

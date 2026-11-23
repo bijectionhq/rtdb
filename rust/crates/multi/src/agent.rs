@@ -48,6 +48,7 @@ impl SuffixCut<'_> {
 
 #[derive(Clone, Debug)]
 pub struct AgentOptions {
+    pub audience_journal_port: Option<u16>,
     pub storage: CellStorage,
     pub world_archive: Option<CellStorage>,
     pub s3_write_role: Option<S3WriteRole>,
@@ -84,7 +85,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { storage, world_archive: None, s3_write_role: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { audience_journal_port: None, storage, world_archive: None, s3_write_role: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
@@ -459,7 +460,7 @@ impl NodeAgent {
     /// Before a query on a deployment held with linearizable reads, confirms with a quorum of its logkeepers that no later holder has sealed its stream (`ServeLinearizableReadOnWriter`).
     pub async fn confirm_read(&self, name: &str) -> Result<()> {
         let Some(id) = self.holdings.lock().get(name).filter(|holding| holding.linearizable).map(|holding| holding.id.clone()) else { return Ok(()) };
-        self.confirm_holder(name, &id).await
+        self.confirm_holder(name, &id, None).await
     }
 
     pub async fn confirm_hosted_read(&self, database: &Database) -> Result<String> {
@@ -500,16 +501,27 @@ impl NodeAgent {
             }
         }
         require_recovered_checkpoint(&record, database)?;
-        if !matches!(check, HostedReadCheck::AudienceRoute) {
-            self.confirm_holder(name, &id).await?;
+        match check {
+            HostedReadCheck::Ordinary => self.confirm_holder(name, &id, None).await?,
+            HostedReadCheck::AudienceRoute => {}
+            HostedReadCheck::AudienceCapture => {
+                let port = self.options.audience_journal_port.ok_or_else(unavailable)?;
+                self.confirm_holder(name, &id, Some(port)).await?;
+            }
         }
         Ok(id)
     }
 
-    async fn confirm_holder(&self, name: &str, id: &str) -> Result<()> {
+    async fn confirm_holder(&self, name: &str, id: &str, authority_port: Option<u16>) -> Result<()> {
         let writer = self.writers.lock().get(id).and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))?;
-        match tokio::time::timeout(CONFIRM_WITHIN, writer.confirm_leadership()).await {
+        let confirmation = async {
+            match authority_port {
+                Some(port) => writer.confirm_authority(port).await,
+                None => writer.confirm_leadership().await,
+            }
+        };
+        match tokio::time::timeout(CONFIRM_WITHIN, confirmation).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}"))),
             Err(_) => Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/leadership-unconfirmed", format!("A quorum of {name}'s logkeepers did not confirm its holder in time"))),
