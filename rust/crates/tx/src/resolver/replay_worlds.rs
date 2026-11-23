@@ -169,7 +169,9 @@ impl OpenTransaction<'_> {
                 self.record_replayed_world_relocation(replay, world.id, readmission)?;
             } else {
                 match previous {
-                    None if world.pin == world.id && !world.dropped => (),
+                    None if world.pin == world.id && !world.dropped => {
+                        require_replayed_fork_parent(context, owner, &world, logical).await?;
+                    }
                     Some((previous, _))
                         if !previous.dropped && previous.until > logical
                             && ((world.dropped && previous.same_fork(&world))
@@ -382,6 +384,37 @@ impl OpenTransaction<'_> {
             Interval::new(Timestamp(0), Timestamp::MAX)?,
         )
     }
+}
+
+/// Every copied child must extend its parent's earlier accepted prefix. The
+/// replay installer retains the source registrations used by this check,
+/// including intermediate aliases that have expired at the capture end.
+async fn require_replayed_fork_parent(
+    context: &Arc<rtdb_query::QueryContext>,
+    owner: &str,
+    world: &OwnedWorld,
+    logical: Timestamp,
+) -> Result<()> {
+    let unavailable = OwnedWorld::unavailable;
+    let Some(link) = world.fork_lineage.last() else { return Ok(()); };
+    let (source, _reservation) =
+        rtdb_query::read_owned_world(Arc::clone(context), owner, Iid(link.world))
+            .await?
+            .ok_or_else(unavailable)?;
+    let admits_child = if world.ancestor.is_some() {
+        source.can_retain_overlay(world)
+    } else {
+        source.can_retain_parent(world)
+    };
+    if !admits_child
+        || source.pin.0 != link.pin
+        || link.registered >= logical
+        || logical >= source.until
+        || world.fork_lineage != source.retained_child_lineage(world, link.registered)?
+    {
+        return Err(unavailable());
+    }
+    Ok(())
 }
 
 async fn replay_control(
