@@ -16,10 +16,17 @@ struct Currency {
     pending: Option<(i64, i64)>,
 }
 
+impl Currency {
+    fn confirm(&mut self, installed: Option<ReplicaPosition>) {
+        (self.anchor, self.pending) = step::confirm(self.anchor, self.pending, installed.map(|position| position.0));
+    }
+}
+
 impl ReadCurrency {
     /// Whether a fresh tip observation is due: none is pending and the anchor is absent or older than `refresh` micros.
-    pub fn needs_observation(&self, now: i64, refresh: i64) -> bool {
-        let currency = self.0.lock();
+    pub fn needs_observation(&self, installed: Option<ReplicaPosition>, now: i64, refresh: i64) -> bool {
+        let mut currency = self.0.lock();
+        currency.confirm(installed);
         currency.pending.is_none() && currency.anchor.is_none_or(|anchor| now.saturating_sub(anchor) >= refresh)
     }
     /// Records the tip published no earlier than `observed_at`; the caller reads the clock before the tip.
@@ -31,8 +38,7 @@ impl ReadCurrency {
     /// The caller observes installed progress before capturing its catalog.
     pub fn anchor(&self, installed: Option<ReplicaPosition>) -> Option<i64> {
         let mut currency = self.0.lock();
-        (currency.anchor, currency.pending) =
-            step::confirm(currency.anchor, currency.pending, installed.map(|position| position.0));
+        currency.confirm(installed);
         currency.anchor
     }
     pub fn pending_tip(&self) -> Option<ReplicaPosition> { self.0.lock().pending.map(|(_, tip)| ReplicaPosition(tip)) }
@@ -59,14 +65,25 @@ mod tests {
     #[test]
     fn an_observation_anchors_only_after_its_tip_is_applied() {
         let currency = ReadCurrency::default();
-        assert!(currency.needs_observation(10, 5));
+        assert!(currency.needs_observation(None, 10, 5));
         currency.observe(10, position(4));
-        assert!(!currency.needs_observation(100, 5));
+        assert!(!currency.needs_observation(None, 100, 5));
         assert_eq!(currency.anchor(None), None);
         assert_eq!(currency.anchor(Some(position(3))), None);
         assert_eq!(currency.anchor(Some(position(4))), Some(10));
-        assert!(!currency.needs_observation(14, 5));
-        assert!(currency.needs_observation(15, 5));
+        assert!(!currency.needs_observation(Some(position(4)), 14, 5));
+        assert!(currency.needs_observation(Some(position(4)), 15, 5));
+    }
+
+    #[test]
+    fn an_applied_old_observation_leaves_the_same_request_eligible_to_refresh() {
+        let currency = ReadCurrency::default();
+        currency.observe(10, position(4));
+        assert!(!currency.needs_observation(Some(position(3)), 100, 5));
+        assert!(currency.needs_observation(Some(position(4)), 100, 5));
+        currency.observe(100, position(5));
+        assert_eq!(currency.anchor(Some(position(4))), Some(10));
+        assert_eq!(currency.anchor(Some(position(5))), Some(100));
     }
 
     #[test]

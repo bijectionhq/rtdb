@@ -27,6 +27,7 @@
 --
 -- Query snapshots on every node also hold a bounded read lease, because another node's collector cannot see them.
 -- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
+-- A node confirms any pending observation its catalog has already applied before deciding whether to sample the tip again.
 -- A snapshot captured after that confirmation may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`.
 -- Each provider request checks the lease when it is admitted; a request admitted in time runs to completion.
 -- Objects are immutable, so a request that overruns the deadline can only fail; a missing object it then reports is classified as the expired lease.

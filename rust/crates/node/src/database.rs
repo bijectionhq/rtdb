@@ -131,7 +131,8 @@ impl Database {
         let (lease, margin) = (garbage.reader_lease_micros()?, garbage.reader_lease_margin_micros()?);
         let deadline = |anchor: Option<i64>| anchor.and_then(|anchor| lease_deadline(anchor, lease, margin));
         let observed_at = clock.monotonic_micros();
-        if self.currency.needs_observation(observed_at, lease / 4) {
+        let installed = self.replication.status().installed.map(|prefix| prefix.replica);
+        if self.currency.needs_observation(installed, observed_at, lease / 4) {
             let logs = Arc::clone(&self.logs);
             if let Ok(Ok(tip)) = self.io.run_blocking(move || Ok(logs.latest_replica_position())).await { self.currency.observe(observed_at, tip); }
         }
@@ -607,11 +608,12 @@ impl MaintenanceSupervisor {
             if self.options.replication.enabled {
                 if let Ok(lease) = self.options.garbage.reader_lease_micros() {
                     let observed_at = self.clock.monotonic_micros();
-                    if self.currency.needs_observation(observed_at, lease / 4) {
+                    let installed = current.installed.map(|prefix| prefix.replica);
+                    if self.currency.needs_observation(installed, observed_at, lease / 4) {
                         let logs = Arc::clone(&self.logs);
                         if let Ok(Ok(tip)) = tokio::task::spawn_blocking(move || logs.latest_replica_position()).await { self.currency.observe(observed_at, tip); }
+                        self.currency.anchor(installed);
                     }
-                    self.currency.anchor(current.installed.map(|prefix| prefix.replica));
                 }
             }
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };
