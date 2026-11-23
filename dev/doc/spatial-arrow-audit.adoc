@@ -92,6 +92,11 @@ The host checks the SDK reply's encoded size with a bounded byte counter.
 | Compatible payload columns pass from the upload through source IPC and ordered resolution into the Arrow event batch.
 Transaction resolution still orders admission, locality, and final-state checks.
 
+| Bijection deploy-hook catalog
+| Hook setup decoded the staged declaration bodies, re-encoded them while opening the Root, and parsed the successor schema again.
+| Hook setup uses the prepared typed schema, its digest, and the typed relation declarations.
+The ordered publication builds its Arrow declaration batch from the prepared durable bodies.
+
 | Hosted Root catalog replacement
 | The Flight decoder materialized the hosted catalog payload as generic document fields before source encoding and resolution.
 | The supported Root owner, program and relation-declaration payloads retain Arrow columns through the placed source log and ordered event write.
