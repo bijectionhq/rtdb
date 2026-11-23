@@ -369,7 +369,7 @@ fn trie_block(name: &str) -> Option<i64> {
 pub async fn fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
     let past = match at_block { Some(block) => Some((block, block_packs(bucket, parent, block).await?, written_at_ms(bucket, parent, block).await?)), None => None };
     let wanted = |name: &str| {
-        if crate::store::stays_in_source_residence(name) { return false; }
+        if name.starts_with("oversized/") || crate::store::stays_in_source_residence(name) { return false; }
         match &past {
             None => true,
             Some((_, packs, _)) if name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY)) => packs.contains(name),
@@ -759,6 +759,7 @@ mod tests {
         put(&bucket, &format!("p/v06/{}/{:020}-early", crate::store::GARBAGE_DIRECTORY, 500), b"{}").await;
         put(&bucket, &format!("p/v06/{}/{:020}-late", crate::store::GARBAGE_DIRECTORY, 1_500), b"{}").await;
         put(&bucket, "p/v06/tables/t/data/l01-compacted.arrow", b"compacted").await;
+        put(&bucket, "p/v06/oversized/b00-parent.binpb", b"an offloaded parent journal frame").await;
         fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
         let referenced: Vec<String> = Base::load(bucket.as_ref(), "c/v06").await.unwrap().objects.into_keys().collect();
         assert_eq!(referenced, ["tables/t/data/l01-compacted.arrow".to_owned(), format!("{}/{:020}-early", crate::store::GARBAGE_DIRECTORY, 500), pack(0)],

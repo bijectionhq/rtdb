@@ -1564,6 +1564,7 @@ rule ReleaseReplicaReplay {
 -- A replica payload release identifies the exact publication carried by a certified replica entry.
 -- Provider deletion requires the directory to record trim completion for every journal in the authorized inventory.
 -- A provider retry names the same publication until settlement is recorded.
+-- A checkpoint fork references checkpoint objects and gives any replayed payload its own journal custody.
 
 ------------------------------------------------------------
 -- Rules: compaction
