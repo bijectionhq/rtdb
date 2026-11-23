@@ -25,6 +25,7 @@ mod hosted_control;
 mod constraint_receipt;
 mod retry;
 mod retention;
+pub use retention::installed_receipt_time;
 mod fixed_range;
 mod ordered_micros;
 mod replay_constraints;

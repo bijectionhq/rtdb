@@ -27,29 +27,62 @@ impl OpenTransaction<'_> {
     pub(super) async fn observe_retention_clock(&self, appended: Timestamp) -> Result<RetentionClock> {
         let snapshot = self.buffer.base_snapshot();
         let Some(predecessor) = snapshot.tx_basis() else { return Ok(RetentionClock::observe(None, appended)); };
-        if !snapshot.column_names(&rtdb_types::TableRef::new("xt", "txs")).contains("receipt_time") {
-            return Ok(RetentionClock::observe(None, appended));
-        }
-        let mut cursor = self.open_query(
-            "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?",
-            vec![Value::I64(predecessor.tx_id.0)],
-        ).await?;
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        let previous = installed_receipt_time(context, predecessor).await?;
+        Ok(RetentionClock::observe(previous, appended))
+    }
+}
+
+/// The installed receipt clock belongs to an exact transaction position.
+/// A fork can give a copied replica frame a new source ID while preserving its stored history row.
+pub async fn installed_receipt_time(
+    context: std::sync::Arc<rtdb_query::QueryContext>, head: rtdb_types::TransactionKey,
+) -> Result<Option<Timestamp>> {
+    use rtdb_query::PreparedQuery;
+    use rtdb_types::{LogicalType, ScalarType, TableRef};
+
+    let database = rtdb_plan::Catalog::default_database(&context.catalog);
+    let [snapshot] = context.catalog.database(database)?.partitions.as_slice() else {
+        return Err(clock_error("The installed receipt clock requires one partition"));
+    };
+    if !snapshot.column_names(&TableRef::new("xt", "txs")).contains("receipt_time") { return Ok(None); }
+    let system_time = || super::time_value(head.system_time);
+    for (sql, arguments) in [
+        ("SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ?",
+            vec![Value::I64(head.tx_id.0), system_time()]),
+        ("SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE system_time = ?", vec![system_time()]),
+    ] {
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: arguments.iter().enumerate().map(|(slot, value)| {
+                let ty = match value { Value::I64(_) => LogicalType::Scalar(ScalarType::I64), _ => value.logical_type() };
+                (slot, ty)
+            }).collect(),
+            default_timezone: context.timezone.clone(),
+            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
+            ..Default::default()
+        };
+        let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &options, &context.memory)?;
+        let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context.clone(), arguments).await?;
+        let mut observed = None;
         while let Some(page) = cursor.next_batch().await? {
             let batch = page.batch();
             if batch.num_rows() == 0 { continue; }
-            let value = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
-            if batch.num_rows() != 1 {
-                return Err(Anomaly::fault("rtdb.tx/retention-clock", "The durable receipt clock has multiple predecessors"));
+            if batch.num_rows() != 1 || observed.is_some() {
+                return Err(clock_error("The durable receipt clock has multiple predecessors"));
             }
-            return match value {
-                Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Ok(RetentionClock::observe(Some(Timestamp(value)), appended)),
-                Value::Null | Value::Undefined => Ok(RetentionClock::observe(None, appended)),
-                _ => Err(Anomaly::fault("rtdb.tx/retention-clock", "The durable receipt clock has no timestamp")),
-            };
+            let value = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
+            observed = Some(match value {
+                Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Some(Timestamp(value)),
+                Value::Null | Value::Undefined => None,
+                _ => return Err(clock_error("The durable receipt clock has no timestamp")),
+            });
         }
-        Err(Anomaly::fault("rtdb.tx/retention-clock", "The ordered transaction predecessor is missing"))
+        if let Some(observed) = observed { return Ok(observed); }
     }
+    Err(clock_error("The installed transaction predecessor is missing"))
 }
+
+fn clock_error(message: &str) -> Anomaly { Anomaly::fault("rtdb.tx/retention-clock", message) }
 
 impl OpenTransaction<'_> {
     pub(super) async fn historical_guard_original(&self, key: &str, submitted_at: Timestamp) -> Result<Option<rtdb_types::TransactionKey>> {
@@ -80,7 +113,7 @@ impl OpenTransaction<'_> {
         if self.snapshot()?.contains_table(&receipts) {
             self.retire_receipt_rows(
                 receipts,
-                "SELECT _id FROM xt.idempotency_receipts FOR ALL VALID_TIME GROUP BY _id HAVING MAX(_valid_to) <= ? ORDER BY _id LIMIT 128",
+                "SELECT _id FROM xt.idempotency_receipts FOR ALL VALID_TIME GROUP BY _id HAVING MAX(_valid_to) <= ? ORDER BY CAST(_id AS TEXT) LIMIT 128",
                 observed,
             ).await?;
         }
@@ -96,7 +129,7 @@ impl OpenTransaction<'_> {
         if self.snapshot()?.contains_table(&private) {
             self.retire_receipt_rows(
                 private,
-                "SELECT _id FROM xt.rtdb_replay_keys FOR ALL VALID_TIME GROUP BY _id HAVING MAX(_valid_to) <= ? ORDER BY _id LIMIT 128",
+                "SELECT _id FROM xt.rtdb_replay_keys FOR ALL VALID_TIME GROUP BY _id HAVING MAX(_valid_to) <= ? ORDER BY CAST(_id AS TEXT) LIMIT 128",
                 observed,
             ).await?;
         }

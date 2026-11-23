@@ -1192,7 +1192,15 @@ async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome
         panic!("expected history");
     };
     assert_eq!(row["user_metadata"], Value::Null);
-    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let body = initial.to_replica_body(&context.memory).unwrap();
+    let rtdb_format::envelope::ReplicaBody::ResolvedTx(mut copied) = body.body().clone() else {
+        panic!("expected copied replica frame");
+    };
+    copied.tx_id = Some(10);
+    copied.src_msg_id = Some(10);
+    let recovered = decode_replica(&copied, None, state.snapshot().block_index(), &context.memory).unwrap();
+    state.apply(&recovered.writes).unwrap();
+    let mut resolver = TxResolver::new(Some(recovered.result.tx_key()), SourcePosition(10), None, &context.memory).unwrap();
 
     let query = async |snapshot: rtdb_index::Snapshot, text: &str| {
         let snapshot = snapshot.with_system_time_cap(Some(Timestamp(100))).unwrap();
@@ -1223,7 +1231,7 @@ async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome
         vec![Value::Utf8("system_time".into()), Value::I32(10), Value::I32(1184)],
     ]);
     let expiry = 100 + RECEIPT_WINDOW_MICROS;
-    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(expiry), request(vec![], &context), &context).await.unwrap();
+    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(11), Timestamp(expiry), request(vec![], &context), &context).await.unwrap();
     let sidecar = cut.writes().tables()[&TableRef::new("xt", "idempotency_receipts")].batch().unwrap();
     let erased = sidecar.view().read_event(0).unwrap();
     assert_eq!(erased.iid, EntityId::Integer(0).iid());

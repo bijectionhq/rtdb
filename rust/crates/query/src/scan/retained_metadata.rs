@@ -42,7 +42,7 @@ impl PartitionScan {
         let iids = rows.iter().map(|row| batches[row.source.0 as usize].header(row.source.1 as usize).map(|header| header.iid))
             .collect::<Result<Vec<_>>>()?;
         let Some(mut retained) = self.retention_scan(
-            &snapshot, sidecar(), iids.iter().copied().collect(), &["_id", "user_metadata"],
+            &snapshot, sidecar(), Some(iids.iter().copied().collect()), &["_id", "user_metadata"],
             TemporalFilter::At(Expr::Literal(time)),
         ).await? else { return Ok(None); };
 
@@ -78,22 +78,34 @@ impl PartitionScan {
         &self, snapshot: &Snapshot, head: rtdb_types::TransactionKey,
     ) -> Result<Option<Value>> {
         let clock_id = rtdb_types::EntityId::Integer(head.tx_id.0).iid();
-        let Some(mut clock) = self.retention_scan(
-            snapshot, TableRef::new("xt", "txs"), [clock_id].into(), &["_id", "receipt_time"], TemporalFilter::All,
-        ).await? else { return Ok(None); };
-        let Some(clock) = Box::pin(clock.next_batch()).await? else { return Ok(None); };
-        if clock.len != 1 || clock.columns[0].value(0)? != Value::I64(head.tx_id.0) {
-            return Err(invalid("transaction-metadata", "The retained clock differs from the captured transaction"));
+        for iids in [Some([clock_id].into()), None] {
+            let Some(mut clock) = self.retention_scan(
+                snapshot, TableRef::new("xt", "txs"), iids, &["system_time", "receipt_time"], TemporalFilter::All,
+            ).await? else { return Ok(None); };
+            let mut observed = None;
+            while let Some(page) = Box::pin(clock.next_batch()).await? {
+                for row in 0..page.len {
+                    let time = page.columns[0].value(row)?;
+                    if !matches!(time, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == head.system_time.0) {
+                        continue;
+                    }
+                    if observed.is_some() {
+                        return Err(invalid("transaction-metadata", "Multiple clocks for the captured transaction"));
+                    }
+                    observed = Some(match page.columns[1].value(row)? {
+                        time @ Value::Timestamp { unit: TimeUnit::Microsecond, .. } => Some(time),
+                        Value::Null | Value::Undefined => None,
+                        _ => return Err(invalid("transaction-metadata", "The retained clock has no timestamp")),
+                    });
+                }
+            }
+            if let Some(observed) = observed { return Ok(observed); }
         }
-        match clock.columns[1].value(0)? {
-            time @ Value::Timestamp { unit: TimeUnit::Microsecond, .. } => Ok(Some(time)),
-            Value::Null | Value::Undefined => Ok(None),
-            _ => Err(invalid("transaction-metadata", "The retained clock has no timestamp")),
-        }
+        Err(invalid("transaction-metadata", "The retained clock cannot be matched to the captured transaction"))
     }
 
     async fn retention_scan(
-        &self, snapshot: &Snapshot, table: TableRef, iids: BTreeSet<Iid>,
+        &self, snapshot: &Snapshot, table: TableRef, iids: Option<BTreeSet<Iid>>,
         names: &[&str], valid_time: TemporalFilter,
     ) -> Result<Option<ScanCursor>> {
         let qualified = QualifiedTable { database: self.scan.table.name.database.clone(), table };
@@ -104,7 +116,7 @@ impl PartitionScan {
         }).collect();
         let scan = Scan {
             table, columns, valid_time, system_time: TemporalFilter::Default, clamp_valid_time: false,
-            iids: Some(iids), predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
+            iids, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
         ScanCursor::over(scan, self.execution.clone(), None, std::slice::from_ref(snapshot), &self.storage, false, None).await.map(Some)
     }
