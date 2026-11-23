@@ -1185,6 +1185,7 @@ impl OwnedReadSession {
             live: self.historical.is_none().then_some(self.present),
             issued_on: self.present,
             publication: false,
+            overlay: None,
             renewal: false,
             until: self.fork_until,
             scope,
@@ -1202,6 +1203,31 @@ impl OwnedReadSession {
         self.check()?;
         cut.basis = publication;
         cut.publication = true;
+        Ok(cut)
+    }
+
+    /// Certifies the original Held publication for an independently retained fork.
+    pub async fn fork_overlay_cut(
+        &self, scope: rtdb_types::PlacedAttemptScope, world: &rtdb_types::OwnedWorld, system: Timestamp,
+    ) -> Result<OwnedForkCut> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let mut cut = self.fork_cut(scope).await?;
+        if !matches!(world.mode, rtdb_types::WorldClockMode::Held { .. }) || cut.live.is_none() {
+            return Err(unavailable());
+        }
+        if !(1..=32).contains(&world.schemas.relations().count()) { return Err(unavailable()); }
+        let relations = world.schemas.relations().map(|(name, _)| rtdb_types::OwnedRelation::new(name))
+            .collect::<Result<Vec<_>>>()?;
+        let clock = self.certify_world_accepted_scope(world, &relations, system).await?;
+        for relation in &relations {
+            if self.world_parent_witness(world.id, relation).await?.purge_frontier() != 0 {
+                return Err(unavailable());
+            }
+        }
+        cut.live = None;
+        cut.basis = system;
+        cut.overlay = Some((world.id, world.pin, clock));
+        cut.until = cut.until.min(world.until);
         Ok(cut)
     }
 
@@ -2416,6 +2442,7 @@ pub struct OwnedForkCut {
     live: Option<TransactionKey>,
     issued_on: TransactionKey,
     publication: bool,
+    overlay: Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)>,
     renewal: bool,
     until: Timestamp,
     scope: rtdb_types::PlacedAttemptScope,
@@ -2425,6 +2452,7 @@ impl OwnedForkCut {
     pub fn basis(&self) -> Timestamp { self.basis }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
     pub fn is_publication(&self) -> bool { self.publication }
+    pub fn overlay(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)> { self.overlay }
     pub fn is_renewal(&self) -> bool { self.renewal }
     pub fn matches_basis(&self, basis: TransactionKey) -> bool {
         self.basis == basis.system_time && self.live.is_none_or(|live| live == basis)
@@ -2590,7 +2618,15 @@ impl NativeSession {
             .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
             .saturating_add(fork.root.as_ref().and_then(|section| section.publication.as_ref()).map_or(0, |root| root.writes.len() + 1))
             .saturating_add(3 + usize::from(requires_tip));
-        if record.id != fork.world || record.pin != fork.pin || !fork.cut.matches_basis(record.basis)
+        let archive_basis = match (&record.ancestor, fork.cut.overlay()) {
+            (None, None) => record.basis,
+            (Some(ancestor), Some((world, pin, clock))) if ancestor.world == world.0
+                && ancestor.pin == pin.0 && ancestor.logical == clock
+                && root == OwnedForkRoot::None && fork.previous.is_none() && fork.sibling.is_none()
+                && requested == rtdb_types::WorldClockMode::Retained => ancestor.basis,
+            _ => return Err(rtdb_types::OwnedWorld::unavailable()),
+        };
+        if record.id != fork.world || record.pin != fork.pin || !fork.cut.matches_basis(archive_basis)
             || ((fork.previous.is_none() || fork.sibling.is_some()) != (record.pin == record.id)) || fork.controls.is_empty()
             || fork.previous.is_some_and(|pin| pin == record.pin || (record.mode.is_writable() && !proposal_hold))
             || record.mode != requested

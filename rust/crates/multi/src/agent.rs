@@ -633,7 +633,7 @@ impl NodeAgent {
             }
             if let SuffixCut::HeldPublication(cut, ..) = &cutoff {
                 let expected = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
-                if !cut.is_publication() || cut.scope() != expected
+                if (!cut.is_publication() && cut.overlay().is_none()) || cut.scope() != expected
                     || expires_at_ms > cut.until().0.div_euclid(1000)
                 {
                     return Err(unavailable());

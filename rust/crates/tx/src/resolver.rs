@@ -1240,6 +1240,27 @@ impl<'a> OpenTransaction<'a> {
                         {
                             return Err(unavailable());
                         }
+                        if let Some(ancestor) = &world.ancestor {
+                            if with_root || previous.is_some() || sibling.is_some()
+                                || ancestor.basis.system_time >= self.tx_key().system_time
+                                || ancestor.basis.tx_id >= self.tx_key().tx_id
+                            {
+                                return Err(unavailable());
+                            }
+                            let base = self.buffer.base_snapshot();
+                            let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                            let (source, _charge) = rtdb_query::read_owned_world(context, owner, Iid(ancestor.world))
+                                .await?.ok_or_else(unavailable)?;
+                            if source.pin.0 != ancestor.pin || source.dropped || source.ancestor.is_some()
+                                || !matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
+                                || source.until < world.until
+                                || source.capture != world.capture || source.suffix != world.suffix
+                                || source.basis != world.basis || source.manifest != world.manifest
+                                || source.parent_publication != world.parent_publication || source.schemas != world.schemas
+                            {
+                                return Err(unavailable());
+                            }
+                        }
                         if let Some(previous) = previous {
                             let base = self.buffer.base_snapshot();
                             let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
@@ -2822,6 +2843,7 @@ mod tests {
         for (mode, valid) in [(WorldClockMode::Proposal, Timestamp(200)), (WorldClockMode::Held { start: Timestamp(100) }, Timestamp(101))] {
             let world = Iid([1; 16]);
             let record = OwnedWorld {
+            ancestor: None,
                 id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
                 manifest: "a".repeat(43), basis: cut, parent_publication: None,
                 mode, until: Timestamp(1000), dropped: false,
@@ -2901,6 +2923,7 @@ mod tests {
         let world = Iid([1; 16]);
         let overlay = relation.in_world(world)?;
         let record = OwnedWorld {
+            ancestor: None,
             id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None, manifest: "a".repeat(43),
             basis: cut, parent_publication: None, mode: WorldClockMode::Proposal, until: Timestamp(1000), dropped: false,
             schemas: WorldSchemas::new(BTreeMap::from([(relation.name().into(), schema)]))?,

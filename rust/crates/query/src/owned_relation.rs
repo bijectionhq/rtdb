@@ -599,7 +599,7 @@ pub async fn read_owned_world(
 
     let memory = Arc::clone(&context.memory);
     let id = EntityId::Uuid(world.0);
-    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix"];
+    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor"];
     let Some(mut cursor) = open_owned_point(
         context, owner, &OwnedRelation::world_catalog(), &id, None, Some(&names),
     ).await? else { return Ok(None); };

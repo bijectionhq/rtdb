@@ -84,11 +84,24 @@ impl WorldClockMode {
     }
 }
 
+/// The original retained publication of a single writable Held ancestor.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OwnedWorldAncestor {
+    pub world: [u8; 16],
+    pub pin: [u8; 16],
+    pub capture: [u8; 16],
+    pub suffix: [u8; 16],
+    pub manifest: String,
+    pub basis: TransactionKey,
+    pub logical: Timestamp,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedWorld {
     pub id: Iid,
     pub pin: Iid,
     pub capture: Iid,
+    pub ancestor: Option<OwnedWorldAncestor>,
     pub suffix: Option<Iid>,
     pub manifest: String,
     pub basis: TransactionKey,
@@ -101,7 +114,10 @@ pub struct OwnedWorld {
 
 impl OwnedWorld {
     pub fn inherited_clock(&self) -> Timestamp {
-        self.parent_publication.unwrap_or(self.basis.system_time)
+        self.ancestor.as_ref().map_or_else(
+            || self.parent_publication.unwrap_or(self.basis.system_time),
+            |ancestor| ancestor.logical,
+        )
     }
 
     pub fn initial_clock(&self) -> Timestamp {
@@ -134,6 +150,18 @@ impl OwnedWorld {
                 Value::Binary(self.schemas.encoded.clone()),
             ),
         ]);
+        if let Some(ancestor) = &self.ancestor {
+            row.insert("ancestor".into(), Value::Struct(StructFields::from([
+                ("world".into(), Value::Uuid(ancestor.world)),
+                ("pin".into(), Value::Uuid(ancestor.pin)),
+                ("capture".into(), Value::Uuid(ancestor.capture)),
+                ("suffix".into(), Value::Uuid(ancestor.suffix)),
+                ("manifest".into(), Value::Utf8(ancestor.manifest.clone())),
+                ("basis_id".into(), Value::I64(ancestor.basis.tx_id.0)),
+                ("basis_time".into(), Value::I64(ancestor.basis.system_time.0)),
+                ("logical".into(), Value::I64(ancestor.logical.0)),
+            ])));
+        }
         if let Some(suffix) = self.suffix {
             row.insert("suffix".into(), Value::Uuid(suffix.0));
         }
@@ -182,18 +210,48 @@ impl OwnedWorld {
             Some(Value::Uuid(id)) if *id != [0; 16] => Some(Iid(*id)),
             _ => return Err(Self::unavailable()),
         };
-        if row.len() != 12 + usize::from(row.contains_key("suffix"))
+        let ancestor = match row.get("ancestor") {
+            None | Some(Value::Null | Value::Undefined) => None,
+            Some(Value::Struct(fields)) if fields.len() == 8 => {
+                let uuid = |name| match fields.get(name) {
+                    Some(Value::Uuid(id)) if *id != [0; 16] => Ok(*id),
+                    _ => Err(Self::unavailable()),
+                };
+                let integer = |name| match fields.get(name) {
+                    Some(Value::I64(value)) => Ok(*value),
+                    _ => Err(Self::unavailable()),
+                };
+                let manifest = match fields.get("manifest") {
+                    Some(Value::Utf8(manifest)) if valid_manifest(manifest) => manifest.clone(),
+                    _ => return Err(Self::unavailable()),
+                };
+                let basis = TransactionKey {
+                    tx_id: TxId(integer("basis_id")?),
+                    system_time: Timestamp(integer("basis_time")?),
+                };
+                let logical = Timestamp(integer("logical")?);
+                let world = uuid("world")?;
+                if world == *id || *pin != *id || mode != WorldClockMode::Retained
+                    || basis.tx_id.0 <= *tx_id || basis.system_time.0 <= *time
+                    || basis.system_time.0 >= *until || logical <= inherited || logical > basis.system_time
+                {
+                    return Err(Self::unavailable());
+                }
+                Some(OwnedWorldAncestor { world, pin: uuid("pin")?, capture: uuid("capture")?,
+                    suffix: uuid("suffix")?, manifest, basis, logical })
+            }
+            _ => return Err(Self::unavailable()),
+        };
+        if row.len() != 12 + usize::from(row.contains_key("suffix")) + usize::from(row.contains_key("ancestor"))
             || *id == [0; 16] || *pin == [0; 16]
             || *capture == [0; 16]
             || *until <= *time
-            || manifest.len() != 43
-            || !manifest
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !valid_manifest(manifest)
         {
             return Err(Self::unavailable());
         }
         Ok(Self {
+            ancestor,
             id: Iid(*id),
             pin: Iid(*pin),
             capture: Iid(*capture),
@@ -216,7 +274,7 @@ impl OwnedWorld {
     }
 
     pub fn can_advance_to(&self, next: &Self) -> bool {
-        self.id == next.id
+        self.ancestor.is_none() && next.ancestor.is_none() && self.id == next.id
             && self.pin != next.pin
             && !self.dropped && !next.dropped
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
@@ -233,7 +291,7 @@ impl OwnedWorld {
     }
 
     fn shares_retained_archive(&self, next: &Self) -> bool {
-        self.pin != next.pin && !self.dropped && !next.dropped
+        self.ancestor.is_none() && next.ancestor.is_none() && self.pin != next.pin && !self.dropped && !next.dropped
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
             && self.capture == next.capture && self.suffix == next.suffix
             && self.manifest == next.manifest && self.basis == next.basis
@@ -257,7 +315,7 @@ impl OwnedWorld {
     }
 
     pub fn same_fork(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.id == other.id && self.ancestor == other.ancestor
             && self.pin == other.pin
             && self.capture == other.capture
             && self.suffix == other.suffix
@@ -272,6 +330,11 @@ impl OwnedWorld {
     pub fn unavailable() -> Anomaly {
         Anomaly::incorrect("rtdb.world/unavailable", "The owned world is unavailable")
     }
+}
+
+fn valid_manifest(manifest: &str) -> bool {
+    manifest.len() == 43
+        && manifest.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Every local fact is either a complete replacement or a tombstone.
@@ -341,5 +404,38 @@ impl WorldShadow {
             return Err(unavailable());
         }
         Ok(fact)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_held_ancestor_requires_independent_retained_child() -> Result<()> {
+        let mut child = OwnedWorld {
+            id: Iid([1; 16]), pin: Iid([1; 16]), capture: Iid([2; 16]), suffix: None,
+            ancestor: Some(OwnedWorldAncestor {
+                world: [3; 16], pin: [3; 16], capture: [4; 16], suffix: [5; 16],
+                manifest: "b".repeat(43),
+                basis: TransactionKey { tx_id: TxId(20), system_time: Timestamp(200) },
+                logical: Timestamp(150),
+            }),
+            manifest: "a".repeat(43),
+            basis: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
+            parent_publication: Some(Timestamp(100)), mode: WorldClockMode::Retained,
+            until: Timestamp(300), schemas: WorldSchemas::new(BTreeMap::new())?, dropped: false,
+        };
+        let stored = child.record();
+        assert_eq!(OwnedWorld::from_record(&stored)?, child);
+        assert_eq!(child.initial_clock(), Timestamp(150));
+
+        child.mode = WorldClockMode::Held { start: Timestamp(150) };
+        assert!(OwnedWorld::from_record(&child.record()).is_err());
+
+        child.mode = WorldClockMode::Retained;
+        child.ancestor.as_mut().expect("fixture contains an ancestor").logical = Timestamp(201);
+        assert!(OwnedWorld::from_record(&child.record()).is_err());
+        Ok(())
     }
 }

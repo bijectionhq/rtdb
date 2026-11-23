@@ -54,7 +54,7 @@ pub(crate) fn obsolete_fork_input(record: &DeploymentRecord, capture: Uuid) -> b
         && !record
             .checkpoint_worlds
             .values()
-            .any(|world| world.capture == capture && world.until.0 > now_ms().saturating_mul(1000))
+            .any(|world| world.retains_capture(capture, rtdb_types::Timestamp(now_ms().saturating_mul(1000))))
         && !record.checkpoint_suffix_pins.values().any(|pin| {
             pin.capture == capture
                 && (pin.expires_at_ms > now_ms()
@@ -181,7 +181,7 @@ async fn retire_capture_inner(
                 return Err(inconsistent("A live suffix pin retains this checkpoint capture"));
             }
             if record.checkpoint_worlds.values().any(|world| {
-                world.capture == capture && world.until.0 > now_ms().saturating_mul(1000)
+                world.retains_capture(capture, rtdb_types::Timestamp(now_ms().saturating_mul(1000)))
             }) {
                 return Err(inconsistent("A live world retains this checkpoint capture"));
             }
@@ -412,6 +412,7 @@ mod tests {
         record.checkpoint_worlds.insert(
             world,
             CheckpointWorldRetention {
+                ancestor: None,
                 world,
                 owner: "owner".into(),
                 capture,

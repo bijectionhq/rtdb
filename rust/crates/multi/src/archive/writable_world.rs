@@ -151,7 +151,7 @@ async fn copy_fork_suffix(
     restore_binding: Option<[u8; 32]>,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(Uuid, Option<Uuid>)> {
-    if !cut.is_publication() || deadline <= now() {
+    if (!cut.is_publication() && cut.overlay().is_none()) || deadline <= now() {
         return Err(OwnedWorld::unavailable());
     }
     let binding = archive_binding(archive)?;
@@ -191,6 +191,125 @@ async fn copy_fork_suffix(
     ).await?;
     replica_suffix::capture(directory, storage, archive, keys, hosted_task, deployment, suffix, pin, memory).await?;
     Ok((capture, Some(suffix)))
+}
+
+/// Materializes a separately held exact overlay position from the original
+/// placed replica stream. The result only identifies prepared archive media.
+pub(crate) async fn prepare_checkpoint_world_overlay(
+    directory: Arc<dyn Directory>, archive: &CellStorage, storage: &CellStorage,
+    agent: &crate::agent::NodeAgent, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
+    session: &mut NativeSession, deployment: Uuid, cut: rtdb_node::OwnedForkCut,
+    child: Uuid, retain_until: Timestamp,
+    resources: CheckpointReadResources<'_>,
+) -> Result<rtdb_flight_sql::PreparedWorldOverlay> {
+    let unavailable = OwnedWorld::unavailable;
+    let (world, pin, logical) = cut.overlay().ok_or_else(unavailable)?;
+    if child.is_nil() || child.as_bytes() == &world.0 || retain_until <= now() {
+        return Err(unavailable());
+    }
+    let source = directory.deployment(&deployment.to_string()).await?.ok_or_else(unavailable)?;
+    let retained = source.checkpoint_worlds.get(&Uuid::from_bytes(pin.0))
+        .filter(|retained| retained.ancestor.is_none() && retained.world.as_bytes() == &world.0
+            && retained.until >= retain_until)
+        .ok_or_else(unavailable)?;
+    admit_session(session, &source, &retained.owner)?;
+    if session.placed_history()? != Some(cut.scope()) { return Err(unavailable()); }
+    let live = session.open_owned_read().await?;
+    let (original, _charge) = live.world_registration(world).await?.filter(|(original, _)| {
+        original.pin == pin && !original.dropped && matches_retention(original, retained)
+    }).ok_or_else(unavailable)?;
+    if cut.basis() <= original.basis.system_time || cut.until() <= now() { return Err(unavailable()); }
+    if live.world_registration(Iid(*child.as_bytes())).await?.is_some() { return Err(unavailable()); }
+    let (capture, suffix) = if let Some(prior) = source.checkpoint_worlds.get(&child).filter(|prior| prior.until > now()) {
+        let ancestor = prior.ancestor.as_ref().filter(|ancestor| {
+            ancestor.world.as_bytes() == &world.0 && ancestor.pin.as_bytes() == &pin.0
+                && ancestor.logical == logical && cut.matches_basis(ancestor.basis)
+        }).ok_or_else(unavailable)?;
+        if prior.until != retain_until || prior.owner != retained.owner { return Err(unavailable()); }
+        (ancestor.capture, ancestor.suffix)
+    } else {
+        let (capture, suffix) = copy_fork_suffix(
+            Arc::clone(&directory), storage, archive, keys, hosted_task, agent, deployment,
+            &source, &cut, cut.until(), None, resources.memory,
+        ).await?;
+        (capture, suffix.ok_or_else(unavailable)?)
+    };
+    let installed = directory.deployment(&deployment.to_string()).await?.ok_or_else(unavailable)?;
+    admit_session(session, &installed, &retained.owner)?;
+    let (point, manifest) = capture_receipt(&installed, archive, deployment, capture)?.ok_or_else(unavailable)?;
+    let prepared = replica_suffix::accepted(&installed, &point, &manifest, suffix)?;
+    if !cut.matches_basis(prepared.basis) || installed.checkpoint_worlds.get(&Uuid::from_bytes(pin.0)) != Some(retained) {
+        return Err(unavailable());
+    }
+    let basis = prepared.basis;
+    let reusable = installed.checkpoint_worlds.get(&child).is_some_and(|prior|
+        prior.until > now() && prior.ancestor.as_ref().is_some_and(|ancestor| ancestor.suffix == suffix));
+    let until = if reusable { cut.until() }
+        else { cut.until().min(Timestamp(prepared.expires_at_ms.saturating_mul(1000))) };
+    let owner = &retained.owner;
+    let original = &original;
+    with_registered_capture_context(
+        directory.as_ref(), archive, keys, hosted_task,
+        CaptureSelection { deployment, capture, manifest: &manifest, suffix: Some(suffix), expected_basis: Some(basis) },
+        resources, |context, basis| async move {
+            let (archived, _charge) = rtdb_query::read_owned_world(Arc::clone(&context), owner, world)
+                .await?.ok_or_else(unavailable)?;
+            let publication = rtdb_query::read_owned_world_clock_revision(context, owner, world).await?;
+            if &archived != original || publication != Some((logical, basis.system_time)) {
+                return Err(unavailable());
+            }
+            Ok(())
+        },
+    ).await?;
+    // The copied position must still belong to an admitted source registration.
+    let reopened = open_world(directory.as_ref(), archive, session, deployment, Uuid::from_bytes(world.0)).await?;
+    if &reopened.record != original || now() >= until { return Err(unavailable()); }
+    let refreshed = reopened.snapshot.fork_overlay_cut(cut.scope(), original, basis.system_time).await?;
+    if refreshed.overlay() != cut.overlay() || !refreshed.matches_basis(basis) || now() >= until {
+        return Err(unavailable());
+    }
+    let ancestor = rtdb_directory::CheckpointWorldAncestor {
+        world: Uuid::from_bytes(world.0), pin: Uuid::from_bytes(pin.0), capture, suffix,
+        manifest_sha256: manifest.clone(), basis, logical,
+    };
+    let binding = CheckpointWorldRetention {
+        world: child, ancestor: Some(ancestor), owner: owner.clone(),
+        capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
+        schema_digest: retained.schema_digest, suffix: retained.suffix, basis: retained.basis,
+        parent_publication: retained.parent_publication, mode: WorldClockMode::Retained, until: retain_until,
+    };
+    let key = deployment.to_string();
+    update_installation(directory.as_ref(), &key, |current| {
+        let active = now();
+        if active >= until || active >= retain_until
+            || current.incarnation != installed.incarnation || current.log_epoch != installed.log_epoch
+            || PlacedAttemptScope::new(&current.stream("replica"), current.epoch)? != cut.scope()
+            || current.checkpoint_worlds.get(&Uuid::from_bytes(pin.0)) != Some(retained)
+        {
+            return Err(unavailable());
+        }
+        // Both exact captures must still be admitted when custody transfers to the pending child.
+        for archive_position in [
+            CheckpointReadWorld { deployment, capture, manifest_sha256: manifest.clone(), suffix: Some(suffix), basis },
+            CheckpointReadWorld {
+                deployment, capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
+                suffix: retained.suffix, basis: retained.basis,
+            },
+        ] {
+            admit_capture(current, archive, &archive_position)?;
+        }
+        current.checkpoint_worlds.retain(|_, world| world.until > active);
+        if let Some(prior) = current.checkpoint_worlds.get(&child) {
+            return if prior == &binding { Ok(()) } else { Err(unavailable()) };
+        }
+        if current.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS { return Err(unavailable()); }
+        current.checkpoint_worlds.insert(child, binding.clone());
+        Ok(())
+    }).await?;
+    Ok(rtdb_flight_sql::PreparedWorldOverlay {
+        world: world.0, parent_pin: pin.0, capture: *capture.as_bytes(), suffix: *suffix.as_bytes(),
+        manifest, basis, logical, until: retain_until, child: *child.as_bytes(),
+    })
 }
 
 /// Retain the pre-replay base once, then independently archive one exact
@@ -340,6 +459,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     live.check()?;
     let pin = Uuid::from_bytes(world.pin.0);
     let retained = CheckpointWorldRetention {
+        ancestor: None,
         world: id,
         owner,
         capture: Uuid::from_bytes(parent.capture),
@@ -427,12 +547,25 @@ pub(crate) async fn finish_checkpoint_replay_parents(
     Ok(())
 }
 
+fn world_ancestor(retained: &CheckpointWorldRetention) -> Option<rtdb_types::OwnedWorldAncestor> {
+    retained.ancestor.as_ref().map(|ancestor| rtdb_types::OwnedWorldAncestor {
+        world: *ancestor.world.as_bytes(),
+        pin: *ancestor.pin.as_bytes(),
+        capture: *ancestor.capture.as_bytes(),
+        suffix: *ancestor.suffix.as_bytes(),
+        manifest: ancestor.manifest_sha256.clone(),
+        basis: ancestor.basis,
+        logical: ancestor.logical,
+    })
+}
+
 fn world_record(
     pin: Uuid,
     retained: &CheckpointWorldRetention,
     schemas: rtdb_types::WorldSchemas,
 ) -> OwnedWorld {
     OwnedWorld {
+        ancestor: world_ancestor(retained),
         id: Iid(*retained.world.as_bytes()),
         pin: Iid(*pin.as_bytes()),
         capture: Iid(*retained.capture.as_bytes()),
@@ -466,6 +599,38 @@ pub(crate) async fn fork_checkpoint_world_selected(
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
+    if let Some((world, pin, logical)) = fork.cut.overlay() {
+        let unavailable = OwnedWorld::unavailable;
+        let child = Uuid::from_bytes(fork.world.0);
+        let retained = source.checkpoint_worlds.get(&child).ok_or_else(unavailable)?;
+        let ancestor = retained.ancestor.as_ref().ok_or_else(unavailable)?;
+        if !capture.is_nil() || suffix.is_some() || child.is_nil() || retained.world != child
+            || fork.world != fork.pin || retained.owner != owner || retained.until != until
+            || retained.mode != WorldClockMode::Retained || fork.cut.until() <= now() || until <= now()
+            || ancestor.world.as_bytes() != &world.0 || ancestor.pin.as_bytes() != &pin.0
+            || ancestor.logical != logical || !fork.cut.matches_basis(ancestor.basis)
+            || session.placed_history()? != Some(fork.cut.scope())
+        {
+            return Err(unavailable());
+        }
+        let source_retention = source.checkpoint_worlds.get(&Uuid::from_bytes(pin.0)).ok_or_else(unavailable)?;
+        let live = session.open_owned_read().await?;
+        let (registered, _charge) = live.world_registration(world).await?.ok_or_else(unavailable)?;
+        if registered.dropped || registered.pin != pin || !matches_retention(&registered, source_retention)
+            || registered.schemas.digest() != retained.schema_digest
+        {
+            return Err(unavailable());
+        }
+        admit_world_media(&source, archive, deployment_id, retained)?;
+        live.check()?;
+        drop(live);
+        let registration = world_record(child, retained, registered.schemas);
+        let outcome = session.register_owned_world_checked(&registration, fork).await?;
+        if !outcome.committed() {
+            return Err(outcome.error().cloned().unwrap_or_else(unavailable));
+        }
+        return Ok((child, outcome.tx_key()));
+    }
     let authored_advance = fork.previous.is_some() && fork.cut.is_publication()
         && fork.root.as_ref().is_some_and(|root| root.publication.is_some())
         && matches!(fork.requested, rtdb_node::WorldClockRequest::Retained);
@@ -607,6 +772,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         return Err(OwnedWorld::unavailable());
     }
     let retained = CheckpointWorldRetention {
+        ancestor: None,
         world: id,
         owner,
         capture: parent.capture,
@@ -687,7 +853,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
 }
 
 fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
-    world.id.0 == *retained.world.as_bytes()
+    world.ancestor == world_ancestor(retained)
+        && world.id.0 == *retained.world.as_bytes()
         && world.capture.0 == *retained.capture.as_bytes()
         && world.suffix.map(|suffix| Uuid::from_bytes(suffix.0)) == retained.suffix
         && world.manifest == retained.manifest_sha256
@@ -696,6 +863,30 @@ fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) ->
         && world.mode == retained.mode
         && world.until == retained.until
         && world.schemas.digest() == retained.schema_digest
+}
+
+fn parent_media(deployment: Uuid, retained: &CheckpointWorldRetention) -> CheckpointReadWorld {
+    CheckpointReadWorld {
+        deployment, capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
+        suffix: retained.suffix, basis: retained.basis,
+    }
+}
+
+fn ancestor_media(deployment: Uuid, ancestor: &rtdb_directory::CheckpointWorldAncestor) -> CheckpointReadWorld {
+    CheckpointReadWorld {
+        deployment, capture: ancestor.capture, manifest_sha256: ancestor.manifest_sha256.clone(),
+        suffix: Some(ancestor.suffix), basis: ancestor.basis,
+    }
+}
+
+fn admit_world_media(
+    installation: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, retained: &CheckpointWorldRetention,
+) -> Result<()> {
+    admit_capture(installation, archive, &parent_media(deployment, retained))?;
+    if let Some(ancestor) = &retained.ancestor {
+        admit_capture(installation, archive, &ancestor_media(deployment, ancestor))?;
+    }
+    Ok(())
 }
 
 struct OpenWorld {
@@ -730,14 +921,7 @@ async fn open_world(
     if retained.until <= now() {
         return Err(OwnedWorld::unavailable());
     }
-    let parent = CheckpointReadWorld {
-        deployment,
-        capture: retained.capture,
-        manifest_sha256: retained.manifest_sha256.clone(),
-        suffix: retained.suffix,
-        basis: retained.basis,
-    };
-    admit_capture(&installation, archive, &parent)?;
+    admit_world_media(&installation, archive, deployment, retained)?;
     if world.dropped
         || snapshot.present().system_time >= retained.until
         || !matches_retention(&world, retained)
@@ -803,13 +987,12 @@ pub(crate) async fn commit_checkpoint_world_batch(
         let pin = Uuid::from_bytes(section.parent_pin.0);
         let retained = installation.checkpoint_worlds.get(&pin).ok_or_else(OwnedWorld::unavailable)?;
         admit_session(session, &installation, &retained.owner)?;
-        if retained.world.as_bytes() != &section.world.0 || retained.basis != section.parent_basis || now() >= retained.until {
+        if retained.world.as_bytes() != &section.world.0 || retained.basis != section.parent_basis
+            || now() >= retained.until || (retained.ancestor.is_some() && !matches!(&section.effect, rtdb_node::OwnedWorldEffect::Drop))
+        {
             return Err(OwnedWorld::unavailable());
         }
-        admit_capture(&installation, archive, &CheckpointReadWorld {
-            deployment, capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
-            suffix: retained.suffix, basis: retained.basis,
-        })?;
+        admit_world_media(&installation, archive, deployment, retained)?;
         if matches!(&section.effect, rtdb_node::OwnedWorldEffect::Drop) {
             terminal.push((pin, retained));
         }
@@ -918,13 +1101,7 @@ impl OpenWorld {
     }
 
     fn parent(&self, deployment: Uuid) -> CheckpointReadWorld {
-        CheckpointReadWorld {
-            deployment,
-            capture: self.retained.capture,
-            manifest_sha256: self.retained.manifest_sha256.clone(),
-            suffix: self.retained.suffix,
-            basis: self.retained.basis,
-        }
+        parent_media(deployment, &self.retained)
     }
 
     /// Outer absence allows archive fallback. A local tombstone answers absence.

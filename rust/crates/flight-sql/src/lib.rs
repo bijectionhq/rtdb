@@ -19,4 +19,4 @@ pub use server::{ServerDriver, ServerHandle, ServerStatus};
 mod owned_actions;
 
 mod owned_world;
-pub use owned_world::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldParentVersion, WorldParentVersions, WorldPointResult, WorldPointRow};
+pub use owned_world::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, PreparedWorldOverlay, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldParentVersion, WorldParentVersions, WorldPointResult, WorldPointRow};
