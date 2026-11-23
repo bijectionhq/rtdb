@@ -135,14 +135,14 @@ impl OpenTransaction<'_> {
             });
             self.unique_changes.paths.insert(relation.clone(), path);
         }
-        let ordered = self.tx_key().system_time;
+        let valid_at = self.owned_constraint_present();
         if let Some(path) = self
             .unique_changes
             .paths
             .get_mut(relation)
             .and_then(Option::as_mut)
         {
-            if valid.lower() != ordered || valid.upper() != Timestamp::MAX || valid.is_empty() {
+            if valid.lower() != valid_at || valid.upper() != Timestamp::MAX || valid.is_empty() {
                 return Err(Anomaly::incorrect(
                     "rtdb.owned/unique-valid-time",
                     "Unique writes require validity from ordered present without an end",
@@ -355,7 +355,8 @@ impl OpenTransaction<'_> {
         &self, snapshot: Snapshot, owner: &str, relation: &OwnedRelation, id: &EntityId, column: &str,
     ) -> Result<Option<Vec<u8>>> {
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let cursor = rtdb_query::open_owned_point(context, owner, relation, id, None, Some(&[column])).await?;
+        let valid = Interval::at(self.owned_constraint_present())?;
+        let cursor = rtdb_query::open_owned_point(context, owner, relation, id, Some(valid), Some(&[column])).await?;
         match self.read_occupancy_cell(cursor, id, column, unique_uncovered).await? {
             None => Ok(None),
             Some(Value::Binary(key)) if !key.is_empty() && key.len() <= MAX_KEY_BYTES => Ok(Some(key)),

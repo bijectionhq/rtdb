@@ -417,6 +417,13 @@ impl<'a> OpenTransaction<'a> {
         Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
+
+    /// Constraint checks interpret mutations at their authored valid time.
+    /// Held replay retains that time while ordering new system revisions.
+    fn owned_constraint_present(&self) -> Timestamp {
+        self.hosted_replay.as_ref().map_or(self.tx_key().system_time, |replay| replay.source_time())
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
         self.context.check_cancelled()?;

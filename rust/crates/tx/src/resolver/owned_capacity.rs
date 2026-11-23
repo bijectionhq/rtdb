@@ -434,6 +434,7 @@ impl OpenTransaction<'_> {
                 .relations
                 .insert(relation.clone(), rule);
         }
+        let valid_at = self.owned_constraint_present();
         let Some(touched) = self
             .capacity_changes
             .relations
@@ -442,7 +443,7 @@ impl OpenTransaction<'_> {
         else {
             return Ok(());
         };
-        if valid.lower() != self.buffer.tx_key().system_time || valid.upper() != Timestamp::MAX {
+        if valid.lower() != valid_at || valid.upper() != Timestamp::MAX {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/capacity-valid-time",
                 "Capacity writes require validity from ordered present without an end",
@@ -550,6 +551,7 @@ impl OpenTransaction<'_> {
                     .filter(|&name| name != rule.column.as_str()),
             )
             .collect::<Vec<_>>();
+        let valid = Interval::at(self.owned_constraint_present())?;
         let mut deltas = BTreeMap::<EntityId, Delta>::new();
         let mut allocations = Vec::new();
         for id in ids {
@@ -565,7 +567,7 @@ impl OpenTransaction<'_> {
                     owner,
                     relation,
                     id,
-                    None,
+                    Some(valid),
                     Some(&columns),
                 )
                 .await?;
