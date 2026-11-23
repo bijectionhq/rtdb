@@ -1592,7 +1592,9 @@ pub(crate) async fn restore_checkpoint(
         .ok_or_else(|| unavailable("The current installation key is unavailable"))?;
     // The Directory CAS below still requires this same current checkpoint after
     // validating its authenticated source root. Recovery retains its ordered tail.
-    admit_lifetime_restore(directory, archive, keys, &point, &manifest_sha256, hosted_task, true).await?;
+    Box::pin(admit_lifetime_restore(
+        directory, archive, keys, &point, &manifest_sha256, hosted_task, true,
+    )).await?;
 
     let fenced = update_installation(directory, &id, |record| {
         if read_receipt(record)?.is_some() {
