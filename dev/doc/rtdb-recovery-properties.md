@@ -237,6 +237,7 @@ Upgrade logkeepers while retaining their journal directories, then quiesce direc
 Keep a quorum of logkeepers available within each ensemble during the logkeeper rollout.
 Upgraded readers accept legacy address inventories and packed parked records.
 Directory clients that predate bound inventories must be upgraded before those inventories are written.
+A serving receipt that omits rebuildable search objects uses its own digest domain, so every holder that may open the deployment must be upgraded before a holder publishes one.
 Reopen held deployments at a higher epoch to install the identity-bound activation.
 Resume an interrupted legacy cell transfer with both source and destination directories available so it can bind the source membership before copying.
 Before retiring or transferring an installation with an address-only inventory, verify each historical journal that received its replica stream.

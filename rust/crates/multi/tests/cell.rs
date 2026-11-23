@@ -3575,6 +3575,7 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.expect("the logkeepers trimmed the replica prefix before restarting the holder");
+    drop(reader);
     let table = TableRef::new("public", "docs");
     let snapshot = database.snapshot();
     let slug = snapshot.table_entry(&table).unwrap().slug.clone();

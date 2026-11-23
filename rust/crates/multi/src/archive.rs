@@ -1415,8 +1415,8 @@ pub(crate) async fn matches_recovery_manifest(
     store: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch, expected: [u8; 32],
 ) -> Result<bool> {
     if recovery_manifest_sha256(store, checkpoint, epoch).await? == expected { return Ok(true); }
-    // Older receipts committed to the full replay copy inventory.
-    Ok(replay_inventory_sha256(store, checkpoint, epoch).await? == expected)
+    // Older receipts committed to the full replay copy inventory, which a lost derived search object leaves unobservable.
+    Ok(replay_inventory_sha256(store, checkpoint, epoch).await.is_ok_and(|digest| digest == expected))
 }
 
 async fn hash_recovery_inventory(
@@ -1432,7 +1432,10 @@ async fn hash_recovery_inventory(
     let mut closure = catalog_objects_at_view(store, &catalog, inventory, false).await?.into_iter();
 
     let mut manifest = ring::digest::Context::new(&ring::digest::SHA256);
-    manifest.update(b"rtdb/recovery-manifest/v1\0");
+    manifest.update(match inventory {
+        CheckpointInventory::Serving => b"rtdb/recovery-manifest/serving/v1\0".as_slice(),
+        CheckpointInventory::Copy(_) => b"rtdb/recovery-manifest/v1\0".as_slice(),
+    });
     manifest.update(&encode(&(root, epoch.0, first_required))?);
     loop {
         let batch = closure.by_ref().take(OBSERVATION_BATCH_MEMBERS).collect::<Vec<_>>();
@@ -3199,8 +3202,8 @@ mod tests {
         assert!(matches_recovery_manifest(store.as_ref(), checkpoint, epoch, legacy).await?);
         store.delete(&posting).await?;
         assert!(matches_recovery_manifest(store.as_ref(), checkpoint, epoch, published).await?);
-        assert_eq!(matches_recovery_manifest(store.as_ref(), checkpoint, epoch, legacy).await.unwrap_err().code,
-            "rtdb.storage/missing-object");
+        assert!(!matches_recovery_manifest(store.as_ref(), checkpoint, epoch, legacy).await?,
+            "a legacy receipt over a lost posting run no longer matches");
 
         let primary = key(&entry.slug.data_key(&TrieKey::new(2, None, vec![0], BlockIndex(checkpoint.block))?))?;
         for required in [primary, page] {
