@@ -23,6 +23,7 @@ import org.apache.arrow.flight.CloseSessionRequest
 import org.apache.arrow.flight.CloseSessionResult
 import org.apache.arrow.flight.FlightCallHeaders
 import org.apache.arrow.flight.FlightClientMiddleware
+import org.apache.arrow.flight.FlightServerMiddleware
 import org.apache.arrow.flight.GetSessionOptionsRequest
 import org.apache.arrow.flight.HeaderCallOption
 import org.apache.arrow.flight.Location
@@ -43,6 +44,10 @@ import org.apache.arrow.flight.sql.impl.FlightSql.SqlSupportedTransaction
 import org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementIngest.TableDefinitionOptions
 import org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementIngest.TableDefinitionOptions.TableExistsOption
 import org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementIngest.TableDefinitionOptions.TableNotExistOption
+import io.opentelemetry.sdk.common.CompletableResultCode
+import io.opentelemetry.sdk.trace.data.SpanData
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor
+import io.opentelemetry.sdk.trace.export.SpanExporter
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.BigIntVector
@@ -66,6 +71,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import xtdb.InternalApi
 import xtdb.api.FlightSql
 import xtdb.api.error.Incorrect
 import xtdb.api.FlightSqlConfig
@@ -80,6 +86,8 @@ import java.time.Instant
 import java.time.InstantSource
 import java.time.ZonedDateTime
 import java.util.*
+import java.util.concurrent.Phaser
+import java.util.concurrent.TimeUnit.SECONDS
 
 class FlightSqlAdbcTest {
 
@@ -94,11 +102,25 @@ class FlightSqlAdbcTest {
 
     private val emptyCallOpts = arrayOf<CallOption>()
 
+    private val spans = mutableListOf<SpanData>()
+
     @BeforeEach
     fun setUp() {
         xtdb = Xtdb.openNode {
             server { port = 0 }
             flightSql { port = 0 }
+            tracer {
+                enabled = true
+                spanProcessor = SimpleSpanProcessor.create(object : SpanExporter {
+                    override fun export(spanData: Collection<SpanData>): CompletableResultCode {
+                        spans.addAll(spanData)
+                        return CompletableResultCode.ofSuccess()
+                    }
+
+                    override fun flush() = CompletableResultCode.ofSuccess()
+                    override fun shutdown() = CompletableResultCode.ofSuccess()
+                })
+            }
         }
 
         flightPort = xtdb.flightSqlPort
@@ -391,15 +413,38 @@ class FlightSqlAdbcTest {
     }
 
     private class TestClock(@Volatile var now: Instant = Instant.parse("2030-01-01T00:00:00Z")) : InstantSource {
+        private val calls = Phaser(1)
+
+        fun trackCall(): FlightServerMiddleware {
+            calls.register()
+            return object : FlightServerMiddleware {
+                override fun onBeforeSendingHeaders(outgoingHeaders: CallHeaders) = Unit
+
+                override fun onCallCompleted(status: CallStatus) {
+                    calls.arriveAndDeregister()
+                }
+
+                override fun onCallErrored(err: Throwable) = Unit
+            }
+        }
+
         override fun instant(): Instant = now
-        fun advance(d: Duration) { now = now.plus(d) }
+
+        fun advance(d: Duration) {
+            calls.awaitAdvanceInterruptibly(calls.arrive(), 10, SECONDS)
+            now = now.plus(d)
+        }
     }
 
+    @OptIn(InternalApi::class)
     private fun <R> withClockedServer(
         vararg middleware: FlightClientMiddleware.Factory, f: (FlightSqlClient, TestClock) -> R
     ): R {
         val clock = TestClock()
-        return FlightSql.open(xtdb, FlightSqlConfig().port(0), clock, sweepInterval = Duration.ofDays(1)).use { srv ->
+        return FlightSql.open(xtdb, FlightSqlConfig().port(0), clock, sweepInterval = Duration.ofDays(1)) {
+            // This runs after the session middleware releases the lease for each call.
+            middleware(FlightServerMiddleware.Key.of("test-clock")) { _, _, _ -> clock.trackCall() }
+        }.use { srv ->
             val builder = FlightClient.builder(al, Location.forGrpcInsecure("127.0.0.1", srv.port))
             middleware.forEach { builder.intercept(it) }
             FlightSqlClient(builder.build()).use { client -> f(client, clock) }
@@ -1799,6 +1844,22 @@ class FlightSqlAdbcTest {
         assertEquals(
             listOf(mapOf("_id" to "jms", "name" to "James")),
             fsqlClient.execute("SELECT _id, name FROM users", *emptyCallOpts).readRows()
+        )
+    }
+
+    @Test
+    fun `a flight sql connection tags its query span XTDB Flight SQL`() {
+        conn.createStatement().use { stmt ->
+            stmt.setSqlQuery("SELECT 1")
+            stmt.executeQuery().use { r -> while (r.reader.loadNextBatch()) { } }
+        }
+
+        Thread.sleep(100)
+
+        assertEquals(
+            "XTDB Flight SQL",
+            spans.first { it.name == "xtdb.query" }.attributes.asMap()
+                .entries.first { it.key.key == "application.name" }.value
         )
     }
 }

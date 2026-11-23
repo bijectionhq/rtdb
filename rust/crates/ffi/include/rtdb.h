@@ -106,6 +106,7 @@ int32_t rtdb_v1_session_open(RtdbHandle database, const uint8_t *name, size_t na
                            const uint8_t *user, size_t user_length, const uint8_t *secret, size_t secret_length,
                            RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_session_set_catalog(RtdbHandle session, const uint8_t *name, size_t name_length, RtdbHandle *error);
+int32_t rtdb_v1_session_set_application_name(RtdbHandle session, const uint8_t *name, size_t name_length, RtdbHandle *error);
 int32_t rtdb_v1_session_await_token(RtdbHandle session, RtdbHandle *out, RtdbHandle *error);
 
 /* Operations descend from their session's cancellation lifetime.

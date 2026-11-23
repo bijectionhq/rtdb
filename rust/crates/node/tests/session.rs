@@ -317,7 +317,8 @@ fn retained_parameters_reject_over_budget_updates_atomically() {
     assert_eq!(session.parameter("application_name"), Some("client"));
     assert_eq!(service.memory.used_bytes(), retained);
     session.reset().unwrap();
-    assert_eq!(service.memory.used_bytes(), baseline);
+    assert_eq!(session.application_name(), "client");
+    assert_eq!(service.memory.used_bytes(), retained);
     drop(session);
     assert_eq!(service.memory.used_bytes(), 0);
 }
