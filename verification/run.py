@@ -12,7 +12,7 @@ import subprocess
 import tarfile
 import tempfile
 
-from residence_trace import project, verify_native
+from residence_trace import project, verify_joined, verify_native
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -3247,6 +3247,11 @@ RESIDENCE_AUTHORITY_CONTROLS = (
     ("ack_before_closure", "AcknowledgedClosure"),
     ("arm_before_successor", "ErasureHasSuccessor"),
     ("use_revoked_cache", "RevokedCacheClosed"),
+    ("ack_payload_quorum", "AcknowledgedDecision"),
+    ("read_unpublished_decision", "FreshIndexHasPublication"),
+    ("lose_decision_on_activation", "DecisionSurvivesActivation"),
+    ("grant_without_fence", "RecoveryFenceProtectsDeletion"),
+    ("trim_without_fence", "RecoveryFenceProtectsDeletion"),
 )
 RESIDENCE_AUTHORITY_CASES = (
     ("ResidenceComposition", "residence-authorities",
@@ -3374,6 +3379,8 @@ def verify_composed_residence_trace(args, scratch):
         positions.setdefault(event[0], index)
     swaps = {
         "uncovered-acknowledgement": ("acknowledge", "publish-checkpoint"),
+        "ack-before-publication": ("ack-commit", "publish-decision"),
+        "delete-before-recovery-fence": ("authorize-version", "install-recovery-fence"),
         "successor-missing": ("arm-erasure", "publish-checkpoint"),
         "retained-catalog": ("advance-floor", "drain-provider-read"),
         "retained-suffix": ("trim", "finish-recovery"),
@@ -3411,6 +3418,8 @@ def verify_composed_residence_trace(args, scratch):
 
     for kind, field, value in (
         ("capture-fresh", "loglet", "unknown-ensemble"),
+        ("capture-fresh", "decision", "other-prefix"),
+        ("authorize-version", "recovery_root", "other-closure"),
         ("revoke-key", "key_slot", "different-key"),
         ("remove-version", "publication", {"key": "outside", "version": "replacement", "epoch": 0}),
         ("copy-fork", "destination", "another-fork"),
@@ -4962,6 +4971,17 @@ def verify_native_recovery_trace(args, source):
     if not required.issubset(event["event"] for event in native):
         raise ValueError(f"{label}: the native residence capture omitted a checkpoint, hold, or trim observation")
     verify_native(native)
+    verify_joined([native])
+    bad_root = copy.deepcopy(native)
+    published = next(event for event in bad_root if event["event"] == "authorize-trim")
+    published["manifest"][0] ^= 1
+    try:
+        verify_joined([bad_root])
+    except ValueError as error:
+        if "authorize-trim lacks the exact published recovery closure" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted a substituted recovery manifest")
     bad_scope = copy.deepcopy(native)
     applied = next(event for event in bad_scope if event["event"] == "apply-trim")
     applied["epoch"] += 1
@@ -5954,6 +5974,9 @@ def main():
         "rust/crates/multi/src/logs.rs",
         "rust/crates/multi/src/recovery_holds.rs",
         "rust/crates/multi/src/residence_trace.rs",
+        "rust/crates/types/src/residence_trace.rs",
+        "rust/crates/logkeeper/src/client/writer.rs",
+        "rust/crates/storage/src/cache.rs",
         "rust/crates/multi/src/hosted_recovery.rs",
         "rust/crates/multi/src/journal/log.rs",
         "rust/crates/pg-source/src/driver.rs",

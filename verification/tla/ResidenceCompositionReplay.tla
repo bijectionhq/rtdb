@@ -49,6 +49,10 @@ ObservedStep(event) ==
       [] kind = "receipt-clock" -> ObserveReceiptClock(cut) /\ authority'.receiptClock = epoch
       [] kind = "collect-receipt" -> CollectReceipt /\ authority.receiptClock = cut
       [] kind = "redeem-receipt" -> RedeemReceipt(publication, outcome)
+      [] kind = "certify-decision" -> CertifyDecision(cut)
+      [] kind = "publish-decision" -> PublishDecision(epoch, cut)
+      [] kind = "ack-commit" -> AcknowledgeCommit(cut)
+      [] kind = "install-recovery-fence" -> InstallRecoveryFence(cut)
       [] kind = "change-loglet" -> ChangeLoglet /\ authority'.loglet = epoch
       [] kind = "read-index" -> ConfirmReadIndex(epoch, cut)
       [] kind = "capture-fresh" -> CaptureFresh(cut) /\ authority.indexFor = epoch
@@ -70,6 +74,8 @@ Complete ==
     /\ source = {} /\ forkCopy = Needs(fork)
     /\ (~ExtendAuthorities \/
         /\ authority.confirmed = 1 /\ ~authority.retained /\ authority.clockRegressed
+        /\ authority.acknowledged = 1 /\ authority.activationFloor = 1
+        /\ authority.recoveryFence = 1 /\ authority.deletion = "old"
         /\ authority.redemption = "expired" /\ authority.captured = 1
         /\ authority.cacheResult = "erased-under-view")
     /\ IF DisposalEffectsOnly

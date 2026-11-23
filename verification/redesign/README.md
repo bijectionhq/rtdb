@@ -16,7 +16,7 @@ The second review revises the custody and erasure contracts and adds the placed 
 | R6 Sealing with destroyable data keys | [R6-sealing.md](R6-sealing.md) | Multi seals under a per-deployment key; classic unsealed; no per-unit keys |
 | R7 History collection and privacy erasure | [R7-eraser.md](R7-eraser.md) | Contract and bounded custody model; runtime pending |
 | R8 Retention of receipts and transaction metadata | [R8-metadata-retention.md](R8-metadata-retention.md) | Ordered expiry and receipt compaction land. New checkpoints omit covered receipt tries. Directory deployments retire exact loose receipt L0 after successor publication and replay exclusion. Classic local retirement uses a detached repair anchor. Closure over remaining copies stays open. |
-| R9 Capabilities and composed model | [R9-capabilities-and-composition.md](R9-capabilities-and-composition.md) | Exact read-index, hosted retirement and PostgreSQL feedback capabilities are wired. The composed model and replay represent R1–R8. Multi emits native diagnostic observations. Full production coverage and execution evidence for the new paths remain open. |
+| R9 Capabilities and composed model | [R9-capabilities-and-composition.md](R9-capabilities-and-composition.md) | Typed query holds, fresh-read and retirement authority, revocable-store cache exclusion, and hosted feedback recovery gates land. The bounded model represents R1–R8 and the T1/T2 prerequisites. Native captures join recovery owners. Full provider, cursor-local key and cross-owner replay coverage remains open. |
 
 Dependency order: R4 and R6 can proceed in parallel; R5 needs R4; R7 needs R5 and R6; R8 needs R7; R9 grows with each.
 

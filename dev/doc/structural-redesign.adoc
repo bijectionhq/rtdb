@@ -223,11 +223,12 @@ Held archive and remaining provider custody closure stay open.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
-|Fresh snapshot capture retains the exact read index through capture, and hosted exact removal consumes a lineage deletion grant.
-The shared model and replay cover the R1–R8 authority transitions in a bounded residence.
-Multi records scoped native observations for diagnostic validation.
-PostgreSQL source feedback uses a permit derived from checkpoint or retained-local-replay evidence.
-Full storage-read and hosted recovery-acknowledgement capability coverage, cross-owner native replay and execution evidence remain open.
+|Catalog holds bind pool residence and physical cut through query execution and provider drain.
+Revocable stores opt out of shared plaintext and decoded-page caching.
+Hosted PostgreSQL feedback follows the exact published recovery root.
+The bounded replay includes quorum publication before acknowledgement and recovery exclusion before deletion.
+Native replay joins checkpoint, trim and dependent retirement observations by exact identities and revisions.
+Universal low-level read and cursor-local key enforcement, production T1 and T2 completion, full cross-owner replay, and execution evidence remain open.
 |===
 
 == Placed serving and search

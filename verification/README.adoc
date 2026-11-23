@@ -129,6 +129,8 @@ The checker requires a covering published manifest and preserves each recorded r
 It checks each observed physical floor against the authorization held at that observation.
 Run `python3 verification/recovery_trace.py /path/to/rust-recovery-trace.json` to check the capture again.
 The same fixture supplies scoped Multi observations to the residence validator, which compares physical trim with its exact directory authorization.
+The joined replay also requires the exact published root and manifest at or before each authorization, while the negative control substitutes the manifest.
+The standalone checker accepts additional per-process captures with repeated `--join PATH` arguments.
 Use `python3 verification/residence_trace.py /path/to/rust-residence-observations.jsonl` to recheck those observations.
 The native replay also includes the thousand-conjunct plan on RTDB's production worker stack.
 The archived controls skip cursor admission and reopen an admitted cursor.

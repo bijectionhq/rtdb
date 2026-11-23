@@ -122,3 +122,29 @@ The authored projection abstracts plurality of held views, receipt identities an
 The native runner also includes the existing thousand-conjunct fixture on the production worker stack.
 Cross-process trace reconstruction, observation of every runtime linearization point, configured-provider evidence and execution of the worker-stack fixture remain open.
 The expanded model, replay controls and Rust changes have source review only.
+
+## Round 3 continuation
+
+The storage pool issues an opaque catalog registration bound to its physical cut and pool residence.
+Query entry points verify that authority before opening or advancing a cursor, returning an in-memory answer, or sending a delegated or direct owned answer.
+Provider admission retains the held catalogs and registered owner through I/O drain.
+Prepared audience queries reuse their registration on the same pool and within its admitted scope.
+
+A shared byte or decoded-page cache requires an explicit opt-in by the underlying object owner.
+Encrypted and captured object stores use fresh owner-mediated reads, and coordinated raw providers can cache ciphertext below decryption.
+Already materialized plaintext owned by an individual cursor or other execution still needs an exact live-key fence through consumption.
+That work depends on the per-unit authority and drain contract for each provider and capture kind.
+
+A hosted PostgreSQL confirmation can advance from the locally adopted checkpoint only after the live recovery owner confirms its identical root and replica boundary.
+Directory-managed journals require the installed manifest, active writer scope and usable replay start.
+Installed journals compare the selected durable checkpoint against the current writer grant.
+The feedback driver retries the checkpoint comparison as publication advances.
+The early feedback path continues to require synced local source, replica, and object recovery.
+
+The shared bounded model now requires a matching certificate with a publication quorum before acknowledgement or a fresh decision at the successor cut.
+A successor loglet retains the installed decision floor.
+Trimming and exact deletion require an installed recovery fence after replacement publication and older replay drain.
+The native checker joins observed checkpoint, trim and offloaded-object retirement decisions by scope, revision, root, manifest and journal anchor.
+This join covers the recorded recovery and retirement owners.
+The full native capture still needs the production T1 certificate-to-query handoff, T2's exact reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
+The new model, controls and native joins have source review only.

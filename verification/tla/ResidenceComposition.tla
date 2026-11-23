@@ -34,7 +34,7 @@ VARIABLES
     fork,
     \* @type: Bool;
     stalePublication,
-    \* @type: {systemTime: Int, rawTime: Int, receiptClock: Int, clockRegressed: Bool, mode: Str, requestedTime: Int, decision: Str, retained: Bool, redemption: Str, redemptionBody: Str, redemptionExpired: Bool, namingEpoch: Int, loglet: Int, indexFor: Int, indexThrough: Int, captured: Int, captureLoglet: Int, confirmed: Int, erasure: Str, cacheResult: Str};
+    \* @type: {systemTime: Int, rawTime: Int, receiptClock: Int, clockRegressed: Bool, mode: Str, requestedTime: Int, decision: Str, retained: Bool, redemption: Str, redemptionBody: Str, redemptionExpired: Bool, namingEpoch: Int, loglet: Int, indexFor: Int, indexThrough: Int, captured: Int, captureLoglet: Int, confirmed: Int, erasure: Str, cacheResult: Str, certified: Int, publications: Set(Int), acknowledged: Int, activationFloor: Int, recoveryFence: Int, deletion: Str};
     authority
 
 vars == <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
@@ -55,7 +55,9 @@ AuthorityInit ==
     [systemTime |-> 0, rawTime |-> 0, receiptClock |-> 0, clockRegressed |-> FALSE, mode |-> "", requestedTime |-> 0,
      decision |-> "", retained |-> FALSE, redemption |-> "", redemptionBody |-> "", redemptionExpired |-> FALSE,
      namingEpoch |-> 0, loglet |-> 0, indexFor |-> None, indexThrough |-> None,
-     captured |-> None, captureLoglet |-> None, confirmed |-> None, erasure |-> "open", cacheResult |-> ""]
+     captured |-> None, captureLoglet |-> None, confirmed |-> None, erasure |-> "open", cacheResult |-> "",
+     certified |-> None, publications |-> {}, acknowledged |-> None, activationFloor |-> 0,
+     recoveryFence |-> 0, deletion |-> ""]
 
 Init ==
     /\ authority = AuthorityInit
@@ -114,6 +116,7 @@ FinishRecovery ==
 Trim ==
     /\ Open /\ firstRecord = 1 /\ checkpoint = 1
     /\ (recovery # 0 \/ Mutation = "trim_ignores_recovery")
+    /\ (~ExtendAuthorities \/ authority.recoveryFence = 1 \/ Mutation = "trim_without_fence")
     /\ firstRecord' = 2
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery,
                    phase, source, forkCopy, prepared, fork, stalePublication>>
@@ -145,12 +148,15 @@ CancelPreparation ==
 AuthorizeVersion ==
     /\ phase = "serving" /\ prepared = None /\ floor = 1 /\ "old" \in source
     /\ 0 \notin RetirementCuts
+    /\ (~ExtendAuthorities \/ authority.recoveryFence = 1 \/ Mutation = "grant_without_fence")
+    /\ authority' = [authority EXCEPT !.deletion = IF ExtendAuthorities THEN "old" ELSE ""]
     /\ phase' = "retiring"
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
                    source, forkCopy, prepared, fork, stalePublication>>
 
 ApplyVersionRemoval ==
     /\ phase = "retiring" /\ "old" \in source
+    /\ (~ExtendAuthorities \/ authority.deletion = "old")
     /\ source' = source \ (IF Mutation = "remove_by_path" THEN {"old", "new"} ELSE {"old"})
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
                    phase, forkCopy, prepared, fork, stalePublication>>
@@ -194,7 +200,7 @@ SettleDisposal ==
 
 StorageNext == PublishCheckpoint \/ OpenQuery \/ CloseQuery \/ BeginProviderRead \/ DrainProviderRead
         \/ AdmitRecovery \/ FinishRecovery \/ Trim \/ AdvanceFloor \/ PrepareFork \/ PublishFork
-        \/ CancelPreparation \/ AuthorizeVersion \/ ApplyVersionRemoval \/ SettleVersion
+        \/ CancelPreparation \/ ApplyVersionRemoval \/ SettleVersion
         \/ AuthorizeDisposal \/ SettleDisposal
         \/ \E publication \in Publications : CopyForkPublication(publication) \/ EraseResidencePublication(publication)
 
@@ -238,13 +244,37 @@ RedeemReceipt(body, answer) ==
           /\ authority' = [authority EXCEPT !.redemption = answer, !.redemptionBody = body, !.redemptionExpired = expired]
     /\ UNCHANGED vars
 
+DecisionVisible == authority.publications \in {{1, 2}, {1, 3}, {2, 3}, {1, 2, 3}}
+
+CertifyDecision(cut) ==
+    /\ phase = "serving" /\ cut = 1 /\ head = cut /\ authority.certified = None
+    /\ authority' = [authority EXCEPT !.certified = cut]
+    /\ UNCHANGED vars
+
+PublishDecision(peer, cut) ==
+    /\ Open /\ cut = authority.certified /\ cut = 1 /\ peer \notin authority.publications
+    /\ authority' = [authority EXCEPT !.publications = @ \cup {peer},
+            !.activationFloor = IF authority.loglet = 1 /\ authority.publications # {}
+                                 THEN cut ELSE @]
+    /\ UNCHANGED vars
+
+AcknowledgeCommit(cut) ==
+    /\ Open /\ head = cut /\ cut = authority.certified /\ cut = 1
+    /\ authority.acknowledged = None
+    /\ (DecisionVisible \/ Mutation = "ack_payload_quorum")
+    /\ authority' = [authority EXCEPT !.acknowledged = cut]
+    /\ UNCHANGED vars
+
 ChangeLoglet ==
     /\ phase = "serving" /\ authority.loglet = 0
-    /\ authority' = [authority EXCEPT !.loglet = 1]
+    /\ authority' = [authority EXCEPT !.loglet = 1,
+            !.activationFloor = IF DecisionVisible /\ Mutation # "lose_decision_on_activation" THEN authority.certified ELSE 0]
     /\ UNCHANGED vars
 
 ConfirmReadIndex(epoch, through) ==
     /\ Open /\ epoch = authority.loglet /\ through = head /\ authority.indexFor # epoch
+    /\ (through = 0 \/ (DecisionVisible /\ (epoch = 0 \/ authority.activationFloor >= through))
+        \/ Mutation = "read_unpublished_decision")
     /\ authority' = [authority EXCEPT !.indexFor = epoch, !.indexThrough = through]
     /\ UNCHANGED vars
 
@@ -262,6 +292,12 @@ Acknowledge(cut) ==
     /\ Open /\ cut = 1 /\ head = cut /\ authority.confirmed = None
     /\ ((checkpoint >= cut /\ Needs(checkpoint) \subseteq source) \/ Mutation = "ack_before_closure")
     /\ authority' = [authority EXCEPT !.confirmed = cut]
+    /\ UNCHANGED vars
+
+InstallRecoveryFence(cut) ==
+    /\ phase = "serving" /\ cut = 1 /\ authority.recoveryFence < cut
+    /\ checkpoint = cut /\ Needs(cut) \subseteq source /\ recovery # 0
+    /\ authority' = [authority EXCEPT !.recoveryFence = cut]
     /\ UNCHANGED vars
 
 PrepareErasure ==
@@ -292,15 +328,23 @@ AuthorityNext ==
     \/ \E sample \in {0, 3} : ObserveReceiptClock(sample)
     \/ CollectReceipt
     \/ \E body \in {"original", "other"}, answer \in {"accepted", "refused", "conflict", "expired"} : RedeemReceipt(body, answer)
+    \/ \E cut \in {1} : CertifyDecision(cut) \/ AcknowledgeCommit(cut) \/ InstallRecoveryFence(cut)
+    \/ \E peer \in 1..3, cut \in {1} : PublishDecision(peer, cut)
     \/ ChangeLoglet
     \/ \E epoch \in 0..1, through \in 0..1 : ConfirmReadIndex(epoch, through)
     \/ \E cut \in 0..1 : CaptureFresh(cut) \/ Acknowledge(cut)
     \/ PrepareErasure \/ ArmErasure \/ RevokeKey
     \/ \E answer \in {"page", "erased-under-view"} : ReadOldCachedPage(answer)
 
-Next == Install \/ (StorageNext /\ UNCHANGED authority) \/ (ExtendAuthorities /\ AuthorityNext)
+Next == Install \/ AuthorizeVersion \/ (StorageNext /\ UNCHANGED authority) \/ (ExtendAuthorities /\ AuthorityNext)
 Spec == Init /\ [][Next]_allVars
 
+AcknowledgedDecision == authority.acknowledged # None => DecisionVisible
+FreshIndexHasPublication == authority.indexThrough = 1 => DecisionVisible
+DecisionSurvivesActivation == authority.loglet = 1 /\ authority.acknowledged # None =>
+    authority.activationFloor >= authority.acknowledged
+RecoveryFenceProtectsDeletion == ExtendAuthorities /\ (authority.deletion # "" \/ firstRecord = 2) =>
+    authority.recoveryFence = 1
 BoundedAppend == authority.decision # "" => authority.systemTime > 0 /\ authority.systemTime <= authority.rawTime
 ExternalClamp == authority.mode = "external" =>
     authority.systemTime = IF authority.requestedTime > authority.rawTime THEN authority.rawTime ELSE authority.requestedTime
@@ -328,6 +372,8 @@ Safe == FloorKeepsHeldCatalogs /\ RetainedCutsReadable /\ ReplaySurvivesTrim /\ 
         /\ ForkCopyMatches /\ ClosedAfterDrain /\ ReceiptConfirmsAbsence /\ PublicationRespectsClose
         /\ BoundedAppend /\ ExternalClamp /\ DistinctNamingEpoch /\ ReceiptExpiry /\ ReceiptReplay
         /\ FreshCapture /\ AcknowledgedClosure /\ ErasureHasSuccessor /\ RevokedCacheClosed
+        /\ AcknowledgedDecision /\ FreshIndexHasPublication /\ DecisionSurvivesActivation
+        /\ RecoveryFenceProtectsDeletion
 
 NeverDisposesAfterTrimAndForkCopy ==
     ~(phase = "disposed" /\ head = 1 /\ firstRecord = 2 /\ fork = 1 /\ forkCopy = Needs(1))

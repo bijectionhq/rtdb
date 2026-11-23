@@ -1,5 +1,6 @@
 pub mod directory_io;
 pub mod readset;
+pub mod residence_trace;
 mod error;
 mod calendar;
 mod zone;

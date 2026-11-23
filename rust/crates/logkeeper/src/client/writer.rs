@@ -761,6 +761,12 @@ impl Writer {
     }
 
     fn release(&self, pipeline: &mut Pipeline, quorum: i64) {
+        rtdb_types::residence_trace::logkeeper_publication(
+            &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), quorum,
+            self.ensemble.config.write_quorum,
+            || pipeline.replicas.iter().enumerate().filter_map(|(peer, replica)|
+                (replica.installed >= quorum).then_some(peer)).collect(),
+        );
         let previous = pipeline.commit;
         pipeline.commit = quorum;
         self.tip.send_replace(Tip::Open(quorum));

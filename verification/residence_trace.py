@@ -43,6 +43,14 @@ def verify_native(events):
                     require(deletes.setdefault(key, identity) == identity, "retirement changed its publication")
                 else:
                     require(deletes.get(key) == identity, "delete lacks a matching exact authorization")
+            elif kind == "quorum-publication":
+                peers = event["installed"]
+                require(digest(event["ensemble"]) and event["epoch"] > 0 and event["through"] >= 0
+                        and event["quorum"] > 0 and len(peers) == len(set(peers)) and len(peers) >= event["quorum"],
+                        "publication lacks its durable quorum")
+            elif kind == "retirement-recovery-dependency":
+                require(digest(event["anchor"]) and event["position"] <= event["trim_through"],
+                        "retirement has no matching recovery exclusion")
             elif kind == "authorize-trim":
                 checkpoint = event["checkpoint"]
                 require(digest(event["manifest"]) and digest(checkpoint["root_sha256"])
@@ -110,6 +118,59 @@ def verify_native(events):
                         f"native observation {index + 1}: catalog hold precedes the admission floor")
 
 
+def replica_scope(event):
+    return scope(event, ("installation", "incarnation", "epoch", "stream"))
+
+
+def exact_checkpoint(event, checkpoint, manifest):
+    return (*replica_scope(event), checkpoint["block"], checkpoint["through"],
+            tuple(checkpoint["root"]), tuple(manifest))
+
+
+def verify_joined(captures):
+    """Join independently captured owner events by immutable identity and authority revision."""
+    for events in captures:
+        verify_native(events)
+    events = [event for capture in captures for event in capture]
+    published = {}
+    for event in events:
+        if event["event"] == "publish-checkpoint":
+            identity = exact_checkpoint(event, event, event["manifest"])
+            published[identity] = min(event["revision"], published.get(identity, event["revision"]))
+    installed_trims = {}
+    for event in events:
+        if event["event"] == "apply-trim":
+            key = (*replica_scope(event), event["through"], tuple(event["anchor"]))
+            installed_trims[key] = min(event["revision"], installed_trims.get(key, event["revision"]))
+    joined = 0
+    for event in events:
+        kind = event["event"]
+        if kind == "authorize-trim":
+            checkpoint = event["checkpoint"]
+            identity = exact_checkpoint(event, {
+                "block": checkpoint["block"], "through": checkpoint["boundary"], "root": checkpoint["root_sha256"],
+            }, event["manifest"])
+        elif kind == "hosted-recovery-closure":
+            identity = exact_checkpoint(event, event, event["manifest"])
+        elif kind == "retirement-recovery-dependency":
+            trim = (*replica_scope(event), event["trim_through"], tuple(event["anchor"]))
+            require(trim in installed_trims and installed_trims[trim] <= event["revision"],
+                    "dependent retirement lacks the exact installed recovery exclusion")
+            joined += 1
+            continue
+        else:
+            continue
+        require(identity in published and published[identity] <= event["revision"],
+                f"{kind} lacks the exact published recovery closure")
+        joined += 1
+    require(joined > 0, "the captures have no cross-owner recovery observations")
+
+
+def read_native(path):
+    with path.open() as stream:
+        return [json.loads(line) for line in stream]
+
+
 def project(trace):
     """Validate observation identities before reducing them to this model's finite domains."""
     history, residence, fork = scope(trace, ("history", "residence", "fork"))
@@ -145,6 +206,10 @@ def project(trace):
                 require(event["destination"] == fork, "fork observation names a different residence")
             if kind in {"change-loglet", "read-index", "capture-fresh"}:
                 require(epoch in (0, 1) and event["loglet"] == trace["loglets"][epoch], "loglet identity does not match its epoch")
+            if kind in {"certify-decision", "publish-decision", "ack-commit"} or (kind in {"read-index", "capture-fresh"} and cut > 0):
+                require(event["decision"] == trace["decision"], "decision belongs to another committed prefix")
+            if kind in {"install-recovery-fence", "authorize-version", "trim"}:
+                require(event["recovery_root"] == trace["recovery_root"], "recovery fence names another closure")
             if kind in {"attempt-outcome", "receipt-clock", "redeem-receipt", "collect-receipt"}:
                 require(event["attempt"] == trace["attempt"], "receipt observation names another attempt")
             if kind in {"prepare-erasure", "arm-erasure", "revoke-key", "read-old-cache"}:
@@ -163,6 +228,7 @@ def main():
     parser.add_argument("--tlc", type=Path, help="check a bounded JSON projection with this TLA+ tools jar")
     parser.add_argument("--java", default="java")
     parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--join", action="append", type=Path, help="also verify identity joins with this native JSONL capture")
     args = parser.parse_args()
     try:
         if args.tlc:
@@ -175,9 +241,11 @@ def main():
             events = project(json.loads(args.trace.read_text()))
             with TemporaryDirectory(prefix="rtdb-residence-replay-") as scratch:
                 check_residence_trace(tools, Path(scratch), "tlc-residence-trace-capture", events, extended=True)
+        elif args.join:
+            verify_joined([read_native(path) for path in [args.trace, *args.join]])
+            print("Joined native residence observations accepted")
         else:
-            with args.trace.open() as stream:
-                verify_native([json.loads(line) for line in stream])
+            verify_native(read_native(args.trace))
             print("Native residence observations accepted")
     except (KeyError, TypeError, ValueError) as error:
         parser.exit(1, f"{error}\n")
