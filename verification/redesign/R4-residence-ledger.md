@@ -1,35 +1,41 @@
-# R4 · Residence ledger, reader holds and the collection floor
+# R4 · Residence ledger, reader holds and deletion grants
 
 ## Goal
 
 Replace every timer that today stands in for knowing who still reads a file with one linearizable record per database.
 After R4, a file is deleted only when the ledger proves no admitted reader, recovery root or fork can need it.
 
-## Converged design
+## Approved design
 
-All three designers proposed the same mechanism; differences are noted inline.
+The residence ledger orders eligible roots, admissions, retirement and deletion grants under one physical owner.
+Multi uses the directory and lineage authority.
+Classic uses a conditional-write head or a synchronized filesystem ledger in one lock domain.
+The current authority and irreversible exclusions survive restore outside the data being restored.
 
-- **The ledger.** One record per database residence holding: the published catalog generation (head), the admission floor `F`, reader holds `(holder, generation, ticket, expiry)`, recovery roots (R5) and, later, the key catalog (R6).
-  - Multi: the deployment's directory record, updated by compare-and-swap. The peer's `catalog_readers` map (below) is the start of it.
-  - Classic: an object in the database's own store written with conditional writes (put-if-absent for a chain of `ledger/<seq>` objects, or If-Match on one head object), and an atomic link or rename on a local filesystem.
-    Designers differed only in layout (one head object, a sequence chain, or a head object plus one hold object per follower); pick one and record why.
-- **Admission.** Before opening storage, a reader CASes a hold on the generation of the catalog it captured.
-  The CAS succeeds only if that generation is at or above `F` and is not revoked by an erasure (R7).
-  A follower that is behind the log tip can still serve an explicit basis it has applied, because admission needs the ledger, not the tip.
-- **Renewal and self-fencing.** Holders renew every `R`.
-  Before each provider request a reader checks its own monotonic deadline (last renewal start + `T` − margin); this reuses the shape of today's `ReadLease` check in `storage/src/io_region.rs`.
-  Leader-local readers take the same holds through an in-process fast path.
-- **Expiry.** The collector drops a hold only after it has observed the same ticket unchanged across two sweeps a local monotonic `T` apart.
-- **Deletion authority.** The storage owner mints a grant for an installed retirement and its immutable targets.
-  The conservative implementation can use the generation cutoff inside that owner.
-  The [Lean comparison](../lean/ResidenceReaderRetention.lean) proves that an older hold can delay retirement of a publication it never used.
-  Exact reachability from held manifests, recovery closures and forks is under review.
-  The collector submits the installed receipt and retries a pending decision.
+The writer and replay installer publish complete immutable dependency manifests at each eligible cut.
+Manifest edges bind the original basis and scope, including inherited layers, catalog and routing evidence, artefacts, replay coverage and the openable custody needed to use them.
+A physical leaf names the owner, namespace, allocation incarnation, provider key and its immutable version or terminal creation identity.
+A pack is one physical leaf. Each member that depends on it keeps its edge.
+Keep explicit exhaustion so an incomplete or stale inventory supplies no negative evidence.
+
+The authority orders claims from current publications, advertised historical scopes, holds, forks, in-flight work, recovery roots, and staging or transfer work.
+Register the exact scope before storage I/O, and acquire additional coverage before expanding it.
+The catalog floor governs admission to advertised history.
+Closing issuance or renewal preserves already admitted work through drain.
+An abandoned hold requires positive drain evidence or an enforced bound through the last possible provider access, including clock uncertainty.
+
+The physical owner consumes the retirement receipt, checks zero reachability and closes new references in the same ordered decision that persists the grant.
+The grant names one immutable publication.
+Ambiguous writes retain their staging edges until reconciled or fenced.
+An old authentic manifest cannot re-admit a granted publication.
+Retries consume the same grant and settle only on exact removal, terminal replacement or conclusive absence.
+The [Lean comparison](../lean/ResidenceReaderRetention.lean) explains why an unrelated earlier hold supplies no deletion evidence and must not block eligibility.
 
 ## Invariants
 
-- **G1.** No object reachable from an admitted hold's generation or a live recovery root is deleted.
-- **G2.** Every delete is authorized against one ledger version, and the authorization stays valid until the provider delete (names never repeat after R3).
+- **GC-1.** Admitted reads, forks, recovery roots and operations retain their complete dependency scopes through their promised lifetimes and drain.
+- **GC-2.** The physical owner's ordered grant binds the exact immutable publication, establishes absence of eligible dependencies, and excludes later references and late publication.
+- **LIVE-2.** Fair collection and eventual provider settlement reclaim each retired publication after its final dependency and fence, including during unrelated holds.
 
 ## What R4 deletes
 
@@ -124,7 +130,7 @@ An exclusive compactor reset resumes admission at the installed cut of its newly
 Classic S3, Azure and GCS use one conditional-write head under the classic storage root for reader registration, release and floor advancement.
 The head makes registration and floor advancement one decision and avoids deriving current admission from a possibly stale list of ticket objects.
 Every successful update advances the sequence, including a cancellation that fences a registration with a lost reply.
-The shared classic grant owner checks the stored receipt and orders its conservative eligibility decision against the same residence.
+The current classic grant owner checks the stored receipt and uses the conservative cutoff until the complete dependency census is wired.
 A pending decision keeps the intent available for retry.
 Multi queues scoped releases and the provider consumes the existing exact lineage grant.
 A provider request retains its ticket through cancellation and releases it on drain.

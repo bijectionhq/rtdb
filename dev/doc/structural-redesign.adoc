@@ -38,9 +38,32 @@ Physical acceptance requires certified bounds and timely original evidence from 
 A copied record and a subsequent clock reading carry no original vote.
 Catalog admission uses a monotone floor recorded by the residence ledger.
 Physical reclamation requires a grant from the storage owner.
-Node-local monotonic durations expire holds of readers that stop renewing them.
+Expiry closes issuance. Retained operations keep their dependencies until drain or an enforced bound through their last possible access.
 Receipt deadlines use the installed decision clock.
 Erasure starts at publication of the erasing generation and uses the custody authority's bounded grant clock.
+
+== Reclamation and recovery guarantees
+
+GC-1::
+An admitted read or fork holds every physical publication reachable from its admitted scope at the original basis for the promised lifetime, subject to ordered erasure.
+In-flight operations keep their dependencies through their final use and provider drain.
+A published recovery root holds its complete dependencies and required replay suffix.
+A packed member holds the physical pack that supplies it.
+
+GC-2::
+Only the physical owner may grant deletion of an immutable provider publication.
+In one ordered decision it consumes retirement evidence, establishes that the publication has no eligible dependencies, and permanently excludes new references or a late publication that could re-establish the dependency.
+The grant names the exact provider version or terminal creation identity and remains valid through retry and owner replacement.
+
+DUR-2::
+Every selectable recovery path authenticates a complete checkpoint and sufficient committed replay under the current recovery authority.
+Replacing a path preserves reconstruction of the acknowledged history within the supported fault model and fences superseded dependencies.
+A pointer in a fenced journal range confers no access to a detached payload, including when that journal returns or is restored.
+
+LIVE-2::
+Each retired physical publication becomes eligible after its last dependency drains and future use is fenced.
+Fair collection and eventual provider settlement or conclusive absence reclaim it while unrelated holds survive or excluded historical journals are unavailable.
+Media disposal has independent evidence.
 
 == Mechanisms
 
@@ -66,7 +89,7 @@ Applicable custody can withhold that winner's bytes and cannot substitute an ear
 |Timestamp-vector snapshot tokens and lower-bound-plus-cap resumption.
 
 |History retention and privacy erasure
-|History collection retires data below a cut protected by the residence ledger.
+|History collection withdraws publications and grants deletion when no admitted scope reaches their physical identities.
 Privacy erasure prepares readable successors, then publishes them and arms bounded key revocation within the affected custody domain.
 Recovery and compactor reset start from held recovery roots.
 |Permanent L0 retention, `reset_to_l0`, live recovery data sharing a destruction deadline without a successor.
@@ -97,10 +120,9 @@ Corpus-relative scores take the corpus statistics as arguments.
 
 |No reference authority
 |One linearizable residence ledger per database: the Multi directory record, or a conditional-write object in classic deployments.
-Readers hold a catalog generation by compare-and-swap before opening storage and renew while they read.
-The catalog floor controls new admissions.
-The storage owner grants deletion for the retired publications it can release.
-The conservative cutoff remains in use where the exact-reachability policy is pending.
+Readers register the exact manifest scope before opening storage.
+The catalog floor controls admission to advertised history.
+The physical owner checks reachability and orders deletion against new references at the same ledger head.
 |`garbage_lifetime`, the fixed read lease and its collector wait, the reaper grace and wall-clock release stamps, the unbounded in-process registry.
 
 |Positional names
@@ -151,6 +173,8 @@ Compaction and stored artefact builds on coordinated storage hold their input ca
 Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
 Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
 The coordinated collector submits the installed receipt to the storage owner, which owns the pending decision and the deletion grant.
+The approved reachability contract replaces the cutoff for deletion.
+The coordinated receipt path still uses the conservative cutoff pending implementation of complete dependency claims.
 Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
 
 |5
@@ -162,7 +186,7 @@ Pending archive captures protect their journal interval until archive publicatio
 Recovery can verify members of the same pack against a shared fresh provider observation.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
 Enrolled terminal storage can retire loose files with a write witness and an installed release.
-Opted-in versioned S3 deployments retire exact oversized replica payloads after a certified directory cut and fsync-backed trim from every known physical journal.
+The existing versioned S3 payload collector still waits for the known physical journals to trim. The approved contract requires brokered recovery exclusion and drain before independent payload settlement.
 Normal readers hold those payloads through provider drain.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
