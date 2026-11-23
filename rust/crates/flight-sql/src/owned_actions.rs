@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{arrow, invalid, status, unsupported},
-    lease::{Leased, Lookup},
+    lease::Leased,
     service::{Call, Service, found},
     state::ResourceOwner,
     upload, wire,
@@ -175,7 +175,7 @@ pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_SCOPED_READ_V1: &str = "rtdb.owned.OpenOwnedScopedRead.v1";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
-pub(crate) const OPEN_APPLIED_OWNED_READ_V3: &str = "rtdb.owned.OpenAppliedRead.v3";
+pub(crate) const OPEN_APPLIED_OWNED_READ_V4: &str = "rtdb.owned.OpenAppliedRead.v4";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_WORLD_VERSION_V2: &str = "rtdb.owned.ReadHeldWorldVersion.v2";
@@ -282,7 +282,7 @@ pub(crate) struct OwnedReadResource {
     session: String,
     database: String,
     witnesses: Mutex<BTreeMap<Uuid, RetainedRangeWitness>>,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -1076,7 +1076,7 @@ impl Service {
     pub(crate) async fn open_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if !body.is_empty() { return Err(invalid("Owned read open takes an empty body")); }
-        self.retain_new_owned_read(call, None).await
+        self.retain_new_owned_read(call, None, 0).await
     }
 
     pub(crate) async fn open_applied_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1085,35 +1085,37 @@ impl Service {
             return Err(Status::permission_denied("An applied owned read requires its placed owner session"));
         }
         let (floor, rest) = hosted_observation::applied_read_floor(body)?;
-        if !rest.is_empty() { return Err(invalid("Applied read has trailing bytes")); }
-        if let Some(source) = call.session.audience_source {
+        let generation = u64::from_be_bytes(rest.try_into().map_err(|_| invalid("Applied read requires an exact generation"))?);
+        if let Some(source) = call.session.audience_source() {
             if floor.history() != source {
                 return Err(Status::permission_denied("The applied floor belongs to another audience source"));
             }
         } else if self.0.config.audience.is_some() {
             return Err(Status::permission_denied("This source requires a reserved Flight session"));
+        } else if generation != 0 {
+            return Err(invalid("An ordinary applied read uses generation zero"));
         }
-        self.retain_new_owned_read(call, Some(&floor)).await
+        self.retain_new_owned_read(call, Some(&floor), generation).await
     }
 
     async fn retain_new_owned_read(
-        &self, call: &Call, applied_floor: Option<&rtdb_node::AppliedReadFloor>,
+        &self, call: &Call, applied_floor: Option<&rtdb_node::AppliedReadFloor>, generation: u64,
     ) -> Result<ActionResult, Status> {
-        let slots = if call.session.audience_source.is_some() {
-            &self.0.audience.as_ref().ok_or_else(unsupported)?.holds
-        } else {
-            &self.0.owned_read_slots
+        let audience = call.session.audience_source().is_some();
+        let permit = if audience { None } else {
+            Some(Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+                .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?)
         };
-        let permit = Arc::clone(slots).try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
+        // The audience session owns one prepaid slot. A lost reply can leave its last handle behind.
+        if audience { call.session.begin_audience_read(generation)?; }
         let snapshot = match applied_floor {
             Some(minimum) => native.open_applied_owned_read(minimum).await,
             None => native.open_owned_read().await,
         }.map_err(status)?;
-        self.retain_owned_read(call, snapshot, permit, true)
+        self.retain_owned_read(call, snapshot, permit, true, generation)
     }
 
     pub(crate) async fn open_owned_scoped_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1137,7 +1139,7 @@ impl Service {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let snapshot = original.snapshot.scope_root_read(relations).await.map_err(status)?;
-        self.retain_owned_read(call, snapshot, permit, true)
+        self.retain_owned_read(call, snapshot, Some(permit), true, 0)
     }
 
     pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1169,12 +1171,12 @@ impl Service {
             .await.map_err(status)?;
         held.snapshot.check_relation(&publication).map_err(status)?;
         match snapshot {
-            Some(snapshot) => self.retain_owned_read(call, snapshot, permit, false),
+            Some(snapshot) => self.retain_owned_read(call, snapshot, Some(permit), false, 0),
             None => Ok(ActionResult { body: Bytes::from_static(&[0]) }),
         }
     }
 
-    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: OwnedSemaphorePermit, include_transaction: bool) -> Result<ActionResult, Status> {
+    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: Option<OwnedSemaphorePermit>, include_transaction: bool, generation: u64) -> Result<ActionResult, Status> {
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
         let reply_charge = call.reserve(64)?;
         let handle = Uuid::new_v4();
@@ -1188,7 +1190,12 @@ impl Service {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             witnesses: Mutex::default(), _permit: permit, _reservation: reservation,
         });
-        call.owned_reads().insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
+        let handle = Bytes::copy_from_slice(handle.as_bytes());
+        if call.session.audience_source().is_some() {
+            call.session.install_audience_read(generation, handle, held)?;
+        } else {
+            self.0.owned_reads.insert(handle, held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
+        }
         Ok(ActionResult { body: wire::retain(reply, reply_charge) })
     }
 
@@ -1201,7 +1208,11 @@ impl Service {
     }
 
     fn retained_owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
-        let entry = found(call.owned_reads().lookup(handle, false), "owned read")?;
+        let entry = if call.session.audience_source().is_some() {
+            call.session.audience_read(handle).ok_or_else(|| Status::not_found("unknown owned read"))?
+        } else {
+            found(self.0.owned_reads.lookup(handle, false), "owned read")?
+        };
         if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
             return Err(Status::not_found("unknown owned read"));
         }
@@ -1214,7 +1225,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.retained_owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, id, valid, _identity) = point_request(call, request, if with_valid { PointTime::Optional } else { PointTime::Default })?;
@@ -1358,7 +1369,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (mask, request) = if positioned {
@@ -1616,7 +1627,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, id, request, _identity) = self.owned_versions_request(call, request)?;
@@ -1714,7 +1725,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, arrow) = split_relation(request)?;
@@ -1790,7 +1801,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, arrow_bytes) = split_relation(request)?;
@@ -1923,7 +1934,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (valid, request) = request.split_first_chunk::<8>()
@@ -2159,7 +2170,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, cursor) = split_relation(request)?;
@@ -2221,7 +2232,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
@@ -2335,12 +2346,20 @@ impl Service {
         self.owned_action_reply(&schema, Some(&batch))
     }
 
+    fn take_owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
+        if call.session.audience_source().is_some() {
+            call.session.take_audience_read(handle).ok_or_else(|| Status::not_found("unknown owned read"))
+        } else {
+            found(self.0.owned_reads.take(handle), "owned read")
+        }
+    }
+
     pub(crate) fn close_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if body.len() != 16 { return Err(invalid("Owned read close requires one 16-byte handle")); }
         let handle = Bytes::copy_from_slice(body);
         self.retained_owned_read(call, &handle)?;
-        let entry = found(call.owned_reads().take(&handle), "owned read")?;
+        let entry = self.take_owned_read(call, &handle)?;
         entry.close();
         Ok(())
     }

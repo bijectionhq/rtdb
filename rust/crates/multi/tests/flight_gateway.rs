@@ -56,13 +56,14 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
             body.extend_from_slice(&offset.to_be_bytes());
             body.extend_from_slice(&time.to_be_bytes());
         }
+        body.extend_from_slice(&0u64.to_be_bytes());
         body
     };
     let mut raw = FlightServiceClient::new(channel(address).await);
     for _ in 0..2 {
         let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
         let body = request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0);
-        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v3", body))
+        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v4", body))
             .await.unwrap().into_inner();
         let result = results.message().await.unwrap().unwrap();
         assert!(results.message().await.unwrap().is_none());
@@ -100,7 +101,7 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
         request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0 - 1),
         request(uuid::Uuid::new_v4(), floor.tx_id.0, floor.system_time.0, prior.system_time.0),
     ] {
-        let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v3", body)).await {
+        let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v4", body)).await {
             Ok(response) => response.into_inner().message().await.unwrap_err(),
             Err(error) => error,
         };

@@ -3,10 +3,11 @@ use bytes::Bytes;
 use rtdb_auth::Principal;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Database, NativeSession, Node};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use uuid::Uuid;
-use crate::{error::status, lease::Leased, wire::BoundParameters};
+use crate::{error::status, lease::Leased, owned_actions::OwnedReadResource, wire::BoundParameters};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Owner { Anonymous, Authenticated(Uuid) }
@@ -37,22 +38,75 @@ impl Leased for ConnectionResource {
 }
 impl Drop for ConnectionResource { fn drop(&mut self) { self.native.get_mut().state_mut().close(); } }
 struct CatalogSelection { name: String, _reservation: Arc<MemoryReservation> }
-enum SessionState { Open { connections: BTreeMap<String, (Arc<ConnectionResource>, Arc<MemoryReservation>)>, catalog: Option<CatalogSelection> }, Closed }
+enum SessionState {
+    Open {
+        connections: BTreeMap<String, (Arc<ConnectionResource>, Arc<MemoryReservation>)>,
+        catalog: Option<CatalogSelection>,
+        audience_generation: u64,
+        audience_read: Option<(Bytes, Arc<OwnedReadResource>)>,
+    },
+    Closed,
+}
 struct Placement { name: String, attachment: Weak<Database> }
 
 pub(crate) struct Session {
     pub id: String,
     pub caller: Arc<Caller>,
-    pub audience_source: Option<uuid::Uuid>,
+    audience: Option<(Uuid, OwnedSemaphorePermit)>,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Session {
-    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, audience_source: Option<uuid::Uuid>, reservation: Arc<MemoryReservation>) -> Self {
+    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, audience: Option<(Uuid, OwnedSemaphorePermit)>, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
-        Self { id, caller, audience_source, placement, state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }), _reservation: reservation }
+        Self {
+            id, caller, audience, placement,
+            state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None, audience_generation: 0, audience_read: None }),
+            _reservation: reservation,
+        }
     }
+    pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|(source, _)| *source) }
+
+    pub fn audience_read(&self, handle: &Bytes) -> Option<Arc<OwnedReadResource>> {
+        let state = self.state.lock().expect("session lock");
+        let SessionState::Open { audience_read: Some((id, read)), .. } = &*state else { return None; };
+        (id == handle).then(|| Arc::clone(read))
+    }
+
+    pub fn begin_audience_read(&self, generation: u64) -> Result<(), Status> {
+        let previous = {
+            let mut state = self.state.lock().expect("session lock");
+            let SessionState::Open { audience_generation, audience_read, .. } = &mut *state else {
+                return Err(Status::not_found("session closed"));
+            };
+            if self.audience.is_none() || generation <= *audience_generation {
+                return Err(Status::failed_precondition("The audience read generation is stale"));
+            }
+            *audience_generation = generation;
+            audience_read.take()
+        };
+        if let Some((_, read)) = previous { read.close(); }
+        Ok(())
+    }
+
+    pub fn take_audience_read(&self, handle: &Bytes) -> Option<Arc<OwnedReadResource>> {
+        let mut state = self.state.lock().expect("session lock");
+        let SessionState::Open { audience_read, .. } = &mut *state else { return None; };
+        if audience_read.as_ref().is_none_or(|(id, _)| id != handle) { return None; }
+        audience_read.take().map(|(_, read)| read)
+    }
+
+    pub fn install_audience_read(&self, generation: u64, handle: Bytes, read: Arc<OwnedReadResource>) -> Result<(), Status> {
+        let mut state = self.state.lock().expect("session lock");
+        let SessionState::Open { audience_generation, audience_read, .. } = &mut *state else { return Err(Status::not_found("session closed")); };
+        if generation == 0 || generation != *audience_generation || audience_read.is_some() {
+            return Err(Status::failed_precondition("The audience read generation changed"));
+        }
+        *audience_read = Some((handle, read));
+        Ok(())
+    }
+
     pub fn memory(&self) -> &Arc<MemoryBudget> { self._reservation.budget() }
     pub fn closed(&self) -> bool { matches!(*self.state.lock().expect("session lock"), SessionState::Closed) }
     pub fn placed_database(&self) -> Option<&str> { self.placement.as_ref().map(|placement| placement.name.as_str()) }
@@ -87,7 +141,7 @@ impl Session {
     pub fn open_native(&self, database: &str, node: &Node) -> Result<NativeSession, Status> {
         self.require_database(database, node)?;
         let identity = self.caller.principal.clone();
-        let native = if self.audience_source.is_some() {
+        let native = if self.audience.is_some() {
             node.session_with_prepaid_memory(database, identity, Arc::clone(self.memory()))
         } else {
             node.session(database, identity)
@@ -109,7 +163,13 @@ impl Session {
 fn placement_changed() -> Status { Status::unavailable("This node no longer holds the Flight SQL session's deployment") }
 
 impl Leased for Session {
-    fn close(&self) { if let SessionState::Open { connections, .. } = std::mem::replace(&mut *self.state.lock().expect("session lock"), SessionState::Closed) { for (connection, _) in connections.into_values() { connection.close(); } } }
+    fn close(&self) {
+        let state = std::mem::replace(&mut *self.state.lock().expect("session lock"), SessionState::Closed);
+        if let SessionState::Open { connections, audience_read, .. } = state {
+            if let Some((_, read)) = audience_read { read.close(); }
+            for (connection, _) in connections.into_values() { connection.close(); }
+        }
+    }
 }
 impl Drop for Session { fn drop(&mut self) { self.close(); } }
 pub(crate) struct Transaction { pub owner: ResourceOwner, pub connection: Arc<ConnectionResource>, _reservation: Arc<MemoryReservation> }

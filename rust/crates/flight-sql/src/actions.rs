@@ -10,10 +10,10 @@ use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Lea
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
-        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, OPEN_APPLIED_OWNED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
-        if call.session.audience_source.is_some() && !matches!(action.r#type.as_str(),
-            OPEN_APPLIED_OWNED_READ_V3 | CONFIRM_APPLIED_HOSTED_V5 | HELD_OWNED_POINT_V2
-                | HELD_OWNED_HISTORICAL_POINT_V1 | READ_HELD_HOSTED_CONTROL_V2 | CLOSE_OWNED_READ_V1
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, OPEN_APPLIED_OWNED_READ_V4, READ_HELD_HOSTED_CONTROL_V2};
+        if call.session.audience_source().is_some() && !matches!(action.r#type.as_str(),
+            OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 | HELD_OWNED_POINT_V2
+                | HELD_OWNED_HISTORICAL_POINT_V1 | READ_HELD_HOSTED_CONTROL_V2 | CLOSE_OWNED_READ_V1 | "CloseSession"
         ) {
             return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
         }
@@ -42,7 +42,7 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V1 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V3 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
@@ -211,9 +211,11 @@ impl Service {
                 }
                 "CloseSession" => {
                     protocol::Empty::decode(action.body.as_ref()).map_err(arrow)?;
-                    if let Lookup::Found(session) = self.0.sessions.take(&call.session.id) { session.close(); }
+                    call.close_session();
                     if call.minted { return Err(Status::not_found("No session to close")); }
-                    Ok(vec![Ok(raw(&protocol::CloseResult { status: 1 }, self)?)])
+                    let result = protocol::CloseResult { status: 1 };
+                    let charge = call.reserve(wire::add(result.encoded_len(), 256)?)?;
+                    Ok(vec![Ok(ActionResult { body: wire::retain(result.encode_to_vec(), charge) })])
                 }
                 _ => Err(unsupported()),
             }
