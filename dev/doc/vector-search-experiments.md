@@ -421,7 +421,7 @@ Durable logs and external protocols still encode their prescribed formats.
 | 4 | UNNEST and list readers | Stored lists use the scan's Arrow child selections and parent indices. List-expression pages carry typed numeric vectors, indexed integer series generate signed Arrow vectors, and mixed nonnumeric expressions retain their value semantics. |
 | 5 | List indexing, comparison and hashing | Float comparison and ordering read typed components directly. Packed numeric hashing uses the same primitive codecs as Arrow cells. Indexing returns one value, and generic mixed-type comparison still evaluates the cells needed by SQL ordering. |
 | 6 | Generic layout and extensions | Supported numeric child arrays preserve validity, dense union tags and logical decimal metadata. Compatible layout changes use Arrow kernels. Decorated and nonnumeric child types still follow their own logical readers. The native schema reader retains its accepted layout contract. |
-| 7 | Scoring | Direct cosine reads selected Arrow cells. Cosine nested in other expressions reads Arrow or packed views where available, then computes the same score from the supplied components. Reference normalization and score accumulation use native computation state. |
+| 7 | Scoring | Direct cosine reads selected Arrow cells. A simple Boolean CASE evaluates its guard and scores only selected rows from Arrow. Other expressions can read Arrow or packed views through the evaluator. Reference normalization and score accumulation use native computation state. |
 | 8 | Page presence statistics | Ordinary list presence uses parent validity. Typed page readers compute child numeric statistics, including Float16. |
 | 9 | Generic row spill | Row spill uses Arrow IPC, including per-record schemas for mixed fallback rows. Packed numeric children retain their widths and nulls when the result needs a new layout. |
 | 10 | Arrow bulk writes | Arrow COPY and uploaded Arrow document batches submit typed columns through the node and transaction writer. Admission checks the schema, identifiers and validity. |
@@ -443,6 +443,31 @@ Durable logs and external protocols still encode their prescribed formats.
 | 26 | Durable log envelopes | The encoder transfers uniquely held IPC buffers into protobuf fields with their reservations. Shared inputs may require a copy. The final protobuf frame retains the existing byte format. |
 | 27 | FTS and ordered sidecars | Postings, ordered keys and candidate IIDs serve their index algorithms. The embedding payload stays in primary Arrow data. |
 | 28 | Experimental ANN | Exact reranking binds a slice of the query fixture's Arrow buffer. HDF5 and NumPy remain fixture inputs. Centroids, heaps, range metadata and churn masks are algorithm state. |
+
+#### Qualification of the 28-entry audit
+
+The first full run on implementation commit `e69f116926` passed 5,886 Rust workspace tests and seven doctests, with 15 Rust tests ignored.
+The Gradle unit, property, and integration suites passed 3,243, 3,348, and 5,629 tests respectively, with one PostgreSQL source skip.
+This run covered Arrow COPY followed by flush and vector ranking, Flight ticket compatibility, native C Data buffer custody, delegated Arrow predicate frames, and temporal ranking.
+
+The paired release measurement used the same 100,000 100-dimensional GloVe vectors and 12 query vectors, with in-memory primary storage on an Apple M4 Max.
+The baseline was the pre-audit release binary at `fa969b755`.
+The candidate included the CASE guard fix on the `5191a9f0ed` tree, which also incorporates later RTDB main work.
+The first measurement of this integrated code spent about 2,002 ms p50 evaluating the unfiltered CASE route because SQL wraps a searched CASE guard in `IS TRUE`.
+The fixed projection handles that guard over Arrow Boolean arguments and columns and skips disabled rows before reading their embeddings.
+
+| Stationary filter | CASE exact p50, ms, before → after | Direct exact p50, ms, before → after | Ordered exact p50, ms, before → after |
+| --- | ---: | ---: | ---: |
+| None | 534.27 → 81.83 | 218.92 → 81.76 | 216.52 → 81.95 |
+| Random, ~0.1% | 8.31 → 4.16 | 7.34 → 4.14 | 5.60 → 5.50 |
+| Random, ~1% | 17.35 → 7.88 | 11.06 → 7.87 | 9.50 → 12.97 |
+| Random, ~10% | 63.34 → 14.53 | 12.69 → 14.57 | 20.42 → 28.12 |
+| Whole clusters, ~1% | 18.46 → 7.97 | 11.20 → 7.95 | 9.93 → 13.72 |
+
+Unfiltered warm ANN at 32 probes improved from 4.94 ms to 3.20 ms p50, and unfiltered exact search under churn went from 214.81 ms to 82.67 ms p50.
+Loading and flushing the fixture took 662 ms before and 967 ms after, and ordered-index build time went from 14.30 s to 8.05 s.
+Both builds passed five temporal canaries and checked result ID order and distance bits between their exact routes for all 60 stationary and 20 churn cases.
+All compared ANN samples had identical recall, returned counts, and expected result counts.
 
 ### Remaining scalar paths
 

@@ -7,7 +7,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_expr::CosineVector;
-use rtdb_plan::{ColumnId, Expr, Schema};
+use rtdb_plan::{ColumnId, Expr, Schema, UnaryOp};
 use rtdb_types::{ListValue, ListView, LogicalType, Result, ScalarType, Value};
 
 use crate::columnar::{Column, ColumnBatch};
@@ -73,6 +73,10 @@ impl Projection {
         let (condition, score) = match expr {
             Expr::Case { branches, otherwise } if matches!(otherwise.as_ref(), Expr::Literal(Value::Null)) => {
                 let [(condition, score)] = branches.as_slice() else { return Ok(None); };
+                let condition = match condition {
+                    Expr::Unary { op: UnaryOp::IsTrue, expr } => expr.as_ref(),
+                    condition => condition,
+                };
                 (Some(condition), score)
             }
             expr => (None, expr),
