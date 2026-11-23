@@ -18,6 +18,7 @@ pub enum NeverVersionedObject {
     Retired(Uuid),
 }
 
+#[derive(Clone)]
 pub struct ObservedTerminalObject {
     allocation: Uuid,
     target: S3TombstoneTarget,
@@ -89,6 +90,14 @@ impl NeverVersionedRetirement<'_> {
     pub async fn read_observed_range(
         &self, key: &ObjectKey, observed: &ObservedTerminalObject, range: Range<u64>,
     ) -> Result<Bytes> {
+        self.inventory.inspect((key.clone(), observed.clone(), range), |inventory, (key, observed, range)| async move {
+            NeverVersionedRetirement { inventory: &inventory }.read_range_at_publication(&key, &observed, range).await
+        }).await
+    }
+
+    async fn read_range_at_publication(
+        &self, key: &ObjectKey, observed: &ObservedTerminalObject, range: Range<u64>,
+    ) -> Result<Bytes> {
         let path = self.checked_path(key, &observed.target)?;
         let S3TombstoneCondition::Matches(tag) = &observed.target.condition else {
             return Err(unavailable("The observed publication has no strong entity tag"));
@@ -126,6 +135,12 @@ impl NeverVersionedRetirement<'_> {
     }
 
     async fn observe_with_size(&self, key: &ObjectKey) -> Result<(NeverVersionedObject, Option<u64>)> {
+        self.inventory.inspect(key.clone(), |inventory, key| async move {
+            NeverVersionedRetirement { inventory: &inventory }.inspect_metadata(&key).await
+        }).await
+    }
+
+    async fn inspect_metadata(&self, key: &ObjectKey) -> Result<(NeverVersionedObject, Option<u64>)> {
         let path = self.path(key);
         let reply = self
             .inventory

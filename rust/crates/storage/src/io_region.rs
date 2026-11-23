@@ -210,9 +210,19 @@ impl IoRegion {
         Self::reading(view, self.run(move || work(&selection.0, &selection.1))).await
     }
 
+    pub(crate) async fn admit_read<O, A>(&self, owner: Arc<O>, target: A) -> Result<IoAdmission>
+    where
+        O: Send + Sync + 'static,
+        A: Send + Sync + 'static,
+    {
+        let view = HeldView::recovery(Arc::new((owner, target)));
+        Self::reading(view, async { self.admit() }).await
+    }
+
+    /// Admits a provider read of the selected object, range, or prefix.
     #[cfg(feature = "remote")]
-    pub(crate) async fn read_async<T, O, A, F>(
-        &self, owner: Arc<O>, target: A, work: impl FnOnce(Arc<O>, A) -> F,
+    pub async fn read_async<T, O, A, F>(
+        &self, owner: Arc<O>, target: A, work: impl FnOnce(Arc<O>, A) -> F + Send + 'static,
     ) -> Result<T>
     where
         T: Send + 'static,
@@ -221,8 +231,10 @@ impl IoRegion {
         F: std::future::Future<Output = Result<T>> + Send + 'static,
     {
         let selection = Arc::new((owner, target));
-        let work = work(selection.0.clone(), selection.1.clone());
-        Self::reading(HeldView::recovery(selection), self.run_async(work)).await
+        let view = HeldView::recovery(selection.clone());
+        Self::reading(view, self.run_async(async move {
+            work(selection.0.clone(), selection.1.clone()).await
+        })).await
     }
 
     pub(crate) async fn run<T: Send + 'static>(&self, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {

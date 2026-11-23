@@ -336,12 +336,12 @@ impl ObjectStore for DiskCachedStore {
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
-        let _scope = self.io.admit()?;
+        let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let _operation = self.cache.begin_operation()?;
         match self.cache.cached_size(&self.key(key)?) { Some(size) => Ok(StoredObject { key: key.clone(), size }), None => self.cache.cancellation.run_until_cancelled(self.remote.head(key)).await.ok_or_else(cache_closed)? }
     }
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> {
-        let _scope = self.io.admit()?;
+        let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.head_fresh(key)).await.ok_or_else(cache_closed)?
     }
@@ -355,12 +355,12 @@ impl ObjectStore for DiskCachedStore {
         self.remote.observe_range(key, range).await
     }
     async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
-        let _scope = self.io.admit()?;
+        let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.retirement_version(key)).await.ok_or_else(cache_closed)?
     }
     async fn retirement_publication(&self, key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
-        let _scope = self.io.admit()?;
+        let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.retirement_publication(key)).await.ok_or_else(cache_closed)?
     }
@@ -368,13 +368,13 @@ impl ObjectStore for DiskCachedStore {
         self.get_range(key, 0..self.head(key).await?.size).await
     }
     async fn get_fresh(&self, key: &ObjectKey) -> Result<Bytes> {
-        let _scope = self.io.admit()?;
+        let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.get_fresh(key)).await.ok_or_else(cache_closed)?
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> { self.remote.get_fresh_exact(key, length).await }
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<crate::ObjectObservation<Bytes>> {
-        let _scope = self.io.admit()?;
+        let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.observe_fresh_exact(key, length)).await.ok_or_else(cache_closed)?
     }
@@ -384,7 +384,7 @@ impl ObjectStore for DiskCachedStore {
         self.get_reserved_range(key, range, reservation).await.map(|bytes| Bytes::from_owner(OwnedRead(bytes)))
     }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
-        let scope = self.io.admit()?;
+        let scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let cache_key = self.key(key)?;
         let lease = self.cache.get(&cache_key, self.remote.as_ref(), key).await?;
         if range.end.checked_sub(range.start) != Some(reservation.length() as u64) || range.end > lease.size() {
@@ -404,7 +404,7 @@ impl ObjectStore for DiskCachedStore {
     fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool { self.remote.supports_observed_scan_ranges(key) }
 
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
-        let scope = self.io.admit()?;
+        let scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let operation = self.cache.begin_operation()?.and(scope);
         let Some(lease) = self.cache.cached_file(&self.key(key)?) else {
             return self.cache.cancellation.run_until_cancelled(self.remote.get_reserved_scan_range(key, range, reservation))
@@ -419,7 +419,7 @@ impl ObjectStore for DiskCachedStore {
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }
     /// The lease pins the cached file, so the cache neither evicts nor counts as free what a reader still maps.
     async fn local_file(&self, key: &ObjectKey) -> Result<Option<crate::LocalFile>> {
-        let scope = self.io.admit()?;
+        let scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let lease = self.cache.get(&self.key(key)?, self.remote.as_ref(), key).await?;
         let operation = self.cache.begin_operation()?.and(scope);
         IoRegion::run_admitted(operation, move || {
@@ -428,7 +428,7 @@ impl ObjectStore for DiskCachedStore {
         }).await
     }
     async fn cached_local_file(&self, key: &ObjectKey) -> Result<Option<crate::LocalFile>> {
-        let scope = self.io.admit()?;
+        let scope = self.io.admit_read(self.cache.clone(), self.key(key)?).await?;
         let operation = self.cache.begin_operation()?.and(scope);
         let Some(lease) = self.cache.cached_file(&self.key(key)?) else { return Ok(None) };
         IoRegion::run_admitted(operation, move || {
@@ -451,7 +451,7 @@ impl ObjectStore for DiskCachedStore {
         self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await?;
         Ok(written)
     }
-    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
+    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _scope = self.io.admit_read(self.cache.clone(), (self.namespace.clone(), directory.cloned())).await?; let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -6,7 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{Error, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, valid_object_version}};
+use rtdb_storage::{Error, IoRegion, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, valid_object_version}};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneCondition};
 
 #[path = "never_versioned.rs"]
@@ -19,7 +19,9 @@ fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String
     }
 }
 
+#[derive(Clone)]
 pub struct VersionedInventory {
+    reads: Arc<IoRegion>,
     client: Client,
     namespace: S3ObjectNamespace,
     root: ObjectKey,
@@ -75,7 +77,18 @@ fn retirement_error(key: &ObjectKey, error: Anomaly) -> Error {
 
 impl VersionedInventory {
     pub(crate) fn new(client: Client, namespace: S3ObjectNamespace, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
-        Self { client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing, terminal_allocation: None }
+        Self { reads: IoRegion::new(), client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing, terminal_allocation: None }
+    }
+
+    async fn inspect<T, A, F>(&self, selection: A, inspect: impl FnOnce(Arc<Self>, A) -> F + Send + 'static) -> Result<T>
+    where
+        T: Send + 'static,
+        A: Clone + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        self.reads.read_async(Arc::new(self.clone()), selection, move |owner, target| async move {
+            Ok(inspect(owner, target).await)
+        }).await?
     }
 
     pub(crate) fn namespace(&self) -> &S3ObjectNamespace { &self.namespace }
@@ -98,6 +111,10 @@ impl VersionedInventory {
     }
 
     pub(crate) async fn enrollment_inventory_is_clean(&self, existing_evidence: Option<&ObjectKey>) -> Result<bool> {
+        self.inspect(existing_evidence.cloned(), |owner, target| async move { owner.inspect_enrollment_inventory_is_clean(target.as_ref()).await }).await
+    }
+
+    async fn inspect_enrollment_inventory_is_clean(&self, existing_evidence: Option<&ObjectKey>) -> Result<bool> {
         let root = Path::from(self.root.as_str());
         let prefix = format!("{root}/");
         if !self.multipart_batch(&prefix).await?.is_empty() { return Ok(false); }
@@ -165,6 +182,10 @@ impl VersionedInventory {
     }
 
     async fn version_status(&self, key: &str, version: &str) -> Result<VersionStatus> {
+        self.inspect((key.to_owned(), version.to_owned()), |owner, (key, version)| async move { owner.observe_version_status(&key, &version).await }).await
+    }
+
+    async fn observe_version_status(&self, key: &str, version: &str) -> Result<VersionStatus> {
         let mut marker: (Option<String>, Option<String>) = (None, None);
         let mut seen = BTreeSet::new();
         let mut target_latest = None;
@@ -261,6 +282,10 @@ impl VersionedInventory {
     /// Finds immediate directories even when every object under them is
     /// represented only by a noncurrent version, a tombstone or an upload.
     pub async fn child_directories(&self, parent: &ObjectKey) -> Result<BTreeSet<String>> {
+        self.inspect(parent.clone(), |owner, target| async move { owner.inspect_child_directories(&target).await }).await
+    }
+
+    async fn inspect_child_directories(&self, parent: &ObjectKey) -> Result<BTreeSet<String>> {
         let prefix = self.prefix(parent);
         let mut directories = BTreeSet::new();
         let mut marker = (None, None);
@@ -320,6 +345,10 @@ impl VersionedInventory {
     }
 
     async fn multipart_batch(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        self.inspect(prefix.to_owned(), |owner, target| async move { owner.inspect_multipart_batch(&target).await }).await
+    }
+
+    async fn inspect_multipart_batch(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         let mut marker = (None, None);
         loop {
             let page = self.client.list_multipart_uploads().bucket(&self.namespace.bucket).max_uploads(1000)
@@ -412,6 +441,10 @@ impl VersionedInventory {
     }
 
     async fn version_batch(&self, prefix: &str) -> Result<Vec<ObjectIdentifier>> {
+        self.inspect(prefix.to_owned(), |owner, target| async move { owner.inspect_version_batch(&target).await }).await
+    }
+
+    async fn inspect_version_batch(&self, prefix: &str) -> Result<Vec<ObjectIdentifier>> {
         let page = self.client.list_object_versions().bucket(&self.namespace.bucket).prefix(prefix).max_keys(1000)
             .set_request_payer(self.request_payer.clone()).send().await
             .map_err(|error| unavailable(format!("Listing object versions failed: {error}")))?;
