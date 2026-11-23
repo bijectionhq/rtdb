@@ -7,7 +7,7 @@ use rtdb_directory::{
     CheckpointStageIntent, DeploymentRecord, Directory, DisposalReceipt, HostedTask,
     ServingInventory,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -229,6 +229,7 @@ pub struct RecoveryService {
     keys: Arc<dyn KeyService>,
     hosted_task: Option<HostedTask>,
     control: ControlKey,
+    memory: Arc<MemoryBudget>,
 }
 
 impl RecoveryService {
@@ -249,6 +250,7 @@ impl RecoveryService {
             keys,
             hosted_task,
             control,
+            memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
         })
     }
 
@@ -342,8 +344,8 @@ impl RecoveryService {
                     .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
                         "The checkpoint suffix pin changed before archive admission"))?;
                 let archive_sha256 = archive::capture_replica_suffix(
-                    directory, &self.archive, self.keys.as_ref(), self.hosted_task.as_ref(),
-                    request.authority, lease, retained,
+                    directory, &self.storage, &self.archive, self.keys.as_ref(), self.hosted_task.as_ref(),
+                    request.authority, lease, retained, &self.memory,
                 ).await?;
                 Ok(Reply::SuffixCaptured {
                     name: installation.name, authority: request.authority,
@@ -914,6 +916,7 @@ mod tests {
         let service = RecoveryService {
             hosted_task: None,
             control: ControlKey::default(),
+            memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local {

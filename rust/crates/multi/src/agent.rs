@@ -24,21 +24,24 @@ use crate::hosted_recovery::{ReplicaTrimPlan, replay_start};
 
 enum SuffixCut<'a> {
     Tip(TransactionKey),
-    HeldPublication(&'a rtdb_node::OwnedForkCut, &'a dyn crate::keys::KeyService),
+    HeldPublication(
+        &'a rtdb_node::OwnedForkCut, &'a dyn crate::keys::KeyService,
+        &'a BlockCatalog, Arc<rtdb_storage::IoRegion>,
+    ),
 }
 
 impl SuffixCut<'_> {
     fn time(&self) -> rtdb_types::Timestamp {
         match self {
             Self::Tip(key) => key.system_time,
-            Self::HeldPublication(cut, _) => cut.basis(),
+            Self::HeldPublication(cut, ..) => cut.basis(),
         }
     }
 
     fn matches(&self, key: TransactionKey) -> bool {
         match self {
             Self::Tip(expected) => *expected == key,
-            Self::HeldPublication(cut, _) => cut.matches_basis(key),
+            Self::HeldPublication(cut, ..) => cut.matches_basis(key),
         }
     }
 }
@@ -590,9 +593,10 @@ impl NodeAgent {
 
     pub(crate) async fn pin_held_fork_suffix(
         &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
-        capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, keys: &dyn crate::keys::KeyService, expires_at_ms: i64,
+        capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, keys: &dyn crate::keys::KeyService,
+        base: &BlockCatalog, io: Arc<rtdb_storage::IoRegion>, expires_at_ms: i64,
     ) -> Result<CheckpointSuffixPin> {
-        self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::HeldPublication(cut, keys), expires_at_ms)
+        self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::HeldPublication(cut, keys, base, io), expires_at_ms)
             .await
     }
 
@@ -621,7 +625,7 @@ impl NodeAgent {
             {
                 return Err(unavailable());
             }
-            if let SuffixCut::HeldPublication(cut, _) = &cutoff {
+            if let SuffixCut::HeldPublication(cut, ..) = &cutoff {
                 let expected = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
                 if !cut.is_publication() || cut.scope() != expected
                     || expires_at_ms > cut.until().0.div_euclid(1000)
@@ -697,9 +701,10 @@ impl NodeAgent {
             // Discovery streams the quorum-certified applied interval. Its
             // target is the original held publication, not the driver tip.
             let _charge = self.node.memory().reserve(32 << 20)?;
-            let SuffixCut::HeldPublication(cut, keys) = &cutoff else { return Err(unavailable()); };
+            let SuffixCut::HeldPublication(cut, keys, base, io) = &cutoff else { return Err(unavailable()); };
             let (basis, replica, source) = crate::archive::find_held_publication(
-                &stream, &proof, &record, *keys, cut,
+                &stream, &proof, &record, &self.options.storage, *keys, cut,
+                base, Arc::clone(io), self.node.memory(),
             ).await?;
             if source <= checkpoint.source || source > source_through || replica > replica_through {
                 return Err(unavailable());

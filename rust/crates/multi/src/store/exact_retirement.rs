@@ -122,7 +122,9 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
             let Some(witness) = read_release(bucket, &marker.key).await? else { continue; };
             let Some(relative) = witness.target_name().filter(|_| witness.release_version.is_some() || witness.terminal.is_some()) else { continue; };
             if witness.record.released_at_ms > threshold || !permits_release(candidate, &store, &witness.record) { continue; }
-            if !recovery_covers_release(candidate, &witness.record) { continue; }
+            if !recovery_covers_release(candidate, &witness.record)
+                || !super::oversized_payload_collectable(candidate, &witness.record.key, rtdb_directory::now_ms())
+            { continue; }
             let target = ObjectKey::new(format!("{store}/{relative}"))?;
             if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
             eligible.push((marker.key, target, witness));
@@ -363,7 +365,9 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
             StorageRegion::Remote { archive: Some(_), .. } | StorageRegion::Local { archive: Some(_), .. } => true,
             _ => false,
         }) { return Err(changed()); }
-        if !recovery_covers_release(record, &witness.record) {
+        if !recovery_covers_release(record, &witness.record)
+            || !super::oversized_payload_collectable(record, &witness.record.key, rtdb_directory::now_ms())
+        {
             return Err(changed());
         }
         if let Some(PackReadiness::Covered { block, youngest }) = pack {

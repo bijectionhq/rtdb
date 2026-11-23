@@ -139,6 +139,7 @@ async fn copy_published_fork_input(
 
 async fn copy_fork_suffix(
     directory: Arc<dyn Directory>,
+    storage: &CellStorage,
     archive: &CellStorage,
     keys: &dyn KeyService,
     hosted_task: Option<&HostedTask>,
@@ -147,6 +148,7 @@ async fn copy_fork_suffix(
     source: &DeploymentRecord,
     cut: &rtdb_node::OwnedForkCut,
     deadline: Timestamp,
+    memory: &Arc<MemoryBudget>,
 ) -> Result<(Uuid, Option<Uuid>)> {
     if !cut.is_publication() || deadline <= now() {
         return Err(OwnedWorld::unavailable());
@@ -184,13 +186,18 @@ async fn copy_fork_suffix(
                 }).ok_or_else(OwnedWorld::unavailable)?;
             Ok(Some(crate::hosted_recovery::replay_start(current, selected.checkpoint.boundary)?))
         },
-        |_, _, _| async {
+        |current, _, io| async move {
+            let (point, manifest) = capture_receipt(&current, archive, deployment, capture)?
+                .ok_or_else(OwnedWorld::unavailable)?;
+            let (base, _) = replica_suffix::read_base_catalog(
+                archive.bucket(Arc::clone(&io)).await?, &point, &manifest, keys,
+            ).await?;
             agent.pin_held_fork_suffix(
-                &source.name, deployment, suffix, capture, cut, keys, expires_at_ms,
+                &source.name, deployment, suffix, capture, cut, keys, &base, io, expires_at_ms,
             ).await
         },
     ).await?;
-    replica_suffix::capture(directory, archive, keys, hosted_task, deployment, suffix, pin).await?;
+    replica_suffix::capture(directory, storage, archive, keys, hosted_task, deployment, suffix, pin, memory).await?;
     Ok((capture, Some(suffix)))
 }
 
@@ -265,8 +272,8 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
         capture
     } else {
         copy_fork_suffix(
-            Arc::clone(&directory), archive, keys, hosted_task, agent, deployment,
-            &source, &cut, cut.until(),
+            Arc::clone(&directory), storage, archive, keys, hosted_task, agent, deployment,
+            &source, &cut, cut.until(), resources.memory,
         ).await?
     };
     let installed = directory.deployment(&deployment.to_string()).await?
@@ -512,8 +519,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
                 (capture, None)
             } else {
                 copy_fork_suffix(
-                    Arc::clone(&directory), archive, keys, hosted_task,
-                    agent.ok_or_else(OwnedWorld::unavailable)?, deployment_id, &source, &fork.cut, deadline,
+                    Arc::clone(&directory), storage, archive, keys, hosted_task,
+                    agent.ok_or_else(OwnedWorld::unavailable)?, deployment_id, &source, &fork.cut, deadline, resources.memory,
                 ).await?
             };
             source = directory.deployment(&deployment).await?.ok_or_else(OwnedWorld::unavailable)?;

@@ -6,19 +6,20 @@ use prost::Message;
 use rtdb_directory::{CheckpointSuffixPin, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
 use rtdb_format::{
     catalog::BlockCatalog,
-    envelope::{ReplicaBody, ReplicaFrame},
+    envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame},
     keys::block_key,
+    CURRENT_STORAGE_VERSION,
 };
 use rtdb_logkeeper::{ArchivedReplicaEntry, JournalDigest};
-use rtdb_types::{Anomaly, BlockIndex, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, BlockIndex, MemoryBudget, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey, TxId};
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use super::{
-    CapturePoint, URL_SAFE_NO_PAD, capture_receipt, encode, inconsistent, read_object, require_capture_open,
+    CapturePoint, URL_SAFE_NO_PAD, capture_receipt, checkpoint_storage_root, encode, inconsistent, read_object, require_capture_open,
     unavailable, verified_archive, verify_cut,
 };
-use super::replica_artifact::{CertifiedSegments, ReplicaArtifact, require_chain};
+use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, require_chain};
 use super::stage::{RegionPublication, with_region};
 use crate::{
     admin::{administration_stream, update_installation},
@@ -26,49 +27,116 @@ use crate::{
     deployment::CellStorage,
     keys::KeyService,
     reference::{PrefixedStore, key},
+    store::{EncryptingStore, ROOT_MARKER},
 };
-use rtdb_storage::ObjectStore;
+use rtdb_storage::{IoRegion, ObjectStore};
 
 pub(crate) const MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 4096;
 const FORMAT: &[u8] = b"rtdb.replica-suffix.v1\0";
 
+struct ServingPayloads<'a> {
+    record: &'a DeploymentRecord,
+    storage: &'a CellStorage,
+    keys: &'a dyn KeyService,
+    io: Arc<IoRegion>,
+    memory: &'a Arc<MemoryBudget>,
+    store: tokio::sync::OnceCell<EncryptingStore>,
+}
+
+impl<'a> ServingPayloads<'a> {
+    fn new(
+        record: &'a DeploymentRecord, storage: &'a CellStorage, keys: &'a dyn KeyService,
+        io: Arc<IoRegion>, memory: &'a Arc<MemoryBudget>,
+    ) -> Self {
+        Self { record, storage, keys, io, memory, store: tokio::sync::OnceCell::new() }
+    }
+
+    async fn read(&self, envelope: &ReplicaEnvelope) -> Result<PayloadBytes> {
+        let name = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
+            .ok_or_else(suffix_unavailable)?;
+        let store = self.store.get_or_try_init(|| async {
+            let material = self.keys.existing_key(&self.record.key_id()).await?
+                .ok_or_else(suffix_unavailable)?;
+            let bucket = self.storage.bucket(Arc::clone(&self.io)).await?;
+            let root = format!("{}/{}", self.record.storage_prefix(), checkpoint_storage_root()?);
+            let files = PrefixedStore::new(bucket, root);
+            let owner = files.observe_fresh_exact(&key(ROOT_MARKER)?, self.record.id.len()).await?;
+            if owner.value.as_ref() != self.record.id.as_bytes() {
+                return Err(suffix_unavailable());
+            }
+            EncryptingStore::new(Arc::new(files), &material)
+        }).await?;
+        PayloadBytes::read(store, &key(&name)?, self.memory).await
+    }
+}
+
+pub(super) async fn read_base_catalog(
+    bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService,
+) -> Result<(BlockCatalog, [u8; crate::keys::KEY_BYTES])> {
+    let (base, material) = verified_archive(bucket.clone(), point, manifest, keys).await?;
+    let root = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
+    let root_object = base.objects.iter().find(|object| object.name == root.as_str())
+        .ok_or_else(|| inconsistent("The suffix capture omitted its root catalog"))?;
+    let files = PrefixedStore::new(bucket, format!("checkpoint-captures/{}/{}/objects", point.deployment, point.operation));
+    let root_bytes = read_object(&files, &root, root_object).await?;
+    let catalog = BlockCatalog::decode(&Cipher::new(&material)?.open(root.as_str(), &root_bytes)?)?;
+    verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
+    Ok((catalog, material))
+}
+
 /// Resolve the original accepted publication to its complete transaction and
 /// journal cut inside a previously quorum-certified applied interval.
 pub(crate) async fn find_held_publication(
     stream: &rtdb_logkeeper::StreamConfig, proof: &JournalDigest,
-    record: &DeploymentRecord, keys: &dyn KeyService, cut: &rtdb_node::OwnedForkCut,
+    record: &DeploymentRecord, storage: &CellStorage, keys: &dyn KeyService, cut: &rtdb_node::OwnedForkCut,
+    base: &BlockCatalog, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
 ) -> Result<(TransactionKey, i64, i64)> {
     let cipher = TerminalReplicaCipher::open(record, keys).await?;
+    let payloads = ServingPayloads::new(record, storage, keys, io, memory);
     let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, proof)?;
     let log_epoch = StorageEpoch(record.log_epoch);
+    let mut fence = rtdb_replication::TermFence::from_catalog(base)?;
+    let mut writer = None;
     let mut selected = None;
     while let Some(mut entries) = pages.next_page().await? {
+        if selected.is_some() {
+            continue;
+        }
         cipher.open_page(&mut entries)?;
         for entry in entries {
-            let Some(ReplicaBody::ResolvedTx(row)) = ReplicaFrame::decode(&entry.payload)?.message
-            else { continue; };
+            let envelope = admit_record(&entry, &mut fence, &mut writer, record.epoch)?;
+            let payload;
+            let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                payload = payloads.read(&envelope).await?;
+                envelope.unwrap_payload(&payload.bytes)?
+            } else {
+                envelope
+            };
+            let ReplicaBody::ResolvedTx(row) = envelope.message else { continue; };
             if row.system_time_micros != Some(cut.basis().0) { continue; }
             let basis = TransactionKey {
                 tx_id: TxId(row.tx_id.ok_or_else(suffix_unavailable)?),
                 system_time: cut.basis(),
             };
             let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
-            if !(1..=record.epoch).contains(&entry.epoch) || !row.committed.unwrap_or(false)
+            if !row.committed.unwrap_or(false)
                 || !cut.matches_basis(basis) || row.db_op.is_some() || row.external_source_token.is_some()
-                || source < 0 || selected.replace((basis, entry.lsn, source)).is_some()
+                || source < 0
             {
                 return Err(suffix_unavailable());
             }
+            selected = Some((basis, entry.lsn, source));
+            break;
         }
     }
     selected.ok_or_else(suffix_unavailable)
 }
 
 pub(crate) async fn capture(
-    directory: Arc<dyn Directory>, archive: &CellStorage, keys: &dyn KeyService,
+    directory: Arc<dyn Directory>, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
     hosted_task: Option<&HostedTask>, deployment: Uuid, pin_id: Uuid,
-    selected: CheckpointSuffixPin,
+    selected: CheckpointSuffixPin, memory: &Arc<MemoryBudget>,
 ) -> Result<String> {
     let id = deployment.to_string();
     with_region(
@@ -81,17 +149,8 @@ pub(crate) async fn capture(
             let (directory, selected, id) = (&directory, &selected, &id);
             async move {
                 let (point, pin) = admit(&record, archive, deployment, pin_id, selected)?;
-                let bucket = archive.bucket(io).await?;
-                let (base, material) = verified_archive(bucket.clone(), &point, &pin.manifest_sha256, keys).await?;
-                let root = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
-                let root_object = base.objects.iter().find(|object| object.name == root.as_str())
-                    .ok_or_else(|| inconsistent("The suffix capture omitted its root catalog"))?;
-                let prefix = format!("checkpoint-captures/{deployment}/{}", pin.capture);
-                let files = PrefixedStore::new(bucket.clone(), format!("{prefix}/objects"));
-                let cipher = Cipher::new(&material)?;
-                let root_bytes = read_object(&files, &root, root_object).await?;
-                let catalog = BlockCatalog::decode(&cipher.open(root.as_str(), &root_bytes)?)?;
-                verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
+                let bucket = archive.bucket(Arc::clone(&io)).await?;
+                let (catalog, material) = read_base_catalog(Arc::clone(&bucket), &point, &pin.manifest_sha256, keys).await?;
                 let stream_name = record.stream("replica");
                 let artifact = suffix_artifact(bucket.as_ref(), &material, deployment, pin_id, pin, &stream_name)?;
 
@@ -105,7 +164,9 @@ pub(crate) async fn capture(
                     );
                     let remaining = pin.expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
                     let materialize = async {
+                        let _pages = memory.reserve(32 << 20)?;
                         let cipher = TerminalReplicaCipher::open(&record, keys).await?;
+                        let payloads = ServingPayloads::new(&record, storage, keys, io, memory);
                         let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                         let mut progress = SuffixProgress::new(pin, &catalog)?;
                         let mut chain = artifact.chain();
@@ -117,8 +178,18 @@ pub(crate) async fn capture(
                             let segment = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
                             rtdb_logkeeper::verify_certified_range(&segment, &entries)?;
                             cipher.open_page(&mut entries)?;
-                            progress.apply_segment(&entries, pin, |_| Ok(()))?;
                             artifact.put_segment(&entries, &mut chain).await?;
+                            for entry in entries {
+                                let envelope = progress.admit(&entry, pin)?;
+                                if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                                    let payload = payloads.read(&envelope).await?;
+                                    let resolved = envelope.unwrap_payload(&payload.bytes)?;
+                                    progress.apply(resolved, pin, |_| Ok(()))?;
+                                    artifact.put_payload(entry.lsn, &payload.bytes, &mut chain).await?;
+                                } else {
+                                    progress.apply(envelope, pin, |_| Ok(()))?;
+                                }
+                            }
                         }
                         progress.finish(pin)?;
                         artifact.put_manifest(chain).await
@@ -177,7 +248,17 @@ pub(super) async fn apply_archived(
     while progress.next <= pin.replica_through {
         let _charge = memory.reserve(MAX_SEGMENT_BYTES * 4 + 4096 + MAX_SEGMENT_ENTRIES * 128)?;
         let entries = artifact.read_segment(progress.next, pin.replica_through, &mut chain).await?;
-        progress.apply_segment(&entries, pin, |message| recovered.apply_archived_transaction(message, memory))?;
+        for entry in entries {
+            let envelope = progress.admit(&entry, pin)?;
+            let payload;
+            let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                payload = artifact.read_payload(entry.lsn, &mut chain, memory).await?;
+                envelope.unwrap_payload(&payload.bytes)?
+            } else {
+                envelope
+            };
+            progress.apply(envelope, pin, |message| recovered.apply_archived_transaction(message, memory))?;
+        }
     }
     progress.finish(pin)?;
     require_chain(chain, expected)?;
@@ -415,63 +496,51 @@ impl SuffixProgress {
         })
     }
 
-    fn apply_segment(
-        &mut self, entries: &[ArchivedReplicaEntry], pin: &CheckpointSuffixPin,
-        mut apply: impl FnMut(&rtdb_format::log::proto::ResolvedTx) -> Result<()>,
+    fn admit(&mut self, entry: &ArchivedReplicaEntry, pin: &CheckpointSuffixPin) -> Result<ReplicaEnvelope> {
+        if entry.lsn != self.next || entry.lsn > pin.replica_through || self.tx == pin.basis {
+            return Err(suffix_unavailable());
+        }
+        let admitted = admit_record(entry, &mut self.fence, &mut self.writer_epoch, pin.writer_epoch)?;
+        self.next = entry.lsn.checked_add(1).ok_or_else(suffix_unavailable)?;
+        Ok(admitted)
+    }
+
+    fn apply(
+        &mut self, body: ReplicaEnvelope, pin: &CheckpointSuffixPin,
+        apply: impl FnOnce(&rtdb_format::log::proto::ResolvedTx) -> Result<()>,
     ) -> Result<()> {
         let log_epoch = StorageEpoch(pin.log_epoch);
-        for entry in entries {
-            if entry.lsn != self.next || entry.lsn > pin.replica_through || self.tx == pin.basis
-                || !(1..=pin.writer_epoch).contains(&entry.epoch)
-                || self.writer_epoch.is_some_and(|prior| prior > entry.epoch)
-            {
-                return Err(suffix_unavailable());
-            }
-            let body = ReplicaFrame::decode(&entry.payload)?;
-            if body.term.0 <= 0 || body.term_sequence.is_none_or(|sequence| sequence.0 < 0) {
-                return Err(suffix_unavailable());
-            }
-            let admission = self.fence.admit(body.term, body.term_sequence)?;
-            if admission.verdict != rtdb_replication::Verdict::Apply
-                || (admission.opens_term() && !matches!(&body.message,
-                    Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none()))
-            {
-                return Err(suffix_unavailable());
-            }
-            self.writer_epoch = Some(entry.epoch);
-            self.next = entry.lsn.checked_add(1).ok_or_else(suffix_unavailable)?;
-            match body.message {
-                Some(ReplicaBody::ResolvedTx(row)) if row.db_op.is_none() && row.external_source_token.is_none() => {
-                    let id = row.tx_id.ok_or_else(suffix_unavailable)?;
-                    let time = Timestamp(row.system_time_micros.ok_or_else(suffix_unavailable)?);
-                    let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
-                    if id <= self.tx.tx_id.0 || time <= self.tx.system_time || source <= self.source
-                        || id > pin.basis.tx_id.0 || time > pin.basis.system_time || source > pin.source_through
-                    {
-                        return Err(suffix_unavailable());
-                    }
-                    apply(&row)?;
-                    self.tx = TransactionKey { tx_id: TxId(id), system_time: time };
-                    self.source = source;
+        match body.message {
+            ReplicaBody::ResolvedTx(row) if row.db_op.is_none() && row.external_source_token.is_none() => {
+                let id = row.tx_id.ok_or_else(suffix_unavailable)?;
+                let time = Timestamp(row.system_time_micros.ok_or_else(suffix_unavailable)?);
+                let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
+                if id <= self.tx.tx_id.0 || time <= self.tx.system_time || source <= self.source
+                    || id > pin.basis.tx_id.0 || time > pin.basis.system_time || source > pin.source_through
+                {
+                    return Err(suffix_unavailable());
                 }
-                Some(ReplicaBody::BlockBoundary(boundary))
-                    if boundary.block_index.is_some_and(|block| block >= self.block) => (),
-                Some(ReplicaBody::BlockUploaded(upload)) if upload.storage_epoch == Some(pin.log_epoch)
-                    && upload.external_source_token.is_none() => {
-                    let block = upload.block_index.ok_or_else(suffix_unavailable)?;
-                    let source = upload.latest_processed_msg_id.map(SourcePosition)
-                        .map(|pos| pos.after_offset(log_epoch)).ok_or_else(suffix_unavailable)?;
-                    if block < self.block || source < self.block_source || source > self.source
-                        || (block == self.block && source != self.block_source)
-                    {
-                        return Err(suffix_unavailable());
-                    }
-                    self.block = block;
-                    self.block_source = source;
-                }
-                Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none() => (),
-                _ => return Err(suffix_unavailable()),
+                apply(&row)?;
+                self.tx = TransactionKey { tx_id: TxId(id), system_time: time };
+                self.source = source;
             }
+            ReplicaBody::BlockBoundary(boundary)
+                if boundary.block_index.is_some_and(|block| block >= self.block) => (),
+            ReplicaBody::BlockUploaded(upload) if upload.storage_epoch == Some(pin.log_epoch)
+                && upload.external_source_token.is_none() => {
+                let block = upload.block_index.ok_or_else(suffix_unavailable)?;
+                let source = upload.latest_processed_msg_id.map(SourcePosition)
+                    .map(|pos| pos.after_offset(log_epoch)).ok_or_else(suffix_unavailable)?;
+                if block < self.block || source < self.block_source || source > self.source
+                    || (block == self.block && source != self.block_source)
+                {
+                    return Err(suffix_unavailable());
+                }
+                self.block = block;
+                self.block_source = source;
+            }
+            ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none() => (),
+            _ => return Err(suffix_unavailable()),
         }
         Ok(())
     }
@@ -484,6 +553,28 @@ impl SuffixProgress {
         }
         Ok(())
     }
+}
+
+fn admit_record(
+    entry: &ArchivedReplicaEntry, fence: &mut rtdb_replication::TermFence,
+    previous_writer: &mut Option<u64>, writer_epoch: u64,
+) -> Result<ReplicaEnvelope> {
+    if !(1..=writer_epoch).contains(&entry.epoch) || previous_writer.is_some_and(|prior| prior > entry.epoch) {
+        return Err(suffix_unavailable());
+    }
+    let envelope = ReplicaFrame::decode(&entry.payload)?.into_envelope().ok_or_else(suffix_unavailable)?;
+    if envelope.term.0 <= 0 || envelope.term_sequence.is_none_or(|sequence| sequence.0 < 0) {
+        return Err(suffix_unavailable());
+    }
+    let admitted = fence.admit(envelope.term, envelope.term_sequence)?;
+    if admitted.verdict != rtdb_replication::Verdict::Apply
+        || (admitted.opens_term() && !matches!(&envelope.message,
+            ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none()))
+    {
+        return Err(suffix_unavailable());
+    }
+    *previous_writer = Some(entry.epoch);
+    Ok(envelope)
 }
 
 #[cfg(test)]

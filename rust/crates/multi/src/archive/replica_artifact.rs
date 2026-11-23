@@ -1,4 +1,4 @@
-use std::{iter::Peekable, vec::IntoIter};
+use std::{iter::Peekable, sync::Arc, vec::IntoIter};
 
 use bytes::Bytes;
 use prost::Message;
@@ -6,7 +6,7 @@ use ring::digest::{Context, SHA256};
 use rtdb_directory::{CheckpointTransferTerminal, DeploymentRecord};
 use rtdb_logkeeper::{ArchivedReplicaEntry, CertifiedRangeReader};
 use rtdb_storage::{ObjectKey, ObjectStore};
-use rtdb_types::Result;
+use rtdb_types::{MemoryBudget, MemoryReservation, Result};
 
 use crate::{
     archive::{
@@ -18,6 +18,31 @@ use crate::{
 };
 
 const MAX_RECEIPT_BYTES: usize = 16 << 10;
+
+pub(super) struct PayloadBytes {
+    pub(super) bytes: Bytes,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PayloadBytes {
+    pub(super) async fn read(
+        store: &dyn ObjectStore,
+        key: &ObjectKey,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let size = usize::try_from(store.head_fresh(key).await?.size).map_err(|_| bad_segment())?;
+        let reserved = size
+            .checked_mul(6)
+            .and_then(|size| size.checked_add(4096))
+            .ok_or_else(bad_segment)?;
+        let reservation = memory.reserve(reserved)?;
+        let bytes = store.observe_fresh_exact(key, size).await?.value;
+        Ok(Self {
+            bytes,
+            _reservation: reservation,
+        })
+    }
+}
 
 pub(super) struct ReplicaArtifact<'a> {
     store: &'a dyn ObjectStore,
@@ -107,6 +132,33 @@ impl<'a> ReplicaArtifact<'a> {
         Ok(entries)
     }
 
+    /// The payload object belongs to its exact replica offset. The segment
+    /// continues to carry the certified outer envelope.
+    pub(super) async fn put_payload(
+        &self,
+        offset: i64,
+        body: &[u8],
+        chain: &mut Context,
+    ) -> Result<()> {
+        let object = self.payload(offset)?;
+        let digest = self.put(&object, body).await?;
+        extend_payload(chain, offset, &digest);
+        Ok(())
+    }
+
+    pub(super) async fn read_payload(
+        &self,
+        offset: i64,
+        chain: &mut Context,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<PayloadBytes> {
+        let object = self.payload(offset)?;
+        let mut body = PayloadBytes::read(self.store, &object, memory).await?;
+        extend_payload(chain, offset, &sha256(&body.bytes));
+        body.bytes = self.cipher.open(object.as_str(), &body.bytes)?;
+        Ok(body)
+    }
+
     pub(super) async fn put_manifest(&self, chain: Context) -> Result<[u8; 32]> {
         let object = self.manifest()?;
         let mut body = Vec::with_capacity(32 + self.receipt.len());
@@ -147,6 +199,10 @@ impl<'a> ReplicaArtifact<'a> {
 
     fn segment(&self, first: i64) -> Result<ObjectKey> {
         key(&format!("{}/segments/{first:020}", self.prefix))
+    }
+
+    fn payload(&self, offset: i64) -> Result<ObjectKey> {
+        key(&format!("{}/payloads/{offset:020}", self.prefix))
     }
 
     async fn put(&self, object: &ObjectKey, plaintext: &[u8]) -> Result<[u8; 32]> {
@@ -253,6 +309,12 @@ fn require_dense(entries: &[ArchivedReplicaEntry], first: i64, terminal: i64) ->
 fn extend_chain(chain: &mut Context, first: i64, through: i64, digest: &[u8; 32]) {
     chain.update(&first.to_be_bytes());
     chain.update(&through.to_be_bytes());
+    chain.update(digest);
+}
+
+fn extend_payload(chain: &mut Context, offset: i64, digest: &[u8; 32]) {
+    chain.update(b"payload\0");
+    chain.update(&offset.to_be_bytes());
     chain.update(digest);
 }
 

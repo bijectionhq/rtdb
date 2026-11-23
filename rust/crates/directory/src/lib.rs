@@ -933,6 +933,20 @@ impl DeploymentRecord {
                 }))
     }
 
+    /// Oversized replica records keep their payloads in the serving store
+    /// until every raw replay owner has independently materialized its cut.
+    pub fn required_oversized_payload_block(&self, now_ms: i64) -> Option<i64> {
+        self.checkpoint_captures.values()
+            .filter(|capture| capture.world_replay.is_some() && capture.incarnation == self.incarnation
+                && capture.log_epoch == self.log_epoch && self.lifecycle != Lifecycle::Deleted)
+            .map(|capture| capture.checkpoint.block)
+            .chain(self.checkpoint_suffix_pins.values()
+                .filter(|pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none()
+                    && pin.incarnation == self.incarnation && pin.log_epoch == self.log_epoch)
+                .map(|pin| pin.checkpoint.block))
+            .min()
+    }
+
     /// The ciphertext binds to the logical deployment. A transfer copies
     /// the records into the destination journal at their original offsets.
     pub fn replica_seal_scope(&self) -> String { format!("{}/1/replica", self.id) }

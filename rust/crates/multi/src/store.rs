@@ -1317,6 +1317,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 StoredRelease::Path(record) => record,
             };
             if !permits_release(record, &store, &released) || !recovery_covers_release(record, &released)
+                || !oversized_payload_collectable(record, &released.key, now_ms)
                 || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
                 .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))
             {
@@ -1400,6 +1401,12 @@ fn checkpoint_metadata_block(key: &str) -> Option<i64> {
     };
     if file.contains('/') { return None; }
     rtdb_format::keys::block_index_from_key(file).ok().map(|index| index.0)
+}
+
+fn oversized_payload_collectable(record: &DeploymentRecord, key: &str, now: i64) -> bool {
+    key.strip_prefix("oversized/")
+        .and_then(rtdb_format::keys::oversized_block_index)
+        .is_none_or(|block| record.required_oversized_payload_block(now).is_none_or(|held| block.0 < held))
 }
 
 /// When a garbage record's name says it was released, in milliseconds since the epoch.
