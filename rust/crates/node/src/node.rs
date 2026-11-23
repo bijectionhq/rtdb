@@ -1344,6 +1344,17 @@ impl OwnedReadSession {
         Ok(cut)
     }
 
+    pub async fn fork_held_root_publication_cut(
+        &self, scope: rtdb_types::PlacedAttemptScope, basis: Timestamp,
+    ) -> Result<OwnedForkCut> {
+        let mut cut = self.fork_publication_cut(scope).await?;
+        if basis > cut.basis() {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        cut.basis = basis;
+        Ok(cut)
+    }
+
     /// Certifies the original Held publication for an independently retained fork.
     pub async fn fork_overlay_cut(
         &self, scope: rtdb_types::PlacedAttemptScope, world: &rtdb_types::OwnedWorld, system: Timestamp,
@@ -2859,6 +2870,8 @@ impl NativeSession {
         use rtdb_tx::OwnedForkRoot;
         let proposal_publication = requested == rtdb_types::WorldClockMode::Proposal
             && fork.cut.is_publication() && fork.root.is_some();
+        let held_publication = matches!(fork.requested, WorldClockRequest::Held { start: None })
+            && fork.cut.is_publication() && fork.root.is_some() && fork.previous.is_none();
         let proposal_hold = requested == rtdb_types::WorldClockMode::Proposal
             && fork.cut.is_renewal() && fork.previous.is_some();
         let root = match &fork.root {
@@ -2878,7 +2891,7 @@ impl NativeSession {
         let requires_live_tip = record.initial_clock() > inherited
             || (requested == rtdb_types::WorldClockMode::Proposal && !proposal_publication && !proposal_hold);
         let requires_tip = requires_live_tip || proposal_publication
-            || (root != OwnedForkRoot::None && !fork.cut.is_renewal()
+            || (root != OwnedForkRoot::None && !fork.cut.is_renewal() && !held_publication
                 && record.parent_publication == Some(record.basis.system_time));
         let effects = fork.controls.len()
             .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
@@ -2899,19 +2912,20 @@ impl NativeSession {
             || ((fork.previous.is_none() || fork.sibling.is_some()) != (record.pin == record.id)) || fork.controls.is_empty()
             || fork.previous.is_some_and(|pin| pin == record.pin || (record.mode.is_writable() && !proposal_hold))
             || record.mode != requested
+            || (held_publication && !record.is_held_root_fork())
             || (requires_live_tip && fork.cut.live.is_none())
             || (fork.cut.is_publication() && (root == OwnedForkRoot::None
                 || record.parent_publication != Some(fork.cut.basis())))
             || effects > 4096 || !fork.controls.iter().any(rtdb_tx::HostedControlWrite::is_check)
             || (root == OwnedForkRoot::None && fork.controls.iter().any(|control| !control.is_check()))
-            || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites)
+            || ((held_publication || matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites))
                 && fork.controls.iter().all(rtdb_tx::HostedControlWrite::is_check))
             || (root == OwnedForkRoot::WritesAdvance && !fork.cut.is_publication())
             || (fork.cut.is_renewal() && !matches!(root, OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold | OwnedForkRoot::ProposalShorten))
             || fork.sibling.is_some_and(|sibling| sibling == record.id || fork.previous.is_none()
                 || root != OwnedForkRoot::WritesSibling)
             || (root != OwnedForkRoot::None && ((fork.previous.is_some() && !matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold | OwnedForkRoot::ProposalShorten))
-                || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication && !proposal_hold)
+                || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication && !proposal_hold && !held_publication)
                 || (fork.cut.live.is_none() && !fork.cut.is_publication())))
             || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>

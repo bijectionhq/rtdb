@@ -157,6 +157,12 @@ impl OwnedWorld {
         }
     }
 
+    pub fn is_held_root_fork(&self) -> bool {
+        self.ancestor.is_none()
+            && self.parent_publication == Some(self.basis.system_time)
+            && self.mode == (WorldClockMode::Held { start: self.basis.system_time })
+    }
+
     pub fn record(&self) -> StructFields<Value> {
         let (mode, start) = match self.mode {
             WorldClockMode::Retained => ("retained", Value::Null),
@@ -501,6 +507,10 @@ mod tests {
             id: Iid([3; 16]), pin: Iid([3; 16]), until: Timestamp(200),
             mode: WorldClockMode::Retained, ..source.clone()
         };
+        assert!(!source.is_held_root_fork());
+        let exact = OwnedWorld { mode: WorldClockMode::Held { start: source.basis.system_time }, ..source.clone() };
+        assert!(OwnedWorld::from_record(&exact.record())?.is_held_root_fork());
+        assert!(!OwnedWorld { parent_publication: None, ..exact }.is_held_root_fork());
         assert!(source.can_retain_parent(&child));
         assert_eq!(child.initial_clock(), Timestamp(100));
         assert!(!source.can_retain_parent(&OwnedWorld { until: Timestamp(301), ..child.clone() }));

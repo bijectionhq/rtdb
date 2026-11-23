@@ -755,7 +755,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     } else if capture.is_nil() {
         if suffix.is_some() || fork.root.is_none() || (fork.previous.is_some() && !authored_advance)
             || !(matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
-                || (matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal)
+                || (matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal | rtdb_node::WorldClockRequest::Held { start: None })
                     && fork.cut.is_publication()))
         {
             return Err(OwnedWorld::unavailable());

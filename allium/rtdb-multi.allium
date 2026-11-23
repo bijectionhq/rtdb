@@ -1434,6 +1434,8 @@ rule ConsumeIntake {
 -- The admission holds until the query cursor and its archive I/O drain.
 -- The read loads only the checkpoint closure, with no replay of the serving tail.
 -- A writable checkpoint world durably pins that capture before ordering its owner-scoped registration.
+-- A held child of Root starts at the exact archived Root publication, even if Root has since advanced.
+-- The child's registration, its application ownership custody, the request receipt and any Root facts order together.
 -- A world opens against an authenticated attachment when the durable pin and ordered registration name the same cut and remain live.
 -- Child writes are confined to one world, and the ordered resolver checks that world's expiry before applying any writes.
 -- A fork records its owner's declared relation schemas from the exact archived parent.

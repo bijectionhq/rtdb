@@ -1505,11 +1505,7 @@ impl<'a> OpenTransaction<'a> {
             let publish_root = root == OwnedForkRoot::Writes || root == OwnedForkRoot::ProposalWrites || bounded_write;
             let with_root = root != OwnedForkRoot::None;
             let proposal_publication = matches!(root, OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites);
-            let required_mode = if proposal_publication || proposal_hold {
-                rtdb_types::WorldClockMode::Proposal
-            } else {
-                rtdb_types::WorldClockMode::Retained
-            };
+            let mut held_publication = false;
             let mut forks = 0;
             let mut checks = 0;
             let mut root_rows = 0usize;
@@ -1576,11 +1572,19 @@ impl<'a> OpenTransaction<'a> {
                     }
                     Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, .. }) => {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
+                        use rtdb_types::WorldClockMode;
+                        held_publication = matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::Writes)
+                            && overlay_source.is_none() && world.is_held_root_fork();
+                        let valid_mode = if proposal_publication || proposal_hold {
+                            world.mode == WorldClockMode::Proposal
+                        } else {
+                            held_publication || world.mode == WorldClockMode::Retained
+                        };
                         if world.dropped || world.basis.system_time >= self.tx_key().system_time
                             || deadline.is_none_or(|until| until > world.until)
                             || sibling.is_some() != sibling_fork
                             || (with_root && ((previous.is_some() != bounded_write)
-                                || world.mode != required_mode
+                                || !valid_mode
                                 || ((proposal_publication || bounded_write) && world.parent_publication != Some(world.basis.system_time))
                                 || world.basis.tx_id >= self.tx_key().tx_id))
                         {
@@ -1636,7 +1640,8 @@ impl<'a> OpenTransaction<'a> {
                             if world.pin != world.id { return Err(unavailable()); }
                         }
                         if world.initial_clock() > world.inherited_clock() || (world.mode == rtdb_types::WorldClockMode::Proposal && !proposal_hold)
-                            || (with_root && !renewal && !sibling_fork && world.parent_publication == Some(world.basis.system_time))
+                            || (with_root && !renewal && !sibling_fork && !held_publication
+                                && world.parent_publication == Some(world.basis.system_time))
                         {
                             expected_tip = Some((world.basis.system_time, world.parent_publication));
                         }
@@ -1653,7 +1658,7 @@ impl<'a> OpenTransaction<'a> {
             if (bounded_write && (!replacement_checked || !existing_control_write || control_writes > (5 + usize::from(proposal_hold))))
                 || forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096
                 || (publish_root && root_rows == 0)
-                || ((root == OwnedForkRoot::Controls || proposal_publication) && control_writes == 0)
+                || ((held_publication || root == OwnedForkRoot::Controls || proposal_publication) && control_writes == 0)
             {
                 return Err(unavailable());
             }

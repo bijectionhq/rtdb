@@ -407,6 +407,8 @@ variant TxMessage : SourceMessage {
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
     -- Acceptance-relative Root writes retain those columns when their validity offsets are placed at the ordered system time.
     -- Root publication and fork admission count the Arrow document rows against the same effect limits as row writes.
+    -- A held fork of an exact Root publication orders its new world registration with the Root section and owner controls.
+    -- The fork inherits the archived publication's clock while Root witnesses validate at ordering.
     -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
     -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.

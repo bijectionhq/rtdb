@@ -3584,6 +3584,10 @@ impl Service {
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
         let select_publication = matches!(*mode, 4 | 5) && publish_root;
         let proposed_publication = *mode == 5 && publish_root;
+        let held_publication = *mode == 10 && publish_root;
+        if held_publication && (*previous_handle != [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
+            return Err(invalid("A held Root fork derives its archive from the selected publication"));
+        }
         let proposal_hold = matches!(*mode, 8 | 9) && publish_root;
         let proposal_shorten = *mode == 9 && publish_root;
         let sibling = *mode == 7 && publish_root;
@@ -3591,7 +3595,15 @@ impl Service {
         if renewal && (*previous_handle == [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
             return Err(invalid("An authored renewal requires its original retained handle and derives its archive"));
         }
+        let (held_basis, rest) = if held_publication {
+            let (basis, rest) = rest.split_first_chunk::<8>()
+                .ok_or_else(|| invalid("Held Root fork has no exact publication"))?;
+            (Some(Timestamp(i64::from_be_bytes(*basis))), rest)
+        } else {
+            (None, rest)
+        };
         let (requested, rest) = match *mode {
+            10 if held_publication => (rtdb_node::WorldClockRequest::Held { start: None }, rest),
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
             8 | 9 if proposal_hold => (rtdb_node::WorldClockRequest::Proposal, rest),
             6 | 7 if renewal => (rtdb_node::WorldClockRequest::Retained, rest),
@@ -3614,7 +3626,9 @@ impl Service {
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let policy = self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
-        let cut = if select_publication {
+        let cut = if let Some(basis) = held_basis {
+            held.snapshot.fork_held_root_publication_cut(scope, basis).await.map_err(status)?
+        } else if select_publication {
             held.snapshot.fork_publication_cut(scope).await.map_err(status)?
         } else {
             held.snapshot.fork_cut(scope).await.map_err(status)?
@@ -3656,10 +3670,11 @@ impl Service {
         let mut root_framing = None;
         let mut root_groups = 0;
         let groups = if publish_root {
-            if (previous.is_some() && !authored_replacement) || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication || proposal_hold)
+            if (previous.is_some() && !authored_replacement)
+                || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication || proposal_hold || held_publication)
                 || (cut.live().is_none() && !cut.is_publication())
             {
-                return Err(invalid("A Root publication requires an initial retained fork at its original live hold"));
+                return Err(invalid("A co-ordered fork requires an admitted Root hold and clock mode"));
             }
             let (witnesses, groups, charge) = self.owned_witness_prefix(call, groups, true)?;
             root_witness_charge = Some(charge);
@@ -3719,7 +3734,7 @@ impl Service {
         if !controls.iter().any(rtdb_tx::HostedControlWrite::is_check) {
             return Err(invalid("A retained fork requires a hosted ownership check"));
         }
-        if publish_root && (root.publication.is_none() || proposed_publication)
+        if publish_root && (root.publication.is_none() || proposed_publication || held_publication)
             && controls.iter().all(rtdb_tx::HostedControlWrite::is_check) {
             return Err(invalid("A co-ordered fork requires Root facts or a hosted control replacement"));
         }
