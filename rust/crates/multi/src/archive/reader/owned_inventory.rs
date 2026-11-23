@@ -335,7 +335,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                     } else if let Some(payload) = offloaded.as_ref() {
                         let proxy = target_payload_proxy(&envelope, resolved, &payload.body.bytes)?;
                         publish_target_payload(directory, storage, keys, task, &target, &reserved, &payload.path, &payload.body.bytes).await?;
-                        if let Some(proxy) = proxy { entry.payload = proxy; }
+                        entry.payload = proxy;
                     }
                 }
                 next += entries.len() as i64;
@@ -370,6 +370,7 @@ async fn observe_transfer_payload(
     let Some(relative) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? else {
         return Ok(None);
     };
+    replica_suffix::require_payload_digest(envelope)?;
     let body = artifact.read_payload(offset, chain, memory).await?;
     let resolved = envelope.unwrap_payload(&body.bytes)?;
     Ok(Some(DetachedTransferPayload { path: crate::reference::key(&relative)?, resolved, body }))
@@ -419,14 +420,13 @@ pub(super) async fn verify_seeded_payloads(
     Ok(())
 }
 
-fn target_payload_proxy(original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8]) -> Result<Option<bytes::Bytes>> {
+fn target_payload_proxy(original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8]) -> Result<bytes::Bytes> {
     let rtdb_format::envelope::ReplicaBody::OversizedMessage(reference) = &original.message else {
         return Err(inconsistent("The target payload has no certified reference"));
     };
-    if reference.payload_sha256.is_none() { return Ok(None); }
     let id = reference.payload_id.clone().ok_or_else(|| inconsistent("The target payload has no object identity"))?;
     let proxy = resolved.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(reference.block_index.unwrap_or_default()), id, body);
-    Ok(Some(proxy.encode().into()))
+    Ok(proxy.encode().into())
 }
 
 async fn publish_target_payload(

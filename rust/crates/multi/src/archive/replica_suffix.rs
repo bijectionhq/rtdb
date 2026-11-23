@@ -92,14 +92,21 @@ impl<'a> ServingPayloads<'a> {
     }
 
     pub(super) async fn resolve_verified(&self, position: i64, envelope: &ReplicaEnvelope) -> Result<(ReplicaEnvelope, PayloadBytes)> {
-        let ReplicaBody::OversizedMessage(reference) = &envelope.message else { return Err(suffix_unavailable()); };
-        if self.record.storage_namespaces.is_none() || reference.payload_sha256.as_ref().is_none_or(|digest| digest.len() != 32) {
-            return Err(suffix_unavailable());
-        }
+        require_payload_digest(envelope)?;
+        if self.record.storage_namespaces.is_none() { return Err(suffix_unavailable()); }
         let body = self.read(position, envelope).await?;
         let resolved = envelope.unwrap_payload(&body.bytes)?;
         Ok((resolved, body))
     }
+}
+
+pub(super) fn require_payload_digest(envelope: &ReplicaEnvelope) -> Result<()> {
+    if !matches!(&envelope.message,
+        ReplicaBody::OversizedMessage(reference) if reference.payload_sha256.as_ref().is_some_and(|digest| digest.len() == 32))
+    {
+        return Err(suffix_unavailable());
+    }
+    Ok(())
 }
 
 pub(super) async fn read_base_catalog(
@@ -352,6 +359,7 @@ pub(super) async fn apply_archived(
             let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
             let payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                require_payload_digest(&envelope)?;
                 payload = artifact.read_payload(entry.lsn, &mut chain, memory).await?;
                 envelope.unwrap_payload(&payload.bytes)?
             } else {
@@ -388,7 +396,7 @@ fn suffix_artifact<'a>(
     identity.writer_epoch = 0;
     identity.archive_sha256 = None;
     let (version, domain): (_, &'static [u8]) = match pin.custody {
-        CheckpointSuffixCustody::Capture => ("v2", b"RTDB checkpoint suffix segments v2\0"),
+        CheckpointSuffixCustody::Capture => ("v3", b"RTDB checkpoint suffix segments v3\0"),
         _ => ("v3", b"RTDB held business suffix segments v3\0"),
     };
     ReplicaArtifact::new(

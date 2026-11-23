@@ -151,21 +151,22 @@ The old-pack grant can settle a mixed pack whose independent replay manifest omi
 The Classic trie deletion grant settles S3 compacted receipt files by the exact versions captured at publication and retained in the installed retirement.
 The provider inventories the exact version before and after deletion, blocks a deletion that would expose older data, and refuses to withdraw a path slot while another version is visible.
 Classic streamed file publication also settles the private staging version after the conditional copy completes.
-A legacy object without original publication evidence in a versioned bucket remains pending.
+The versioned grant requires original publication evidence for both the file and its release record.
 Other Classic providers lack this version-bound settlement.
 
 Maintenance on an active installed grant records receipt L0 publication identities and sends files from its installed trie-removal receipt to the existing reclamation queue.
 An inherited member remains the responsibility of its original grant.
 Queue admission permits no provider effect. Active file settlement needs the exact recovery-dependency fence to consume the queued identity.
 
-M1 remains open for prior still-held archives, unbound Classic remote objects, active installed journal grant files, detached or legacy copies outside these grants, and untracked media snapshots.
-Closure needs exact custodian settlement after the successor and all such references are released.
+The v3 suffix cutover resets installed data. V2 suffixes are outside the reader contract.
+M1 remains open for unbound Classic remote objects, active installed journal grant files, and untracked media snapshots.
+Closure needs exact custodian settlement after the successor and its references are released.
 A captured archive's existing whole-capture settlement can run after release of its last entitlement.
 Held-world suffixes verify the original certified journal interval and all placed transaction witnesses before materializing the business projection.
 The archive manifest authenticates the original transaction coordinates and the original business table batches, including detached payloads.
 The source authority keeps retry state, and the held-world copy omits retry tables, attempt identities and their acceptance witnesses.
 An exact published checkpoint used for an owned held read verifies the original manifest digest and opens only its business members.
 Full checkpoint restores still require their complete replay inventory.
-Retiring a receipt-only checkpoint member or an earlier mixed suffix requires its original custodian and a grant that accounts for those recovery entitlements.
+Retiring a receipt-only checkpoint member requires its original custodian and a grant that accounts for its recovery entitlements.
 A quiet history still needs ordered receipt-clock progress to trigger collection.
 Early erasure of associated metadata enters the same copy-settlement path as expiry.
