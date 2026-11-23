@@ -26,6 +26,10 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
     let pgwire = cell.connect("shop").await;
     pgwire.simple_query("INSERT INTO orders (_id, total) VALUES (1, 77)").await.unwrap();
     pgwire.simple_query("SELECT total FROM orders").await.unwrap();
+    let node = cell.node(cell.holder("shop").await.unwrap()).server.node();
+    let prior = node.latest_completed_transactions().unwrap()["shop"][0].unwrap();
+    pgwire.simple_query("INSERT INTO orders (_id, total) VALUES (2, 89)").await.unwrap();
+    pgwire.simple_query("SELECT total FROM orders").await.unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -44,14 +48,21 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
         request
     };
 
-    let node = cell.node(cell.holder("shop").await.unwrap()).server.node();
     let floor = node.latest_completed_transactions().unwrap()["shop"][0].unwrap();
-    let mut request = floor.tx_id.0.to_be_bytes().to_vec();
-    request.extend_from_slice(&floor.system_time.0.to_be_bytes());
+    let request = |history: uuid::Uuid, tx_offset: i64, ordered_at: i64, prior_at: i64| {
+        let mut body = history.as_bytes().to_vec();
+        body.push(2);
+        for (offset, time) in [(tx_offset, ordered_at), (prior.tx_id.0, prior_at)] {
+            body.extend_from_slice(&offset.to_be_bytes());
+            body.extend_from_slice(&time.to_be_bytes());
+        }
+        body
+    };
     let mut raw = FlightServiceClient::new(channel(address).await);
     for _ in 0..2 {
         let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
-        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v2", request.clone()))
+        let body = request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0);
+        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v3", body))
             .await.unwrap().into_inner();
         let result = results.message().await.unwrap().unwrap();
         assert!(results.message().await.unwrap().is_none());
@@ -84,14 +95,17 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
     }
     assert_eq!(node.latest_completed_transactions().unwrap()["shop"][0], Some(floor));
 
-    request[..8].copy_from_slice(&(floor.tx_id.0 + 1).to_be_bytes());
-    request[8..].copy_from_slice(&(floor.system_time.0 + 1).to_be_bytes());
-    let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v2", request)).await {
-        Ok(response) => response.into_inner().message().await.unwrap_err(),
-        Err(error) => error,
-    };
-    assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("does not cover"));
+    for body in [
+        request(id, floor.tx_id.0 + 1, floor.system_time.0 + 1, prior.system_time.0),
+        request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0 - 1),
+        request(uuid::Uuid::new_v4(), floor.tx_id.0, floor.system_time.0, prior.system_time.0),
+    ] {
+        let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v3", body)).await {
+            Ok(response) => response.into_inner().message().await.unwrap_err(),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), Code::Unavailable);
+    }
 
     cancellation.cancel();
     tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();

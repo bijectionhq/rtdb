@@ -32,7 +32,7 @@ pub use database::{CompactionRelay, Database};
 pub use rtdb_tx::HostedControlWrite;
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityPage, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
-pub use node::AppliedOwnedPoint;
+pub use node::{AppliedOwnedPoint, AppliedReadFloor};
 #[cfg(feature = "search")]
 pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};
 pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldAcceptedCut, OwnedWorldEffect, OwnedWorldFork, OwnedWorldWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldVersionRead, OwnedWorldWrite, ReadFence, WorldClockRequest};

@@ -1,7 +1,7 @@
 mod historical_owned_read;
 mod hosted_control;
 mod hosted_observation;
-pub use hosted_observation::AppliedOwnedPoint;
+pub use hosted_observation::{AppliedOwnedPoint, AppliedReadFloor};
 mod owned_changes;
 mod owned_usage;
 pub use owned_usage::OwnedStorageUsage;
@@ -92,7 +92,7 @@ impl NodeServices {
 enum CatalogReadCut {
     Current,
     Reserved(TransactionKey),
-    HostedApplied(TransactionKey),
+    HostedApplied { minimum: TransactionKey, history: uuid::Uuid },
 }
 
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
@@ -385,10 +385,10 @@ impl Node {
         let placed = self.catalog.is_placed();
         let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
         let hosted_fence = match cut {
-            CatalogReadCut::HostedApplied(_) => {
+            CatalogReadCut::HostedApplied { history, .. } => {
                 self.ensure_indexing()?;
                 if !placed || placement.is_none() { return Err(hosted_source_unavailable()); }
-                Some(self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?)
+                Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history))
             }
             CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
                 if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
@@ -409,7 +409,7 @@ impl Node {
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let database_lease = match cut {
-                CatalogReadCut::HostedApplied(_) => None,
+                CatalogReadCut::HostedApplied { .. } => None,
                 CatalogReadCut::Current | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
             };
             if let Some(database_lease) = database_lease {
@@ -427,7 +427,7 @@ impl Node {
                     }
                     snapshot
                 }
-                CatalogReadCut::HostedApplied(minimum) => {
+                CatalogReadCut::HostedApplied { minimum, .. } => {
                     let snapshot = database.partition.snapshot();
                     let selected = snapshot.tx_basis().filter(|selected| covers_transaction(*selected, minimum))
                         .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-below-floor",
@@ -444,11 +444,14 @@ impl Node {
             let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
             let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             let snapshot = snapshot.with_system_time_cap(cap)?;
-            let snapshot = if let Some(fence) = hosted_fence {
+            let snapshot = if let Some((fence, expected_history)) = hosted_fence {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
                 let permit = database.storage.object_store().retain_catalog(Some(cut)).await?
                     .ok_or_else(applied_catalog_unretained)?;
-                fence.confirm_hosted(&database).await?;
+                let history = fence.confirm_hosted(&database).await?;
+                if uuid::Uuid::parse_str(&history).ok() != Some(expected_history) {
+                    return Err(hosted_source_unavailable());
+                }
                 self.attached_database(&name, placement)?;
                 snapshot.with_catalog_read(permit)
             } else {
@@ -2878,10 +2881,10 @@ impl NativeSession {
         self.retain_owned_read(None).await
     }
     /// Retains the already-applied catalog from the current recovered hosted holder.
-    pub async fn open_applied_owned_read(&mut self, minimum: TransactionKey) -> Result<OwnedReadSession> {
-        self.retain_owned_read(Some(minimum)).await
+    pub async fn open_applied_owned_read(&mut self, floor: &AppliedReadFloor) -> Result<OwnedReadSession> {
+        self.retain_owned_read(Some(floor)).await
     }
-    async fn retain_owned_read(&mut self, applied_floor: Option<TransactionKey>) -> Result<OwnedReadSession> {
+    async fn retain_owned_read(&mut self, applied_floor: Option<&AppliedReadFloor>) -> Result<OwnedReadSession> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
         let node = self.service.node.clone();
         let identity = Arc::clone(&self.service.identity);
@@ -2898,7 +2901,7 @@ impl NativeSession {
         let applied_scope = applied_floor.map(|_| attached_scope.ok_or_else(hosted_source_unavailable)).transpose()?;
         let attached = Arc::downgrade(&attached);
         let (reserved, cut) = match applied_floor {
-            Some(minimum) => (None, CatalogReadCut::HostedApplied(minimum)),
+            Some(floor) => (None, floor.cut(None)?),
             None => {
                 let present = self.reserve_ordered_present().await?;
                 (Some(present.system_time), CatalogReadCut::Reserved(present))
@@ -2917,6 +2920,9 @@ impl NativeSession {
         ).await?;
         let present = context.catalog.database(&database)?.partitions.first().and_then(|partition| partition.tx_basis())
             .ok_or_else(hosted_source_unavailable)?;
+        if let Some(floor) = applied_floor {
+            floor.require_transactions(&context, present, None).await?;
+        }
         let lease = context.catalog.read_lease();
         let witness_scope = attached_scope.filter(|_| applied_scope.is_none() && lease.as_ref().and_then(|lease| lease.deadline()).is_some());
         let clock = Arc::clone(&node.factory.clock);
