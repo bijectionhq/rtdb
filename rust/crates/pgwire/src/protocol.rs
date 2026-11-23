@@ -587,6 +587,7 @@ impl ProtocolSession {
             let Some(batch) = &query.batch else { break; };
             let schema = batch.batch().schema();
             let row = query.row;
+            let delivery = query.cursor.delivery_grant();
             let consumption: Result<()> = async {
                 let _scratch = memory.reserve(4096)?;
                 let mut body = DataRow::new(&memory)?;
@@ -602,7 +603,7 @@ impl ProtocolSession {
                         Some(encoded) => body.cell(encoded.as_slice())?,
                     }
                 }
-                let grant = query.cursor.delivery_grant().await?;
+                let grant = delivery.await?;
                 grant.deliver(async {
                     writer.row_body(&body.bytes).await?;
                     if grant.is_bounded() { writer.flush().await?; }
