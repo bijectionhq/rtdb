@@ -2,13 +2,13 @@ use rtdb_directory::{
     Checkpoint, DeploymentRecord, Directory, ExactRetirementGrant, HostedTask, LineageChange, LineageRetirement, LineageState,
     RetirementWork, StorageRegion, now_ms,
 };
-use rtdb_format::{catalog::BlockCatalog, keys::block_key};
+use rtdb_format::keys::block_key;
 use rtdb_s3::{NeverVersionedRetirement, VersionedInventory};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget};
 use uuid::Uuid;
 
-use super::{MAXIMUM_MEMBER_BYTES, ObservedPack, PackStorage, covered_pack, eligible, is_block_l0};
+use super::{ObservedPack, PackStorage, covered_pack, eligible, is_block_l0};
 use crate::archive;
 use crate::cipher::Cipher;
 use crate::deployment::CellStorage;
@@ -252,11 +252,7 @@ async fn successor_present(
     let root = block_key(BlockIndex(checkpoint.block))?;
     let pack = key(&format!("{store}/{}", block_pack(&root)))?;
     let Some(observed) = observe_pack(bucket, terminal, &pack).await? else { return Ok(false); };
-    let Some(entry) = observed.index.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
-        else { return Ok(false); };
-    let sealed = observed.read_member(entry).await?;
-    let catalog = BlockCatalog::decode(&cipher.open(&root, &sealed)?)?;
-    Ok(catalog.block_index().0 == checkpoint.block && catalog.publication_sha256() == checkpoint.root_sha256)
+    observed.checkpoint_matches(checkpoint, cipher).await
 }
 
 fn changed() -> Anomaly {

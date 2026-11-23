@@ -1921,6 +1921,7 @@ rule ReapUnreachable {
     -- Every indexed member of a hosted pack needs a mature release for the same publication.
     -- A versioned pack is erased by its exact version.
     -- An enrolled terminal pack is replaced by a conditional tombstone after an entity-tag-bound index read.
+    -- The same terminal observation mechanism opens the successor root and checks its published digest before authorization.
     -- Only checkpoint metadata may be covered by this pack collector. A newer published pack must be present in the same store.
     -- The owner CAS checks the pack's block and the greatest covered metadata block against its current checkpoint and holds.
     -- An exact absence observation permits residual member release markers to settle while a replacement pack remains available.

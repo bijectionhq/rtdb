@@ -20,7 +20,8 @@
 -- The physical owner verifies a newer published pack in the same store,
 -- checks every member against mature releases for that publication, and retains
 -- checkpoint metadata at or above an active startup or capture floor.
--- The terminal collector reads the index under the pack's strong entity tag and retires it through a conditional tombstone.
+-- The terminal collector reads the index under the pack's strong entity tag.
+-- It authenticates the successor root under the successor pack's tag and checks the digest against the directory before authorizing a conditional tombstone.
 -- A covered pack must contain only checkpoint metadata. An ordinary hosted
 -- release by path can withdraw a reference but cannot erase an owned pack.
 -- On local Multi storage, the reaper may retire a mixed pack below the published checkpoint under the replay archive handoff in rtdb-multi.allium.

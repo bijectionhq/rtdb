@@ -389,7 +389,7 @@ An initiation that loses its response before admission can leave an empty upload
 Hosted qualification must establish conditional multipart completion for a zero-byte payload and confirm that a closed upload cannot publish after whole-residence disposal.
 Enabling this profile in the hosted fleet still needs a matching reaper policy and live provider qualification.
 The checkpoint-metadata collector binds terminal releases to the pack's allocation, physical key and strong entity tag.
-It checks a release for every indexed member under that publication and requires a newer readable pack beyond the held metadata floor.
+It checks a release for every indexed member under that publication and authenticates the newer published root digest from the successor pack beyond the held metadata floor.
 The selected release marker settles with the pack. Other terminal member markers remain until residence disposal.
 Mixed packs with independent replay coverage use the separate parked-root retirement path.
 Other mixed packs and previously unwitnessed files still need publication coverage.

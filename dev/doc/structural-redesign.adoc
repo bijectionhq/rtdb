@@ -141,7 +141,7 @@ Normal readers hold those payloads through provider drain.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.
-Checkpoint-metadata packs in an enrolled terminal allocation require a release for every indexed member of the same publication and a readable newer pack.
+Checkpoint-metadata packs in an enrolled terminal allocation require a release for every indexed member of the same publication and a successor root that matches the published checkpoint digest.
 Full recovery closures, terminal coverage for other mixed packs and live provider qualification remain open.
 
 |6
