@@ -173,6 +173,23 @@ impl PartialEq for TableBlock { fn eq(&self, other: &Self) -> bool { self.wire =
 
 impl TrieDetails {
     pub fn encoded_size(&self) -> usize { self.encoded_len() }
+
+    /// The objects of this trie that a checkpoint holding it preserves.
+    pub fn checkpoint_files(&self, slug: &TableSlug, contents: CheckpointContents) -> Result<BTreeSet<String>> {
+        let state = TrieState::try_from(self.trie_state.unwrap_or_default())
+            .map_err(|_| invalid("Unknown trie state in checkpoint"))?;
+        let trie: TrieKey = self.trie_key.as_deref().unwrap_or_default().parse()?;
+        let mut files = BTreeSet::new();
+        if state == TrieState::Garbage && (contents == CheckpointContents::Primary || trie.level() != 0) { return Ok(files); }
+        files.insert(slug.data_key(&trie));
+        files.insert(slug.metadata_key(&trie));
+        if contents == CheckpointContents::Replay && state != TrieState::Garbage {
+            for record in &self.artefacts {
+                files.insert(slug.recorded_artefact_key(&trie, record)?);
+            }
+        }
+        Ok(files)
+    }
 }
 
 impl TableBlock {
@@ -239,17 +256,7 @@ impl TableBlock {
     pub fn checkpoint_trie_files(&self, slug: &TableSlug, contents: CheckpointContents) -> Result<BTreeSet<String>> {
         let mut files = BTreeSet::new();
         for detail in self.trie_details() {
-            let state = TrieState::try_from(detail.trie_state.unwrap_or_default())
-                .map_err(|_| invalid("Unknown trie state in checkpoint"))?;
-            let trie: TrieKey = detail.trie_key.as_deref().unwrap_or_default().parse()?;
-            if state == TrieState::Garbage && (contents == CheckpointContents::Primary || trie.level() != 0) { continue; }
-            files.insert(slug.data_key(&trie));
-            files.insert(slug.metadata_key(&trie));
-            if contents == CheckpointContents::Replay && state != TrieState::Garbage {
-                for record in &detail.artefacts {
-                    files.insert(slug.recorded_artefact_key(&trie, record)?);
-                }
-            }
+            files.append(&mut detail.checkpoint_files(slug, contents)?);
         }
         if contents == CheckpointContents::Replay {
             for run in &self.wire.search_runs { files.insert(run.object_key(slug)?); }
