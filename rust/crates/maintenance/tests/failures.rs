@@ -134,25 +134,28 @@ async fn two_databases_share_a_slot_until_cancelled_uploads_finish() {
     let (second_driver, second_handle) = CompactionDriver::new(state(), second.clone(), Arc::new(RejectPublication), 2, 1, false).unwrap();
     let first_cancel = CancellationToken::new();
     let second_cancel = CancellationToken::new();
-    let mut first_run = Box::pin(first_driver.with_job_slots(slots.clone()).run(first_cancel.clone()));
+    let first_run = tokio::spawn(first_driver.with_job_slots(slots.clone()).run(first_cancel.clone()));
     let mut second_run = Box::pin(second_driver.with_job_slots(slots.clone()).run(second_cancel.clone()));
 
-    assert!(futures::poll!(first_run.as_mut()).is_pending());
-    assert_eq!(first.started.available_permits(), 1);
-    assert!(futures::poll!(second_run.as_mut()).is_pending());
-    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+    first.started.acquire().await.unwrap().forget();
+    let second_pending_before_cancel = futures::poll!(second_run.as_mut()).is_pending();
+    let calls_before_cancel = second.calls.load(Ordering::SeqCst);
     first_cancel.cancel();
-    assert!(futures::poll!(first_run.as_mut()).is_pending());
-    assert_eq!(first.cancelling.available_permits(), 1);
-    assert!(futures::poll!(second_run.as_mut()).is_pending());
-    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+    first.cancelling.acquire().await.unwrap().forget();
+    let second_pending_during_cancel = second_pending_before_cancel && futures::poll!(second_run.as_mut()).is_pending();
+    let calls_during_cancel = second.calls.load(Ordering::SeqCst);
 
     first.release.add_permits(1);
-    first_run.await.unwrap();
-    let mut completion = Box::pin(second_handle.compact_all());
-    assert!(futures::poll!(completion.as_mut()).is_pending());
-    assert!(futures::poll!(second_run.as_mut()).is_pending());
-    assert_eq!(completion.await.unwrap_err(), denied());
+    first_run.await.unwrap().unwrap();
+    assert!(second_pending_before_cancel);
+    assert_eq!(calls_before_cancel, 0);
+    assert!(second_pending_during_cancel);
+    assert_eq!(calls_during_cancel, 0);
+    let completion = tokio::select! {
+        result = second_handle.compact_all() => result,
+        result = &mut second_run => panic!("Second driver exited before replying: {result:?}"),
+    };
+    assert_eq!(completion.unwrap_err(), denied());
     assert_eq!(second.calls.load(Ordering::SeqCst), 1);
     second_cancel.cancel();
     second_run.await.unwrap();
