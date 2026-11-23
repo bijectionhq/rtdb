@@ -82,6 +82,8 @@ impl ClassicLogDeletionGrant {
         if store.retained_repair_anchor().await? != Some(anchor) || replica.file_name().and_then(|name| name.to_str()) != Some("REPLICA_LOG") {
             return Err(unavailable());
         }
+        crate::sealing::ClassicKeyVault::require_unsealed_log(replica)?;
+        crate::sealing::ClassicKeyVault::require_unsealed_log(&replica.with_file_name("LOG"))?;
         let root = ObjectKey::new(block_key(anchor.block)?)?;
         let catalog = BlockCatalog::decode(&store.get_fresh(&root).await?)?;
         if catalog.publication_sha256() != Some(anchor.sha256)

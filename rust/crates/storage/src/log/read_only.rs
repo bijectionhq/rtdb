@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
 use super::{AppendReceipt, Log, LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead};
-use super::local::{corrupt, inspect_record, inspect_record_body, is_record_separator, read_record, read_record_body, read_record_header_at};
-use crate::{Error, IoRegion, Result, object_store::ReadReservation};
+use super::local::{corrupt, inspect_record, inspect_record_body, is_record_separator, physical_maximum, read_record, read_record_body, read_record_header_at};
+use crate::{Error, IoRegion, Result, object_store::ReadReservation, sealing::{ClassicKeyVault, ClassicObjectKeys}};
 
 #[derive(Clone, Debug)]
 pub struct ReadOnlyLocalLogOptions {
@@ -29,13 +29,14 @@ pub struct ReadOnlyLocalLog {
     path: Arc<PathBuf>,
     options: ReadOnlyLocalLogOptions,
     reads: Option<Arc<IoRegion>>,
+    keys: Option<Arc<ClassicObjectKeys>>,
 }
 
 impl ReadOnlyLocalLog {
     /// Opens the caller-selected LOG or REPLICA_LOG path without creating it or taking a writer lock.
     /// The external writer must preserve the append-only file and its record framing.
     pub fn open(path: impl AsRef<Path>, options: ReadOnlyLocalLogOptions) -> Result<Arc<Self>> {
-        Self::open_with_reads(path.as_ref(), options, None)
+        Self::open_with_reads(path.as_ref(), options, None, None)
     }
 
     /// Opens the external append-only log as in [`Self::open`] and enables reserved replay.
@@ -44,14 +45,31 @@ impl ReadOnlyLocalLog {
     /// The caller stops its consumers and closes and drains the region before shutting down the runtime.
     pub fn open_in(path: impl AsRef<Path>, options: ReadOnlyLocalLogOptions, reads: Arc<IoRegion>) -> Result<Arc<Self>> {
         let _operation = reads.admit()?;
-        Self::open_with_reads(path.as_ref(), options, Some(reads))
+        Self::open_with_reads(path.as_ref(), options, Some(reads), None)
     }
 
-    fn open_with_reads(path: &Path, options: ReadOnlyLocalLogOptions, reads: Option<Arc<IoRegion>>) -> Result<Arc<Self>> {
+    pub fn open_with_key_slots(path: impl AsRef<Path>, options: ReadOnlyLocalLogOptions,
+        reads: Arc<IoRegion>, keys: Arc<ClassicObjectKeys>,
+    ) -> Result<Arc<Self>> {
+        let _operation = reads.admit()?;
+        Self::open_with_reads(path.as_ref(), options, Some(reads), Some(keys))
+    }
+
+    fn open_with_reads(path: &Path, mut options: ReadOnlyLocalLogOptions, reads: Option<Arc<IoRegion>>,
+        keys: Option<Arc<ClassicObjectKeys>>,
+    ) -> Result<Arc<Self>> {
+        if keys.is_none() {
+            ClassicKeyVault::require_unsealed_log(path).map_err(|error| Error::Task(error.to_string()))?;
+        }
+        let expanded = physical_maximum(options.maximum_message_bytes, keys.is_some())?;
+        if keys.is_some() {
+            options.maximum_poll_bytes = options.maximum_poll_bytes.max(expanded);
+        }
+        options.maximum_message_bytes = expanded;
         if options.maximum_message_bytes > i32::MAX as usize || options.poll_interval.is_zero() || options.maximum_poll_records == 0 || options.maximum_poll_bytes < options.maximum_message_bytes {
             return Err(Error::Task("read-only log requires a positive polling interval and record limit, an i32 message limit, and room for a maximum-size message".into()));
         }
-        let log = Arc::new(Self { path: Arc::new(path.to_path_buf()), options, reads });
+        let log = Arc::new(Self { path: Arc::new(path.to_path_buf()), options, reads, keys });
         log.latest()?;
         Ok(log)
     }
@@ -96,14 +114,14 @@ fn latest_at_length(file: &mut File, path: &Path, maximum: usize, length: u64, i
 
 fn unavailable(position: LogOffset) -> Error { Error::UnavailableLogRange { requested: position.0, first_retained: 0 } }
 
-fn read_batch(file: &mut File, path: &Path, options: &ReadOnlyLocalLogOptions, from: u64, to: u64, latest: LogOffset) -> Result<(Vec<LogRecord>, u64)> {
+fn read_batch(file: &mut File, path: &Path, options: &ReadOnlyLocalLogOptions, from: u64, to: u64, latest: LogOffset, keys: Option<&ClassicObjectKeys>) -> Result<(Vec<LogRecord>, u64)> {
     file.seek(SeekFrom::Start(from)).map_err(|error| Error::io(path, error))?;
     let mut records = Vec::new();
     let mut bytes = 0usize;
     let mut next = from;
     while next < to && latest.0 >= 0 && next <= latest.0 as u64 {
         if records.len() == options.maximum_poll_records || bytes.checked_add(options.maximum_message_bytes).is_none_or(|size| size > options.maximum_poll_bytes) { break; }
-        let record = read_record(file, path, options.maximum_message_bytes)?;
+        let record = read_record(file, path, options.maximum_message_bytes, keys)?;
         bytes += record.payload.len();
         records.push(record);
         next = file.stream_position().map_err(|error| Error::io(path, error))?;
@@ -114,7 +132,7 @@ fn read_batch(file: &mut File, path: &Path, options: &ReadOnlyLocalLogOptions, f
 #[async_trait]
 impl Log for ReadOnlyLocalLog {
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
-        file_range(Arc::clone(&self.path), self.options.maximum_message_bytes, from, to, None)
+        file_range(Arc::clone(&self.path), self.options.maximum_message_bytes, from, to, None, self.keys.clone())
     }
     async fn enqueue(&self, _: Bytes, _: Timestamp) -> Result<AppendReceipt> { Err(Error::ReadOnlyLog(self.path.as_ref().clone())) }
 
@@ -143,6 +161,7 @@ impl Log for ReadOnlyLocalLog {
             path: Arc::clone(&self.path),
             options: self.options.clone(),
             cursor: ReadOnlyCursor { after, next, observed_length },
+            keys: self.keys.clone(),
         };
         match &self.reads {
             Some(reads) => Ok(Box::new(ReadOnlyReplayTail { tail, reads: Arc::clone(reads) })),
@@ -161,10 +180,10 @@ impl Log for ReadOnlyLocalLog {
         if from.0 as u64 == end { return Ok(Vec::new()); }
         if from == to {
             file.seek(SeekFrom::Start(from.0 as u64)).map_err(|error| Error::io(self.path.as_ref(), error))?;
-            read_record(&mut file, &self.path, self.options.maximum_message_bytes)?;
+            read_record(&mut file, &self.path, self.options.maximum_message_bytes, self.keys.as_deref())?;
             return Ok(Vec::new());
         }
-        let (records, next) = read_batch(&mut file, &self.path, &self.options, from.0 as u64, to.0 as u64, latest)?;
+        let (records, next) = read_batch(&mut file, &self.path, &self.options, from.0 as u64, to.0 as u64, latest, self.keys.as_deref())?;
         if next < (to.0 as u64).min(end) { return Err(Error::LogReadLimit { maximum_records: self.options.maximum_poll_records, maximum_payload_bytes: self.options.maximum_poll_bytes }); }
         Ok(records)
     }
@@ -184,7 +203,7 @@ fn frame_end(file: &mut File, path: &Path, start: u64, maximum: usize) -> Result
     Ok(end)
 }
 
-pub(super) fn file_range(path: Arc<PathBuf>, maximum: usize, from: LogOffset, to: LogOffset, durable: Option<LogOffset>) -> Result<Box<dyn super::LogRange>> {
+pub(super) fn file_range(path: Arc<PathBuf>, maximum: usize, from: LogOffset, to: LogOffset, durable: Option<LogOffset>, keys: Option<Arc<ClassicObjectKeys>>) -> Result<Box<dyn super::LogRange>> {
     if from.0 < 0 { return Err(unavailable(from)); }
     if to < from { return Err(Error::Task("log range end precedes its start".into())); }
     let mut file = open_existing(&path)?;
@@ -213,19 +232,19 @@ pub(super) fn file_range(path: Arc<PathBuf>, maximum: usize, from: LogOffset, to
     } else {
         0
     };
-    Ok(Box::new(FileRange { file, path, maximum, next: from.0 as u64, end }))
+    Ok(Box::new(FileRange { file, path, maximum, next: from.0 as u64, end, keys }))
 }
 
-struct FileRange { file: Option<File>, path: Arc<PathBuf>, maximum: usize, next: u64, end: u64 }
+struct FileRange { file: Option<File>, path: Arc<PathBuf>, maximum: usize, next: u64, end: u64, keys: Option<Arc<ClassicObjectKeys>> }
 #[async_trait]
 impl super::LogRange for FileRange {
-    fn allocation_bound(&self) -> usize { self.maximum.saturating_add(256) }
+    fn allocation_bound(&self) -> usize { self.maximum.saturating_mul(if self.keys.is_some() { 2 } else { 1 }).saturating_add(256) }
     async fn next(&mut self, reservation: crate::object_store::ReadReservation) -> Result<Option<LogRecord>> {
         if reservation.length() < self.allocation_bound() { return Err(Error::Task("log read reservation is too small".into())); }
         if self.next >= self.end { return Ok(None); }
         let file = self.file.as_mut().ok_or_else(|| unavailable(LogOffset(self.next as i64)))?;
         file.seek(SeekFrom::Start(self.next)).map_err(|error| Error::io(self.path.as_ref(), error))?;
-        let record = read_record(file, &self.path, self.maximum)?;
+        let record = read_record(file, &self.path, self.maximum, self.keys.as_deref())?;
         self.next = file.stream_position().map_err(|error| Error::io(self.path.as_ref(), error))?;
         record.retain(reservation).map(Some)
     }
@@ -254,7 +273,7 @@ impl ReadOnlyCursor {
         Ok((Some(header.replay_head()), end))
     }
 
-    fn materialize_head(self, path: &Path, maximum: usize, head: ReplayHead, reservation: ReadReservation) -> Result<(LogRecord, u64)> {
+    fn materialize_head(self, path: &Path, maximum: usize, head: ReplayHead, reservation: ReadReservation, keys: Option<&ClassicObjectKeys>) -> Result<(LogRecord, u64)> {
         if head.metadata.offset.0 != self.next as i64 {
             return Err(Error::Task("log replay head does not match the next position".into()));
         }
@@ -270,20 +289,20 @@ impl ReadOnlyCursor {
         if reservation.length() < head.allocation_bound {
             return Err(Error::Task("log read reservation is too small".into()));
         }
-        let record = read_record_body(&mut file, path, header)?.retain(reservation)?;
+        let record = read_record_body(&mut file, path, header, keys)?.retain(reservation)?;
         let next = file.stream_position().map_err(|error| Error::io(path, error))?;
         Ok((record, next))
     }
 }
 
-struct ReadOnlyTail { path: Arc<PathBuf>, options: ReadOnlyLocalLogOptions, cursor: ReadOnlyCursor }
+struct ReadOnlyTail { path: Arc<PathBuf>, options: ReadOnlyLocalLogOptions, cursor: ReadOnlyCursor, keys: Option<Arc<ClassicObjectKeys>> }
 
 impl ReadOnlyTail {
     fn read_available(&mut self) -> Result<Vec<LogRecord>> {
         let Some((mut file, latest, end)) = self.cursor.observe(&self.path, self.options.maximum_message_bytes)? else { return Ok(Vec::new()); };
         self.cursor.observed_length = end;
         if latest == self.cursor.after { return Ok(Vec::new()); }
-        let (records, next) = read_batch(&mut file, &self.path, &self.options, self.cursor.next, end, latest)?;
+        let (records, next) = read_batch(&mut file, &self.path, &self.options, self.cursor.next, end, latest, self.keys.as_deref())?;
         let last = records.last().ok_or_else(|| corrupt(&self.path, self.cursor.next, "complete tip yielded no record"))?;
         self.cursor.after = last.metadata.offset;
         self.cursor.next = next;
@@ -337,7 +356,8 @@ impl LogReplayTail for ReadOnlyReplayTail {
 
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord> {
         let (path, maximum, cursor) = (Arc::clone(&self.tail.path), self.tail.options.maximum_message_bytes, self.tail.cursor);
-        let (record, next) = self.reads.run(move || cursor.materialize_head(&path, maximum, head, reservation)).await?;
+        let keys = self.tail.keys.clone();
+        let (record, next) = self.reads.run(move || cursor.materialize_head(&path, maximum, head, reservation, keys.as_deref())).await?;
         self.tail.cursor.after = record.metadata.offset;
         self.tail.cursor.next = next;
         Ok(record)

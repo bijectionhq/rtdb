@@ -211,9 +211,16 @@ impl NativeResources {
         Ok(self)
     }
     fn local_log(&self, path: PathBuf, source: bool, read_only: bool, cancellation: CancellationToken, io: Arc<IoRegion>) -> Result<(Arc<dyn Log>, Option<ResourceDriver>)> {
-        if read_only { return Ok((ReadOnlyLocalLog::open_in(path, self.read_only_log.clone(), io)?, None)); }
+        let keys = self.classic_vault.as_ref().map(|vault| vault.log_keys(&path, !read_only, Arc::clone(&io))).transpose()?;
+        if read_only {
+            let log = match keys {
+                Some(keys) => ReadOnlyLocalLog::open_with_key_slots(path, self.read_only_log.clone(), io, keys)?,
+                None => ReadOnlyLocalLog::open_in(path, self.read_only_log.clone(), io)?,
+            };
+            return Ok((log, None));
+        }
         let timestamps = Arc::new(NativeLogTimestamps { clock: Arc::clone(&self.local_log_clock), source, use_for_non_transactions: self.local_log_uses_clock_for_non_transactions });
-        let (log, driver) = LocalLog::open_with_timestamp_source_in(path, LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity }, timestamps, io)?;
+        let (log, driver) = LocalLog::open_with_key_slots(path, LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity }, timestamps, io, keys)?;
         Ok((log, Some(async move { driver.run(cancellation).await.map_err(Into::into) }.boxed())))
     }
 }

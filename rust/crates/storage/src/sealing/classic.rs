@@ -20,6 +20,7 @@ use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 
 const OWNER: &str = "~rtdb-classic-key-lineage";
 const KEY_BYTES: usize = 32;
+pub(crate) const LOG_SEAL_OVERHEAD: usize = 16 + super::cipher::SEALED_OVERHEAD;
 
 #[derive(Clone)]
 pub struct ClassicKeyVault(Arc<Path>);
@@ -112,6 +113,88 @@ impl ClassicKeyVault {
         }))
     }
 
+    pub fn log_keys(
+        &self,
+        path: &Path,
+        allow_enrollment: bool,
+        region: Arc<IoRegion>,
+    ) -> Result<Arc<ClassicObjectKeys>> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("The Classic log has no owner directory"))?;
+        if allow_enrollment {
+            fs::create_dir_all(parent).map_err(io(parent))?;
+        }
+        self.require_separate_path(parent)?;
+        let marker = path.with_extension("key-lineage");
+        let read = || -> Result<Option<Uuid>> {
+            match fs::read(&marker) {
+                Ok(bytes) => {
+                    Ok(Some(Uuid::from_slice(&bytes).map_err(|_| {
+                        invalid("The Classic log lineage is malformed")
+                    })?))
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(io(&marker)(error).into()),
+            }
+        };
+        let id = match read()? {
+            Some(id) => id,
+            None if allow_enrollment => {
+                let _gate = lock(&marker)?;
+                if let Some(id) = read()? {
+                    id
+                } else {
+                    match fs::metadata(path) {
+                        Ok(metadata) if metadata.len() == 0 => {}
+                        Ok(_) => {
+                            return Err(invalid(
+                                "Existing Classic log data has no immutable key lineage",
+                            ));
+                        }
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(io(path)(error).into()),
+                    }
+                    let id = Uuid::new_v4();
+                    let scope = self.0.join(id.simple().to_string());
+                    fs::create_dir(&scope).map_err(io(&scope))?;
+                    sync_directory(&self.0).map_err(io(&self.0))?;
+                    let mut temporary =
+                        tempfile::NamedTempFile::new_in(parent).map_err(io(parent))?;
+                    temporary.write_all(id.as_bytes()).map_err(io(&marker))?;
+                    crate::sync_file(temporary.as_file()).map_err(io(&marker))?;
+                    temporary
+                        .persist_noclobber(&marker)
+                        .map_err(|error| io(&marker)(error.error))?;
+                    sync_directory(parent).map_err(io(parent))?;
+                    id
+                }
+            }
+            None => return Err(invalid("The Classic log has no enrolled key lineage")),
+        };
+        let namespace = self.0.join(id.simple().to_string());
+        if !namespace.is_dir() {
+            return Err(invalid(
+                "The original Classic log key authority is unavailable",
+            ));
+        }
+        Ok(Arc::new(ClassicObjectKeys {
+            path: namespace.into(),
+            region,
+        }))
+    }
+
+    pub fn require_unsealed_log(path: &Path) -> Result<()> {
+        if path
+            .with_extension("key-lineage")
+            .try_exists()
+            .map_err(io(path))?
+        {
+            return Err(invalid("The Classic log requires its original key vault"));
+        }
+        Ok(())
+    }
+
     pub fn wrap(
         store: Arc<dyn ObjectStore>,
         keys: Arc<ClassicObjectKeys>,
@@ -180,29 +263,75 @@ impl ObjectCipher for ClassicObjectKeys {
         let key = key.clone();
         self.region
             .run_blocking(move || {
-                let _lock = lock(&path)?;
-                if path
-                    .with_extension("closed")
-                    .try_exists()
-                    .map_err(io(&path))?
-                {
-                    return Err(Error::ErasedUnderView);
-                }
-                let mut material: [u8; KEY_BYTES] = match fs::read(&path) {
-                    Ok(bytes) => bytes
-                        .try_into()
-                        .map_err(|_| Error::Task("Invalid Classic unit key".into()))?,
-                    Err(error) if error.kind() == ErrorKind::NotFound && operation.provisions() => {
-                        create(&path)?
-                    }
-                    Err(error) => return Err(io(&path)(error)),
-                };
-                let cipher = Cipher::new(&material).map_err(|error| Error::Task(error.to_string()));
-                material.fill(0);
-                operation.apply(&cipher?, &key)
+                with_key(&path, operation.provisions(), |cipher| {
+                    operation.apply(cipher, &key)
+                })
             })
             .await
     }
+}
+
+impl ClassicObjectKeys {
+    pub(crate) fn seal_record(
+        &self,
+        offset: i64,
+        timestamp: i64,
+        payload: &[u8],
+    ) -> crate::Result<Bytes> {
+        let publication = Uuid::new_v4();
+        let name = ObjectKey::new(format!("frames/{publication}"))?;
+        let associated = format!("rtdb.classic.log-frame/v1/{publication}/{offset}/{timestamp}");
+        let ciphertext = with_key(&self.name(&name), true, |cipher| {
+            cipher.seal(&associated, payload)
+        })?;
+        let mut sealed = Vec::with_capacity(16 + ciphertext.len());
+        sealed.extend_from_slice(publication.as_bytes());
+        sealed.extend_from_slice(&ciphertext);
+        Ok(sealed.into())
+    }
+
+    pub(crate) fn open_record(
+        &self,
+        offset: i64,
+        timestamp: i64,
+        payload: &[u8],
+    ) -> crate::Result<Bytes> {
+        let (publication, ciphertext) = payload.split_at_checked(16).ok_or_else(|| {
+            Error::Task("The sealed Classic log frame has no publication identity".into())
+        })?;
+        let publication = Uuid::from_slice(publication)
+            .map_err(|_| Error::Task("Invalid log publication identity".into()))?;
+        let name = ObjectKey::new(format!("frames/{publication}"))?;
+        let associated = format!("rtdb.classic.log-frame/v1/{publication}/{offset}/{timestamp}");
+        with_key(&self.name(&name), false, |cipher| {
+            cipher.open(&associated, ciphertext)
+        })
+    }
+}
+
+fn with_key<T>(
+    path: &Path,
+    provision: bool,
+    operate: impl FnOnce(&Cipher) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _lock = lock(path)?;
+    if path
+        .with_extension("closed")
+        .try_exists()
+        .map_err(io(path))?
+    {
+        return Err(Error::ErasedUnderView);
+    }
+    let mut material: [u8; KEY_BYTES] = match fs::read(path) {
+        Ok(bytes) => bytes
+            .try_into()
+            .map_err(|_| Error::Task("Invalid Classic unit key".into()))?,
+        Err(error) if error.kind() == ErrorKind::NotFound && provision => create(path)?,
+        Err(error) => return Err(io(path)(error)),
+    };
+    let cipher = Cipher::new(&material).map_err(|error| Error::Task(error.to_string()));
+    material.fill(0);
+    operate(&cipher?)
 }
 
 fn lock(path: &Path) -> crate::Result<File> {

@@ -2,6 +2,7 @@
 
 pub mod cipher;
 mod classic;
+pub(crate) use classic::LOG_SEAL_OVERHEAD;
 pub use classic::{ClassicKeyVault, ClassicObjectKeys};
 
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
@@ -279,10 +280,17 @@ impl ObjectStore for EncryptingStore {
                 "The trie release does not match its stored installation receipt",
             ));
         }
-        if self.classic_control.is_some() && self.inner.local_maintenance_store().is_some()
+        if self.classic_control.is_some()
+            && self.inner.local_maintenance_store().is_some()
             && let ObjectKeys::Units(ledger) = &self.keys
         {
-            return crate::classic_retirement::retire_with_keys(self, receipt, contents, Some(ledger.as_ref())).await;
+            return crate::classic_retirement::retire_with_keys(
+                self,
+                receipt,
+                contents,
+                Some(ledger.as_ref()),
+            )
+            .await;
         }
         self.inner.release_trie_files(receipt, contents).await
     }

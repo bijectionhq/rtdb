@@ -1,5 +1,5 @@
 use super::{AppendReceipt, AppendTimestampSource, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
-use crate::{Error, IoRegion, Result, object_store::ReadReservation};
+use crate::{Error, IoRegion, Result, object_store::ReadReservation, sealing::{ClassicKeyVault, ClassicObjectKeys, LOG_SEAL_OVERHEAD}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs2::FileExt;
@@ -16,9 +16,11 @@ const HEADER_BYTES: u64 = 13;
 const TRAILER_BYTES: u64 = 8;
 const RECORD_SEPARATOR: u8 = 0x1e;
 const RETIRED_SEPARATOR: u8 = 0x1d;
+const SEALED_SEPARATOR: u8 = 0x1c;
+const RETIRED_SEALED_SEPARATOR: u8 = 0x1b;
 
 pub(super) fn is_record_separator(byte: u8) -> bool {
-    matches!(byte, RECORD_SEPARATOR | RETIRED_SEPARATOR)
+    matches!(byte, RECORD_SEPARATOR | RETIRED_SEPARATOR | SEALED_SEPARATOR | RETIRED_SEALED_SEPARATOR)
 }
 const MAXIMUM_POLL_RECORDS: usize = 1024;
 const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
@@ -35,6 +37,7 @@ pub struct LocalLog {
     queue: mpsc::Sender<Queued>,
     progress: Arc<Progress>,
     maximum_message_bytes: usize,
+    keys: Option<Arc<ClassicObjectKeys>>,
     reads: Arc<IoRegion>,
 }
 
@@ -44,7 +47,7 @@ pub struct LocalLogDriver {
     progress: Arc<Progress>,
 }
 
-struct Writer { file: File, path: Arc<PathBuf>, timestamps: Arc<dyn AppendTimestampSource> }
+struct Writer { file: File, path: Arc<PathBuf>, timestamps: Arc<dyn AppendTimestampSource>, keys: Option<Arc<ClassicObjectKeys>> }
 
 pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Error {
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
@@ -54,14 +57,16 @@ pub(super) struct RecordHeader {
     metadata: LogMetadata,
     payload_size: usize,
     retired: bool,
+    sealed: bool,
 }
 
 impl RecordHeader {
     pub(super) fn replay_head(&self) -> ReplayHead {
         ReplayHead {
             metadata: self.metadata,
-            payload_len: self.payload_size,
-            allocation_bound: self.payload_size.saturating_add(LOG_RECORD_OVERHEAD_BYTES),
+            payload_len: self.payload_size - if self.sealed { LOG_SEAL_OVERHEAD } else { 0 },
+            allocation_bound: self.payload_size.saturating_mul(if self.sealed { 2 } else { 1 })
+                .saturating_add(LOG_RECORD_OVERHEAD_BYTES),
         }
     }
 }
@@ -82,7 +87,8 @@ fn parse_record_header(file: &mut File, path: &Path, maximum: usize, offset: u64
     file.read_exact(&mut header).map_err(|error| corrupt(path, offset, format!("incomplete record header: {error}")))?;
     if !is_record_separator(header[0]) { return Err(corrupt(path, offset, "invalid local log record separator")); }
     let size = i32::from_be_bytes(header[1..5].try_into().expect("fixed header size"));
-    if size < 0 || size as usize > maximum {
+    let sealed = matches!(header[0], SEALED_SEPARATOR | RETIRED_SEALED_SEPARATOR);
+    if size < 0 || size as usize > maximum || (sealed && (size as usize) < LOG_SEAL_OVERHEAD) {
         return Err(corrupt(path, offset, format!("invalid payload size {size}, maximum {maximum}")));
     }
     let end = offset.checked_add(HEADER_BYTES + size as u64 + TRAILER_BYTES)
@@ -90,7 +96,7 @@ fn parse_record_header(file: &mut File, path: &Path, maximum: usize, offset: u64
     if end > length { return Err(corrupt(path, offset, format!("incomplete record ends at {end}, file length {length}"))); }
     let timestamp = Timestamp(i64::from_be_bytes(header[5..13].try_into().expect("fixed header size")));
     Ok(RecordHeader { metadata: LogMetadata { offset: LogOffset(offset as i64), timestamp },
-        payload_size: size as usize, retired: header[0] == RETIRED_SEPARATOR })
+        payload_size: size as usize, retired: matches!(header[0], RETIRED_SEPARATOR | RETIRED_SEALED_SEPARATOR), sealed })
 }
 
 fn read_record_trailer(file: &mut File, path: &Path, offset: LogOffset) -> Result<()> {
@@ -102,12 +108,12 @@ fn read_record_trailer(file: &mut File, path: &Path, offset: LogOffset) -> Resul
     Ok(())
 }
 
-pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogRecord> {
+pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize, keys: Option<&ClassicObjectKeys>) -> Result<LogRecord> {
     let header = read_record_header(file, path, maximum)?;
-    read_record_body(file, path, header)
+    read_record_body(file, path, header, keys)
 }
 
-pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogRecord> {
+pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeader, keys: Option<&ClassicObjectKeys>) -> Result<LogRecord> {
     if header.retired {
         let requested = header.metadata.offset.0;
         return Err(Error::UnavailableLogRange {
@@ -117,7 +123,12 @@ pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeade
     let mut payload = vec![0; header.payload_size];
     file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
     read_record_trailer(file, path, header.metadata.offset)?;
-    Ok(LogRecord::new(header.metadata, Bytes::from(payload)))
+    let payload = match (header.sealed, keys) {
+        (true, Some(keys)) => keys.open_record(header.metadata.offset.0, header.metadata.timestamp.0, &payload)?,
+        (false, None) => Bytes::from(payload),
+        _ => return Err(corrupt(path, header.metadata.offset.0 as u64, "the log frame uses a different custody profile")),
+    };
+    Ok(LogRecord::new(header.metadata, payload))
 }
 
 pub(super) fn inspect_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogMetadata> {
@@ -160,10 +171,13 @@ pub(crate) fn prefix_end(file: &mut File, path: &Path, maximum: usize, boundary:
 pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u64) -> Result<()> {
     let zeros = [0; 8192];
     let mut next = 0;
+    if end > 0 && read_record_header_at(file, path, maximum, 0, end)?.sealed {
+        return Err(Error::Closed("Sealed Classic log retirement requires its original key authority".into()));
+    }
     while next < end {
         let header = read_record_header_at(file, path, maximum, next, end)?;
         file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
-        file.write_all(&[RETIRED_SEPARATOR]).map_err(|error| Error::io(path, error))?;
+        file.write_all(&[if header.sealed { RETIRED_SEALED_SEPARATOR } else { RETIRED_SEPARATOR }]).map_err(|error| Error::io(path, error))?;
         file.seek(SeekFrom::Start(next + HEADER_BYTES)).map_err(|error| Error::io(path, error))?;
         let mut remaining = header.payload_size;
         while remaining > 0 {
@@ -176,15 +190,25 @@ pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u
     crate::sync_file(file).map_err(|error| Error::io(path, error))
 }
 
-fn inspect(file: &mut File, path: &Path, maximum: usize) -> Result<LogOffset> {
+fn inspect(file: &mut File, path: &Path, maximum: usize, sealed: bool) -> Result<LogOffset> {
     let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
     if length >= 1 << 48 { return Err(corrupt(path, length, "local log exceeds the 48-bit offset space")); }
     file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(path, error))?;
     let mut latest = LogOffset(-1);
     while file.stream_position().map_err(|error| Error::io(path, error))? < length {
-        latest = inspect_record(file, path, maximum)?.offset;
+        let header = read_record_header(file, path, maximum)?;
+        if header.sealed != sealed {
+            return Err(corrupt(path, header.metadata.offset.0 as u64, "the log frame uses a different custody profile"));
+        }
+        latest = inspect_record_body(file, path, header)?.offset;
     }
     Ok(latest)
+}
+
+pub(super) fn physical_maximum(maximum: usize, sealed: bool) -> Result<usize> {
+    maximum.checked_add(if sealed { LOG_SEAL_OVERHEAD } else { 0 })
+        .filter(|size| *size <= i32::MAX as usize)
+        .ok_or_else(|| Error::Task("local log payload and seal exceed i32 framing".into()))
 }
 
 impl LocalLog {
@@ -202,8 +226,18 @@ impl LocalLog {
 
     /// Uses a caller-owned reader I/O region; the caller closes that region after consumers and the writer join.
     pub fn open_with_timestamp_source_in(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>, reads: Arc<IoRegion>) -> Result<(Arc<Self>, LocalLogDriver)> {
+        Self::open_with_key_slots(path, options, timestamps, reads, None)
+    }
+
+    pub fn open_with_key_slots(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
+    ) -> Result<(Arc<Self>, LocalLogDriver)> {
         let _operation = reads.admit()?;
         let path = path.as_ref();
+        if keys.is_none() {
+            ClassicKeyVault::require_unsealed_log(path).map_err(|error| Error::Task(error.to_string()))?;
+        }
+        let maximum = physical_maximum(options.maximum_message_bytes, keys.is_some())?;
         if options.queue_capacity == 0 || options.maximum_message_bytes > i32::MAX as usize {
             return Err(Error::Task("local log requires a positive queue and an i32 payload limit".into()));
         }
@@ -211,7 +245,7 @@ impl LocalLog {
         let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)
             .map_err(|error| Error::io(path, error))?;
         file.try_lock_exclusive().map_err(|error| Error::io(path, error))?;
-        let latest = inspect(&mut file, path, options.maximum_message_bytes)?;
+        let latest = inspect(&mut file, path, maximum, keys.is_some())?;
         crate::sync_file(&file).map_err(|error| Error::io(path, error))?;
         if let Some(parent) = path.parent() {
             crate::sync_directory(parent).map_err(|error| Error::io(parent, error))?;
@@ -219,8 +253,8 @@ impl LocalLog {
         let path = Arc::new(path.to_path_buf());
         let progress = Arc::new(Progress::new(latest));
         let (send, queue) = mpsc::channel(options.queue_capacity);
-        let log = Arc::new(Self { path: path.clone(), queue: send, progress: progress.clone(), maximum_message_bytes: options.maximum_message_bytes, reads });
-        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps }), queue, progress }))
+        let log = Arc::new(Self { path: path.clone(), queue: send, progress: progress.clone(), maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads });
+        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress }))
     }
 
     /// Closes and drains reader I/O; the caller must cancel and join the writer driver first.
@@ -236,14 +270,18 @@ impl Writer {
             for record in records {
                 let timestamp = self.timestamps.timestamp(&record.payload, record.timestamp)?;
                 let offset = self.file.stream_position().map_err(|error| Error::io(self.path.as_ref(), error))?;
-                let end = offset.checked_add(HEADER_BYTES + record.payload.len() as u64 + TRAILER_BYTES)
+                let payload = match &self.keys {
+                    Some(keys) => keys.seal_record(offset as i64, timestamp.0, &record.payload)?,
+                    None => record.payload.clone(),
+                };
+                let end = offset.checked_add(HEADER_BYTES + payload.len() as u64 + TRAILER_BYTES)
                     .filter(|end| *end < 1 << 48)
                     .ok_or_else(|| corrupt(&self.path, offset, "local log offset space exhausted"))?;
                 let mut bytes = Vec::with_capacity((end - offset) as usize);
-                bytes.push(RECORD_SEPARATOR);
-                bytes.extend_from_slice(&(record.payload.len() as i32).to_be_bytes());
+                bytes.push(if self.keys.is_some() { SEALED_SEPARATOR } else { RECORD_SEPARATOR });
+                bytes.extend_from_slice(&(payload.len() as i32).to_be_bytes());
                 bytes.extend_from_slice(&timestamp.0.to_be_bytes());
-                bytes.extend_from_slice(&record.payload);
+                bytes.extend_from_slice(&payload);
                 bytes.extend_from_slice(&(offset as i64).to_be_bytes());
                 self.file.write_all(&bytes).map_err(|error| Error::io(self.path.as_ref(), error))?;
                 metadata.push(LogMetadata { offset: LogOffset(offset as i64), timestamp });
@@ -321,7 +359,8 @@ impl Log for LocalLog {
     fn maximum_append_bytes(&self) -> Option<usize> { Some(self.maximum_message_bytes) }
 
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
-        super::read_only::file_range(Arc::clone(&self.path), self.maximum_message_bytes, from, to, Some(self.progress.latest()?))
+        let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
+        super::read_only::file_range(Arc::clone(&self.path), maximum, from, to, Some(self.progress.latest()?), self.keys.clone())
     }
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         if payload.len() > self.maximum_message_bytes {
@@ -337,7 +376,8 @@ impl Log for LocalLog {
     fn latest(&self) -> Result<LogOffset> { self.progress.latest() }
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
-        let (path, maximum, progress) = (self.path.clone(), self.maximum_message_bytes, self.progress.clone());
+        let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
+        let (path, progress) = (self.path.clone(), self.progress.clone());
         let latest = progress.latest()?;
         if after.0 < -1 || after > latest {
             return Err(Error::UnavailableLogRange { requested: after.0, first_retained: 0 });
@@ -351,12 +391,14 @@ impl Log for LocalLog {
                 file.stream_position().map_err(|error| Error::io(path.as_ref(), error))
             }).await?
         };
-        Ok(Box::new(LocalTail { path, progress, maximum, after, next, reads: Arc::clone(&self.reads) }))
+        Ok(Box::new(LocalTail { path, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() }))
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {
         let latest = self.progress.latest()?;
-        let (path, maximum) = (self.path.clone(), self.maximum_message_bytes);
+        let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
+        let path = self.path.clone();
+        let keys = self.keys.clone();
         if from.0 < 0 { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         if to < from { return Err(Error::Task("log range end precedes its start".into())); }
         self.reads.run(move || {
@@ -364,21 +406,21 @@ impl Log for LocalLog {
             if from > latest {
                 let end = if latest.0 < 0 { 0 } else {
                     file.seek(SeekFrom::Start(latest.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
-                    read_record(&mut file, &path, maximum)?;
+                    read_record(&mut file, &path, maximum, keys.as_deref())?;
                     file.stream_position().map_err(|error| Error::io(path.as_ref(), error))? as i64
                 };
                 if from.0 != end { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
                 return Ok(Vec::new());
             }
             file.seek(SeekFrom::Start(from.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
-            let first = read_record(&mut file, &path, maximum)?;
+            let first = read_record(&mut file, &path, maximum, keys.as_deref())?;
             let mut result = Vec::new();
             if from < to { result.push(first); }
             else { return Ok(result); }
             loop {
                 let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))? as i64;
                 if next >= to.0 || next > latest.0 { break; }
-                result.push(read_record(&mut file, &path, maximum)?);
+                result.push(read_record(&mut file, &path, maximum, keys.as_deref())?);
             }
             Ok(result)
         }).await
@@ -388,6 +430,7 @@ impl Log for LocalLog {
 struct LocalTail {
     path: Arc<PathBuf>, progress: Arc<Progress>, maximum: usize, after: LogOffset, next: u64,
     reads: Arc<IoRegion>,
+    keys: Option<Arc<ClassicObjectKeys>>,
 }
 
 impl LocalTail {
@@ -395,6 +438,7 @@ impl LocalTail {
         let tip = await_tip(&self.progress, self.after, timeout).await?;
         if tip <= self.after { return Ok(Vec::new()); }
         let (path, maximum, next) = (self.path.clone(), self.maximum, self.next);
+        let keys = self.keys.clone();
         let payload_limit = payload_limit.max(maximum);
         let (records, next) = self.reads.run(move || {
             let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
@@ -407,7 +451,7 @@ impl LocalTail {
                 {
                     break;
                 }
-                let record = read_record(&mut file, &path, maximum)?;
+                let record = read_record(&mut file, &path, maximum, keys.as_deref())?;
                 payload_bytes += record.payload.len();
                 records.push(record);
             }
@@ -459,6 +503,7 @@ impl LogReplayTail for LocalTail {
             return Err(Error::Task("log replay head exceeds the durable tip".into()));
         }
         let (path, maximum, next) = (Arc::clone(&self.path), self.maximum, self.next);
+        let keys = self.keys.clone();
         let (record, next) = self.reads.run(move || {
             let mut file = open_at(&path, next)?;
             let header = read_record_header(&mut file, &path, maximum)?;
@@ -468,7 +513,7 @@ impl LogReplayTail for LocalTail {
             if reservation.length() < head.allocation_bound {
                 return Err(Error::Task("log read reservation is too small".into()));
             }
-            let record = read_record_body(&mut file, &path, header)?.retain(reservation)?;
+            let record = read_record_body(&mut file, &path, header, keys.as_deref())?.retain(reservation)?;
             let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))?;
             Ok((record, next))
         }).await?;
@@ -481,6 +526,38 @@ impl LogReplayTail for LocalTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sealed_frames_replay_with_the_original_lineage_and_keep_plaintext_out_of_the_log() -> rtdb_types::Result<()> {
+        let keys = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(keys.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let vault = ClassicKeyVault::open(keys.path())?;
+        let path = files.path().join("LOG");
+        let io = IoRegion::new();
+        let slots = vault.log_keys(&path, true, Arc::clone(&io))?;
+        let (log, driver) = LocalLog::open_with_key_slots(
+            &path, LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 },
+            Arc::new(SuppliedTimestamp), Arc::clone(&io), Some(slots),
+        )?;
+        let shutdown = CancellationToken::new();
+        let writer = tokio::spawn(driver.run(shutdown.clone()));
+        let body = Bytes::from_static(b"sealed application payload");
+        let chosen = log.enqueue(body.clone(), Timestamp(7)).await?.durable().await?;
+        let raw = fs::read(&path).unwrap();
+        assert!(!raw.windows(body.len()).any(|window| window == body.as_ref()));
+        let slots = vault.log_keys(&path, false, Arc::clone(&io))?;
+        let reader = super::super::ReadOnlyLocalLog::open_with_key_slots(&path, Default::default(), io, slots)?;
+        let records = reader.read_range(chosen.offset, LogOffset(chosen.offset.0 + 1)).await?;
+        assert_eq!(records[0].payload, body);
+        shutdown.cancel();
+        writer.await.unwrap()?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn local_tail_checks_room_for_a_maximum_size_message_before_reading_the_next_payload() {
@@ -503,6 +580,7 @@ mod tests {
             after: LogOffset(-1),
             next: 0,
             reads: Arc::clone(&log.reads),
+            keys: None,
         };
         for (limit, from, to) in [(8, 0, 2), (5, 2, 3), (5, 3, 4), (5, 4, 5)] {
             let batch = tail.poll_with_payload_limit(Duration::ZERO, limit).await.unwrap();
@@ -529,6 +607,7 @@ mod retention_tests {
             file: scratch.reopen().map_err(|error| Error::io(&path, error))?,
             path: Arc::clone(&path),
             timestamps: Arc::new(SuppliedTimestamp),
+            keys: None,
         };
         let record = |payload: &'static [u8]| Queued {
             payload: Bytes::from_static(payload), timestamp: Timestamp(5), durable: oneshot::channel().0,
@@ -542,9 +621,9 @@ mod retention_tests {
         assert!(bytes[HEADER_BYTES as usize..HEADER_BYTES as usize + b"old receipt".len()].iter().all(|byte| *byte == 0));
         assert_eq!(inspect(&mut writer.file, &path, 1024)?, before);
         writer.file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(&path, error))?;
-        assert!(matches!(read_record(&mut writer.file, &path, 1024), Err(Error::UnavailableLogRange { requested: 0, .. })));
+        assert!(matches!(read_record(&mut writer.file, &path, 1024, None), Err(Error::UnavailableLogRange { requested: 0, .. })));
         writer.file.seek(SeekFrom::Start(before.0 as u64)).map_err(|error| Error::io(&path, error))?;
-        assert_eq!(read_record(&mut writer.file, &path, 1024)?.payload.as_ref(), b"surviving suffix");
+        assert_eq!(read_record(&mut writer.file, &path, 1024, None)?.payload.as_ref(), b"surviving suffix");
         Ok(())
     }
 }

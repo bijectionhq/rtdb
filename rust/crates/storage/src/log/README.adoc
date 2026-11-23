@@ -57,3 +57,9 @@ The source has not been compiled or executed during Phase 1.
 `AppendReceipt` is a passive completion value.
 An observed receipt wraps a caller-polled future without changing the backend's ownership of an accepted write.
 Dropping an observation future does not withdraw bytes already accepted by the log.
+
+
+Enrolled Classic source and replica logs use a separate vault lineage for each file.
+Each sealed frame carries a fresh publication identity and authenticates its physical offset and sampled timestamp under the corresponding slot.
+A read-only reopen requires the original vault and verifies the frame before returning its payload.
+Offline physical prefix retirement currently admits clear frames only.
