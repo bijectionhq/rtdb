@@ -191,21 +191,24 @@ class MemoryCacheTest {
             throw e.cause ?: e
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `ooms the mem-cache`() = runTest {
-        MemoryCache(allocator, 100, PathLoader()).use { cache ->
+        MemoryCache(allocator, 100, PathLoader(), UnconfinedTestDispatcher(testScheduler)).use { cache ->
             shouldThrow<OutOfMemoryException> {
                 unwrapCause {
                     cache.get(Path.of("t1/200"), Slice(0, 200)) { k -> k to null }.use { }
                 }
             }
 
+            runCurrent()
             withClue("only takes a slice of a bigger file") {
                 cache.get(Path.of("t1/200"), Slice(0, 50)) { k -> k to null }.use { b1 ->
                     assertEquals(2, b1.getByte(0))
                 }
             }
 
+            runCurrent()
             withClue("but too many slices OOMs too") {
                 cache.get(Path.of("t1/200"), Slice(0, 75)) { k -> k to null }.use { b1 ->
                     assertEquals(2, b1.getByte(0), "the second get's mapping, still idle")
