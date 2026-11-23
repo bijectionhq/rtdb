@@ -121,7 +121,10 @@
 -- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
 -- An exceeded bound aborts the entire group, including the writes and counter deltas.
--- World writes to a governed root refuse without inherited capacity accounting.
+-- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.
+-- A replacement outside every current Root capacity predicate does not increase a covered count.
+-- A world write that can increase occupancy still requires inherited accounting.
+-- Acceptance-valid writes in a Held world start at the logical clock that the world publishes with them and have an open end.
 -- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.

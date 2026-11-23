@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, num::NonZeroUsize};
 
-use rtdb_types::{EntityId, OwnedRelation};
+use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, WorldShadow};
 
 use super::{
     owned_unique::{MAX_KEY_BYTES, unique_id},
@@ -172,6 +172,26 @@ fn predicates(mut encoded: &[u8]) -> Result<Vec<(&str, &[u8])>> {
     Ok(result)
 }
 
+fn matches_predicate(value: &Value, expected: &[u8]) -> Result<bool> {
+    match value {
+        Value::Binary(bytes) => Ok(bytes.as_slice() == expected),
+        Value::Null | Value::Undefined => Ok(false),
+        _ => Err(invalid_key()),
+    }
+}
+
+fn shadow_charges(row: &StructFields<Value>, qualifiers: &[(&str, &[u8])]) -> Result<bool> {
+    if WorldShadow::is_tombstone(row) {
+        return Ok(false);
+    }
+    for &(column, expected) in qualifiers {
+        if !matches_predicate(row.get(column).unwrap_or(&Value::Undefined), expected)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[derive(Clone, Default)]
 struct CapacityPolicy {
     rules: Vec<CapacityRule>,
@@ -263,6 +283,44 @@ fn capacity_conditions(operations: &[Operation]) -> impl Iterator<Item = Capacit
 }
 
 impl OpenTransaction<'_> {
+    pub(super) async fn require_noncharging_world_write(
+        &self, owner: &str, root: &OwnedRelation, schema: &OwnedSchema, rows: &[StructFields<Value>],
+    ) -> Result<()> {
+        // A shadow outside every current bucket can only release occupancy,
+        // regardless of whether it displaces an archived or local fact.
+        if rows.iter().all(WorldShadow::is_tombstone) {
+            return Ok(());
+        }
+        let base = self.buffer.base_snapshot();
+        let stored;
+        let policy = match self.capacity_changes.relations.get(root).and_then(Option::as_ref) {
+            Some(touched) => &touched.policy,
+            None => {
+                stored = self.capacity_policy(base.clone(), owner, root).await?;
+                &stored
+            }
+        };
+        if !policy.rules.is_empty() && base.relation_event_frontier(&root.table(owner))? != policy.through_events {
+            return Err(uncovered());
+        }
+        for rule in &policy.rules {
+            if !rule.admits(schema)? {
+                return Err(uncovered());
+            }
+            let qualifiers = predicates(&rule.when)?;
+            for row in rows {
+                self.context.check_cancelled()?;
+                if shadow_charges(row, &qualifiers)? {
+                    return Err(Anomaly::incorrect(
+                        "rtdb.owned/world-capacity-uncovered",
+                        "The world charge requires inherited capacity accounting",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn hosted_capacity_writer(&self) -> Result<Timestamp> {
         let unavailable = || Anomaly::new(
             AnomalyCategory::Forbidden,
@@ -899,10 +957,8 @@ impl OpenTransaction<'_> {
         qualifiers: &[(&str, &[u8])],
     ) -> Result<Option<Vec<u8>>> {
         for &(column, expected) in qualifiers {
-            match self.read_occupancy_value_at(rows, row, column, uncovered)? {
-                Value::Binary(bytes) if bytes.as_slice() == expected => (),
-                Value::Binary(_) | Value::Null | Value::Undefined => return Ok(None),
-                _ => return Err(invalid_key()),
+            if !matches_predicate(&self.read_occupancy_value_at(rows, row, column, uncovered)?, expected)? {
+                return Ok(None);
             }
         }
         let Value::Binary(mut key) =
