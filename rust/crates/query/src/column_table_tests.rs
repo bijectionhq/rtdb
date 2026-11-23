@@ -1,8 +1,8 @@
 use crate::{
     CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions,
     context::{Execution, OuterRows},
-    operators::build_pages,
-    pages::BoxPageCursor,
+    operators::build_column_pages,
+    columnar::BoxBatchCursor,
     parameters::BoundParameters,
     runtime_schema::{EmittedRelation, RuntimeSchema},
 };
@@ -77,7 +77,7 @@ fn column_table(name: &str, expr: Expr) -> Arc<Relation> {
 async fn open(
     relation: Arc<Relation>,
     execution: &Execution,
-) -> Result<(BoxPageCursor, Arc<RuntimeSchema>)> {
+) -> Result<(BoxBatchCursor, Arc<RuntimeSchema>)> {
     let emitted = EmittedRelation::derive(
         relation,
         &execution.context.catalog,
@@ -85,7 +85,7 @@ async fn open(
         &execution.context.memory,
     )?;
     let output = emitted.output();
-    Ok((build_pages(emitted, execution.clone()).await?, output))
+    Ok((build_column_pages(emitted, execution.clone()).await?.unwrap(), output))
 }
 
 #[derive(Deserialize)]
@@ -140,8 +140,8 @@ async fn column_tables_preserve_the_four_original_single_column_assertions() {
             case.id
         );
         let mut rows = Vec::new();
-        while let Some(page) = cursor.next_page().await.unwrap() {
-            rows.extend(page.rows().iter().map(|row| row.values.clone()));
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            rows.extend((0..page.len).map(|row| vec![page.columns[0].value(row).unwrap()]));
         }
         assert_eq!(rows, case.expected.rows, "{}", case.id);
         drop(cursor);
@@ -274,9 +274,9 @@ async fn column_tables_publish_one_complete_page_including_empty_and_undemanded_
             let execution = execution(batch_rows, vec![]);
             let baseline = execution.context.memory.used_bytes();
             let (mut cursor, types) = open(column_table("v", expr), &execution).await.unwrap();
-            let page = cursor.next_page().await.unwrap().unwrap();
-            assert_eq!(page.len(), expected_len);
-            assert!(cursor.next_page().await.unwrap().is_none());
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(page.len, expected_len);
+            assert!(cursor.next_batch().await.unwrap().is_none());
             drop(cursor);
             drop(types);
             drop(page);
@@ -312,17 +312,16 @@ async fn column_table_ordinality_is_one_i64_sequence_across_internal_reader_slic
         types.schema().fields()[1].data_type,
         LogicalType::Scalar(ScalarType::I64)
     );
-    let page = cursor.next_page().await.unwrap().unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
     assert_eq!(
-        page.rows()
-            .iter()
-            .map(|row| row.values.clone())
+        (0..page.len)
+            .map(|row| page.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>())
             .collect::<Vec<_>>(),
         (1..8)
             .map(|value| vec![Value::I64(value), Value::I64(value)])
             .collect::<Vec<_>>()
     );
-    assert!(cursor.next_page().await.unwrap().is_none());
+    assert!(cursor.next_batch().await.unwrap().is_none());
 }
 
 #[tokio::test]

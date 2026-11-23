@@ -4,7 +4,7 @@ use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, OrdinalityScope, Relation, Rela
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_types::{LogicalType, Result, ScalarType, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::{Execution, OuterRows}, operators::build_pages, pages::BoxPageCursor, parameters::BoundParameters, runtime_schema::EmittedRelation};
+use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::{Execution, OuterRows}, columnar::{BoxBatchCursor, ColumnBatch}, operators::build_column_pages, parameters::BoundParameters, runtime_schema::EmittedRelation};
 
 fn execution(batch_rows: usize) -> Execution {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
@@ -21,9 +21,12 @@ fn series(start: i64, end: i64, step: i64, inclusive: bool) -> Expr {
     let args = vec![Expr::Literal(Value::I64(start)), Expr::Literal(Value::I64(end)), Expr::Literal(Value::I64(step)), Expr::Literal(Value::Bool(inclusive))];
     Expr::Call { name: "generate_series".into(), return_type: rtdb_plan::function_type_with_args("generate_series", &args).unwrap(), args }
 }
-async fn open(relation: Arc<Relation>, execution: &Execution) -> Result<BoxPageCursor> {
+async fn open(relation: Arc<Relation>, execution: &Execution) -> Result<BoxBatchCursor> {
     let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, execution.parameters.types(), &execution.context.memory)?;
-    build_pages(Arc::clone(&runtime), execution.clone()).await
+    Ok(build_column_pages(runtime, execution.clone()).await?.unwrap())
+}
+fn rows(batch: &ColumnBatch) -> Vec<Vec<Value>> {
+    (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect()
 }
 fn numbers(values: &[i64]) -> Vec<Vec<Value>> { values.iter().map(|value| vec![Value::I64(*value)]).collect() }
 
@@ -39,7 +42,7 @@ async fn list_pages_preserve_the_reference_batch_boundaries_independently_of_cli
             let baseline = execution.context.memory.used_bytes();
             let mut cursor = open(list(series(1, end, 1, inclusive)), &execution).await.unwrap();
             let mut pages = Vec::new();
-            while let Some(page) = cursor.next_page().await.unwrap() { pages.push(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>()); }
+            while let Some(page) = cursor.next_batch().await.unwrap() { pages.push(rows(&page)); }
             assert_eq!(pages, expected.iter().map(|page| numbers(page)).collect::<Vec<_>>());
             drop(cursor);
             assert_eq!(execution.context.memory.used_bytes(), baseline);
@@ -55,10 +58,10 @@ async fn page_ordinality_has_i64_cells_and_restarts_for_each_semantic_page() {
     let relation = Arc::new(input.with_ordinality(field, OrdinalityScope::Page).unwrap());
     let mut cursor = open(relation, &execution).await.unwrap();
     for expected in [vec![(1,1),(2,2),(3,3)],vec![(4,1),(5,2),(6,3)],vec![(7,1)]] {
-        let page = cursor.next_page().await.unwrap().unwrap();
-        assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), expected.into_iter().map(|(a,n)| vec![Value::I64(a),Value::I64(n)]).collect::<Vec<_>>());
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(rows(&page), expected.into_iter().map(|(a,n)| vec![Value::I64(a),Value::I64(n)]).collect::<Vec<_>>());
     }
-    assert!(cursor.next_page().await.unwrap().is_none());
+    assert!(cursor.next_batch().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -70,11 +73,11 @@ async fn relation_ordinality_includes_rows_in_pages_skipped_by_the_consumer() {
     let mut cursor = open(relation, &execution).await.unwrap();
     assert_eq!(cursor.skip_complete_pages(4).unwrap(), 3);
     for expected in [&[4, 5, 6][..], &[7][..]] {
-        let page = cursor.next_page().await.unwrap().unwrap();
-        let rows = expected.iter().map(|value| vec![Value::I64(*value), Value::I64(*value)]).collect::<Vec<_>>();
-        assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), rows);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let expected = expected.iter().map(|value| vec![Value::I64(*value), Value::I64(*value)]).collect::<Vec<_>>();
+        assert_eq!(rows(&page), expected);
     }
-    assert!(cursor.next_page().await.unwrap().is_none());
+    assert!(cursor.next_batch().await.unwrap().is_none());
 }
 
 fn division_by_zero() -> Expr { Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0))) }
@@ -88,17 +91,17 @@ async fn list_cells_are_demanded_only_in_complete_emitted_pages() {
         expressions.push(division_by_zero());
         let mut cursor = open(list(Expr::List(expressions)), &execution).await.unwrap();
         if good == 3 {
-            let page = cursor.next_page().await.unwrap().unwrap();
-            assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), numbers(&[1,2,3]));
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(rows(&page), numbers(&[1,2,3]));
         }
-        assert_eq!(cursor.next_page().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
         drop(cursor);
         assert_eq!(execution.context.memory.used_bytes(), baseline);
     }
     let mut cursor = open(list(series(1, 2_000_000_000, 1, false)), &execution).await.unwrap();
-    drop(cursor.next_page().await.unwrap().unwrap());
+    drop(cursor.next_batch().await.unwrap().unwrap());
     execution.context.cancellation.cancel();
-    assert_eq!(cursor.next_page().await.err().unwrap().code, "xtdb/query-cancelled");
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb/query-cancelled");
     drop(cursor);
     assert_eq!(execution.context.memory.used_bytes(), baseline);
 }
@@ -110,12 +113,12 @@ async fn integer_list_fast_forward_preserves_full_and_partial_pages() {
     let mut cursor = open(list(series(8, 1, -1, true)), &execution).await.unwrap();
 
     assert_eq!(cursor.skip_complete_pages(4).unwrap(), 3);
-    let page = cursor.next_page().await.unwrap().unwrap();
-    assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), numbers(&[5, 4, 3]));
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(rows(&page), numbers(&[5, 4, 3]));
     drop(page);
     assert_eq!(cursor.skip_complete_pages(1).unwrap(), 0);
     assert_eq!(cursor.skip_complete_pages(2).unwrap(), 2);
-    assert!(cursor.next_page().await.unwrap().is_none());
+    assert!(cursor.next_batch().await.unwrap().is_none());
 
     drop(cursor);
     assert_eq!(execution.context.memory.used_bytes(), baseline);
@@ -126,7 +129,7 @@ async fn fast_forward_preserves_errors_in_lists_and_computed_projections() {
     let execution = execution(1);
     let mut lazy = open(list(Expr::List(vec![division_by_zero()])), &execution).await.unwrap();
     assert_eq!(lazy.skip_complete_pages(3).unwrap(), 0);
-    assert_eq!(lazy.next_page().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+    assert_eq!(lazy.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
 
     let input = list(series(0, 9, 1, false));
     let column = input.schema().fields()[0].clone();
@@ -137,7 +140,7 @@ async fn fast_forward_preserves_errors_in_lists_and_computed_projections() {
     }]).unwrap());
     let limited = Arc::new(computed.limit(Some(Expr::Literal(Value::I64(3))), Some(Expr::Literal(Value::I64(1)))).unwrap());
     let mut cursor = open(limited, &execution).await.unwrap();
-    assert_eq!(cursor.next_page().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
 }
 
 #[tokio::test]
@@ -157,11 +160,11 @@ async fn emitted_definition_survives_its_caller_and_output_survives_the_cursor()
     let emitted = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, execution.parameters.types(), &execution.context.memory).unwrap();
     drop(relation);
     assert!(definition.upgrade().is_some());
-    let mut cursor = build_pages(emitted, execution.clone()).await.unwrap();
-    let page = cursor.next_page().await.unwrap().unwrap();
+    let mut cursor = build_column_pages(emitted, execution.clone()).await.unwrap().unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
     drop(cursor);
     assert!(definition.upgrade().is_none());
-    assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), numbers(&[1,2,3]));
+    assert_eq!(rows(&page), numbers(&[1,2,3]));
     drop(page);
     assert_eq!(execution.context.memory.used_bytes(), baseline);
 }

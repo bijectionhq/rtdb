@@ -125,10 +125,10 @@ async fn build_batches_at(
             };
             Ok(Some((batches,false)))
         }
-        RelationNode::Scan(_) if output.is_arrow() => {
+        RelationNode::Scan(scan) if output.is_arrow() => {
             let width = runtime.schema().len();
             let memory = Arc::clone(&execution.context.memory);
-            let pages = build_pages(runtime, execution).await?;
+            let pages = open_catalog_scan(scan, &runtime, execution).await?;
             Ok(Some((crate::columnar::batches_from_pages(pages, width, memory), false)))
         }
         RelationNode::ColumnTable { expr, .. } if output.is_arrow() => {
@@ -646,6 +646,31 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         }
         _ => None,
     })
+}
+
+async fn open_catalog_scan(scan: &rtdb_plan::Scan, runtime: &Arc<EmittedRelation>, execution: Execution) -> Result<BoxPageCursor> {
+    let execution = execution.in_operator();
+    execution.context.check_cancelled()?;
+    let reservation = state_reservation(runtime, &execution)?;
+    let analysis = execution.analysis.clone();
+    let context = Arc::clone(&execution.context);
+    let mut constraints = crate::inspection::Constraints::default();
+    for predicate in &scan.predicates { constraints.add(predicate); }
+    let rows: BoxCursor = if crate::inspection::is_inspection(&scan.table.name.table) {
+        Box::new(crate::inspection::InspectionCursor::new(scan.clone(), execution.clone(), &constraints).await?)
+    } else {
+        Box::new(crate::system::SystemCursor::new(scan.clone(), execution.clone()))
+    };
+    let pages = crate::pages::from_rows(rows, Arc::clone(&context));
+    let pages: BoxPageCursor = match scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right)) {
+        Some(predicate) => Box::new(PageFilter {
+            input: pages, schema: runtime.schema().clone(), stages: vec![(predicate, execution.clone())],
+            _collapsed: context.memory.reserve(0)?, execution,
+        }),
+        None => pages,
+    };
+    let pages = crate::pages::retain_page_state(pages, reservation);
+    Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis, &context.memory), runtime.relation(), &context))
 }
 
 fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<BoxPageCursor>> {
