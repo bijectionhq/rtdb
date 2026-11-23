@@ -257,9 +257,18 @@ The rebuild and generation-retirement costs still need to be measured over susta
 
 ## Verification
 
-The native suite passed all 83 tests and the SQL array suite passed all six tests.
-The separate release test of the centroid read path passed its full-shortlist removal, retained snapshot, and coverage fallback assertions.
-The full Gradle unit suite passed all 3,190 tests with the native library built from the draft branch.
+The release Rust suites passed for the expression, SQL, query, format, index, transaction, FFI, Flight SQL, and node crates.
+The new regressions cover Arrow C Data ingest through flush and query, Flight SQL ingest and INSERT SELECT, replay through the existing put operation, list and component nulls during gather, and ANN on a captured basis during churn.
+The format and index suites passed again after the mixed-layout flush change.
+The full Rust workspace passed compilation across all targets.
+
+With the rebuilt native library supplied to Gradle, the unit suite passed 3,190 tests and the property suite passed 3,348 cases.
+The property results include 3,300 numbered simulation iterations across 33 methods.
+The integration suite passed 5,629 tests with one PostgreSQL-source skip and zero failures.
+The Gradle runs emitted no reflection or boxed math warnings.
+
+GitHub's JVM jobs fail in native ABI initialization because the workflow invokes Gradle without setting `xtdb.native.library`.
+The draft and main runs report the same error at the library-path check. [Draft CI](https://github.com/bijectionhq/rtdb/actions/runs/45087814248) · [Main CI](https://github.com/bijectionhq/rtdb/actions/runs/45087416220)
 
 ## Arrow path inventory
 
