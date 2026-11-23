@@ -45,6 +45,46 @@ async fn a_static_insert_preserves_interleaved_assertion_order_for_one_identity(
 }
 
 #[tokio::test]
+async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_same_time() {
+    use rtdb_format::envelope::SourceMessage;
+
+    let context = context();
+    let source = prepare_submission(vec![
+        sql("ASSERT CURRENT_TIMESTAMP < TIMESTAMP '1970-01-01T00:00:00.000102Z'"),
+        sql("INSERT INTO docs (_id, v, _valid_from, _valid_to)
+            VALUES ('at-' || CAST(CURRENT_TIMESTAMP + INTERVAL '1' SECOND AS VARCHAR),
+                    CURRENT_TIMESTAMP + INTERVAL '1' SECOND,
+                    CURRENT_TIMESTAMP + INTERVAL '2' SECOND,
+                    CURRENT_TIMESTAMP + INTERVAL '3' SECOND)"),
+    ], SubmitOptions::default(), "xtdb", &context.memory).unwrap();
+    let encoded = source.encode().unwrap();
+    let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+    let replay = || SourceTransaction::decode(&message, &context.memory).unwrap();
+
+    for previous in [100, 101] {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+        resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(previous), request(vec![], &context), &context).await.unwrap();
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+        let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(90), replay(), &context).await.unwrap();
+        assert_eq!(result.result().tx_key().system_time, Timestamp(previous + 1));
+        if previous == 101 {
+            assert_eq!(result.result().error().unwrap().code, "xtdb/assert-failed");
+            assert!(!result.writes().tables().contains_key(&table()));
+            continue;
+        }
+        assert!(result.result().committed(), "{:?}", result.result().error());
+        let event = result.writes().tables()[&table()].batch().unwrap().view().read_event(0).unwrap();
+        assert_eq!(event.valid_time, Interval::from_micros(2_000_101, 3_000_101).unwrap());
+        let StoredOperation::Put(row) = event.operation else { panic!("Expected a put"); };
+        let Value::Utf8(id) = &row["_id"] else { panic!("Expected an encoded key"); };
+        let expected = Timestamp(1_000_101);
+        assert_eq!(rtdb_types::parse_sql_timestamp_instant(id.strip_prefix("at-").unwrap(), "UTC").unwrap().as_micros().unwrap(), expected);
+        assert_eq!(rtdb_expr::timestamp_micros(&row["v"], "UTC").unwrap(), expected);
+    }
+}
+
+#[tokio::test]
 async fn sql_source_replay_keeps_unreached_parameter_cells_in_arrow() {
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};

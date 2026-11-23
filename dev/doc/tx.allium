@@ -206,6 +206,8 @@
 -- Key conflicts expose neither the occupied key nor its holder.
 -- A held range requires an exact published covering generation for the captured frontier and serves one page directly from that path.
 -- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
+-- An ordinary SQL transaction can assert that this time precedes an exclusive bound.
+-- Subsequent SQL mutations can use the same time plus intervals in values, encoded keys and validity endpoints.
 -- A native SQL insert can put many documents in one operation with distinct valid-time bounds.
 -- The documents retain their input order, including overlapping assertions for the same identity.
 -- A null start defaults to the assigned system time and a null end defaults to the open end.

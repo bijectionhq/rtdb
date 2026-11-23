@@ -69,9 +69,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         return Ok(None);
     }
     fn resolve_only(expr: &rtdb_plan::Expr) -> bool {
-        let mut requires_clock = false;
-        expr.visit(&mut |expr| if let rtdb_plan::Expr::Cast { expr, target } = expr { requires_clock |= target.requires_current_time(&expr.data_type()); });
-        requires_clock || expr.is_volatile() || rtdb_expr::requires_pg_catalog(expr)
+        expr.requires_current_time() || expr.is_volatile() || rtdb_expr::requires_pg_catalog(expr)
     }
     fn needs_resolver(input: &Relation) -> bool { input.expressions().iter().any(|expr| resolve_only(expr)) || input.children().iter().any(|input| needs_resolver(input)) }
     let valid_time = plan.valid_time();

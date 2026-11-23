@@ -75,7 +75,7 @@ impl TemporalField {
 pub(crate) fn canonical(name: &str) -> &str {
     match name { "now" => "current_timestamp","localdate" => "local_date","localtime" => "local_time","localtimestamp" => "local_timestamp",other => other }
 }
-fn clock(name: &str) -> bool { matches!(canonical(name),"current_timestamp" | "current_time" | "current_date" | "current_timezone" | "local_timestamp" | "local_time" | "local_date") }
+pub(crate) fn clock(name: &str) -> bool { matches!(canonical(name),"current_timestamp" | "current_time" | "current_date" | "current_timezone" | "local_timestamp" | "local_time" | "local_date") }
 fn signed(ty: &L) -> bool { matches!(ty,L::Scalar(S::I8 | S::I16 | S::I32 | S::I64)) }
 fn date_time(ty: &S) -> bool { matches!(ty,S::DateDay | S::DateMilli | S::Timestamp {..}) }
 fn interval(ty: &S) -> bool { matches!(ty,S::Interval(_) | S::IntervalMonthDayMicro) }

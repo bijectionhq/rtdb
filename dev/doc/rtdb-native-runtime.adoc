@@ -22,6 +22,11 @@ The link:../../rust/crates/sql/README.adoc[SQL] and link:../../rust/crates/xtql/
 The rows apply in input order.
 A null start uses the transaction's assigned time, and a null end leaves validity open.
 
+Use `ASSERT CURRENT_TIMESTAMP < TIMESTAMP '2027-01-15T00:00:00Z'` as the first statement of a read-write transaction to require an exclusive deadline.
+The assertion uses the assigned system time, including any increase required to advance the previous transaction's time.
+The transaction aborts when the assertion fails.
+In the same transaction, an expression such as `CURRENT_TIMESTAMP + INTERVAL '1' SECOND` can supply a value, part of an encoded key, or a validity endpoint.
+
 The embedded library exposes a versioned C ABI with Arrow C Data and C Stream ownership.
 The Java foreign-memory adapter implements ADBC and the existing Clojure connection protocols over that library.
 Applications depending on concrete JVM `Xtdb.Connection` or `RelationReader` classes need the migration described in link:../../rust/crates/ffi/README.adoc[the embedded binding reference].

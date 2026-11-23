@@ -277,6 +277,15 @@ impl Expr {
         self.visit(&mut |expr| { if let Self::Call { name, .. } = expr { volatile |= name.eq_ignore_ascii_case("random") || name.eq_ignore_ascii_case("sleep"); } });
         volatile
     }
+    pub fn requires_current_time(&self) -> bool {
+        let mut required = false;
+        self.visit(&mut |expr| match expr {
+            Self::Cast { expr, target } => required |= target.requires_current_time(&expr.data_type()),
+            Self::Call { name, .. } => required |= crate::temporal_functions::clock(name),
+            _ => (),
+        });
+        required
+    }
     pub fn column(id: ColumnId, data_type: LogicalType) -> Self { Self::Column { id, data_type } }
     pub fn binary(op: BinaryOp, left: Self, right: Self) -> Self { Self::Binary { op, left: Box::new(left), right: Box::new(right) } }
     pub fn unary(op: UnaryOp, expr: Self) -> Self { Self::Unary { op, expr: Box::new(expr) } }
