@@ -54,7 +54,7 @@ pub enum Request {
     /// Answers Done while the agent is serving: the controller's liveness probe.
     Ping,
     OpenPgwire,
-    FlightEndpoint,
+    FlightEndpoint { audience: bool },
     HoldingLoads { #[serde(default)] measure_query_cpu: bool },
     ReadLoads,
     /// A client is using the deployment through a gateway.

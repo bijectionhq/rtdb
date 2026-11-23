@@ -146,20 +146,20 @@ impl Service {
                 .map(AudienceFlightConfig::source)
                 .ok_or_else(|| Status::permission_denied("Flight audience reservation is not installed"))
         }).transpose()?;
-        if sources.next().is_some() || audience_source.is_some() && matches!(kind, CallKind::Ordinary) {
+        if sources.next().is_some() || audience_source.is_some() != self.0.config.audience.is_some()
+            || audience_source.is_some() && matches!(kind, CallKind::Ordinary) {
             return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
         }
         let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
         let sessions = self.sessions(audience.is_some());
-        let reserved_call = audience.filter(|_| matches!(kind, CallKind::Action));
-        let permits = reserved_call.map_or(&self.0.permits, |audience| &audience.calls);
+        let permits = audience.map_or(&self.0.permits, |audience| &audience.calls);
         let permit = Arc::clone(permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
         let admission = Admission::new(self.clone(), permit);
         let header_bytes = request.metadata().iter().try_fold(4096usize, |bytes, entry| {
             let size = match entry { tonic::metadata::KeyAndValueRef::Ascii(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())?, tonic::metadata::KeyAndValueRef::Binary(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())? };
             wire::add(bytes, wire::mul(size, 16)?)
         })?;
-        let request_memory = reserved_call.map_or(self.memory(), |audience| &audience.memory);
+        let request_memory = audience.map_or(self.memory(), |audience| &audience.memory);
         let reservation = request_memory.reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
         let requested_database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose()?;
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);

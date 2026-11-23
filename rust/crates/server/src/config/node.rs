@@ -9,13 +9,16 @@ impl NodeConfiguration {
         self.default_timezone.as_deref().unwrap_or(NodeOptions::DEFAULT_TIMEZONE)
     }
 
-    /// Splits the process allocation ceiling between the shared object cache and execution region.
-    /// Each cache and execution reservation is shared across every database on the node.
+    /// Funds the installed audience before splitting the ordinary allocation between cache and execution.
     pub fn node_options(&self, allocation_limit_bytes: usize) -> Result<NodeOptions> {
-        let cache_bytes = self.memory_cache.maximum_bytes.unwrap_or_else(|| (allocation_limit_bytes as f64 * self.memory_cache.maximum_ratio) as usize);
-        let execution_memory_bytes = allocation_limit_bytes.checked_sub(cache_bytes).filter(|bytes| *bytes > 0)
-            .ok_or_else(|| invalid("Memory cache must leave a positive execution allocation budget"))?;
+        let prepaid = self.flight_sql.as_ref().and_then(|settings| settings.audience)
+            .map_or(0, |(_, audience)| audience.execution_bytes());
+        let ordinary = allocation_limit_bytes.checked_sub(prepaid)
+            .ok_or_else(|| invalid("Memory limit cannot fund the installed Flight audience"))?;
+        let cache_bytes = self.memory_cache.maximum_bytes.unwrap_or_else(|| (ordinary as f64 * self.memory_cache.maximum_ratio) as usize);
         if cache_bytes == 0 { return Err(invalid("Memory cache allocation budget must be positive")); }
+        if cache_bytes >= ordinary { return Err(invalid("Memory cache must leave a positive ordinary execution allocation budget")); }
+        let execution_memory_bytes = allocation_limit_bytes - cache_bytes;
         let mut options = NodeOptions::default();
         options.membership = match &self.fixed_databases {
             Some(databases) => Membership::Fixed(databases.clone()),

@@ -26,7 +26,7 @@ pub struct FlightSettings {
     pub session_idle_timeout: Duration, pub session_unclaimed_timeout: Duration,
     pub owned_native_actions: bool,
     pub hosted_controls: Option<rtdb_flight_sql::HostedControlConfig>,
-    pub audience: Option<rtdb_flight_sql::AudienceFlightConfig>,
+    pub audience: Option<(std::net::SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>,
 }
 impl Default for FlightSettings {
     fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, hosted_controls: None, audience: None } }

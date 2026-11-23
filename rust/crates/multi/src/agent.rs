@@ -228,7 +228,7 @@ pub struct NodeAgent {
     node: Node,
     lease: Arc<MemberLease>,
     address: String,
-    flight_endpoint: Option<String>,
+    flight_endpoints: FlightEndpoints,
     options: AgentOptions,
     holdings: Mutex<BTreeMap<String, LocalHolding>>,
     /// Deployments a fragment was asked of before this node had them open, whose replicas its next pass opens.
@@ -246,9 +246,20 @@ pub struct NodeAgent {
     fragments_read: Mutex<BTreeMap<(String, String, String), u64>>,
 }
 
+pub(crate) struct FlightEndpoints {
+    pub ordinary: Option<String>,
+    pub audience: Option<String>,
+}
+
+impl FlightEndpoints {
+    fn get(&self, audience: bool) -> &Option<String> {
+        if audience { &self.audience } else { &self.ordinary }
+    }
+}
+
 impl NodeAgent {
-    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub(crate) fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoints: FlightEndpoints, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, node, lease, address, flight_endpoints, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -1411,7 +1422,7 @@ impl Handler for NodeAgent {
             Request::OpenPgwire => Err(Anomaly::unsupported("rtdb.multi/control-request", "This control endpoint does not provide Pgwire")),
             Request::HoldingLoads { measure_query_cpu } => Ok(Response::HoldingLoads { holdings: self.holding_loads(measure_query_cpu) }),
             Request::ReadLoads => Ok(Response::ReadLoads { loads: self.read_loads() }),
-            Request::FlightEndpoint => self.flight_endpoint.clone().map(|address| Response::FlightEndpoint { address })
+            Request::FlightEndpoint { audience } => self.flight_endpoints.get(audience).clone().map(|address| Response::FlightEndpoint { address })
                 .ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-flight-endpoint", "The holder does not have a Flight SQL endpoint")),
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::SubscribeFresh { name } => self.subscribe_for(&name, SubscriptionUse::FreshQuery).await,

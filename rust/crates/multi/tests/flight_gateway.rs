@@ -124,7 +124,13 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     let address = listener.local_addr().unwrap();
     let cancellation = CancellationToken::new();
     let options = GatewayOptions { capabilities: Some(secret()), ..Default::default() };
-    let driver = tokio::spawn(flight_gateway::serve(listener, Arc::clone(&cell.directory), options, cancellation.clone()));
+    let driver = tokio::spawn(flight_gateway::serve(listener, Arc::clone(&cell.directory), options.clone(), cancellation.clone()));
+    let audience_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let audience_address = audience_listener.local_addr().unwrap();
+    let audience = rtdb_flight_sql::AudienceFlightConfig::parse(&format!("{installation}/1")).unwrap();
+    let audience_driver = tokio::spawn(flight_gateway::serve_audience(
+        audience_listener, Arc::clone(&cell.directory), options, audience, cancellation.clone(),
+    ));
     let mut flight = FlightSqlServiceClient::new(channel(address).await);
     flight.set_header("x-xtdb-database", &selector);
     flight.handshake("xtdb", "cell-test").await.unwrap();
@@ -145,6 +151,16 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
         request
     };
     let mut raw = FlightServiceClient::new(channel(address).await);
+    let mut audience_client = FlightServiceClient::new(channel(audience_address).await);
+    let mut ordinary_route = Request::new(Action { r#type: "CloseSession".into(), body: Default::default() });
+    ordinary_route.metadata_mut().insert("authorization", format!("Bearer {route}").parse().unwrap());
+    assert_eq!(audience_client.do_action(ordinary_route).await.unwrap_err().code(), Code::PermissionDenied);
+
+    let mut wrong_listener = Request::new(futures::stream::iter([HandshakeRequest::default()]));
+    wrong_listener.metadata_mut().insert("x-xtdb-database", selector.parse().unwrap());
+    wrong_listener.metadata_mut().insert(rtdb_flight_sql::AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().unwrap());
+    assert_eq!(raw.handshake(wrong_listener).await.unwrap_err().code(), Code::PermissionDenied);
+
     assert!(raw.do_get(request(ticket.clone(), &route, None)).await.is_ok());
     assert_eq!(raw.do_get(request(ticket.clone(), "invalid", None)).await.unwrap_err().code(), Code::Unauthenticated);
     assert_eq!(raw.do_get(request(ticket.clone(), &route, Some("another"))).await.unwrap_err().code(), Code::PermissionDenied);
@@ -178,6 +194,7 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
 
     cancellation.cancel();
     tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), audience_driver).await.unwrap().unwrap().unwrap();
     cell.stop().await;
 }
 

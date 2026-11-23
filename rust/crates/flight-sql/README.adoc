@@ -269,15 +269,15 @@ An inexact floor, foreign history, or a cut that cannot be retained is refused w
 The handle admits held point, historical point and hosted control reads and applied confirmation.
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
-On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder.
-The authenticated hosted owner sends that value as `x-rtdb-audience-flight-v3` during the handshake.
-The gateway and holder must acknowledge the exact source and turn count.
-The sealed route then uses its own gateway call permits, backend connection pool, holder call permits and session slots.
-Each pool has two permits per turn and two for preparation and cleanup.
-Before serving, the holder reserves an execution pool of 16 MiB per permit. It refuses startup if the node cannot fund the pool.
+On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v4` on the audience gateway during its handshake.
+The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
+The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
+The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
+Before serving, the holder reserves 16 MiB of execution memory per permit. The reservation is deducted before the ordinary allocation splits between cache and execution. It refuses startup if the node cannot fund the pool.
 Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
 A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
-Handshake routing and authentication use ordinary admission. Socket buffers, storage service, and scheduling still need their own capacity.
+The audience handshake and subsequent actions use the reserved admission. Routing still depends on directory and placement service. Network scheduling, object storage and execution scheduling are separate capacity obligations.
 The reservation admits applied open and confirmation, held point and historical point reads, hosted control reads, and closure of the hold or session.
 The gateway routes only action RPCs on a reserved session.
 

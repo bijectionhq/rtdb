@@ -1092,7 +1092,7 @@ impl Service {
             if floor.history() != source {
                 return Err(Status::permission_denied("The applied floor belongs to another audience source"));
             }
-        } else if self.0.config.audience.is_some() {
+        } else if self.0.config.reserved_applied_source == Some(floor.history()) {
             return Err(Status::permission_denied("This source requires a reserved Flight session"));
         } else if generation != 0 {
             return Err(invalid("An ordinary applied read uses generation zero"));

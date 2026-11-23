@@ -3,7 +3,7 @@ use rtdb_node::Database;
 use rtdb_types::{Anomaly, Result};
 
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
-pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v3";
+pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudienceFlightConfig {
@@ -30,7 +30,7 @@ impl AudienceFlightConfig {
     pub fn permits(self) -> usize { 2 * (self.turns + 1) }
 
     /// The installed byte pool includes both the active round and its replacement.
-    pub(crate) fn execution_bytes(self) -> usize { self.permits() * (16 << 20) }
+    pub fn execution_bytes(self) -> usize { self.permits() * (16 << 20) }
 }
 
 pub trait FlightPeerVerifier: std::fmt::Debug + Send + Sync {
@@ -55,7 +55,10 @@ pub struct FlightConfig {
     pub maximum_message_bytes: usize,
     pub owned_native_actions: bool,
     pub hosted_controls: Option<HostedControlConfig>,
+    /// An exclusive listener for this installed audience.
     pub audience: Option<AudienceFlightConfig>,
+    /// The ordinary listener cannot mint applied holds for this installed audience.
+    pub reserved_applied_source: Option<uuid::Uuid>,
     pub maximum_concurrent_calls: usize,
     pub playground: bool,
     pub forwarded_peer: Option<Arc<dyn FlightPeerVerifier>>,
@@ -63,12 +66,13 @@ pub struct FlightConfig {
 }
 impl Default for FlightConfig {
     fn default() -> Self {
-        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, audience: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, owned_world_host: None }
+        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, owned_world_host: None }
     }
 }
 impl FlightConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.audience.is_some() && (!self.owned_native_actions || self.hosted_controls.is_none() || self.forwarded_peer.is_none()) {
+        if self.audience.is_some() && (!self.owned_native_actions || self.hosted_controls.is_none() || self.forwarded_peer.is_none()
+            || self.reserved_applied_source.is_some()) {
             return Err(Anomaly::incorrect("rtdb.flight-sql/audience", "An audience reservation requires placed hosted controls and authenticated forwarding"));
         }
         if [self.transaction_idle_timeout, self.prepared_statement_idle_timeout, self.session_idle_timeout, self.session_unclaimed_timeout, self.sweep_interval].iter().any(Duration::is_zero) || self.maximum_message_bytes == 0 || self.maximum_concurrent_calls == 0 {

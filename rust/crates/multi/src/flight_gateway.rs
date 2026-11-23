@@ -20,7 +20,7 @@ use crate::{admin, capability::CellSecret, cipher::Cipher, control, gateway::{De
 
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
-const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v2";
+const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v3";
 const HANDSHAKE: &str = "/arrow.flight.protocol.FlightService/Handshake";
 const DO_ACTION: &str = "/arrow.flight.protocol.FlightService/DoAction";
 const MAXIMUM_HEADER_BYTES: u32 = 8 * 1024;
@@ -42,12 +42,6 @@ struct SessionRoute {
     audience: Option<String>,
 }
 
-struct AudienceGateway {
-    profile: AudienceFlightConfig,
-    calls: Arc<Semaphore>,
-    transport: Client<HttpConnector, Incoming>,
-}
-
 struct Router {
     directory: Arc<dyn Directory>,
     control: control::ControlKey,
@@ -55,8 +49,8 @@ struct Router {
     routes: Cipher,
     transport: Client<HttpConnector, Incoming>,
     calls: Arc<Semaphore>,
-    deployments: Arc<DeploymentConnections>,
-    audience: Option<AudienceGateway>,
+    deployments: Option<Arc<DeploymentConnections>>,
+    audience: Option<AudienceFlightConfig>,
     timeout: Duration,
 }
 
@@ -79,6 +73,20 @@ impl Body for RoutedBody {
 type ProxyBody = Either<Empty<Bytes>, RoutedBody>;
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
+    serve_listener(listener, directory, options, None, cancellation).await
+}
+
+pub async fn serve_audience(
+    listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions,
+    audience: AudienceFlightConfig, cancellation: CancellationToken,
+) -> Result<()> {
+    serve_listener(listener, directory, options, Some(audience), cancellation).await
+}
+
+async fn serve_listener(
+    listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions,
+    audience: Option<AudienceFlightConfig>, cancellation: CancellationToken,
+) -> Result<()> {
     let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect("rtdb.multi/flight-secret", "Flight SQL routing requires the cell secret"))?;
     let address = listener.local_addr().map_err(network)?;
     let tls = options.tls.as_ref().map(|config| {
@@ -93,23 +101,19 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         return Err(Anomaly::incorrect("rtdb.multi/flight-admission", "Flight SQL gateway admission limits must be positive and supported by the runtime"));
     }
 
-    let transport = || {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(options.control_timeout));
-        connector.set_nodelay(true);
-        Client::builder(TokioExecutor::new()).http2_only(true)
-            .retry_canceled_requests(false).pool_timer(TokioTimer::new()).pool_max_idle_per_host(1)
-            .pool_idle_timeout(Duration::from_secs(30)).build(connector)
-    };
-    let audience = options.flight_audience.map(|audience| AudienceGateway {
-        profile: audience, calls: Arc::new(Semaphore::new(audience.permits())), transport: transport(),
-    });
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(options.control_timeout));
+    connector.set_nodelay(true);
+    let transport = Client::builder(TokioExecutor::new()).http2_only(true)
+        .retry_canceled_requests(false).pool_timer(TokioTimer::new()).pool_max_idle_per_host(1)
+        .pool_idle_timeout(Duration::from_secs(30)).build(connector);
+    let limit = audience.map_or(options.maximum_connections, AudienceFlightConfig::permits);
     let router = Arc::new(Router { directory, control: control::ControlKey(Some(Arc::clone(secret))),
-        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport: transport(), audience,
-        calls: Arc::new(Semaphore::new(options.maximum_connections)),
-        deployments: Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment)),
+        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, audience,
+        calls: Arc::new(Semaphore::new(limit)),
+        deployments: audience.is_none().then(|| Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment))),
         timeout: options.startup_timeout });
-    let connections = Arc::new(Semaphore::new(options.maximum_connections));
+    let connections = Arc::new(Semaphore::new(limit));
     loop {
         let (stream, remote) = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
@@ -178,7 +182,7 @@ impl Router {
         let current = current.filter(|record| record.writer_pool().is_some() && record.holder.as_ref() == Some(&holder)).ok_or_else(moved)?;
         let member = member.filter(|member| holder_is_current(&current, member)).ok_or_else(moved)?;
         let control = member.control_address.as_deref().ok_or_else(moved)?;
-        let reply = control::call(control, &control::Request::FlightEndpoint, self.timeout, &self.control).await
+        let reply = control::call(control, &control::Request::FlightEndpoint { audience: self.audience.is_some() }, self.timeout, &self.control).await
             .map_err(|_| Status::unavailable("The holder did not report a Flight SQL endpoint"))?;
         let control::Response::FlightEndpoint { address } = reply else { return Err(Status::unavailable("The holder has no Flight SQL endpoint")); };
         Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address })
@@ -216,27 +220,21 @@ impl Router {
             (Some(_), None) => routed_audience,
             _ => return Err(Status::permission_denied("The Flight audience is fixed at its handshake")),
         };
-        let reserved = match audience {
-            Some(profile) => {
-                let configured = self.audience.as_ref().filter(|audience| audience.profile == profile)
-                    .ok_or_else(|| Status::permission_denied("Flight audience reservation is not installed"))?;
-                if routed_audience.is_some() && request.uri().path() != DO_ACTION {
-                    return Err(Status::permission_denied("The Flight audience only routes observation actions"));
-                }
-                routed_audience.map(|_| configured)
-            }
-            None => None,
-        };
-        let calls = reserved.map_or(&self.calls, |audience| &audience.calls);
-        let call = Arc::clone(calls).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight SQL gateway call limit reached"))?;
+        if audience != self.audience {
+            return Err(Status::permission_denied("The Flight route belongs to another listener"));
+        }
+        if routed_audience.is_some() && request.uri().path() != DO_ACTION {
+            return Err(Status::permission_denied("The Flight audience only routes observation actions"));
+        }
+        let call = Arc::clone(&self.calls).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight SQL gateway call limit reached"))?;
         let name = match (&route, selector) {
             (None, None) => return Err(Status::invalid_argument("Flight SQL startup requires x-xtdb-database")),
             (None, Some(selector)) => database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?.0,
             (Some(route), _) => route.target.name.as_str(),
         };
-        let deployment = if reserved.is_some() { None } else {
-            Some(self.deployments.admit(name).ok_or_else(|| Status::resource_exhausted("This deployment has reached its Flight SQL call limit"))?)
-        };
+        let deployment = self.deployments.as_ref().map(|deployments| {
+            deployments.admit(name).ok_or_else(|| Status::resource_exhausted("This deployment has reached its Flight SQL call limit"))
+        }).transpose()?;
         let routing = async {
             match route {
                 Some(route) => {
@@ -277,8 +275,7 @@ impl Router {
         let path = request.uri().path_and_query().ok_or_else(|| Status::invalid_argument("Invalid Flight SQL request path"))?.clone();
         *request.uri_mut() = Uri::builder().scheme("http").authority(target.address.as_str()).path_and_query(path)
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
-        let transport = reserved.map_or(&self.transport, |audience| &audience.transport);
-        let mut response = transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL writer disconnected"))?;
+        let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL writer disconnected"))?;
         self.rewrite_response(response.headers_mut(), target, audience)?;
         Ok(response.map(|body| Either::Right(RoutedBody { body, _call: call, _deployment: deployment })))
     }

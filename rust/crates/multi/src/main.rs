@@ -23,10 +23,10 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
-       rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
+       rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -98,6 +98,13 @@ impl Arguments {
     fn present(&self, name: &str) -> bool { self.flags.contains_key(name) }
     fn address(&self, name: &str, default: &str) -> Result<SocketAddr> {
         self.optional(name).unwrap_or(default).parse().map_err(|_| usage(format!("--{name} must be HOST:PORT")))
+    }
+    fn audience_flight(&self) -> Result<Option<(SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>> {
+        if !self.present("flight-audience") && !self.present("flight-audience-listen") { return Ok(None); }
+        let address = self.required("flight-audience-listen")?.parse()
+            .map_err(|_| usage("--flight-audience-listen must be HOST:PORT".into()))?;
+        let audience = rtdb_flight_sql::AudienceFlightConfig::parse(self.required("flight-audience")?)?;
+        Ok(Some((address, audience)))
     }
     fn number<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.optional(name).map(|value| value.parse().map_err(|_| usage(format!("--{name} must be a number")))).transpose().map(|value| value.unwrap_or(default))
@@ -381,10 +388,9 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 Some(path) => NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?,
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
-            if arguments.present("flight-audience") {
-                let audience = rtdb_flight_sql::AudienceFlightConfig::parse(arguments.required("flight-audience")?)?;
+            if let Some(audience) = arguments.audience_flight()? {
                 configuration.flight_sql.as_mut().filter(|flight| flight.port >= 0)
-                    .ok_or_else(|| usage("--flight-audience requires a Flight SQL listener".into()))?.audience = Some(audience);
+                    .ok_or_else(|| usage("--flight-audience requires a Flight SQL configuration".into()))?.audience = Some(audience);
             }
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
@@ -445,12 +451,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None
             };
             let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), ..Default::default() };
-            if arguments.present("flight-audience") {
-                if !arguments.present("flight-listen") {
-                    return Err(usage("--flight-audience requires --flight-listen".into()));
-                }
-                options.flight_audience = Some(rtdb_flight_sql::AudienceFlightConfig::parse(arguments.required("flight-audience")?)?);
-            }
             options.maximum_connections = arguments.number("max-connections", options.maximum_connections)?;
             options.maximum_connections_per_deployment = arguments.number("max-connections-per-deployment", options.maximum_connections_per_deployment)?;
             options.maximum_buffered_bytes = arguments.number("max-buffered-bytes", options.maximum_buffered_bytes)?;
@@ -473,6 +473,17 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     None => std::future::pending().await,
                 }
             };
+            let audience = if let Some((address, audience)) = arguments.audience_flight()? {
+                let listener = tokio::net::TcpListener::bind(address).await.map_err(io)?;
+                eprintln!("Audience Flight gateway listening on {}", listener.local_addr().map_err(io)?);
+                Some((listener, audience))
+            } else { None };
+            let audience_flight = async {
+                match audience {
+                    Some((listener, audience)) => rtdb_multi::flight_gateway::serve_audience(listener, Arc::clone(&directory), options.clone(), audience, cancellation.clone()).await,
+                    None => std::future::pending().await,
+                }
+            };
             if arguments.present("install-listen") {
                 let tls = tls.ok_or_else(|| usage("The installation listener requires a TLS configuration".into()))?;
                 let installer = rtdb_multi::install::Installer::from_file(
@@ -485,12 +496,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 tokio::select! {
                     gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
                     flight = flight => flight,
+                    audience_flight = audience_flight => audience_flight,
                     installation = rtdb_multi::install::serve(installs, tls, directory.clone(), Arc::new(installer), cancellation.clone()) => installation,
                 }
             } else {
                 tokio::select! {
                     gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
                     flight = flight => flight,
+                    audience_flight = audience_flight => audience_flight,
                 }
             }
         }

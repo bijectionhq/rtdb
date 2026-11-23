@@ -53,7 +53,6 @@ pub struct GatewayOptions {
     pub touch_interval: Duration,
     /// The cell's secret, with which the gateway mints a capability for each reconnection of an authenticated session.
     pub capabilities: Option<Arc<crate::capability::CellSecret>>,
-    pub flight_audience: Option<rtdb_flight_sql::AudienceFlightConfig>,
 }
 
 impl Default for GatewayOptions {
@@ -62,7 +61,7 @@ impl Default for GatewayOptions {
             cells: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
             control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10),
             maximum_connections: 4096, maximum_connections_per_deployment: 256,
-            maximum_buffered_bytes: crate::session::DEFAULT_GATEWAY_FRAME_BYTES, capabilities: None, flight_audience: None,
+            maximum_buffered_bytes: crate::session::DEFAULT_GATEWAY_FRAME_BYTES, capabilities: None,
         }
     }
 }

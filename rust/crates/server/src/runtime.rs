@@ -49,7 +49,7 @@ pub struct PlacedOptions {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub health: Option<SocketAddr> }
+pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub audience_flight: Option<SocketAddr>, pub health: Option<SocketAddr> }
 
 #[derive(Clone)]
 pub struct ServerHandle {
@@ -73,7 +73,7 @@ pub struct ServerDriver {
     handle: ServerHandle,
     node: NodeDriver,
     pgwire: Vec<(rtdb_pgwire::ServerHandle, rtdb_pgwire::ServerDriver)>,
-    flight: Option<(rtdb_flight_sql::ServerHandle, rtdb_flight_sql::ServerDriver)>,
+    flight: Vec<(rtdb_flight_sql::ServerHandle, rtdb_flight_sql::ServerDriver)>,
     health: Option<(HealthHandle, HealthDriver)>,
     registrations: Vec<rtdb_metrics::MetricRegistration>,
     tracing: Option<(crate::tracing::TraceExportHandle, crate::tracing::TraceExporter)>,
@@ -189,18 +189,30 @@ impl ServerDriver {
                 pgwire.push((handle, driver));
             }
         }
-        let flight = match &config.flight_sql {
-            Some(settings) if settings.port >= 0 => {
-                let configuration = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
-                    transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
-                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
-                    forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions, hosted_controls: settings.hosted_controls.clone(), audience: settings.audience, ..Default::default() };
-                let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
-                addresses.flight_sql = Some(handle.address());
-                Some((handle, driver))
+        let mut flight = Vec::new();
+        if let Some(settings) = &config.flight_sql
+            && settings.port >= 0
+        {
+            let ordinary = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
+                transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
+                session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
+                forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions,
+                hosted_controls: settings.hosted_controls.clone(),
+                reserved_applied_source: settings.audience.map(|(_, audience)| audience.source()),
+                ..Default::default() };
+            if let Some((address, audience)) = settings.audience {
+                let reserved = rtdb_flight_sql::FlightConfig {
+                    address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None,
+                    ..ordinary.clone()
+                };
+                let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(reserved, node.clone(), auth.clone()).await?;
+                addresses.audience_flight = Some(handle.address());
+                flight.push((handle, driver));
             }
-            _ => None,
-        };
+            let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(ordinary, node.clone(), auth.clone()).await?;
+            addresses.flight_sql = Some(handle.address());
+            flight.push((handle, driver));
+        }
         let health = match &config.health {
             Some(settings) if settings.port >= 0 => {
                 let configuration = HealthConfig { address: address(&settings.host, settings.port).await?, ..Default::default() };
@@ -241,7 +253,8 @@ impl ServerDriver {
         let mut listeners = JoinSet::new();
         let mut pgwire = Vec::new();
         for (handle, driver) in self.pgwire { pgwire.push(handle); listeners.spawn(driver.run()); }
-        let flight = self.flight.map(|(handle, driver)| { listeners.spawn(driver.run()); handle });
+        let mut flight = Vec::new();
+        for (handle, driver) in self.flight { flight.push(handle); listeners.spawn(driver.run()); }
         let health = self.health.map(|(handle, driver)| { listeners.spawn(driver.run()); handle });
         enum Exit { Requested, Node(std::result::Result<Result<()>, JoinError>), Listener(Option<std::result::Result<Result<()>, JoinError>>) }
         let exit = tokio::select! {
@@ -257,7 +270,7 @@ impl ServerDriver {
             Exit::Listener(result) => result.and_then(|result| joined(result).err()).or_else(|| Some(unexpected("listener"))),
         };
         for listener in pgwire { listener.shutdown(); }
-        if let Some(listener) = flight { listener.shutdown(); }
+        for listener in flight { listener.shutdown(); }
         if let Some(listener) = health { listener.shutdown(); }
         while let Some(result) = listeners.join_next().await { remember(&mut failure, joined(result)); }
         self.handle.node.shutdown();
