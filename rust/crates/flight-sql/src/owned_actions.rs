@@ -33,6 +33,7 @@ use crate::{
     upload, wire,
 };
 
+pub(crate) const DECIDE_HOSTED_V1: &str = "rtdb.owned.DecideHosted.v1";
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
@@ -66,13 +67,7 @@ pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchP
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
-pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
-pub(crate) const COMMIT_HOSTED_DECIDING_V2: &str = "rtdb.owned.CommitHostedDeciding.v2";
 pub(crate) const OFFER_CLOCK_SLOT_V1: &str = "rtdb.owned.OfferClockSlot.v1";
-pub(crate) const COMMIT_HOSTED_AT_SLOT_V1: &str = "rtdb.owned.CommitHostedAtSlot.v1";
-pub(crate) const COMMIT_HOSTED_STAGED_V6: &str = "rtdb.owned.CommitHostedStaged.v6";
-pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
-pub(crate) const COMMIT_HOSTED_WORLD_READS_V3: &str = "rtdb.owned.CommitHostedWorldReads.v3";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
@@ -260,9 +255,8 @@ pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V3: &str = "rtdb.owned.PublishHeldWorldRetention.v3";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
-pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
-pub(crate) const COMMIT_HELD_WORLDS_AT_SLOT_V1: &str = "rtdb.owned.CommitHeldWorldsAtSlot.v1";
-pub(crate) const COMMIT_HELD_WORLDS_V6: &str = "rtdb.owned.CommitHeldWorlds.v6";
+pub(crate) const DECIDE_WORLD_CUT_V1: &str = "rtdb.owned.DecideWorldCut.v1";
+pub(crate) const DECIDE_HELD_WORLDS_V1: &str = "rtdb.owned.DecideHeldWorlds.v1";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -950,24 +944,6 @@ impl Service {
         Ok((witnesses, body, framing))
     }
 
-    pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &Bytes, counted: bool) -> Result<ActionResult, Status> {
-        self.commit_hosted_with_reads(call, body, body, counted, Vec::new(), None, false, None).await
-    }
-
-    pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
-        let body = envelope.as_ref();
-        if self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
-        self.hosted_control_policy(call)?;
-        let ([kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing hosted root commit kind"))?;
-        let counted = match kind {
-            0 => false,
-            1 => true,
-            _ => return Err(invalid("Invalid hosted root commit kind")),
-        };
-        let (worlds, body) = self.hosted_world_read_prefix(call, body)?;
-        self.commit_hosted_with_reads(call, envelope, body, counted, worlds, None, false, None).await
-    }
-
     fn hosted_world_read_prefix<'a>(
         &self, call: &Call, body: &'a [u8],
     ) -> Result<(Vec<HostedWorldRead>, &'a [u8]), Status> {
@@ -1048,31 +1024,24 @@ impl Service {
         Ok((original.snapshot.present(), body))
     }
 
-    pub(crate) async fn commit_hosted_flagged_action(
-        &self, call: &Call, envelope: &Bytes, recheck_at_staging: bool, at_slot: bool,
+    pub(crate) async fn decide_hosted_action(
+        &self, call: &Call, envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
-        let (slot, recheck_at_staging, body) = if at_slot {
-            let (slot, body) = self.owned_clock_slot(call, envelope).await?;
-            let ([mode], body) = body.split_first_chunk::<1>()
-                .ok_or_else(|| invalid("Missing clock slot commit mode"))?;
-            let recheck = match mode {
-                0 => false,
-                1 => true,
-                _ => return Err(invalid("Invalid clock slot commit mode")),
-            };
-            (Some(slot), recheck, body)
-        } else {
-            (None, recheck_at_staging, envelope.as_ref())
-        };
         self.hosted_control_policy(call)?;
-        let ([flags], body) = body.split_first_chunk::<1>()
-            .ok_or_else(|| invalid("Missing hosted commit flags"))?;
-        let allowed = if recheck_at_staging || at_slot { 0b111 } else { 0b11 };
-        if *flags & !allowed != 0 {
-            return Err(invalid("Invalid hosted commit flags"));
+        let ([flags], body) = envelope.split_first_chunk::<1>()
+            .ok_or_else(|| invalid("Missing hosted decision flags"))?;
+        if *flags & !0b1_1111 != 0 {
+            return Err(invalid("Invalid hosted decision flags"));
         }
         let counted = *flags & 1 != 0;
-        let (refusal, primary) = if (!recheck_at_staging && !at_slot) || *flags & 0b100 != 0 {
+        let recheck_at_staging = *flags & 8 != 0;
+        let (slot, body) = if *flags & 16 != 0 {
+            let (slot, body) = self.owned_clock_slot(call, body).await?;
+            (Some(slot), body)
+        } else {
+            (None, body)
+        };
+        let (refusal, primary) = if *flags & 4 != 0 {
             let (length, body) = body.split_first_chunk::<4>()
                 .ok_or_else(|| invalid("Missing hosted refusal length"))?;
             let (refusal, primary) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
@@ -1167,9 +1136,7 @@ impl Service {
                 .ok_or_else(|| invalid("Truncated refusal fact stream"))?;
             let facts = owned_groups(facts, false, true)?;
             let controls = owned_groups(controls, true, false)?;
-            let continuation = !recheck_at_staging && controls.len() == 1
-                && controls[0].0.name() == "bj_fact_root_admission";
-            if facts.len() != 2 || (!continuation && controls.len() != 3) {
+            if facts.len() != 2 || controls.is_empty() {
                 return Err(invalid("A hosted refusal requires its original receipt groups"));
             }
             hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
@@ -3842,6 +3809,8 @@ impl Service {
         let mut root_witness_charge = None;
         let mut root_framing = None;
         let mut root_groups = 0;
+        let mut count_charges = Vec::new();
+        let mut refusal_charges = Vec::new();
         let groups = if publish_root {
             if (previous.is_some() && !authored_replacement)
                 || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication || proposal_hold || held_publication)
@@ -3849,11 +3818,37 @@ impl Service {
             {
                 return Err(invalid("A co-ordered fork requires an admitted Root hold and clock mode"));
             }
+            let ([flags], groups) = groups.split_first_chunk::<1>()
+                .ok_or_else(|| invalid("Missing Root cut decision flags"))?;
+            if *flags & !3 != 0 {
+                return Err(invalid("Invalid Root cut decision flags"));
+            }
+            let groups = if *flags & 1 != 0 {
+                let (counts, groups, charges) = owned_count_conditions(call, groups)?;
+                rows_left = rows_left.checked_sub(counts.len())
+                    .ok_or_else(|| invalid("Fork exceeds its effect limit"))?;
+                root.checks.extend(counts);
+                count_charges = charges;
+                groups
+            } else { groups };
             let (witnesses, groups, charge) = self.owned_witness_prefix(call, groups, true)?;
             root_witness_charge = Some(charge);
             let (size, body) = groups.split_first_chunk::<4>().ok_or_else(|| invalid("Missing Root section length"))?;
-            let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*size) as usize)
+            let (facts, tail) = body.split_at_checked(u32::from_be_bytes(*size) as usize)
                 .ok_or_else(|| invalid("Incomplete Root groups"))?;
+            let controls = if *flags & 2 != 0 {
+                let (length, body) = tail.split_first_chunk::<4>()
+                    .ok_or_else(|| invalid("Missing Root cut refusal length"))?;
+                let (refusal, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+                    .ok_or_else(|| invalid("Incomplete Root cut refusal"))?;
+                let refusal = owned_groups(refusal, true, false)?;
+                hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;
+                let (refusal, charges) = self.decode_hosted_control_groups(call, refusal, scope, &mut rows_left, false)?;
+                if refusal.is_empty() { return Err(invalid("Missing Root cut refusal receipt")); }
+                root.refusal = refusal;
+                refusal_charges = charges;
+                controls
+            } else { tail };
             root_groups = ordered_group_count(facts)?;
             root_framing = Some(call.reserve(root_groups * 512)?);
             let mut operations = Vec::new();
@@ -3899,7 +3894,7 @@ impl Service {
         } else {
             groups
         };
-        let _root_reservations = (root_batches, root_witness_charge, root_framing);
+        let _root_reservations = (root_batches, root_witness_charge, root_framing, count_charges, refusal_charges);
         let groups = owned_groups(groups, true, false)?;
         if root_groups + groups.len() > MAX_COMMIT_GROUPS {
             return Err(invalid("Fork exceeds its grouped effect limit"));
@@ -3956,16 +3951,18 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn commit_world_batch_action(&self, call: &Call, envelope: &Bytes, at_slot: bool) -> Result<ActionResult, Status> {
-        let (slot, body) = if at_slot {
-            let (slot, body) = self.owned_clock_slot(call, envelope).await?;
-            (Some(slot), body)
-        } else {
-            (None, envelope.as_ref())
-        };
+    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
+        let ([flags], body) = envelope.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world decision flags"))?;
+        if *flags & !7 != 0 { return Err(invalid("Invalid world decision flags")); }
+        let (slot, body) = if *flags & 1 != 0 {
+            let (slot, body) = self.owned_clock_slot(call, body).await?;
+            (Some(slot), body)
+        } else {
+            (None, body)
+        };
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world batch deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
         let (fingerprint, body) = body.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world batch fingerprint"))?;
@@ -4085,6 +4082,11 @@ impl Service {
         let observed_ops = observations.iter()
             .map(|read| read.witnesses.len() * 2 + usize::from(read.clock.is_some())).sum::<usize>();
         rows_left = rows_left.checked_sub(observed_ops).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
+        let (counts, body, _counts) = if *flags & 2 != 0 {
+            owned_count_conditions(call, body)?
+        } else { (Vec::new(), body, Vec::new()) };
+        rows_left = rows_left.checked_sub(counts.len())
+            .ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
         if !observations.is_empty() && *root_kind >= 3 {
             return Err(invalid("Independent observers require an ordinary world batch"));
@@ -4129,7 +4131,7 @@ impl Service {
         let _root_groups = self.decode_owned_commit_groups(
             call, envelope, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, CommitEffects::Facts,
         )?;
-        let mut root = rtdb_node::OwnedRootSection::default();
+        let mut root = rtdb_node::OwnedRootSection { checks: counts, ..Default::default() };
         let mut root_writes = Vec::new();
         for operation in root_ops {
             match &operation {
@@ -4172,13 +4174,13 @@ impl Service {
             return Err(invalid("The Root section kind disagrees with its observations"));
         }
         rows_left = rows_left.checked_sub(root_witnesses.len()).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
-        let (refusal, body) = if proposal_land {
+        let (refusal, body) = if *flags & 4 != 0 {
             let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Missing landing refusal length"))?;
             let (refusal, body) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
                 .ok_or_else(|| invalid("Incomplete landing refusal"))?;
             let refusal = owned_groups(refusal, true, false)?;
-            if refusal.len() != 1 || refusal[0].0.name() != "bj_fact_root_admission" {
-                return Err(invalid("A landing refusal requires its original receipt and proof"));
+            if refusal.is_empty() || !(proposal_overlay || delete_root || proposal_land || proposal_close) {
+                return Err(invalid("The world decision has no matching refusal alternative"));
             }
             (refusal, body)
         } else {
@@ -4188,13 +4190,13 @@ impl Service {
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
         let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
-        let _refusal_charge = if proposal_land {
+        let _refusal_charge = if !refusal.is_empty() {
             hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;
             let (refusal, charge) = self.decode_hosted_control_groups(call, refusal, scope, &mut rows_left, false)?;
-            if refusal.len() != 2 {
+            if proposal_land && refusal.len() != 2 {
                 return Err(invalid("A landing refusal requires its original receipt and proof"));
             }
-            root.proposal_refusal = refusal;
+            root.refusal = refusal;
             Some(charge)
         } else {
             None

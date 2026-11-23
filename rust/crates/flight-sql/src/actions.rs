@@ -45,6 +45,7 @@ impl Service {
                 }
             }
             match action_type {
+                crate::owned_actions::DECIDE_HOSTED_V1 => Ok(vec![Ok(self.decide_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
@@ -57,16 +58,10 @@ impl Service {
                 crate::owned_actions::OWNED_SPATIAL_READINESS_V1 => Ok(vec![Ok(self.spatial_path_readiness_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::Ordered).await?)]),
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_COUNTED_V2 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V3 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_DECIDING_V2 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false, false).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_STAGED_V6 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true, false).await?)]),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V1 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_AT_SLOT_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false, true).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V3 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped, false).await?)]),
@@ -174,13 +169,12 @@ impl Service {
                     Ok(Vec::new())
                 }
                 crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V3 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
-                crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::PUBLISH_WORLD_CUT_V2 => {
+                crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::DECIDE_WORLD_CUT_V1 => {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
-                        action.r#type == crate::owned_actions::PUBLISH_WORLD_CUT_V2).await?)])
+                        action.r#type == crate::owned_actions::DECIDE_WORLD_CUT_V1).await?)])
                 }
-                crate::owned_actions::COMMIT_HELD_WORLDS_V6 | crate::owned_actions::COMMIT_HELD_WORLDS_AT_SLOT_V1 => {
-                    let at_slot = action.r#type == crate::owned_actions::COMMIT_HELD_WORLDS_AT_SLOT_V1;
-                    Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body, at_slot).await?)])
+                crate::owned_actions::DECIDE_HELD_WORLDS_V1 => {
+                    Ok(vec![Ok(self.decide_held_worlds_action(&call, &action.body).await?)])
                 }
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {

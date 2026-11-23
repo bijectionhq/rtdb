@@ -1497,7 +1497,8 @@ impl<'a> OpenTransaction<'a> {
             || (!publications.is_empty() && !observing_worlds.is_empty());
         let hosted_world_reads = crate::hosted_control::hosted_root_world_reads(operations);
         let root_conditions = !publications.is_empty() && operations.iter().any(|operation| match operation {
-            Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }) =>
+            Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
+                | TxOp::OwnedCheckCapacity { relation, .. }) =>
                 relation.world().is_none() && !relation.is_world_catalog(),
             _ => false,
         });
@@ -1649,7 +1650,8 @@ impl<'a> OpenTransaction<'a> {
                         control_writes += 1;
                         existing_control_write |= control.expected().is_some();
                     }
-                    Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
+                    Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
+                        | TxOp::OwnedCheckCapacity { relation, .. })
                         if with_root && relation.is_root_data() => {}
                     Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None })
                     | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: false, .. }

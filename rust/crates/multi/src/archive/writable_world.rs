@@ -949,7 +949,14 @@ pub(crate) async fn fork_checkpoint_world_selected(
     if let Some(previous) = previous
         && let Some(prior) = installed.checkpoint_worlds.get(&previous)
     {
-        let _ = retire_world_pins(directory.as_ref(), &deployment, &[(previous, prior)], installed.incarnation, installed.log_epoch).await;
+        // An ordered refusal keeps the predecessor live. If the new pin
+        // cannot be confirmed here, let directory custody expire naturally.
+        if let Ok(held) = session.open_owned_read().await
+            && let Ok(Some((current, _))) = held.world_registration(registration.id).await
+            && current.pin == registration.pin && !current.dropped
+        {
+            let _ = retire_world_pins(directory.as_ref(), &deployment, &[(previous, prior)], installed.incarnation, installed.log_epoch).await;
+        }
     }
     Ok((id, outcome.tx_key()))
 }
@@ -1090,7 +1097,7 @@ pub(crate) async fn commit_checkpoint_world_batch(
         }
         admitted.push((retained.until, section));
     }
-    let deciding_landing = !root.proposal_refusal.is_empty();
+    let deciding_landing = !root.refusal.is_empty();
     let outcome = session.commit_owned_world_batch(admitted, root, observed, fingerprint, controls, deadline).await?;
     if !outcome.committed() {
         return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));

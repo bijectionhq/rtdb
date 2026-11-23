@@ -613,7 +613,8 @@ pub(crate) fn retained_release_world(operations: &[crate::source::Operation]) ->
         match op {
             Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (),
-            Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
+            Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
+                | TxOp::OwnedCheckCapacity { relation, .. })
                 if relation.is_root_data() => { root_checks += 1; }
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })
                 if relation.is_root_data() && delete.is_none() => delete = Some((relation, id)),
@@ -1374,7 +1375,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
         match operation {
             Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }
-                | TxOp::OwnedCheckRange { .. }) => (),
+                | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. }) => (),
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation, local_frontier, .. }) => {
                 if local_frontier.is_some() { timelines.insert(relation); }
             }
@@ -1679,7 +1680,7 @@ pub(crate) fn hosted_proposal_land(
         match op {
             Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }
-                | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckWorldPurge { .. }) => (),
+                | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheckWorldPurge { .. }) => (),
             Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
             | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. }
                 if relation.is_root_data() && !close && !documents.rows().is_empty() =>

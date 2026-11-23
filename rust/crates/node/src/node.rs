@@ -2851,7 +2851,7 @@ pub struct OwnedRootSection {
     pub clock_slot: Option<TransactionKey>,
     pub proposal_overlay: bool,
     pub proposal_land: bool,
-    pub proposal_refusal: Vec<rtdb_tx::HostedControlWrite>,
+    pub refusal: Vec<rtdb_tx::HostedControlWrite>,
     pub proposal_close: bool,
     pub checks: Vec<TxOp>,
     pub publication: Option<OwnedRootPublication>,
@@ -2989,7 +2989,8 @@ impl NativeSession {
             || (root != OwnedForkRoot::None && !fork.cut.is_renewal() && !held_publication
                 && record.parent_publication == Some(record.basis.system_time));
         let effects = fork.controls.len()
-            .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
+            .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()
+                .saturating_add(if section.refusal.is_empty() { 0 } else { section.refusal.len() + 3 })))
             .saturating_add(fork.root.as_ref().and_then(|section| section.publication.as_ref()).map_or(0, |root| root.writes.len() + 1))
             .saturating_add(3 + usize::from(requires_tip));
         let overlay_source = fork.cut.overlay();
@@ -3023,7 +3024,8 @@ impl NativeSession {
                 || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication && !proposal_hold && !held_publication)
                 || (fork.cut.live.is_none() && !fork.cut.is_publication())))
             || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {
-                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
+                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
+                | TxOp::OwnedCheckCapacity { relation, .. } =>
                     !relation.is_root_data(),
                 _ => true,
             })
@@ -3042,10 +3044,13 @@ impl NativeSession {
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
         ops.push(TxOp::owned_deadline(until));
-        if let Some(section) = fork.root {
+        let refusal = if let Some(section) = fork.root {
             ops.extend(section.checks);
             ops.extend(section.publication.into_iter().flat_map(|root| root.writes));
-        }
+            section.refusal
+        } else {
+            Vec::new()
+        };
         ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
         if requires_tip {
             ops.push(TxOp::OwnedCheck {
@@ -3055,10 +3060,39 @@ impl NativeSession {
                 expected: record.parent_publication,
             });
         }
+        let marker = (!refusal.is_empty())
+            .then(|| self.decision_attempt_marker(&fork.attempt, fork.fingerprint)).transpose()?;
         ops.push(TxOp::OwnedForkWorld { record: record.record(), previous: fork.previous, sibling: fork.sibling,
             overlay_source: parent_source.or_else(|| overlay_source.map(|(world, pin, _)| (world, pin))),
             attempt: fork.attempt, fingerprint: fork.fingerprint, root });
+        if let Some(marker) = marker {
+            ops.push(TxOp::HostedConstraintRefusal);
+            ops.push(marker);
+            ops.push(self.decision_receipt_head()?);
+            ops.extend(refusal.into_iter().map(TxOp::HostedControl));
+        }
         self.state.execute_tx(ops, Default::default()).await
+    }
+
+    fn decision_attempt_marker(&self, attempt: &str, fingerprint: [u8; 32]) -> Result<TxOp> {
+        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ATTEMPT_RELATION)?;
+        let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([
+            ("_id".into(), rtdb_types::Value::Utf8(attempt.to_owned())),
+            ("fingerprint".into(), rtdb_types::Value::Binary(fingerprint.to_vec())),
+        ])], self.service.node.memory())?;
+        Ok(TxOp::OwnedInsertDocs {
+            relation, documents, valid_from: Some(Timestamp::MIN), valid_to: Some(Timestamp::MAX),
+        })
+    }
+
+    fn decision_receipt_head(&self) -> Result<TxOp> {
+        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+        let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([
+            ("_id".into(), rtdb_types::Value::Utf8("sync_receipt_head".to_owned())),
+        ])], self.service.node.memory())?;
+        Ok(TxOp::OwnedReplaceDocs {
+            relation, documents, valid_from: Some(Timestamp::MIN), valid_to: Some(Timestamp::MAX),
+        })
     }
 
     pub async fn commit_owned_world_batch(
@@ -3081,19 +3115,14 @@ impl NativeSession {
         let proposal_overlay = root.proposal_overlay;
         let proposal_close = root.proposal_close;
         let proposal_land = root.proposal_land || proposal_close;
-        if root.proposal_refusal.len() != if root.proposal_land { 2 } else { 0 } {
+        if (root.proposal_land && root.refusal.len() != 2)
+            || (!root.refusal.is_empty() && !(proposal_land || proposal_overlay || delete_root))
+        {
             return Err(unavailable());
         }
-        let refusal = if root.proposal_land {
+        let refusal = if !root.refusal.is_empty() {
             let attempt = &sections.first().ok_or_else(unavailable)?.1.attempt;
-            let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ATTEMPT_RELATION)?;
-            let marker = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([
-                ("_id".into(), rtdb_types::Value::Utf8(attempt.clone())),
-                ("fingerprint".into(), rtdb_types::Value::Binary(fingerprint.to_vec())),
-            ])], self.service.node.memory())?;
-            Some(TxOp::OwnedInsertDocs {
-                relation, documents: marker, valid_from: Some(Timestamp::MIN), valid_to: Some(Timestamp::MAX),
-            })
+            Some(self.decision_attempt_marker(attempt, fingerprint)?)
         } else {
             None
         };
@@ -3138,7 +3167,8 @@ impl NativeSession {
         if !(1..=8).contains(&sections.len()) || controls.is_empty()
             || (!retained_release && !proposal_overlay && !proposal_land && controls.iter().any(|control| !control.is_check()))
             || root.checks.iter().any(|check| match check {
-                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
+                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
+                | TxOp::OwnedCheckCapacity { relation, .. } =>
                     relation.world().is_some() || relation.is_world_catalog(),
                 _ => true,
             })
@@ -3211,7 +3241,7 @@ impl NativeSession {
         effects = effects.saturating_add(observed.checks.len().saturating_mul(2))
             .saturating_add(observed.clocks.len());
         if refusal.is_some() {
-            effects = effects.saturating_add(root.proposal_refusal.len() + 2);
+            effects = effects.saturating_add(root.refusal.len() + 3);
         }
         if effects > 4096 || now >= until { return Err(unavailable()); }
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
@@ -3254,7 +3284,10 @@ impl NativeSession {
         if let Some(marker) = refusal {
             ops.push(TxOp::HostedConstraintRefusal);
             ops.push(marker);
-            ops.extend(root.proposal_refusal.into_iter().map(TxOp::HostedControl));
+            if !root.proposal_land {
+                ops.push(self.decision_receipt_head()?);
+            }
+            ops.extend(root.refusal.into_iter().map(TxOp::HostedControl));
         }
         self.state.execute_tx(ops, Default::default()).await
     }

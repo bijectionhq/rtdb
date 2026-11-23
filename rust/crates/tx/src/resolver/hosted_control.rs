@@ -37,6 +37,7 @@ impl OpenTransaction<'_> {
                     TxOp::OwnedDeadline { .. }
                         | TxOp::OwnedCheck { .. }
                         | TxOp::OwnedForkWorld { .. }
+                        | TxOp::OwnedCheckWorldScope { clock: None, .. }
                         | TxOp::OwnedCheckRange { .. }
                         | TxOp::OwnedCheckCapacity { .. }
                         | TxOp::OwnedDeclareCapacity { .. }
@@ -96,7 +97,8 @@ impl OpenTransaction<'_> {
                 if validating_world {
                     if !matches!(operation, Operation::Public(
                         TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckWorldScope { .. }
-                            | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::HostedControl(_)
+                            | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. }
+                            | TxOp::OwnedCheckCapacity { .. } | TxOp::HostedControl(_)
                     )) && !(publishing_world && matches!(operation,
                         Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }
                             | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedArrowDocs { .. } | TxOp::OwnedDelete { .. })

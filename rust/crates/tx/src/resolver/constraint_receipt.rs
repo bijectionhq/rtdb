@@ -43,22 +43,34 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         validate_continuation_choice(primary, refusal, placed)?;
         return Ok((primary, refusal));
     }
-    let impact_count = refusal.iter().filter_map(hosted).filter(|control| decision_impact(control)).count();
-    let receipts = refusal.len() - impact_count;
-    if !placed
-        || !matches!(receipts, 6 | 7)
-        || (impact_count != 0 && receipts != 7)
-        || !(primary.iter().all(primary_op)
-            || crate::hosted_control::hosted_root_world_reads(primary))
+    validate_registered_choice(primary, refusal, placed)?;
+    Ok((primary, refusal))
+}
+
+fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], placed: bool) -> Result<()> {
+    use crate::hosted_control::{ProposalLandingEffect, hosted_proposal_land, hosted_proposal_overlay, retained_release_world};
+
+    let world = hosted_proposal_overlay(primary).is_some()
+        || retained_release_world(primary).is_some()
+        || hosted_proposal_land(primary).is_some_and(|landing| landing.effect == ProposalLandingEffect::Close);
+    let embedded = primary.iter().find_map(|op| match op {
+        Operation::Public(TxOp::OwnedForkWorld { attempt, fingerprint, .. }) => Some((attempt, fingerprint)),
+        Operation::Public(TxOp::OwnedPublishWorld { attempt, fingerprint, .. }) if world => Some((attempt, fingerprint)),
+        _ => None,
+    });
+    if !placed || !(world || primary.iter().all(primary_op)
+        || crate::hosted_control::hosted_root_world_reads(primary))
     {
         return Err(invalid());
     }
-
-    let control_writes = primary
-        .iter()
-        .filter_map(hosted)
-        .filter(|control| !control.is_check())
-        .count();
+    let offered_controls = primary.iter().filter_map(hosted)
+        .filter(|control| !control.is_check()).collect::<Vec<_>>();
+    let attempts = primary.iter().filter(|op| write_relation(op)
+        .is_some_and(|relation| relation.name() == ATTEMPTS)).collect::<Vec<_>>();
+    if (attempts.is_empty() && embedded.is_none()) || (!attempts.is_empty() && embedded.is_some()) {
+        return Err(invalid());
+    }
+    let mut copied_attempts = std::collections::BTreeSet::new();
     let written_relations = primary
         .iter()
         .filter_map(write_relation)
@@ -69,7 +81,7 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         .any(|relation| !matches!(*relation, ATTEMPTS | PUBLICATIONS))
     {
         ROOT_HEAD
-    } else if primary
+    } else if embedded.is_some() || primary
         .iter()
         .any(|op| matches!(op, Operation::Public(TxOp::OwnedCheckCapacity { .. })))
     {
@@ -77,43 +89,24 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
     } else {
         return Err(invalid());
     };
-    let marker_writes = primary
-        .iter()
-        .filter(|op| match op {
-            Operation::Public(TxOp::OwnedReplaceDocs {
-                relation,
-                documents,
-                ..
-            }) if relation.name() == PUBLICATIONS
-                && marker_id(documents.rows())
-                    .and_then(|id| id.strip_prefix("fact_partition_head:"))
-                    .is_some_and(|relation| {
-                        relation.starts_with("fact_")
-                            && written_relations.contains(relation)
-                            && !matches!(relation, ATTEMPTS | PUBLICATIONS)
-                    }) =>
-            {
-                false
+    let mut expected_types = 1 | 2 | 32;
+    for control in &offered_controls {
+        if let EntityId::String(id) = control.id() {
+            if control.name() == ADMISSION {
+                if id.starts_with("sync_dispatch:") { expected_types |= 4; }
+                if id == "sync_public_pending" { expected_types |= 8; }
+                if id.starts_with(DECISION_PREFIX) { expected_types |= 64; }
             }
-            _ => write_relation(op)
-                .is_some_and(|relation| matches!(relation.name(), ATTEMPTS | PUBLICATIONS)),
-        })
-        .count();
-    // Each alternative replacement is matched below. Counting both sets also
-    // rules out silently dropping an unrelated control or attempt on refusal.
-    let records_decision = receipts == 7;
-    if control_writes != 4 + usize::from(records_decision) + impact_count || marker_writes != 2 {
-        return Err(invalid());
+        }
     }
-
+    let impact_count = offered_controls.iter().filter(|control| decision_impact(control)).count();
     let mut types = 0;
     let mut impact_ids = std::collections::BTreeSet::new();
     for alternative in refusal {
         let bit = match alternative {
             Operation::Public(TxOp::HostedControl(control)) => {
-                let original = primary
-                    .iter()
-                    .filter_map(hosted)
+                let original = offered_controls
+                    .iter().copied()
                     .find(|original| {
                         original.name() == control.name() && original.id() == control.id()
                     })
@@ -136,16 +129,20 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
                 documents,
                 valid_from,
                 valid_to,
-            }) if relation.name() == ATTEMPTS && documents.rows().len() == 1 => {
-                if !primary.iter().any(|op| {
-                    matches!(op, Operation::Public(TxOp::OwnedInsertDocs {
-                    relation: old, documents: old_rows, valid_from: start, valid_to: end,
-                }) if old == relation && old_rows.rows() == documents.rows()
-                    && start == valid_from && end == valid_to)
-                }) {
-                    return Err(invalid());
-                }
-                16
+            }) if relation.name() == ATTEMPTS => {
+                let index = if let Some((attempt, fingerprint)) = embedded {
+                    if !attempt_marker(documents, *valid_from, *valid_to, attempt, fingerprint) {
+                        return Err(invalid());
+                    }
+                    0
+                } else {
+                    attempts.iter().position(|op| matches!(op, Operation::Public(TxOp::OwnedInsertDocs {
+                        relation: old, documents: old_rows, valid_from: start, valid_to: end,
+                    }) if old == relation && old_rows.rows() == documents.rows()
+                        && start == valid_from && end == valid_to)).ok_or_else(invalid)?
+                };
+                if !copied_attempts.insert(index) { return Err(invalid()); }
+                continue;
             }
             Operation::Public(TxOp::OwnedReplaceDocs {
                 relation,
@@ -153,9 +150,11 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
                 valid_from,
                 valid_to,
             }) if relation.name() == PUBLICATIONS && marker(documents.rows(), RECEIPT_HEAD) => {
-                if !primary.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedReplaceDocs {
-                    relation: old, documents: old_rows, valid_from: start, valid_to: end,
-                }) if old == relation && marker(old_rows.rows(), primary_head) && start == valid_from && end == valid_to))
+                if !(embedded.is_some() && *valid_from == Some(rtdb_types::Timestamp::MIN)
+                    && *valid_to == Some(rtdb_types::Timestamp::MAX))
+                    && !primary.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedReplaceDocs {
+                        relation: old, documents: old_rows, valid_from: start, valid_to: end,
+                    }) if old == relation && marker(old_rows.rows(), primary_head) && start == valid_from && end == valid_to))
                 {
                     return Err(invalid());
                 }
@@ -168,11 +167,28 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         }
         types |= bit;
     }
-    let expected_types = if records_decision { 127 } else { 63 };
-    if types != expected_types {
+    if types != expected_types
+        || copied_attempts.len() != attempts.len() + usize::from(embedded.is_some())
+        || impact_ids.len() != impact_count
+    {
         return Err(invalid());
     }
-    Ok((primary, refusal))
+    Ok(())
+}
+
+fn attempt_marker(
+    documents: &crate::Documents,
+    from: Option<rtdb_types::Timestamp>,
+    to: Option<rtdb_types::Timestamp>,
+    attempt: &str,
+    fingerprint: &[u8; 32],
+) -> bool {
+    let [row] = documents.rows() else { return false; };
+    from == Some(rtdb_types::Timestamp::MIN)
+        && to == Some(rtdb_types::Timestamp::MAX)
+        && row.len() == 2
+        && matches!(row.get("_id"), Some(Value::Utf8(id)) if id == attempt)
+        && matches!(row.get("fingerprint"), Some(Value::Binary(bytes)) if bytes.as_slice() == fingerprint)
 }
 
 fn landing_slot(control: &HostedControlWrite) -> Option<usize> {
@@ -221,11 +237,7 @@ fn validate_landing_choice(primary: &[Operation], refusal: &[Operation], placed:
                 if relation.name() == ATTEMPTS && *valid_from == Some(Timestamp::MIN)
                     && *valid_to == Some(Timestamp::MAX) =>
             {
-                let [row] = documents.rows() else { return Err(invalid()); };
-                if found_attempt || row.len() != 2
-                    || !matches!(row.get("_id"), Some(Value::Utf8(id)) if id == attempt)
-                    || !matches!(row.get("fingerprint"), Some(Value::Binary(bytes)) if bytes.as_slice() == fingerprint)
-                {
+                if found_attempt || !attempt_marker(documents, *valid_from, *valid_to, attempt, fingerprint) {
                     return Err(invalid());
                 }
                 found_attempt = true;
@@ -486,11 +498,13 @@ fn same_binding(
 
 fn primary_op(op: &Operation) -> bool {
     match op {
-        Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::HostedControl(_)) => true,
+        Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. }
+            | TxOp::OwnedForkWorld { .. } | TxOp::HostedControl(_)) => true,
         Operation::Public(
             TxOp::OwnedCheck { relation, .. }
             | TxOp::OwnedCheckRange { relation, .. }
             | TxOp::OwnedCheckCapacity { relation, .. }
+            | TxOp::OwnedRelativePeriod { relation, .. }
             | TxOp::OwnedInsertDocs { relation, .. }
             | TxOp::OwnedReplaceDocs { relation, .. }
             | TxOp::OwnedArrowDocs { relation, .. }
