@@ -1164,6 +1164,11 @@ rule LeaderProcessesArtefactsRemoved {
 rule AppendReplicaMessage {
     -- Append the message to the replica log, in resolution order, STAMPED with this leader's term and the next position within it.
     -- Every record the term writes goes through this one ordered path, the block upload included, so the term's positions follow the log's order.
+    -- The native writer resamples a strict placed transaction's clock after encoding and fingerprinting the final frame.
+    -- The rounded upper sample must be at least the retained staging sample and strictly before the guarded cutoff.
+    -- A staged strict write holds later resolution, appender commands and a full block's cut until its admitted read-back.
+    -- On failure the appender submits no frame and the driver discards the term's speculative suffix before reclaiming and resolving the durable source again.
+    -- Transport and quorum durability still follow dispatch and depend on the installed receiver's service bound.
     --
     -- Nothing here is atomic across messages and nothing needs to be: a superseded leader is fenced by the term its records carry, checked when it reads them back, not by an append that fails.
     --
