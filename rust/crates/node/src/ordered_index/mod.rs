@@ -393,6 +393,14 @@ async fn owned_projection(
     Ok(OwnedProjection { fields, empty })
 }
 
+/// Resolve the ordered key declaration within an already admitted archived cut.
+pub async fn path_columns_at_cut(
+    context: &Arc<QueryContext>, owner: &str,
+    relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+) -> Result<Vec<String>> {
+    Ok(owned_definition(context, owner, relation, path).await?.columns)
+}
+
 pub(crate) async fn stable_owned_path_columns(
     before: &Arc<QueryContext>,
     after: &Arc<QueryContext>,

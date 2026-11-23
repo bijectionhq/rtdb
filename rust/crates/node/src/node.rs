@@ -1264,10 +1264,19 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         valid_at: Timestamp, observed: bool,
     ) -> Result<OwnedWorldShadowRead> {
+        self.read_world_shadow_at(world, relation, id, valid_at, self.present.system_time, observed).await
+    }
+
+    async fn read_world_shadow_at(
+        &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        valid_at: Timestamp, system: Timestamp, observed: bool,
+    ) -> Result<OwnedWorldShadowRead> {
         let valid = rtdb_types::Interval::at(valid_at)?;
         self.require_unscoped_root()?;
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
+        let context = if system == self.present.system_time { context }
+            else { context.with_owned_system_cut(system, &context.cancellation)? };
         let root = relation;
         let relation = root.in_world(world)?;
         let mut row = None;
@@ -1281,7 +1290,7 @@ impl OwnedReadSession {
                     return Err(rtdb_types::OwnedWorld::unavailable());
                 }
                 let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, &self.context.memory)?;
-                if revision > self.present.system_time { return Err(rtdb_types::OwnedWorld::unavailable()); }
+                if revision > system { return Err(rtdb_types::OwnedWorld::unavailable()); }
                 local_revision = Some(revision);
                 row = Some(batch);
             }

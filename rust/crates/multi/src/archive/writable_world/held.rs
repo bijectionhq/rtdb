@@ -41,6 +41,12 @@ enum ArchiveRead {
         reply: oneshot::Sender<Result<()>>,
     },
     Point(ArchivePoint),
+    PathColumns {
+        relation: OwnedRelation,
+        path: OwnedRelation,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<Vec<String>>>,
+    },
     Search {
         partitions: Vec<(OwnedRelation, OwnedRelation)>,
         frontiers: Vec<i64>,
@@ -168,6 +174,53 @@ impl HeldCheckpointWorld {
         };
         self.check_relation(relation)?;
         Ok(WorldPoint { present: self.present(), fact, until: None, shadowed, witness })
+    }
+
+    pub async fn path_touch(
+        &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
+        group: Timestamp, valid: Timestamp,
+    ) -> Result<[(Option<WorldFact>, bool); 2]> {
+        self.check_relation(relation)?;
+        let (columns, [before, after]) = self.open.snapshot.world_path_touch(
+            self.open.record.id, relation, path, id, group, valid,
+        ).await?;
+        let guard = self.open.snapshot.relation_release_guard([relation])?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::PathColumns {
+            relation: relation.clone(), path: path.clone(), guard, reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let parent_columns = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+        if parent_columns != columns || columns.last().is_none_or(|column| column != "_id")
+            || columns[..columns.len() - 1].iter().any(|column| schema.path_column_type(column).is_none())
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        let mut sides = [(None, false), (None, false)];
+        for (local, side) in [before, after].into_iter().zip(&mut sides) {
+            let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
+            let shadowed = local.is_some();
+            let mut fact = match local {
+                Some(fact) => match WorldShadow::from_record(fact.row)? {
+                    WorldShadow::Deleted => None,
+                    WorldShadow::Present(row) => Some(WorldFact {
+                        row, revision: fact.revision, lifetime: None, _reservation: fact._reservation,
+                    }),
+                },
+                None => self.archive_point(relation, id, valid, None).await?,
+            };
+            if let Some(fact) = &mut fact {
+                if !fact.row.contains_key("_id") { return Err(OwnedWorld::unavailable()); }
+                fact.row.retain(|name, _| name == "_id" || columns.contains(name));
+                for column in &columns {
+                    if !fact.row.contains_key(column) { fact.row.insert(column.clone(), Value::Null); }
+                }
+            }
+            *side = (fact, shadowed);
+        }
+        self.check_relation(relation)?;
+        Ok(sides)
     }
 
     pub async fn parent_point(
@@ -682,6 +735,19 @@ pub(crate) async fn open_held_checkpoint_world(
                                         &context, &owner, frontiers.iter().map(|(relation, frontier)| (relation, *frontier)),
                                     ));
                                     let _ = reply.send(coverage);
+                                }
+                                ArchiveRead::PathColumns { relation, path, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        rtdb_node::path_columns_at_cut(&context, &owner, &relation, &path).await
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
                                 }
                                 ArchiveRead::Point(ArchivePoint { relation, id, valid, lifetime, guard, mut reply }) => {
                                     let read = async {
