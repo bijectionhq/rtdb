@@ -437,3 +437,69 @@ mod slab_tests {
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+#[cfg(test)]
+mod vector_path_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use arrow_array::{Array, FixedSizeListArray, Float32Array};
+    use arrow_schema::{DataType, Field};
+    use rtdb_index::{PartitionState, TransactionBuffer};
+    use rtdb_plan::{Binder, Expr, NamedExpr, QualifiedTable, RelationNode, Scan, SortExpr, TemporalFilter};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::{Interval, ScalarType, StructFields, TableRef, Timestamp, TransactionKey, TxId};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn ranked_vector_query_opens_as_columns_from_arrow_arguments() {
+        let memory = MemoryBudget::new(1 << 25);
+        let table = TableRef::new("public", "vectors");
+        let state = PartitionState::empty(rtdb_trie::TrieConfig::default()).unwrap();
+        let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(1) };
+        let mut tx = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+        for (id, values) in [(1, [0.0, 1.0]), (2, [1.0, 0.0])] {
+            let doc = StructFields::from([("_id".into(), Value::I64(id)),
+                ("embedding".into(), Value::FixedSizeList(values.map(Value::F32).to_vec()))]);
+            tx.put(table.clone(), doc, Interval::ALL).unwrap();
+        }
+        state.apply(&tx.stage().unwrap()).unwrap();
+        let snapshot = state.value().snapshot();
+        let vector_type = snapshot.column_types(&table)["embedding"].clone();
+        let database = crate::DatabaseSnapshot { partitions: vec![snapshot],
+            storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(1), "UTC", crate::QueryOptions {
+            batch_rows: 1, ..Default::default()
+        }, &CancellationToken::new()).unwrap();
+        let table = context.catalog.table(&QualifiedTable { database: "xtdb".into(), table }).unwrap().unwrap();
+        let mut binder = Binder::default();
+        let vector = binder.field("embedding", None, vector_type.clone()).unwrap();
+        let scan = Arc::new(Relation::scan(Scan {
+            table, columns: vec![vector.clone()], valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
+            clamp_valid_time: false, iids: None, predicates: vec![], top_k: None, ordered_top_k: None, matches: vec![],
+        }).unwrap());
+        let distance_type = LogicalType::Scalar(ScalarType::F64).maybe();
+        let distance = binder.field("distance", None, distance_type.clone()).unwrap();
+        let input = Arc::new(scan.project(vec![
+            NamedExpr { field: vector.clone(), expr: vector.expression() },
+            NamedExpr { field: distance.clone(), expr: Expr::Call { name: "cosine_distance".into(),
+                args: vec![vector.expression(), Expr::Parameter { index: 0, data_type: vector_type }], return_type: distance_type } },
+        ]).unwrap());
+        let plan = Arc::new(Relation::new(input.schema().clone(), RelationNode::SortLimit {
+            input, order_by: vec![SortExpr { expr: distance.expression(), descending: false, nulls_first: false }],
+            offset: None, fetch: Some(Expr::Literal(Value::I64(1))),
+        }).unwrap());
+        let element = Arc::new(Field::new("item", DataType::Float32, false));
+        let vector = FixedSizeListArray::try_new(element, 2, Arc::new(Float32Array::from(vec![1.0, 0.0])), None).unwrap();
+        let schema = ArrowSchema::new(vec![Field::new("", vector.data_type().clone(), false)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(vector)]).unwrap();
+        let args = OwnedBatch::new(batch, &memory).unwrap();
+        let mut cursor = PreparedQuery::new(plan).unwrap().execute_arrow(context, args, None, &BTreeMap::new()).await.unwrap();
+        assert!(matches!(cursor.input, Some(QueryInput::Columns(_))));
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        let vector = result.batch().column(0).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let values = vector.values().as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[1.0, 0.0]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+}

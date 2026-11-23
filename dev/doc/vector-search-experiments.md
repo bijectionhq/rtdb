@@ -385,4 +385,5 @@ The ANN recall, returned counts, and cold range counts matched the preceding 100
 Unfiltered exact p50 was 581.12 ms with the Arrow path and 4,691.70 ms with the scalar control on the same snapshot.
 Separate ADBC and Flight SQL tests ingest fixed-size floats, bind the reference vector through Arrow, and return the ranked embedding column.
 The ADBC test covers null embeddings, nullable metadata, stable ties, and an offset after flush.
+A cursor regression asserts that a ranked query with an Arrow argument opens on the columnar execution path.
 A result-conformance test verifies that schema changes share the original float component buffer.
