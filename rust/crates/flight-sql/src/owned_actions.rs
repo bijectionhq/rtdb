@@ -3,7 +3,7 @@ mod hosted_observation;
 mod unique;
 
 pub(crate) use hosted_control::READ_HELD_HOSTED_CONTROL_V2;
-pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V5, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V2};
+pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V5, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
 pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
@@ -276,11 +276,6 @@ pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
 
-fn audience_history_cut(present: Timestamp, system: Timestamp, valid: Option<Timestamp>) -> bool {
-    valid == Some(system) && system.0 >= 0 && system < present
-        && present.0.saturating_sub(system.0) < 60_000_000
-}
-
 pub(crate) const HELD_OWNED_RANGE_V3: &str = "rtdb.owned.ReadHeldRange.v3";
 pub(crate) const HELD_OWNED_RANGE_V4: &str = "rtdb.owned.ReadHeldRange.v4";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
@@ -323,6 +318,7 @@ pub(crate) struct OwnedReadResource {
     session: String,
     database: String,
     audience_work: Option<rtdb_storage::audience_work::TurnAllowance>,
+    audience_projection_work: Option<rtdb_storage::audience_work::TurnAllowance>,
     witnesses: Mutex<BTreeMap<Uuid, RetainedRangeWitness>>,
     spatial_filters: Mutex<BTreeMap<Uuid, Arc<RetainedSpatialFilter>>>,
     _permit: Option<OwnedSemaphorePermit>,
@@ -606,6 +602,27 @@ fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     if length > 96 { return Err(invalid("Owned action relation exceeds its length limit")); }
     let name = std::str::from_utf8(name).map_err(arrow)?;
     Ok((OwnedRelation::new(name).map_err(status)?, arrow_bytes))
+}
+
+fn require_audience_point(
+    session: &crate::state::Session, relation: &OwnedRelation, id: &EntityId, recovering: bool,
+) -> Result<(), Status> {
+    let projection = session.audience_projection()?;
+    if audience_point_admitted(&projection.relation, relation, id, recovering) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("The point is outside the prepared audience projection"))
+    }
+}
+
+fn audience_point_admitted(
+    projection: &OwnedRelation, relation: &OwnedRelation, id: &EntityId, recovering: bool,
+) -> bool {
+    relation == projection
+        || (recovering && relation.name() == "fact_layout_readiness")
+        || (relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+            && matches!(id, EntityId::String(id) if id == "head" || id == "sync_receipt_head"
+                || id.strip_prefix("fact_partition_head:") == Some(projection.name())))
 }
 
 fn split_position_mask(body: &[u8]) -> Result<((Timestamp, u32), &[u8]), Status> {
@@ -1643,6 +1660,11 @@ impl Service {
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             audience_work: rtdb_storage::audience_work::current_turn(),
+            audience_projection_work: (generation > 1 && call.session.audience_source().is_some()).then(|| {
+                rtdb_storage::audience_work::TurnAllowance::new(
+                    crate::config::AUDIENCE_TURN_LIMITS, crate::config::AUDIENCE_TURN_ACTIONS,
+                )
+            }),
             witnesses: Mutex::default(), spatial_filters: Mutex::default(), _permit: permit, _reservation: reservation,
         });
         let handle = Bytes::copy_from_slice(handle.as_bytes());
@@ -1674,13 +1696,41 @@ impl Service {
         Ok(entry)
     }
 
+    pub(crate) fn audience_open_generation(&self, body: &[u8]) -> Result<u64, Status> {
+        let (_, rest) = hosted_observation::applied_read_floor(body)?;
+        let generation = u64::from_be_bytes(rest.try_into().map_err(|_| invalid("Applied read requires an exact generation"))?);
+        if generation == 0 { return Err(invalid("An audience read requires a prepaid generation")); }
+        Ok(generation)
+    }
+
     pub(crate) fn audience_read_work(
-        &self, call: &Call, body: &[u8],
+        &self, call: &Call, action: &str, body: &[u8],
     ) -> Result<rtdb_storage::audience_work::TurnAllowance, Status> {
-        let (handle, _) = body.split_first_chunk::<16>()
+        let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("The audience observation has no original read handle"))?;
-        self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?.audience_work.clone()
-            .ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
+        let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let work = match action {
+            HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 => {
+                if request.len() > 16 * 1024 {
+                    return Err(invalid("The audience projection request exceeds its carrier bound"));
+                }
+                let (relation, _) = split_relation(request)?;
+                let projection = call.session.audience_projection()?;
+                if relation == projection.relation {
+                    &held.audience_projection_work
+                } else if action == HELD_OWNED_POINT_V2
+                    && (relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+                        || (held.audience_projection_work.is_none() && relation.name() == "fact_layout_readiness"))
+                {
+                    &held.audience_work
+                } else {
+                    return Err(Status::permission_denied("The relation is outside the prepared audience projection"));
+                }
+            },
+            READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V5 => &held.audience_work,
+            _ => return Err(unsupported()),
+        };
+        work.clone().ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
     }
 
     pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8], time: PointTime) -> Result<ActionResult, Status> {
@@ -1693,6 +1743,9 @@ impl Service {
             return Err(status(error));
         }
         let (relation, id, valid, _identity) = point_request(call, request, time)?;
+        if call.session.audience_source().is_some() {
+            require_audience_point(&call.session, &relation, &id, held.audience_projection_work.is_none())?;
+        }
         let fixed = matches!(time, PointTime::Required);
         self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held))).await
     }
@@ -2259,7 +2312,7 @@ impl Service {
     pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let audience = call.session.audience_source().is_some();
-        if audience && (!matches!(version, HeldRangeFormat::Full | HeldRangeFormat::Historical) || body.len() > 16 * 1024) {
+        if audience && (!matches!(version, HeldRangeFormat::Full) || body.len() > 16 * 1024) {
             return Err(invalid("The audience page exceeds its carrier bounds"));
         }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
@@ -2305,12 +2358,6 @@ impl Service {
             };
             Some(Timestamp(*system))
         } else { None };
-        if let Some(system) = system.filter(|_| audience) {
-            let present = held.snapshot.present().system_time;
-            if !audience_history_cut(present, system, valid_at) {
-                return Err(invalid("The audience page requires a recent exact historical cut"));
-            }
-        }
         let (page, evidence, expiry) = if !matches!(version, HeldRangeFormat::Leading) {
             let Some(Value::Bool(descending)) = row.get("descending") else {
                 return Err(invalid("Owned range requires a boolean descending field"));
@@ -2322,10 +2369,14 @@ impl Service {
                 descending: *descending,
                 limit,
             };
-            if audience && (!(1..=5).contains(&request.limit) || request.descending
-                || request.lower.is_some() || request.upper.is_some() || !relation.is_root_data())
-            {
-                return Err(invalid("The audience page requires a bounded forward Root scan"));
+            if audience {
+                let projection = call.session.audience_projection()?;
+                if relation != projection.relation || path != projection.address_path
+                    || !(1..=5).contains(&request.limit) || request.descending
+                    || request.lower.is_some() || request.upper.is_some()
+                {
+                    return Err(invalid("The audience page requires its bounded inline address order"));
+                }
             }
             if let (Some(system), Some(valid)) = (system, valid_at) {
                 held.snapshot.range_page_by_key_at_system(&relation, &path, request, system, valid)
@@ -4664,18 +4715,22 @@ fn owned_capacity_declaration(relation: OwnedRelation, row: &StructFields<Value>
 mod commit_tests;
 
 #[cfg(test)]
-mod audience_history_tests {
+mod audience_projection_tests {
     use super::*;
 
     #[test]
-    fn a_reserved_page_uses_a_recent_cut_at_the_same_valid_instant() {
-        let present = Timestamp(90_000_000);
-        let inside = Timestamp(30_000_001);
-        let boundary = Timestamp(30_000_000);
-        assert!(audience_history_cut(present, inside, Some(inside)));
-        assert!(!audience_history_cut(present, boundary, Some(boundary)));
-        assert!(!audience_history_cut(present, present, Some(present)));
-        assert!(!audience_history_cut(present, inside, Some(boundary)));
+    fn excludes_foreign_relations_and_their_markers_from_the_projection() {
+        let visible = OwnedRelation::new("visible").unwrap();
+        let hidden = OwnedRelation::new("hidden").unwrap();
+        let markers = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION).unwrap();
+        let readiness = OwnedRelation::new("fact_layout_readiness").unwrap();
+        let id = |value: &str| EntityId::String(value.into());
+        assert!(audience_point_admitted(&visible, &visible, &id("doc"), false));
+        assert!(!audience_point_admitted(&visible, &hidden, &id("doc"), false));
+        assert!(audience_point_admitted(&visible, &markers, &id("fact_partition_head:visible"), false));
+        assert!(!audience_point_admitted(&visible, &markers, &id("fact_partition_head:hidden"), false));
+        assert!(!audience_point_admitted(&visible, &readiness, &id("layout"), false));
+        assert!(audience_point_admitted(&visible, &readiness, &id("layout"), true));
     }
 }
 

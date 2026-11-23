@@ -11,16 +11,27 @@ use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Lea
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
-        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, HELD_OWNED_RANGE_V4, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V2, READ_HELD_HOSTED_CONTROL_V2};
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
         use rtdb_storage::audience_work;
         let turn = if call.session.audience_source().is_some() {
-            match action.r#type.as_str() {
-                OPEN_APPLIED_OWNED_READ_V4 => Some(audience_work::TurnAllowance::new(AUDIENCE_TURN_LIMITS, AUDIENCE_TURN_ACTIONS)),
-                HELD_OWNED_POINT_V2 | HELD_OWNED_HISTORICAL_POINT_V1 | HELD_OWNED_RANGE_V2 | HELD_OWNED_RANGE_V4
-                    | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V5 =>
-                    Some(self.audience_read_work(&call, &action.body).map_err(|error| call.error(error))?),
-                _ => None,
-            }
+            let admit = || -> Result<_, Status> {
+                Ok(match action.r#type.as_str() {
+                    PREPARE_APPLIED_READ_V3 => call.session.audience_recovery_work(),
+                    OPEN_APPLIED_OWNED_READ_V4 => {
+                        let generation = self.audience_open_generation(&action.body)?;
+                        call.session.audience_projection()?;
+                        if generation == 1 {
+                            call.session.audience_recovery_work()
+                        } else {
+                            Some(audience_work::TurnAllowance::new(AUDIENCE_TURN_LIMITS, AUDIENCE_TURN_ACTIONS))
+                        }
+                    },
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V5 =>
+                        Some(self.audience_read_work(&call, &action.r#type, &action.body)?),
+                    _ => None,
+                })
+            };
+            admit().map_err(|error| call.error(error))?
         } else { None };
         if let Some(turn) = &turn {
             turn.admit_action().map_err(|error| call.error(Status::resource_exhausted(error.to_string())))?;
@@ -32,9 +43,8 @@ impl Service {
                     .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                 match action_type {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
-                    PREPARE_APPLIED_READ_V2 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_HISTORICAL_POINT_V1 | HELD_OWNED_RANGE_V2
-                    | HELD_OWNED_RANGE_V4 | READ_HELD_HOSTED_CONTROL_V2 => {
+                    PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | READ_HELD_HOSTED_CONTROL_V2 => {
                         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
                         let attachment = attachment.ok_or_else(unsupported)?;
                         self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
@@ -84,7 +94,7 @@ impl Service {
                 crate::owned_actions::SPATIAL_HELD_OWNED_V1 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V1).await?)]),
                 crate::owned_actions::SPATIAL_HELD_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V2).await?)]),
                 crate::owned_actions::SPATIAL_HELD_OWNED_V3 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V3).await?)]),
-                PREPARE_APPLIED_READ_V2 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
+                PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
@@ -100,7 +110,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_RANGE_V1 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V2 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V3 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid).await?)]),
-                HELD_OWNED_RANGE_V4 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical).await?)]),
+                crate::owned_actions::HELD_OWNED_RANGE_V4 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical).await?)]),
                 crate::owned_actions::HELD_OWNED_COUNT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, false).await?)]),
                 crate::owned_actions::HELD_OWNED_COUNT_V2 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, false).await?)]),
                 crate::owned_actions::HELD_OWNED_MEASURE_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, true).await?)]),

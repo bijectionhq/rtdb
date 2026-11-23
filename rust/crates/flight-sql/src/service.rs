@@ -350,7 +350,12 @@ impl Service {
                             return Err(Status::deadline_exceeded("The audience session ceiling elapsed during handshake"));
                         }
                         let session = mint(Some(AudienceSession { source, seat: requested,
-                            cache: Arc::clone(&audience.cache), expires_at, _claim: claim }))?;
+                            cache: Arc::clone(&audience.cache), expires_at, _claim: claim,
+                            projection: std::sync::OnceLock::new(),
+                            recovery_work: rtdb_storage::audience_work::TurnAllowance::new(
+                                crate::config::AUDIENCE_RECOVERY_LIMITS, crate::config::AUDIENCE_RECOVERY_ACTIONS,
+                            ),
+                        }))?;
                         *original = Arc::downgrade(&session);
                         session
                     }
@@ -516,7 +521,7 @@ mod tests {
             assert!(matches!(CallKind::action(false, action), CallKind::Action));
         }
         for action in [
-            crate::owned_actions::PREPARE_APPLIED_READ_V2,
+            crate::owned_actions::PREPARE_APPLIED_READ_V3,
             crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4,
             crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5,
             "closesession",

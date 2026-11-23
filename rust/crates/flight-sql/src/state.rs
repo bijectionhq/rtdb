@@ -49,8 +49,15 @@ enum SessionState {
 }
 struct Placement { name: String, attachment: Weak<Database> }
 
+pub(crate) struct AudienceProjection {
+    pub relation: rtdb_types::OwnedRelation,
+    pub address_path: rtdb_types::OwnedRelation,
+}
+
 pub(crate) struct AudienceSession {
     pub source: Uuid,
+    pub projection: std::sync::OnceLock<AudienceProjection>,
+    pub recovery_work: rtdb_storage::audience_work::TurnAllowance,
     pub seat: crate::AudienceSeat,
     pub cache: Arc<CacheBudget>,
     pub expires_at: tokio::time::Instant,
@@ -78,6 +85,20 @@ impl Session {
     }
     pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|audience| audience.source) }
     pub fn audience_seat(&self) -> Option<crate::AudienceSeat> { self.audience.as_ref().map(|audience| audience.seat) }
+
+    pub fn install_audience_projection(&self, projection: AudienceProjection) -> Result<(), Status> {
+        self.audience.as_ref().ok_or_else(crate::error::unsupported)?.projection.set(projection)
+            .map_err(|_| Status::failed_precondition("The audience projection is already prepared"))
+    }
+
+    pub fn audience_projection(&self) -> Result<&AudienceProjection, Status> {
+        self.audience.as_ref().and_then(|audience| audience.projection.get())
+            .ok_or_else(|| Status::failed_precondition("The audience projection is not prepared"))
+    }
+
+    pub fn audience_recovery_work(&self) -> Option<rtdb_storage::audience_work::TurnAllowance> {
+        self.audience.as_ref().map(|audience| audience.recovery_work.clone())
+    }
 
     pub fn audience_remaining_micros(&self) -> Option<u64> {
         let remaining = self.audience.as_ref()?.expires_at.saturating_duration_since(tokio::time::Instant::now());

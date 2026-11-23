@@ -30,6 +30,17 @@ pub(crate) const AUDIENCE_TURN_LIMITS: rtdb_storage::audience_work::Limits = rtd
     decode_bytes: 1 << 30,
 };
 
+// One catalog preparation, one readiness hold, one confirmation and at
+// most eight layout points. This allowance lives with the replacement seat.
+pub(crate) const AUDIENCE_RECOVERY_ACTIONS: usize = 11;
+pub(crate) const AUDIENCE_RECOVERY_LIMITS: rtdb_storage::audience_work::Limits = rtdb_storage::audience_work::Limits {
+    provider_requests: 2048,
+    provider_bytes: 256 << 20,
+    provider_metadata_bytes: 32 << 20,
+    scan_items: 1 << 19,
+    decode_bytes: 512 << 20,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudienceFlightConfig {
     source: uuid::Uuid,

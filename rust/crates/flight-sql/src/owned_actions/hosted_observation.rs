@@ -2,7 +2,7 @@ use super::*;
 use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
-pub(crate) const PREPARE_APPLIED_READ_V2: &str = "rtdb.owned.PrepareAppliedRead.v2";
+pub(crate) const PREPARE_APPLIED_READ_V3: &str = "rtdb.owned.PrepareAppliedRead.v3";
 pub(crate) const CONFIRM_APPLIED_HOSTED_V5: &str = "rtdb.owned.ConfirmAppliedHosted.v5";
 
 pub(super) fn applied_read_floor(body: &[u8]) -> Result<(rtdb_node::AppliedReadFloor, &[u8]), Status> {
@@ -58,7 +58,11 @@ impl Service {
     pub(crate) async fn prepare_applied_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         let source = call.session.audience_source().ok_or_else(unsupported)?;
         let (floor, rest) = applied_read_floor(body)?;
-        if !rest.is_empty() { return Err(invalid("Applied preparation has trailing bytes")); }
+        let (relation, rest) = split_relation(rest)?;
+        let (address_path, rest) = split_relation(rest)?;
+        if !rest.is_empty() || !relation.is_root_data() {
+            return Err(invalid("Applied preparation requires one Root relation and its address order"));
+        }
         if floor.history() != source {
             return Err(Status::permission_denied("The applied preparation belongs to another audience source"));
         }
@@ -66,6 +70,7 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let remaining = native.prepare_applied_owned_reads(&floor).await.map_err(status)?;
+        call.session.install_audience_projection(crate::state::AudienceProjection { relation, address_path })?;
         let lease = call.session.audience_remaining_micros().ok_or_else(|| Status::unavailable("The audience session expired during catalog preparation"))?;
         let remaining = remaining.min(lease);
         Ok(ActionResult { body: Bytes::copy_from_slice(&remaining.to_be_bytes()) })
@@ -88,6 +93,11 @@ impl Service {
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512 + 8192)?;
         let (point, body) = applied_point(body)?;
+        if call.session.audience_source().is_some() {
+            if let Some(point) = &point {
+                require_audience_point(&call.session, &point.relation, &point.id, false)?;
+            }
+        }
         let groups = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
