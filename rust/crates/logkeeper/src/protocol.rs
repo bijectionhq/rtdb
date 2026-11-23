@@ -209,7 +209,7 @@ pub(crate) enum RequestBody {
     ReadIndex(LogletCheck),
     #[prost(message, tag = "16")]
     Identify(Identify),
-    #[prost(message, tag = "18")]
+    #[prost(message, tag = "30")]
     TrimDurable(Trim),
 }
 
@@ -217,7 +217,7 @@ pub(crate) enum RequestBody {
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 30")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -365,6 +365,34 @@ fn a_legacy_peer_cannot_decode_a_durable_trim_as_an_ordinary_trim() {
     let durable = LegacyTrimRequest::decode(request(RequestBody::TrimDurable(trim)).as_slice()).unwrap();
     assert!(durable.trim.is_none());
     assert_eq!(durable.target_journal, "journal");
+}
+
+#[cfg(test)]
+#[test]
+fn authority_confirmation_and_durable_trim_use_disjoint_requests() {
+    #[derive(Message)]
+    struct AuthorityRequest {
+        #[prost(message, optional, tag = "18")]
+        confirm_authority: Option<LogletCheck>,
+    }
+
+    let confirm = AuthorityRequest {
+        confirm_authority: Some(LogletCheck {
+            stream: "scope".into(),
+            epoch: 8,
+            ensemble: Bytes::from_static(&[42; 32]),
+        }),
+    };
+    let decoded = Request::decode(confirm.encode_to_vec().as_slice()).unwrap();
+    assert!(decoded.body.is_none());
+
+    let trim = Request {
+        id: 1,
+        body: Some(RequestBody::TrimDurable(Trim { stream: "scope".into(), through_lsn: 4 })),
+        target_journal: "journal".into(),
+    };
+    let decoded = AuthorityRequest::decode(trim.encode_to_vec().as_slice()).unwrap();
+    assert!(decoded.confirm_authority.is_none());
 }
 
 /// Groups consecutive lsns written at the same epoch.
