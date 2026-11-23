@@ -5,6 +5,8 @@ use super::{HostedControlWrite, NATIVE_FRONTIER, RESTORE, control_body, replay_i
 
 const PREFIX: &str = "native-world-admitted/";
 const ROOT_ADMISSION: &str = "bj_fact_root_admission";
+const AUTHORED_HOLDERS: &str = "native_authored_root_versions";
+const ORIGINAL_AUTHORED_HOLDERS: &str = "original_native_authored_root_versions";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +133,18 @@ impl WorldReadmission {
         let writes = controls
             .clone()
             .filter(|control| control.name() == ROOT_ADMISSION && !control.is_check());
+        if writes.clone().any(|control| control.id() == &EntityId::String(AUTHORED_HOLDERS.into()))
+            && (matches!(original.mode, rtdb_types::WorldClockMode::Held { .. })
+                || !controls.clone().any(|control| {
+                    control.name() == ROOT_ADMISSION && control.is_check() && control.expected().is_some()
+                        && matches!(control.id(), EntityId::String(id) if id == ORIGINAL_AUTHORED_HOLDERS)
+                }))
+        {
+            return Err(replay_invalid());
+        }
+        let writes = writes.filter(
+            |control| !matches!(control.id(), EntityId::String(id) if id == AUTHORED_HOLDERS),
+        );
         if original.mode != rtdb_types::WorldClockMode::Proposal {
             return if writes.count() == 0 {
                 Ok(())
