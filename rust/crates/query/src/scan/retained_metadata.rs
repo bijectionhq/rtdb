@@ -106,10 +106,9 @@ impl PartitionScan {
                     }
                 }
             }
-            if let Some(exact) = exact
-                && (exact.is_some() || complete_history)
-            {
-                return Ok(exact.or(prior).map(|value| Value::Timestamp {
+            let observed = exact.flatten();
+            if observed.is_some() || complete_history {
+                return Ok(observed.or(prior).map(|value| Value::Timestamp {
                     value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
                 }));
             }

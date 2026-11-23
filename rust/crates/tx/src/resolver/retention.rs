@@ -56,10 +56,10 @@ pub async fn installed_receipt_time(
             "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE system_time = ?",
             vec![system_time()],
         ).await?,
-    }.ok_or_else(|| clock_error("The installed transaction predecessor is missing"))?;
-    if let Some(exact) = exact { return Ok(Some(exact)); }
+    };
+    if let Some(Some(exact)) = exact { return Ok(Some(exact)); }
 
-    // A pre-retention resolver can install a successor without carrying the clock.
+    // Legacy replay can advance the installed head without a transaction row carrying the clock.
     Ok(read_receipt_clock_row(&context,
         "SELECT MAX(receipt_time) FROM xt.txs FOR ALL VALID_TIME WHERE system_time <= ?",
         vec![system_time()],
