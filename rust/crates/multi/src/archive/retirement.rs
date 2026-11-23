@@ -25,6 +25,13 @@ pub(crate) fn require_capture_open(record: &DeploymentRecord, capture: Uuid) -> 
     Ok(())
 }
 
+fn serving_retains_capture(record: &DeploymentRecord, capture: Uuid) -> bool {
+    let selected = record.serving_replay_capture.map(|source| source.as_u128());
+    let repair = record.checkpoint_recovery.as_ref().map(|repair|
+        (repair.operation.as_u128(), repair.completed_at_ms.is_none()));
+    super::replay_handoff::retains_capture(selected, repair, capture.as_u128())
+}
+
 /// Persist the release before erasing. With no registered capture, the ID
 /// still receives a tombstone so a late start cannot create media.
 pub(crate) async fn retire_capture(
@@ -61,11 +68,7 @@ pub(crate) fn obsolete_fork_input(record: &DeploymentRecord, capture: Uuid) -> b
                     || (pin.custody == CheckpointSuffixCustody::Capture
                         && pin.archive_sha256.is_some()))
         })
-        && !record
-            .checkpoint_recovery
-            .as_ref()
-            .is_some_and(|repair| repair.operation == capture)
-        && record.serving_replay_capture != Some(capture)
+        && !serving_retains_capture(record, capture)
 }
 
 pub(crate) fn obsolete_world_suffix(
@@ -187,10 +190,7 @@ async fn retire_capture_inner(
                 return Err(inconsistent("A live world retains this checkpoint capture"));
             }
 
-            if (record.serving_replay_capture == Some(capture) || record
-                .checkpoint_recovery
-                .as_ref()
-                .is_some_and(|repair| repair.operation == capture))
+            if serving_retains_capture(record, capture)
                 && (record.lifecycle != Lifecycle::Deleted || record.disposal.is_none())
             {
                 return Err(inconsistent(
@@ -524,6 +524,100 @@ mod tests {
         let retained = directory.deployment(&record.id).await?.unwrap();
         assert_eq!(retained.serving_replay_capture, Some(capture));
         assert!(require_capture_open(&retained, capture).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_superseded_repair_archive_remains_until_its_readers_drain() -> Result<()> {
+        let files = tempfile::tempdir().unwrap();
+        let archive = CellStorage::Local { root: files.path().join("archive") };
+        let storage = CellStorage::Local { root: files.path().join("serving") };
+        let keys = LocalKeyService::new(files.path().join("keys"))?;
+        let directory = MemoryDirectory::new();
+        let capture = Uuid::new_v4();
+        let region = Uuid::new_v4();
+        let witness = keys.hold_local_storage_region(region)?;
+        let mut record = DeploymentRecord::new("tenant", "org", Vec::new(), now_ms());
+        let archive_binding = archive_binding(&archive)?;
+        let checkpoint = rtdb_directory::Checkpoint {
+            block: 0, boundary: 0, source: 0, system_time: 0, root_sha256: Some([1; 32]),
+        };
+        record.checkpoint_captures.insert(capture, rtdb_directory::CheckpointCapture {
+            archive: archive_binding.clone(), incarnation: record.incarnation, log_epoch: record.log_epoch, checkpoint,
+            automatic_fork: false, world_replay: None, media_bound: true, manifest_sha256: Some("original".into()),
+            remote_disposal: None,
+        });
+        let receipt = rtdb_directory::CheckpointRecovery {
+            operation: capture, checkpoint, epoch: 0, previous_lifecycle: Lifecycle::Live,
+            archive: archive_binding.clone(), manifest_sha256: "original".into(), completed_at_ms: Some(now_ms()),
+        };
+        record.checkpoint_recovery = Some(Box::new(receipt.clone()));
+        record.checkpoint_repair_receipts.insert(capture, receipt.clone());
+        let record = directory.create_deployment(record).await?;
+        let deployment = Uuid::parse_str(&record.id).unwrap();
+        let point = capture_point(&record, deployment, capture, &archive_binding)?;
+        let archive_key = archive_key_id(&point);
+        let material = keys.key(&archive_key).await?;
+        let media = archive.bucket(IoRegion::new()).await?;
+        let original = key(&format!("checkpoint-captures/{}/{capture}/capture.json", record.id))?;
+        media.put(&original, bytes::Bytes::from_static(b"original")).await?;
+        let error = retire_capture(directory.as_ref(), &record, &storage, &archive, &keys, capture, None)
+            .await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("The serving history still depends on this capture"));
+
+        let selected = Uuid::new_v4();
+        let published = update_installation(directory.as_ref(), &record.id, |current| {
+            current.serving_replay_capture = Some(selected);
+            current.storage_regions.insert(region, rtdb_directory::StorageRegion::Local {
+                archive: None, checkpoint_suffix: None, repair_archive: Some(capture),
+                tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            });
+            Ok(())
+        }).await?;
+        let error = retire_capture(directory.as_ref(), &published, &storage, &archive, &keys, capture, None)
+            .await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("The capture still has admitted archive I/O"));
+        assert_eq!(media.get(&original).await?.as_ref(), b"original");
+        assert_eq!(keys.existing_key(&archive_key).await?, Some(material));
+
+        drop(witness);
+        let retired = finish_capture_retirement(directory.as_ref(), &storage, &keys, &record.id, capture).await?;
+        assert!(retired.observed_empty_at_ms.is_some());
+        assert!(matches!(media.get(&original).await, Err(rtdb_storage::Error::MissingObject(_))));
+        assert_eq!(keys.existing_key(&archive_key).await.unwrap_err().code, "rtdb.multi/key-destroyed");
+        let current = directory.deployment(&record.id).await?.unwrap();
+        assert!(current.storage_regions.is_empty());
+        assert_eq!(current.serving_replay_capture, Some(selected));
+        assert_eq!(current.checkpoint_recovery.unwrap().operation, capture);
+        let retried = super::super::restore(
+            directory.as_ref(), &storage, &archive, &keys, deployment, capture, 4 << 20, None,
+        ).await?;
+        assert_eq!(retried, receipt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_restore_keeps_its_own_capture_alongside_serving_replay() -> Result<()> {
+        let files = tempfile::tempdir().unwrap();
+        let archive = CellStorage::Local { root: files.path().join("archive") };
+        let storage = CellStorage::Local { root: files.path().join("serving") };
+        let keys = LocalKeyService::new(files.path().join("keys"))?;
+        let directory = MemoryDirectory::new();
+        let capture = Uuid::new_v4();
+        let mut record = DeploymentRecord::new("tenant", "org", Vec::new(), now_ms());
+        record.serving_replay_capture = Some(Uuid::new_v4());
+        record.lifecycle = Lifecycle::Restoring;
+        record.checkpoint_recovery = Some(Box::new(rtdb_directory::CheckpointRecovery {
+            operation: capture, checkpoint: rtdb_directory::Checkpoint { block: 0, boundary: 0, source: 0,
+                system_time: 0, root_sha256: Some([1; 32]) }, epoch: 0, previous_lifecycle: Lifecycle::Live,
+            archive: archive_binding(&archive)?, manifest_sha256: "pending".into(), completed_at_ms: None,
+        }));
+        let record = directory.create_deployment(record).await?;
+        let error = retire_capture(directory.as_ref(), &record, &storage, &archive, &keys, capture, None)
+            .await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("The serving history still depends on this capture"));
+        let current = directory.deployment(&record.id).await?.unwrap();
+        assert!(require_capture_open(&current, capture).is_ok());
         Ok(())
     }
 

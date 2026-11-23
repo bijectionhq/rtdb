@@ -902,7 +902,8 @@ pub async fn retain_serving_replay(
             return Ok(());
         }
         let previous = serving_archive(record)?.map(|source| source.point.checkpoint.block);
-        let parked = record.holder.is_none() && record.checkpoint_recovery.is_none() && record.move_from.is_none();
+        let restore_pending = record.checkpoint_recovery.as_ref().is_some_and(|repair| repair.completed_at_ms.is_none());
+        let parked = record.holder.is_none() && !restore_pending && record.move_from.is_none();
         let exact_checkpoint = record.checkpoint == Some(point.checkpoint)
             && point.checkpoint.root_sha256.is_some() && record.recovery_manifest_sha256.is_some();
         let same_selection = record.epoch == installation.epoch

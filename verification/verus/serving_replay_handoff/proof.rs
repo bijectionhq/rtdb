@@ -3,7 +3,7 @@
 #[path = "../../../rust/crates/multi/src/archive/replay_handoff.rs"]
 mod handoff;
 
-use handoff::may_install;
+use handoff::{may_install, retains_capture};
 use vstd::prelude::*;
 
 verus! {
@@ -24,6 +24,24 @@ fn an_installed_source_moves_strictly_forward(prior: i64, candidate: i64)
 {
     let accepted = may_install(true, true, true, Some(prior), candidate);
     assert(!accepted);
+}
+
+fn pending_restore_retains_its_capture(selected: u128, repair: u128) {
+    let retained = retains_capture(Some(selected), Some((repair, true)), repair);
+    assert(retained);
+}
+
+fn an_explicit_archive_supersedes_a_completed_repair(selected: u128, repair: u128)
+    requires selected != repair,
+{
+    let old = retains_capture(Some(selected), Some((repair, false)), repair);
+    let new = retains_capture(Some(selected), Some((repair, false)), selected);
+    assert(!old && new);
+}
+
+fn a_completed_repair_without_a_successor_retains_its_capture(repair: u128) {
+    let retained = retains_capture(None, Some((repair, false)), repair);
+    assert(retained);
 }
 
 }

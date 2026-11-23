@@ -2065,6 +2065,24 @@ async fn the_local_reaper_retires_an_original_l0_pack_under_verified_archive_cus
     assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
     reopened.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
     assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20", "30"]);
+    let holder = cell.holder("shop").await.unwrap();
+    drop(reopened);
+    cell.node(holder).agent.park("shop").await.unwrap();
+    let after_restore = cell.directory.deployment(&deployment).await.unwrap().unwrap();
+    let next = uuid::Uuid::new_v4();
+    let advanced = rtdb_multi::archive::capture(
+        cell.directory.clone(), &storage, &archive, &keys, id, next, None, Some(&after_restore),
+    ).await.unwrap();
+    assert!(advanced.objects.iter().any(|object| object.name == input.name));
+    let registered = cell.directory.deployment(&deployment).await.unwrap().unwrap();
+    rtdb_multi::archive::retain_serving_replay(
+        cell.directory.as_ref(), &storage, &archive, &keys, &registered, next, &advanced.manifest_sha256().unwrap(), None,
+    ).await.unwrap();
+    let published = cell.directory.deployment(&deployment).await.unwrap().unwrap();
+    assert_eq!(published.serving_replay_capture, Some(next));
+    assert!(published.checkpoint_repair_receipts.contains_key(&repair));
+    let reopened = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20", "30"]);
     drop(reopened);
     cell.stop().await;
 }

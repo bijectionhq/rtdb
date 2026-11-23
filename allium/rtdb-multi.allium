@@ -2723,6 +2723,7 @@ rule HostedCheckpointCapture {
 
 rule HostedCheckpointRecovery {
     -- An installation with a selected replay archive restores from a complete replay capture and selects that capture when the restore completes.
+    -- A pending restore retains its input while the selected serving capture retains current history.
     when: AuthenticatedRecoveryRestore(authority, name, capture_id, manifest_digest)
 
     requires: ConfiguredOrganizationOwns(authority, name)
@@ -2743,6 +2744,7 @@ rule RetainServingReplayArchive {
     -- The installation publishes the capture and the recovery inventory digest observed in its archive custody together.
     -- A new region opens that source under its own admission before rechecking the published inventory.
     -- Later captures can inherit the admitted source and a newer verified checkpoint can replace it.
+    -- A completed restore can advance to a newer replay capture after the root parks at that checkpoint.
     -- A superseded archive stays available to readers admitted under its identity until their work drains.
     when: AuthenticatedReplayArchiveRetention(authority, name, capture_id, manifest_digest)
 
