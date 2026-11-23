@@ -1069,13 +1069,13 @@ mod tests {
         let backend = Backend::new(stream, 1, MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES));
         let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
         let mut session = Session::new(Bytes::new(), router, directory.clone(), record.id.clone(), None, false);
-        drop(session.record.wait_for(|snapshot| snapshot.is_some()).await.unwrap());
+        drop(session.record.as_mut().unwrap().wait_for(|snapshot| snapshot.is_some()).await.unwrap());
         assert!(!session.stale(&backend));
 
         record.epoch = 2;
         let version = record.version;
         directory.replace_deployment(record, version).await.unwrap().applied().unwrap();
-        drop(session.record.wait_for(|snapshot| snapshot.as_ref().is_some_and(|snapshot| snapshot.epoch == 2)).await.unwrap());
+        drop(session.record.as_mut().unwrap().wait_for(|snapshot| snapshot.as_ref().is_some_and(|snapshot| snapshot.epoch == 2)).await.unwrap());
         assert!(session.stale(&backend));
     }
 
