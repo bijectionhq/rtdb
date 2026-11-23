@@ -8,7 +8,8 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
-pub(super) const MAX_BYTES: usize = 8 * 1024 * 1024;
+// Match the owned Flight request envelope. Each control cell is bounded separately.
+pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
 const MAGIC: &[u8] = b"BJWP1";
 const MAX_EFFECTS: usize = 4096;
 
