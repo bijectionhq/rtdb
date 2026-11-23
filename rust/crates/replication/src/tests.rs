@@ -1730,6 +1730,47 @@ async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp, positio
     (key, receipt, readback)
 }
 
+#[tokio::test]
+async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies() {
+    let wall = Arc::new(AtomicI64::new(110));
+    let clock: ReplicationClock = {
+        let wall = Arc::clone(&wall);
+        Arc::new(move || Timestamp(wall.load(Ordering::Relaxed)))
+    };
+    let config = ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() };
+    let mut fixture = fixture_with_clock(config, 1 << 16, Some(clock)).await;
+    let scope = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap();
+    Arc::get_mut(&mut fixture.driver.resolve).unwrap().owned_witness_scope = Some(scope);
+    let operation = DbOp::AttachDatabase(proto::AttachDatabase {
+        db_name: Some("a".repeat(1 << 17)), config: Some(DatabaseConfig::default()),
+    });
+    let (_, prior_applied, prior_record) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    assert!(matches!(ReplicaEnvelope::decode(&prior_record.payload).unwrap().unwrap().message, ReplicaBody::OversizedMessage(_)));
+
+    let strict = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true }],
+        SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory,
+    ).unwrap().with_placed_seed(Some(scope.issue()));
+    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord {
+        metadata: LogMetadata { offset: LogOffset(1), timestamp: Timestamp(101) },
+        payload: strict.encode().unwrap().into_bytes(),
+    });
+    fixture.driver.resolve_next_source().await.unwrap();
+    let leader = fixture.driver.leader.as_ref().unwrap();
+    assert!(leader.resolution.is_none());
+    assert!(!leader.ready_source());
+    assert!(!leader.accepting_commands());
+
+    wall.store(200, Ordering::Relaxed);
+    fixture.driver.consume(prior_record).await.unwrap();
+    assert!(matches!(prior_applied.await.unwrap().unwrap(), Applied::Transaction(_)));
+    assert!(fixture.driver.leader.as_ref().unwrap().ready_source());
+    fixture.driver.resolve_next_source().await.unwrap();
+    let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
+    assert_eq!(result.as_ref().unwrap().result().error().unwrap().code, "rtdb.owned/expired");
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    fixture.driver.demote().await.unwrap();
+}
+
 async fn attach_readback_fixture(replica_message_limit: usize) -> (Fixture, DbOp, oneshot::Receiver<DbOp>, oneshot::Sender<Result<()>>) {
     let mut fixture = fixture(ReplicationConfig {
         may_lead: false, assertion_interval: Duration::from_secs(3600), ..Default::default()

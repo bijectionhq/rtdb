@@ -65,6 +65,11 @@ pub(crate) struct IdempotencyGuard {
 }
 
 impl SourceTransaction {
+    pub fn uses_staging_deadline(&self) -> bool {
+        self.operations.iter().any(|operation| matches!(operation,
+            Operation::Public(TxOp::OwnedDeadline { recheck_at_staging: true, .. })))
+    }
+
     pub fn new(ops: Vec<TxOp>, options: SubmitOptions, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let operations = ops.into_iter().map(Operation::Public).collect();
         Self::from_operations(operations, options, memory)

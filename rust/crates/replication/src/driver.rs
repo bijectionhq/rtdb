@@ -296,10 +296,23 @@ struct LeaderState {
     recovery_write: Option<Arc<PendingWrite>>,
     held: VecDeque<AdmittedReplica>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
     source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
+    waiting_strict_source: Option<SourceInput>,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
     deferred_commands: VecDeque<Command>,
     compactor_reset: Option<CompactorReset>,
     trie_removals: Vec<AppliedTrieRemoval>,
+}
+
+struct SourceInput {
+    position: SourcePosition,
+    log_time: Timestamp,
+    work: SourceWork,
+    _decode_charge: Arc<MemoryReservation>,
+}
+
+enum SourceWork {
+    Resolve(SourceTransaction),
+    Skip(SourceMessage),
 }
 
 struct AppliedTrieRemoval {
@@ -313,6 +326,15 @@ impl LeaderState {
     fn resolver_mut(&mut self) -> Result<&mut TxResolver> { self.resolver.as_mut().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
     fn can_poll_source(&self) -> bool { self.recovery_write.is_none() && self.cycle.accepting() }
     fn accepting(&self) -> bool { self.can_poll_source() && self.resolution.is_none() }
+    fn drained_for_strict_source(&self) -> bool { self.pending.is_empty() && self.production.is_none() }
+    fn ready_source(&self) -> bool {
+        self.accepting() && if self.waiting_strict_source.is_some() {
+            self.drained_for_strict_source()
+        } else {
+            self.source_head.is_some() || !self.source_batch.is_empty()
+        }
+    }
+    fn accepting_commands(&self) -> bool { self.accepting() && self.waiting_strict_source.is_none() }
     fn pending_tx_at(&self, sequence: Option<TermSequence>) -> Option<(&Arc<PendingWrite>, &Arc<ResolvedTx>)> {
         self.pending.iter().find_map(|pending| {
             let WriteBody::Resolved(tx) = &pending.body else { return None; };
@@ -421,16 +443,16 @@ impl ReplicationDriver {
             self.prepare_polls();
             enum Event { ReplicaBatch(Box<dyn LogTail>, Result<TailPoll>), Replica, SourceBatch(Box<dyn LogTail>, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>) }
             let ready_replica = self.replica_head.is_some() || !self.replica_batch.is_empty();
-            let accept_commands = self.leader.as_ref().is_none_or(|leader| leader.accepting() || leader.deferred_commands.len() < 128);
+            let accept_commands = self.leader.as_ref().is_none_or(|leader| leader.accepting_commands() || leader.deferred_commands.len() < 128);
             let mut empty_poll = None;
             let mut empty_job = None;
             let mut empty_resolution = None;
             let mut empty_production = None;
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
-                    let accepting = leader.accepting();
-                    let ready_source = accepting && (leader.source_head.is_some() || !leader.source_batch.is_empty());
-                    (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, accepting && !leader.deferred_commands.is_empty())
+                    let ready_source = leader.ready_source();
+                    let ready_deferred = leader.accepting_commands() && !leader.deferred_commands.is_empty();
+                    (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
                 }
                 None => (&mut empty_poll, &mut empty_job, &mut empty_resolution, &mut empty_production, false, false),
             };
@@ -580,7 +602,8 @@ impl ReplicationDriver {
             }
         }
         if let Some(leader) = &mut self.leader {
-            if leader.can_poll_source() && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
+            if leader.can_poll_source() && leader.waiting_strict_source.is_none()
+                && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
                 if let Some(tail) = leader.source_tail.take() { leader.source_poll = Some(start_poll(tail, self.config.assertion_interval)); }
             }
         }
@@ -642,7 +665,7 @@ impl ReplicationDriver {
         let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
+            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
         if produce_inherited {
             self.produce_pending()?;
         }
@@ -1128,6 +1151,11 @@ impl ReplicationDriver {
     }
     async fn resolve_next_source(&mut self) -> Result<()> {
         let Some(leader) = &mut self.leader else { return Ok(()); };
+        if leader.waiting_strict_source.is_some() {
+            if !leader.ready_source() { return Ok(()); }
+            let source = leader.waiting_strict_source.take().expect("checked for a waiting strict source");
+            return self.begin_source_resolution(source);
+        }
         let (LogRecord { metadata, payload }, decode_reservation) = if let Some(head) = leader.source_head {
             let tail = leader.source_tail.as_deref_mut().ok_or_else(|| invalid("Prepared source head has no tail"))?;
             let Some(record) = read_replay_head(tail, head, &self.resolve.memory, source_decode_bound, &self.cancellation).await? else { return Ok(()); };
@@ -1138,7 +1166,7 @@ impl ReplicationDriver {
             (record, None)
         };
         let position = self.logs.source_position(metadata)?;
-        let _decoded_reservation = match decode_reservation {
+        let decode_charge = match decode_reservation {
             Some(reservation) => reservation,
             None => self.resolve.memory.reserve(source_decode_bound(payload.len())?)?,
         };
@@ -1151,29 +1179,21 @@ impl ReplicationDriver {
         let resolved = match message {
             Some(message @ (SourceMessage::LegacyTransaction(_) | SourceMessage::Protobuf(SourceBody::Tx(_)))) => {
                 if self.config.external_source { return Err(Anomaly::incorrect("xtdb/external-source-transaction", "Client transactions are disabled for an external-source database")); }
-                let skipped = self.config.skipped_transactions.contains(&position);
-                let request = if skipped { None } else { Some(SourceTransaction::decode(&message, &self.resolve.memory)?) };
-                let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
-                let context = Arc::clone(&self.resolve);
-                let clock = Arc::clone(&self.clock);
-                let maximum_inline_bytes = self.logs.replica_inline_limit();
-                leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
-                    let _decoded_reservation = _decoded_reservation;
-                    let result = match request {
-                        Some(request) => resolver.resolve_source_for_writer(durable, position, metadata.timestamp, request, &context,
-                            Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes })).await,
-                        None => async {
-                            let digits = position.0.to_string();
-                            let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
-                            let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
-                            let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
-                            context.storage.object_store().put(&key, payload).await?;
-                            let attempt = SourceTransaction::skipped_attempt(&message, position)?;
-                            resolver.resolve_skipped(durable, position, metadata.timestamp, attempt, &context)
-                        }.await,
-                    };
-                    (resolver, result)
-                }) });
+                let work = if self.config.skipped_transactions.contains(&position) {
+                    SourceWork::Skip(message)
+                } else {
+                    SourceWork::Resolve(SourceTransaction::decode(&message, &self.resolve.memory)?)
+                };
+                let source = SourceInput { position, log_time: metadata.timestamp, work, _decode_charge: decode_charge };
+                // Keep this position as the source head until every previously queued replica
+                // write has been read back. In particular, none can still be offloading a body.
+                if matches!(&source.work, SourceWork::Resolve(request) if request.uses_staging_deadline())
+                    && !leader.drained_for_strict_source()
+                {
+                    leader.waiting_strict_source = Some(source);
+                } else {
+                    self.begin_source_resolution(source)?;
+                }
                 None
             }
             Some(SourceMessage::Protobuf(SourceBody::AttachDatabase(message))) => {
@@ -1229,6 +1249,32 @@ impl ReplicationDriver {
         if let Some(resolved) = resolved { self.enqueue_resolved(resolved, None).await?; }
         Ok(())
     }
+    fn begin_source_resolution(&mut self, source: SourceInput) -> Result<()> {
+        let durable = self.partition.snapshot();
+        let leader = self.leader.as_mut().ok_or_else(term_ended)?;
+        let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
+        let context = Arc::clone(&self.resolve);
+        let clock = Arc::clone(&self.clock);
+        let maximum_inline_bytes = self.logs.replica_inline_limit();
+        leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
+            let SourceInput { position, log_time, work, _decode_charge } = source;
+            let result = match work {
+                SourceWork::Resolve(request) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
+                    Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes })).await,
+                SourceWork::Skip(message) => async {
+                    let digits = position.0.to_string();
+                    let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
+                    let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
+                    let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
+                    context.storage.object_store().put(&key, payload).await?;
+                    let attempt = SourceTransaction::skipped_attempt(&message, position)?;
+                    resolver.resolve_skipped(durable, position, log_time, attempt, &context)
+                }.await,
+            };
+            (resolver, result)
+        }) });
+        Ok(())
+    }
     async fn enqueue_resolved(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>) -> Result<()> {
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.resolved(resolved.writes().row_count()?)?;
@@ -1245,13 +1291,13 @@ impl ReplicationDriver {
     }
     async fn flush_if_due(&mut self) -> Result<()> {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        if self.leader.as_ref().is_some_and(LeaderState::accepting) && self.flush_timer.should_flush((self.clock)(), persisted) { self.cut().await?; }
+        if self.leader.as_ref().is_some_and(LeaderState::accepting_commands) && self.flush_timer.should_flush((self.clock)(), persisted) { self.cut().await?; }
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
         let Some(leader) = &mut self.leader else { command.fail(term_ended()); return Ok(()); };
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
-        if !leader.accepting() { leader.deferred_commands.push_back(command); return Ok(()); }
+        if !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }
         match command {
             Command::ResetCompactor { expected, expected_block, replacement, reservations, completion, .. } => {
                 let value = self.partition.value();

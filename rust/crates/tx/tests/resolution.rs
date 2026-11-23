@@ -1060,6 +1060,10 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(!changed.writes().tables().contains_key(&facts.table("owner")));
 
     let staging_deadline = || TxOp::OwnedDeadline { until: Timestamp(200), recheck_at_staging: true };
+    let apply_staged = |resolver: &mut TxResolver| {
+        while let Some(staged) = resolver.take_head() { state.apply(staged.writes()).unwrap(); }
+    };
+    apply_staged(&mut resolver);
     let expired = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(4), Timestamp(104),
         source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication { clock: &|| Timestamp(199), maximum_inline_bytes: Some(1 << 20) }),
@@ -1069,6 +1073,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(!expired.writes().tables().contains_key(&table));
     assert!(!expired.writes().tables().contains_key(&facts.table("owner")));
 
+    apply_staged(&mut resolver);
     let oversized = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(5), Timestamp(105),
         source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(100) }),
@@ -1078,6 +1083,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(!oversized.writes().tables().contains_key(&table));
     assert!(!oversized.writes().tables().contains_key(&facts.table("owner")));
 
+    apply_staged(&mut resolver);
     let accepted = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(6), Timestamp(106),
         source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(1 << 20) }),
