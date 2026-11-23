@@ -294,8 +294,6 @@ impl TxResolver {
             system_time: Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
         };
         let attempt = request.placed_attempt(position)?;
-        let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
-        tx.trace_parent = span.as_ref().map(|span| span.context());
         let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
             && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
         let placement = if selected_time.is_ok() {
@@ -303,6 +301,8 @@ impl TxResolver {
         } else {
             Ok(())
         };
+        let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+        tx.trace_parent = span.as_ref().map(|span| span.context());
         let replay = match &request.guard {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
