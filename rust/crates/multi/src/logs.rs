@@ -438,7 +438,7 @@ impl SealedLog {
 }
 
 fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
-    Ok(LogRecord { metadata: record.metadata, payload: cipher.open(stream, &record.payload)? })
+    Ok(LogRecord { payload: cipher.open(stream, &record.payload)?, ..record })
 }
 
 #[async_trait]

@@ -148,7 +148,7 @@ async fn memory_replay_delivery_keeps_its_charge_through_truncation_and_the_appe
     let memory = MemoryBudget::new(1024);
     let append_bound = 256 + 7;
     let append_reservation = ReadReservation::new(append_bound, memory.reserve(append_bound).unwrap());
-    let payload = LogRecord { metadata: LogMetadata { offset: LogOffset(-1), timestamp: Timestamp(0) }, payload: Bytes::from_static(b"payload") }
+    let payload = LogRecord::new(LogMetadata { offset: LogOffset(-1), timestamp: Timestamp(0) }, Bytes::from_static(b"payload"))
         .retain(append_reservation).unwrap().payload;
     let first = log.enqueue(payload, Timestamp(5)).await.unwrap().durable().await.unwrap();
     let mut tail = log.tail(LogOffset(-1)).await.unwrap();

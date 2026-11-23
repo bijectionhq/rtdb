@@ -144,7 +144,7 @@ async fn local_tail_delivers_a_capped_prefix_and_resumes_at_the_exact_byte_offse
         let receipt = log.enqueue(payload.clone(), timestamp).await.unwrap();
         let metadata = LogMetadata { offset: LogOffset(expected_offset), timestamp };
         expected_offset += 21 + payload.len() as i64;
-        appends.push((receipt, LogRecord { metadata, payload }));
+        appends.push((receipt, LogRecord::new(metadata, payload)));
     }
     let mut expected = Vec::new();
     for (receipt, record) in appends {

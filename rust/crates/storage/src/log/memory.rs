@@ -90,7 +90,7 @@ impl MemoryLog {
         let timestamp = sample(&payload)?;
         let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
         records.next = next;
-        records.values.push_back(LogRecord { metadata, payload });
+        records.values.push_back(LogRecord::new(metadata, payload));
         self.shared.progress.advance(metadata.offset);
         let (sender, durable) = oneshot::channel();
         let _ = sender.send(Ok(metadata));

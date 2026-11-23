@@ -147,6 +147,10 @@ pub trait IndexPageLifecycle: Send + Sync {
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
+    /// Opens the read-only objects owned by an authenticated replica delivery.
+    async fn open_replica_objects(&self, _scope: crate::log::ReplicaObjectScope) -> Result<Arc<dyn ObjectStore>> {
+        Err(Error::Task("The store has no installed replica object scope".into()))
+    }
     /// Published checkpoint files survive a process restart on the same storage.
     fn syncs_checkpoints(&self) -> bool { false }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }

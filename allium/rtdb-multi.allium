@@ -463,12 +463,14 @@ contract LogService {
         -- The installed journal chooses a replacement grant against its exact observed predecessor and the candidate's current enrollment.
         -- The chosen result binds the original paid append window and a protected recovery cut.
         -- A worker reports readiness only after materialising that exact checkpoint and applying the chosen suffix through the grant cut.
+        -- An offloaded record retains its replay hold through the read from its original writer's object scope.
+        -- The loaded body matches the digest in the chosen record.
         -- A gateway authenticates readiness against its invocation and the current installed journal grant.
         -- An installed journal route owns its session authority independently of the cell directory.
 
     @invariant InstalledCheckpointPrecedesTrim
         -- A checkpoint custodian supplies the exact immutable provider manifest for one reconstructable RTDB checkpoint and journal cut.
-        -- The journal orders publication against the current grant before accepting trim through that cut.
+        -- The journal orders publication under the custodian before accepting trim through that cut.
         -- A live replay reservation protects its exact interval, and an independent checkpoint hold protects its original root.
 
     @invariant FreshJournalReadConsumesAnInvocation

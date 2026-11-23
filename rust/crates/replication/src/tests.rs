@@ -66,8 +66,8 @@ async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: 
     Fixture { driver, handle, logs, store, blocks, memory, source, replica }
 }
 fn raw(position: i64, term: i64, sequence: i64, body: ReplicaBody) -> LogRecord {
-    LogRecord { metadata: LogMetadata { offset: LogOffset(position), timestamp: Timestamp(position * 100 + 1) },
-        payload: ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(sequence)), message: body }.encode().into() }
+    LogRecord::new(LogMetadata { offset: LogOffset(position), timestamp: Timestamp(position * 100 + 1) },
+        ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(sequence)), message: body }.encode().into())
 }
 fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary(proto::BlockBoundary { block_index: Some(index), latest_processed_msg_id: Some(source), external_source_token: None }) }
 fn resolved(id: i64, source: i64) -> ReplicaBody { ReplicaBody::ResolvedTx(proto::ResolvedTx { tx_id: Some(id), system_time_micros: Some(id * 100 + 100), committed: Some(true), src_msg_id: Some(source), ..Default::default() }) }
@@ -862,7 +862,7 @@ async fn cancelled_fresh_offload_read_keeps_its_delivery_until_provider_drain() 
     let hold = Arc::new(());
     let released_hold = Arc::downgrade(&hold);
     let delivery = Bytes::from_owner(HeldDelivery { bytes: proxy.encode(), _hold: hold });
-    let record = logs.decode_replica(LogRecord { metadata: LogMetadata { offset: LogOffset(0), timestamp: Timestamp(0) }, payload: delivery }).unwrap().unwrap();
+    let record = logs.decode_replica(LogRecord::new(LogMetadata { offset: LogOffset(0), timestamp: Timestamp(0) }, delivery)).unwrap().unwrap();
     let waiter = tokio::spawn(async move { logs.resolve_oversized_fresh(record).await });
     entering.await.unwrap();
     waiter.abort();
@@ -1244,7 +1244,7 @@ async fn produced_memory_checkpoint(sequenced: bool) -> Fixture {
 }
 
 fn raw_with_envelope(position: i64, envelope: &ReplicaEnvelope) -> LogRecord {
-    LogRecord { metadata: LogMetadata { offset: LogOffset(position), timestamp: Timestamp(0) }, payload: envelope.encode().into() }
+    LogRecord::new(LogMetadata { offset: LogOffset(position), timestamp: Timestamp(0) }, envelope.encode().into())
 }
 
 async fn reopen_memory_checkpoint(fixture: &Fixture) -> (ReplicationHandle, ReplicationDriver) {
@@ -1867,10 +1867,10 @@ async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies
     let strict = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true, journal_before: None }],
         SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory,
     ).unwrap().with_placed_seed(Some(scope.issue()));
-    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord {
-        metadata: LogMetadata { offset: LogOffset(1), timestamp: Timestamp(101) },
-        payload: strict.encode().unwrap().into_bytes(),
-    });
+    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord::new(
+        LogMetadata { offset: LogOffset(1), timestamp: Timestamp(101) },
+        strict.encode().unwrap().into_bytes(),
+    ));
     fixture.driver.resolve_next_source().await.unwrap();
     let leader = fixture.driver.leader.as_ref().unwrap();
     assert!(leader.resolution.is_none());
@@ -1911,9 +1911,9 @@ async fn a_strict_write_expired_before_dispatch_resolves_again_from_its_source()
     ).unwrap().with_placed_seed(Some(scope.issue()));
     let payload = command.encode().unwrap().into_bytes();
     let source = fixture.logs.append_source_encoded(payload.clone(), Timestamp(100)).await.unwrap();
-    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord {
-        metadata: LogMetadata { offset: LogOffset(source.0), timestamp: Timestamp(100) }, payload,
-    });
+    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord::new(
+        LogMetadata { offset: LogOffset(source.0), timestamp: Timestamp(100) }, payload,
+    ));
     fixture.driver.resolve_next_source().await.unwrap();
     let leader = fixture.driver.leader.as_mut().unwrap();
     let (resolver, result) = super::pending_resolution(&mut leader.resolution).await;

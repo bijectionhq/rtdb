@@ -1292,7 +1292,7 @@ impl ReplicationDriver {
             let source = leader.waiting_strict_source.take().expect("checked for a waiting strict source");
             return self.begin_source_resolution(source);
         }
-        let (LogRecord { metadata, payload }, decode_reservation) = if let Some(head) = leader.source_head {
+        let (LogRecord { metadata, payload, .. }, decode_reservation) = if let Some(head) = leader.source_head {
             let tail = leader.source_tail.as_deref_mut().ok_or_else(|| invalid("Prepared source head has no tail"))?;
             let Some(record) = read_replay_head(tail, head, &self.resolve.memory, source_decode_bound, &self.cancellation).await? else { return Ok(()); };
             leader.source_head = None;

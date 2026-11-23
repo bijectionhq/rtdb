@@ -94,7 +94,7 @@ impl KafkaTail {
             return Err(Error::Task("log read reservation is too small".into()));
         }
         let payload = self.pending_message()?.as_borrowed().payload().ok_or_else(|| self.tombstone())?;
-        let record = LogRecord { metadata: head.metadata, payload: Bytes::copy_from_slice(payload) };
+        let record = LogRecord::new(head.metadata, Bytes::copy_from_slice(payload));
         let record = match reservation { Some(reservation) => record.retain(reservation)?, None => record };
         self.pending = None;
         self.next = record.metadata.offset.0 + 1;

@@ -104,7 +104,7 @@ pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeade
     let mut payload = vec![0; header.payload_size];
     file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
     read_record_trailer(file, path, header.metadata.offset)?;
-    Ok(LogRecord { metadata: header.metadata, payload: Bytes::from(payload) })
+    Ok(LogRecord::new(header.metadata, Bytes::from(payload)))
 }
 
 pub(super) fn inspect_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogMetadata> {

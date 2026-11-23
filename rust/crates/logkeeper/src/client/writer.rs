@@ -156,7 +156,7 @@ pub(crate) struct Writer {
 }
 
 fn record(entry: &Entry) -> LogRecord {
-    LogRecord { metadata: LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, payload: entry.payload.clone() }
+    LogRecord::new(LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, entry.payload.clone())
 }
 
 /// Seals every server and gathers a write quorum of replies, plus any that arrive shortly after.

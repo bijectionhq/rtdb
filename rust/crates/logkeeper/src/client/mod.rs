@@ -413,7 +413,7 @@ impl QuorumLog {
 }
 
 fn record(entry: crate::protocol::Entry) -> LogRecord {
-    LogRecord { metadata: LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, payload: entry.payload }
+    LogRecord::new(LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, entry.payload)
 }
 
 fn unavailable(stream: &str, message: impl Into<String>) -> Error { Error::Remote { key: stream.to_owned(), message: message.into() } }

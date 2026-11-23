@@ -960,8 +960,9 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
     let directory: Arc<dyn Directory> = MemoryDirectory::new();
     let keys = Arc::new(LocalKeyService::new(authority.data.path().join("keys")).unwrap());
     keys.key(&record.key_id()).await.unwrap();
+    let serving_root = authority.data.path().join("serving");
     let storage = CellStorage::Local {
-        root: authority.data.path().join("serving"),
+        root: serving_root.clone(),
     };
     let archive_root = authority.data.path().join("archive");
     let archive = CellStorage::Local {
@@ -1164,6 +1165,35 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
             .exists()
     );
 
+    let suffix = common::connect(&sql_address.to_string(), "shop").await;
+    let large = "x".repeat(1_310_720);
+    suffix
+        .simple_query(&format!(
+            "INSERT INTO suffix_values (_id, body) VALUES (1, '{large}')"
+        ))
+        .await
+        .unwrap();
+    drop(suffix);
+    let storage_root = rtdb_format::keys::StorageRoot::new(
+        rtdb_format::keys::CURRENT_STORAGE_VERSION,
+        rtdb_types::StorageEpoch(0),
+    )
+    .unwrap()
+    .key();
+    let original_objects = serving_root
+        .join(record.storage_prefix())
+        .join("~ordered")
+        .join(authority.placement.generation.to_string())
+        .join(incumbent.epoch.to_string())
+        .join(storage_root)
+        .join("oversized");
+    assert!(
+        fs::read_dir(original_objects)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().is_file())
+    );
+    assert!(route(&routing).await.head.next_lsn > interrupted.head.next_lsn);
+
     let unavailable = installed.endpoints[0].address;
     cohort
         .voters
@@ -1207,6 +1237,14 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
     assert_eq!(
         common::values(&replacement, "SELECT total FROM orders WHERE _id = 1").await,
         ["11"]
+    );
+    assert_eq!(
+        common::values(
+            &replacement,
+            "SELECT octet_length(body) FROM suffix_values WHERE _id = 1"
+        )
+        .await,
+        ["1310720"]
     );
     let elected = route(&routing).await.writer.grant.unwrap();
     assert_eq!(

@@ -21,7 +21,7 @@ pub struct ReplicaRecord {
     pub envelope: Arc<ReplicaEnvelope>,
     reservation: Arc<MemoryReservation>,
     pub(crate) fingerprint: Option<ReplicaFingerprint>,
-    oversized_delivery: Option<Bytes>,
+    oversized_delivery: Option<LogRecord>,
 }
 impl ReplicaRecord { pub fn retained_bytes(&self) -> usize { self.reservation.bytes() } }
 
@@ -225,11 +225,14 @@ impl PartitionLogs {
         let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
         let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
             .then(|| fingerprint(&record.payload));
-        let oversized_delivery = matches!(&envelope.message, ReplicaBody::OversizedMessage(_)).then_some(record.payload);
+        let oversized_delivery = matches!(&envelope.message, ReplicaBody::OversizedMessage(_)).then_some(record);
         Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery }))
     }
     /// Admission runs on the outer envelope before this fetch; a held block receives the resolved body.
     pub async fn resolve_oversized(&self, mut record: ReplicaRecord) -> Result<ReplicaRecord> {
+        if record.oversized_delivery.as_ref().is_some_and(|delivery| delivery.replica_objects.is_some()) {
+            return self.resolve_oversized_fresh(record).await;
+        }
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
@@ -241,10 +244,22 @@ impl PartitionLogs {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
+        let origin = delivery.replica_objects.as_ref().map(|custody| custody.scope);
+        if origin.is_some() && !matches!(&record.envelope.message,
+            ReplicaBody::OversizedMessage(reference) if reference.payload_sha256.as_ref().is_some_and(|sha| sha.len() == 32))
+        {
+            return Err(Anomaly::fault("rtdb.replication/oversized-digest", "An installed replica payload has no exact digest"));
+        }
         IoRegion::retaining(Arc::new(delivery), async {
-            let length = usize::try_from(self.store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
-            let _payload = self.memory.reserve(length)?;
-            let payload = self.store.get_fresh_exact(&key, length).await?;
+            let store = match origin {
+                Some(scope) => self.store.open_replica_objects(scope).await?,
+                None => Arc::clone(&self.store),
+            };
+            let length = usize::try_from(store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
+            let allocation = store.exact_object_allocation(&key, length)?;
+            let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(size_overflow)?;
+            let charge = self.memory.reserve(charge)?;
+            let payload = IoRegion::retaining(charge.clone(), store.get_fresh_exact(&key, length)).await?;
             self.decode_oversized(record, &payload)
         }).await
     }
@@ -258,7 +273,7 @@ impl PartitionLogs {
 }
 
 impl ReplicaRecord {
-    fn take_oversized_delivery(&mut self) -> Result<Bytes> {
+    fn take_oversized_delivery(&mut self) -> Result<LogRecord> {
         self.oversized_delivery.take().ok_or_else(|| Anomaly::fault(
             "rtdb.replication/oversized-delivery", "An offloaded replica record has no admitted delivery",
         ))

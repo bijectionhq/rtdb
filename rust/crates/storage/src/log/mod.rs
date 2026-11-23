@@ -61,15 +61,52 @@ pub struct LogMetadata {
     pub timestamp: Timestamp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaObjectScope {
+    pub deployment: uuid::Uuid,
+    pub incarnation: uuid::Uuid,
+    pub group: uuid::Uuid,
+    pub generation: u64,
+    pub writer_epoch: u64,
+}
+
+#[derive(Clone)]
+pub struct ReplicaObjectCustody {
+    pub scope: ReplicaObjectScope,
+    _hold: Arc<dyn Send + Sync>,
+}
+
+impl ReplicaObjectCustody {
+    pub fn new(scope: ReplicaObjectScope, hold: Arc<dyn Send + Sync>) -> Self {
+        Self { scope, _hold: hold }
+    }
+}
+
+impl std::fmt::Debug for ReplicaObjectCustody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.scope.fmt(formatter)
+    }
+}
+
+impl PartialEq for ReplicaObjectCustody {
+    fn eq(&self, other: &Self) -> bool { self.scope == other.scope }
+}
+impl Eq for ReplicaObjectCustody {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
     pub metadata: LogMetadata,
     pub payload: Bytes,
+    pub replica_objects: Option<ReplicaObjectCustody>,
 }
 
 const LOG_RECORD_OVERHEAD_BYTES: usize = 256;
 
 impl LogRecord {
+    pub fn new(metadata: LogMetadata, payload: Bytes) -> Self {
+        Self { metadata, payload, replica_objects: None }
+    }
+
     /// Keeps the caller's pre-read charge alive for every clone of the payload.
     pub fn retain(self, reservation: ReadReservation) -> Result<Self> {
         if reservation.length() < self.payload.len().saturating_add(LOG_RECORD_OVERHEAD_BYTES) { return Err(Error::Task("log record exceeds its read reservation".into())); }
@@ -79,7 +116,11 @@ impl LogRecord {
     fn with_read_reservation(self, reservation: ReadReservation) -> Self {
         struct Retained { bytes: Bytes, _reservation: ReadReservation }
         impl AsRef<[u8]> for Retained { fn as_ref(&self) -> &[u8] { &self.bytes } }
-        Self { metadata: self.metadata, payload: Bytes::from_owner(Retained { bytes: self.payload, _reservation: reservation }) }
+        Self {
+            metadata: self.metadata,
+            payload: Bytes::from_owner(Retained { bytes: self.payload, _reservation: reservation }),
+            replica_objects: self.replica_objects,
+        }
     }
 }
 

@@ -7,12 +7,13 @@ use crate::journal::{
 use crate::store::{EncryptingStore, ScopedCellWrites};
 use async_trait::async_trait;
 use bytes::Bytes;
-use ordered_logkeeper::ordered::Grant;
+use ordered_logkeeper::ordered::{Grant, Placement};
 use prost_types::Any;
 use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
 use rtdb_replication::{BlockDiscovery, PublishedCheckpoint};
 use rtdb_storage::{
     Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore,
+    log::ReplicaObjectScope,
     object_store::{ObjectReadAllocation, ReadReservation, RetainedBytes, StoredObject},
 };
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result};
@@ -107,7 +108,9 @@ impl RemoteStorageFactory for StoreFactory {
             (Some(opened.store), BlockDiscovery::AtPublished(published))
         };
         let bucket = self.storage.bucket(Arc::clone(&io)).await?;
-        let prefix = source_prefix(&placement, grant, root);
+        let storage_prefix = placement.record.storage_prefix();
+        let installed = placement.worker.placement();
+        let prefix = source_prefix(&storage_prefix, installed.generation, grant.epoch, root);
         let writer = match (&self.storage, &self.scoped_writes) {
             (CellStorage::S3 { config }, Some(scoped)) => {
                 let authorization: Arc<dyn rtdb_s3::WriteAuthorization> = scope.clone();
@@ -122,14 +125,22 @@ impl RemoteStorageFactory for StoreFactory {
             }
             (CellStorage::Local { .. }, _) => None,
         };
-        let upper =
-            Arc::new(crate::reference::PrefixedStore::new(bucket, prefix).with_writer(writer));
+        let upper = Arc::new(
+            crate::reference::PrefixedStore::new(Arc::clone(&bucket), prefix).with_writer(writer),
+        );
         crate::store::check_root(upper.as_ref(), &placement.record.id, true).await?;
         let upper: Arc<dyn ObjectStore> = Arc::new(EncryptingStore::new(upper, &material)?);
         let store = Arc::new(ServingStore {
             lower,
             upper,
             scope: Some(scope),
+            replica_objects: Some(ReplicaObjects {
+                installed,
+                storage_prefix,
+                root: root.clone(),
+                bucket,
+                material,
+            }),
             _protection: Some(protection),
         });
         Ok(OpenedRecoveryStore {
@@ -142,14 +153,56 @@ impl RemoteStorageFactory for StoreFactory {
     }
 }
 
-fn source_prefix(placement: &super::Placement, grant: Grant, root: &ObjectKey) -> String {
-    format!(
-        "{}/~ordered/{}/{}/{}",
-        placement.record.storage_prefix(),
-        placement.worker.placement().generation,
-        grant.epoch,
-        root.as_str()
-    )
+fn source_prefix(
+    storage_prefix: &str,
+    generation: u64,
+    writer_epoch: u64,
+    root: &ObjectKey,
+) -> String {
+    format!("{storage_prefix}/~ordered/{generation}/{writer_epoch}/{root}")
+}
+
+struct ReplicaObjects {
+    installed: Placement,
+    storage_prefix: String,
+    root: ObjectKey,
+    bucket: Arc<dyn ObjectStore>,
+    material: Vec<u8>,
+}
+
+impl ReplicaObjects {
+    async fn open(&self, scope: ReplicaObjectScope) -> rtdb_storage::Result<Arc<dyn ObjectStore>> {
+        if scope.deployment != self.installed.deployment
+            || scope.incarnation != self.installed.incarnation
+            || scope.group != self.installed.group
+            || scope.generation != self.installed.generation
+            || scope.writer_epoch == 0
+        {
+            return Err(Error::Task(
+                "The replica object scope belongs to a different installed placement".into(),
+            ));
+        }
+        let prefix = source_prefix(
+            &self.storage_prefix,
+            scope.generation,
+            scope.writer_epoch,
+            &self.root,
+        );
+        let bucket = Arc::new(crate::reference::PrefixedStore::new(
+            Arc::clone(&self.bucket),
+            prefix,
+        ));
+        let owner = self.installed.deployment.to_string();
+        let marker = ObjectKey::new(crate::store::ROOT_MARKER)?;
+        if bucket.get_fresh_exact(&marker, owner.len()).await?.as_ref() != owner.as_bytes() {
+            return Err(Error::Task(
+                "The replica object namespace has a different owner".into(),
+            ));
+        }
+        let reader = EncryptingStore::new(bucket, &self.material)
+            .map_err(|error| Error::Task(error.to_string()))?;
+        Ok(Arc::new(reader))
+    }
 }
 
 pub(super) async fn reopen_source(
@@ -161,7 +214,12 @@ pub(super) async fn reopen_source(
     origin: Preparation,
 ) -> Result<Arc<dyn ObjectStore>> {
     let root = ObjectKey::new(crate::archive::checkpoint_storage_root()?)?;
-    let prefix = source_prefix(placement, origin.writer, &root);
+    let prefix = source_prefix(
+        &placement.record.storage_prefix(),
+        placement.worker.placement().generation,
+        origin.writer.epoch,
+        &root,
+    );
     let bucket = storage.bucket(Arc::clone(io)).await?;
     let upper = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix));
     crate::store::check_root(upper.as_ref(), &placement.record.id, false).await?;
@@ -175,6 +233,7 @@ pub(super) async fn reopen_source(
         lower,
         upper,
         scope: None,
+        replica_objects: None,
         _protection: None,
     }))
 }
@@ -185,6 +244,7 @@ struct ServingStore {
     lower: Option<Arc<dyn ObjectStore>>,
     upper: Arc<dyn ObjectStore>,
     scope: Option<Arc<WriteScope>>,
+    replica_objects: Option<ReplicaObjects>,
     _protection: Option<Arc<crate::journal::Held>>,
 }
 
@@ -223,6 +283,17 @@ impl ServingStore {
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    async fn open_replica_objects(
+        &self,
+        scope: ReplicaObjectScope,
+    ) -> rtdb_storage::Result<Arc<dyn ObjectStore>> {
+        let owner = self
+            .replica_objects
+            .as_ref()
+            .ok_or_else(|| Error::Task("The store has no installed replica object scope".into()))?;
+        owner.open(scope).await
+    }
+
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         self.reading(key).await?.head_fresh(key).await
     }

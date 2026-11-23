@@ -13,7 +13,7 @@ use rtdb_storage::{
     Error, Result,
     log::{
         AppendCapacity, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange,
-        LogRecord, LogReplayTail, LogTail, ReplayHead,
+        LogRecord, LogReplayTail, LogTail, ReplayHead, ReplicaObjectCustody, ReplicaObjectScope,
     },
     object_store::ReadReservation,
 };
@@ -535,8 +535,20 @@ impl Cursor {
                 "The ordered record differs from the prepared head".into(),
             ));
         }
+        let placement = self.reads.journal.placement();
+        let scope = ReplicaObjectScope {
+            deployment: placement.deployment,
+            incarnation: placement.incarnation,
+            group: placement.group,
+            generation: placement.generation,
+            writer_epoch: first.grant.epoch,
+        };
         let record = LogRecord {
             metadata: head.metadata,
+            replica_objects: Some(ReplicaObjectCustody::new(
+                scope,
+                Arc::clone(held) as Arc<dyn Send + Sync>,
+            )),
             payload: Bytes::from_owner(Delivery {
                 bytes: first.payload,
                 _held: Arc::clone(held),
