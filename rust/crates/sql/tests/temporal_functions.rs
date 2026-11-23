@@ -34,6 +34,12 @@ async fn sql_extract_and_trunc_normalize_fields_and_execute_real_projection() {
 }
 
 #[tokio::test]
+async fn subtracting_a_date_column_and_literal_returns_signed_days() {
+    let sql = "SELECT d - DATE '1970-01-01' AS diff, DATE '1970-01-01' - d AS reverse_diff FROM (VALUES (DATE '1969-12-31')) v(d)";
+    assert_eq!(query(sql, "UTC").await.unwrap(), [vec![V::I32(-1), V::I32(1)]]);
+}
+
+#[tokio::test]
 async fn sql_range_bins_lower_period_bounds_and_support_lazy_cardinality() {
     assert_eq!(query("SELECT CARDINALITY(RANGE_BINS(INTERVAL '15' MINUTE,PERIOD(TIMESTAMP '2020-01-01T00:13Z',TIMESTAMP '2020-01-01T00:38Z')))","UTC").await.unwrap(),[vec![V::I32(3)]]);
     assert_eq!(query("SELECT CARDINALITY(RANGE_BINS(INTERVAL '1' SECOND,PERIOD(TIMESTAMP '2020-01-01T00:00Z',NULL)))","UTC").await.unwrap(),[vec![V::Null]]);

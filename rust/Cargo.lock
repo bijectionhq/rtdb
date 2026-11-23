@@ -4578,6 +4578,7 @@ dependencies = [
  "rtdb-types",
  "serde",
  "serde_json",
+ "stacker",
  "tokio",
  "tokio-util",
 ]
@@ -4622,6 +4623,7 @@ dependencies = [
  "rtdb-expr",
  "rtdb-format",
  "rtdb-maintenance",
+ "rtdb-metrics",
  "rtdb-node",
  "rtdb-plan",
  "rtdb-query",
@@ -4993,6 +4995,7 @@ dependencies = [
  "rtdb-expr",
  "rtdb-format",
  "rtdb-maintenance",
+ "rtdb-metrics",
  "rtdb-node",
  "rtdb-pg-codec",
  "rtdb-plan",

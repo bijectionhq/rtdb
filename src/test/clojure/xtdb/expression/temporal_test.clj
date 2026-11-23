@@ -9,7 +9,8 @@
             [xtdb.serde :as serde]
             [xtdb.test-util :as tu]
             [xtdb.time :as time]
-            [xtdb.types :as types])
+            [xtdb.types :as types]
+            [xtdb.vector.reader :as vr])
   (:import (java.time Duration Instant LocalDate LocalDateTime LocalTime Period ZoneId ZoneOffset ZonedDateTime)
            java.time.temporal.ChronoUnit
            (org.apache.arrow.vector PeriodDuration)
@@ -1250,6 +1251,108 @@
       true (list '== a-milli 'b) #xt/date "2023-01-01" #xt/date "2023-01-01"
       true (list '> 'b a-milli) #xt/date "2023-01-01" #xt/date "2023-01-02")))
 
+(t/deftest temporal-ne-is-the-negation-of-eq-across-types-and-units-6435-6441
+  (letfn [(cast-to [col col-type] (list 'cast col (types/->type col-type)))]
+    (t/are [eq? a-expr b-expr a b]
+        (= [eq? (not eq?)]
+           [(et/project1 (list '== a-expr b-expr) {:a a, :b b})
+            (et/project1 (list '<> a-expr b-expr) {:a a, :b b})])
+
+      true 'a (cast-to 'b [:date :milli]) #xt/date "2020-01-01" #xt/date "2020-01-01"
+      false 'a (cast-to 'b [:date :milli]) #xt/date "2020-01-01" #xt/date "2020-01-02"
+
+      true 'a 'b #xt/date "2020-01-01" #xt/date-time "2020-01-01T00:00"
+      false 'a 'b #xt/date "2020-01-01" #xt/date-time "2020-01-01T00:00:01"
+      true 'a 'b #xt/date "2020-01-01" #xt/zoned-date-time "2020-01-01T00:00Z"
+      true 'a 'b #xt/date-time "2020-01-01T00:00" #xt/zoned-date-time "2020-01-01T00:00Z"
+      false 'a 'b #xt/date-time "2020-01-01T00:00" #xt/zoned-date-time "2020-01-01T00:00+01:00"
+
+      true (cast-to 'a [:timestamp-local :milli]) (cast-to 'b [:timestamp-local :micro])
+      #xt/date-time "2020-01-01T00:00:00.123" #xt/date-time "2020-01-01T00:00:00.123"
+
+      false (cast-to 'a [:timestamp-local :milli]) (cast-to 'b [:timestamp-local :micro])
+      #xt/date-time "2020-01-01T00:00:00.123" #xt/date-time "2020-01-01T00:00:00.123001"
+
+      true (cast-to 'a [:timestamp-tz :milli "UTC"]) (cast-to 'b [:timestamp-tz :nano "UTC"])
+      #xt/zoned-date-time "2020-01-01T00:00:00.123Z" #xt/zoned-date-time "2020-01-01T00:00:00.123Z"
+
+      true (cast-to 'a [:time-local :second]) (cast-to 'b [:time-local :micro]) #xt/time "12:00:00" #xt/time "12:00:00"
+      false (cast-to 'a [:time-local :second]) (cast-to 'b [:time-local :micro]) #xt/time "12:00:00" #xt/time "12:00:01"
+
+      true (cast-to 'a [:duration :milli]) (cast-to 'b [:duration :micro]) #xt/duration "PT1S" #xt/duration "PT1S"
+      false (cast-to 'a [:duration :milli]) (cast-to 'b [:duration :micro]) #xt/duration "PT1S" #xt/duration "PT2S"
+
+      true (cast-to 'a [:interval :year-month]) (cast-to 'b [:interval :month-day-nano]) #xt/interval "P1Y" #xt/interval "P1Y"
+      false (cast-to 'a [:interval :year-month]) (cast-to 'b [:interval :month-day-nano]) #xt/interval "P1Y" #xt/interval "P13M"
+
+      true ['a] ['b] #xt/date "2020-01-01" #xt/date-time "2020-01-01T00:00"
+      false ['a] ['b] #xt/date "2020-01-01" #xt/date-time "2020-01-01T00:00:01"
+
+      true {:x 'a} {:x 'b} #xt/date "2020-01-01" #xt/date-time "2020-01-01T00:00"
+      false {:x 'a} {:x 'b} #xt/date "2020-01-01" #xt/date-time "2020-01-01T00:00:01"))
+
+  (t/are [a-expr b-expr a b expected]
+      (= expected
+         [(et/project1 (list '== a-expr b-expr) {:a a, :b b})
+          (et/project1 (list '<> a-expr b-expr) {:a a, :b b})])
+
+    ['a] ['b] nil #xt/date "2020-01-01" [nil nil]
+    {:x 'a} {:x 'b} nil #xt/date "2020-01-01" [nil nil]
+    {:x 'a} {:y 'b} #xt/date "2020-01-01" #xt/date "2020-01-01" [false true])
+
+  (t/is (= [false nil]
+           (et/project '(<> a b) [{:a #xt/date "2020-01-01", :b #xt/date-time "2020-01-01T00:00"}
+                                  {:a #xt/date "2020-01-01", :b nil}]))
+        "a null operand gives a null <>, as it does a null ="))
+
+(t/deftest date-minus-date-literal-is-the-days-between
+  (with-open [rel (vr/rel-reader [(tu/open-vec "a" #xt/type [:date :day] [#xt/date "2023-05-11" #xt/date "2023-04-01"])])]
+    (t/is (= {:res [10 -30], :res-type #xt/type :i32}
+             (et/run-projection rel '(- a #xt/date "2023-05-01")))
+          "column minus literal")
+    (t/is (= {:res [-10 30], :res-type #xt/type :i32}
+             (et/run-projection rel '(- #xt/date "2023-05-01" a)))
+          "literal minus column")))
+
+(t/deftest test-date-milli-args
+  (letfn [(project-milli [form ^LocalDate a]
+            (with-open [rel (vr/rel-reader [(tu/open-vec "a" #xt/type [:date :milli] [a])])]
+              (-> (et/run-projection rel form)
+                  (update :res first))))]
+    (t/are [res res-type form a] (= {:res res, :res-type res-type} (project-milli form a))
+      #xt/date "2023-05-01" #xt/type [:date :milli] '(date_trunc "MONTH" a) #xt/date "2023-05-17"
+      #xt/date "1969-12-01" #xt/type [:date :milli] '(date_trunc "MONTH" a) #xt/date "1969-12-15"
+      #xt/date "2023-06-17" #xt/type [:date :milli] '(+ a (single-field-interval 1 "MONTH" 2 0)) #xt/date "2023-05-17"
+      #xt/date "2023-06-17" #xt/type [:date :milli] '(+ (single-field-interval 1 "MONTH" 2 0) a) #xt/date "2023-05-17"
+      #xt/date "2022-05-17" #xt/type [:date :milli] '(- a (single-field-interval 1 "YEAR" 2 0)) #xt/date "2023-05-17"
+      #xt/date-time "2023-05-17T12:00" #xt/type [:timestamp-local :micro] '(+ a (single-field-interval 12 "HOUR" 2 0)) #xt/date "2023-05-17"
+      -16 #xt/type :i32 '(- (date_trunc "MONTH" a) a) #xt/date "2023-05-17"
+      16 #xt/type :i32 '(- a #xt/date "2023-05-01") #xt/date "2023-05-17"
+      true #xt/type :bool '(< a #xt/date "2023-05-18") #xt/date "2023-05-17"
+      true #xt/type :bool '(< a "2023-05-18") #xt/date "2023-05-17"
+      false #xt/type :bool '(<> a #xt/date "2023-05-17") #xt/date "2023-05-17"
+      1684281600.0 #xt/type :f64 '(_meta_double a) #xt/date "2023-05-17"
+      2023 #xt/type :i32 '(extract "YEAR" a) #xt/date "2023-05-17"
+      #xt/date "1969-12-15" #xt/type [:date :day] (list 'cast 'a (types/->type [:date :day])) #xt/date "1969-12-15"
+      #xt/date "1969-12-15" #xt/type [:date :milli] (list 'cast 'a (types/->type [:date :milli])) #xt/date "1969-12-15"
+      #xt/date-time "1969-12-15T00:00" #xt/type [:timestamp-local :micro] (list 'cast 'a (types/->type [:timestamp-local :micro])) #xt/date "1969-12-15"
+      "1969-12-15" #xt/type :utf8 (list 'cast 'a #xt/type :utf8) #xt/date "1969-12-15"))
+
+  (t/is (anomalous? [:unsupported nil #"date-milli"]
+                    (with-open [rel (vr/rel-reader [(tu/open-vec "a" #xt/type [:date :milli] [#xt/date "2023-05-17"])])]
+                      (et/run-projection rel '(generate_series a a (single-field-interval 1 "MONTH" 2 0)))))))
+
+(t/deftest test-casts-into-date-milli
+  (with-open [rel (vr/rel-reader [(tu/open-vec "ts" #xt/type [:timestamp-local :micro] [#xt/date-time "1969-12-15T13:00"])
+                                  (tu/open-vec "tstz" #xt/type [:timestamp-tz :micro "UTC"] [#xt/zoned-date-time "1969-12-15T13:00Z"])
+                                  (tu/open-vec "s" #xt/type :utf8 ["1969-12-15"])])]
+    (t/are [form] (= {:res [#xt/date "1969-12-15"], :res-type #xt/type [:date :milli]}
+                     (et/run-projection rel form))
+      (list 'cast 'ts (types/->type [:date :milli]))
+      (list 'cast 'tstz (types/->type [:date :milli]))
+      (list 'cast 's (types/->type [:date :milli]))
+      (list 'cast (list 'cast 'ts (types/->type [:date :day])) (types/->type [:date :milli])))))
+
 (t/deftest test-uoe-thrown-for-unsupported-div
   (t/is (anomalous? [:unsupported nil]
                     (et/project1 '(/ (+ (single-field-interval 1 "MONTH" 2 0) (single-field-interval 3 "MINUTE" 2 0)) 3) {})))
@@ -2032,3 +2135,19 @@
                                                  {:default-tz zone})]
     (t/is (= (.toInstant (.atStartOfDay (LocalDate/parse "2018-11-04") zone))
              (.toInstant res)))))
+
+(t/deftest time-columns-of-second-and-milli-unit-are-readable
+  (letfn [(project [unit expr]
+            (-> (tu/query-ra [:project {:projections [{'res expr}]}
+                              [:project {:projections [{'a (list 'cast "12:34:56.789" (types/->type [:time-local unit]))}
+                                                       {'b (list 'cast "12:34:57" (types/->type [:time-local unit]))}]}
+                               [:table {:rows [{}]}]]])
+                first :res))]
+    (t/are [unit expected expr] (= expected (project unit expr))
+      :second #xt/time "12:34:56" '(cast a #xt/type [:time-local :micro])
+      :second 56 '(extract "SECOND" a)
+      :second true '(< a b)
+
+      :milli #xt/time "12:34:56.789" '(cast a #xt/type [:time-local :nano] {:precision 9})
+      :milli 56 '(extract "SECOND" a)
+      :milli true '(< a b))))

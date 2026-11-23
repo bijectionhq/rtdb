@@ -109,22 +109,13 @@ pub(crate) fn null_eq_scoped(left: &Value, right: &Value, timezone: &str, alloca
     Ok(sql_eq_scoped(left, right, timezone, allocation)? == Some(true))
 }
 
-/// Numeric and composite inequality negate SQL equality; temporal scalars compare their read values without unit coercion.
-/// NULL produces unknown, including nested NULLs in equal-shaped lists or structs.
-/// The scope retains type metadata and reached Transit intermediates; callers separately own numeric scratch.
+/// Negates SQL equality in the session timezone and preserves unknown results.
 pub fn sql_not_eq_in_timezone(left: &Value, right: &Value, timezone: &str, allocation: &EvaluationScope) -> Result<Option<bool>> {
     sql_not_eq_scoped(left, right, timezone, Some(allocation))
 }
 
 pub(crate) fn sql_not_eq_scoped(left: &Value, right: &Value, timezone: &str, allocation: Option<&EvaluationScope>) -> Result<Option<bool>> {
-    admit_equality(left, right, allocation)?;
-    if nullish(left) || nullish(right) { return Ok(None); }
-    if matches!(left, Value::Transit(_)) || matches!(right, Value::Transit(_)) { return emitted_eq(left, right, allocation).map(|equal|Some(!equal)); }
-    if (number(left).is_some() && number(right).is_some()) || matches!((left, right),
-        (Value::List(_), Value::List(_)) | (Value::FixedSizeList(_), Value::FixedSizeList(_)) | (Value::Struct(_), Value::Struct(_))) {
-        return Ok(sql_eq_value(left, right, timezone, allocation)?.map(|equal| !equal));
-    }
-    Ok(Some(!emitted_eq(left, right, allocation)?))
+    Ok(sql_eq_scoped(left, right, timezone, allocation)?.map(|equal| !equal))
 }
 
 fn postgres_reference(value: &Value) -> Option<i32> {

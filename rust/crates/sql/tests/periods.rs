@@ -125,13 +125,14 @@ async fn correlated_aggregate_uses_the_same_runtime_null_dispatch() {
 }
 
 #[tokio::test]
-async fn decimal_min_max_reject_the_missing_reference_setter_when_input_reaches_the_factory() {
-    for function in ["MIN", "MAX"] {
-        for filter in ["", " FILTER (WHERE FALSE)"] {
-            let sql = format!("SELECT {function}(CAST(1 AS DECIMAL)){filter} FROM (VALUES (1)) v(n)");
-            assert_eq!(query(&sql).await.unwrap_err().code, "rtdb.query/min-max-setter");
-        }
-        let sql = format!("SELECT {function}(CAST(1 AS DECIMAL)) FROM (VALUES (1)) v(n) WHERE FALSE");
+async fn decimal_min_max_keep_the_declared_type_across_multiple_pages() {
+    let decimal = |n: i128| V::Decimal(rtdb_types::DecimalValue::new(n.to_be_bytes().to_vec(), 4, 2, 128).unwrap());
+    for (function, expected) in [("MIN", decimal(-240)), ("MAX", decimal(199))] {
+        let sql = format!("SELECT {function}(CAST(n AS DECIMAL(4,2))) FROM (VALUES (1.99),(-2.40),(NULL),(1.10)) v(n)");
+        let (schema, rows) = query(&sql).await.unwrap();
+        assert_eq!(schema.fields()[0].data_type, expected.logical_type().maybe());
+        assert_eq!(rows, [vec![expected]]);
+        let sql = format!("SELECT {function}(CAST(n AS DECIMAL(4,2))) FILTER (WHERE FALSE) FROM (VALUES (1)) v(n)");
         assert_eq!(query(&sql).await.unwrap().1, [vec![V::Null]]);
     }
 }

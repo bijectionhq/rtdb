@@ -69,13 +69,12 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
             encode_timestamp(format, *value, *unit, timezone.as_deref(), ty == PgType::TimestampTz, environment)?
         }
         PgType::Date => {
-            let days = match value {
-                Value::DateDay(days) => i64::from(*days),
-                Value::DateMilli(_) if binary => return Err(Anomaly::fault("xtdb.arrow/unsupported-vector-operation", "getInt unsupported on DateMilliVector")),
-                Value::DateMilli(value) => value / 86_400_000,
-                _ => return Err(incompatible(ty, value)),
-            };
-            if binary { (days as i32).wrapping_sub(PG_EPOCH_DAYS).to_be_bytes().to_vec() } else { date_text(days)?.into_bytes() }
+            let days = value.date_days().ok_or_else(|| incompatible(ty, value))?;
+            if binary {
+                let pg_days = i32::try_from(days - i64::from(PG_EPOCH_DAYS))
+                    .map_err(|_| Anomaly::incorrect("xtdb/date-out-of-range", "Date is outside the PostgreSQL binary date range"))?;
+                pg_days.to_be_bytes().to_vec()
+            } else { date_text(days)?.into_bytes() }
         }
         PgType::Time => { let Value::Time { value, unit, .. } = value else { return Err(incompatible(ty, value)); }; let value = nanos(*value, *unit); if binary { i64::try_from(value / 1000).map_err(invalid)?.to_be_bytes().to_vec() } else { time_text(value, true)?.into_bytes() } }
         PgType::Interval => { let (months, days, nanos) = interval_parts(value)?; interval_text(months, days, nanos / 1000 * 1000).into_bytes() }
@@ -164,7 +163,7 @@ fn tagged_json(tag: &str, text: &str, output: &mut String) -> Result<()> { outpu
 fn scalar_text(value: &Value) -> Result<(&'static str, String)> {
     Ok(match value {
         Value::Keyword(value) => ("xt:keyword", value.as_str().into()), Value::Uuid(value) => ("xt:uuid", uuid::Uuid::from_bytes(*value).to_string()),
-        Value::DateDay(days) => ("xt:date", date_text(i64::from(*days))?), Value::DateMilli(value) => ("xt:date", date_text(value / 86_400_000)?),
+        Value::DateDay(days) => ("xt:date", date_text(i64::from(*days))?), Value::DateMilli(value) => ("xt:date", date_text(value.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY))?),
         Value::Time { value, unit, .. } => ("xt:time", time_text(nanos(*value, *unit), false)?),
         Value::Timestamp { value, unit, timezone } => (if timezone.is_some() { "xt:timestamptz" } else { "xt:timestamp" }, timestamp_text(*value, *unit, timezone.as_deref(), TimestampText::Iso)?),
         Value::Duration { value, unit } => ("xt:duration", duration_text(nanos(*value, *unit))),

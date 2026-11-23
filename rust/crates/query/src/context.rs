@@ -40,7 +40,7 @@ pub trait OrderedIndexInventory: Send + Sync {
 #[derive(Clone)]
 pub struct CatalogSnapshot {
     pub(crate) default_database: String,
-    pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
+    pub(crate) databases: Arc<BTreeMap<String, DatabaseSnapshot>>,
     transaction_scoped: bool,
     owned_relation: Option<(QualifiedTable, Option<rtdb_types::EntityId>)>,
     pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
@@ -60,7 +60,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
@@ -145,7 +145,7 @@ impl Catalog for CatalogSnapshot {
 
 impl rtdb_expr::PgCatalogLookup for CatalogSnapshot {
     fn relations(&self, allocation: &rtdb_expr::EvaluationScope, visit: &mut dyn FnMut(i32, &TableRef) -> Result<()>) -> Result<()> {
-        for (name, database) in &self.databases {
+        for (name, database) in self.databases.iter() {
             let mut bytes = crate::system_schema::allocation_bound(name)?;
             for partition in &database.partitions { bytes = bytes.checked_add(partition.schema_allocation_bound(name)?).ok_or_else(|| invalid("catalog-size", "Relation lookup exceeds addressable memory"))?; }
             allocation.reserve(bytes)?;
@@ -163,6 +163,7 @@ pub struct QueryOptions {
     /// Build-row threshold for join Bloom/IID filters; exceeding it disables the filters.
     pub join_build_rows: i64,
     pub spill_limit_bytes: u64,
+    pub materialized_spill_rows: usize,
     pub bypass_temporal_pruning: bool,
     /// SQL GENERATE_SERIES excludes its endpoint when the process compatibility setting is enabled.
     pub generate_series_end_exclusive: bool,
@@ -178,7 +179,7 @@ impl QueryOptions {
     }
 }
 impl Default for QueryOptions {
-    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default(), memory_quantum: 0 } }
+    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, materialized_spill_rows: 100_000, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default(), memory_quantum: 0 } }
 }
 
 #[derive(Clone)]
@@ -194,6 +195,8 @@ pub struct QueryContext {
     pub(crate) execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
     pub(crate) tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub(crate) trace_parent: Option<rtdb_plan::SpanContext>,
+    pub(crate) application_name: Option<(Arc<str>, Arc<rtdb_columnar::MemoryReservation>)>,
+    pub(crate) operator_root: Option<Arc<Self>>,
     pub(crate) read_basis: Option<Arc<crate::settings::ReadBasis>>,
     pub(crate) accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>,
     pub(crate) query_cpu: Option<Arc<crate::QueryCpu>>,
@@ -210,22 +213,35 @@ impl QueryContext {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, read_basis: None, accelerators: Arc::from(Vec::new()), query_cpu: None }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, accelerators: Arc::from(Vec::new()), query_cpu: None }))
     }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
-    pub fn with_observer(self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
-        Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: observer, tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), query_cpu: self.query_cpu.clone() })
+    pub fn with_observer(mut self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
+        Arc::make_mut(&mut self).execution_observer = observer;
+        self
     }
     /// Scans opened from this context consult these before opening; see `ScanAccelerator`.
-    pub fn with_accelerators(self: Arc<Self>, accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>) -> Arc<Self> {
-        Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators, query_cpu: self.query_cpu.clone() })
+    pub fn with_accelerators(mut self: Arc<Self>, accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>) -> Arc<Self> {
+        Arc::make_mut(&mut self).accelerators = accelerators;
+        self
     }
     /// Applies explicit span parentage to subsequently opened executions without thread-local context.
-    pub fn with_tracer(self: Arc<Self>, tracer: Option<Arc<dyn rtdb_plan::Tracer>>, parent: Option<rtdb_plan::SpanContext>) -> Arc<Self> {
-        Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer, trace_parent: parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), query_cpu: self.query_cpu.clone() })
+    pub fn with_tracer(mut self: Arc<Self>, tracer: Option<Arc<dyn rtdb_plan::Tracer>>, parent: Option<rtdb_plan::SpanContext>) -> Arc<Self> {
+        let context = Arc::make_mut(&mut self);
+        context.tracer = tracer;
+        context.trace_parent = parent;
+        self
+    }
+
+    pub fn with_application_name(mut self: Arc<Self>, name: Option<&str>) -> Arc<Self> {
+        if self.tracer.as_ref().is_some_and(|tracer| tracer.query_enabled()) {
+            let application_name = name.and_then(|name| {
+                let reservation = self.memory.reserve(name.len().checked_add(64)?).ok()?;
+                Some((Arc::from(name), reservation))
+            });
+            Arc::make_mut(&mut self).application_name = application_name;
+        }
+        self
     }
 
     pub fn with_query_cpu(mut self: Arc<Self>, counter: Option<Arc<crate::QueryCpu>>) -> Arc<Self> {
@@ -272,8 +288,12 @@ impl QueryContext {
         self.execution_child_with_memory(self.memory.scope())
     }
     pub(crate) fn execution_child_with_memory(&self, memory: Arc<MemoryBudget>) -> Arc<Self> {
-        Arc::new(Self { catalog: self.catalog.clone(), memory, current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.child_token(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), query_cpu: self.query_cpu.clone() })
+        Arc::new(Self { memory, cancellation: self.cancellation.child_token(), ..self.clone() })
+    }
+
+    pub(crate) fn operator_scope(self: &Arc<Self>) -> Arc<Self> {
+        debug_assert!(self.operator_root.is_none());
+        Arc::new(Self { memory: self.memory.scope(), operator_root: Some(Arc::clone(self)), ..(**self).clone() })
     }
 }
 
@@ -387,8 +407,18 @@ impl Execution {
         let outer = self.outer.prepend(schema, row, &self.context.memory)?;
         Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(self.parameters.overlay(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
     }
+    pub fn in_operator(mut self) -> Self {
+        if self.context.operator_root.is_none() && (self.analysis.is_some() || self.context.trace_parent.is_some()) {
+            self.context = self.context.operator_scope();
+        }
+        self
+    }
+
     pub fn child(&self, index: usize) -> Self {
-        let mut execution = self.clone(); execution.analysis = self.analysis.as_ref().and_then(|node| node.child(index)); execution
+        let mut execution = self.clone();
+        if let Some(root) = &self.context.operator_root { execution.context = Arc::clone(root); }
+        execution.analysis = self.analysis.as_ref().and_then(|node| node.child(index));
+        execution
     }
     pub fn scope(&self) -> Result<rtdb_expr::EvaluationScope> { rtdb_expr::EvaluationScope::new(&self.context.memory) }
     pub fn expression_type(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema) -> Result<rtdb_types::LogicalType> {

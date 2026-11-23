@@ -99,8 +99,81 @@ async fn tracing_cursor_parentage_counts_actual_operator_and_output_pages() {
     assert!(root.attributes().any(|(name, value)| name == "query.peak_memory_bytes" && value.parse::<usize>().unwrap() > 0));
     assert!(output.attributes().any(|attribute| attribute == ("cursor.page_count", "2")));
     assert!(table.attributes().any(|attribute| attribute == ("cursor.page_count", "1")));
+    assert!(table.attributes().any(|(name, value)| name == "cursor.peak_memory_bytes" && value.parse::<usize>().unwrap() > 0));
     assert!(!table.attributes().any(|(name, _)| name == "cursor.pull_count"));
     assert!(spans.iter().all(|span| span.ended >= span.started));
+}
+
+#[tokio::test]
+async fn analyze_reports_the_arrow_union_it_actually_runs() {
+    let context = query_context(Default::default());
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 32, true, false).unwrap();
+    let context = context.with_tracer(Some(tracer.clone()), None);
+    let left = numbers(0, "v", &[1, 2]);
+    let right = numbers(0, "v", &[3]);
+    let union = Arc::new(Relation::new(left.schema().clone(), RelationNode::Set {
+        left, right, operator: SetOperator::Union, all: true,
+    }).unwrap());
+    let prepared = PreparedQuery::from_prepared(rtdb_plan::PreparedStatement {
+        statement: rtdb_plan::Statement::Explain { relation: union, mode: rtdb_plan::ExplainMode::Analyze },
+        parameter_types: Default::default(), source: String::new(), notices: Vec::new(), settings: Default::default(),
+    }, &context.memory).unwrap();
+    let mut cursor = prepared.execute_columns(context, vec![]).await.unwrap();
+    let mut union_peaks = None;
+    while let Some(page) = cursor.next_batch().await.unwrap() {
+        let batch = page.batch();
+        let value = |row, col| read_value(batch.schema().field(col), batch.column(col).as_ref(), row).unwrap();
+        for row in 0..batch.num_rows() {
+            if matches!(value(row, 1), Value::Keyword(op) if op.as_str() == "union-all") {
+                assert_eq!(value(row, 7), Value::I64(3));
+                let (Value::I64(own), Value::I64(query)) = (value(row, 9), value(row, 10)) else { panic!("Expected memory peaks"); };
+                assert!(own > 0 && query >= own);
+                union_peaks = Some(own);
+            }
+        }
+    }
+    drop(cursor);
+    tracer.close();
+    let mut actual = None;
+    while let Some(span) = receiver.next().await {
+        if span.name == "query.cursor.union-all" {
+            let attributes: BTreeMap<_, _> = span.attributes().collect();
+            assert_eq!(attributes["union_all_columnar"], "true");
+            actual = Some(attributes["cursor.peak_memory_bytes"].parse::<i64>().unwrap());
+        }
+    }
+    assert!(actual.is_some());
+    assert_eq!(actual, union_peaks);
+}
+
+#[tokio::test]
+async fn directly_projected_arrow_parameters_emit_an_operator_peak() {
+    use arrow_array::{Int64Array, RecordBatch};
+    let context = query_context(Default::default());
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 16, true, false).unwrap();
+    let context = context.with_tracer(Some(tracer.clone()), None);
+    let ty = scalar(ScalarType::I64);
+    let schema = Schema::new(vec![field(0, "v", ty.clone())]).unwrap();
+    let plan = Arc::new(Relation::new(schema, RelationNode::Values {
+        rows: vec![vec![Expr::Parameter { index: 0, data_type: ty.clone() }]],
+    }).unwrap());
+    let batch = RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(vec![7])) as arrow_array::ArrayRef)]).unwrap();
+    let arguments = rtdb_columnar::OwnedBatch::new(batch, &context.memory).unwrap();
+    let prepared = PreparedQuery::new(plan).unwrap();
+    let mut cursor = prepared.execute_parameter_projection(context, &arguments, &[ty], Some("SELECT ? AS v")).await.unwrap().unwrap();
+    assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+    tracer.close();
+    let mut peak = None;
+    while let Some(span) = receiver.next().await {
+        if span.name == "query.cursor.table" {
+            let attributes: BTreeMap<_, _> = span.attributes().collect();
+            assert_eq!(attributes["cursor.row_count"], "1");
+            peak = Some(attributes["cursor.peak_memory_bytes"].parse::<usize>().unwrap());
+        }
+    }
+    assert!(peak.is_some_and(|bytes| bytes > 0));
 }
 
 #[tokio::test]
@@ -394,18 +467,49 @@ async fn filtered_array_and_vec_aggregate_groups_promote_output_nullability() {
 }
 
 #[tokio::test]
-async fn min_max_missing_setters_fail_before_filtering_but_empty_input_keeps_null() {
-    for (ty, value) in [(scalar(ScalarType::I8), Value::I8(1)), (scalar(ScalarType::I16), Value::I16(1)),
-        (scalar(ScalarType::Time { unit: rtdb_types::TimeUnit::Microsecond, bit_width: 64 }), Value::Time { value: 1, unit: rtdb_types::TimeUnit::Microsecond, bit_width: 64 })] {
-        for function in [AggregateFunction::Min, AggregateFunction::Max] {
-            let input = values(0, "v", ty.clone(), vec![value.clone()]);
-            let mut expression = agg(1, function.clone(), Some(input.schema().fields()[0].expression()), ty.clone().maybe());
-            expression.filter = Some(Expr::Literal(Value::Bool(false)));
-            assert_eq!(collect(aggregate(input, vec![], vec![expression]), query_context(Default::default())).await.unwrap_err().code, "rtdb.query/min-max-setter");
-            let input = values(0, "v", ty.clone(), vec![]);
-            let expression = agg(1, function, Some(input.schema().fields()[0].expression()), ty.clone().maybe());
-            assert_eq!(collect(aggregate(input, vec![], vec![expression]), query_context(Default::default())).await.unwrap(), [vec![Value::Null]]);
+async fn min_max_preserve_narrow_integer_and_time_types() {
+    use rtdb_types::TimeUnit;
+    let time = |value, unit, bit_width| Value::Time { value, unit, bit_width };
+    for (small, large) in [
+        (Value::I8(-7), Value::I8(9)), (Value::I16(-257), Value::I16(1300)),
+        (time(1, TimeUnit::Second, 32), time(7, TimeUnit::Second, 32)),
+        (time(1, TimeUnit::Millisecond, 32), time(7000, TimeUnit::Millisecond, 32)),
+        (time(1, TimeUnit::Microsecond, 64), time(7000, TimeUnit::Microsecond, 64)),
+        (time(1, TimeUnit::Nanosecond, 64), time(7000, TimeUnit::Nanosecond, 64)),
+    ] {
+        let ty = small.logical_type().maybe();
+        for (function, expected) in [(AggregateFunction::Min, small.clone()), (AggregateFunction::Max, large.clone())] {
+            for filtered in [false, true] {
+                let input = values(0, "v", ty.clone(), vec![large.clone(), Value::Null, small.clone()]);
+                let mut expression = agg(1, function.clone(), Some(input.schema().fields()[0].expression()), ty.clone());
+                if filtered { expression.filter = Some(Expr::Literal(Value::Bool(false))); }
+                let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });
+                let output = collect(aggregate(input, vec![], vec![expression]), context).await.unwrap();
+                assert_eq!(output, [vec![if filtered { Value::Null } else { expected.clone() }]]);
+            }
         }
+    }
+}
+
+#[tokio::test]
+async fn min_max_compare_calendar_days_and_return_the_winning_raw_date64_cells() {
+    let ty = scalar(ScalarType::DateMilli).maybe();
+    let input = values(0, "v", ty.clone(), vec![Value::DateMilli(86_400_001), Value::Null, Value::DateMilli(-1)]);
+    let argument = input.schema().fields()[0].expression();
+    let min = agg(1, AggregateFunction::Min, Some(argument.clone()), ty.clone());
+    let mut max = agg(2, AggregateFunction::Max, Some(argument), ty);
+    max.field.name = "max".into();
+    let relation = aggregate(input, vec![], vec![min, max]);
+    for arrow in [false, true] {
+        let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });
+        let prepared = PreparedQuery::new(Arc::clone(&relation)).unwrap();
+        let mut cursor = if arrow { prepared.execute_columns(context, vec![]).await } else { prepared.execute(context, vec![]).await }.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let batch = page.batch();
+        assert_eq!(batch.num_rows(), 1);
+        let read = |col| read_value(batch.schema().field(col), batch.column(col).as_ref(), 0).unwrap();
+        assert_eq!([read(0), read(1)], [Value::DateMilli(-1), Value::DateMilli(86_400_001)]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
     }
 }
 

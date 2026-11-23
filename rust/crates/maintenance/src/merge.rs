@@ -234,7 +234,6 @@ impl<'a, State> EntityStates<'a, State> {
 struct SameTimeState {
     calculator: AdmittedPolygonCalculator,
     system_from: Option<Timestamp>,
-    seen_erase: bool,
     erased: bool,
 }
 
@@ -245,41 +244,36 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
     for event in events {
         let state = states.get(event, memory, || SameTimeState {
             calculator: AdmittedPolygonCalculator::new(None, Arc::clone(memory)),
-            system_from: None, seen_erase: false, erased: false,
+            system_from: None, erased: false,
         })?;
+        if state.erased { continue; }
         if state.system_from != Some(event.system_from) {
             state.calculator.reset();
             state.system_from = Some(event.system_from);
-            state.seen_erase = false;
         }
         let header = event.header();
-        let resolved = if state.erased { None } else {
-            state.calculator.visit(&header, |polygon| {
-                if header.commit_position != 0 {
+        let resolved = state.calculator.visit(&header, |polygon| {
+            if header.commit_position != 0 {
+                charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+                result.push(event.clone());
+                return Ok(());
+            }
+            for (valid_from, valid_to, system_to) in polygon.ranges() {
+                if system_to > event.system_from {
                     charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                    result.push(event.clone());
-                    return Ok(());
+                    let mut event = event.clone();
+                    event.valid_time = Interval::new(valid_from, valid_to)?;
+                    result.push(event);
                 }
-                for (valid_from, valid_to, system_to) in polygon.ranges() {
-                    if system_to > event.system_from {
-                        charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                        let mut event = event.clone();
-                        event.valid_time = Interval::new(valid_from, valid_to)?;
-                        result.push(event);
-                    }
-                }
-                Ok(())
-            })?
-        };
+            }
+            Ok(())
+        })?;
         if header.op == EventOp::Erase { state.erased = true; }
         if resolved.is_none() {
-            if !state.seen_erase {
-                charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                let mut event = event.clone();
-                event.valid_time = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
-                result.push(event);
-            }
-            state.seen_erase = true;
+            charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+            let mut event = event.clone();
+            event.valid_time = Interval::ALL;
+            result.push(event);
         }
     }
     Ok((result, charges))
@@ -587,7 +581,7 @@ mod tests {
         for [later, earlier] in [[&events[1], &events[0]], [&events[2], &events[0]]] {
             let unsorted = [page(&[later.clone(), earlier.clone()])];
             let error = planner::RowHeap::new(&unsorted).err().unwrap();
-            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-time descending"));
+            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-position descending"));
         }
     }
 
