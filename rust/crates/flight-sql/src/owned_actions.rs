@@ -188,12 +188,12 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
-pub(crate) const READ_HELD_WORLD_CHANGES_V2: &str = "rtdb.owned.ReadHeldWorldChanges.v2";
-pub(crate) const HELD_OWNED_MERGED_CHANGES_V2: &str = "rtdb.owned.ReadHeldMergedChanges.v2";
+pub(crate) const READ_HELD_WORLD_CHANGES_V3: &str = "rtdb.owned.ReadHeldWorldChanges.v3";
+pub(crate) const HELD_OWNED_MERGED_CHANGES_V3: &str = "rtdb.owned.ReadHeldMergedChanges.v3";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
 pub(crate) const APPLY_HELD_EXPIRY_V1: &str = "rtdb.owned.ApplyHeldExpiry.v1";
 pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
-pub(crate) const HELD_OWNED_CHANGES_V2: &str = "rtdb.owned.ReadHeldChanges.v2";
+pub(crate) const HELD_OWNED_CHANGES_V3: &str = "rtdb.owned.ReadHeldChanges.v3";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_IDENTITY_MORE: &str = "rtdb.owned.identity_more";
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
@@ -2741,5 +2741,7 @@ fn owned_touches_type() -> rtdb_types::LogicalType {
         ("op".into(), LogicalType::Scalar(ScalarType::Utf8)),
         ("valid_from_micros".into(), LogicalType::Scalar(ScalarType::I64)),
         ("valid_to_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
+        ("created_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
+        ("expiry_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
     ])))
 }

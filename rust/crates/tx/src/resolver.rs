@@ -278,7 +278,7 @@ impl TxResolver {
             }
             if outcome.is_ok() {
                 if let Some(replay) = &tx.hosted_replay {
-                    outcome = replay.require_constraints_matched();
+                    outcome = replay.require_constraints_matched().and_then(|()| replay.require_expiries_matched());
                 }
             }
             if has_owned_operations && outcome.is_ok() {
@@ -1575,7 +1575,8 @@ impl<'a> OpenTransaction<'a> {
         }
         floor.expired_created_through = OwnedLifetimeFloor::at(lifetime, ordered)?.expired_created_through;
         floor.swept_present_through = floor.swept_present_through.max(cutoff);
-        self.erase_owned(relation, id, OwnedChangeKind::Expired).await?;
+        let original = rtdb_types::expired_lifetime_interval(created, expires)?;
+        self.erase_owned(relation, id, OwnedChangeKind::Expired(original)).await?;
         self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
         Ok(())
     }
@@ -1616,13 +1617,14 @@ impl<'a> OpenTransaction<'a> {
         if relation.world().is_some() || relation.is_world_catalog() {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        let replay_lifetime = if let Some(replay) = &self.hosted_replay {
+        let replay_lifetime = if self.hosted_replay.is_some() {
             let (schema, _) = self.read_owned_schema(owner, relation).await?.ok_or_else(replay_period_unavailable)?;
             schema.lifetime_micros().map(|duration| {
+                let replay = self.hosted_replay.as_mut().ok_or_else(lifetime_uncovered)?;
                 let floor = replay.lifetime(relation).ok_or_else(lifetime_uncovered)?;
                 floor.check(duration, replay.source_time())?;
-                if floor.swept_present_through == Timestamp::MIN { return Err(lifetime_uncovered()); }
-                Ok(floor)
+                let original = replay.take_expiry(relation, id)?;
+                Ok((duration, original))
             }).transpose()?
         } else { None };
         let snapshot = self.snapshot()?;
@@ -1635,13 +1637,13 @@ impl<'a> OpenTransaction<'a> {
         let table = relation.table(owner);
         let ordered = self.tx_key();
         let context = self.context.query_context(snapshot, ordered.system_time, &self.options.default_tz, self.trace_parent)?;
-        let kind = if let Some(floor) = replay_lifetime {
-            if self.observed_owned_lifetime(Arc::clone(&context), owner, relation, id, floor.duration)
-                .await?.is_some_and(|(_, expires)| expires > floor.swept_present_through)
+        let kind = if let Some((duration, original)) = replay_lifetime {
+            if self.observed_owned_lifetime(Arc::clone(&context), owner, relation, id, duration)
+                .await?.is_some_and(|(created, expires)| created != original.lower() || expires != original.upper())
             {
                 return Err(lifetime_uncovered());
             }
-            rtdb_types::OwnedChangeKind::Expired
+            rtdb_types::OwnedChangeKind::Expired(original)
         } else { kind };
         let search = OwnedRelation::search_catalog(owner);
         if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
@@ -2013,10 +2015,10 @@ impl<'a> OpenTransaction<'a> {
         let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit");
         use rtdb_types::{OwnedChange, OwnedChangeKind};
         let group = self.owned_changes.entry(relation.name().to_owned()).or_default();
-        if group.erased || matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired) {
+        if group.erased || matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired(_)) {
             for previous in &group.touches {
                 let previous = OwnedChange::from_value(previous)?;
-                if previous.id == id && (matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired) || matches!(previous.kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired)) {
+                if previous.id == id && (matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired(_)) || matches!(previous.kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired(_))) {
                     return Err(Anomaly::incorrect("rtdb.owned/purge-overlap", "Owned erase cannot share its identity with another mutation in the same commit"));
                 }
             }
@@ -2029,7 +2031,7 @@ impl<'a> OpenTransaction<'a> {
         group.touches.push(entry);
         group.reservations.push(charge);
         group.bytes = group_bytes;
-        group.erased |= matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired);
+        group.erased |= matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired(_));
         Ok(())
     }
 

@@ -150,7 +150,9 @@ impl OwnedReadSession {
             for touch in &change.touches {
                 match touch.kind {
                     rtdb_types::OwnedChangeKind::Put if touch.valid == valid => (),
-                    rtdb_types::OwnedChangeKind::Expired => (),
+                    rtdb_types::OwnedChangeKind::Expired(original)
+                        if original.lower().0.checked_add(policy.duration) == Some(original.upper().0)
+                            && original.upper() <= rtdb_types::OwnedLifetimeFloor::expiry_replay_cutoff(group.revision) => (),
                     _ => return Err(change_feed_uncovered()),
                 }
             }

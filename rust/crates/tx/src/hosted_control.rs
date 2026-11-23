@@ -12,6 +12,8 @@ const NATIVE_FRONTIER: &str = "native-frontier.v1";
 const REPLAY_TRANSACTIONS: &str = "bj_rtdb_restore_transactions";
 const MAX_REPLAY_LIFETIMES: usize = 32;
 const MAX_REPLAY_LIFETIME_BYTES: usize = 16 * 1024;
+const MAX_REPLAY_EXPIRIES: usize = 64;
+const MAX_REPLAY_EXPIRY_BYTES: usize = 32 * 1024;
 const MAX_REPLAY_CONSTRAINTS: usize = 64;
 const MAX_REPLAY_CONSTRAINT_BYTES: usize = 32 * 1024;
 
@@ -56,6 +58,8 @@ pub struct HostedReplay {
     #[serde(skip)]
     lifetimes: Vec<ReplayLifetime>,
     #[serde(skip)]
+    expiries: Vec<ReplayExpiry>,
+    #[serde(skip)]
     constraints: Vec<ReplayConstraint>,
     #[serde(skip)]
     worlds: Vec<u8>,
@@ -68,6 +72,22 @@ pub(crate) struct ReplayLifetime {
     duration: i64,
     expired_created_through: i64,
     swept_present_through: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayExpiry {
+    relation: String,
+    identity: Vec<u8>,
+    created_micros: i64,
+    expiry_micros: i64,
+}
+
+impl ReplayExpiry {
+    fn interval(&self) -> Result<rtdb_types::Interval> {
+        rtdb_types::expired_lifetime_interval(Timestamp(self.created_micros), Timestamp(self.expiry_micros))
+            .map_err(|_| replay_invalid())
+    }
 }
 
 impl ReplayLifetime {
@@ -105,6 +125,8 @@ pub fn hosted_replay_controls<'a>(
     let lifetimes = selected(RESTORE, &lifetime_id);
     let constraint_id = format!("native-constraints/{}", source.tx_id.0);
     let constraints = selected(RESTORE, &constraint_id);
+    let expiry_id = format!("native-expiries/{}", source.tx_id.0);
+    let expiries = selected(RESTORE, &expiry_id);
     let prefix = format!("native-worlds/{}/", source.tx_id.0);
     let mut chunks = std::collections::BTreeMap::new();
     let mut bytes = 0usize;
@@ -122,7 +144,7 @@ pub fn hosted_replay_controls<'a>(
         }
     }
     if controls.clone().filter(|control| control.name() == RESTORE).count()
-        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + chunks.len()
+        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + usize::from(expiries.is_some()) + chunks.len()
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
         || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
@@ -153,6 +175,30 @@ pub fn hosted_replay_controls<'a>(
             let relation = OwnedRelation::new(lifetime.relation.as_str()).map_err(|_| replay_invalid())?;
             if !relation.is_root_data()
                 || lifetime.floor().check(lifetime.duration, source.system_time).is_err()
+            {
+                return Err(replay_invalid());
+            }
+        }
+    }
+    if let Some(expiries) = expiries {
+        let encoded = control_body(expiries, MAX_REPLAY_EXPIRY_BYTES)
+            .filter(|_| expiries.expected().is_none()).ok_or_else(replay_invalid)?;
+        replay.expiries = serde_json::from_slice(encoded).map_err(|_| replay_invalid())?;
+        if !(1..=MAX_REPLAY_EXPIRIES).contains(&replay.expiries.len())
+            || !replay.expiries.windows(2).all(|pair|
+                (&pair[0].relation, &pair[0].identity) < (&pair[1].relation, &pair[1].identity))
+        {
+            return Err(replay_invalid());
+        }
+        for original in &replay.expiries {
+            let relation = OwnedRelation::new(original.relation.as_str()).map_err(|_| replay_invalid())?;
+            let identity = EntityId::from_handle_bytes(&original.identity).map_err(|_| replay_invalid())?;
+            let floor = replay.lifetime(&relation).ok_or_else(replay_invalid)?;
+            let interval = original.interval()?;
+            if !relation.is_root_data() || identity.handle_bytes() != original.identity
+                || interval.lower().0.checked_add(floor.duration) != Some(interval.upper().0)
+                || interval.upper() > floor.swept_present_through
+                || interval.upper() > rtdb_types::OwnedLifetimeFloor::expiry_replay_cutoff(source.system_time)
             {
                 return Err(replay_invalid());
             }
@@ -306,6 +352,21 @@ impl HostedReplay {
     pub(crate) fn is_transient_world_control(&self, control: &HostedControlWrite) -> bool {
         !self.worlds.is_empty() && control.name() == RESTORE
             && matches!(control.id(), EntityId::String(id) if id.starts_with("native-worlds/"))
+    }
+
+    pub(crate) fn take_expiry(
+        &mut self, relation: &OwnedRelation, id: &EntityId,
+    ) -> Result<rtdb_types::Interval> {
+        let handle = id.handle_bytes();
+        let index = self.expiries.binary_search_by(|proof| {
+            (proof.relation.as_str(), proof.identity.as_slice()).cmp(&(relation.name(), handle.as_slice()))
+        }).map_err(|_| replay_invalid())?;
+        self.expiries.remove(index).interval()
+    }
+
+    pub(crate) fn require_expiries_matched(&self) -> Result<()> {
+        if !self.expiries.is_empty() { return Err(replay_invalid()); }
+        Ok(())
     }
 
     pub(crate) fn source_time(&self) -> Timestamp { self.source.system_time }
