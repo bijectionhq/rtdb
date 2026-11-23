@@ -1025,9 +1025,14 @@ impl Service {
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing clock slot hold"))?;
-        let original = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let original = self.owned_read(call, &Bytes::copy_from_slice(handle)).map_err(|error| {
+            if error.code() == tonic::Code::NotFound { Self::clock_slot_missed() } else { error }
+        })?;
         original.snapshot.require_unscoped_root().map_err(status)?;
-        if original.snapshot.fork_cut(scope).await.map_err(status)?.live().is_none() {
+        let cut = original.snapshot.fork_cut(scope).await.map_err(|error| {
+            if error.code == "rtdb.world/unavailable" { Self::clock_slot_missed() } else { status(error) }
+        })?;
+        if cut.live().is_none() {
             return Err(Status::failed_precondition("An ordered clock slot requires a live placed Root hold"));
         }
         Ok((original.snapshot.present(), body))
