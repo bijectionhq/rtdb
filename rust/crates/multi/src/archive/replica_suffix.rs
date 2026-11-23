@@ -3,7 +3,7 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use prost::Message;
-use rtdb_directory::{Checkpoint, CheckpointSuffixPin, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
+use rtdb_directory::{Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
 use rtdb_format::{
     catalog::BlockCatalog,
     envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame},
@@ -141,7 +141,7 @@ pub(crate) async fn capture(
 ) -> Result<String> {
     let id = deployment.to_string();
     with_region(
-        directory.as_ref(), keys, &id, archive, hosted_task, Some(selected.capture),
+        directory.as_ref(), keys, &id, archive, hosted_task, Some((selected.capture, Some(pin_id))),
         Some(RegionPublication::Capture(Arc::clone(&directory))),
         |record| {
             admit_copy(record, archive, deployment, pin_id, &selected)
@@ -229,10 +229,21 @@ pub(super) fn accepted<'a>(
         || pin.checkpoint.boundary.checked_add(1) != Some(pin.journal_interval[0])
         || pin.journal_interval[1] != pin.replica_through || pin.source_through <= point.checkpoint.source
         || pin.basis.system_time.0 <= point.checkpoint.system_time
+        || !admits_custody(record, suffix, pin)
     {
         return Err(suffix_unavailable());
     }
     Ok(pin)
+}
+
+fn admits_custody(record: &DeploymentRecord, suffix: Uuid, pin: &CheckpointSuffixPin) -> bool {
+    let now = now_ms();
+    match pin.custody {
+        CheckpointSuffixCustody::Capture => true,
+        CheckpointSuffixCustody::World =>
+            pin.expires_at_ms > now || record.retains_world_suffix(suffix, pin, now),
+        CheckpointSuffixCustody::RetiringWorld => false,
+    }
 }
 
 pub(super) async fn apply_archived(
@@ -286,9 +297,17 @@ fn suffix_artifact<'a>(
     identity.writer_epoch = 0;
     identity.archive_sha256 = None;
     ReplicaArtifact::new(
-        bucket, material, format!("checkpoint-captures/{deployment}/{}/replica-suffix/{suffix}/v2", pin.capture),
+        bucket, material, format!("{}/v2", archive_prefix(deployment, suffix, pin)),
         encode(&(stream, identity))?, b"RTDB checkpoint suffix segments v2\0",
     )
+}
+
+pub(super) fn archive_prefix(deployment: Uuid, suffix: Uuid, pin: &CheckpointSuffixPin) -> String {
+    let scope = match pin.custody {
+        CheckpointSuffixCustody::Capture => "replica-suffix",
+        CheckpointSuffixCustody::World | CheckpointSuffixCustody::RetiringWorld => "world-replica-suffix",
+    };
+    format!("checkpoint-captures/{deployment}/{}/{scope}/{suffix}", pin.capture)
 }
 
 fn archive_digest(expected: &str) -> Result<[u8; 32]> {
@@ -438,6 +457,7 @@ fn admit<'a>(
     let mut identity = pin.clone();
     identity.archive_sha256.clone_from(&selected.archive_sha256);
     if &identity != selected || record.incarnation != pin.incarnation || record.log_epoch != pin.log_epoch
+        || !admits_custody(record, pin_id, pin)
         || pin.checkpoint.boundary.checked_add(1) != Some(pin.journal_interval[0])
         || pin.replica_through != pin.journal_interval[1]
         || (pin.archive_sha256.is_none() && (pin.expires_at_ms <= now_ms()
@@ -721,6 +741,7 @@ mod custody_tests {
         };
         let pin = CheckpointSuffixPin {
             capture, manifest_sha256: "manifest".into(), checkpoint,
+            custody: CheckpointSuffixCustody::Capture,
             incarnation: record.incarnation, log_epoch: record.log_epoch, writer_epoch: record.epoch,
             basis: TransactionKey { tx_id: TxId(3), system_time: Timestamp(20) },
             replica_through: 6, source_through: 3, journal_interval: [5, 6], journal_sha256: [2; 32],
@@ -743,7 +764,7 @@ mod custody_tests {
         let started = Arc::new(Notify::new());
         let (drain, provider) = std::sync::mpsc::channel();
         let copy = with_region(
-            directory.as_ref(), &keys, &id, &archive, None, Some(capture), None,
+            directory.as_ref(), &keys, &id, &archive, None, Some((capture, Some(lease))), None,
             |record| admit_copy(record, &archive, deployment, lease, &pin),
             |_, _, io| async {
                 let provider_started = Arc::clone(&started);

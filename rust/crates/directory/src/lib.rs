@@ -415,6 +415,8 @@ pub enum StorageRegion {
     Local {
         archive: Option<uuid::Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_suffix: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         repair_archive: Option<uuid::Uuid>,
         #[serde(default)]
         tracks_ordered_index_pages: bool,
@@ -431,6 +433,8 @@ pub enum StorageRegion {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checkpoint_replay_from: Option<i64>,
         archive: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_suffix: Option<uuid::Uuid>,
         /// Serving I/O can read its repair archive while writing its own prefix.
         repair_archive: Option<uuid::Uuid>,
         owner: Option<HostedTask>,
@@ -475,6 +479,15 @@ impl StorageRegion {
             Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => return false,
         };
         archive_custody::covers_archive(destination.map(|id| id.as_u128()), repair.map(|id| id.as_u128()), capture.as_u128())
+    }
+
+    pub fn holds_checkpoint_suffix(&self, capture: uuid::Uuid, suffix: uuid::Uuid) -> bool {
+        match self {
+            Self::Local { archive, checkpoint_suffix, .. } |
+            Self::Remote { archive, checkpoint_suffix, .. } =>
+                *archive == Some(capture) && *checkpoint_suffix == Some(suffix),
+            _ => false,
+        }
     }
 
     /// Reads may begin only under an open region for the exact archive.
@@ -575,10 +588,21 @@ pub struct CheckpointWorldRetention {
     pub until: rtdb_types::Timestamp,
 }
 
+pub const MAX_RETAINED_WORLDS: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointSuffixCustody {
+    Capture,
+    World,
+    RetiringWorld,
+}
+
 /// Exact replay prefix protected by the installation's replica trim authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointSuffixPin {
     pub capture: uuid::Uuid,
+    pub custody: CheckpointSuffixCustody,
     pub manifest_sha256: String,
     pub checkpoint: Checkpoint,
     pub incarnation: u64,
@@ -848,6 +872,18 @@ impl DeploymentRecord {
         self.checkpoint_suffix_pins.values().any(|pin| pin.expires_at_ms > now_ms)
     }
 
+    pub fn retains_world_suffix(&self, suffix: uuid::Uuid, pin: &CheckpointSuffixPin, now_ms: i64) -> bool {
+        (pin.archive_sha256.is_some() && self.lifecycle != Lifecycle::Deleted
+            && self.checkpoint_captures.get(&pin.capture).is_some_and(|base|
+                base.world_replay.is_some() && base.incarnation == pin.incarnation
+                    && base.incarnation == self.incarnation
+                    && base.log_epoch == pin.log_epoch && base.log_epoch == self.log_epoch))
+            || self.checkpoint_worlds.values().any(|world| {
+                world.capture == pin.capture && world.suffix == Some(suffix)
+                    && world.until.0 > now_ms.saturating_mul(1000)
+            })
+    }
+
     pub fn is_resident_idle(&self) -> bool {
         self.holder.is_some() && self.resident_idle.is_some_and(|idle| idle.epoch == self.epoch) && self.writer_pool().is_some()
     }
@@ -1109,7 +1145,7 @@ fn stage_hosted_fork_record(mut child: DeploymentRecord, parent: &DeploymentReco
     child.hosted_fork_stage = Some(HostedForkStage { source_lineage: parent.lineage.clone(), preparation });
     child.storage_regions.insert(preparation.token, StorageRegion::Remote {
         tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
-        archive: None, repair_archive: None, owner, closed: false, publications: BTreeMap::new(),
+        archive: None, checkpoint_suffix: None, repair_archive: None, owner, closed: false, publications: BTreeMap::new(),
     });
     Ok(child)
 }

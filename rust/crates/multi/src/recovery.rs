@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rtdb_directory::{
-    CheckpointStageIntent, DeploymentRecord, Directory, DisposalReceipt, HostedTask,
+    CheckpointStageIntent, CheckpointSuffixCustody, DeploymentRecord, Directory, DisposalReceipt, HostedTask,
     ServingInventory,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
@@ -339,7 +339,8 @@ impl RecoveryService {
                 }
                 let retained = directory.deployment(&installation.id).await?
                     .and_then(|current| current.checkpoint_suffix_pins.get(&lease).cloned())
-                    .filter(|pin| pin.capture == request.capture && pin.basis == basis
+                    .filter(|pin| pin.custody == CheckpointSuffixCustody::Capture
+                        && pin.capture == request.capture && pin.basis == basis
                         && pin.expires_at_ms == expires_at_ms)
                     .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
                         "The checkpoint suffix pin changed before archive admission"))?;

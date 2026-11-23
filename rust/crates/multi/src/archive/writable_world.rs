@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, now_ms};
+use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, now_ms};
 use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
@@ -18,8 +18,6 @@ use crate::admin::update_installation;
 
 mod held;
 pub(crate) use held::{HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
-
-const MAX_RETAINED_WORLDS: usize = 64;
 
 fn now() -> Timestamp {
     Timestamp(now_ms().saturating_mul(1_000))
@@ -66,11 +64,13 @@ fn admit_capture(
 /// writes the Directory pin or submits the ordered registration.
 fn select_held_archive(
     source: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, cut: &rtdb_node::OwnedForkCut,
+    restore_binding: Option<[u8; 32]>,
 ) -> Result<Option<(Uuid, Option<Uuid>)>> {
     let binding = archive_binding(archive)?;
     let available = |capture: &Uuid, registered: &rtdb_directory::CheckpointCapture| {
         registered.archive == binding && registered.media_bound
             && registered.incarnation == source.incarnation && registered.log_epoch == source.log_epoch
+            && restore_binding.is_none_or(|binding| registered.world_replay == Some(binding))
             && registered.checkpoint.root_sha256.is_some()
             && registered.manifest_sha256.is_some()
             && require_capture_open(source, *capture).is_ok()
@@ -148,6 +148,7 @@ async fn copy_fork_suffix(
     source: &DeploymentRecord,
     cut: &rtdb_node::OwnedForkCut,
     deadline: Timestamp,
+    restore_binding: Option<[u8; 32]>,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(Uuid, Option<Uuid>)> {
     if !cut.is_publication() || deadline <= now() {
@@ -158,25 +159,16 @@ async fn copy_fork_suffix(
         base.archive == binding && base.media_bound && base.manifest_sha256.is_some()
             && base.checkpoint.root_sha256.is_some() && base.incarnation == source.incarnation
             && base.log_epoch == source.log_epoch && base.checkpoint.system_time < cut.basis().0
+            && restore_binding.is_none_or(|binding| base.world_replay == Some(binding))
             && require_capture_open(source, **capture).is_ok()
             && crate::hosted_recovery::replay_start(source, base.checkpoint.boundary).is_ok()
     }).max_by_key(|(_, base)| base.checkpoint.boundary)
         .map(|(capture, _)| *capture).ok_or_else(OwnedWorld::unavailable)?;
 
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    digest.update(b"rtdb.world-fork-suffix.v1\0");
-    digest.update(deployment.as_bytes());
-    digest.update(capture.as_bytes());
-    digest.update(&source.incarnation.to_be_bytes());
-    digest.update(&source.log_epoch.to_be_bytes());
-    digest.update(&cut.basis().0.to_be_bytes());
-    let mut id = [0; 16];
-    id.copy_from_slice(&digest.finish().as_ref()[..16]);
-    let suffix = Uuid::from_bytes(id);
     let expires_at_ms = deadline.0.div_euclid(1000)
         .min(rtdb_directory::now_ms().saturating_add(60_000));
-    let pin = super::stage::with_region(
-        directory.as_ref(), keys, &source.id, archive, hosted_task, Some(capture), None,
+    let (suffix, pin) = super::stage::with_region(
+        directory.as_ref(), keys, &source.id, archive, hosted_task, Some((capture, None)), None,
         |current| {
             require_capture_open(current, capture)?;
             let selected = current.checkpoint_captures.get(&capture)
@@ -193,7 +185,7 @@ async fn copy_fork_suffix(
                 archive.bucket(Arc::clone(&io)).await?, &point, &manifest, keys,
             ).await?;
             agent.pin_held_fork_suffix(
-                &source.name, deployment, suffix, capture, cut, keys, &base, io, expires_at_ms,
+                &source.name, deployment, capture, cut, keys, &base, io, expires_at_ms,
             ).await
         },
     ).await?;
@@ -268,12 +260,12 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
     let original = original.ok_or_else(OwnedWorld::unavailable)?;
     let scope = session.placed_history()?.ok_or_else(OwnedWorld::unavailable)?;
     let (cut, logical) = held.replayed_parent_cut(binding, original, scope).await?;
-    let (capture, suffix) = if let Some(capture) = select_held_archive(&source, archive, deployment, &cut)? {
+    let (capture, suffix) = if let Some(capture) = select_held_archive(&source, archive, deployment, &cut, Some(binding))? {
         capture
     } else {
         copy_fork_suffix(
             Arc::clone(&directory), storage, archive, keys, hosted_task, agent, deployment,
-            &source, &cut, cut.until(), resources.memory,
+            &source, &cut, cut.until(), Some(binding), resources.memory,
         ).await?
     };
     let installed = directory.deployment(&deployment.to_string()).await?
@@ -504,7 +496,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         if fork.cut.live().is_none() && !fork.cut.is_publication() {
             return Err(OwnedWorld::unavailable());
         }
-        if let Some(selected) = select_held_archive(&source, archive, deployment_id, &fork.cut)? {
+        if let Some(selected) = select_held_archive(&source, archive, deployment_id, &fork.cut, None)? {
             selected
         } else {
             let storage = capture_source.ok_or_else(OwnedWorld::unavailable)?;
@@ -520,7 +512,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
             } else {
                 copy_fork_suffix(
                     Arc::clone(&directory), storage, archive, keys, hosted_task,
-                    agent.ok_or_else(OwnedWorld::unavailable)?, deployment_id, &source, &fork.cut, deadline, resources.memory,
+                    agent.ok_or_else(OwnedWorld::unavailable)?, deployment_id, &source, &fork.cut, deadline, None, resources.memory,
                 ).await?
             };
             source = directory.deployment(&deployment).await?.ok_or_else(OwnedWorld::unavailable)?;

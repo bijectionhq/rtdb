@@ -397,9 +397,9 @@ impl CellStoreFactory {
                 } else { None };
                 let repair = crate::archive::completed_repair(record)?.map(|repair| repair.operation);
                 record.storage_regions.insert(id, if local {
-                    StorageRegion::Local { archive: None, repair_archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from }
+                    StorageRegion::Local { archive: None, checkpoint_suffix: None, repair_archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from }
                 } else {
-                    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from, archive: None, repair_archive: repair, owner: hosted_task.clone(),
+                    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from, archive: None, checkpoint_suffix: None, repair_archive: repair, owner: hosted_task.clone(),
                         closed: false, publications: BTreeMap::new() }
                 });
                 Ok(())
@@ -456,7 +456,7 @@ impl CellStoreFactory {
 }
 
 pub(crate) fn remote_storage_region(archive: Option<Uuid>, owner: Option<HostedTask>) -> StorageRegion {
-    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
+    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, archive, checkpoint_suffix: None, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
 }
 
 pub(crate) fn track_publications(
@@ -1530,6 +1530,17 @@ pub async fn run_reaper(
                                     Some(Ok(_)) => {},
                                 }
                             }
+                            for (&suffix, _) in record.checkpoint_suffix_pins.iter()
+                                .filter(|(id, pin)| crate::archive::obsolete_world_suffix(record, **id, pin))
+                                .take(8)
+                            {
+                                let disposal = crate::archive::retire_world_suffix(directory.as_ref(), &record.id, suffix);
+                                match cancellation.run_until_cancelled(disposal).await {
+                                    None => return,
+                                    Some(Err(error)) => eprintln!("World suffix {suffix} disposal is pending: {}", error.code),
+                                    Some(Ok(())) => {},
+                                }
+                            }
                         }
                         for record in deployments.iter().filter(|record| {
                             record.lifecycle == Lifecycle::Deleting || move_cleanup_due(record, now, grace)
@@ -1766,7 +1777,7 @@ mod tests {
         record.holder = Some(MemberId::fresh());
         record.storage_namespaces = Some(namespaces);
         record.storage_regions.insert(owner, StorageRegion::Local {
-            archive: None, repair_archive: None, tracks_ordered_index_pages: true,
+            archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true,
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
         let record = directory.create_deployment(record).await.unwrap();
@@ -2344,7 +2355,7 @@ mod tests {
         assert_eq!(before.storage_regions[&region], StorageRegion::Remote {
             tracks_ordered_index_pages: true,
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
-            archive: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
+            archive: None, checkpoint_suffix: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
@@ -2353,7 +2364,7 @@ mod tests {
         assert_eq!(retained.storage_regions[&region], StorageRegion::Remote {
             tracks_ordered_index_pages: true,
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
-            archive: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
+            archive: None, checkpoint_suffix: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
     }
 
@@ -2513,7 +2524,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
-        record.storage_regions.insert(region, StorageRegion::Local { archive: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, });
+        record.storage_regions.insert(region, StorageRegion::Local { archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
 

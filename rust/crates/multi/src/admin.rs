@@ -1202,7 +1202,9 @@ async fn prepare_cell_move(
         if record.has_live_suffix_pins(now_ms()) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
         }
-        record.checkpoint_suffix_pins.retain(|_, pin| pin.archive_sha256.is_some());
+        record.checkpoint_suffix_pins.retain(|_, pin| {
+            pin.custody != rtdb_directory::CheckpointSuffixCustody::Capture || pin.archive_sha256.is_some()
+        });
         record.lifecycle = Lifecycle::Moving;
         record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
             Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", record.id))
@@ -1350,7 +1352,7 @@ async fn stage_cell_storage(
             return Err(cell_move_conflict(from, to, &staged.name));
         }
         record.storage_regions.insert(region, if local {
-            StorageRegion::Local { archive: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, }
+            StorageRegion::Local { archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, }
         } else {
             crate::store::remote_storage_region(None, hosted_task.clone())
         });
@@ -1476,7 +1478,9 @@ async fn begin_disposal_at(directory: &dyn Directory, id: &str, incarnation: Opt
         if record.has_live_suffix_pins(now_ms()) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
         }
-        record.checkpoint_suffix_pins.retain(|_, pin| pin.archive_sha256.is_some());
+        record.checkpoint_suffix_pins.retain(|_, pin| {
+            pin.custody != rtdb_directory::CheckpointSuffixCustody::Capture || pin.archive_sha256.is_some()
+        });
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),

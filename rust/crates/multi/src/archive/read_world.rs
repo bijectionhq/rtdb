@@ -253,7 +253,7 @@ where
         &deployment,
         archive,
         hosted_task,
-        Some(selected.capture),
+        Some((selected.capture, selected.suffix)),
         None,
         |record| admit(record).map(|_| None),
         |record, _, region| async move {

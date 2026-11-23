@@ -85,7 +85,7 @@ pub(crate) use writable_world::retain_replayed_checkpoint_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::WorldPoint;
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
-pub(crate) use retirement::{finish_capture_retirement, obsolete_fork_input, require_capture_open, retire_capture, retire_obsolete_fork_input};
+pub(crate) use retirement::{finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, retire_world_suffix};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, StageSelector, inspect_staged_owned_relations, stream_staged_owned_event_files, tunnel_staged_checkpoint};
 
@@ -300,7 +300,7 @@ pub(crate) async fn materialize_completed_repair(
     let archive: CellStorage = serde_json::from_str(&repair.archive)
         .map_err(|_| inconsistent("Invalid retained archive binding"))?;
     stage::with_region(
-        directory, keys, &source.id, &archive, hosted_task, Some(repair.operation), None,
+        directory, keys, &source.id, &archive, hosted_task, Some((repair.operation, None)), None,
         |current| {
             if !matches!(current.lifecycle, Lifecycle::Moving)
                 || current.epoch != source.epoch
@@ -674,7 +674,7 @@ pub(crate) async fn verify_checkpoint_capture(
         .filter(|(_, retained)| retained == manifest)
         .ok_or_else(|| inconsistent("The capture does not retain the supplied manifest"))?;
     stage::with_region(
-        directory, keys, &source.id, archive, hosted_task, Some(operation), None,
+        directory, keys, &source.id, archive, hosted_task, Some((operation, None)), None,
         |record| {
             require_capture_open(record, operation)?;
             if capture_receipt(record, archive, deployment, operation)?.as_ref() != Some(&(point.clone(), manifest.clone()))
@@ -1121,6 +1121,7 @@ async fn capture_checkpoint(
         let admission = if local {
             rtdb_directory::StorageRegion::Local {
                 archive: Some(operation),
+                checkpoint_suffix: None,
                 repair_archive,
                 tracks_ordered_index_pages: true,
                 checkpoint_metadata_from,
@@ -2204,7 +2205,7 @@ mod tests {
         let id = deployment.to_string();
         update_installation(directory.as_ref(), &id, |record| {
             record.storage_regions.insert(predecessor, rtdb_directory::StorageRegion::Local {
-                archive: None, repair_archive: None,
+                archive: None, checkpoint_suffix: None, repair_archive: None,
                 tracks_ordered_index_pages: false,
                 checkpoint_metadata_from: Some(checkpoint.block),
                 checkpoint_replay_from: None,

@@ -115,6 +115,7 @@ mod tests {
         record.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 7, custody: ReplayCustody::Local });
         record.checkpoint_suffix_pins.insert(pin, CheckpointSuffixPin {
             capture: uuid::Uuid::new_v4(), manifest_sha256: "root".into(), checkpoint: checkpoint(4),
+            custody: rtdb_directory::CheckpointSuffixCustody::Capture,
             incarnation: record.incarnation, log_epoch: record.log_epoch, writer_epoch: 1,
             basis: TransactionKey { tx_id: TxId(6), system_time: Timestamp(6) },
             replica_through: 6, source_through: 6, journal_interval: [5, 6], journal_sha256: [3; 32],

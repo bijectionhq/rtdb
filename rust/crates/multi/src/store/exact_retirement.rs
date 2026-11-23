@@ -545,7 +545,7 @@ mod tests {
         record.holder = Some(MemberId::fresh());
         record.storage_namespaces = Some(namespaces);
         record.storage_regions.insert(region, StorageRegion::Local {
-            archive: None, repair_archive: None, tracks_ordered_index_pages: true,
+            archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true,
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
         record.checkpoint = Some(rtdb_directory::Checkpoint {
@@ -782,7 +782,7 @@ mod tests {
         garbage.delete(&table).await.unwrap();
         crate::admin::update_installation(directory.as_ref(), &owner.id, |current| {
             current.storage_regions.insert(region, StorageRegion::Local {
-                archive: None, repair_archive: None, tracks_ordered_index_pages: false,
+                archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: false,
                 checkpoint_metadata_from: Some(0), checkpoint_replay_from: None,
             });
             Ok(())

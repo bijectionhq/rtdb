@@ -265,7 +265,7 @@ mod tests {
         record.holder = Some(rtdb_directory::MemberId("writer".into()));
         let owner = Uuid::new_v4();
         record.storage_regions.insert(owner, StorageRegion::Local {
-            archive: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
         let record = directory.create_deployment(record).await.unwrap();
         let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
@@ -291,7 +291,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
         let owner = Uuid::new_v4();
         record.storage_regions.insert(owner, StorageRegion::Local {
-            archive: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
         let record = directory.create_deployment(record).await.unwrap();
         let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };

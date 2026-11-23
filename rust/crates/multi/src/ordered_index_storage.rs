@@ -538,7 +538,7 @@ mod tests {
         require_page_publication(&closed, owner, &new_key).unwrap();
         let mut before_cutover = closed.clone();
         before_cutover.storage_regions.insert(Uuid::new_v4(), StorageRegion::Local {
-            archive: None, repair_archive: None, tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
         reap(directory.as_ref(), &storage, &bucket, &before_cutover).await.unwrap();
         assert!(bucket.head(&unregistered).await.is_ok());

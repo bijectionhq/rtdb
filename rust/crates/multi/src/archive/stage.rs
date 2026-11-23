@@ -212,7 +212,7 @@ pub(super) async fn stage_checkpoint_for(
         &source_id,
         archive,
         hosted_task.as_ref(),
-        Some(point.operation),
+        Some((point.operation, None)),
         None,
         |current| {
             require_capture_open(current, point.operation)?;
@@ -330,7 +330,7 @@ pub(super) async fn with_region<T, F, Fut>(
     deployment: &str,
     media: &CellStorage,
     hosted_task: Option<&HostedTask>,
-    capture: Option<Uuid>,
+    archive: Option<(Uuid, Option<Uuid>)>,
     publication: Option<RegionPublication>,
     admit: impl Fn(&DeploymentRecord) -> Result<Option<i64>>,
     run: F,
@@ -340,16 +340,21 @@ where
     Fut: Future<Output = Result<T>>,
 {
     let region = Uuid::new_v4();
+    let (capture, checkpoint_suffix) = archive.map_or((None, None), |(capture, suffix)| (Some(capture), suffix));
     let (state, witness) = match media {
         CellStorage::Local { .. } => (
-            rtdb_directory::StorageRegion::Local { archive: capture, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, },
+            rtdb_directory::StorageRegion::Local { archive: capture, checkpoint_suffix, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, },
             keys.hold_local_storage_region(region)?,
         ),
         CellStorage::S3 { .. } => {
             let owner = hosted_task.cloned().ok_or_else(|| {
                 inconsistent("Remote checkpoint staging requires its installed ECS task")
             })?;
-            (remote_storage_region(capture, Some(owner)), None)
+            let mut state = remote_storage_region(capture, Some(owner));
+            if let rtdb_directory::StorageRegion::Remote { checkpoint_suffix: held_suffix, .. } = &mut state {
+                *held_suffix = checkpoint_suffix;
+            }
+            (state, None)
         }
     };
     let witnessed = witness.is_some();

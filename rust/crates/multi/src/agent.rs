@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, CheckpointSuffixPin, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park, suspend_holding};
+use rtdb_directory::{Cas, Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, DeploymentRecord, Directory, Lifecycle, MAX_RETAINED_WORLDS, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park, suspend_holding};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
@@ -588,24 +588,30 @@ impl NodeAgent {
         capture: uuid::Uuid, basis: TransactionKey, expires_at_ms: i64,
     ) -> Result<Response> {
         self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::Tip(basis), expires_at_ms)
-            .await.map(|pin| Response::CheckpointSuffixPinned { pin })
+            .await.map(|(_, pin)| Response::CheckpointSuffixPinned { pin })
     }
 
     pub(crate) async fn pin_held_fork_suffix(
-        &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
+        &self, name: &str, deployment: uuid::Uuid,
         capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, keys: &dyn crate::keys::KeyService,
         base: &BlockCatalog, io: Arc<rtdb_storage::IoRegion>, expires_at_ms: i64,
-    ) -> Result<CheckpointSuffixPin> {
-        self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::HeldPublication(cut, keys, base, io), expires_at_ms)
-            .await
+    ) -> Result<(uuid::Uuid, CheckpointSuffixPin)> {
+        self.pin_suffix_at(
+            name, deployment, uuid::Uuid::new_v4(), capture,
+            SuffixCut::HeldPublication(cut, keys, base, io), expires_at_ms,
+        ).await
     }
 
     async fn pin_suffix_at(
         &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
         capture: uuid::Uuid, cutoff: SuffixCut<'_>, expires_at_ms: i64,
-    ) -> Result<CheckpointSuffixPin> {
+    ) -> Result<(uuid::Uuid, CheckpointSuffixPin)> {
         const MAX_PIN_MS: i64 = 60_000;
         const MAX_PINS: usize = 32;
+        let custody = match &cutoff {
+            SuffixCut::Tip(_) => CheckpointSuffixCustody::Capture,
+            SuffixCut::HeldPublication(..) => CheckpointSuffixCustody::World,
+        };
         let unavailable = || Anomaly::new(
             AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
             "The exact checkpoint suffix is no longer admissible on this writer",
@@ -649,20 +655,29 @@ impl NodeAgent {
         };
         let record = self.directory.deployment(&id).await?.ok_or_else(unavailable)?;
         let (checkpoint, manifest_sha256) = validate(&record)?;
-        if let Some(prior) = record.checkpoint_suffix_pins.get(&lease) {
+        let reusable_world = |record: &DeploymentRecord| {
+            record.checkpoint_suffix_pins.iter().find_map(|(id, prior)| {
+                (prior.custody == CheckpointSuffixCustody::World && prior.capture == capture
+                    && prior.manifest_sha256 == manifest_sha256 && prior.checkpoint == checkpoint
+                    && prior.incarnation == record.incarnation && prior.log_epoch == record.log_epoch
+                    && prior.writer_epoch == epoch && cutoff.matches(prior.basis)
+                    && prior.expires_at_ms > now_ms() && prior.expires_at_ms <= expires_at_ms)
+                    .then_some(*id)
+            })
+        };
+        if custody == CheckpointSuffixCustody::World {
+            if let Some(existing) = reusable_world(&record) {
+                return Ok((existing, record.checkpoint_suffix_pins[&existing].clone()));
+            }
+        } else if let Some(prior) = record.checkpoint_suffix_pins.get(&lease) {
             if prior.capture == capture && prior.manifest_sha256 == manifest_sha256
                 && prior.checkpoint == checkpoint && cutoff.matches(prior.basis)
-                && (match &cutoff {
-                    SuffixCut::Tip(_) => prior.expires_at_ms == expires_at_ms,
-                    SuffixCut::HeldPublication(..) => prior.expires_at_ms > now_ms() && prior.expires_at_ms <= expires_at_ms,
-                })
+                && prior.custody == custody && prior.expires_at_ms == expires_at_ms
                 && prior.incarnation == record.incarnation && prior.log_epoch == record.log_epoch && prior.writer_epoch == epoch
             {
-                return Ok(prior.clone());
+                return Ok((lease, prior.clone()));
             }
-            if matches!(&cutoff, SuffixCut::Tip(_)) || prior.archive_sha256.is_some() || prior.expires_at_ms > now_ms() {
-                return Err(unavailable());
-            }
+            return Err(unavailable());
         }
         let database = self.node.catalog().database(name)?;
         let before = database.status();
@@ -717,12 +732,12 @@ impl NodeAgent {
         ).await.map_err(|_| unavailable())??;
         if proof.interval != [first_replica, replica_through] { return Err(unavailable()); }
         let pin = CheckpointSuffixPin {
-            capture, manifest_sha256, checkpoint, incarnation: record.incarnation,
+            capture, custody, manifest_sha256: manifest_sha256.clone(), checkpoint, incarnation: record.incarnation,
             log_epoch: record.log_epoch, writer_epoch: epoch, basis, replica_through,
             source_through, journal_interval: proof.interval, journal_sha256: proof.digest_bytes().ok_or_else(unavailable)?,
             expires_at_ms, archive_sha256: None,
         };
-        crate::admin::update_installation(self.directory.as_ref(), &id, |current| {
+        let installed = crate::admin::update_installation(self.directory.as_ref(), &id, |current| {
             let (selected, manifest) = validate(current)?;
             if selected != pin.checkpoint || manifest != pin.manifest_sha256
                 || current.incarnation != record.incarnation || current.log_epoch != record.log_epoch
@@ -730,22 +745,36 @@ impl NodeAgent {
             {
                 return Err(unavailable());
             }
+            if custody == CheckpointSuffixCustody::World && reusable_world(current).is_some() {
+                return Ok(());
+            }
             if let Some(prior) = current.checkpoint_suffix_pins.get(&lease) {
-                if prior == &pin { return Ok(()); }
-                if matches!(&cutoff, SuffixCut::Tip(_)) || prior.archive_sha256.is_some()
-                    || prior.expires_at_ms > now_ms()
-                {
-                    return Err(unavailable());
-                }
+                return if prior == &pin { Ok(()) } else { Err(unavailable()) };
             }
             let now = now_ms();
             if expires_at_ms <= now { return Err(unavailable()); }
-            current.checkpoint_suffix_pins.retain(|_, hold| hold.expires_at_ms > now || hold.archive_sha256.is_some());
-            if current.checkpoint_suffix_pins.len() >= MAX_PINS { return Err(unavailable()); }
+            current.checkpoint_suffix_pins.retain(|_, hold| {
+                hold.custody != CheckpointSuffixCustody::Capture
+                    || hold.expires_at_ms > now || hold.archive_sha256.is_some()
+            });
+            let world = custody == CheckpointSuffixCustody::World;
+            let count = current.checkpoint_suffix_pins.values().filter(|hold| {
+                (hold.custody != CheckpointSuffixCustody::Capture) == world
+            }).count();
+            let limit = if world { MAX_RETAINED_WORLDS + MAX_PINS } else { MAX_PINS };
+            if count >= limit {
+                return Err(unavailable());
+            }
             current.checkpoint_suffix_pins.insert(lease, pin.clone());
             Ok(())
         }).await?;
-        Ok(pin)
+        let id = if custody == CheckpointSuffixCustody::World {
+            reusable_world(&installed).ok_or_else(unavailable)?
+        } else {
+            lease
+        };
+        let pin = installed.checkpoint_suffix_pins.get(&id).cloned().ok_or_else(unavailable)?;
+        Ok((id, pin))
     }
 
     pub async fn park(&self, name: &str) -> Result<Response> { self.park_holding(name, None).await }

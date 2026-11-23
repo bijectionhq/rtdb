@@ -1358,6 +1358,10 @@ rule ConsumeIntake {
 -- The ordered resolver fills each disjoint slot from the transaction reading and checks the completed row against its declared schema.
 -- Committed events and archive replay carry filled values and require no slot metadata.
 -- While a world is retained the archive retirement fence cannot close its capture.
+-- A completed world-parent suffix remains available while its preparation lease, the held restore, or a retained world still holds it.
+-- The reaper closes an expired suffix after its last world reference and its admitted provider regions have drained.
+-- A closed suffix admits no more readers or copies, and another materialization uses a fresh identity.
+-- Suffix retirement empties that suffix's provider inventory before releasing its Directory slot.
 -- An initial retained fork at the original live Root key may share one ordered publication with checked Root writes and checked hosted controls.
 -- A live hold may select its accepted application publication as the initial retained basis.
 -- An initial Proposal may inherit that same application basis when its creation and the checked hosted settlement share one ordered attempt.
@@ -1496,7 +1500,8 @@ rule PublishCheckpoint {
 rule TrimCertifiedReplicaPrefix {
     -- The checkpoint's boundary record supplies the intake position on reopen.
     -- An active suffix pin retains its first required replica record until its verified archive publication is recorded or the pin expires.
-    -- The archived suffix retains its capture through its own custody.
+    -- A separately captured suffix retains its capture until explicit archive retirement.
+    -- A world-parent suffix protects its capture for the duration of its preparation lease, held restore, and retained world references.
     -- A copy admitted against a pending suffix retains its first required replica record until its provider region drains.
     when: ReplicaPrefixCertified(holding, through, digest)
 
