@@ -45,7 +45,7 @@ W1, W2, W4 and W6 can start now and in parallel; W7 runs alongside all of them, 
 | --- | --- | --- | --- | --- |
 | W1 | Reader entitlement on every read and delete path | SNAP-1, GC-1, GC-2, LIVE-2 | R4 supersedes the lease mechanism | Every read path holds a lease, hold or registry entry, and every deletion path waits for it; native replays and Verus laws for each |
 | W2 | Recovery holds and root closure across authorities | DUR-2, GC-1 | — | Recovery keeps a usable root and log suffix under concurrent collection on every authority and deletion path |
-| W3 | Commit and replica path from admission to applied state | TX-1, TX-2, DUR-1 | — | Each acknowledgement is tied to the same applied outcome after failover and replay, and stale-term and premature-ack mutations fail |
+| W3 | Certified commit decisions and protected applied fresh cuts | TX-1, TX-2, SNAP-1, DUR-1 | W1 for capture custody | Acknowledgement and successive fresh reads preserve quorum-installed cuts through recovery. Fair quorum service can answer while an uncertified tail is stalled. |
 | W4 | Temporal composition end to end | TIME-1, TIME-2 | — | Production contracts for event order, visitor shells and range decomposition refine the Lean reference |
 | W5 | Compaction refinement | COMPACT-1 | W4 for the history relation | Merged output refines the input history through every publication route, including retry and restart |
 | W6 | Ranked search completeness | FTS-1, FTS-2 | — | Planner, visibility and index provably supply a complete frontier, and native postings refine the modelled summaries |
@@ -125,7 +125,7 @@ Goal: every successful acknowledgement names an admitted, applied batch that rec
 
 **Open obligations:**
 
-1. Model the boundary from resolving and staging, through durable read-back and atomic publication, to acknowledgement.
+1. Model exact payload votes, partial decision installation, quorum-stable decisions, delayed replies, fresh probes and write-back, exact applied capture under a hold, and disjoint-config handoff. Check acknowledgement and prior-read coverage, prefix agreement, strict original acceptance and permanent exclusion. Reach a read with a silent writer and a stalled minority tail, a read stabilizing a partial installation, and an advancing clock with ambiguous guarded settlement. Mutate payload-only acknowledgement, single-copy read exposure, digest and journal identity binding, probe replay, skip-apply, hold bypass, witness loss on trim, prepared-epoch reads, incomplete activation, copied or cutoff-equal timed votes, and exclusion inferred from silence.
 2. Replay injected crashes at each transition natively.
 3. Prove the partition publication transitions, scan coverage, and the composition from token to effect.
 4. Trace replica decoding, deferred delivery, oversized payload resolution, leader and follower apply, and recovery imports.

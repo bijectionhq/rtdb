@@ -77,29 +77,19 @@ Move recovery can sync the predecessor at the successor's epoch before installin
 The predecessor needs a quorum-durable closed state that fences read-index votes; the successor needs a quorum-durable active state before it issues votes.
 The states bind the deployment history and exact loglet configuration.
 
-The current writer returns an append receipt as soon as a quorum holds the entry, before every commit-watermark publication is acknowledged.
-Sampling only published commit watermarks can therefore miss a completed write.
-The read index collects positive replies from an intersecting quorum of the exact active loglet.
-It counts each unobserved slot as a possible vote for a completed position.
-With `q` write votes required and `u` unobserved slots, the `(q - u)`th highest held position is a conservative bound.
-It also includes the highest reported published position.
-An observation from every slot excludes a tail held only by a minority, even when publication is delayed.
-A brief grace for further replies only starts when the held bound exceeds the published or quorum-observed frontier.
-The subscriber waits until its committed prefix is applied through the bound and refuses freshness if it cannot reach it.
-The wire protocol and the one-quorum append contract are unchanged.
-[ReadIndexFrontiers.lean](../lean/ReadIndexFrontiers.lean) proves the bound over arbitrary finite inventories and witnesses why a silent slot cannot be counted as a negative vote.
-[ActiveLogletReadIndex.tla](../tla/ActiveLogletReadIndex.tla) checks this rule with overlapping three-journal ensembles, two available positions and a single read.
-It separates a synced predecessor from an active successor and allows publication to lag acknowledgement.
-The move and activation are atomic in the model.
-The native logkeeper persists activation only on the writer's target ensemble after recovery and installs the same activation on repaired replicas.
-A read-index round requires matching stream, epoch, ensemble and write quorum and accepts a journal's held position only after its preceding journal work is durable.
-A writer requires an activated write quorum before it opens.
-During upgrade, logkeepers must serve the identity handshake before cell writers and subscribers enable identity-bound sessions.
-The subscriber probes the replica log of its attached database and waits for its installed position before capturing an implicit query or transaction snapshot.
-An explicit or already pinned basis keeps the history and time selected by the caller or transaction.
-The gateway requests a subscriber that supports fresh reads for a deployment with linearizable reads enabled.
-A subscriber that cannot establish its basis refuses before the read.
-The gateway retries an unanswered command on the holder when the refusal leaves the backend idle.
+The certified-prefix contract in [structural redesign](../../dev/doc/structural-redesign.adoc) requires quorum installation before a writer returns an append receipt or a fresh reader exposes a cut.
+The fresh reader samples a nonce-bound quorum of the active configuration and selects its greatest compatible installed certificate.
+A reader may stabilize an exact partial decision by installing it on a quorum.
+A staged suffix carries no read authority.
+Seal and activation preserve the installed floor and a usable recovery closure.
+Strict guards settle using original durable evidence and can leave a sealed attempt unresolved.
+The serving attachment holds and applies the exact selected cut before using it for snapshot capture.
+A gateway can retry an eligible, unanswered read in the same history.
+
+The retained proof runs for the held-position frontier cover the prior one-quorum acknowledgement protocol.
+They establish neither certified read-to-read monotonicity nor progress with an uncertified stalled tail.
+The replacement model and controls belong to [W3](../PROGRAMME.md#w3--commit-and-replica-path-from-admission-to-applied-state).
+
 The durable on-disk journal identity binds the logkeeper's directory registration.
 The active ensemble fingerprint binds the declared journal identities and write quorum.
 Every new transport session identifies its durable journal before admitting work.

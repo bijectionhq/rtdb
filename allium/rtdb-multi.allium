@@ -591,9 +591,12 @@ contract LogService {
         -- A standalone authority addresses its journal by the retained journal ID.
         -- Only the process holding the journal can reach that transport.
 
-    @invariant CommitIsAWriteQuorum
-        -- A record is committed when write_quorum of its loglet's ensemble have made it durable.
-        -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
+    @invariant VisibilityRequiresAnInstalledDecision
+        -- Payload votes authenticate distinct physical journals, the active configuration and the exact recoverable prefix digest.
+        -- The decision certificate binds the predecessor and admissible evidence.
+        -- Each installer durably records the full compatible certificate in its local journal order.
+        -- Append receipts require a quorum of installations. Transaction replies and external effects also require exact application.
+        -- Sealing retains installed certificates and potentially chosen ordinary values, and activation installs the recovered prefix and dependencies on the successor quorum.
 
     @invariant GuardedAppendRequiresALiveUpperSample
         -- Before a guarded append takes a log position or dispatches a record, the writer samples its live clock in append order.
@@ -673,15 +676,13 @@ contract LogService {
         -- Before writing, the holder activates a durable write quorum for the epoch, the member identities and the configured quorum size.
         -- A journal acknowledges activation only at its promised and synced epoch and records at most one ensemble for that epoch.
         -- A higher promise revokes the activation.
-        -- A positive read-index reply requires that activation and reports the last held and published positions after preceding journal work is durable.
-        -- A read index requires an intersecting write quorum of positive replies.
-        -- Its upper bound includes every position that could have been held by a write quorum before the read began.
-        -- Unobserved journal slots count as possible holders, so each additional positive reply can rule out a minority tail.
-        -- A published position or a position held by a full observed quorum can discharge that uncertainty.
-        -- If the round cannot settle the uncertainty within its confirmation grace, it returns the conservative bound.
-        -- The active loglet client carries the stream, epoch, ensemble identity and position together in its admitted read index.
-        -- A subscriber waits for committed application through the result before taking its query snapshot on the same attachment.
-        -- Fresh basis capture retains the read's protection until the partition snapshot is taken.
+        -- A positive reply requires that activation and binds the fresh invocation nonce to the greatest installed decision in the same local order.
+        -- The reader selects the greatest compatible decision from an intersecting quorum of distinct positive replies.
+        -- The selected cut must have quorum installation before exposure. The reader can complete installation of its exact certificate.
+        -- An installer already ahead can attest a verified extension without changing the reader's selection.
+        -- The admitted read index binds the stream, history, epoch, ensemble, cut and exact prefix digest.
+        -- A serving attachment acquires replay protection and waits for same-history application through the cut before capturing that exact snapshot.
+        -- Fresh basis capture retains protection through execution and transfer. Raw staged tips do not constrain selection.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
