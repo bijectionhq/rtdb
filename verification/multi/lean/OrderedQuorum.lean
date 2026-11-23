@@ -24,7 +24,7 @@ theorem intersects (leftVotes : Majority left) (rightVotes : Majority right) :
 
 structure Value where
   ballot : Nat
-  prefix : List Nat
+  entries : List Nat
 
 def Extends (past next : List Nat) : Prop := ∃ suffix, next = past ++ suffix
 
@@ -44,8 +44,8 @@ theorem recovering_a_chosen_prefix (chosen next : Value)
     (remembers : ∀ voter, accept voter → prepared voter →
       ∃ value, reported voter = some value ∧ chosen.ballot ≤ value.ballot)
     (highest : ∀ voter value, prepared voter → reported voter = some value → value.ballot ≤ picked.ballot)
-    (validHigher : chosen.ballot ≤ picked.ballot → Extends chosen.prefix picked.prefix)
-    (extendsPicked : Extends picked.prefix next.prefix) : Extends chosen.prefix next.prefix := by
+    (validHigher : chosen.ballot ≤ picked.ballot → Extends chosen.entries picked.entries)
+    (extendsPicked : Extends picked.entries next.entries) : Extends chosen.entries next.entries := by
   obtain ⟨voter, acceptedHere, preparedHere⟩ := intersects accepted quorum
   obtain ⟨value, report, notOlder⟩ := remembers voter acceptedHere preparedHere
   have latest := Nat.le_trans notOlder (highest voter value preparedHere report)
@@ -54,7 +54,7 @@ theorem recovering_a_chosen_prefix (chosen next : Value)
 structure Seal where
   predecessor : Nat
   successor : Nat
-  prefix : List Nat
+  entries : List Nat
 
 /-- Durable votes name one successor and one sealed prefix. A different
 successor or a different prefix would need an intersecting voter to attest

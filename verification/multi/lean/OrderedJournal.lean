@@ -48,7 +48,7 @@ structure Preparation where
 
 structure State where
   cohort : Nat
-  seal : Option Nat
+  successorSeal : Option Nat
   writer : Nat
   custodian : Nat
   chosen : Nat → Option Cut
@@ -70,7 +70,7 @@ def update (f : α → β) [DecidableEq α] (key : α) (value : β) : α → β 
   fun entry => if entry = key then value else f entry
 
 def Current (s : State) (cohort writer : Nat) : Prop :=
-  cohort = s.cohort ∧ writer = s.writer ∧ s.seal = none
+  cohort = s.cohort ∧ writer = s.writer ∧ s.successorSeal = none
 
 def CanServe (s : State) (hold : Hold) (applied : Cut) : Prop :=
   hold ∈ s.holdBook ∧ s.chosen applied.next = some applied ∧ hold.through.next ≤ applied.next
@@ -90,7 +90,7 @@ def seedCut : Cut := ⟨0, 0⟩
 
 def seed : State where
   cohort := 1
-  seal := none
+  successorSeal := none
   writer := 0
   custodian := 1
   chosen := fun n => if n = 0 then some seedCut else none
@@ -121,16 +121,21 @@ inductive Step (readerSlots activationSlots : Nat) : State → State → Prop wh
       (issuer : attempt.issuer = writer) (fresh : s.receipts attempt = none)
       (next : receipt.cut.next = s.head.next + 1) :
       Step readerSlots activationSlots s
-        {s with head := receipt.cut, chosen := update s.chosen receipt.cut.next (some receipt.cut),
+        {s with
+          head := receipt.cut
+          chosen := update s.chosen receipt.cut.next (some receipt.cut)
           receipts := update s.receipts attempt (some receipt)}
   | expire (s : State) (observed : Nat) (forward : s.observed ≤ observed) :
       Step readerSlots activationSlots s
-        {s with observed := observed,
+        {s with
+          observed := observed
           receipts := fun attempt => if attempt.expiry ≤ observed then none else s.receipts attempt}
   | grant (s : State) (cohort expected nonce : Nat) (auth : Current s cohort expected)
       (quorum : s.quorum = true) (room : ActivationCount s < activationSlots) :
       Step readerSlots activationSlots s
-        {s with writer := s.writer + 1, readFloor := 0,
+        {s with
+          writer := s.writer + 1
+          readFloor := 0
           holdBook := hold s (s.writer + 1) nonce true :: s.holdBook}
   | barrier (s : State) (cohort writer nonce : Nat) (auth : Current s cohort writer)
       (quorum : s.quorum = true) (room : ReaderCount s < readerSlots)
@@ -141,11 +146,11 @@ inductive Step (readerSlots activationSlots : Nat) : State → State → Prop wh
       (quorum : s.quorum = true) (next : nonce = s.readFloor + 1) :
       Step readerSlots activationSlots s {s with readFloor := nonce}
   | closeHold (s : State) (closing : Hold) (owner : Nat) (quorum : s.quorum = true)
-      (matches : closing.enrollment = owner) (present : closing ∈ s.holdBook) :
+      (agrees : closing.enrollment = owner) (present : closing ∈ s.holdBook) :
       Step readerSlots activationSlots s {s with holdBook := s.holdBook.filter (fun entry => decide (entry ≠ closing))}
   | prepare (s : State) (custodian : Nat) (base target : Checkpoint)
       (authorized : custodian = s.custodian) (quorum : s.quorum = true)
-      (empty : s.preparing = none) (matches : s.chosen target.cut.next = some target.cut)
+      (empty : s.preparing = none) (agrees : s.chosen target.cut.next = some target.cut)
       (forward : s.published.cut.next < target.cut.next) (within : target.cut.next ≤ s.head.next)
       (baseOpen : base ∉ s.closed) (targetOpen : target ∉ s.closed) :
       Step readerSlots activationSlots s {s with preparing := some ⟨base, target, false⟩}
@@ -156,13 +161,13 @@ inductive Step (readerSlots activationSlots : Nat) : State → State → Prop wh
   | publish (s : State) (custodian : Nat) (base target : Checkpoint)
       (authorized : custodian = s.custodian) (quorum : s.quorum = true)
       (ready : s.preparing = some ⟨base, target, true⟩)
-      (matches : s.chosen target.cut.next = some target.cut)
+      (agrees : s.chosen target.cut.next = some target.cut)
       (forward : s.published.cut.next < target.cut.next) (within : target.cut.next ≤ s.head.next) :
       Step readerSlots activationSlots s {s with published := target, preparing := none}
   | trim (s : State) (custodian : Nat) (selected : Checkpoint) (through : Cut)
       (authorized : custodian = s.custodian) (quorum : s.quorum = true)
       (selection : selected = s.published)
-      (matches : s.chosen through.next = some through) (forward : s.floor ≤ through.next)
+      (agrees : s.chosen through.next = some through) (forward : s.floor ≤ through.next)
       (covered : through.next ≤ s.published.cut.next)
       (unheld : ∀ h ∈ s.holdBook, h.first = h.through.next ∨ through.next ≤ h.first) :
       Step readerSlots activationSlots s {s with floor := through.next}
@@ -178,12 +183,12 @@ inductive Step (readerSlots activationSlots : Nat) : State → State → Prop wh
       (authorized : custodian = s.custodian) (exactProvider : old.provider = provider) (reachable : s.provider = true)
       (quorum : s.quorum = true) :
       Step readerSlots activationSlots s {s with disposed := old :: s.disposed}
-  | seal (s : State) (successor : Nat) (active : s.seal = none) (quorum : s.quorum = true)
+  | sealCohort (s : State) (successor : Nat) (active : s.successorSeal = none) (quorum : s.quorum = true)
       (successorDistinct : successor ≠ s.cohort) (funded : Bool) (ticket : funded = true) :
-      Step readerSlots activationSlots s {s with seal := some successor}
-  | install (s : State) (successor : Nat) (matches : s.seal = some successor)
+      Step readerSlots activationSlots s {s with successorSeal := some successor}
+  | install (s : State) (successor : Nat) (agrees : s.successorSeal = some successor)
       (prepared : Bool) (ticket : prepared = true) :
-      Step readerSlots activationSlots s {s with cohort := successor, seal := none}
+      Step readerSlots activationSlots s {s with cohort := successor, successorSeal := none}
   | lostReply (s : State) : Step readerSlots activationSlots s s
   | quorumAvailability (s : State) (reachable : Bool) :
       Step readerSlots activationSlots s {s with quorum := reachable}
@@ -219,9 +224,9 @@ theorem step_preserves_checkpoint_and_holds (before : Invariant s)
     · exact held h old
   case closeHold =>
     exact ⟨covered, head, selected, fun h member => held h (List.mem_filter.mp member).1⟩
-  case publish custodian base target authorized quorum ready matches forward within =>
-    exact ⟨Nat.le_trans covered (Nat.le_of_lt forward), within, matches, held⟩
-  case trim custodian selectedRoot through authorized quorum selection matches forward current pins =>
+  case publish custodian base target authorized quorum ready agrees forward within =>
+    exact ⟨Nat.le_trans covered (Nat.le_of_lt forward), within, agrees, held⟩
+  case trim custodian selectedRoot through authorized quorum selection agrees forward current pins =>
     exact ⟨current, head, selected, pins⟩
 
 theorem protected_through_trace (before : Invariant s)
@@ -264,18 +269,18 @@ theorem previous_writer_cannot_act (s : State) (cohort : Nat) :
   omega
 
 theorem sealed_predecessor_cannot_act (s : State) (successor : Nat) :
-    ¬Current {s with seal := some successor} s.cohort s.writer := by
+    ¬Current {s with successorSeal := some successor} s.cohort s.writer := by
   simp [Current]
 
 theorem installed_successor_fences_the_old_cohort (s : State) (successor : Nat)
     (different : successor ≠ s.cohort) :
-    ¬Current {s with cohort := successor, seal := none} s.cohort s.writer := by
+    ¬Current {s with cohort := successor, successorSeal := none} s.cohort s.writer := by
   intro old
   exact different old.1.symm
 
 theorem successor_cannot_change_original_receipt (s : State) (successor : Nat)
     (attempt : Attempt) (payload : Nat) :
-    Reissue {s with cohort := successor, seal := none} attempt payload = Reissue s attempt payload := rfl
+    Reissue {s with cohort := successor, successorSeal := none} attempt payload = Reissue s attempt payload := rfl
 
 theorem repeated_payload_returns_exact_receipt (present : s.receipts attempt = some r) :
     Reissue s attempt r.payload = some r := by simp [Reissue, present]
@@ -325,10 +330,10 @@ theorem read_cannot_serve_an_unapplied_barrier (served : CanServe s h applied) :
     h.through.next ≤ applied.next := served.2.2
 
 theorem read_cannot_serve_same_position_with_alien_digest (served : CanServe s h applied)
-    (matches : s.chosen expected.next = some expected) (samePosition : applied.next = expected.next) :
+    (agrees : s.chosen expected.next = some expected) (samePosition : applied.next = expected.next) :
     applied = expected := by
   have actual := served.2.1
-  rw [samePosition, matches] at actual
+  rw [samePosition, agrees] at actual
   exact (Option.some.inj actual).symm
 
 theorem late_provider_write_after_fence_is_refused (s : State) (old : Checkpoint) (provider : Nat) :
