@@ -198,16 +198,16 @@ fn remove_ticket(path: &Path) -> Result<()> {
     }
 }
 
-fn well_formed(cut: CatalogCut) -> bool {
+pub(crate) fn well_formed(cut: CatalogCut) -> bool {
     cut.through.after_offset(cut.replica_epoch) >= 0
         || ReplicaPosition::from_epoch_offset(cut.replica_epoch, -1).ok() == Some(cut.through)
 }
 
-fn same_storage(left: CatalogCut, right: CatalogCut) -> bool {
+pub(crate) fn same_storage(left: CatalogCut, right: CatalogCut) -> bool {
     left.storage_version == right.storage_version && left.storage_epoch == right.storage_epoch
 }
 
-fn covers(reader: CatalogCut, floor: CatalogCut) -> bool {
+pub(crate) fn covers(reader: CatalogCut, floor: CatalogCut) -> bool {
     well_formed(reader) && same_storage(reader, floor) && reader.replica_epoch == floor.replica_epoch
         && reader.through >= floor.through
 }

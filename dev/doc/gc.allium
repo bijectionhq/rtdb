@@ -49,6 +49,10 @@
 -- A successor journal can open from the latest durable checkpoint after offline replacement.
 -- Held catalogs from the predecessor and opaque captures delay the successor floor.
 -- Installing the successor floor fences earlier journals.
+-- Classic remote storage orders holds and floor advancement on one conditional-write object in the storage root.
+-- The object sequence advances even when rescinding an absent hold after an uncertain registration.
+-- A remote hold remains through its last admitted provider request.
+-- Loss of the holder without a drain retains its ticket.
 -- An exclusive compactor reset resumes cut publication after it adopts its new naming epoch.
 -- The installed prefix covers the new catalog before the reset completes.
 -- A coordinated reset stages the compacted file identities with the successor block and naming epoch before adoption.

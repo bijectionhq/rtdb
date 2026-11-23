@@ -110,8 +110,9 @@ Each remaining increment has a design and handoff note in link:../../verificatio
 
 |4
 |Residence ledger with holds and collection floor; delete the timer stack.
-|Multi and native local storage enforce a catalog admission floor and retry trie retirement from installed receipts.
-Remote classic storage, renewal, full recovery-root integration and timer removal remain open.
+|Multi, native local storage, and classic S3, Azure and GCS storage enforce a catalog admission floor and retry trie retirement from installed receipts.
+Classic remote holds use conditional writes and finish after admitted provider work drains.
+Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.

@@ -87,7 +87,7 @@ impl AzureConfig {
             .with_http_connector(copy::CopyConnector::new(connection.account.clone(), credentials))
             .build().map_err(invalid)?;
         ensure_container(&client, &connection.account, &connection.endpoint, &self.container).await?;
-        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
+        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io).with_catalog_ledger()?))
     }
 
     pub fn to_proto(&self) -> Result<AzureBlobStorageConfig> {
