@@ -24,8 +24,8 @@ use crate::{
     keys::KeyService,
     reference::{PrefixedStore, key},
     store::{
-        ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
-        track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
+        CheckpointReplayPublication, ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
+        track_checkpoint_replay_publication, track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
     },
 };
 
@@ -169,9 +169,9 @@ pub(super) async fn stage_checkpoint_for(
     {
         return Err(inconsistent("A terminal transfer requires the original current source checkpoint"));
     }
-    super::admit_lifetime_restore(
+    Box::pin(super::admit_lifetime_restore(
         directory.as_ref(), archive, keys, &point, &manifest, hosted_task.as_ref(), transfer_only, false,
-    ).await?;
+    )).await?;
     let intent = CheckpointStage {
         intent: request,
         source_incarnation: point.incarnation,
@@ -318,13 +318,14 @@ fn staged(
 
 /// Keep the archive key or target upload under its original directory
 /// inventory until all asynchronous storage operations have drained.
-pub(super) enum RegionPublication {
+pub(crate) enum RegionPublication {
     Stage(Arc<dyn Directory>, Uuid),
     CheckpointTransfer(Arc<dyn Directory>, Uuid),
+    CheckpointReplay(Arc<dyn Directory>, CheckpointReplayPublication),
     Capture(Arc<dyn Directory>),
 }
 
-pub(super) async fn with_region<T, F, Fut>(
+pub(crate) async fn with_region<T, F, Fut>(
     directory: &dyn Directory,
     keys: &dyn KeyService,
     deployment: &str,
@@ -368,6 +369,9 @@ where
             Some(RegionPublication::CheckpointTransfer(owner, operation)) => {
                 track_checkpoint_transfer_publications(&mut io, owner, deployment.to_owned(), region, operation);
             }
+            Some(RegionPublication::CheckpointReplay(owner, replay)) => {
+                track_checkpoint_replay_publication(&mut io, owner, deployment.to_owned(), region, replay);
+            }
             Some(RegionPublication::Capture(owner)) => {
                 track_publications(&mut io, owner, deployment.to_owned(), region, None);
             }
@@ -410,15 +414,14 @@ async fn copy_checkpoint(
     archive_io: Arc<IoRegion>,
     target_io: Arc<IoRegion>,
 ) -> Result<String> {
-    let bucket = archive.bucket(archive_io).await?;
+    let bucket = archive.bucket(Arc::clone(&archive_io)).await?;
     let prefix = format!(
         "checkpoint-captures/{}/{}",
         point.deployment, point.operation
     );
-    let (capture, material) = verified_archive(bucket.clone(), point, manifest, keys).await?;
-    let source_cipher = Cipher::new(&material)?;
+    let (capture, source_cipher) = verified_archive(bucket.clone(), point, manifest, keys, archive_io).await?;
     let media_key = keys.key(&target.key_id()).await?;
-    if media_key == material {
+    if source_cipher.matches(media_key).await? {
         return Err(inconsistent(
             "The staged installation must have its own media key",
         ));
@@ -436,7 +439,7 @@ async fn copy_checkpoint(
     for object in &capture.objects {
         let name = key(&object.name)?;
         let ciphertext = read_object(&source, &name, object).await?;
-        let plaintext = source_cipher.open_object(&name, &ciphertext)?;
+        let plaintext = object.open(source_cipher.as_ref(), &name, ciphertext).await?;
         let resealed = target_cipher.seal_object(&name, &plaintext)?;
         let staged = ArchivedObject::from_sealed(&name, &resealed)?;
         put_exact(&destination, &name, resealed).await?;

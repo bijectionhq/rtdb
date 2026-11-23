@@ -198,6 +198,8 @@ impl EncodedEvent for EventRef<'_> {
 }
 
 impl PageEvent {
+    pub fn page_ordinal(&self) -> usize { self.row }
+
     /// The bytes the event's document decodes to at most, which encoding its cells may hold at once.
     pub fn document_bytes(&self) -> Result<usize> {
         if let Some(bytes) = self.bytes.get() { return Ok(*bytes); }

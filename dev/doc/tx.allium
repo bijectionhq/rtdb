@@ -352,10 +352,21 @@ value CommitOpts {
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
     --   system_time   — the system-time to record the transaction at.
     --                   It must advance the history and must not be later than the source log's append time for the record.
-    --                   A later time aborts the transaction with rtdb/future-system-time, so history time never leads the log's clock.
+    --                   A later explicit time aborts the transaction with rtdb/future-system-time.
+    --                   The engine projects automatic history time strictly forward even at equal or regressed append timestamps.
     --   user_metadata — per-transaction metadata.
+    --                   New source-log submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   The installed catalog determines retention even when a query selects an earlier system time.
+    --                   A settled retry keeps its original causal coordinate after that metadata expires.
     --                   An idempotency_key field names a retry identity scoped to the database and principal: a same-body retry within the receipt window is answered with the original's outcome, and a different body aborts with rtdb/idempotency-conflict.
-    --                   The source-log timestamps of admission and retry determine whether the receipt is within its window.
+    --                   Within one installed history, receipt admission and expiry use the greatest source-log append time observed through the transaction being resolved.
+    --                   The native rtdb_retry_v1 field takes a document with a lowercase 32-hex-digit nonce and an integer not_after_micros.
+    --                   Its principal-scoped identity includes that exclusive UTC-microsecond deadline, which is within one hour of the admission clock.
+    --                   A same-body retry before expiry returns the first terminal outcome, including an abort.
+    --                   A different body returns rtdb/idempotency-conflict, and any retry at or after expiry returns rtdb/idempotency-expired.
+    --                   The engine uses a nondecreasing clock of observed bounded-request log timestamps, preserved across restarts.
+    --                   A new operation uses a fresh identity, and rtdb_retry_v1 is mutually exclusive with idempotency_key.
+    --                   PgWire exposes the native protocol with SHOW rtdb_bounded_retry = 1, checked on each new connection before a bounded submission.
     --                   RTDB recognises the Boolean rtdb_ordered_system_time field as an opt-in to rejecting an explicit system time behind the source log.
     --                   The PgWire SHOW rtdb_ordered_system_time value is 1 when the server supports this guard.
     --   async         — true: commit submits without awaiting; false: execute-and-await.
@@ -1132,7 +1143,10 @@ rule CommitWriting {
 }
 
 -- In a placed deployment, COMMIT ASYNC sets the connection's await token to an opaque attempt receipt.
--- A placed COMMIT SYNC sets it to an applied replica prefix after reading the exact attempt outcome.
+-- A placed attempt receipt stops redeeming after the installed ordered receipt clock reaches its exclusive expiry.
+-- A placed COMMIT SYNC sets the connection await token to an applied replica prefix after reading the exact attempt outcome.
+-- An applied prefix remains a causal basis after attempt receipt expiry.
+-- In the versioned placed outcome format, admitted writers collect expired attempt rows as ordered erasures.
 -- Before pinning an implicit read basis, an attempt receipt is redeemed and an applied token waits for its installed prefix.
 -- A supplied snapshot token still caps the history visible to the read.
 -- A frozen placed attachment confirms await tokens from its own admitted checkpoint before pinning the read basis.
@@ -1417,6 +1431,10 @@ surface SqlStatements {
 
     @guarantee WriteOnlyWriting
         -- A Writing transaction rejects queries; a read-only transaction rejects DML.
+
+    @guarantee PgwireCancellationDuringSort
+        -- The JVM external sorter checks for cancellation while merging spilled runs.
+        -- PgWire returns SQLSTATE 57014 when a client cancellation interrupts query execution.
 
     @guarantee ConnectionScopedIdentity
         -- Every transaction this connection submits is stamped with the connection's

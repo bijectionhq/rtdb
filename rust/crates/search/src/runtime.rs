@@ -83,13 +83,14 @@ impl LivePostingPage {
                 for (term, frequency) in frequencies {
                     let score = rtdb_text::unit_term_score(frequency);
                     let (rows, peak) = postings.entry(term.to_owned()).or_insert_with(|| {
-                        (Vec::new(), crate::rank_cutoff::RankKey { score, id })
+                        (Vec::new(), crate::rank_cutoff::RankKey::integer(score, id))
                     });
                     rows.push(row);
                     if score > peak.score {
-                        *peak = crate::rank_cutoff::RankKey { score, id };
+                        *peak = crate::rank_cutoff::RankKey::integer(score, id);
                     } else if score == peak.score {
-                        peak.id = peak.id.zip(id).map(|(left, right)| left.min(right));
+                        let minimum = peak.integer_id().zip(id).map(|(left, right)| left.min(right));
+                        *peak = crate::rank_cutoff::RankKey::integer(peak.score, minimum);
                     }
                 }
                 tokens.append(true);
@@ -105,7 +106,7 @@ impl LivePostingPage {
         Ok(Some(Self { first_row: from, terms: StringArray::from(terms),
             rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens: tokens.finish(),
             peak_scores: Float64Array::from_iter_values(peaks.iter().map(|peak| peak.score)),
-            peak_ids: Int64Array::from_iter(peaks.into_iter().map(|peak| peak.id)), minimum_id }))
+            peak_ids: Int64Array::from_iter(peaks.into_iter().map(crate::rank_cutoff::RankKey::integer_id)), minimum_id }))
     }
 
     fn term_index(&self, term: &str) -> Option<usize> {
@@ -136,7 +137,7 @@ impl LivePostingPage {
                 _ => self.minimum_id,
             }
         } else { None };
-        Some(crate::rank_cutoff::RankKey { score, id })
+        Some(crate::rank_cutoff::RankKey::integer(score, id))
     }
 
     pub(crate) fn visit(&self, query: &rtdb_text::Query, phrases: bool,

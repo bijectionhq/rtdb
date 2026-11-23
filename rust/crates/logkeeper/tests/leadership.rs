@@ -107,6 +107,41 @@ async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_active_read_index_ignores_an_append_held_only_by_a_minority() {
+    let ensemble = Ensemble::start(3).await;
+    let stream = "minority-read-index";
+    let config = ensemble.config(stream);
+    let mut proxies = Vec::new();
+    for address in &ensemble.addresses { proxies.push(CountingProxy::start(*address).await); }
+    let proxied = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string().into()).collect(), ..config };
+    let writer = open_writer(proxied.clone(), 1, CancellationToken::new()).await.unwrap();
+    let committed = append(writer.as_ref(), "committed", 1).await.offset;
+    let reader = open_reader(proxied, CancellationToken::new()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for slot in 0..3 {
+            let replica = open_reader(ensemble.config_of(&[slot], stream), CancellationToken::new()).await.unwrap();
+            while replica.read_range(committed, LogOffset(committed.0 + 1)).await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }).await.expect("each journal received the committed prefix");
+    let accepted = proxies[0].accepted_appends();
+
+    for proxy in &proxies[1..] { proxy.drop_appends(); }
+    let in_flight = writer.enqueue(Bytes::from_static(b"partial"), Timestamp(2)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while proxies[0].accepted_appends() == accepted {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.expect("the first journal durably accepted the partial append");
+
+    assert_eq!(writer.latest().unwrap(), committed);
+    assert_eq!(reader.read_index(1).await.unwrap(), committed);
+    assert_eq!(reader.read_range(LogOffset(0), LogOffset(2)).await.unwrap()[0].payload, "committed");
+    drop(in_flight);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_recovered_predecessor_cannot_confirm_a_successor_read_index() {
     let ensemble = Ensemble::start(4).await;
     let config = |servers: &[usize]| StreamConfig {

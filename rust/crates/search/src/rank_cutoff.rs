@@ -23,6 +23,19 @@ verus! {
             },
         }
     }
+
+    pub open spec fn uuid_bound_loses(bound: Option<(u64, Option<u128>)>, score: u64, iid: u128) -> bool {
+        match bound {
+            None => true,
+            Some((bits, first)) => match score_key(bits) {
+                None => false,
+                Some(key) => key < score || (key == score && match first {
+                    None => false,
+                    Some(first) => iid < first,
+                }),
+            },
+        }
+    }
 }
 
 // The nonnegative binary64 encodings are ordered by their unsigned bits.
@@ -68,13 +81,69 @@ pub(crate) fn can_stop(kth: u64, pending: Option<u64>, unread: Option<u64>) -> b
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == uuid_bound_loses(bound, kth, iid),
+))]
+fn worse_than_uuid(bound: Option<(u64, Option<u128>)>, kth: u64, iid: u128) -> bool {
+    match bound {
+        None => true,
+        Some((score, first)) => match rank_key(score) {
+            None => false,
+            Some(key) => key < kth || (key == kth && match first {
+                Some(first) => iid < first,
+                None => false,
+            }),
+        },
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == match score_key(kth) {
+        None => false,
+        Some(key) => uuid_bound_loses(pending, key, iid) && uuid_bound_loses(unread, key, iid),
+    },
+))]
+pub(crate) fn can_stop_with_uuid(
+    kth: u64, iid: u128, pending: Option<(u64, Option<u128>)>, unread: Option<(u64, Option<u128>)>,
+) -> bool {
+    match rank_key(kth) {
+        None => false,
+        Some(key) => worse_than_uuid(pending, key, iid) && worse_than_uuid(unread, key, iid),
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RankIdentity {
+    Integer(i64),
+    Uuid([u8; 16]),
+}
+
+#[cfg(not(verus_keep_ghost))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RankKey {
     pub score: f64,
-    pub id: Option<i64>,
+    id: Option<RankIdentity>,
 }
 
+#[cfg(not(verus_keep_ghost))]
 impl RankKey {
+    pub fn integer(score: f64, id: Option<i64>) -> Self {
+        Self { score, id: id.map(RankIdentity::Integer) }
+    }
+
+    pub fn uuid(score: f64, iid: [u8; 16]) -> Self {
+        Self { score, id: Some(RankIdentity::Uuid(iid)) }
+    }
+
+    pub fn has_id(self) -> bool { self.id.is_some() }
+
+    pub fn integer_id(self) -> Option<i64> {
+        match self.id { Some(RankIdentity::Integer(id)) => Some(id), _ => None }
+    }
+
+    pub fn score_only(self) -> Self { Self { id: None, ..self } }
+
     pub fn compare(self, other: Self) -> std::cmp::Ordering {
         self.score_order(other).then_with(|| other.id.cmp(&self.id))
     }
@@ -85,10 +154,19 @@ impl RankKey {
     }
 
     pub fn beats(self, bound: Self) -> bool {
-        let (Some(winner), Some(ceiling)) = (rank_key(self.score.to_bits()), rank_key(bound.score.to_bits())) else {
-            return false;
-        };
-        winner > ceiling || (winner == ceiling && self.id.zip(bound.id).is_some_and(|(id, best)| id < best))
+        let score = self.score.to_bits();
+        let ceiling = bound.score.to_bits();
+        match (self.id, bound.id) {
+            (Some(RankIdentity::Uuid(id)), other) => {
+                let floor = match other { Some(RankIdentity::Uuid(best)) => Some(u128::from_be_bytes(best)), _ => None };
+                can_stop_with_uuid(score, u128::from_be_bytes(id), Some((ceiling, floor)), None)
+            }
+            (Some(RankIdentity::Integer(id)), Some(RankIdentity::Integer(best))) => {
+                let (Some(score), Some(ceiling)) = (rank_key(score), rank_key(ceiling)) else { return false; };
+                score > ceiling || (score == ceiling && id < best)
+            }
+            _ => can_stop(score, Some(ceiling), None),
+        }
     }
 }
 
@@ -98,11 +176,25 @@ mod tests {
 
     #[test]
     fn integer_tie_break_requires_a_strict_proof() {
-        let winner = RankKey { score: -0.0, id: Some(-1) };
-        assert!(winner.beats(RankKey { score: 0.0, id: Some(0) }));
-        assert!(!winner.beats(RankKey { score: 0.0, id: Some(-1) }));
-        assert!(!winner.beats(RankKey { score: 0.0, id: None }));
-        assert!(!winner.beats(RankKey { score: f64::NAN, id: Some(0) }));
+        let winner = RankKey::integer(-0.0, Some(-1));
+        assert!(winner.beats(RankKey::integer(0.0, Some(0))));
+        assert!(!winner.beats(RankKey::integer(0.0, Some(-1))));
+        assert!(!winner.beats(RankKey::integer(0.0, None)));
+        assert!(!winner.beats(RankKey::integer(f64::NAN, Some(0))));
+    }
+
+    #[test]
+    fn uuid_tie_break_uses_the_complete_unsigned_identity() {
+        let mut first = [0; 16];
+        first[15] = 255;
+        let mut next = [0; 16];
+        next[14] = 1;
+        let winner = RankKey::uuid(-0.0, first);
+        let bound = RankKey::uuid(0.0, next);
+        assert!(winner.compare(bound).is_gt());
+        assert!(winner.beats(bound));
+        assert!(!winner.beats(RankKey::uuid(0.0, first)));
+        assert!(!winner.beats(RankKey::integer(0.0, None)));
     }
 
     #[test]

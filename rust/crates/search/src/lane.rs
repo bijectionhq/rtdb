@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -234,11 +234,20 @@ impl ArtefactBuilder for SearchBuilder {
         let recorded_stats = tokio::task::spawn_blocking(move || -> Result<_> {
             let opened = inputs.into_iter().map(|input| open_input(input, &memory)).collect::<Result<Vec<_>>>()?;
             let file = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
-            let members = opened.into_iter().map(|(reader, opening)| PageRows::new(reader, opening, Arc::clone(&memory), token.clone(), owned));
+            let uuid_iids = (format == crate::file::TREE_FORMAT_VERSION && !owned).then(|| Arc::new(AtomicBool::new(true)));
+            let members = opened.into_iter().map(|(reader, opening)| {
+                let mut rows = PageRows::new(reader, opening, Arc::clone(&memory), token.clone(), owned);
+                rows.uuid_iids.clone_from(&uuid_iids);
+                rows
+            });
             let sections = write_versioned_group(&columns, members, &identity, version, ceiling, file, Some(indexing), format)?;
             let mut file = std::fs::File::open(output).map_err(fault)?;
             match format {
-                crate::file::TREE_FORMAT_VERSION => crate::file::encode_tree_stats(&sections, &crate::file::TreeLocator::read(&mut file)?),
+                crate::file::TREE_FORMAT_VERSION => {
+                    let canonical = uuid_iids.is_some_and(|proof| proof.load(Ordering::Relaxed));
+                    let locator = crate::file::TreeLocator::read(&mut file)?.with_uuid_iid_evidence(canonical);
+                    crate::file::encode_tree_stats(&sections, &locator)
+                }
                 crate::file::FORMAT_VERSION => crate::file::encode_catalog_stats(&sections, Some(&crate::file::FooterLocator::read(&mut file)?)),
                 crate::file::TANTIVY_FORMAT_VERSION => Ok(crate::file::encode_tantivy_stats(&sections)),
                 _ => crate::file::encode_catalog_stats(&sections, None),
@@ -278,6 +287,12 @@ fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool) 
     Ok(IndexedRow { header, key, sql_id, values })
 }
 
+fn uuid_id_matches_iid(event: &EventRef<'_>) -> bool {
+    let header = event.header();
+    header.op != EventOp::Put
+        || matches!(event.put_identity(), Ok(Some(EntityIdRef::Uuid(id))) if id == header.iid.0)
+}
+
 pub(crate) fn integer_sql_id(event: &EventRef<'_>) -> Option<i64> {
     match event.put_identity().ok().flatten() {
         Some(EntityIdRef::Integer(id)) if rtdb_types::EntityId::Integer(id).iid() == event.header().iid => Some(id),
@@ -304,13 +319,20 @@ pub(crate) struct ArrowSearchPage {
     events: EventBatch,
     _owned: OwnedBatch,
     with_identity: bool,
+    uuid_iids: Option<Arc<AtomicBool>>,
 }
 
 impl SearchPage for ArrowSearchPage {
     fn len(&self) -> usize { self.events.len() }
 
     fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
-        search_row(self.events.borrow_event(row)?, columns, self.with_identity)
+        let event = self.events.borrow_event(row)?;
+        if let Some(proof) = &self.uuid_iids
+            && proof.load(Ordering::Relaxed) && !uuid_id_matches_iid(&event)
+        {
+            proof.store(false, Ordering::Relaxed);
+        }
+        search_row(event, columns, self.with_identity)
     }
 }
 
@@ -321,12 +343,13 @@ pub(crate) struct PageRows {
     cancellation: CancellationToken,
     page: usize,
     with_identity: bool,
+    uuid_iids: Option<Arc<AtomicBool>>,
 }
 
 impl PageRows {
     fn new(reader: ArrowFile, opening: Arc<MemoryReservation>, memory: Arc<MemoryBudget>,
            cancellation: CancellationToken, with_identity: bool) -> Self {
-        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity }
+        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity, uuid_iids: None }
     }
 }
 
@@ -342,7 +365,7 @@ impl Iterator for PageRows {
         self.page += 1;
         Some(read_page(&mut self.reader, page, &self.memory).and_then(|owned| {
             let events = EventBatch::new(owned.batch().clone())?;
-            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity })
+            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity, uuid_iids: self.uuid_iids.clone() })
         }))
     }
 }
@@ -368,6 +391,20 @@ mod tests {
     use super::*;
     use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
     use rtdb_types::{EntityId, Iid, Interval, LogicalType, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
+
+    #[test]
+    fn a_uuid_column_does_not_certify_a_mismatched_physical_iid() {
+        let id = [1; 16];
+        let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent {
+            commit_position: 0,
+            iid, entity_key: None, system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Uuid(id))])),
+        });
+        let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::Uuid))]);
+        let batch = EventBatch::new(build_event_batch(&rows, Some(fields), None).unwrap()).unwrap();
+        assert!(uuid_id_matches_iid(&batch.borrow_event(0).unwrap()));
+        assert!(!uuid_id_matches_iid(&batch.borrow_event(1).unwrap()));
+    }
 
     #[test]
     fn arrow_search_rows_keep_token_presence_and_owned_identity() {
