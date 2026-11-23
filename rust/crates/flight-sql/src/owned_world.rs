@@ -172,6 +172,14 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>,
         limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn parent_touch_images_at<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
+    ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>>;
+    fn parent_changes_at<'a>(
+        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
+        through: Timestamp, limit: usize, reverse: bool,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)>>;
     fn parent_versions_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, selected: Timestamp,
         request: rtdb_node::OwnedVersionRequest,
@@ -189,7 +197,7 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<(Timestamp, Timestamp)>>>;
     fn select_parent_as_of<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
-    ) -> BoxFuture<'a, Result<Timestamp>>;
+    ) -> BoxFuture<'a, Result<Option<Timestamp>>>;
     fn parent_point_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;

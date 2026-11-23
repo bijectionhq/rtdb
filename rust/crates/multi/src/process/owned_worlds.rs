@@ -295,6 +295,25 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
+    fn parent_touch_images_at<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
+    ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>> {
+        Box::pin(async move {
+            let [prior, accepted] = HeldCheckpointWorld::parent_touch_images_at(
+                self, relation, path, id, selected, before, group, valid, images,
+            ).await?;
+            Ok([path_touch_result(before, (prior, false)), path_touch_result(group, (accepted, false))])
+        })
+    }
+
+    fn parent_changes_at<'a>(
+        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
+        through: Timestamp, limit: usize, reverse: bool,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::parent_changes_at(self, relation, selected, after, through, limit, reverse))
+    }
+
     fn parent_versions_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, selected: Timestamp,
         request: rtdb_node::OwnedVersionRequest,
@@ -333,7 +352,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn select_parent_as_of<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
-    ) -> BoxFuture<'a, Result<Timestamp>> {
+    ) -> BoxFuture<'a, Result<Option<Timestamp>>> {
         Box::pin(HeldCheckpointWorld::select_parent_as_of(self, relations, requested))
     }
 
