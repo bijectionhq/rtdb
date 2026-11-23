@@ -1254,11 +1254,7 @@ impl<'a> OpenTransaction<'a> {
                             return Err(different());
                         }
                         if let OwnedPathKind::Spatial(expected) = kind {
-                            let stored = match cell("geometry_encoding") {
-                                Some(cell) if rtdb_columnar::selected_cell(cell.field, cell.array, cell.row)?.is_some() =>
-                                    rtdb_types::SpatialGeometryEncoding::parse(cell.utf8().ok_or_else(different)?)?,
-                                _ => rtdb_types::SpatialGeometryEncoding::TaggedWkb,
-                            };
+                            let stored = rtdb_spatial::path_geometry_encoding(cell("geometry_encoding"))?;
                             if stored != expected { return Err(different()); }
                         }
                         found = true;

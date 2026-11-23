@@ -6,6 +6,7 @@ mod nearest;
 mod postings;
 mod read;
 
+pub use definition::path_geometry_encoding;
 pub use kernel::{Classification, Predicate};
 pub use lane::SpatialArtefacts;
 pub use nearest::PreparedNearest;

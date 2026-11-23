@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use arrow_schema::DataType;
 use rtdb_columnar::{ArrowCell, MemoryBudget};
 use rtdb_index::Snapshot;
 use rtdb_maintenance::ArtefactDefinition;
@@ -111,13 +112,20 @@ pub(crate) async fn held_definition(
     Ok(definition)
 }
 
+pub fn path_geometry_encoding(cell: Option<ArrowCell<'_>>) -> Result<SpatialGeometryEncoding> {
+    let Some(cell) = cell else { return Ok(SpatialGeometryEncoding::TaggedWkb); };
+    let value = cell.physical()?;
+    if value.field.data_type() == &DataType::Null || value.array.is_null(value.row) {
+        return Ok(SpatialGeometryEncoding::TaggedWkb);
+    }
+    SpatialGeometryEncoding::parse(value.utf8().ok_or_else(malformed)?)
+}
+
+fn malformed() -> Anomaly {
+    Anomaly::fault("rtdb.spatial/path-catalog", "The spatial path catalog contains an invalid declaration")
+}
+
 async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Definition>> {
-    let malformed = || {
-        Anomaly::fault(
-            "rtdb.spatial/path-catalog",
-            "The spatial path catalog contains an invalid declaration",
-        )
-    };
     let mut output = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
@@ -133,13 +141,7 @@ async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Defi
             let generation = cell("version")
                 .and_then(ArrowCell::int64)
                 .ok_or_else(malformed)?;
-            let encoding = if let Some(value) = cell("geometry_encoding")
-                && rtdb_columnar::selected_cell(value.field, value.array, value.row)?.is_some()
-            {
-                SpatialGeometryEncoding::parse(value.utf8().ok_or_else(malformed)?)?
-            } else {
-                SpatialGeometryEncoding::TaggedWkb
-            };
+            let encoding = path_geometry_encoding(cell("geometry_encoding"))?;
             let table = TableRef::new(schema, table);
             if !(1..=16).contains(&columns.len()) || !catalog.owns_path_target(&table) {
                 return Err(malformed());
@@ -164,4 +166,25 @@ async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Defi
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+#[test]
+fn catalog_reads_both_legacy_and_explicit_geometry_encodings() {
+    use arrow_array::{NullArray, StringArray};
+    use arrow_schema::Field;
+
+    let missing = Field::new("geometry_encoding", DataType::Null, true);
+    let absent = NullArray::new(1);
+    let text = Field::new("geometry_encoding", DataType::Utf8, true);
+    let present = StringArray::from(vec![None, Some("bijection-geometry-v1")]);
+    for cell in [
+        None,
+        Some(ArrowCell { field: &missing, array: &absent, row: 0 }),
+        Some(ArrowCell { field: &text, array: &present, row: 0 }),
+    ] {
+        assert_eq!(path_geometry_encoding(cell).unwrap(), SpatialGeometryEncoding::TaggedWkb);
+    }
+    let explicit = ArrowCell { field: &text, array: &present, row: 1 };
+    assert_eq!(path_geometry_encoding(Some(explicit)).unwrap(), SpatialGeometryEncoding::BijectionGeometry);
 }
