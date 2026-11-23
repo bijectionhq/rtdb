@@ -417,6 +417,10 @@ variant TxMessage : SourceMessage {
     -- Acceptance-relative Root writes retain those columns when their validity offsets are placed at the ordered system time.
     -- Root publication and fork admission count the Arrow document rows against the same effect limits as row writes.
     -- A held fork of an exact Root publication orders its new world registration with the Root section and owner controls.
+    -- Original replay admits a copied overlay fork only after replaying the selected
+    -- Held writer's actual clock publication. Its source receipt binds the exact
+    -- writer pin, Root basis, accepted reading and physical transaction. If the
+    -- retained archive extends further, that media end has its own source receipt.
     -- The fork inherits the archived publication's clock while Root witnesses validate at ordering.
     -- A reviewed Proposal landing must consume an offered Root clock slot before any of its effects can publish.
     -- The slot's reading binds the Root writes, ordered predicates and landing outcome.

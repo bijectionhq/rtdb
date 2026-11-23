@@ -36,6 +36,32 @@ impl ReplayedRegistration {
     }
 }
 
+/// The registration receipt identifies a writer. A separate clock proof
+/// identifies the exact publication selected from that writer.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayedHeldPublication {
+    binding: [u8; 32],
+    pin: [u8; 16],
+    root: TransactionKey,
+    source: TransactionKey,
+    reading: Timestamp,
+}
+
+impl ReplayedHeldPublication {
+    fn binds(&self, binding: [u8; 32], ancestor: &rtdb_types::OwnedWorldAncestor) -> bool {
+        self.binding == binding && self.pin == ancestor.pin
+            && self.root == ancestor.source_root && self.reading == ancestor.logical
+            && self.source.system_time == ancestor.system
+            && (self.source == ancestor.basis
+                || (self.source.tx_id < ancestor.basis.tx_id && self.source.system_time < ancestor.basis.system_time))
+    }
+}
+
+fn held_publication_locator(world: Iid, source: Timestamp) -> String {
+    format!("native-world-publication/{world}/{}", source.0)
+}
+
 fn registration_locator(world: Iid) -> String {
     format!("native-world-registration/{world}")
 }
@@ -258,6 +284,9 @@ impl OpenTransaction<'_> {
                     ]),
                     Interval::ALL,
                 )?;
+                if matches!(world.mode, WorldClockMode::Held { .. }) {
+                    self.record_replayed_held_publication(replay, &world, clock)?;
+                }
                 active.insert(id, (world, charge, clock));
             }
         }
@@ -347,6 +376,31 @@ impl OpenTransaction<'_> {
             TableRef::new("public", crate::hosted_control::RESTORE),
             StructFields::from([
                 ("_id".into(), Value::Utf8(registration_locator(world.id))),
+                ("binding".into(), Value::Binary(body)),
+            ]),
+            Interval::new(Timestamp(0), Timestamp::MAX)?,
+        )
+    }
+
+    fn record_replayed_held_publication(
+        &mut self,
+        replay: &HostedReplay,
+        world: &OwnedWorld,
+        reading: Timestamp,
+    ) -> Result<()> {
+        let source = replay.source_position();
+        let proof = ReplayedHeldPublication {
+            binding: replay.holds_binding(),
+            pin: world.pin.0,
+            root: world.basis,
+            source,
+            reading,
+        };
+        let body = serde_json::to_vec(&proof).map_err(|_| OwnedWorld::unavailable())?;
+        self.buffer.put(
+            TableRef::new("public", crate::hosted_control::RESTORE),
+            StructFields::from([
+                ("_id".into(), Value::Utf8(held_publication_locator(world.id, source.system_time))),
                 ("binding".into(), Value::Binary(body)),
             ]),
             Interval::new(Timestamp(0), Timestamp::MAX)?,
@@ -463,6 +517,44 @@ async fn require_replayed_fork_parent(
     {
         return Err(unavailable());
     }
+    if let Some(ancestor) = &world.ancestor {
+        require_replayed_held_publication(context, owner, replay, ancestor).await?;
+    }
+    Ok(())
+}
+
+async fn require_replayed_held_publication(
+    context: &Arc<rtdb_query::QueryContext>,
+    owner: &str,
+    replay: &HostedReplay,
+    ancestor: &rtdb_types::OwnedWorldAncestor,
+) -> Result<()> {
+    let unavailable = OwnedWorld::unavailable;
+    let id = Iid(ancestor.world);
+    let (body, selected_destination) =
+        replay_control(context, &held_publication_locator(id, ancestor.system)).await?;
+    let proof: ReplayedHeldPublication = serde_json::from_slice(&body).map_err(|_| unavailable())?;
+    let selected = proof.source;
+    if !proof.binds(replay.holds_binding(), ancestor) {
+        return Err(unavailable());
+    }
+    if selected != ancestor.basis {
+        let locator = format!("native-transaction/{}", ancestor.basis.tx_id.0);
+        let (media_receipt, media_destination) = replay_control(context, &locator).await?;
+        if media_destination <= selected_destination || !replay.matches_parent_receipt(&media_receipt, ancestor.basis) {
+            return Err(unavailable());
+        }
+    }
+    let locator = format!("native-transaction/{}", selected.tx_id.0);
+    let (receipt, destination) = replay_control(context, &locator).await?;
+    let (record, reading, _charge) =
+        rtdb_query::read_held_world_publication(context, owner, id, destination).await?;
+    if destination != selected_destination
+        || !replay.matches_parent_receipt(&receipt, selected)
+        || record.pin.0 != proof.pin || record.basis != proof.root || reading != proof.reading
+    {
+        return Err(unavailable());
+    }
     Ok(())
 }
 
@@ -490,8 +582,31 @@ async fn replay_control(
 
 #[cfg(test)]
 mod tests {
-    use super::ReplayedRegistration;
-    use rtdb_types::{OwnedWorldForkLink, Timestamp, TransactionKey, TxId};
+    use super::{ReplayedHeldPublication, ReplayedRegistration};
+    use rtdb_types::{OwnedWorldAncestor, OwnedWorldForkLink, Timestamp, TransactionKey, TxId};
+
+    #[test]
+    fn replayed_held_publication_binds_the_selected_cut_within_its_media() {
+        let source = TransactionKey { tx_id: TxId(8), system_time: Timestamp(90) };
+        let root = TransactionKey { tx_id: TxId(5), system_time: Timestamp(60) };
+        let proof = ReplayedHeldPublication {
+            binding: [1; 32], pin: [2; 16], root, source, reading: Timestamp(61),
+        };
+        let mut ancestor = OwnedWorldAncestor {
+            world: [3; 16], pin: proof.pin, capture: [4; 16], suffix: [5; 16], manifest: String::new(),
+            basis: source, system: source.system_time, source_root: root, logical: proof.reading,
+        };
+        assert!(proof.binds([1; 32], &ancestor));
+        ancestor.basis.tx_id = TxId(9);
+        assert!(!proof.binds([1; 32], &ancestor));
+        ancestor.basis.system_time = Timestamp(100);
+        assert!(proof.binds([1; 32], &ancestor));
+        ancestor.logical = Timestamp(62);
+        assert!(!proof.binds([1; 32], &ancestor));
+        ancestor.logical = proof.reading;
+        ancestor.source_root = source;
+        assert!(!proof.binds([1; 32], &ancestor));
+    }
 
     #[test]
     fn replayed_registration_rejects_an_unrelated_pin_or_original_cut() {
