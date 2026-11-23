@@ -814,6 +814,8 @@ The refusal section contains a length-prefixed fact group stream followed by the
 An optional held-world read prefix uses the same count, handles, and witness nonces as CommitHostedWorldReads.v2.
 An ordinary or counted hosted commit follows.
 Its placed live Root owner supplies the same attempt marker, the receipt publication marker, the same dispatch retirement and alternative bodies for the exact business and private execution receipt slots.
+A public decision may also supply one absent-checked `root_decision:<sha256>` admission slot in both alternatives.
+The identity and all fields other than its outcome body must match between the alternatives.
 Only uniqueness, capacity and final-count violations found after evaluating the primary candidate select the refusal.
 The resolver discards the candidate buffer and orders the alternative under the same transaction key and the original deadline, Root point and range guards, hosted-control guards, and any retained-world scope, pin, purge, overlay and point guards.
 A receipt-only request with a final count condition moves the Sync receipt head for either result.
