@@ -208,7 +208,7 @@ A bounded wall-time guarantee requires a separately qualified time source.
 Provider work checks the schedule before and after cryptography.
 The directory reaper can resume the scheduled revocation and waits for admitted regions before removing ciphertext.
 
-Physical cleanup then settles independently.
+Physical cleanup confirms the original capture media witness before reporting an empty inventory.
 This contract covers the enrolled archive's ability to decrypt, which is revoked by the time the commitment is recorded.
 The capture protocol's deadline request requires a qualified provider and active-reader policy, and remains unavailable with these providers.
 

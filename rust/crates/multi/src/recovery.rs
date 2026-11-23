@@ -1035,6 +1035,18 @@ mod tests {
     use super::*;
     use rtdb_directory::MemoryDirectory;
 
+    async fn bind_test_archive_media(service: &RecoveryService, owner: &DeploymentRecord, operation: Uuid) -> Result<()> {
+        let deployment = owner.id.parse().unwrap();
+        let point = CapturePoint {
+            deployment, operation, incarnation: owner.incarnation, log_epoch: owner.log_epoch,
+            checkpoint: owner.checkpoint_captures[&operation].checkpoint,
+        };
+        let marker = rtdb_storage::ObjectKey::new(format!("checkpoint-authorities/{deployment}/{operation}.json"))?;
+        let archive = service.archive.bucket(rtdb_storage::IoRegion::new()).await?;
+        archive.put(&marker, serde_json::to_vec(&point).unwrap().into()).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn scheduled_capture_revocation_survives_reopening_the_key_authority() -> Result<()> {
         let temporary = tempfile::tempdir().unwrap();
@@ -1081,6 +1093,7 @@ mod tests {
         let retained = keys.archive_key(&key_id, true).await?;
         let plaintext = bytes::Bytes::from_static(b"held archive");
         let ciphertext = retained.seal("member", plaintext.clone()).await?;
+        bind_test_archive_media(&service, &installation, capture).await?;
         directory.create_deployment(installation).await?;
         let request = |action: serde_json::Value| {
             serde_json::from_value(serde_json::json!({
@@ -1167,6 +1180,7 @@ mod tests {
             archive: Some(capture), checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: false,
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
+        bind_test_archive_media(&service, &installation, capture).await.unwrap();
         directory.create_deployment(installation).await.unwrap();
         let run = |action: serde_json::Value| {
             let request = serde_json::from_value(serde_json::json!({
@@ -1212,14 +1226,17 @@ mod tests {
         assert_eq!(keys.existing(&archive_key_id).await.unwrap(), original);
         assert!(matches!(run(status.clone()).await, Reply::CaptureDiscardPrepared { key_withdrawn_at_ms: None, .. }));
         let CellStorage::Local { root } = &service.archive else { unreachable!() };
-        std::fs::write(root, b"unavailable archive path").unwrap();
+        let detached = temporary.path().join("detached-media");
+        std::fs::rename(root, &detached).unwrap();
         assert!(matches!(run(settle.clone()).await, Reply::Deferred));
         let Reply::CaptureDiscardPrepared { authorized_at_ms: same, key_withdrawn_at_ms: Some(withdrawn), .. } =
             run(status.clone()).await else { panic!("the durable key withdrawal is missing") };
         assert_eq!(same, authorized_at_ms);
         assert!(keys.existing(&archive_key_id).await.is_err());
         assert_eq!(keys.existing("independent-capture").await.unwrap(), independent);
-        std::fs::remove_file(root).unwrap();
+        assert!(matches!(run(settle.clone()).await, Reply::Deferred));
+        std::fs::remove_dir(root).unwrap();
+        std::fs::rename(detached, root).unwrap();
         let Reply::CaptureDiscarded { archive_disposal, .. } = run(settle).await
             else { panic!("capture did not settle") };
         assert_eq!((archive_disposal.authorized_at_ms, archive_disposal.key_withdrawn_at_ms), (authorized_at_ms, withdrawn));

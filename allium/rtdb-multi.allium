@@ -2754,7 +2754,7 @@ rule SettleCheckpointCaptureDiscard {
 
     ensures:
         ObserveCaptureKeyVaultWithdrawal(capture)
-        if ArchiveProviderInventoryEmpty(capture):
+        if OriginalCaptureMediaWitnessMatches(capture) and ArchiveProviderInventoryEmpty(capture):
             RetainCaptureDiscardCompletion(capture)
 }
 

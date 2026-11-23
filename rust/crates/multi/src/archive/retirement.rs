@@ -4,11 +4,11 @@ use rtdb_directory::{
     CheckpointCaptureRetirement, CheckpointSuffixCustody, CheckpointSuffixPin, DeploymentRecord,
     Directory, Lifecycle, now_ms,
 };
-use rtdb_storage::{IoRegion, ObjectKey};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::Result;
 use uuid::Uuid;
 
-use super::{archive_binding, archive_key_id, capture_point, inconsistent, key, require_archive_key_authority, unavailable};
+use super::{CapturePoint, archive_binding, archive_key_id, archive_witness, capture_point, inconsistent, key, read, require_archive_key_authority, unavailable};
 use crate::{
     admin::update_installation, deployment::CellStorage, keys::{ArchiveKeyWithdrawal, KeyService},
     store::reconcile_storage_regions,
@@ -125,7 +125,7 @@ pub(crate) async fn retire_world_suffix(
     let prefix = key(&super::replica_suffix::archive_prefix(
         deployment, suffix, pin,
     ))?;
-    purge_archive_prefix(&archive, &prefix).await?;
+    purge_archive_prefix(&archive, &prefix, None).await?;
     update_installation(directory, id, |current| {
         if current.checkpoint_suffix_pins.get(&suffix) == Some(pin) {
             current.checkpoint_suffix_pins.remove(&suffix);
@@ -325,13 +325,18 @@ pub(crate) async fn finish_capture_retirement(
         .ok_or_else(|| inconsistent("The archive key withdrawal was not recorded"))?;
     let archive: CellStorage = serde_json::from_str(&accepted.archive)
         .map_err(|_| inconsistent("Invalid retained capture custody"))?;
+    let record = directory.deployment(id).await?
+        .ok_or_else(|| unavailable("The original capture owner is unavailable"))?;
+    let registered = record.checkpoint_captures.get(&capture);
+    let media = registered.filter(|value| value.media_bound).map(|_| {
+        let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
+        capture_point(&record, deployment, capture, &accepted.archive)
+    }).transpose()?;
     let prefix = key(&format!("checkpoint-captures/{id}/{capture}"))?;
-    purge_archive_prefix(&archive, &prefix).await?;
+    purge_archive_prefix(&archive, &prefix, media.as_ref()).await?;
     let settled = update_installation(directory, id, |current| {
-        if has_capture_region(current, capture) {
-            return Err(inconsistent(
-                "The closed capture admitted another archive region",
-            ));
+        if has_capture_region(current, capture) || current.checkpoint_captures.get(&capture) != registered {
+            return Err(inconsistent("The closed capture changed before settling its media inventory"));
         }
         current
             .checkpoint_suffix_pins
@@ -462,26 +467,39 @@ fn checked_retirement<'a>(
         .ok_or_else(|| inconsistent("The physical release lost its capture fence"))
 }
 
-async fn purge_archive_prefix(archive: &CellStorage, prefix: &ObjectKey) -> Result<()> {
+async fn require_archive_media(bucket: &dyn ObjectStore, expected: Option<&CapturePoint>) -> Result<()> {
+    if let Some(point) = expected {
+        let witness = archive_witness(point.deployment, point.operation)?;
+        if read::<CapturePoint>(bucket, &witness).await?.as_ref() != Some(point) {
+            return Err(unavailable("Cannot identify the original checkpoint archive media"));
+        }
+    }
+    Ok(())
+}
+
+async fn purge_archive_prefix(archive: &CellStorage, prefix: &ObjectKey, media: Option<&CapturePoint>) -> Result<()> {
     match archive {
         CellStorage::Local { .. } => {
             let bucket = archive.bucket(IoRegion::new()).await?;
+            require_archive_media(bucket.as_ref(), media).await?;
             for item in bucket.list(Some(prefix)).await? {
                 bucket.delete(&item.key).await?;
             }
             if !bucket.list(Some(prefix)).await?.is_empty() {
                 return Err(unavailable("The checkpoint archive still has objects"));
             }
+            require_archive_media(bucket.as_ref(), media).await?;
         }
         CellStorage::S3 { config } => {
-            CellStorage::s3_inventory(config)
-                .await?
-                .purge(prefix)
-                .await?
+            let bucket = archive.bucket(IoRegion::new()).await?;
+            require_archive_media(bucket.as_ref(), media).await?;
+            CellStorage::s3_inventory(config).await?.purge(prefix).await?;
+            require_archive_media(bucket.as_ref(), media).await?;
         }
     }
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
