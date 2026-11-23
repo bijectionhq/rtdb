@@ -1446,18 +1446,41 @@ mod retained_release_tests {
     }
 }
 
-/// Proposal content settlements may also replace their exact generation row.
-pub fn proposal_overlay_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
+/// A Proposal settlement includes its registered receipt and may advance its review projection.
+pub fn proposal_overlay_controls<'a>(
+    controls: impl IntoIterator<Item = &'a HostedControlWrite>, writes: bool,
+) -> bool {
     let mut checks = 0;
     let mut existing = 0;
     let mut replacements = 0;
+    let mut budget = false;
     for control in controls {
         if control.is_check() {
             checks += 1;
-        } else {
-            existing += usize::from(control.expected().is_some());
-            replacements += 1;
+            continue;
         }
+        if let EntityId::String(id) = control.id() {
+            if control.name() == "bj_fact_root_receipts" && landing_control_id(id, "receipt_budget:") {
+                if std::mem::replace(&mut budget, true) { return false; }
+                continue;
+            }
+            if control.name() == "bj_fact_root_admission" {
+                if ["root_proposal_review_head:", "root_proposal_review_table_head:"]
+                    .iter().any(|prefix| landing_control_id(id, prefix))
+                {
+                    if !writes { return false; }
+                    continue;
+                }
+                if ["root_proposal_review_root:", "root_proposal_review_table_root:"]
+                    .iter().any(|prefix| landing_control_id(id, prefix))
+                {
+                    if !writes || control.expected().is_some() { return false; }
+                    continue;
+                }
+            }
+        }
+        existing += usize::from(control.expected().is_some());
+        replacements += 1;
     }
     checks > 0 && (1..=6).contains(&replacements)
         && existing >= if replacements == 6 { 2 } else { 1 }
@@ -1505,7 +1528,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
         }
     }
     let world = world?;
-    let controls_allowed = if terminal { retained_delete_controls(controls) } else { proposal_overlay_controls(controls) };
+    let controls_allowed = proposal_overlay_controls(controls, !terminal);
     (terminal == writes.is_empty() && controls_allowed && writes.into_iter().all(|(relation, id, start, create_only)| {
         relation.world() == Some(world)
             && points.remove(&(relation, id)).is_some_and(|instants| {

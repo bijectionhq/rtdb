@@ -3165,8 +3165,8 @@ impl NativeSession {
         }
         if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
             || match &sections[0].1.effect {
-                OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls),
-                OwnedWorldEffect::SettleProposal => !rtdb_tx::retained_delete_controls(&controls),
+                OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls, true),
+                OwnedWorldEffect::SettleProposal => !rtdb_tx::proposal_overlay_controls(&controls, false),
                 _ => true,
             })
         {

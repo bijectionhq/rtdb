@@ -488,7 +488,14 @@ impl TxResolver {
                 (primary.len() + refusal.len()).checked_mul(std::mem::size_of::<Operation>() + 128)
                     .ok_or_else(overflow)?,
             )?;
+            let reads_worlds = primary.iter().any(|op| matches!(op,
+                Operation::Public(TxOp::OwnedCheckWorldPurge { .. }
+                    | TxOp::OwnedCheckWorldScope { clock: Some(_), .. })
+            ));
             let operations = primary.iter().filter(constraint_receipt::shared_check)
+                .filter(|op| reads_worlds || !matches!(op,
+                    Operation::Public(TxOp::OwnedCheckWorldScope { clock: None, .. })
+                ))
                 .chain(refusal).cloned().collect::<Vec<_>>();
             outcome = tx.apply_constraint_refusal(&operations, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
@@ -1963,6 +1970,9 @@ impl<'a> OpenTransaction<'a> {
                     }
                     Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
                         if relation.world().is_none() && !relation.is_world_catalog() => 1,
+                    Operation::Public(TxOp::OwnedCheckCapacity { relation, .. })
+                        if !relation.is_world_catalog()
+                            && relation.world().is_none_or(|world| Some(world) == proposal_overlay) => 1,
                     Operation::Public(TxOp::OwnedCheck { relation, .. }) => {
                         if !index.checked_sub(1).is_some_and(|previous|
                             matches!(&operations[previous], Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, .. }) if guarded == relation))
@@ -2033,7 +2043,10 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         self.check_hosted_controls(operations, source_scope, replay).await?;
-        self.check_capacity_source(operations).await?;
+        let signed_root_count = has_clock_slot && proposal_land.is_some_and(|landing| {
+            landing.effect != crate::hosted_control::ProposalLandingEffect::Close
+        });
+        self.check_capacity_source(operations, proposal_overlay, signed_root_count).await?;
         let publishes_catalog = operations.iter().any(|operation| matches!(operation,
             Operation::Public(TxOp::HostedControl(control)) if control.replaces_root_catalog()
         ));

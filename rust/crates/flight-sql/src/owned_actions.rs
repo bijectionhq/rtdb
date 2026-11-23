@@ -4298,7 +4298,7 @@ impl Service {
         } else {
             None
         };
-        if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls) {
+        if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls, !terminal_proposal) {
             return Err(invalid("A Proposal overlay requires checked hosted settlement"));
         }
         if proposal_close && !rtdb_tx::proposal_close_controls(&controls) {

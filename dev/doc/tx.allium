@@ -155,7 +155,10 @@
 -- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.
 -- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
--- An exceeded bound aborts the entire group, including the writes and counter deltas.
+-- A checked Proposal settlement binds a count condition to its own world and evaluates the complete counted prefix across the retained parent and final overlay.
+-- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
+-- When a registered decision offers a refusal receipt, a violated count or constraint selects that receipt and its exact attempt in the same order.
+-- The refusal retains the original Proposal settlement receipt without a new overlay root or approval, and charges the retained bytes of the selected business receipt.
 -- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.
 -- A replacement outside every current Root capacity predicate does not increase a covered count.
 -- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.
