@@ -383,6 +383,10 @@ impl HostedReplay {
 
     pub(crate) fn holds_binding(&self) -> [u8; 32] { self.binding }
 
+    pub(crate) fn relocation_locator(&self, world: rtdb_types::Iid) -> String {
+        format!("native-world-relocated/{}/{world}", self.source.tx_id.0)
+    }
+
     pub(crate) fn check_base(&self, control: &HostedControlWrite, row: Option<&arrow_array::RecordBatch>) -> Result<()> {
         use arrow_array::{Array, BinaryArray};
         if control.name() != RESTORE { return Ok(()); }

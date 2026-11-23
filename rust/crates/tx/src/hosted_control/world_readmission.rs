@@ -1,12 +1,12 @@
 use rtdb_types::{EntityId, Iid, OwnedWorld, Result, Timestamp, TransactionKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{HostedControlWrite, NATIVE_FRONTIER, RESTORE, control_body, replay_invalid};
 
 const PREFIX: &str = "native-world-admitted/";
 const ROOT_ADMISSION: &str = "bj_fact_root_admission";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorldReadmission {
     pub(crate) binding: [u8; 32],
@@ -18,6 +18,8 @@ pub(crate) struct WorldReadmission {
     pub(crate) basis: TransactionKey,
     pub(crate) until: Timestamp,
     pub(crate) source_cut: Timestamp,
+    pub(crate) original_parent: TransactionKey,
+    pub(crate) original_until: Timestamp,
 }
 
 pub(crate) fn world_readmission_control<'a>(
@@ -40,6 +42,10 @@ pub(crate) fn world_readmission_control<'a>(
         || admission.suffix == Some([0; 16])
         || admission.basis.tx_id.0 < 0
         || admission.source_cut.0 <= 0
+        || admission.original_parent.tx_id.0 < 0
+        || admission.original_parent.system_time.0 <= 0
+        || admission.original_parent.system_time > admission.source_cut
+        || admission.source_cut >= admission.original_until
         || admission.basis.system_time <= admission.source_cut
         || admission.until <= admission.basis.system_time
         || admission.until == Timestamp::MAX
@@ -83,6 +89,40 @@ fn is_readmission(control: &HostedControlWrite) -> bool {
 }
 
 impl WorldReadmission {
+    pub(crate) fn require_relocation(
+        &self,
+        prior: &OwnedWorld,
+        next: &OwnedWorld,
+        logical: Timestamp,
+    ) -> Result<()> {
+        if self.binding == [0; 32]
+            || prior.id.0 != self.world
+            || next.id != prior.id
+            || prior.pin.0 != self.pin
+            || next.pin != prior.pin
+            || prior.dropped
+            || next.dropped
+            || next.mode != prior.mode
+            || next.schemas != prior.schemas
+            || next.parent_publication != Some(prior.inherited_clock())
+            || prior.basis != self.original_parent
+            || prior.until != self.original_until
+            || prior.basis.system_time > self.source_cut
+            || self.source_cut >= prior.until
+            || next.basis != self.basis
+            || next.until != self.until
+            || next.capture.0 != self.capture
+            || next.suffix.map(|suffix| suffix.0) != self.suffix
+            || next.manifest != self.manifest
+            || self.source_cut >= next.basis.system_time
+            || next.basis.system_time >= logical
+            || logical >= next.until
+        {
+            return Err(replay_invalid());
+        }
+        Ok(())
+    }
+
     pub(crate) fn require_application<'a>(
         &self,
         original: &OwnedWorld,

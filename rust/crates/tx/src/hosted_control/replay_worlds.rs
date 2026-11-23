@@ -7,17 +7,25 @@ use rtdb_types::{
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::WorldReadmission;
+
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
-const MAGIC: &[u8] = b"BJWP1";
+const MAGIC: &[u8] = b"BJWP2";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
 pub(crate) struct ReplayWorlds {
-    pub(crate) registrations: Vec<OwnedWorld>,
+    pub(crate) registrations: Vec<ReplayRegistration>,
     pub(crate) clocks: Vec<(Iid, Timestamp)>,
     pub(crate) shadows: Vec<ReplayShadow>,
+}
+
+pub(crate) struct ReplayRegistration {
+    pub(crate) world: OwnedWorld,
+    pub(crate) bind_parent: bool,
+    pub(crate) readmission: Option<WorldReadmission>,
 }
 
 pub(crate) struct ReplayShadow {
@@ -32,6 +40,8 @@ pub(crate) struct ReplayShadow {
 #[serde(deny_unknown_fields)]
 struct ArchivedWorld {
     id: [u8; 16],
+    bind_parent: bool,
+    readmission: Option<WorldReadmission>,
     pin: [u8; 16],
     mode: ArchivedMode,
     parent: ArchivedParent,
@@ -59,7 +69,7 @@ struct ArchivedParent {
 }
 
 impl ArchivedWorld {
-    fn into_owned(self) -> Result<OwnedWorld> {
+    fn into_registration(self) -> Result<ReplayRegistration> {
         let mode = match self.mode {
             ArchivedMode::Retained => WorldClockMode::Retained,
             ArchivedMode::Held(start) => WorldClockMode::Held {
@@ -88,7 +98,11 @@ impl ArchivedWorld {
         if world.basis.tx_id.0 < 0 || world.basis.system_time.0 <= 0 {
             return Err(invalid());
         }
-        Ok(world)
+        Ok(ReplayRegistration {
+            world,
+            bind_parent: self.bind_parent,
+            readmission: self.readmission,
+        })
     }
 }
 
@@ -101,11 +115,11 @@ impl ReplayWorlds {
         for _ in 0..registrations {
             let world: ArchivedWorld =
                 serde_json::from_slice(input.frame()?).map_err(|_| invalid())?;
-            let world = world.into_owned()?;
-            if !ids.insert(world.id) {
+            let registration = world.into_registration()?;
+            if !ids.insert(registration.world.id) {
                 return Err(invalid());
             }
-            worlds.registrations.push(world);
+            worlds.registrations.push(registration);
         }
         ids.clear();
         let clocks = input.count()?;
