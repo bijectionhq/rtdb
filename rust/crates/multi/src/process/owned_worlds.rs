@@ -410,6 +410,12 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         Box::pin(async move { self.point(relation, id, valid_at, observed).await.map(point_result) })
     }
 
+    fn read_ancestor_root_point<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>> {
+        Box::pin(async move { self.ancestor_root_point(relation, id, valid).await.map(point_result) })
+    }
+
     fn read_parent_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
     ) -> BoxFuture<'a, Result<WorldPointResult>> {

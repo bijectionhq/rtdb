@@ -1859,7 +1859,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = if matches!(order, WorldOrder::ParentRange | WorldOrder::OverlayRange) {
+        let held = if matches!(order, WorldOrder::ParentRange | WorldOrder::OverlayRange | WorldOrder::ParentCount) {
             self.owned_world_resource(call, &handle)?
         } else {
             self.owned_world_read(call, &handle)?
@@ -2602,6 +2602,7 @@ impl Service {
         let mut result = match mode {
             0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
             2 | 3 => held.snapshot.read_parent_point(&relation, &id, valid_at, *mode == 3).await,
+            4 => held.snapshot.read_ancestor_root_point(&relation, &id, valid_at).await,
             _ => return Err(invalid("Invalid owned world point source")),
         }.map_err(status)?;
         if result.present != held.snapshot.present() {
@@ -2611,7 +2612,7 @@ impl Service {
         let absent = result.row.is_none() && !result.shadowed;
         let nonce = result.witness.take().map(|evidence| held.remember(call, evidence, absent)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
-        if matches!(*mode, 2 | 3) {
+        if matches!(*mode, 2 | 3 | 4) {
             held.snapshot.check_parent_point(&relation, until).map_err(status)?;
         } else {
             held.snapshot.check_relation(&relation).map_err(status)?;
@@ -2689,7 +2690,7 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = if matches!(mode, WorldIdentityRead::Effective) {
+        let held = if matches!(mode, WorldIdentityRead::Effective | WorldIdentityRead::Overlay) {
             self.owned_world_resource(call, &handle)?
         } else {
             self.owned_world_read(call, &handle)?
