@@ -147,11 +147,14 @@ impl OwnedReadSession {
     }
 
     /// Root identities with any assertion current at `system`, across all
-    /// valid time, in key order. Adjacent valid slices of one key collapse;
-    /// a saturated fetch reports more, since repeats consumed it.
+    /// valid time, in key order, each once. Repeated valid slices of one key
+    /// are skipped by fetching again after the last distinct key, until the
+    /// page holds `limit + 1` distinct keys or the relation ends, so a page is
+    /// short only at the end.
     pub async fn identity_page_all_valid(
         &self, relation: &OwnedRelation, system: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<OwnedIdentityPage> {
+        const FETCH: usize = 256;
         if !(1..=MAX_PAGE_ROWS).contains(&limit) {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/identity-page",
@@ -160,16 +163,19 @@ impl OwnedReadSession {
         }
         let at_head = self.admit_root_system(relation, system).await?;
         let context = self.relation_context(relation)?;
-        let fetch = (limit + 1) * 4;
-        let mut charges = vec![self.context.memory.reserve(fetch * 128)?];
+        let mut charges = vec![self.context.memory.reserve(FETCH * 128)?];
         let mut keys: Vec<String> = Vec::with_capacity(limit + 1);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
-        let mut fetched = 0usize;
-        if let Some(mut cursor) = rtdb_query::open_owned_identity_page_all_valid(
-            Arc::clone(&context), &self.owner, relation, system, after, fetch as i64,
-        ).await? {
-            'page: while let Some(batch) = cursor.next_batch().await? {
+        let mut cursor_after: Option<String> = after.map(str::to_owned);
+        'fetch: loop {
+            let Some(mut cursor) = rtdb_query::open_owned_identity_page_all_valid(
+                Arc::clone(&context), &self.owner, relation, system, cursor_after.as_deref(), FETCH as i64,
+            ).await? else {
+                break;
+            };
+            let mut fetched = 0usize;
+            while let Some(batch) = cursor.next_batch().await? {
                 let batch = batch.batch();
                 let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(invalid_page)?;
                 let array = batch.column(column).as_ref();
@@ -179,7 +185,7 @@ impl OwnedReadSession {
                         return Err(invalid_page());
                     };
                     let previous = keys.last().map(String::as_str).or(after);
-                    if previous.is_some_and(|previous| previous == key.as_str()) && !keys.is_empty() {
+                    if keys.last().is_some_and(|last| last == &key) {
                         continue;
                     }
                     if previous.is_some_and(|previous| previous >= key.as_str()) {
@@ -187,7 +193,7 @@ impl OwnedReadSession {
                     }
                     if keys.len() == limit {
                         more = true;
-                        break 'page;
+                        break 'fetch;
                     }
                     let bytes = estimate_read_value_bytes(field, array, row)?;
                     let Some(rest) = remaining.checked_sub(bytes) else {
@@ -199,7 +205,7 @@ impl OwnedReadSession {
                             ));
                         }
                         more = true;
-                        break 'page;
+                        break 'fetch;
                     };
                     remaining = rest;
                     charges.push(self.context.memory.reserve(bytes)?);
@@ -209,9 +215,13 @@ impl OwnedReadSession {
                     keys.push(key);
                 }
             }
-        }
-        if fetched >= fetch {
-            more = true;
+            // A short fetch reached the relation's end.
+            if fetched < FETCH {
+                break;
+            }
+            // The fetch ended inside the last key's slices: continue after
+            // it, so its remaining slices are not fetched again.
+            cursor_after = keys.last().cloned().or(cursor_after);
         }
         context.check_cancelled()?;
         Ok(OwnedIdentityPage { keys, more, _charges: charges })
