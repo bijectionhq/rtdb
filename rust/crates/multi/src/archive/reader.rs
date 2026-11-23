@@ -329,7 +329,7 @@ async fn open_inventory(
     }
     let manifest_path = key(STAGED_MANIFEST)?;
     let media_id = record.key_id();
-    let stage_key = keys.staged_key(&media_id, Arc::clone(&region)).await?;
+    let stage_key = keys.scoped_unit_key(&media_id, Arc::clone(&region)).await?;
     let maximum = crate::cipher::object::sealed_size(&manifest_path, MAXIMUM_MANIFEST_BYTES as usize)?;
     let head = files.head_fresh(&manifest_path).await?;
     let length = usize::try_from(head.size)

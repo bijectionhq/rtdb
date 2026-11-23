@@ -3069,6 +3069,7 @@ rule RetainServingReplayArchive {
 }
 
 rule StageHistoricalCheckpoint {
+    -- Primary members and the sealed inventory have separate slots in the stage vault.
     when: HistoricalCheckpointStageRequested(capture, target, operation)
 
     requires: ExactRetainedCapture(capture)
@@ -3239,7 +3240,7 @@ rule BeginCellMove {
 
 rule MoveCutover {
     -- The destination accepts placements only after the cell map switches to it.
-    -- The destination's first holder imports the sealed source log before it can serve.
+    -- The destination verifies the certified retained interval and reseals each frame into its own slots before it can serve.
     -- A retry after the switch finishes publication and leaves the source tombstone.
     -- Forks in the source cell retain access to every object they share.
     -- Verify the destination's root owner, checkpoint catalog, required trie metadata and trie envelopes against its own storage generation.

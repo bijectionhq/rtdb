@@ -143,7 +143,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                             );
                             let _pages = memory.reserve(32 << 20)?;
                             let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
-                            let source_cipher = replica_suffix::TerminalReplicaCipher::open(&source, keys).await?;
+                            let source_cipher = replica_suffix::TerminalReplicaCipher::open(&source, keys, Arc::clone(&source_io)).await?;
                             let payloads = replica_suffix::ServingPayloads::new(&source, source_region, &certificate, storage, keys, source_io, memory)?;
                             while let Some(mut entries) = segments.next().await? {
                                 let first = entries.first().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
@@ -151,7 +151,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                                 // A provisional read cannot occupy a canonical target name.
                                 let proof = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
                                 rtdb_logkeeper::verify_certified_range(&proof, &entries)?;
-                                source_cipher.open_page(&mut entries)?;
+                                source_cipher.open_page(&mut entries).await?;
                                 artifact.put_segment(&entries, chain).await?;
                                 for entry in entries {
                                     let Some(envelope) = replay.admit(&entry, fence, recovered)? else { continue; };
@@ -251,7 +251,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
         owner, keys, &target_id, storage, task, None, None, admit_target,
         |target, _, region| async move {
             let bucket = storage.bucket(Arc::clone(&region)).await?;
-            let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &target, terminal, region).await?;
+            let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &target, terminal, Arc::clone(&region)).await?;
             let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
             let expected_chain = artifact.read_ordered_transfer(ordered.ciphertext_sha256).await?;
             let start = transfer_first(stage)?;
@@ -315,8 +315,9 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 rtdb_logkeeper::bootstrap_committed_page(&stream, epoch, checkpoint, LogOffset(start), &[], true).await?;
                 return Ok(reserved);
             }
-            let scope = target.replica_seal_scope();
-            let journal_cipher = crate::cipher::Cipher::new(&media)?;
+            let journal = crate::logs::JournalUnits::open(
+                keys, &target.key_id(), &target.replica_seal_scope(), region,
+            ).await?;
             let mut fence = initial_fence;
             let mut writer = None;
             let mut next = start;
@@ -342,7 +343,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 // Preserve the source transaction IDs and term sequences under
                 // the target's own seal.
                 for entry in &mut entries {
-                    entry.payload = journal_cipher.seal_deterministic(&scope, &entry.payload)?;
+                    entry.payload = journal.seed(entry.lsn, entry.payload.clone()).await?;
                 }
                 rtdb_logkeeper::bootstrap_committed_page(
                     &stream, epoch, checkpoint, LogOffset(first), &entries, last == through,

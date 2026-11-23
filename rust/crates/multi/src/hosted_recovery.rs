@@ -200,12 +200,13 @@ async fn offload_candidates(record: &DeploymentRecord, stream: &StreamConfig, st
     keys: &dyn crate::keys::KeyService, first: i64, through: i64) -> Result<Vec<ReplicaPayloadCandidate>> {
     let certificate = rtdb_logkeeper::certify_committed_range(stream, first, through).await?;
     let mut reader = rtdb_logkeeper::CertifiedRangeReader::new(stream, &certificate)?;
-    let cipher = crate::cipher::Cipher::new(&keys.existing(&record.key_id()).await?)?;
-    let scope = record.replica_seal_scope();
+    let journal = crate::logs::JournalUnits::open(
+        keys, &record.key_id(), &record.replica_seal_scope(), rtdb_storage::IoRegion::new(),
+    ).await?;
     let mut candidates = Vec::new();
     while let Some(page) = reader.next_page().await? {
         for entry in page {
-            let bytes = cipher.open(&scope, &entry.payload)?;
+            let bytes = journal.decrypt(entry.payload.clone()).await?;
             let Some(envelope) = ReplicaEnvelope::decode(&bytes)? else { continue; };
             let Some((_, version)) = envelope.offload_publication()? else { continue; };
             let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?

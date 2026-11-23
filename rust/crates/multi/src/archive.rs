@@ -86,6 +86,7 @@ pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
 mod replica_artifact;
 mod replica_suffix;
+pub(crate) use replica_suffix::reseal_live_journal;
 mod replay_handoff;
 pub(crate) use replica_suffix::{capture as capture_replica_suffix, find_held_publication};
 mod read_world;

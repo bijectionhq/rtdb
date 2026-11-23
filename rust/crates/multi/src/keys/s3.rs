@@ -195,9 +195,7 @@ impl KeyService for S3KeyService {
 
     async fn destroy(&self, id: &str) -> Result<()> {
         self.withdraw_current(&object_path(id)?).await?;
-        if id.starts_with("stage-") {
-            self.withdraw_registered_scope(UnitScope::archive(id)).await?;
-        }
+        self.withdraw_registered_scope(UnitScope::archive(id)).await?;
         Ok(())
     }
 
@@ -226,13 +224,12 @@ impl KeyService for S3KeyService {
         self.open_capture(id, provision, region).await
     }
 
-    async fn staged_key(&self, id: &str, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+    async fn scoped_unit_key(&self, id: &str, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
         self.open_capture(id, false, region).await
     }
 
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         self.destroy(id).await?;
-        self.withdraw_registered_scope(UnitScope::archive(id)).await?;
         Ok(ArchiveKeyWithdrawal::Vault)
     }
 

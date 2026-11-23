@@ -434,7 +434,7 @@ async fn copy_checkpoint(
             "The staged installation must have its own media key",
         ));
     }
-    let stage_key = keys.staged_key(&target.key_id(), Arc::clone(&target_io)).await?;
+    let stage_key = keys.scoped_unit_key(&target.key_id(), Arc::clone(&target_io)).await?;
     let serving_cipher = Cipher::new(&media_key)?;
     let source = PrefixedStore::new(bucket, format!("{prefix}/objects"));
     let destination = PrefixedStore::new(

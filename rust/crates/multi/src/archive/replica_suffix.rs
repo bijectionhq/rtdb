@@ -23,7 +23,6 @@ use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, 
 use super::stage::{RegionPublication, with_region};
 use crate::{
     admin::{administration_stream, update_installation},
-    cipher::Cipher,
     deployment::CellStorage,
     keys::KeyService,
     reference::{PrefixedStore, key},
@@ -136,7 +135,7 @@ pub(crate) async fn find_held_publication(
     record: &DeploymentRecord, storage: &CellStorage, keys: &dyn KeyService, cut: &rtdb_node::OwnedForkCut,
     base: &BlockCatalog, region: Uuid, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
 ) -> Result<(TransactionKey, i64, i64)> {
-    let cipher = TerminalReplicaCipher::open(record, keys).await?;
+    let cipher = TerminalReplicaCipher::open(record, keys, Arc::clone(&io)).await?;
     let payloads = ServingPayloads::new(record, region, proof, storage, keys, io, memory)?;
     let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, proof)?;
     let log_epoch = StorageEpoch(record.log_epoch);
@@ -147,7 +146,7 @@ pub(crate) async fn find_held_publication(
         if selected.is_some() {
             continue;
         }
-        cipher.open_page(&mut entries)?;
+        cipher.open_page(&mut entries).await?;
         for entry in entries {
             let Some(envelope) = admit_record(&entry, &mut fence, &mut writer, record.epoch)? else { continue; };
             let _payload;
@@ -213,7 +212,7 @@ pub(crate) async fn capture(
                     let remaining = pin.expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
                     let materialize = async {
                         let _pages = memory.reserve(32 << 20)?;
-                        let cipher = TerminalReplicaCipher::open(&record, keys).await?;
+                        let cipher = TerminalReplicaCipher::open(&record, keys, Arc::clone(&io)).await?;
                         let payloads = ServingPayloads::new(&record, region, &certificate, storage, keys, io, memory)?;
                         let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                         let mut progress = SuffixProgress::new(pin, &catalog)?;
@@ -225,7 +224,7 @@ pub(crate) async fn capture(
                             // interval proof must also match before sealing the manifest.
                             let segment = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
                             rtdb_logkeeper::verify_certified_range(&segment, &entries)?;
-                            cipher.open_page(&mut entries)?;
+                            cipher.open_page(&mut entries).await?;
                             let mut detached = Vec::new();
                             for entry in &mut entries {
                                 let Some(envelope) = progress.admit(entry, pin)? else {
@@ -411,25 +410,63 @@ fn archive_digest(expected: &str) -> Result<[u8; 32]> {
     decoded.try_into().map_err(|_| suffix_unavailable())
 }
 
-pub(super) struct TerminalReplicaCipher {
-    cipher: Cipher,
-    scope: String,
-}
+pub(super) struct TerminalReplicaCipher(crate::logs::JournalUnits);
 
 impl TerminalReplicaCipher {
-    pub(super) async fn open(source: &DeploymentRecord, keys: &dyn KeyService) -> Result<Self> {
-        let material = keys.existing_key(&source.key_id()).await?.ok_or_else(suffix_unavailable)?;
-        Ok(Self { cipher: Cipher::new(&material)?, scope: source.replica_seal_scope() })
+    pub(super) async fn open(source: &DeploymentRecord, keys: &dyn KeyService, io: Arc<IoRegion>) -> Result<Self> {
+        Ok(Self(crate::logs::JournalUnits::open(keys, &source.key_id(), &source.replica_seal_scope(), io).await?))
     }
 
-    pub(super) fn open_page(&self, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
+    pub(super) async fn open_page(&self, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
         for entry in entries {
             // The copy is resealed later; keep the digest its original voters retain.
             rtdb_logkeeper::retain_original_entry_digest(entry);
-            entry.payload = self.cipher.open(&self.scope, &entry.payload)?;
+            entry.payload = self.0.decrypt(entry.payload.clone()).await?;
         }
         Ok(())
     }
+}
+
+/// Copies one sealed source history into a different residence and key vault.
+pub(crate) async fn reseal_live_journal(
+    source: &DeploymentRecord,
+    source_stream: &rtdb_logkeeper::StreamConfig,
+    source_keys: &dyn KeyService,
+    target: &DeploymentRecord,
+    target_stream: &rtdb_logkeeper::StreamConfig,
+    target_keys: &dyn KeyService,
+) -> Result<()> {
+    use rtdb_logkeeper::{bootstrap_committed_page, certify_committed_range, seal_recover_bounds, verify_certified_range};
+    use rtdb_storage::log::LogOffset;
+
+    let (trim, through) = seal_recover_bounds(source_stream, source.epoch).await?;
+    let first = LogOffset(trim.0.checked_add(1).ok_or_else(suffix_unavailable)?);
+    if first > through {
+        return bootstrap_committed_page(target_stream, source.epoch, trim, first, &[], true).await;
+    }
+
+    let io = IoRegion::new();
+    let source_cipher = TerminalReplicaCipher::open(source, source_keys, Arc::clone(&io)).await?;
+    let target_units = crate::logs::JournalUnits::open(
+        target_keys, &target.key_id(), &target.replica_seal_scope(), io,
+    ).await?;
+    let certificate = certify_committed_range(source_stream, first.0, through.0).await?;
+    let cursor = rtdb_logkeeper::CertifiedRangeReader::new(source_stream, &certificate)?;
+    let mut segments = CertifiedSegments::new(cursor);
+    while let Some(mut entries) = segments.next().await? {
+        let first = entries.first().ok_or_else(suffix_unavailable)?.lsn;
+        let last = entries.last().ok_or_else(suffix_unavailable)?.lsn;
+        let page = certify_committed_range(source_stream, first, last).await?;
+        verify_certified_range(&page, &entries)?;
+        source_cipher.open_page(&mut entries).await?;
+        for entry in &mut entries {
+            entry.payload = target_units.seed(entry.lsn, entry.payload.clone()).await?;
+        }
+        bootstrap_committed_page(target_stream, source.epoch, trim, LogOffset(first), &entries, last == through.0).await?;
+        let chosen = certify_committed_range(target_stream, first, last).await?;
+        verify_certified_range(&chosen, &entries)?;
+    }
+    Ok(())
 }
 
 /// Exact replay coordinates retained while the terminal interval is read in
@@ -580,7 +617,7 @@ pub(super) async fn replay_certified_terminal(
     }
     if let Some(certificate) = certificate {
         if certificate.interval != [first, through] { return Err(suffix_unavailable()); }
-        let cipher = TerminalReplicaCipher::open(source, keys).await?;
+        let cipher = TerminalReplicaCipher::open(source, keys, Arc::clone(&io)).await?;
         let payloads = ServingPayloads::new(source, region, certificate, storage, keys, io, memory)?;
         let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, certificate)?;
         while let Some(mut entries) = pages.next_page().await? {
@@ -588,7 +625,7 @@ pub(super) async fn replay_certified_terminal(
                 total.checked_add(entry.payload.len().saturating_mul(2).saturating_add(64))
                     .ok_or_else(suffix_unavailable))?;
             let _charge = memory.reserve(bytes)?;
-            cipher.open_page(&mut entries)?;
+            cipher.open_page(&mut entries).await?;
             for entry in entries {
                 let Some(envelope) = progress.admit(&entry, fence, recovered)? else { continue; };
                 let _payload;
@@ -1017,7 +1054,7 @@ mod custody_tests {
         let cancellation = CancellationToken::new();
         let server = tokio::spawn(journal.serve(listener, cancellation.clone()));
         let writer = rtdb_logkeeper::open_writer(stream.clone(), 1, cancellation.clone()).await?;
-        let writer = crate::logs::SealedLog::new(writer, &source_key, &source.replica_seal_scope())?;
+        let writer = crate::logs::SealedLog::new(writer, keys.as_ref(), &source.key_id(), &source.replica_seal_scope(), IoRegion::new()).await?;
         let claim = |term| ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(0)),
             message: ReplicaBody::NoOp(NoOp::default()) };
         writer.enqueue(claim(1).encode().into(), Timestamp(10)).await?.durable().await?;
@@ -1052,7 +1089,7 @@ mod custody_tests {
         source_objects.put(&earlier_path, earlier_body.clone()).await?;
         writer.enqueue(earlier_proxy.encode().into(), Timestamp(20)).await?.durable().await?;
         let writer = rtdb_logkeeper::open_writer(stream.clone(), 2, cancellation.clone()).await?;
-        let writer = crate::logs::SealedLog::new(writer, &source_key, &source.replica_seal_scope())?;
+        let writer = crate::logs::SealedLog::new(writer, keys.as_ref(), &source.key_id(), &source.replica_seal_scope(), IoRegion::new()).await?;
         writer.enqueue(claim(2).encode().into(), Timestamp(21)).await?.durable().await?;
         let later = large_transaction(terminal_source, 30, 2)?;
         let later_body = Bytes::from(later.encode());
@@ -1078,7 +1115,7 @@ mod custody_tests {
                 root_sha256: Some(rtdb_format::catalog::publication_digest(&root_bytes)) },
         };
         let archive_key = keys.key(&archive_key_id(&point)).await?;
-        let sealed = Cipher::new(&archive_key)?.seal_deterministic(root.as_str(), &root_bytes)?;
+        let sealed = crate::cipher::Cipher::new(&archive_key)?.seal_deterministic(root.as_str(), &root_bytes)?;
         let captured = Capture {
             point: point.clone(), format: rtdb_format::catalog::CheckpointContents::Replay,
             objects: vec![ArchivedObject { name: root.to_string(), bytes: sealed.len() as u64, sha256: digest(&sealed), frame_header_sha256: None }],

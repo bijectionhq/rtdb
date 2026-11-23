@@ -519,7 +519,7 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
         stream: scope.clone(), write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     let keys = cell.keys();
-    let key = keys.key(&deployment.key_id()).await.unwrap();
+    keys.key(&deployment.key_id()).await.unwrap();
     let placed = PlacedAttemptScope::new(&scope, 1).unwrap().issue()
         .identify(SourcePosition(3), Some("owner")).unwrap();
     let body = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(1)),
@@ -534,7 +534,7 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
         }),
     };
     let broadcast = rtdb_logkeeper::open_writer(stream.clone(), 1, Default::default()).await.unwrap();
-    let writer = rtdb_multi::logs::SealedLog::new(broadcast, &key, &deployment.replica_seal_scope()).unwrap();
+    let writer = rtdb_multi::logs::SealedLog::new(broadcast, &keys, &deployment.key_id(), &deployment.replica_seal_scope(), rtdb_storage::IoRegion::new()).await.unwrap();
     let cutoff = Timestamp(150);
     let staging = Timestamp(120);
     assert!(writer.maximum_guarded_append_bytes().is_some());
@@ -1191,8 +1191,7 @@ async fn placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint(
         stream, write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     let replica = rtdb_logkeeper::open_reader(config.clone(), Default::default()).await.unwrap();
-    let material = cell.keys().existing(&record.key_id()).await.unwrap();
-    let replica = rtdb_multi::logs::SealedLog::new(replica, &material, &record.replica_seal_scope()).unwrap();
+    let replica = rtdb_multi::logs::SealedLog::new(replica, &cell.keys(), &record.key_id(), &record.replica_seal_scope(), rtdb_storage::IoRegion::new()).await.unwrap();
     let mut tail = replica.tail(LogOffset(-1)).await.unwrap();
     let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
         let mut outcomes = Vec::new();

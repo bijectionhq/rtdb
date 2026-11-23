@@ -461,13 +461,14 @@ impl Writer {
         Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
     }
 
-    pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<i64> {
+    pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<(i64, i64)> {
         let mut replies = seal_quorum(ensemble, epoch).await?;
         let SealedHistory { source, history, .. } = sealed_history(ensemble, epoch, &mut replies).await?;
         let last = history.last;
+        let trim = history.trim;
         let recovered = Recovered { source: (ensemble, source), start: history.trim + 1, history };
         sync_quorum(ensemble, epoch, &replies, &recovered, last).await?;
-        Ok(last)
+        Ok((trim, last))
     }
 
     /// Recovers the same history used by a local ensemble move and by a

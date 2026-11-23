@@ -22,9 +22,14 @@ use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, object_store::ReadReservati
 use rtdb_types::{Anomaly, BlockIndex, JournalEndpoint, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-use crate::cipher::{Cipher, SEALED_OVERHEAD};
+use crate::cipher::Cipher;
 use crate::deployment::LogkeeperLogConfig;
+use crate::keys::KeyService;
 use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
+
+mod units;
+pub(crate) use units::JournalUnits;
+use units::OVERHEAD as UNIT_OVERHEAD;
 
 const SCAN_WINDOW: i64 = 256;
 const INTAKE_TIP_WINDOW: i64 = 8;
@@ -280,7 +285,7 @@ impl LogFactory for LogkeeperLogFactory {
             AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery,
                 placed_receipt_retirement: config.placed_receipt_retirement }
         } else { AwaitAuthority::Frozen };
-        let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
+        let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &config, Arc::clone(&self.holds)).await?);
         let mut next = next_source_offset_from_cut(replica.as_ref(), epoch, config.transfer_intake_cut).await?;
         if let Some(through) = config.transferred_source_through {
             let floor = through.checked_add(1).filter(|floor| *floor >= 0)
@@ -447,28 +452,24 @@ pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Resul
     Ok(())
 }
 
-/// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
+/// Directory-managed payloads enter the journal as independently sealed publications.
 pub struct SealedLog {
     inner: Arc<dyn Log>,
-    cipher: Arc<Cipher>,
-    stream: Arc<str>,
+    units: Arc<JournalUnits>,
     recovery: Option<RecoveryAdmission>,
 }
 
 impl SealedLog {
-    pub fn new(inner: Arc<dyn Log>, key: &[u8], stream: &str) -> Result<Self> {
-        Ok(Self { inner, cipher: Arc::new(Cipher::new(key)?), stream: Arc::from(stream), recovery: None })
+    pub async fn new(inner: Arc<dyn Log>, keys: &dyn KeyService, residence: &str, scope: &str, io: Arc<IoRegion>) -> Result<Self> {
+        let units = Arc::new(JournalUnits::open(keys, residence, scope, io).await?);
+        Ok(Self { inner, units, recovery: None })
     }
 
-    fn for_serving(inner: Arc<dyn Log>, key: &[u8], config: &LogkeeperLogConfig, holds: Arc<RecoveryHolds>) -> Result<Self> {
-        let mut log = Self::new(inner, key, &config.replica_seal_scope)?;
+    async fn for_serving(inner: Arc<dyn Log>, config: &LogkeeperLogConfig, holds: Arc<RecoveryHolds>) -> Result<Self> {
+        let mut log = Self::new(inner, holds.keys.as_ref(), &config.key_id, &config.replica_seal_scope, IoRegion::new()).await?;
         log.recovery = Some(RecoveryAdmission::new(holds, config));
         Ok(log)
     }
-}
-
-fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
-    Ok(LogRecord { payload: cipher.open(stream, &record.payload)?, ..record })
 }
 
 #[async_trait]
@@ -488,29 +489,29 @@ impl Log for SealedLog {
     fn fences_writer_terms(&self) -> bool { self.inner.fences_writer_terms() }
     async fn holds_writer_grant(&self) -> rtdb_storage::Result<bool> { self.inner.holds_writer_grant().await }
     fn maximum_append_bytes(&self) -> Option<usize> {
-        self.inner.maximum_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+        self.inner.maximum_append_bytes()?.checked_sub(UNIT_OVERHEAD)
     }
     fn maximum_guarded_append_bytes(&self) -> Option<usize> {
-        self.inner.maximum_guarded_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+        self.inner.maximum_guarded_append_bytes()?.checked_sub(UNIT_OVERHEAD)
     }
     fn maximum_timed_original_append_bytes(&self) -> Option<usize> {
-        self.inner.maximum_timed_original_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+        self.inner.maximum_timed_original_append_bytes()?.checked_sub(UNIT_OVERHEAD)
     }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
-        let receipt = self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await?;
+        let receipt = self.inner.enqueue(self.units.seal(payload).await?, timestamp).await?;
         Ok(observe_attempt(receipt, outcome))
     }
     async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
-        self.inner.enqueue_maintenance(self.cipher.seal(&self.stream, &payload)?, timestamp).await
+        self.inner.enqueue_maintenance(self.units.seal(payload).await?, timestamp).await
     }
     async fn available_append_capacity(&self) -> rtdb_storage::Result<Option<rtdb_storage::log::AppendCapacity>> {
         self.inner.available_append_capacity().await
     }
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
-        let receipt = self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await?;
+        let receipt = self.inner.enqueue_guarded(self.units.seal(payload).await?, guard).await?;
         Ok(observe_attempt(receipt, outcome))
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
@@ -521,19 +522,18 @@ impl Log for SealedLog {
             None => None,
         };
         Ok(self.inner.recovery_tail(after).await?.map(|inner| {
-            Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: hold.map(Arc::new), admission: self.recovery.clone() }) as Box<dyn LogTail>
+            Box::new(SealedTail { inner, units: Arc::clone(&self.units), hold: hold.map(Arc::new), admission: self.recovery.clone() }) as Box<dyn LogTail>
         }))
     }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
         if let Some(admission) = &self.recovery { admission.check_start(after).await?; }
-        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: None, admission: self.recovery.clone() }))
+        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, units: Arc::clone(&self.units), hold: None, admission: self.recovery.clone() }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> {
-        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), admission: self.recovery.clone() }))
+        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, units: Arc::clone(&self.units), admission: self.recovery.clone() }))
     }
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> {
-        let mut records = self.inner.read_range(from, to).await?.into_iter()
-            .map(|record| opened(&self.cipher, &self.stream, record)).collect::<rtdb_storage::Result<Vec<_>>>()?;
+        let mut records = open_records(&self.units, self.inner.read_range(from, to).await?).await?;
         if let Some(admission) = &self.recovery { admission.retain_offloaded(&mut records).await?; }
         Ok(records)
     }
@@ -550,8 +550,7 @@ fn observe_attempt(receipt: AppendReceipt, outcome: Option<crate::residence_trac
 
 struct SealedTail {
     inner: Box<dyn LogTail>,
-    cipher: Arc<Cipher>,
-    stream: Arc<str>,
+    units: Arc<JournalUnits>,
     hold: Option<Arc<ReplayHold>>,
     admission: Option<RecoveryAdmission>,
 }
@@ -574,8 +573,7 @@ impl SealedTail {
 #[async_trait]
 impl LogTail for SealedTail {
     async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
-        let mut records = self.inner.poll(timeout).await?.into_iter()
-            .map(|record| opened(&self.cipher, &self.stream, record)).collect::<rtdb_storage::Result<Vec<_>>>()?;
+        let mut records = open_records(&self.units, self.inner.poll(timeout).await?).await?;
         self.retain_deliveries(&mut records).await?;
         Ok(records)
     }
@@ -586,25 +584,47 @@ impl LogTail for SealedTail {
 impl LogReplayTail for SealedTail {
     async fn poll_head(&mut self, timeout: Duration) -> rtdb_storage::Result<Option<ReplayHead>> {
         let head = self.inner.replay().expect("checked when replay was offered").poll_head(timeout).await?;
-        Ok(head.map(|head| ReplayHead { payload_len: head.payload_len.saturating_sub(SEALED_OVERHEAD), ..head }))
+        head.map(|head| {
+            let payload_len = head.payload_len.checked_sub(UNIT_OVERHEAD)
+                .ok_or_else(|| rtdb_storage::Error::Task("Truncated sealed journal record".into()))?;
+            let allocation_bound = head.allocation_bound.checked_mul(2)
+                .ok_or_else(|| rtdb_storage::Error::Task("Journal replay allocation overflow".into()))?;
+            Ok(ReplayHead { payload_len, allocation_bound, ..head })
+        }).transpose()
     }
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
-        let sealed = ReplayHead { payload_len: head.payload_len + SEALED_OVERHEAD, ..head };
+        let payload_len = head.payload_len.checked_add(UNIT_OVERHEAD)
+            .ok_or_else(|| rtdb_storage::Error::Task("Journal record length overflow".into()))?;
+        let sealed = ReplayHead { payload_len, allocation_bound: head.allocation_bound / 2, ..head };
+        if reservation.length() < head.allocation_bound {
+            return Err(rtdb_storage::Error::Task("Journal replay reservation is too small".into()));
+        }
         let record = self.inner.replay().expect("checked when replay was offered").read_head(sealed, reservation).await?;
-        let mut record = opened(&self.cipher, &self.stream, record)?;
+        let mut record = self.units.open_record(record).await?;
         self.retain_deliveries(std::slice::from_mut(&mut record)).await?;
         Ok(record)
     }
 }
 
-struct SealedRange { inner: Box<dyn LogRange>, cipher: Arc<Cipher>, stream: Arc<str>, admission: Option<RecoveryAdmission> }
+async fn open_records(units: &JournalUnits, records: Vec<LogRecord>) -> rtdb_storage::Result<Vec<LogRecord>> {
+    let mut opened = Vec::with_capacity(records.len());
+    for record in records {
+        opened.push(units.open_record(record).await?);
+    }
+    Ok(opened)
+}
+
+struct SealedRange { inner: Box<dyn LogRange>, units: Arc<JournalUnits>, admission: Option<RecoveryAdmission> }
 
 #[async_trait]
 impl LogRange for SealedRange {
-    fn allocation_bound(&self) -> usize { self.inner.allocation_bound() }
+    fn allocation_bound(&self) -> usize { self.inner.allocation_bound().saturating_mul(2) }
     async fn next(&mut self, reservation: ReadReservation) -> rtdb_storage::Result<Option<LogRecord>> {
+        if reservation.length() < self.allocation_bound() {
+            return Err(rtdb_storage::Error::Task("Journal range reservation is too small".into()));
+        }
         let Some(record) = self.inner.next(reservation).await? else { return Ok(None); };
-        let mut record = opened(&self.cipher, &self.stream, record)?;
+        let mut record = self.units.open_record(record).await?;
         if let Some(admission) = &self.admission { admission.retain_offloaded(std::slice::from_mut(&mut record)).await?; }
         Ok(Some(record))
     }

@@ -265,10 +265,17 @@ pub async fn seal(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<LogOf
 /// Fences the original stream and settles exactly the history its normal
 /// recovery would select. The settled epoch has no activated append writer.
 pub async fn seal_recover_committed(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<LogOffset> {
+    let (_, through) = seal_recover_bounds(config, epoch).await?;
+    Ok(through)
+}
+
+/// Returns the settled trim floor and committed end of one recovered history.
+pub async fn seal_recover_bounds(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<(LogOffset, LogOffset)> {
     validate(config)?;
     if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "epochs start at 1")); }
     let ensemble = Ensemble::new(config.clone());
-    Ok(LogOffset(Writer::seal_recover_committed(&ensemble, epoch).await?))
+    let (trim, through) = Writer::seal_recover_committed(&ensemble, epoch).await?;
+    Ok((LogOffset(trim), LogOffset(through)))
 }
 
 /// Lets every server drop entries at or below `through`, which must be committed.

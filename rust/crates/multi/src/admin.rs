@@ -8,7 +8,7 @@ pub use rtdb_directory::DeletionRecord;
 use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, ForkPublication, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_format::{catalog::BlockCatalog, keys::block_key};
 use rtdb_logkeeper::StreamConfig;
-use rtdb_storage::{ObjectStore, log::Log};
+use rtdb_storage::{IoRegion, ObjectStore, log::Log};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, JournalEndpoint, Result, StorageEpoch};
 use tokio_util::sync::CancellationToken;
 
@@ -599,7 +599,7 @@ pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorag
                 Ok(Some(crate::hosted_recovery::replay_start(current, checkpoint.boundary)?))
             },
             |current, _, io| async move {
-                let bucket = storage.bucket(io).await?;
+                let bucket = storage.bucket(Arc::clone(&io)).await?;
                 let scope = format!("{}/{}", source.storage_prefix(), crate::archive::checkpoint_storage_root()?);
                 let store = crate::store::open_deployment_store(bucket, &scope, crate::packing::PackDiscovery::From(checkpoint.block), crate::store::wall_clock()).await?;
                 let material = fork_key(keys, &current).await?;
@@ -611,7 +611,7 @@ pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorag
                 tokio::time::timeout(CONTROL_TIMEOUT, async {
                     let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
                     let through = reader.read_index(current.epoch).await?.through();
-                    let reader = crate::logs::SealedLog::new(reader, &material, &current.replica_seal_scope())?;
+                    let reader = crate::logs::SealedLog::new(reader, keys, &current.key_id(), &current.replica_seal_scope(), io).await?;
                     crate::logs::transactions_until(&reader, &store, &catalog, checkpoint.boundary, through, system_time).await
                 }).await.map_err(|_| fork_unavailable(parent))?
             },
@@ -675,18 +675,16 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
             Some((_, _, target_io)) => storage.bucket(target_io.clone()).await?,
             None => bucket,
         };
-        let key = if same_organisation {
+        if same_organisation {
             crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), Some(selected)).await?;
             keys.install(&child.key_id(), source_key).await?;
-            source_key
         } else {
             let key = keys.key(&child.key_id()).await?;
             crate::archive::copy_fork_checkpoint(bucket.clone(), source, &source_key, &child, &key, Some(selected)).await?;
-            key
-        };
+        }
         if let Some(stream) = &child_stream {
             let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
-            let writer = crate::logs::SealedLog::new(writer, &key, &child.replica_seal_scope())?;
+            let writer = crate::logs::SealedLog::new(writer, keys, &child.key_id(), &child.replica_seal_scope(), Arc::clone(&io)).await?;
             for envelope in tail {
                 writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?;
             }
@@ -1464,7 +1462,9 @@ async fn prepare_cell_move(
         }
     }
 
-    rtdb_logkeeper::copy_retained(source_stream, target_stream, source.epoch).await?;
+    crate::archive::reseal_live_journal(
+        &source, &source_stream, from.keys, &staged, &target_stream, to.keys,
+    ).await?;
     let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
         if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch
             || record.checkpoint != staged.checkpoint || record.storage_namespaces != staged.storage_namespaces
@@ -2103,8 +2103,10 @@ pub async fn audit_acceptance_quorum(
     let entry = entries.pop().filter(|entry| entry.lsn == offset).ok_or_else(unavailable)?;
     let not_strict = || Anomaly::incorrect("rtdb.multi/acceptance-audit-record", "The certified record is not a strict placed acceptance");
     if !entry.guarded { return Err(not_strict()); }
-    let cipher = crate::cipher::Cipher::new(&keys.existing(&current.key_id()).await?)?;
-    let payload = cipher.open(&current.replica_seal_scope(), &entry.payload)?;
+    let units = crate::logs::JournalUnits::open(
+        keys, &current.key_id(), &current.replica_seal_scope(), IoRegion::new(),
+    ).await?;
+    let payload = units.decrypt(entry.payload.clone()).await?;
     let Some(ReplicaEnvelope { term, message: ReplicaBody::ResolvedTx(tx), .. }) = ReplicaEnvelope::decode(&payload)? else {
         return Err(not_strict());
     };
@@ -2198,7 +2200,7 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
     let reader = rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?;
     let latest = reader.latest()?.0;
-    let log = if latest >= 0 { Some(crate::logs::SealedLog::new(reader, &keys.existing(&current.key_id()).await?, &current.replica_seal_scope())?) } else { None };
+    let log = if latest >= 0 { Some(crate::logs::SealedLog::new(reader, keys, &current.key_id(), &current.replica_seal_scope(), IoRegion::new()).await?) } else { None };
     let mut report = AuditReport { required_replica_quorum: stream.write_quorum, ..AuditReport::default() };
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
     let entries_per_batch = ((16 << 20) / maximum_message_bytes.max(1)).clamp(1, 1024) as i64;

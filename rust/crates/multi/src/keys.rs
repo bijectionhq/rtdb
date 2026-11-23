@@ -115,8 +115,8 @@ pub trait KeyService: Send + Sync {
         legacy_archive_key(&key)
     }
 
-    /// An independently withdrawable slot for each staged inventory member.
-    async fn staged_key(&self, _id: &str, _region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+    /// Returns the original residence authority for independently withdrawable units.
+    async fn scoped_unit_key(&self, _id: &str, _region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
         Err(unit::unsupported())
     }
 
@@ -375,9 +375,7 @@ impl KeyService for LocalKeyService {
                 Err(error) => return Err(io(error)),
             }
         }
-        if deployment.starts_with("stage-") {
-            self.withdraw_local_scope(UnitScope::archive(deployment), &IoRegion::new()).await?;
-        }
+        self.withdraw_local_scope(UnitScope::archive(deployment), &IoRegion::new()).await?;
         Ok(())
     }
 
@@ -419,7 +417,7 @@ impl KeyService for LocalKeyService {
         region.run_blocking(move || Ok(vault.open_archive_key(id, provision, key_region))).await?
     }
 
-    async fn staged_key(&self, id: &str, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+    async fn scoped_unit_key(&self, id: &str, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
         self.archive_key(id, false, region).await
     }
 
