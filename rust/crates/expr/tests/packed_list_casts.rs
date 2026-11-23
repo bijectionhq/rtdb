@@ -133,7 +133,7 @@ async fn list_cursor_emits_packed_cast_pages_before_later_element_errors() {
     let schema = Schema::default();
     let memory = rtdb_types::MemoryBudget::new(8 << 20);
     let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
-    let context = EvalContext::default().with_allocation(&scope);
+    let context = EvalContext { allocation: Some(&scope), ..Default::default() };
     let invocation = rtdb_expr::ExpressionInvocation::prepare(&expr, &schema, &context).unwrap();
     let mut pages = invocation.open_list(&[], &context, 2).await.unwrap();
     let first = pages.next_batch().await.unwrap().unwrap();
