@@ -198,6 +198,11 @@ impl SearchAccelerator {
                     work.ranked = true;
                     return Ok(Some(BTreeSet::new()));
                 }
+                if !options.baseline && !options.omit_logical && let Some(scope) = scope.filter(|scope| scope.len() <= 128)
+                    && crate::lane::LogicalIndex::supports(&definition)
+                    && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point() {
+                    return self.rank_points(request, top_k, scope, work).await.map(Some);
+                }
                 let ranking = Narrowing { scope, ..options };
                 if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition, ranking, work).await? {
                     work.ranked = true;
@@ -227,6 +232,26 @@ impl SearchAccelerator {
         candidates.extend(self.live_candidates(request, column, &query)?);
         if candidates.len() > self.max_candidates { work.plain_decline = Some("candidate-budget"); return Ok(None); }
         Ok(Some(candidates))
+    }
+
+    async fn rank_points(&self, request: &ScanRequest<'_>, top: &rtdb_plan::ScanTopK,
+        scope: &BTreeSet<Iid>, work: &mut NarrowingWork) -> Result<BTreeSet<Iid>> {
+        let result = async {
+            let Some(Value::Utf8(text)) = request.constants.constant(&top.query).await? else { return Ok(None); };
+            let Some(rows) = rtdb_query::table_point_rows(request, scope).await? else { return Ok(None); };
+            let scoring = rtdb_text::Scorer::new(Query::parse(&text), None);
+            request.verifier.score_resolved(rows, top.column, None, &scoring).await
+        }.await;
+        match result {
+            Ok(Some(scores)) => {
+                work.ranked = true;
+                let iids = scores.iter().map(|(iid, _)| iid).collect();
+                if top.score.is_some() { work.scores = Some(scores); }
+                Ok(iids)
+            }
+            Err(error) if error.category == AnomalyCategory::Interrupted => Err(error),
+            _ => Ok(scope.clone()),
+        }
     }
 }
 

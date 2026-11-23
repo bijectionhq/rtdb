@@ -33,6 +33,7 @@ use rtdb_format::{
         TableBlock,
         publication_digest,
     },
+    cow_tree::{self, PageDigest, PageStore},
     keys::{
         block_index_from_key,
         block_key,
@@ -40,6 +41,7 @@ use rtdb_format::{
         TrieKey,
         CURRENT_STORAGE_VERSION,
     },
+    term_directory,
 };
 use rtdb_storage::{
     object_store::StoredObject,
@@ -1343,8 +1345,42 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
                     .bind_extent(extent)?;
             }
         }
+        if contents == CheckpointContents::Replay {
+            retain_term_directory_pages(plaintext, &metadata, &table.slug, &mut closure).await?;
+        }
     }
     Ok(closure)
+}
+
+struct ArchiveTermPages<'a> {
+    store: &'a dyn ObjectStore,
+    prefix: String,
+}
+
+#[async_trait::async_trait]
+impl PageStore for ArchiveTermPages<'_> {
+    async fn get(&self, digest: PageDigest, length: u64) -> Result<Bytes> {
+        let object = key(&cow_tree::page_key(&self.prefix, digest))?;
+        let length = usize::try_from(length).map_err(|_| inconsistent("Term directory page exceeds addressable memory"))?;
+        Ok(self.store.get_fresh_exact(&object, length).await?)
+    }
+
+    async fn put(&self, _digest: PageDigest, _bytes: Bytes) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.multi/archive-page-write", "Archive dependency discovery reads existing pages"))
+    }
+}
+
+async fn retain_term_directory_pages(store: &dyn ObjectStore, block: &TableBlock, slug: &rtdb_format::keys::TableSlug,
+    closure: &mut CheckpointObjects) -> Result<()> {
+    let pages = ArchiveTermPages { store, prefix: term_directory::page_prefix(slug) };
+    for directory in &block.as_proto().term_directories {
+        let Some(root) = directory.page_root()? else { continue; };
+        for digest in cow_tree::reachable(&pages, &root).await? {
+            let object = key(&cow_tree::page_key(&pages.prefix, digest))?;
+            closure.insert(object, Some(digest.0));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn recovery_manifest_sha256(
@@ -2890,6 +2926,43 @@ mod tests {
     use crate::cipher::Cipher;
     use super::*;
     use rtdb_directory::{DisposalReceipt, MemoryDirectory};
+
+    #[tokio::test]
+    async fn replay_dependencies_include_the_term_directory_root_and_its_children() -> Result<()> {
+        use rtdb_format::cow_tree::{Edit, MAX_LEAF_ROWS, Row, Summary};
+        use rtdb_format::{keys::TableSlug, log::proto::TermDirectoryRoot};
+        use rtdb_storage::cache::BufferPool;
+        use rtdb_types::{MemoryBudget, TableRef};
+
+        struct UnitBound;
+        impl Summary for UnitBound {
+            fn leaf(&self, _rows: &[Row]) -> Vec<u8> { 1.0f64.to_be_bytes().to_vec() }
+            fn branch(&self, _children: &[&[u8]]) -> Vec<u8> { 1.0f64.to_be_bytes().to_vec() }
+        }
+
+        let store: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
+        let slug = TableSlug::for_unrecorded_table(&TableRef::new("public", "docs"))?;
+        let prefix = term_directory::page_prefix(&slug);
+        let pages = rtdb_query::ObjectPageStore {
+            store: Arc::clone(&store), storage: Arc::new(BufferPool::new(Arc::clone(&store), 16 << 20)),
+            prefix: prefix.clone(),
+        };
+        let edits = (0..=MAX_LEAF_ROWS).map(|index| {
+            Edit::Put(Row { key: index.to_be_bytes().to_vec(), value: vec![1] })
+        }).collect();
+        let (root, written) = cow_tree::apply(&pages, None, edits, &UnitBound, &MemoryBudget::new(16 << 20)).await?;
+        let root = root.unwrap();
+        assert!(written.len() > 1);
+        let table = TableBlock::decode(&[])?.with_term_directories(vec![TermDirectoryRoot {
+            definition_id: Some("body".into()), definition_version: Some(1), root: Some(root.encode()), runs: Some(1),
+        }]);
+        let mut closure = BTreeMap::new();
+        retain_term_directory_pages(store.as_ref(), &table, &slug, &mut closure).await?;
+        let expected = written.into_iter().map(|digest| Ok((key(&cow_tree::page_key(&prefix, digest))?, Some(digest.0))))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        assert_eq!(closure, expected);
+        Ok(())
+    }
 
     struct ReplayFixture {
         point: CapturePoint,

@@ -516,6 +516,9 @@ variant ArtefactsRemovedMessage : SourceMessage {
 }
 
 value ArtefactEntry {
+    -- A logical-search entry can atomically adopt a posting run and its generation's term directory under the expected catalog basis.
+    -- The table block checkpoints active runs and term-directory roots at the same cut.
+    -- An L0 notification carrying a directory update also persists that update's original compare-and-set inputs in the staged table block.
     trie_key: trie_cat/TrieKey
     record: trie_cat/ArtefactRecord
 }

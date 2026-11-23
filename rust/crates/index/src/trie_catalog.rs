@@ -306,6 +306,19 @@ impl TrieCatalog {
         })
     }
 
+    pub fn term_directory(&self, table: &TableRef, id: &str, version: i64) -> Option<&log_pb::TermDirectoryRoot> {
+        self.tables.get(table)?.search.term_directory(id, version)
+    }
+
+    pub fn with_term_directories(&self, table: &TableRef, block: TableBlock) -> TableBlock {
+        block.with_term_directories(self.tables.get(table).into_iter()
+            .flat_map(|state| state.search.term_directories()).cloned().collect())
+    }
+
+    fn load_term_directories(state: &mut TableTries, block: &TableBlock) {
+        std::sync::Arc::make_mut(&mut state.search).load_term_directories(&block.as_proto().term_directories);
+    }
+
     pub fn accepts_search_run(&self, table: &TableRef, record: &log_pb::ArtefactRecord) -> bool {
         let Ok(change) = log_pb::SearchRunChange::from_artefact(record) else { return false; };
         let Some(run) = &change.run else { return false; };
@@ -496,11 +509,13 @@ impl TrieCatalog {
                 wire.entity_directory.clone(), wire.retired_entity_directories.clone())?);
             state.search = std::sync::Arc::new(crate::search_manifest::SearchManifest::load(&wire.search_runs, &wire.retired_search_runs)?);
             state.retired = wire.retired_as_of_micros.map(Timestamp);
+            Self::load_term_directories(&mut state, &blocks[&table]);
             for partition in partitions {
                 let shard = decode_shard(&partition)?;
                 let mut value = ShardValue::default();
                 for wire in partition.tries {
-                    let trie = CatalogTrie::from_proto(&wire)?;
+                    let mut trie = CatalogTrie::from_proto(&wire)?;
+                    trie.artefacts.retain(|record| rtdb_format::term_directory::sealed_change(record).is_none());
                     if Shard::of(&trie.key) != shard { return Err(invalid("Recorded trie differs from its partition")); }
                     value.insert(trie);
                 }

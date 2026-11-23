@@ -191,6 +191,12 @@ rule SearchJobRuns {
     -- A resolved event must identify itself before a forward witness can certify its score.
     -- A posting run records durable custody before uploading its immutable body.
     -- A captured catalog routes each required term using the authenticated locator of each eligible run.
+    -- A captured catalog can hold one complete term directory for each format 16 definition and analyzer generation.
+    -- Each row binds a field, analyzed term and run digest to its document frequency, maximum term frequency, minimum stored length, maximum unit term score and window range.
+    -- Its immutable pages authenticate rows and carry the maximum unit term score of each subtree.
+    -- A run addition or replacement can publish updated rows in the same ordered change as its run receipt, under a compare-and-set on the expected directory root and active run identities.
+    -- The accepted term directory and its active run set are checkpointed together.
+    -- The lane can rebuild a directory from the authenticated term summaries of the active runs.
     -- A run nominates an entity and text revision for a field, with terms and positions established by that definition's analyzer.
     -- A primary rewrite replaces the corresponding history locations while preserving the text revision's posting coverage.
     -- Replacement posting runs cover the exact union of the active receipts they supersede.
@@ -282,6 +288,12 @@ rule RepairUnreadableSearchFile {
 --
 -- When optional search construction cannot fit the query budget or the source page order is unsupported by the search format, the scan evaluates those rows from their data files.
 -- The two-argument score uses the same term contributions and binary64 addition order in each partition and in SQL evaluation.
+--
+-- A ranked point scan with an explicit IID scope of at most 128 resolves that scope through table history and scores the resolved rows directly.
+-- Other logical scans intersect the authenticated routes of every required term, starting with the term with the smallest recorded document frequency.
+-- A sparse logical conjunction expands the rarest required term's posting directory first and intersects occurrences before reading phrase positions.
+-- Dense posting runs expand score-bounded windows in priority order.
+-- A missing or unreadable term directory schedules repair and uses each run's authenticated locator for term membership.
 --
 -- A scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, is ranked before it opens, in each partition it reads:
 --
@@ -404,6 +416,13 @@ contract SearchFileLayout {
         -- Documents fall in windows of 128 consecutive ids.
         -- For each term of a column and each window holding it, the file records the term's highest frequency there and the shortest stored length among the documents holding it, stored for a term in at least 1024 documents and read from its postings otherwise.
         -- A term's part of BM25 rises with its frequency and, its inverse document frequency being positive, falls with the length, so no document in the window scores above the sum of the parts at those, whatever the corpus.
+
+    @invariant TermDirectoryBoundsCoverActiveRuns
+        -- A usable term directory covers exactly the active runs in its generation at the held cut, including runs with no searchable terms.
+        -- An unopened run's bound adds its term bounds in the scoring query's order, with zero for each scoring term absent from the run.
+        -- An unopened run starts with an unknown tie position.
+        -- A scan may omit a run only when authenticated required-term evidence excludes it or its bound is below the verified cutoff.
+        -- A run change without a directory update invalidates the previous directory for that generation.
 
     @invariant RowsAndNullsAreRecorded
         -- The file records the first page and document of each member and the first row of each data page.

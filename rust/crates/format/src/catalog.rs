@@ -210,7 +210,7 @@ impl TrieDetails {
 pub fn replay_artefact_file(
     slug: &TableSlug, trie: &TrieKey, record: &crate::log::proto::ArtefactRecord,
 ) -> Result<Option<String>> {
-    if record.kind() == crate::entity_directory::RECORD_KIND { return Ok(None); }
+    if record.kind() == crate::entity_directory::RECORD_KIND || crate::term_directory::sealed_change(record).is_some() { return Ok(None); }
     if record.kind() == crate::search_manifest::RECORD_KIND {
         let change = crate::log::proto::SearchRunChange::from_artefact(record)?;
         if change.retire_only() { return Ok(None); }
@@ -333,6 +333,11 @@ impl TableBlock {
         Ok(files)
     }
 
+    pub fn with_term_directories(mut self, roots: Vec<crate::log::proto::TermDirectoryRoot>) -> Self {
+        Arc::make_mut(&mut self.wire).term_directories = roots;
+        self
+    }
+
     pub fn trie_details(&self) -> impl Iterator<Item = &TrieDetails> {
         self.wire.partitions.iter().flat_map(|partition| &partition.tries)
             .chain(self.wire.tries.iter().filter(|_| self.wire.partitions.is_empty()))
@@ -351,6 +356,7 @@ impl TableBlock {
         wire.retired_search_runs.clear();
         wire.entity_directory = None;
         wire.retired_entity_directories.clear();
+        wire.term_directories.clear();
         Self { wire: Arc::new(wire), charge: self.charge.clone() }
     }
 

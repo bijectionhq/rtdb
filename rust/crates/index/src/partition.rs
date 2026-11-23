@@ -99,10 +99,25 @@ impl BlockPreparation {
         for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
         let catalog = self.table_catalog()?;
         catalog.tables().iter().map(|(table, meta)| {
-            let block = meta.to_block(trie_catalog.partitions(table)?)?;
+            let mut partitions = trie_catalog.partitions(table)?;
+            preserve_sealed_term_directories(tries.get(table).into_iter().flatten(), &mut partitions);
+            let block = meta.to_block(partitions)?;
             let block = trie_catalog.with_entity_directory(table, block);
-            Ok((table.clone(), trie_catalog.with_retirement(table, trie_catalog.with_search_manifest(table, block))))
+            let block = trie_catalog.with_search_manifest(table, block);
+            Ok((table.clone(), trie_catalog.with_retirement(table, trie_catalog.with_term_directories(table, block))))
         }).collect()
+    }
+}
+
+fn preserve_sealed_term_directories<'a>(tries: impl Iterator<Item = &'a CatalogTrie>,
+    partitions: &mut [rtdb_format::block::proto::Partition]) {
+    for trie in tries {
+        let key = trie.key.to_string();
+        let Some(detail) = partitions.iter_mut().flat_map(|partition| &mut partition.tries)
+            .find(|detail| detail.trie_key() == key) else { continue; };
+        // A retry needs the original CAS, which the checkpoint's resulting root cannot reconstruct.
+        detail.artefacts.extend(trie.artefacts.iter()
+            .filter(|record| rtdb_format::term_directory::sealed_change(record).is_some()).cloned());
     }
 }
 

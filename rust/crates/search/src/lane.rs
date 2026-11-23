@@ -375,7 +375,7 @@ impl ArtefactBuilder for SearchBuilder {
                 rows
             });
             let sections = if history {
-                crate::file::write_group_as(&columns, members, &identity, Some(version), ceiling, file, Some(indexing), format, crate::file::BuildMode::History)?
+                crate::file::write_group_as(&columns, members, &identity, Some(version), ceiling, file, Some(indexing), format, crate::file::BuildMode::History)?.0
             } else {
                 write_versioned_group(&columns, members, &identity, version, ceiling, file, Some(indexing), format)?
             };

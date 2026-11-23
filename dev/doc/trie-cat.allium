@@ -507,6 +507,9 @@ rule FollowerRefreshes {
 ------------------------------------------------------------
 
 rule AddArtefact {
+    -- A logical-search publication can install term-directory evidence together with its change to a definition generation's active runs.
+    -- The directory update compares the held root and the identities of the active runs before changing either.
+    -- A legacy change to the active runs invalidates the directory for that generation.
     -- A recorded entity history authenticates event headers and their Arrow locations within its primary trie.
     -- The history and its optional field witnesses are released with that trie's derived files.
     -- Records an artefact on its trie's entry, on applying an artefacts-added record (db.allium: LeaderAppliesOwnArtefactsAdded, HandleReplicaMessage).

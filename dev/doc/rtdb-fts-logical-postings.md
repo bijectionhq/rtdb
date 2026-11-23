@@ -16,6 +16,9 @@ The same pinned catalog determines which version is visible and where its payloa
 | `PageDigest`, `RootRef`, directory pages, and `DirectoryManifest` | Passive values | Authenticated routing data and the active and retired roots of one table's catalog. |
 | `EntityDirectoryBuilder` and the copy-on-write writer | Passive builders | One sealed source prefix and the pages changed by its edits. |
 | `ObjectPageStore`, `FreshPages`, and `DirectoryRead` | Passive adapters | Immutable page I/O and the catalog and memory scope of one read. |
+| `TermDirectoryRoot`, `TermStats`, and `TermRoutes` | Passive values | The pinned directory receipt, a term's statistics for one run, and the matching run bounds for one query. |
+| `TermSummaries`, `PreparedLogicalRun`, `DirectoryUpdate`, `TermEdits`, and `MaxUnitBound` | Passive objects | Writer-owned Arrow summaries and staged run receipts, a directory build request, sorted tree edits, and the bound fold for immutable pages. |
+| `ObjectPageStore` and `ArchiveTermPages` | Passive storage adapters | The term directory's table prefix and access to authenticated pages. |
 | `RetainedArtefactJournal` and `PrepareSearch` | Passive adapters | Access to verified retained replay and to the file builders invoked by sealing. |
 | `ReplicationDriver` and the artefact driver | Active objects | Ordered adoption and replay, and selection and scheduling of independent build work. |
 | `TrieCollector` | Passive cycle worker | The eligibility observations and receipts used by a collection cycle. |
@@ -75,6 +78,19 @@ Each receipt binds that extent, the definition and generation, the file length, 
 The checkpoint stores active and retired receipts with the table.
 A replacement can adopt the exact union of its still-active inputs in one ordered update.
 
+Each table and format 16 definition generation can hold a term directory over its active runs.
+The analyzer version is part of the definition ID.
+Directory rows are ordered by field, exact analyzed term, and run digest.
+Each row records document frequency, maximum term frequency, minimum stored length, a unit score bound, and the first and last posting window.
+The search writer takes these statistics from the run's Arrow term table and rank roots.
+Each directory branch carries the largest unit score bound of its descendants.
+
+An update writes immutable pages for the affected paths and publishes the root together with the run addition or replacement.
+Adoption compares the expected root and active run identities.
+A change from an older writer invalidates routing for its generation until the lane rebuilds it from the active runs.
+The checkpoint stores the active roots.
+Replay archives include the pages reachable from those roots.
+
 The writer stores a bounded intent before it uploads the immutable run.
 Collection observes the intent and the completed object, obtains provider version evidence where required, and submits abandonment through the ordered catalog.
 Adoption and abandonment are mutually exclusive at that allocation.
@@ -117,8 +133,12 @@ flowchart TD
 Candidate selectors combine covered runs, uncovered history, and the live suffix.
 A failed run contributes a gap while healthy runs remain usable.
 If a bounded gap scan cannot account for all uncovered data, the query uses the authoritative scan.
-The synopsis can exclude a run for a required term at the captured manifest without opening the run.
+A ranked point scan with at most 128 explicitly selected IIDs can score resolved entities directly through table history.
+Other scans intersect directory routes for the required terms, starting with the rarest, and exclude runs that lack any required term without opening them.
+The query adds each run's term bounds in the scoring query's order and uses the result to prioritize unopened runs.
+Sparse conjunctions expand the rarest term and batch posting intersections, while dense searches expand score-bounded windows.
 A phrase additionally checks positions in the candidate posting sequence.
+If the directory is missing or unreadable, the lane receives a repair request and the query uses the run synopses.
 A ranked query prioritizes ready work across compatible partitions and shares a score cutoff derived from verified rows.
 Unknown and exact-gap work keeps an unbounded score until it can nominate candidates.
 SQL tie order remains authoritative at equal scores.

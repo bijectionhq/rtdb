@@ -1752,7 +1752,10 @@ async fn logical_postings_survive_compaction_while_pinned_history_keeps_its_payl
             database.flush().await.unwrap();
             node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
         }
-        assert_eq!(database.trie_catalog().search_runs(&table).count(), 1);
+        let catalog = database.trie_catalog();
+        assert_eq!(catalog.search_runs(&table).count(), 1);
+        let merged = catalog.search_runs(&table).next().unwrap();
+        assert_eq!(catalog.term_directory(&table, merged.definition_id(), merged.definition_version()).unwrap().runs(), 1);
         let expected = rows(session.query_sql(oracle, vec![]).await.unwrap()).await;
         assert_eq!(expected[0][0], Value::I64(2));
         let reads = runtime.logical_run_reads();
@@ -1863,11 +1866,25 @@ async fn a_same_commit_reinsert_keeps_only_the_post_erase_search_revision() {
     let run = catalog.search_runs(&table).next().unwrap();
     assert!(run.has_erases());
     assert_eq!(run.source_rows(), 3);
+    let root = catalog.term_directory(&table, run.definition_id(), run.definition_version()).unwrap()
+        .page_root().unwrap().unwrap();
     let reads = runtime.logical_run_reads();
     assert!(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'oldrevision')", vec![]).await.unwrap()).await.is_empty());
     assert_eq!(runtime.logical_run_reads(), reads);
     assert_eq!(ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'newrevision')", vec![]).await.unwrap()).await), [1]);
     assert!(runtime.logical_run_reads() > reads);
+    let reads = runtime.logical_run_reads();
+    let point = "SELECT _id FROM docs WHERE _id = 1 AND MATCH(body, 'newrevision') ORDER BY SEARCH_SCORE(body, 'newrevision') DESC LIMIT 1";
+    assert_eq!(ids(rows(session.query_sql(point, vec![]).await.unwrap()).await), [1]);
+    assert_eq!(runtime.logical_run_reads(), reads);
+    let slug = database.snapshot().table_entry(&table).unwrap().slug.clone();
+    let page = rtdb_storage::ObjectKey::new(rtdb_format::cow_tree::page_key(
+        &rtdb_format::term_directory::page_prefix(&slug), root.digest)).unwrap();
+    database.storage().invalidate(&page).await.unwrap();
+    database.object_store().put(&page, bytes::Bytes::from_static(b"corrupt")).await.unwrap();
+    let gaps = runtime.serving_gaps();
+    assert_eq!(ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'newrevision')", vec![]).await.unwrap()).await), [1]);
+    assert!(runtime.serving_gaps() > gaps);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
@@ -1942,6 +1959,8 @@ async fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking(
     let replacement = repaired.search_runs(&table).find(|run| runs[0].blocks.iter().all(|block| run.blocks.contains(block)))
         .unwrap_or_else(|| panic!("the damaged extent is covered again: {active:?}"));
     assert_ne!(replacement.object_key(&slug).unwrap(), runs[0].object_key(&slug).unwrap());
+    let directory = repaired.term_directory(&table, replacement.definition_id(), replacement.definition_version()).unwrap();
+    assert_eq!(directory.runs(), active.len() as i64);
     assert!(database.object_store().head(&rtdb_storage::ObjectKey::new(replacement.object_key(&slug).unwrap()).unwrap()).await.is_ok());
     for (accelerated, oracle) in queries {
         assert_eq!(rows(session.query_sql(accelerated, vec![]).await.unwrap()).await, rows(session.query_sql(oracle, vec![]).await.unwrap()).await);

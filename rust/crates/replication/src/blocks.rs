@@ -755,6 +755,8 @@ pub(crate) fn l0_tries(index: BlockIndex, tables: &BTreeMap<rtdb_types::TableRef
                     replaces_root: previous.and_then(|root| root.root.clone()) }.to_artefact()?);
             }
             for run in block.as_proto().search_runs.iter().filter(|run| run.blocks == [index.0]) {
+                if trie.artefacts.iter().any(|record| rtdb_format::term_directory::sealed_change(record)
+                    .is_some_and(|change| change.run.as_ref() == Some(run))) { continue; }
                 trie.artefacts.push(proto::SearchRunChange { run: Some(run.clone()), ..Default::default() }.to_artefact()?);
             }
             if notification.as_ref().is_some_and(|existing| existing != &trie) {

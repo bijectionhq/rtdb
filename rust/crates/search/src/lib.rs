@@ -10,6 +10,7 @@ mod member_bounds;
 mod rank_cutoff;
 mod rank_windows;
 mod rectangle;
+mod term_directory;
 pub mod runtime;
 mod delta;
 

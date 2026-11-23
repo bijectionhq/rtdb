@@ -41,6 +41,12 @@ pub(crate) const TREE_FORMAT_VERSION: i32 = 14;
 pub(crate) const PACKED_FORMAT_VERSION: i32 = 15;
 pub(crate) const LOGICAL_FORMAT_VERSION: i32 = 16;
 pub(crate) type TextRevision = [u8; 32];
+
+pub(crate) fn term_stats(nodes: &StructArray, row: usize, doc_freq: u32) -> Result<crate::term_directory::TermStats> {
+    let node = rank_tree::node_at(nodes, row)?;
+    Ok(crate::term_directory::TermStats { doc_freq, max_tf: node.frequency, min_len: node.length,
+        unit_bound: node.unit_score, first_window: node.first, last_window: node.last })
+}
 pub(crate) use page_tree::PageCache;
 pub(crate) use tree_file::{MAX_ROOT_BYTES, TreeFile, TreeLocator};
 pub(crate) use tree_file::LogicalDocument;

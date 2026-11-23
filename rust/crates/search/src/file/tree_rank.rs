@@ -95,7 +95,7 @@ pub(crate) struct TreeRanked {
     order: TreeRankOrder,
     checked_frequencies: BTreeSet<(usize, usize)>,
     checked_positions: BTreeSet<(usize, usize)>,
-    sparse_phrase: bool,
+    sparse: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,11 +136,11 @@ impl TreeRanked {
         let leading = if matching.iter().all(|&index| terms[index].is_some()) {
             matching.iter().copied().min_by_key(|&index| terms[index].as_ref().expect("matching term is present").frequency)
         } else { None };
-        let sparse_phrase = file.format() == super::LOGICAL_FORMAT_VERSION && !phrases.is_empty()
+        let sparse = file.format() == super::LOGICAL_FORMAT_VERSION && (matching.len() > 1 || !phrases.is_empty())
             && leading.is_some_and(|index| terms[index].as_ref().is_some_and(|term| term.frequency <= 1024));
         let mut rank = Self { file, terms, leading, matching, scoring: score_terms, phrases, scorer: scoring.clone(),
             ready: BinaryHeap::new(), members, documents, bounds, order,
-            checked_frequencies: BTreeSet::new(), checked_positions: BTreeSet::new(), sparse_phrase };
+            checked_frequencies: BTreeSet::new(), checked_positions: BTreeSet::new(), sparse };
         if let Some(leading) = leading {
             let node = rank.terms[leading].as_ref().expect("leading term is present").node;
             let floors = rank.uuid_floors(std::iter::once(node.first)).await?;
@@ -250,7 +250,7 @@ impl TreeRanked {
         if let Some(Work { job: Job::Node(node), .. }) = self.ready.peek() {
             let node = *node;
             self.ready.pop();
-            if self.sparse_phrase {
+            if self.sparse {
                 for leaf in rank_tree::leaves(self.file.reader(), node, node.first, node.last).await? {
                     self.open_node(leaf).await?;
                 }
@@ -260,7 +260,7 @@ impl TreeRanked {
             return Ok(Vec::new());
         }
         let mut windows = BTreeMap::new();
-        let batch = if self.order == TreeRankOrder::Uuid { 1 } else if self.sparse_phrase { 16 } else { 4 };
+        let batch = if self.order == TreeRankOrder::Uuid { 1 } else if self.sparse { 16 } else { 4 };
         while windows.len() < batch && self.ready.peek().is_some_and(|work| matches!(work.job, Job::Windows(_))) {
             let Some(Work { first, job: Job::Windows(blocks), .. }) = self.ready.pop() else { unreachable!() };
             windows.insert(first, blocks);

@@ -9,6 +9,7 @@ use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
 use sha2::{Digest, Sha256};
 use crate::rank_windows::window_of;
+use crate::term_directory::TermSummaries;
 
 use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
     page_tree::{Child, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
@@ -74,7 +75,7 @@ fn start_rows(table: Table, array: &StructArray, start: usize, len: usize) -> Re
 pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, StructArray)>,
     [(_, events), (_, runs), (_, row_runs)]: [(Table, StructArray); 3], plan: PostingPlan,
     positions: Option<Vec<u32>>, revisions: Option<StructArray>, token_sequences: Option<StructArray>,
-    erases: Option<StructArray>) -> Result<()> {
+    erases: Option<StructArray>) -> Result<TermSummaries> {
     let take = |fields: &mut Vec<(Table, StructArray)>, field: Table| -> StructArray {
         let at = fields.iter().position(|(table, _)| *table as usize == field as usize).expect("writer populated this table");
         fields.remove(at).1
@@ -111,6 +112,7 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
         }
     }
     let mut term_pages = Vec::new();
+    let mut summaries = TermSummaries::default();
     let blocks = blocks.column(0).as_list::<i64>();
     let impact_ids = impact_ids.column(0).as_list::<i64>();
     for start in (0..terms.len()).step_by(TERM_ROWS) {
@@ -123,6 +125,9 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
             (Table::Blocks, rank_tree::inline_rows(blocks, &nodes, start, Table::Blocks)?),
             (Table::ImpactIds, rank_tree::inline_rows(impact_ids, &nodes, start, Table::ImpactIds)?),
         ];
+        if token_sequences.is_some() {
+            summaries.push(entry[0].1.clone(), entry[1].1.clone());
+        }
         if packed && start == 0 && end == terms.len() && entry.iter().map(|(_, array)| array.get_array_memory_size()).sum::<usize>() <= 8192 {
             fields.extend(entry.iter().cloned());
         }
@@ -235,7 +240,7 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
     let root = writer.page(fields)?;
     let range = root.range()?;
     if range.end - range.start > MAX_ROOT_BYTES { return Err(fault("Search root exceeds its read budget")); }
-    Ok(())
+    Ok(summaries)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -553,6 +558,16 @@ impl TreeFile {
         let references = self.reader.leaves(self.directories[&kind]).await?;
         let mut pages = self.reader.pages(references.clone(), page_kind(kind)).await?;
         references.into_iter().map(|reference| pages.remove(&reference).ok_or_else(|| corrupt("Search page was omitted"))).collect()
+    }
+
+    pub(crate) async fn visit_term_summaries(&self, mut visit: impl FnMut(u32, &str, crate::term_directory::TermStats) -> Result<()> + Send) -> Result<()> {
+        for reference in self.reader.leaves(self.directories[&TERM]).await? {
+            let page = self.reader.page(reference, PageKind::Terms).await?;
+            let terms = table(&page, Table::Terms);
+            let nodes = table(&page, Table::RankNodes);
+            TermSummaries::visit_page(&terms, &nodes, &mut visit)?;
+        }
+        Ok(())
     }
 
     pub(super) async fn find_ordinals(&self, kind: u8, ordinals: std::collections::BTreeSet<usize>) -> Result<BTreeMap<usize, RecordBatch>> {

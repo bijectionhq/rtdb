@@ -3,13 +3,16 @@ use std::collections::BinaryHeap;
 use std::sync::OnceLock;
 
 use rtdb_format::keys::TrieKey;
+use rtdb_format::{log::proto::{SearchRun, TermDirectoryRoot}, term_directory};
 use rtdb_plan::ColumnId;
-use rtdb_text::Scorer;
+use rtdb_query::ObjectPageStore;
+use rtdb_text::{RankScorer, Scorer};
 use tokio::sync::OnceCell;
 
 use super::*;
 use super::point::SearchWitness;
 use crate::{SearchRuntime, file::{TREE_FORMAT_VERSION, TreeFile, TreeRankOrder, TreeRanked}};
+use crate::term_directory::{TermRoutes, read_routes};
 
 pub(super) struct RecordedTree {
     pub(super) pack: Arc<super::routing::Pack>,
@@ -64,7 +67,8 @@ enum Task {
 }
 
 pub(super) struct LogicalCoverage<'a> {
-    runs: Vec<&'a rtdb_format::log::proto::SearchRun>,
+    runs: Vec<&'a SearchRun>,
+    directory: Option<&'a TermDirectoryRoot>,
     covered: BTreeSet<rtdb_types::BlockIndex>,
     complete: bool,
 }
@@ -91,7 +95,44 @@ pub(super) fn logical_runs<'a>(runtime: &SearchRuntime, request: &ScanRequest<'a
     }) {
         covered.clear();
     }
-    Some(LogicalCoverage { runs, covered, complete })
+    let directory = request.snapshot.trie_catalog().term_directory(&definition.table, &id, definition.version);
+    Some(LogicalCoverage { runs, directory, covered, complete })
+}
+
+impl LogicalCoverage<'_> {
+    async fn routes(&self, runtime: &SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition,
+        field: usize, matching: &Query, scoring: &RankScorer) -> Result<Option<TermRoutes>> {
+        if self.runs.is_empty() { return Ok(None); }
+        let id = definition.artefact_id_for(crate::file::LOGICAL_FORMAT_VERSION);
+        let Some(directory) = self.directory else {
+            runtime.report_term_directory(request.database, &definition.table, &id, definition.version);
+            return Ok(None);
+        };
+        let read = async {
+            if directory.runs() != self.runs.len() as i64 {
+                return Err(Anomaly::fault("rtdb.search/term-directory", "Directory run count differs from its snapshot"));
+            }
+            let table = request.snapshot.table_entry(&definition.table)
+                .ok_or_else(|| Anomaly::fault("rtdb.search/term-directory", "Directory table has no storage slug"))?;
+            let _charge = request.memory.reserve(4096usize.saturating_add(self.runs.len().saturating_mul(80)))?;
+            let runs = self.runs.iter().enumerate().map(|(index, run)| Ok((run.identity()?, index))).collect::<Result<BTreeMap<_, _>>>()?;
+            let store = ObjectPageStore { store: Arc::clone(request.storage.object_store()), storage: Arc::clone(request.storage),
+                prefix: term_directory::page_prefix(&table.slug) };
+            let root = directory.page_root()?;
+            read_routes(&store, root.as_ref(), field as u32, matching, scoring, &runs, request.memory).await
+        };
+        match request.cancellation.run_until_cancelled(read).await {
+            Some(Ok(routes)) => Ok(Some(routes)),
+            Some(Err(error)) if error.category == AnomalyCategory::Interrupted => Err(error),
+            Some(Err(error)) => {
+                if error.code != "rtdb/memory-budget-exceeded" {
+                    runtime.report_term_directory(request.database, &definition.table, &id, definition.version);
+                }
+                Ok(None)
+            }
+            None => Err(search_cancelled()),
+        }
+    }
 }
 
 fn gap_task(frontier: &mut Frontier) {
@@ -100,10 +141,17 @@ fn gap_task(frontier: &mut Frontier) {
     }
 }
 
-fn run_can_match(run: &rtdb_format::log::proto::SearchRun, field: usize, query: &Query) -> bool {
+fn run_can_match(run: &SearchRun, field: usize, query: &Query) -> bool {
     let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode_route)
         .filter(|locator| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64);
     locator.is_none_or(|locator| query.terms().iter().all(|term| locator.might_contain(field as u32, term)))
+}
+
+fn seed_logical<'a>(runs: impl Iterator<Item = (usize, &'a SearchRun)>, directory: Option<&TermRoutes>) -> Vec<(RankKey, usize)> {
+    match directory {
+        Some(directory) => directory.iter().map(|(index, bound)| (RankKey::integer(bound, None), index)).collect(),
+        None => runs.map(|(index, _)| (RankKey::integer(f64::INFINITY, None), index)).collect(),
+    }
 }
 struct Entry { key: RankKey, sequence: u64, task: Task }
 
@@ -195,13 +243,16 @@ impl SearchAccelerator {
         let Some(mut coverage) = logical_runs(&self.runtime, request, definition) else { return Ok(None); };
         let Some(field) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
         let Some(scorer) = Arc::new(Scorer::new(query.clone(), None)).for_ranking() else { return Ok(None); };
+        let routes = coverage.routes(&self.runtime, request, definition, field, query, &scorer).await?;
         let mut results = BTreeSet::new();
         let mut charge = request.memory.reserve(4096)?;
         let mut examined = 0usize;
         if let Some(table) = request.snapshot.table_entry(&definition.table) {
-            for run in &coverage.runs {
+            let runs = coverage.runs.iter().copied().enumerate()
+                .filter(|(_, run)| run_can_match(run, field, query));
+            for (_, index) in seed_logical(runs, routes.as_ref()) {
+                let run = coverage.runs[index];
                 if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
-                if !run_can_match(run, field, query) { continue; }
                 work.logical_roots += 1;
                 let scanned = async {
                     let tree = self.runtime.logical_file(request.storage, &table.slug, run, &definition.columns).await?;
@@ -269,6 +320,10 @@ impl SearchAccelerator {
         }
         let scorer = Arc::new(Scorer::new(scoring_query, None));
         let Some(ranking) = scorer.for_ranking() else { return Ok(None); };
+        let routes = match &logical {
+            Some(coverage) => coverage.routes(&self.runtime, request, definition, column_index, matching, &ranking).await?,
+            None => None,
+        };
         let tree_tries = sources.iter().flat_map(|source| source.members.values().cloned()).collect();
         let visibility = super::point::PackedVisibility::new(request, &definition.table, &sources, column_index, logical.is_some());
         let files = if logical.is_some() { Vec::new() } else {
@@ -303,10 +358,10 @@ impl SearchAccelerator {
             None => (Vec::new(), BTreeSet::new(), false),
         };
         let mut logical_ranks = (0..logical.len()).map(|_| None).collect::<Vec<Option<TreeRanked>>>();
-        for (index, run) in logical.iter().enumerate() {
-            if run_can_match(run, column_index, matching) {
-                frontier.push(RankKey::integer(f64::INFINITY, None), Task::OpenLogical(index));
-            }
+        let runs = logical.iter().copied().enumerate()
+            .filter(|(_, run)| run_can_match(run, column_index, matching));
+        for (bound, index) in seed_logical(runs, routes.as_ref()) {
+            frontier.push(bound, Task::OpenLogical(index));
         }
         if gaps { gap_task(&mut frontier); }
         let mut reservation = request.memory.reserve(4096)?;

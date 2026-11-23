@@ -335,6 +335,7 @@ pub struct SearchRuntime {
     match_sets: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchSet>)>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
     suspect_runs: Mutex<BTreeSet<(String, rtdb_types::TableRef, [u8; 32])>>,
+    suspect_term_directories: Mutex<BTreeSet<(String, rtdb_types::TableRef, String, i64)>>,
     reported: Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>,
 }
 
@@ -375,6 +376,7 @@ impl SearchRuntime {
             files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)),
             mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(),
             match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), suspect_runs: Default::default(),
+            suspect_term_directories: Default::default(),
             reported: Default::default() })
     }
 
@@ -811,6 +813,22 @@ impl SearchRuntime {
 
     pub(crate) fn clear_run(&self, database: &str, table: &rtdb_types::TableRef, id: [u8; 32]) {
         self.suspect_runs.lock().remove(&(database.to_owned(), table.clone(), id));
+    }
+
+    pub(crate) fn report_term_directory(&self, database: &str, table: &rtdb_types::TableRef, id: &str, version: i64) {
+        self.record_serving_gap();
+        let mut suspects = self.suspect_term_directories.lock();
+        if suspects.len() < 1024 && suspects.insert((database.to_owned(), table.clone(), id.to_owned(), version)) {
+            self.notifier(database).notify_one();
+        }
+    }
+
+    pub(crate) fn term_directory_suspect(&self, database: &str, table: &rtdb_types::TableRef, id: &str, version: i64) -> bool {
+        self.suspect_term_directories.lock().contains(&(database.to_owned(), table.clone(), id.to_owned(), version))
+    }
+
+    pub(crate) fn clear_term_directory(&self, database: &str, table: &rtdb_types::TableRef, id: &str, version: i64) {
+        self.suspect_term_directories.lock().remove(&(database.to_owned(), table.clone(), id.to_owned(), version));
     }
     fn notifier(&self, database: &str) -> Arc<tokio::sync::Notify> { Arc::clone(self.reported.lock().entry(database.to_string()).or_default()) }
     pub fn suspects(&self, database: &str) -> Vec<Suspect> { self.suspects.lock().iter().filter(|suspect| suspect.database == database).cloned().collect() }

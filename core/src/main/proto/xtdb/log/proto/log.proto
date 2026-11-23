@@ -197,6 +197,16 @@ message SearchRunChange {
     repeated bytes replaces = 2;
     bool retire_only = 3;
   bool abandon = 4;
+    reserved 5 to 9;
+    TermDirectoryRoot term_directory = 10;
+    bytes replaces_directory = 11;
+}
+
+message TermDirectoryRoot {
+    string definition_id = 1;
+    int64 definition_version = 2;
+    bytes root = 3;
+    int64 runs = 4;
 }
 
 message RetiredSearchRun {

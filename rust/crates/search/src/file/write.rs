@@ -19,6 +19,7 @@ use super::{
     postings::{POSTING_TERMS, PostingBuilder, posting_table},
 };
 use crate::{member_bounds::MemberStart, rectangle::merge_adjacent_valid_time};
+use crate::term_directory::TermSummaries;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum BuildMode { Combined, Postings, History }
@@ -286,9 +287,10 @@ impl Builder {
         Ok(())
     }
 
-    fn finish(mut self, columns: &[String], version: Option<i64>, identity: &str, output: impl Write) -> Result<Vec<Section>> {
+    fn finish(mut self, columns: &[String], version: Option<i64>, identity: &str, output: impl Write) -> Result<(Vec<Section>, TermSummaries)> {
         if self.members.is_empty() { return Err(fault("A search file holds at least one member")); }
         let sections: Vec<_> = self.sections.into_values().collect();
+        let mut summaries = TermSummaries::default();
         let mut writer = Writer::new(output, self.format)?;
         let header = Table::Header.array(vec![
             Arc::new(Int32Array::from(vec![self.format])),
@@ -363,7 +365,7 @@ impl Builder {
                         Arc::new(event_positions(self.erases.values().map(|(_, position, _)| *position))?),
                     ])?)
                 } else { None };
-                super::tree_file::write(&mut writer, directory, visibility, plan,
+                summaries = super::tree_file::write(&mut writer, directory, visibility, plan,
                     (self.format >= PACKED_FORMAT_VERSION).then_some(positions), revisions, documents, erases)?;
             } else {
                 writer.page(directory)?;
@@ -380,7 +382,8 @@ impl Builder {
             }
         }
         writer.finish()?;
-        Ok(sections)
+        summaries.retain(self.reservation)?;
+        Ok((sections, summaries))
     }
 }
 
@@ -448,13 +451,13 @@ pub(super) fn write_group<P, I>(
 ) -> Result<Vec<Section>>
 where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 {
-    write_group_as(columns, members, identity, version, ceiling, output, reservation, format, BuildMode::Combined)
+    write_group_as(columns, members, identity, version, ceiling, output, reservation, format, BuildMode::Combined).map(|(sections, _)| sections)
 }
 
 pub(crate) fn write_group_as<P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: Option<i64>,
     ceiling: Option<i64>, output: impl Write, reservation: Option<Arc<MemoryReservation>>, format: i32, mode: BuildMode,
-) -> Result<Vec<Section>>
+) -> Result<(Vec<Section>, TermSummaries)>
 where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 {
     if format == super::TANTIVY_FORMAT_VERSION {
@@ -466,7 +469,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
         let directory = tempfile::tempdir().map_err(fault)?;
         let store = tantivy::directory::MmapDirectory::open(directory.path()).map_err(fault)?;
         let sections = super::legacy11::write_versioned_group(columns, members, identity, version, ceiling, store, output)?;
-        return Ok(sections.into_iter().map(super::legacy11::Section::into_arrow).collect());
+        return Ok((sections.into_iter().map(super::legacy11::Section::into_arrow).collect(), TermSummaries::default()));
     }
     let mut builder = Builder::new(columns.len(), ceiling, reservation, format, mode);
     let mut previous_member_iid = None;

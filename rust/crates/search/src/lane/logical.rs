@@ -1,6 +1,10 @@
 use std::{collections::BTreeMap, fs::File, io::{BufWriter, Read}, path::Path, sync::Arc};
 
 use arrow_array::Array;
+use rtdb_format::cow_tree::page_key;
+use rtdb_format::term_directory;
+use rtdb_format::log::proto::TermDirectoryRoot;
+use rtdb_query::ObjectPageStore;
 use rtdb_format::{keys::{TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactsAdded, SearchRun, SearchRunChange}};
 use rtdb_index::{PartitionValue, Snapshot};
 use rtdb_maintenance::{ArtefactDefinition, ArtefactPublisher, SnapshotSource, input::{download, open_input}};
@@ -11,8 +15,19 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{SearchDefinition, file::{BuildMode, IndexedRow, LOGICAL_FORMAT_VERSION, LogicalDocument, SearchPage, SearchPosition, search_position, TextRevision, TreeLocator, write_group_as}};
 use super::{PageRows, SearchBuilder, fault, indexing_allowance};
+use crate::term_directory::{TermEdits, TermSummaries};
 
 type Erases = BTreeMap<Iid, SearchPosition>;
+
+struct PreparedLogicalRun {
+    run: SearchRun,
+    summaries: TermSummaries,
+}
+
+enum DirectoryUpdate<'a> {
+    Adopt { run: &'a SearchRun, summaries: &'a TermSummaries, replaces: &'a [Vec<u8>] },
+    Rebuild,
+}
 
 #[derive(Default)]
 struct RunContents {
@@ -81,6 +96,10 @@ impl LogicalIndex {
         snapshot.trie_catalog().search_runs(&self.table)
             .filter(|run| run.definition_id() == self.id && run.definition_version() == self.version).collect()
     }
+
+    fn term_directory<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a TermDirectoryRoot> {
+        snapshot.trie_catalog().term_directory(&self.table, &self.id, self.version)
+    }
 }
 
 pub(super) fn posting_position(header: EventHeader, origin: Option<rtdb_types::EventOrigin>, page_row: usize) -> Result<u32> {
@@ -144,7 +163,7 @@ impl SearchBuilder {
             .ok_or_else(|| fault("Logical search definition has no fields"))?;
         let run = self.build_logical(index, &columns, &view, trie.block_index(), File::open(path).map_err(fault)?,
             size.min(i64::MAX as u64) as i64, seal, cancellation).await?;
-        SearchRunChange { run: Some(run), ..Default::default() }.to_artefact()
+        SearchRunChange { run: Some(run.run), ..Default::default() }.to_artefact()
     }
 
     async fn recover_from_journal(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot,
@@ -179,7 +198,7 @@ impl SearchBuilder {
     }
 
     async fn build_logical(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot, block: BlockIndex, input: File,
-        size: i64, seal: Option<(Snapshot, Arc<rtdb_index::LiveTable>)>, cancellation: &CancellationToken) -> Result<SearchRun> {
+        size: i64, seal: Option<(Snapshot, Arc<rtdb_index::LiveTable>)>, cancellation: &CancellationToken) -> Result<PreparedLogicalRun> {
         let entry = snapshot.table_entry(&index.table).ok_or_else(|| fault("Logical search table has no slug"))?;
         let directory = tempfile::tempdir().map_err(fault)?;
         let output = directory.path().join("postings.arrow");
@@ -189,7 +208,7 @@ impl SearchBuilder {
         let identity = run_identity(&entry.slug, &index.id, index.version, &blocks, 0, &allocation);
         let (budget, token, columns, version) = (Arc::clone(&self.memory), cancellation.clone(), columns.to_vec(), index.version);
         let indexing = self.memory.reserve(indexing_allowance(size))?;
-        let ((locator, digest), source_rows, has_erases) = tokio::task::spawn_blocking(move || {
+        let ((locator, digest), source_rows, has_erases, summaries) = tokio::task::spawn_blocking(move || {
             let (reader, opening) = open_input(input, &budget)?;
             let mut pages = PageRows::new(reader, opening, budget, token, false);
             pages.mode = BuildMode::Postings;
@@ -207,10 +226,11 @@ impl SearchBuilder {
                 }
                 Ok(page)
             });
-            write_group_as(&columns, [counted], &identity, Some(version), None, output, Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
-            Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, source_rows, has_erases))
+            let (_, summaries) = write_group_as(&columns, [counted], &identity, Some(version), None, output, Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
+            Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, source_rows, has_erases, summaries))
         }).await.map_err(fault)??;
-        self.publish_run(index, &entry.slug, &output, blocks, 0, source_rows, has_erases, locator, digest, allocation, cancellation).await
+        let run = self.publish_run(index, &entry.slug, &output, blocks, 0, source_rows, has_erases, locator, digest, allocation, cancellation).await?;
+        Ok(PreparedLogicalRun { run, summaries })
     }
 
     async fn publish_run(&self, index: &LogicalIndex, slug: &TableSlug, output: &Path, blocks: Vec<i64>, rebuild: i64, source_rows: i64,
@@ -228,6 +248,114 @@ impl SearchBuilder {
         let key = ObjectKey::new(run.object_key(slug)?)?;
         run.publication = self.store.put_file_with_publication(&key, output).await?.map(Into::into);
         Ok(run)
+    }
+
+    async fn directory_change(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot, prepared: PreparedLogicalRun,
+        replaces: Vec<Vec<u8>>, cancellation: &CancellationToken) -> Result<SearchRunChange> {
+        let PreparedLogicalRun { run, summaries } = prepared;
+        let update = self.prepare_term_directory(index, columns, snapshot,
+            DirectoryUpdate::Adopt { run: &run, summaries: &summaries, replaces: &replaces }, cancellation).await;
+        let mut change = SearchRunChange { run: Some(run), replaces, ..Default::default() };
+        match update {
+            Ok((root, basis)) => {
+                change.term_directory = Some(root);
+                change.replaces_directory = Some(basis.to_vec());
+            }
+            Err(error) if super::is_search_gap(&error, cancellation) => {
+                self.runtime.report_term_directory(&self.database, &index.table, &index.id, index.version);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(change)
+    }
+
+    async fn prepare_term_directory(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot,
+        update: DirectoryUpdate<'_>, cancellation: &CancellationToken)
+        -> Result<(TermDirectoryRoot, [u8; 32])> {
+        let entry = snapshot.table_entry(&index.table).ok_or_else(|| fault("Term directory has no table slug"))?;
+        let pages = ObjectPageStore { store: Arc::clone(&self.store), storage: Arc::clone(&self.storage), prefix: term_directory::page_prefix(&entry.slug) };
+        let before = index.records(snapshot);
+        let current = index.term_directory(snapshot);
+        let basis = term_directory::publication_basis(current, before.iter().map(|run| run.identity()).collect::<Result<Vec<_>>>()?);
+        let (added, replaces) = match update {
+            DirectoryUpdate::Adopt { run, summaries, replaces } => (Some((run, summaries)), replaces),
+            DirectoryUpdate::Rebuild => (None, &[][..]),
+        };
+        let is_replaced = |run: &SearchRun| replaces.iter().any(|id| id.as_slice() == run.digest());
+        let removed = before.iter().filter(|run| is_replaced(run)).count();
+        if removed != replaces.len() { return Err(fault("Term directory replacement inputs are no longer active")); }
+        let runs = before.len() - removed + usize::from(added.is_some());
+        let record_added = |edits: &mut TermEdits| -> Result<()> {
+            if let Some((run, summaries)) = added {
+                let id = run.identity()?;
+                summaries.visit(|field, term, stats| edits.record(field, term, id, Some(stats)))?;
+            }
+            Ok(())
+        };
+        let updated = if let Some(current) = current.filter(|_| added.is_some()) {
+            let incremental = async {
+                let base = current.page_root()?;
+                let mut edits = TermEdits::new(&self.memory)?;
+                record_added(&mut edits)?;
+                for run in before.iter().copied().filter(|run| is_replaced(run)) {
+                    self.collect_term_edits(&entry.slug, columns, run, &mut edits, true, cancellation).await?;
+                }
+                edits.apply(&pages, base.as_ref(), &self.memory).await
+            };
+            match incremental.await {
+                Ok((root, _)) => Some(root),
+                Err(error) if super::is_search_gap(&error, cancellation) => None,
+                Err(error) => return Err(error),
+            }
+        } else { None };
+        let root = match updated {
+            Some(root) => root,
+            None => {
+                let mut edits = TermEdits::new(&self.memory)?;
+                record_added(&mut edits)?;
+                for run in before.iter().copied().filter(|run| !is_replaced(run)) {
+                    self.collect_term_edits(&entry.slug, columns, run, &mut edits, false, cancellation).await?;
+                }
+                let (root, written) = edits.apply(&pages, None, &self.memory).await?;
+                if current.is_some() {
+                    for digest in written {
+                        self.storage.invalidate(&ObjectKey::new(page_key(&pages.prefix, digest))?).await?;
+                    }
+                }
+                root
+            }
+        };
+        if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+        Ok((TermDirectoryRoot { definition_id: Some(index.id.clone()), definition_version: Some(index.version),
+            root: Some(root.as_ref().map_or_else(Vec::new, |root| root.encode())), runs: Some(runs as i64) }, basis))
+    }
+
+    async fn collect_term_edits(&self, slug: &TableSlug, columns: &[String], run: &SearchRun, edits: &mut TermEdits,
+        deleting: bool, cancellation: &CancellationToken) -> Result<()> {
+        let id = run.identity()?;
+        let file = self.runtime.logical_file(&self.storage, slug, run, columns).await?;
+        file.visit_term_summaries(|field, term, stats| {
+            if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+            edits.record(field, term, id, (!deleting).then_some(stats))
+        }).await
+    }
+
+    async fn repair_term_directory(&self, index: &LogicalIndex, columns: &[String], snapshots: &dyn SnapshotSource, publisher: &dyn ArtefactPublisher,
+        storage: (StorageVersion, StorageEpoch), cancellation: &CancellationToken) -> Result<()> {
+        let snapshot = snapshots.snapshot().snapshot();
+        let Some(run) = index.records(&snapshot).into_iter().next() else { return Ok(()); };
+        if index.term_directory(&snapshot).is_some() && !self.runtime.term_directory_suspect(&self.database, &index.table, &index.id, index.version) {
+            return Ok(());
+        }
+        let hold = self.hold_logical_input(&snapshot).await?;
+        let (root, basis) = IoRegion::reading(hold, self.prepare_term_directory(index, columns, &snapshot, DirectoryUpdate::Rebuild, cancellation)).await?;
+        let change = SearchRunChange { run: Some(run.clone()), term_directory: Some(root.clone()), replaces_directory: Some(basis.to_vec()),
+            ..Default::default() };
+        publish_change(publisher, storage, index, change).await?;
+        if index.term_directory(&snapshots.snapshot().snapshot()) == Some(&root) {
+            self.runtime.clear_term_directory(&self.database, &index.table, &index.id, index.version);
+        }
+        Ok(())
     }
 
     pub(super) async fn refresh_logical(&self, snapshots: &dyn SnapshotSource, publisher: &dyn ArtefactPublisher,
@@ -269,19 +397,23 @@ impl SearchBuilder {
                             Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); continue; }
                             Err(error) => return Err(error),
                         };
-                        let run = self.store_documents(&index, &definition.columns, &entry.slug, blocks, 0, rows, contents, charge, cancellation).await?;
-                        publish_change(publisher, storage, &index, SearchRunChange { run: Some(run), ..Default::default() }).await?;
+                        let prepared = self.store_documents(&index, &definition.columns, &entry.slug, blocks, 0, rows, contents, charge, cancellation).await?;
+                        let current = snapshots.snapshot().snapshot();
+                        let change = self.directory_change(&index, &definition.columns, &current, prepared, Vec::new(), cancellation).await?;
+                        publish_change(publisher, storage, &index, change).await?;
                         continue;
                     }
                     Err(error) => return Err(error),
                 };
-                let run = match self.build_logical(&index, &definition.columns, &snapshot, trie.key.block_index(), input,
+                let prepared = match self.build_logical(&index, &definition.columns, &snapshot, trie.key.block_index(), input,
                     trie.data_file_size, None, cancellation).await {
                     Ok(run) => run,
                     Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); break; }
                     Err(error) => return Err(error),
                 };
-                publish_change(publisher, storage, &index, SearchRunChange { run: Some(run), ..Default::default() }).await?;
+                let current = snapshots.snapshot().snapshot();
+                let change = self.directory_change(&index, &definition.columns, &current, prepared, Vec::new(), cancellation).await?;
+                publish_change(publisher, storage, &index, change).await?;
             }
             loop {
                 let snapshot = snapshots.snapshot().snapshot();
@@ -299,14 +431,19 @@ impl SearchBuilder {
                 let merged = IoRegion::reading(hold,
                     self.merge_logical(&index, &definition.columns, &snapshot, pair, cancellation),
                 ).await;
-                let run = match merged {
+                let prepared = match merged {
                     Ok(run) => run,
                     Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); break; }
                     Err(error) => return Err(error),
                 };
-                let identity = run.identity()?;
-                publish_change(publisher, storage, &index, SearchRunChange { run: Some(run), replaces: input, ..Default::default() }).await?;
+                let identity = prepared.run.identity()?;
+                let change = self.directory_change(&index, &definition.columns, &snapshot, prepared, input, cancellation).await?;
+                publish_change(publisher, storage, &index, change).await?;
                 if !index.records(&snapshots.snapshot().snapshot()).iter().any(|run| run.identity().is_ok_and(|found| found == identity)) { break; }
+            }
+            match self.repair_term_directory(&index, &definition.columns, snapshots, publisher, storage, cancellation).await {
+                Err(error) if super::is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
+                result => result?,
             }
             match self.scrub_logical(&index, &definition.columns, snapshots, publisher, storage, cancellation).await {
                 Err(error) if super::is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
@@ -351,9 +488,9 @@ impl SearchBuilder {
                 let rebuild = run.rebuild().checked_add(1).ok_or_else(|| fault("Search rebuild generation exhausted"))?;
                 let replacement = self.store_documents(index, columns, &entry.slug, run.blocks.clone(), rebuild, run.source_rows(),
                     RunContents { documents, erases: local }, indexing, cancellation).await?;
-                publish_change(publisher, storage, index, SearchRunChange {
-                    run: Some(replacement), replaces: vec![run.digest().to_vec()], ..Default::default()
-                }).await?;
+                let current = snapshots.snapshot().snapshot();
+                let change = self.directory_change(index, columns, &current, replacement, vec![run.digest().to_vec()], cancellation).await?;
+                publish_change(publisher, storage, index, change).await?;
             }
             Ok::<_, rtdb_types::Anomaly>(())
         }).await?;
@@ -464,10 +601,9 @@ impl SearchBuilder {
                     Err(error) => return Err(error),
                 };
                 scrub_documents(&mut contents.documents, &contents.erases);
-                let run = self.store_documents(&index, &definition.columns, &entry.slug, blocks, rebuild, source_rows, contents, charge, cancellation).await?;
-                publish_change(publisher, storage, &index, SearchRunChange {
-                    run: Some(run), replaces: vec![id.to_vec()], ..Default::default()
-                }).await
+                let prepared = self.store_documents(&index, &definition.columns, &entry.slug, blocks, rebuild, source_rows, contents, charge, cancellation).await?;
+                let change = self.directory_change(&index, &definition.columns, &snapshot, prepared, vec![id.to_vec()], cancellation).await?;
+                publish_change(publisher, storage, &index, change).await
             }).await;
             match attempt {
                 Ok(()) => self.runtime.clear_run(&self.database, &table, id),
@@ -479,7 +615,7 @@ impl SearchBuilder {
     }
 
     async fn merge_logical(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot, inputs: &[&SearchRun],
-        cancellation: &CancellationToken) -> Result<SearchRun> {
+        cancellation: &CancellationToken) -> Result<PreparedLogicalRun> {
         let entry = snapshot.table_entry(&index.table).ok_or_else(|| fault("Logical merge has no table slug"))?;
         let mut blocks = Vec::new();
         let mut contents = RunContents::default();
@@ -501,7 +637,7 @@ impl SearchBuilder {
     }
 
     async fn store_documents(&self, index: &LogicalIndex, columns: &[String], slug: &TableSlug, mut blocks: Vec<i64>, rebuild: i64, source_rows: i64,
-        mut contents: RunContents, indexing: Arc<rtdb_columnar::MemoryReservation>, cancellation: &CancellationToken) -> Result<SearchRun> {
+        mut contents: RunContents, indexing: Arc<rtdb_columnar::MemoryReservation>, cancellation: &CancellationToken) -> Result<PreparedLogicalRun> {
         blocks.sort_unstable();
         let has_erases = !contents.erases.is_empty();
         scrub_documents(&mut contents.documents, &contents.erases);
@@ -522,13 +658,14 @@ impl SearchBuilder {
         let file = output.clone();
         let allocation = *uuid::Uuid::new_v4().as_bytes();
         let (identity, columns, version) = (run_identity(slug, &index.id, index.version, &blocks, rebuild, &allocation), columns.to_vec(), index.version);
-        let (locator, digest) = tokio::task::spawn_blocking(move || {
+        let ((locator, digest), summaries) = tokio::task::spawn_blocking(move || {
             let output = BufWriter::new(File::create(&file).map_err(fault)?);
-            write_group_as(&columns, [[Ok(MergedRows(rows))]], &identity, Some(version), None, output,
+            let (_, summaries) = write_group_as(&columns, [[Ok(MergedRows(rows))]], &identity, Some(version), None, output,
                 Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
-            read_locator(&file)
+            Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, summaries))
         }).await.map_err(fault)??;
-        self.publish_run(index, slug, &output, blocks, rebuild, source_rows, has_erases, locator, digest, allocation, cancellation).await
+        let run = self.publish_run(index, slug, &output, blocks, rebuild, source_rows, has_erases, locator, digest, allocation, cancellation).await?;
+        Ok(PreparedLogicalRun { run, summaries })
     }
 }
 
