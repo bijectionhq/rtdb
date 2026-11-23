@@ -390,6 +390,7 @@ variant TxMessage : SourceMessage {
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
     -- PATCH replay binds compatible document and IID vectors to the mutation plan as one list of records.
     -- Put and create-only insert replay retain their Arrow document vectors.
+    -- Governed Arrow writes fill acceptance-relative binary slots in the selected columns during staging.
     -- A put record without an IID vector derives its IIDs from the document ID cells.
     -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
     -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.

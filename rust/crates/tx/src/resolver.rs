@@ -968,7 +968,9 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
                 self.drop_owned_spatial_path(relation, name).await,
             Operation::Public(TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
-                self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial).await,
+                self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial(rtdb_types::SpatialGeometryEncoding::TaggedWkb)).await,
+            Operation::Public(TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, encoding }) =>
+                self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial(*encoding)).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), OwnedPathKind::Search).await,
             Operation::Public(TxOp::HostedConstraintRefusal) => {
@@ -1015,6 +1017,7 @@ impl<'a> OpenTransaction<'a> {
                 if delete_root.is_some() || land_root.is_some() { self.publish_owned_root_head().await?; }
                 Ok(())
             },
+            Operation::Public(TxOp::OwnedRequireSpatialPath { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id, rtdb_types::OwnedChangeKind::Erase).await,
@@ -1162,7 +1165,7 @@ impl<'a> OpenTransaction<'a> {
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             for row in 0..batch.num_rows() {
-                let text = |name| ArrowCell::named(batch, name, row).and_then(ArrowCell::utf8);
+                let text = |field| ArrowCell::named(batch, field, row).and_then(ArrowCell::utf8);
                 if present
                     || text("_id") != Some(path.name())
                     || text("schema_name") != Some(target.schema.as_str())
@@ -1190,7 +1193,7 @@ impl<'a> OpenTransaction<'a> {
         let catalog = match kind {
             OwnedPathKind::Search => rtdb_types::OwnedRelation::search_catalog(owner),
             OwnedPathKind::Ordered => rtdb_types::OwnedRelation::path_catalog(owner),
-            OwnedPathKind::Spatial => rtdb_types::OwnedRelation::spatial_catalog(owner),
+            OwnedPathKind::Spatial(_) => rtdb_types::OwnedRelation::spatial_catalog(owner),
         };
         let declaration = self.read_owned_schema(owner, relation).await?;
         let snapshot = self.snapshot()?;
@@ -1199,7 +1202,7 @@ impl<'a> OpenTransaction<'a> {
         }
         let declared_type = |name: &str| declaration.as_ref().and_then(|(schema, _)| schema.path_column_type(name));
         let available = snapshot.column_names(&target);
-        if kind == OwnedPathKind::Spatial {
+        if matches!(kind, OwnedPathKind::Spatial(_)) {
             if !(1..=16).contains(&columns.len())
                 || columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
                 || columns.iter().any(|column| column.starts_with('_') || declared_type(column) != Some(rtdb_types::ScalarType::Binary))
@@ -1239,15 +1242,24 @@ impl<'a> OpenTransaction<'a> {
                     let batch = batch.batch();
                     for row in 0..batch.num_rows() {
                         if found { return Err(different()); }
-                        let cell = |name| ArrowCell::named(batch, name, row);
-                        let text = |name| cell(name).and_then(ArrowCell::utf8);
-                        let Some(stored_columns) = cell("columns").and_then(ArrowCell::list) else { return Err(different()); };
-                        if text("_id") != Some(name.name()) || text("schema_name") != Some(target.schema.as_str())
+                        let cell = |field| ArrowCell::named(batch, field, row);
+                        let text = |field| cell(field).and_then(ArrowCell::utf8);
+                        let stored_columns = cell("columns").and_then(ArrowCell::list).ok_or_else(different)?;
+                        if text("_id") != Some(name.name())
+                            || text("schema_name") != Some(target.schema.as_str())
                             || text("table_name") != Some(target.table.as_str())
                             || stored_columns.len() != columns.len()
                             || !stored_columns.zip(columns).all(|(value, expected)| value.utf8() == Some(expected.as_str()))
                         {
                             return Err(different());
+                        }
+                        if let OwnedPathKind::Spatial(expected) = kind {
+                            let stored = match cell("geometry_encoding") {
+                                Some(cell) if rtdb_columnar::selected_cell(cell.field, cell.array, cell.row)?.is_some() =>
+                                    rtdb_types::SpatialGeometryEncoding::parse(cell.utf8().ok_or_else(different)?)?,
+                                _ => rtdb_types::SpatialGeometryEncoding::TaggedWkb,
+                            };
+                            if stored != expected { return Err(different()); }
                         }
                         found = true;
                     }
@@ -1255,14 +1267,44 @@ impl<'a> OpenTransaction<'a> {
                 if found { return Ok(()); }
             }
         }
-        let document = StructFields::from([
-            ("_id".into(), Value::Utf8(name.name().into())),
-            ("schema_name".into(), Value::Utf8(target.schema)),
-            ("table_name".into(), Value::Utf8(target.table)),
-            ("columns".into(), Value::list(columns.iter().cloned().map(Value::Utf8).collect())),
-            ("version".into(), Value::I64(self.tx_key().tx_id.0)),
-        ]);
-        self.buffer.put(catalog, document, Interval::ALL)
+        use arrow_array::{ArrayRef, Int64Array, StringArray, StructArray, builder::{ListBuilder, StringBuilder}};
+        let name_bytes = columns.iter().try_fold(0usize, |bytes, name| {
+            bytes.checked_add(name.len()).ok_or_else(overflow)
+        })?;
+        let column_bytes = name_bytes.checked_add(columns.len() * 32 + 4096).ok_or_else(overflow)?;
+        let _scratch = self.context.memory.reserve(column_bytes)?;
+        let strings = StringBuilder::with_capacity(columns.len(), name_bytes);
+        let mut column_names = ListBuilder::with_capacity(strings, 1);
+        for column in columns {
+            column_names.values().append_value(column);
+        }
+        column_names.append(true);
+        let text = |value| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        let mut columns = vec![
+            ("_id", text(name.name())),
+            ("schema_name", text(target.schema.as_str())),
+            ("table_name", text(target.table.as_str())),
+            ("columns", Arc::new(column_names.finish())),
+            ("version", Arc::new(Int64Array::from(vec![self.tx_key().tx_id.0]))),
+        ];
+        if let OwnedPathKind::Spatial(encoding) = kind
+            && encoding != rtdb_types::SpatialGeometryEncoding::TaggedWkb
+        {
+            columns.push(("geometry_encoding", text(encoding.name())));
+        }
+        let document = RecordBatch::try_from_iter(columns)
+            .map_err(|error| Anomaly::fault("rtdb.owned/path-catalog", error.to_string()))?;
+        let header = EventHeader {
+            commit_position: 0,
+            iid: rtdb_types::EntityId::String(name.name().into()).iid(),
+            system_from: self.tx_key().system_time,
+            valid_time: Interval::ALL,
+            op: EventOp::Put,
+        };
+        let batch = rtdb_format::data::owned_put_batch(
+            Arc::new(StructArray::from(document)), &[header], None, &self.context.memory,
+        )?;
+        self.buffer.append_batch(&catalog, batch)
     }
 
     async fn apply_constraint_refusal(
@@ -1318,7 +1360,7 @@ impl<'a> OpenTransaction<'a> {
                     Operation::Public(TxOp::OwnedErase { .. }) if replay.is_some() && root.is_none() => (),
                     Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedDeclarePath { .. }
                         | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. }
-                        | TxOp::OwnedSweepExpired { .. })
+                        | TxOp::OwnedSweepExpired { .. } | TxOp::OwnedRequireSpatialPath { .. })
                     | Operation::Public(TxOp::OwnedArrowDocs { create_only: true, .. })
                     | Operation::OwnedArrowIids { create_only: true, .. }
                     | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
@@ -1779,6 +1821,26 @@ impl<'a> OpenTransaction<'a> {
         }
         self.check_hosted_controls(operations, source_scope, replay).await?;
         self.check_capacity_source(operations).await?;
+        let publishes_catalog = operations.iter().any(|operation| matches!(operation,
+            Operation::Public(TxOp::HostedControl(control))
+                if control.name() == "bj_fact_root_owner" && control.expected().is_some() && !control.is_check()
+                    && matches!(control.id(), EntityId::String(id) if id == "root")
+        ));
+        for operation in operations {
+            if let Operation::Public(TxOp::OwnedRequireSpatialPath { relation, name, columns, encoding }) = operation {
+                if !relation.is_root_data() || !publishes_catalog || source_scope.is_none()
+                    || source_scope != self.context.owned_witness_scope
+                {
+                    return Err(unavailable());
+                }
+                let context = self.context.query_context(
+                    self.buffer.base_snapshot(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+                )?;
+                let lease = context.catalog.read_lease();
+                let check = rtdb_spatial::require_path_ready(Arc::clone(&context), owner, relation, name, columns, *encoding);
+                rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, check)).await?;
+            }
+        }
         for operation in operations {
             if let Operation::Public(TxOp::OwnedCheckWorldScope { scope, clock }) = operation {
                 if self.owned_worlds.is_empty() || deadline.is_none()
@@ -2457,6 +2519,33 @@ impl<'a> OpenTransaction<'a> {
             if !cell_is_present(id_cell)? || replay.is_some_and(|(iids, _)| iids[row] != iid) {
                 return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
             }
+            let mut filled = BTreeMap::<&str, Vec<u8>>::new();
+            let mut slot_reservations = Vec::new();
+            if let Some(slots) = row_cells(row).find(|cell| cell.field.name() == ordered_micros::FIELD)
+                && cell_is_present(slots)?
+            {
+                let (schema, _) = declaration.as_ref().filter(|_| {
+                    self.context.owned_witness_scope.is_some() && restoring.is_none()
+                }).ok_or_else(ordered_micros::invalid)?;
+                if !slots.is_null()? {
+                    let slots = slots.binary().ok_or_else(ordered_micros::invalid)?;
+                    ordered_micros::fill_slots(slots, base_time,
+                        |column| column.starts_with("p_") && schema.path_column_type(column) == Some(ScalarType::Binary),
+                        |name, start, bytes| {
+                            if !filled.contains_key(name) {
+                                let cell = row_cells(row).find(|cell| cell.field.name() == name).ok_or_else(ordered_micros::invalid)?;
+                                if !cell_is_present(cell)? { return Err(ordered_micros::invalid()); }
+                                let source = cell.binary().ok_or_else(ordered_micros::invalid)?;
+                                let bound = source.len().checked_mul(2).and_then(|size| size.checked_add(512)).ok_or_else(overflow)?;
+                                slot_reservations.push(memory.reserve(bound)?);
+                                filled.insert(cell.field.name(), source.to_vec());
+                            }
+                            let cell = filled.get_mut(name).ok_or_else(ordered_micros::invalid)?;
+                            ordered_micros::fill_bytes(cell, start, bytes)
+                        },
+                    )?;
+                }
+            }
             let mut types = StructFields::new();
             let mut fields = Vec::new();
             let mut columns = Vec::new();
@@ -2468,6 +2557,7 @@ impl<'a> OpenTransaction<'a> {
                 if !cell_is_present(cell)? { continue; }
                 fields_present += 1;
                 match cell.field.name().as_str() {
+                    ordered_micros::FIELD => continue,
                     "_valid_from" | "_valid_to" => {
                         explicit_validity = true;
                         if let Some(time) = endpoint(cell)? {
@@ -2478,8 +2568,13 @@ impl<'a> OpenTransaction<'a> {
                         let ty = cell.logical_type()?;
                         rtdb_columnar::validate_readable_cell(cell.field, cell.array, &rtdb_columnar::from_field(cell.field)?, row, &memory)?;
                         types.insert(name.to_owned(), ty);
-                        fields.push(cell.field.clone());
-                        columns.push(source.slice(row, 1));
+                        if let Some(bytes) = filled.remove(name) {
+                            fields.push(arrow_schema::Field::new(name, DataType::Binary, false));
+                            columns.push(Arc::new(arrow_array::BinaryArray::from_iter_values([bytes])) as arrow_array::ArrayRef);
+                        } else {
+                            fields.push(cell.field.clone());
+                            columns.push(source.slice(row, 1));
+                        }
                     }
                 }
             }
@@ -2863,7 +2958,7 @@ fn insert_exists() -> Anomaly {
 enum OwnedPathKind {
     Ordered,
     Search,
-    Spatial,
+    Spatial(rtdb_types::SpatialGeometryEncoding),
 }
 
 fn invalid_search_path_column() -> Anomaly {
@@ -2897,14 +2992,18 @@ fn no_owned_principal() -> Anomaly {
 
 fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Result<()> {
     let put_columns = &["_id", "_fn", "_valid_from", "_valid_to"][..];
+    let root_columns = &["_id", "_fn", "_valid_from", "_valid_to", ordered_micros::FIELD][..];
     if let Operation::Public(TxOp::OwnedArrowDocs { relation, documents, .. }) | Operation::OwnedArrowIids { relation, documents, .. } = operation {
         let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
-        return validate_document_columns(&relation.table(owner), documents.columns(), "insert", put_columns);
+        let permitted = if relation.is_root_data() { root_columns } else { put_columns };
+        return validate_document_columns(&relation.table(owner), documents.columns(), "insert", permitted);
     }
     if let Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. }) | Operation::OwnedWriteIids { relation, documents, .. } = operation {
         let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let permitted = if relation.world().is_some() {
             &["_id", rtdb_types::WorldShadow::FIELDS][..]
+        } else if relation.is_root_data() {
+            root_columns
         } else {
             put_columns
         };

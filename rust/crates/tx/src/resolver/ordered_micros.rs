@@ -41,6 +41,26 @@ fn fill_row(
     ordered: Timestamp,
     allows_key_slot: impl Fn(&str) -> bool,
 ) -> Result<()> {
+    fill_slots(slots, ordered, allows_key_slot, |column, start, bytes| {
+        let Some(Value::Binary(value)) = row.get_mut(column) else { return Err(invalid()); };
+        fill_bytes(value, start, bytes)
+    })
+}
+
+pub(super) fn fill_bytes(value: &mut [u8], start: usize, bytes: [u8; WIDTH]) -> Result<()> {
+    let end = start.checked_add(WIDTH).ok_or_else(invalid)?;
+    let slot = value.get_mut(start..end).ok_or_else(invalid)?;
+    if slot.iter().any(|byte| *byte != 0) { return Err(invalid()); }
+    slot.copy_from_slice(&bytes);
+    Ok(())
+}
+
+pub(super) fn fill_slots(
+    slots: &[u8],
+    ordered: Timestamp,
+    allows_key_slot: impl Fn(&str) -> bool,
+    mut fill: impl FnMut(&str, usize, [u8; WIDTH]) -> Result<()>,
+) -> Result<()> {
     let (count, mut remaining) = slots.split_first_chunk::<2>().ok_or_else(invalid)?;
     let count = usize::from(u16::from_be_bytes(*count));
     if !(1..=MAX_SLOTS).contains(&count) {
@@ -63,18 +83,13 @@ fn fill_row(
         {
             return Err(invalid());
         }
-        let Some(Value::Binary(bytes)) = row.get_mut(column) else { return Err(invalid()); };
-        let slot = bytes.get_mut(start..end).ok_or_else(invalid)?;
-        if slot.iter().any(|byte| *byte != 0) {
-            return Err(invalid());
-        }
         let micros = ordered.0.checked_add(i64::from_be_bytes(*delta)).ok_or_else(invalid)?;
         let bits = if sort_key {
             micros as u64 ^ (1 << 63)
         } else {
             micros as u64
         };
-        slot.copy_from_slice(&bits.to_be_bytes());
+        fill(column, start, bits.to_be_bytes())?;
         previous = (column, end);
         remaining = rest;
     }

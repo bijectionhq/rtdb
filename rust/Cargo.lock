@@ -5382,6 +5382,7 @@ dependencies = [
  "rtdb-metrics",
  "rtdb-plan",
  "rtdb-query",
+ "rtdb-spatial",
  "rtdb-sql",
  "rtdb-storage",
  "rtdb-text",

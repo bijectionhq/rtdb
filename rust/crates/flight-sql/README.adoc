@@ -470,6 +470,10 @@ A page with more matches includes a hex-encoded 16-byte filter capability in the
 The identity starts with tag 0 for UTF-8 text, 1 for UTF-8 keyword, 2 for a big-endian signed 64-bit integer with its sign bit flipped, or 3 for a 16-byte UUID.
 A continuation uses the original filter, valid instant, and held cut and can be retried with the same body.
 `rtdb.owned.SpatialClose.v1` takes the held read handle and filter capability, returning no result.
+`rtdb.owned.SpatialRankOpen.v1` takes a projected nearest request and returns a page from the held exact ranking.
+`rtdb.owned.SpatialRankNext.v1` uses the same capability framing as `SpatialNext.v1` with a big-endian Float64 distance before the complete identity.
+Every nonterminal ranked reply supplies the next exact distance in `rtdb.owned.spatial_next_distance_m`.
+
 A held read retains up to 32 filters and releases them when it closes.
 
 `rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.

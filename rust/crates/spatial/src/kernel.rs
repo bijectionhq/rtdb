@@ -4,9 +4,9 @@ use geometry::predicates::{
 };
 use geometry::spatial_index::{candidate_ranges, point_key, shape_keys};
 use geometry::{
-    Coords, Geometry, GeometryDeclaration, GeometrySpace, GeometryWork, KeyRange, Size,
+    Coords, Geometry, GeometryDeclaration, GeometrySpace, GeometryWork, Gv, KeyRange, Kind, Size,
 };
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, SpatialGeometryEncoding};
 
 pub(crate) const WORK_STEPS: usize = 10_000_000;
 pub(crate) const WORK_BYTES: usize = 8 << 20;
@@ -52,6 +52,33 @@ impl Location {
             geometry,
             position_accuracy,
         })
+    }
+
+    pub(crate) fn decode_stored(
+        bytes: &[u8], encoding: SpatialGeometryEncoding, work: &mut GeometryWork,
+    ) -> Result<Option<Self>> {
+        if encoding == SpatialGeometryEncoding::TaggedWkb {
+            return Self::decode(bytes, work).map(Some);
+        }
+        let value = crate::bijection_geometry::decode(bytes, work)?;
+        if matches!(value, Gv::Null) {
+            return Ok(None);
+        }
+        let declaration = GeometryDeclaration {
+            space: GeometrySpace::wgs84_xy(),
+            size: Size::Large,
+        };
+        if encoding == SpatialGeometryEncoding::BijectionPosition {
+            let position = geometry::admit_position_with_work(&value, &declaration, work)
+                .map_err(geometry_error)?;
+            return Ok(Some(Self {
+                geometry: Geometry::new(Kind::Point, Coords::Point(position.point), declaration.space),
+                position_accuracy: Some(position.accuracy_m),
+            }));
+        }
+        let geometry = geometry::admit_value_with_work(&value, &declaration, work)
+            .map_err(geometry_error)?;
+        Ok(Some(Self { geometry, position_accuracy: None }))
     }
 
     pub(crate) fn keys(&self, work: &mut GeometryWork) -> Result<Vec<i64>> {

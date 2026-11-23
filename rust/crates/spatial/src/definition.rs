@@ -5,7 +5,7 @@ use rtdb_index::Snapshot;
 use rtdb_maintenance::ArtefactDefinition;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, OwnedRelation, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, OwnedRelation, Result, SpatialGeometryEncoding, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const KIND: &str = "spatial";
@@ -15,6 +15,7 @@ pub(crate) struct Definition {
     pub(crate) name: String,
     pub(crate) table: TableRef,
     pub(crate) geometry: String,
+    pub(crate) encoding: SpatialGeometryEncoding,
     pub(crate) partition: Vec<String>,
     pub(crate) generation: i64,
 }
@@ -132,6 +133,13 @@ async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Defi
             let generation = cell("version")
                 .and_then(ArrowCell::int64)
                 .ok_or_else(malformed)?;
+            let encoding = if let Some(value) = cell("geometry_encoding")
+                && rtdb_columnar::selected_cell(value.field, value.array, value.row)?.is_some()
+            {
+                SpatialGeometryEncoding::parse(value.utf8().ok_or_else(malformed)?)?
+            } else {
+                SpatialGeometryEncoding::TaggedWkb
+            };
             let table = TableRef::new(schema, table);
             if !(1..=16).contains(&columns.len()) || !catalog.owns_path_target(&table) {
                 return Err(malformed());
@@ -149,6 +157,7 @@ async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Defi
                 name: name.to_owned(),
                 table,
                 geometry,
+                encoding,
                 partition,
                 generation,
             });

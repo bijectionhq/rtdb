@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
-use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
+use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
@@ -35,7 +35,7 @@ pub(crate) enum Operation {
 impl Operation {
     pub(crate) fn owned_relation(&self) -> Option<&rtdb_types::OwnedRelation> {
         match self {
-            Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. } | TxOp::OwnedDeclareSpatialPath { relation, .. } | TxOp::OwnedDropSpatialPath { relation, .. }
+            Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. } | TxOp::OwnedDeclareSpatialPath { relation, .. } | TxOp::OwnedDeclareEncodedSpatialPath { relation, .. } | TxOp::OwnedRequireSpatialPath { relation, .. } | TxOp::OwnedDropSpatialPath { relation, .. }
                 | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
                 | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckWorldPurge { relation, .. }
                 | TxOp::OwnedErase { relation, .. } | TxOp::OwnedSweepExpired { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
@@ -131,7 +131,7 @@ impl SourceTransaction {
                     (relation.name().len() + name.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
-                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
+                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns } | TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, .. } | TxOp::OwnedRequireSpatialPath { relation, name, columns, .. }) =>
                     (owned_path_bytes(relation, name, columns)?, None, 0),
                 Operation::Public(TxOp::HostedControl(control)) => (control.retained_bytes()?, None, 0),
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => (Value::document_retained_bytes(record)?.saturating_add(attempt.len()), None, 128),
@@ -416,7 +416,7 @@ impl SourceTransaction {
                     relation.name().len() + name.name().len(),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
-                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
+                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns } | TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, .. } | TxOp::OwnedRequireSpatialPath { relation, name, columns, .. }) =>
                     owned_path_bytes(relation, name, columns)?,
                 Operation::Public(TxOp::HostedControl(control)) => control.retained_bytes()?,
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => Value::document_retained_bytes(record)?.saturating_add(attempt.len() + 128),
@@ -471,9 +471,19 @@ const OPERATION_BODY_BYTES: usize = 4_096;
 const OPERATION_CELL_BYTES: usize = 256;
 
 struct SourceOperation<'a> {
-    body: StructFields<Value>,
+    body: SourceOperationBody<'a>,
     iids: Cow<'a, [Iid]>,
     documents: Option<(String, SourceDocuments<'a>)>,
+}
+
+enum SourceOperationBody<'a> {
+    Values(StructFields<Value>),
+    Path {
+        relation: &'a str,
+        name: &'a str,
+        columns: Option<&'a [String]>,
+        encoding: Option<rtdb_types::SpatialGeometryEncoding>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -587,9 +597,11 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             "rtdb-owned-search-path-v1"
         }
         Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) => {
-            body.insert("relation".into(), Value::Utf8(relation.name().into()));
-            body.insert("name".into(), Value::Utf8(name.name().into()));
-            "rtdb-owned-drop-spatial-path-v1"
+            return Ok(("rtdb-owned-drop-spatial-path-v1".into(), SourceOperation {
+                body: SourceOperationBody::Path { relation: relation.name(), name: name.name(), columns: None, encoding: None },
+                iids: identities,
+                documents: None,
+            }));
         }
         Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -597,14 +609,31 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             "rtdb-owned-relation-v1"
         }
         Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns }) => {
-            body.insert("relation".into(), Value::Utf8(relation.name().into()));
-            body.insert("name".into(), Value::Utf8(name.name().into()));
-            body.insert("columns".into(), Value::list(columns.iter().cloned().map(Value::Utf8).collect()));
-            if matches!(operation, Operation::Public(TxOp::OwnedDeclareSpatialPath { .. })) {
+            let tag = if matches!(operation, Operation::Public(TxOp::OwnedDeclareSpatialPath { .. })) {
                 "rtdb-owned-spatial-path-v1"
             } else {
                 "rtdb-owned-path-v1"
-            }
+            };
+            return Ok((tag.into(), SourceOperation {
+                body: SourceOperationBody::Path { relation: relation.name(), name: name.name(), columns: Some(columns), encoding: None },
+                iids: identities,
+                documents: None,
+            }));
+        }
+        Operation::Public(TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, encoding }
+            | TxOp::OwnedRequireSpatialPath { relation, name, columns, encoding }) => {
+            let tag = if matches!(operation, Operation::Public(TxOp::OwnedRequireSpatialPath { .. })) {
+                "rtdb-owned-require-spatial-path-v1"
+            } else {
+                "rtdb-owned-spatial-path-v2"
+            };
+            return Ok((tag.into(), SourceOperation {
+                body: SourceOperationBody::Path {
+                    relation: relation.name(), name: name.name(), columns: Some(columns), encoding: Some(*encoding),
+                },
+                iids: identities,
+                documents: None,
+            }));
         }
         Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -906,7 +935,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         }
         Operation::Removed(name) => return Err(Anomaly::unsupported("rtdb.tx/removed-operation", format!("Cannot encode removed operation {name}"))),
     };
-    Ok((tag.into(), SourceOperation { body, iids: identities, documents: docs }))
+    Ok((tag.into(), SourceOperation { body: SourceOperationBody::Values(body), iids: identities, documents: docs }))
 }
 
 pub(crate) fn document_id(document: &StructFields<Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
@@ -952,11 +981,22 @@ fn named_union<T>(
 }
 
 fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    if let Some(SourceOperation { body: SourceOperationBody::Path { columns, .. }, .. }) = values.first() {
+        let with_columns = columns.is_some();
+        return owned_path_leg(values, with_columns, arrays);
+    }
     let mut iids = Vec::with_capacity(values.len());
-    let (values, documents): (Vec<_>, Vec<_>) = values.into_iter().map(|value| {
+    let mut bodies = Vec::with_capacity(values.len());
+    let mut documents = Vec::with_capacity(values.len());
+    for value in values {
+        let SourceOperationBody::Values(body) = value.body else {
+            return Err(invalid("Transaction operation leg mixes path and value layouts"));
+        };
         iids.push(value.iids);
-        (value.body, value.documents)
-    }).unzip();
+        bodies.push(body);
+        documents.push(value.documents);
+    }
+    let values = bodies;
     let types = values.iter().map(|value| LogicalType::Struct(value.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect())).collect::<Vec<_>>();
     let LogicalType::Struct(mut types) = LogicalType::join_all(&types) else { return Err(invalid("Transaction operation leg has no struct layout")); };
     for temporal in ["_valid_from", "_valid_to"] {
@@ -995,6 +1035,73 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
     }
     if documents.is_some() { return Err(invalid("Document operation has no iids")); }
     rtdb_columnar::build_struct_array(fields.into(), &columns, values.len(), None).map_err(|error| invalid(error.to_string()))
+}
+
+fn owned_path_leg(
+    operations: Vec<SourceOperation<'_>>, with_columns: bool, arrays: &mut BatchBuilder,
+) -> Result<ArrayRef> {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+
+    let paths = operations.iter().map(|operation| match &operation.body {
+        SourceOperationBody::Path { relation, name, columns, encoding } if columns.is_some() == with_columns =>
+            Ok((*relation, *name, *columns, *encoding)),
+        _ => Err(invalid("Transaction operation leg mixes path layouts")),
+    }).collect::<Result<Vec<_>>>()?;
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    for (name, relation) in [("relation", true), ("name", false)] {
+        let values = || paths.iter().map(|path| if relation { path.0 } else { path.1 });
+        let payload = values().try_fold(0usize, |bytes, value| bytes.checked_add(value.len()).ok_or_else(overflow))?;
+        let bytes = payload.checked_add(paths.len() * 8 + 4096).ok_or_else(overflow)?;
+        fields.push(Arc::new(to_field(name, &text)?));
+        columns.push(arrays.column(bytes, || {
+            let mut builder = StringBuilder::with_capacity(paths.len(), payload);
+            for value in values() { builder.append_value(value); }
+            Ok(Arc::new(builder.finish()))
+        })?);
+    }
+    if with_columns {
+        let lists = || paths.iter().flat_map(|path| path.2);
+        let names = || lists().flat_map(|list| list.iter());
+        let (count, payload) = names().try_fold((0usize, 0usize), |(count, bytes), name| -> Result<_> {
+            Ok((count + 1, bytes.checked_add(name.len()).ok_or_else(overflow)?))
+        })?;
+        let bytes = payload.checked_add((paths.len() + count) * 8 + 4096).ok_or_else(overflow)?;
+        let item_type = if count == 0 { LogicalType::Nothing } else { text };
+        let field = Arc::new(to_field("columns", &LogicalType::list(item_type))?);
+        let DataType::List(item) = field.data_type() else { return Err(invalid("Owned path column names must be a list")); };
+        columns.push(arrays.column(bytes, || {
+            if item.data_type() == &DataType::Null {
+                let offsets = OffsetBuffer::new(vec![0; paths.len() + 1].into());
+                return Ok(Arc::new(ListArray::new(Arc::clone(item), offsets, Arc::new(arrow_array::NullArray::new(0)), None)));
+            }
+            let strings = StringBuilder::with_capacity(count, payload);
+            let mut builder = ListBuilder::with_capacity(strings, paths.len()).with_field(Arc::clone(item));
+            for list in lists() {
+                for name in list {
+                    builder.values().append_value(name);
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        })?);
+        fields.push(field);
+    }
+    if paths.first().is_some_and(|path| path.3.is_some()) {
+        let values = paths.iter().map(|path| path.3.map(rtdb_types::SpatialGeometryEncoding::name)
+            .ok_or_else(|| invalid("Transaction operation leg mixes geometry encodings")))
+            .collect::<Result<Vec<_>>>()?;
+        let payload = values.iter().try_fold(0usize, |bytes, name| bytes.checked_add(name.len()).ok_or_else(overflow))?;
+        let bytes = payload.checked_add(values.len() * 8 + 4096).ok_or_else(overflow)?;
+        fields.push(Arc::new(to_field("geometry_encoding", &LogicalType::Scalar(ScalarType::Utf8))?));
+        columns.push(arrays.column(bytes, || {
+            let mut builder = StringBuilder::with_capacity(values.len(), payload);
+            for value in values { builder.append_value(value); }
+            Ok(Arc::new(builder.finish()))
+        })?);
+    }
+    rtdb_columnar::build_struct_array(fields.into(), &columns, paths.len(), None)
 }
 
 fn iid_vector(lists: &[Cow<'_, [Iid]>], field: &Field, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
@@ -1528,6 +1635,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-capacity-v1" => &["relation", "column", "prefix_bytes", "cap"],
             "rtdb-owned-check-capacity-v1" => &["relation", "column", "prefix", "at_most"],
             "rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1" => &["relation", "name", "columns"],
+            "rtdb-owned-spatial-path-v2" | "rtdb-owned-require-spatial-path-v1" => &["relation", "name", "columns", "geometry_encoding"],
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => &["until"],
             "rtdb-hosted-constraint-refusal-v1" => &["version"],
@@ -1687,11 +1795,6 @@ impl SourceOperationReader<'_> {
                 else { return Err(invalid("Owned search path declaration has invalid fields")); };
                 TxOp::OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, column }
             }
-            "rtdb-owned-drop-spatial-path-v1" => {
-                let (Value::Utf8(relation), Value::Utf8(name)) = (value("relation")?, value("name")?)
-                    else { return Err(invalid("Owned spatial path removal has invalid fields")); };
-                TxOp::OwnedDropSpatialPath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)? }
-            }
             "rtdb-owned-relation-v1" => {
                 let (Value::Utf8(relation), Value::Binary(schema)) = (value("relation")?, value("schema")?)
                     else { return Err(invalid("Owned relation declaration has invalid fields")); };
@@ -1700,21 +1803,41 @@ impl SourceOperationReader<'_> {
                     schema: rtdb_types::OwnedSchema::from_json(&schema)?,
                 }
             }
-            name_of_operation @ ("rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1") => {
-                let (Value::Utf8(relation), Value::Utf8(name), Value::List(columns)) =
-                    (value("relation")?, value("name")?, value("columns")?)
-                else { return Err(invalid("Owned path declaration has invalid fields")); };
-                let columns = columns.iter().map(|column| match column.as_ref() {
-                    Value::Utf8(column) => Ok(column.clone()),
-                    _ => Err(invalid("Owned path names a non-text column")),
-                }).collect::<Result<_>>()?;
-                let relation = rtdb_types::OwnedRelation::new(relation)?;
-                let spatial = name_of_operation == "rtdb-owned-spatial-path-v1";
-                let name = rtdb_types::OwnedRelation::new(name)?;
-                if spatial {
-                    TxOp::OwnedDeclareSpatialPath { relation, name, columns }
+            "rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1" | "rtdb-owned-spatial-path-v2" | "rtdb-owned-require-spatial-path-v1" | "rtdb-owned-drop-spatial-path-v1" => {
+                let cell = |key| {
+                    let index = body.fields().iter().position(|field| field.name() == key)?;
+                    Some(ArrowCell {
+                        field: &body.fields()[index],
+                        array: body.column(index).as_ref(),
+                        row: offset,
+                    })
+                };
+                let text = |key| cell(key).and_then(ArrowCell::utf8)
+                    .ok_or_else(|| invalid("Owned path requires text relation and name"));
+                let relation = rtdb_types::OwnedRelation::new(text("relation")?)?;
+                let path = rtdb_types::OwnedRelation::new(text("name")?)?;
+                if name == "rtdb-owned-drop-spatial-path-v1" {
+                    TxOp::OwnedDropSpatialPath { relation, name: path }
                 } else {
-                    TxOp::OwnedDeclarePath { relation, name, columns }
+                    let columns = cell("columns").and_then(ArrowCell::list)
+                        .ok_or_else(|| invalid("Owned path requires a text column list"))?;
+                    let columns = columns.map(|column| column.utf8().map(str::to_owned)
+                        .ok_or_else(|| invalid("Owned path names a non-text column")))
+                        .collect::<Result<Vec<_>>>()?;
+                    match name.as_str() {
+                        "rtdb-owned-spatial-path-v1" => TxOp::OwnedDeclareSpatialPath { relation, name: path, columns },
+                        "rtdb-owned-spatial-path-v2" | "rtdb-owned-require-spatial-path-v1" => {
+                            let encoding = cell("geometry_encoding").and_then(ArrowCell::utf8)
+                                .ok_or_else(|| invalid("Owned spatial path requires a geometry encoding"))?;
+                            let encoding = rtdb_types::SpatialGeometryEncoding::parse(encoding)?;
+                            if name == "rtdb-owned-require-spatial-path-v1" {
+                                TxOp::OwnedRequireSpatialPath { relation, name: path, columns, encoding }
+                            } else {
+                                TxOp::OwnedDeclareEncodedSpatialPath { relation, name: path, columns, encoding }
+                            }
+                        }
+                        _ => TxOp::OwnedDeclarePath { relation, name: path, columns },
+                    }
                 }
             }
             "rtdb-owned-fixed-range-v1" => {
@@ -2190,6 +2313,48 @@ mod tests {
                 advance_to: Some(Timestamp(22)), ..
             })] if *actual == world && *parent_pin == pin
         ));
+    }
+
+    #[test]
+    fn owned_path_columns_preserve_the_source_operation_layout() {
+        let memory = MemoryBudget::new(1 << 20);
+        let locations = ["location".to_owned(), "borough".to_owned()];
+        for columns in [None, Some(&[][..]), Some(locations.as_slice())] {
+            let mut legacy = StructFields::from([
+                ("relation".into(), Value::Utf8("places".into())),
+                ("name".into(), Value::Utf8("by_location".into())),
+            ]);
+            if let Some(columns) = columns {
+                legacy.insert("columns".into(), Value::list(columns.iter().map(|column| Value::Utf8(column.as_str().into())).collect()));
+            }
+            let operation_array = |body| {
+                let mut arrays = BatchBuilder::new(4096, &memory).unwrap();
+                operation_leg(vec![SourceOperation {
+                    body,
+                    iids: Cow::Borrowed(&[]),
+                    documents: None,
+                }], &mut arrays, &memory).unwrap()
+            };
+            let expected = operation_array(SourceOperationBody::Values(legacy));
+            let actual = operation_array(SourceOperationBody::Path { relation: "places", name: "by_location", columns, encoding: None });
+            assert_eq!(actual.to_data(), expected.to_data());
+        }
+    }
+
+    #[test]
+    fn a_spatial_readiness_condition_replays_with_its_exact_definition() {
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new("places").unwrap();
+        let path = rtdb_types::OwnedRelation::new("by_location").unwrap();
+        let columns = vec!["location".to_owned(), "area".to_owned()];
+        let source = SourceTransaction::new(vec![TxOp::OwnedRequireSpatialPath {
+            relation: relation.clone(), name: path.clone(), columns: columns.clone(),
+            encoding: rtdb_types::SpatialGeometryEncoding::BijectionPosition,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let replayed = roundtrip(&source);
+        assert!(matches!(replayed.operations.as_slice(), [Operation::Public(TxOp::OwnedRequireSpatialPath {
+            relation: actual, name, columns: actual_columns, encoding: rtdb_types::SpatialGeometryEncoding::BijectionPosition,
+        })] if actual == &relation && name == &path && actual_columns == &columns));
     }
 
     #[test]
