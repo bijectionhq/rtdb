@@ -178,6 +178,7 @@ impl OpenTransaction<'_> {
         }
         if let Some(replay) = &replay {
             self.restore_owned_lifetime_floors(replay, &context).await?;
+            self.restore_owned_worlds(replay, &context).await?;
         }
         self.hosted_replay = replay;
         Ok(())

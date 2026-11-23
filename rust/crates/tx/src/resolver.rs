@@ -23,6 +23,7 @@ mod hosted_control;
 mod fixed_range;
 mod ordered_micros;
 mod replay_constraints;
+mod replay_worlds;
 mod owned_capacity;
 use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
@@ -699,6 +700,9 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
             Operation::Public(TxOp::HostedControl(control)) => {
+                if self.hosted_replay.as_ref().is_some_and(|replay| replay.is_transient_world_control(control)) {
+                    return Ok(());
+                }
                 if let Some(replacement) = control.replacement() {
                     let valid = interval(Timestamp(0), Timestamp::MAX)?;
                     self.buffer.put(control.table(), replacement.clone(), valid)?;

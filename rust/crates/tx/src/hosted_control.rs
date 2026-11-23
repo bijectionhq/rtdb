@@ -3,6 +3,9 @@ use rtdb_types::{
     TimeUnit, Timestamp, Value,
 };
 
+mod replay_worlds;
+pub(crate) use replay_worlds::ReplayWorlds;
+
 pub(crate) const CONTROL_TABLES: &str = "hosted_control_tables";
 const RESTORE: &str = "bj_rtdb_restore_hold";
 const NATIVE_FRONTIER: &str = "native-frontier.v1";
@@ -54,6 +57,8 @@ pub struct HostedReplay {
     lifetimes: Vec<ReplayLifetime>,
     #[serde(skip)]
     constraints: Vec<ReplayConstraint>,
+    #[serde(skip)]
+    worlds: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -100,8 +105,24 @@ pub fn hosted_replay_controls<'a>(
     let lifetimes = selected(RESTORE, &lifetime_id);
     let constraint_id = format!("native-constraints/{}", source.tx_id.0);
     let constraints = selected(RESTORE, &constraint_id);
+    let prefix = format!("native-worlds/{}/", source.tx_id.0);
+    let mut chunks = std::collections::BTreeMap::new();
+    let mut bytes = 0usize;
+    for control in controls.clone().filter(|control| control.name() == RESTORE) {
+        let EntityId::String(id) = control.id() else { return Err(replay_invalid()); };
+        let Some(index) = id.strip_prefix(&prefix) else { continue; };
+        let number = index.parse::<usize>().map_err(|_| replay_invalid())?;
+        let body = control_body(control, replay_worlds::CHUNK_BYTES)
+            .filter(|body| control.expected().is_none() && !body.is_empty())
+            .ok_or_else(replay_invalid)?;
+        bytes = bytes.checked_add(body.len()).filter(|&size| size <= replay_worlds::MAX_BYTES)
+            .ok_or_else(replay_invalid)?;
+        if number.to_string() != index || chunks.insert(number, body).is_some() {
+            return Err(replay_invalid());
+        }
+    }
     if controls.clone().filter(|control| control.name() == RESTORE).count()
-        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some())
+        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + chunks.len()
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
         || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
@@ -154,6 +175,13 @@ pub fn hosted_replay_controls<'a>(
                 return Err(replay_invalid());
             }
         }
+    }
+    let count = chunks.len();
+    for (index, (number, body)) in chunks.into_iter().enumerate() {
+        if number != index || (index + 1 != count && body.len() != replay_worlds::CHUNK_BYTES) {
+            return Err(replay_invalid());
+        }
+        replay.worlds.extend_from_slice(body);
     }
     Ok(Some(replay))
 }
@@ -266,6 +294,18 @@ impl HostedReplay {
             return Err(replay_constraint_mismatch());
         }
         Ok(())
+    }
+
+
+    pub(crate) fn logical_time(&self) -> Timestamp { Timestamp((self.logical_at / 1_000) as i64) }
+
+    pub(crate) fn world_body(&self) -> &[u8] { &self.worlds }
+
+    /// The co-ordered replay receipt commits to the Original inventory.
+    /// Bulk clear world input stays in its destination relations.
+    pub(crate) fn is_transient_world_control(&self, control: &HostedControlWrite) -> bool {
+        !self.worlds.is_empty() && control.name() == RESTORE
+            && matches!(control.id(), EntityId::String(id) if id.starts_with("native-worlds/"))
     }
 
     pub(crate) fn source_time(&self) -> Timestamp { self.source.system_time }
