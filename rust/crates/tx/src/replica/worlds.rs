@@ -236,6 +236,7 @@ pub(super) fn verify(
     let mut root_head = false;
     let mut publication_frontiers = BTreeSet::new();
     let mut landed_rows = 0usize;
+    let mut landed_positions = BTreeSet::new();
     let mut data = BTreeSet::new();
     let mut journals = BTreeSet::new();
     let mut overlays = BTreeSet::new();
@@ -362,11 +363,17 @@ pub(super) fn verify(
             if landed && allows_delete {
                 landed_rows = landed_rows.saturating_add(batch.len());
                 if landed_rows > crate::MAX_PROPOSAL_LAND_ROWS { return Err(mismatch()); }
+                for index in 0..batch.len() {
+                    if !landed_positions.insert(batch.header(index)?.commit_position) {
+                        return Err(mismatch());
+                    }
+                }
             }
             event_headers(batch, key, allows_delete && !root_holder_replace && !landed)?;
         }
     }
-    if (landed && (landed_rows == 0 || publication_frontiers.len() > landed_rows))
+    if (landed && (landed_rows == 0 || publication_frontiers.len() > landed_rows
+        || !landed_positions.into_iter().eq(1..=landed_rows as u32)))
         || !attempts.is_empty() || root_head != has_root || data != expected_data
         || !journals.remove(OWNED_ATTEMPT_RELATION) || journals != expected_data
         || worlds.iter().any(|(world, kind)| match kind {

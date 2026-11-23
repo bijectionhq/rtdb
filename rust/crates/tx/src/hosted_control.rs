@@ -1045,6 +1045,26 @@ mod retained_release_tests {
             world, pin, effect: ProposalLandingEffect::WithPoints,
         }));
 
+        operations.push(Operation::Public(TxOp::OwnedReplaceDocs {
+            relation: relation.clone(), documents: crate::Documents::new(vec![row("key")], &memory)?,
+            valid_from: None, valid_to: None,
+        }));
+        assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
+            world, pin, effect: ProposalLandingEffect::WithPoints,
+        }));
+        operations.push(Operation::Public(TxOp::OwnedInsertDocs {
+            relation: relation.clone(), documents: crate::Documents::new(vec![row("key")], &memory)?,
+            valid_from: None, valid_to: None,
+        }));
+        assert_eq!(hosted_proposal_land(&operations), None);
+        operations.pop();
+        operations.push(Operation::Public(TxOp::OwnedReplaceDocs {
+            relation: relation.clone(), documents: crate::Documents::new(vec![row("key")], &memory)?,
+            valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)),
+        }));
+        assert_eq!(hosted_proposal_land(&operations), None);
+        operations.pop();
+
         operations.push(Operation::Public(frontier("public_fact_head:BAAAAAAAAAAAAAAAAAAAAA")?));
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.pop();
@@ -1389,6 +1409,7 @@ pub(crate) fn hosted_proposal_land(
     use crate::{TxOp, source::Operation};
     let mut landing = None;
     let mut writes = std::collections::BTreeMap::new();
+    let mut assertion_count = 0;
     let mut close = false;
     let mut controls = Vec::new();
     let mut frontiers = std::collections::BTreeSet::new();
@@ -1414,8 +1435,16 @@ pub(crate) fn hosted_proposal_land(
                 };
                 for row in documents.rows() {
                     let id = row.get("_id")?.entity_id().ok()?;
-                    if writes.insert((relation.name(), id.handle_bytes()), (relation, id, start, false)).is_some()
-                        || writes.len() > MAX_PROPOSAL_LAND_ROWS { return None; }
+                    assertion_count += 1;
+                    if assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
+                    match writes.entry((relation.name(), id.handle_bytes())) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert((relation, id, start, false));
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if start.is_some() || entry.get().2.is_some() => return None,
+                        std::collections::btree_map::Entry::Occupied(_) => (),
+                    }
                 }
             }
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None })
@@ -1424,8 +1453,9 @@ pub(crate) fn hosted_proposal_land(
             {
                 for row in documents.rows() {
                     let id = row.get("_id")?.entity_id().ok()?;
+                    assertion_count += 1;
                     if writes.insert((relation.name(), id.handle_bytes()), (relation, id, None, true)).is_some()
-                        || writes.len() > MAX_PROPOSAL_LAND_ROWS { return None; }
+                        || assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
                 }
             }
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })

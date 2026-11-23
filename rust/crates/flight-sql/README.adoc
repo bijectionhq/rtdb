@@ -643,6 +643,10 @@ The hosted groups require at least one check and allow one to five checked repla
 Root kind 5 can settle a bounded-period Proposal overlay and its hosted receipt in one transaction.
 Each changed entity must supply the complete-key point at its finite valid start and a local timeline frontier over the same inherited relation and pin.
 The ordered writer enforces the inherited bounded-period schema and admits one assertion or tombstone per complete entity key.
+Root kind 6 lands a reviewed Proposal under the original live Root and Proposal holds.
+Its acceptance-valid writes may replace the same complete key in order after the first checked create or replacement.
+Every write occupies a separate assertion position, and the first write binds the original Root presence or absence for that key.
+The original held Proposal supplies its final local point check for the same key.
 Root kind 7 selects one exact hosted Proposal Drop with the original Proposal handle and zero world witnesses.
 It carries the original live Root handle, a matching witnessed acceptance-valid Root delete, and checked custody replacements plus the registered receipt.
 The ordered source compares the physical pin and held overlay clock before terminal registration.
