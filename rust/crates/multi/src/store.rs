@@ -86,6 +86,7 @@ pub struct CellStoreFactory {
     pub keys: Arc<dyn KeyService>,
     pub storage_namespaces: rtdb_directory::StorageNamespaces,
     pub(crate) hosted_task: Option<HostedTask>,
+    pub(crate) audience_source: Option<Uuid>,
     pub(crate) storage_regions: TaskTracker,
     pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
@@ -205,8 +206,8 @@ impl RemoteStorageFactory for CellStoreFactory {
         {
             return Err(Anomaly::incorrect("rtdb.multi/terminal-storage", "A terminal cell writer requires a scoped S3 role"));
         }
-        let audience_transport = matches!(&config.storage, CellStorage::S3 { .. });
         let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
+        let audience_writer = self.audience_writer(&config, &record).is_some();
         let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
@@ -253,6 +254,11 @@ impl RemoteStorageFactory for CellStoreFactory {
                 else { ReplayCustody::Hosted { owner: self.hosted_task.clone() } },
             );
             let (mut opened, audience_reads) = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery, custody).await?;
+            let audience_reads = audience_reads && audience_writer;
+            if audience_reads {
+                let packing = opened.packing.as_ref().expect("opened cell stores own their pack locations");
+                packing.prepare_audience_reads().await?;
+            }
             if let Some(expected) = record.recovery_manifest_sha256 {
                 let checkpoint = record.checkpoint.ok_or_else(|| storage_region_error("A recovery manifest has no checkpoint"))?;
                 let material = self.keys.existing_key(&record.key_id()).await?
@@ -270,7 +276,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             Ok::<_, Anomaly>((opened, audience_reads))
         }).await?;
         let store: Arc<dyn ObjectStore> = opened;
-        let audience = (audience_reads && audience_transport).then(|| Arc::clone(&store));
+        let audience = audience_reads.then(|| Arc::clone(&store));
         Ok(OpenedRecoveryStore { store, audience, blocks, checkpoint_metadata: Some(checkpoint_metadata), fragment_storage: Some(fragment_storage) })
     }
 
@@ -293,11 +299,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             None => self.enroll_serving_key(&config, &id).await?,
         };
         let ordinary = Arc::new(EncryptingStore::new(cached, &material)?);
-        let audience = audience.filter(|_| config.writer_epoch == Some(record.epoch)
-            && record.holder.is_some() && record.linearizable_reads && record.lifecycle == Lifecycle::Live
-            && !config.compactor && config.snapshot_block.is_none());
-        let source = Uuid::parse_str(&record.id).ok().filter(|source| !source.is_nil());
-        let audience = audience.zip(source).map(|(store, source)| {
+        let audience = audience.zip(self.audience_writer(&config, &record)).map(|(store, source)| {
             let store = Arc::new(AudienceObjectStore(EncryptingStore::new(store, &material)?));
             Ok::<_, Anomaly>(AudienceReadStorage { source, store })
         }).transpose()?;
@@ -306,6 +308,14 @@ impl RemoteStorageFactory for CellStoreFactory {
 }
 
 impl CellStoreFactory {
+    fn audience_writer(&self, config: &CellStoreConfig, record: &DeploymentRecord) -> Option<Uuid> {
+        self.audience_source.filter(|source| Uuid::parse_str(&record.id).ok() == Some(*source)
+            && matches!(&config.storage, CellStorage::S3 { .. })
+            && config.writer_epoch == Some(record.epoch) && record.holder.is_some()
+            && record.linearizable_reads && record.lifecycle == Lifecycle::Live
+            && !config.compactor && config.snapshot_block.is_none())
+    }
+
     async fn enroll_serving_key(&self, config: &CellStoreConfig, allow_id: &str) -> Result<[u8; crate::keys::KEY_BYTES]> {
         let unavailable = || Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/key-missing", "The serving key is unavailable");
         let record = self.directory.deployment(&config.deployment).await?
@@ -2025,7 +2035,7 @@ mod tests {
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, storage_regions: TaskTracker::new(),
-            scoped_writes: None, hosted_task: None, local_witnesses: None,
+            scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
         };
         for (writer_epoch, compactor) in [(Some(0), false), (None, true)] {
             let configuration = CellStoreConfig {
@@ -2051,7 +2061,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -2068,7 +2078,7 @@ mod tests {
         let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(), keys: keys.clone(), storage_namespaces,
-            storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None,
+            storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
         };
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
         record.epoch = 2;
@@ -2114,6 +2124,7 @@ mod tests {
         let factory = CellStoreFactory {
             directory, keys: keys.clone(), storage_namespaces, storage_regions: TaskTracker::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None,
+            audience_source: Some(Uuid::parse_str(&record.id).unwrap()),
         };
         let storage: CellStorage = serde_json::from_value(serde_json::json!({
             "kind": "s3",
@@ -2363,7 +2374,7 @@ mod tests {
             directory: directory.clone(),
             keys: keys.clone(),
             storage_regions: TaskTracker::new(),
-            local_witnesses: None,
+            local_witnesses: None, audience_source: None,
             storage_namespaces,
             scoped_writes: None,
             hosted_task: None,
@@ -2749,7 +2760,7 @@ mod tests {
         let tasks = TaskTracker::new();
         let storage_factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, hosted_task: None,
-            storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None,
+            storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None, audience_source: None,
         };
         let configuration = |snapshot_block| Any { type_url: String::new(), value: serde_json::to_vec(&CellStoreConfig {
             storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),

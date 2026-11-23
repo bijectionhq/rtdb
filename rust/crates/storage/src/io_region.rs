@@ -65,8 +65,8 @@ impl IoRegion {
     pub async fn audience_object_read<T>(work: impl std::future::Future<Output = T>) -> T {
         AUDIENCE_OBJECT_READ.scope((), work).await
     }
-    #[cfg(any(feature = "remote", test))]
-    pub(crate) fn requires_audience_transport() -> bool { AUDIENCE_OBJECT_READ.try_with(|_| ()).is_ok() }
+    /// Whether this storage operation must use the audience object path.
+    pub fn requires_audience_transport() -> bool { AUDIENCE_OBJECT_READ.try_with(|_| ()).is_ok() }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
     /// Idle child handles do not delay any drain.

@@ -5,6 +5,7 @@
 //! Every other write (compaction outputs, oversized payloads) goes straight through.
 //! The pack written with a block catalog is named after that block, and its index lists every pack written before it, so a store finds every pack by reading the latest block's, never listing.
 //! A store probes for newer block catalogs when asked for an object it does not know, so a reader finds packs its writer published after it opened.
+//! An audience writer loads locations before attachment and publishes new locations with the blocks its readers may capture.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -15,7 +16,7 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
-use rtdb_storage::{Error, ObjectKey, ObjectObservation, ObjectStore, StoredObject};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, StoredObject};
 use rtdb_types::PhysicalObjectVersion;
 use serde::{Deserialize, Serialize};
 
@@ -216,6 +217,12 @@ impl PackingStore {
         Ok(Some(publication.value))
     }
 
+    /// Loads the serving writer's pack locations before audience reads can start.
+    /// Later publications made by this writer register their locations before applying the new catalog.
+    pub(crate) async fn prepare_audience_reads(&self) -> rtdb_storage::Result<()> {
+        IoRegion::audience_object_read(self.refresh()).await
+    }
+
     async fn refresh(&self) -> rtdb_storage::Result<()> {
         let (discovery, latest) = { let state = self.state.lock(); (state.discovery, state.latest_block) };
         let start = match (discovery, latest) {
@@ -301,6 +308,9 @@ impl PackingStore {
             }
             return Ok(location);
         }
+        if IoRegion::requires_audience_transport() {
+            require_same_version(&location.pack, location.version.as_deref(), head.version.as_ref())?;
+        }
         // A fork's reference can move to its own copy. A new version at the same physical path cannot inherit the admitted index.
         require_pack_relocation(&location.pack, location.version.as_deref(), head.version.as_ref())?;
         let mut publication = read_pack_index(self.inner.as_ref(), &location.pack, head).await?;
@@ -314,6 +324,9 @@ impl PackingStore {
         let mut relocated = false;
         for (_, location) in &members {
             if location.version.as_deref() == head.version.as_ref() { continue; }
+            if IoRegion::requires_audience_transport() {
+                require_same_version(pack, location.version.as_deref(), head.version.as_ref())?;
+            }
             require_pack_relocation(pack, location.version.as_deref(), head.version.as_ref())?;
             relocated = true;
         }
@@ -362,7 +375,7 @@ impl PackingStore {
 
     async fn locate(&self, object: &ObjectKey) -> rtdb_storage::Result<Option<LocatedEntry>> {
         if let Some(found) = self.located(object) { return Ok(Some(found)); }
-        if packed(object.as_str()) { self.refresh().await?; }
+        if packed(object.as_str()) && !IoRegion::requires_audience_transport() { self.refresh().await?; }
         Ok(self.located(object))
     }
 }
@@ -379,6 +392,7 @@ fn key(name: &str) -> rtdb_storage::Result<ObjectKey> { ObjectKey::new(name).map
 impl ObjectStore for PackingStore {
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn head(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        if IoRegion::requires_audience_transport() { return Ok(self.observe_head(object).await?.value); }
         if let Some(bytes) = self.held(object) { return Ok(StoredObject { key: object.clone(), size: bytes.len() as u64 }); }
         match self.inner.head(object).await {
             Err(Error::MissingObject(missing)) => match self.locate(object).await? {
@@ -431,6 +445,7 @@ impl ObjectStore for PackingStore {
         self.inner.retirement_version(key).await
     }
     async fn get(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        if IoRegion::requires_audience_transport() { return self.get_fresh(object).await; }
         if let Some(bytes) = self.held(object) { return Ok(bytes); }
         if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Full).await.map(|read| read.value); }
         self.inner.get(object).await
@@ -449,7 +464,7 @@ impl ObjectStore for PackingStore {
         self.inner.observe_fresh_exact(key, length).await
     }
     async fn get_range(&self, object: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
-        if let Some(bytes) = self.held(object) {
+        if !IoRegion::requires_audience_transport() && let Some(bytes) = self.held(object) {
             if range.start > range.end || range.end > bytes.len() as u64 { return Err(Error::InvalidRange { key: object.to_string(), start: range.start, end: range.end, length: bytes.len() as u64 }); }
             return Ok(bytes.slice(range.start as usize..range.end as usize));
         }
@@ -522,6 +537,27 @@ pub(crate) mod tests {
     use rtdb_storage::MemoryStore;
 
     fn object(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
+
+    #[tokio::test]
+    async fn audience_reads_use_the_installed_pack_locations() {
+        let raw: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+        let earlier = object("tables/orders/data/l00-rc-b00.arrow");
+        let later = object("tables/orders/data/l00-rc-b01.arrow");
+        let bytes = Bytes::from_static(b"row");
+        let writer = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
+        writer.put(&earlier, bytes.clone()).await.unwrap();
+        writer.put(&catalog_key(0).unwrap(), Bytes::from_static(b"block zero")).await.unwrap();
+
+        let holder = PackingStore::open(raw, PackDiscovery::List).await.unwrap();
+        holder.prepare_audience_reads().await.unwrap();
+        assert_eq!(IoRegion::audience_object_read(holder.get_fresh_exact(&earlier, bytes.len())).await.unwrap(), bytes);
+
+        writer.put(&later, bytes.clone()).await.unwrap();
+        writer.put(&catalog_key(1).unwrap(), Bytes::from_static(b"block one")).await.unwrap();
+        assert!(matches!(IoRegion::audience_object_read(holder.get_fresh_exact(&later, bytes.len())).await,
+            Err(Error::MissingObject(_))));
+        assert_eq!(holder.get_fresh_exact(&later, bytes.len()).await.unwrap(), bytes);
+    }
 
     #[derive(Default)]
     pub(crate) struct VersionedPacks {

@@ -66,8 +66,8 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
-    let audience = settings.configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
-    if audience != settings.agent.audience_journal_port.is_some() || settings.agent.audience_journal_port == Some(0) {
+    let audience = settings.configuration.flight_sql.as_ref().and_then(|flight| flight.audience);
+    if audience.is_some() != settings.agent.audience_journal_port.is_some() || settings.agent.audience_journal_port == Some(0) {
         return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
             "An audience Flight listener and its read-only journal port must be installed together"));
     }
@@ -141,6 +141,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         storage_namespaces,
         scoped_writes: scoped_writes.clone(),
         hosted_task: settings.hosted_task,
+        audience_source: audience.map(|profile| profile.source()),
         storage_regions: storage_regions.clone(),
         local_witnesses,
     });
