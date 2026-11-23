@@ -35,9 +35,11 @@ The logkeeper and versioned object provider execute their respective effects.
 The reaper schedules retries while the durable intent remains present.
 
 The serving path now retains each offloaded tail or range delivery through its provider operation.
-The certified versioned-S3 path writes a durable release marker before advancing the directory trim anchor.
-The placement owner persists completion after all known journals durably acknowledge the same trim.
-The existing lineage reaper retires the exact publication and resumes interrupted settlement from its reservation.
+The certified versioned-S3 path installs exact candidates in the directory compare-and-swap that advances its admission frontier.
+The placement owner persists completion after every known physical journal returns a synchronous trim acknowledgement.
+Legacy and non-fsync journal replies cannot satisfy this step.
+The lineage reaper matches each release against that durable candidate and retries settlement against the same provider version.
+A bounded outstanding inventory stops trim before it loses unretired candidates.
 The opt-in rollout requires every serving and recovery reader to support the new envelope.
 Local objects, unversioned buckets and references without an exact publication witness stay outside this collection path.
 

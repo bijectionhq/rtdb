@@ -1540,6 +1540,8 @@ Deployment-scoped S3 credentials address the same cell-relative publication keys
 
 Enable `--replica-payload-reclamation` on the cell's writers after upgrading every serving and recovery reader to the same release.
 A new versioned S3 payload carries its exact provider version and an envelope format that requires the replay admission protocol.
-The holder certifies bounded ranges, publishes candidates before advancing the admission frontier, and records physical trim acknowledgements from every known journal before S3 retirement.
+The holder certifies bounded ranges and installs exact candidates with the directory admission frontier.
+Every known journal must acknowledge the trim using the fsync-backed protocol before S3 retirement.
+The reaper compares its release with the directory candidate and retains each intent through exact settlement.
 An unavailable journal defers physical settlement.
 Legacy, local, and unversioned payloads remain protected against age-based retirement.
