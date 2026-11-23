@@ -12,6 +12,8 @@ import subprocess
 import tarfile
 import tempfile
 
+from residence_trace import project
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -3213,8 +3215,31 @@ TLA_CASES = (
 )
 
 
+RESIDENCE_AUTHORITY_CONTROLS = (
+    ("accept_future_time", "BoundedAppend"),
+    ("unclamped_external", "ExternalClamp"),
+    ("reuse_names", "DistinctNamingEpoch"),
+    ("ignore_floor_readers", "FloorKeepsHeldCatalogs"),
+    ("rewind_receipt_clock", "ReceiptExpiry"),
+    ("collect_live_receipt", "ReceiptExpiry"),
+    ("replace_receipt_outcome", "ReceiptReplay"),
+    ("use_stale_index", "FreshCapture"),
+    ("ack_before_closure", "AcknowledgedClosure"),
+    ("arm_before_successor", "ErasureHasSuccessor"),
+    ("use_revoked_cache", "RevokedCacheClosed"),
+)
+RESIDENCE_AUTHORITY_CASES = (
+    ("ResidenceComposition", "residence-authorities",
+     ("ExtendAuthorities = FALSE", "ExtendAuthorities = TRUE"), None),
+    *(("ResidenceComposition", f"residence-{mutation.replace('_', '-')}",
+       ('Mutation = "none"\nCONSTANT ExtendAuthorities = FALSE\nINVARIANT Safe',
+        f'Mutation = "{mutation}"\nCONSTANT ExtendAuthorities = TRUE\nINVARIANT {invariant}'), invariant)
+      for mutation, invariant in RESIDENCE_AUTHORITY_CONTROLS),
+)
+
+
 def verify_tla(args, scratch):
-    for module, name, mutation, invariant in TLA_CASES:
+    for module, name, mutation, invariant in (*TLA_CASES, *RESIDENCE_AUTHORITY_CASES):
         case = f"tlc-{name}"
         directory = scratch / case
         clone_file(Path(f"verification/tla/{module}.tla"), directory)
@@ -3246,25 +3271,30 @@ def verify_tla(args, scratch):
             print(f"{case}: {states[1]} distinct states, no violation")
 
 
-def check_residence_trace(args, scratch, case, trace, refusal=None, disposal_effects_only=False):
+def check_residence_trace(args, scratch, case, trace, refusal=None, disposal_effects_only=False, *, extended=False):
     directory = scratch / case
     for module in ("ResidenceComposition", "ResidenceCompositionReplay"):
         clone_file(Path(f"verification/tla/{module}.tla"), directory)
     source = directory / "verification/tla/ResidenceCompositionReplay.tla"
-    encoded = ", ".join(f"<<{json.dumps(kind)}, {cut}, {json.dumps(publication)}>>" for kind, cut, publication in trace)
+    if not extended:
+        trace = [[kind, cut, publication, -1, "", -1] for kind, cut, publication in trace]
+    encoded = ", ".join("<<" + ", ".join(json.dumps(field) for field in event) + ">>" for event in trace)
     mode = "TRUE" if disposal_effects_only else "FALSE"
     source.with_name("ResidenceCompositionEvents.tla").write_text(
         "---- MODULE ResidenceCompositionEvents ----\nEXTENDS Integers\n"
         f"Events == <<{encoded}>>\nDisposalEffectsOnly == {mode}\n====\n"
     )
     config = source.with_suffix(".cfg")
-    config.write_text("SPECIFICATION TraceSpec\nCONSTANT Mutation = \"none\"\nINVARIANT Safe\nPROPERTY ReplayTerminates\n")
-    checked = run_case(
-        [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
-         "-workers", "1", "-metadir", str(directory / "states"), "-noGenerateSpecTE",
-         "-config", config.name, source.name],
-        source.parent, args.evidence, case,
-    )
+    authorities = "TRUE" if extended else "FALSE"
+    config.write_text('SPECIFICATION TraceSpec\nCONSTANT Mutation = "none"\n'
+                      f"CONSTANT ExtendAuthorities = {authorities}\nINVARIANT Safe\nPROPERTY ReplayTerminates\n")
+    with tempfile.TemporaryDirectory(prefix="states-", dir=directory) as metadir:
+        checked = run_case(
+            [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
+             "-workers", "1", "-metadir", metadir, "-noGenerateSpecTE",
+             "-config", config.name, source.name],
+            source.parent, args.evidence, case,
+        )
     if refusal is None:
         if checked.returncode or "No error has been found." not in checked.stdout:
             raise ValueError(f"{case}: accepted trace did not reach its terminal state")
@@ -3299,6 +3329,70 @@ def verify_residence_trace(args, scratch, events, disposal_effects_only=False):
         reordered = list(events)
         reordered[left], reordered[right] = reordered[right], reordered[left]
         check_residence_trace(args, scratch, f"{prefix}-{name}", reordered, min(left, right), disposal_effects_only)
+
+
+def verify_composed_residence_trace(args, scratch):
+    from copy import deepcopy
+
+    observed = json.loads((ROOT / "verification/traces/residence-authorities.json").read_text())
+    events = project(observed)
+    check_residence_trace(args, scratch, "tlc-residence-authorities-trace", events, extended=True)
+    positions = {}
+    for index, event in enumerate(events):
+        positions.setdefault(event[0], index)
+    swaps = {
+        "uncovered-acknowledgement": ("acknowledge", "publish-checkpoint"),
+        "successor-missing": ("arm-erasure", "publish-checkpoint"),
+        "retained-catalog": ("advance-floor", "drain-provider-read"),
+        "retained-suffix": ("trim", "finish-recovery"),
+        "uncopied-fork": ("erase-residence", "copy-fork"),
+    }
+    for name, (first, second) in swaps.items():
+        left, right = positions[first], positions[second]
+        reordered = list(events)
+        reordered[left], reordered[right] = reordered[right], reordered[left]
+        check_residence_trace(args, scratch, f"tlc-residence-authorities-{name}", reordered, min(left, right), extended=True)
+
+    replacements = {
+        "future-time": ("attempt-outcome", 1, 3),
+        "rewound-receipt-clock": ("receipt-clock", 3, 2),
+        "reused-naming-epoch": ("install", 3, 0),
+        "early-receipt-collection": ("collect-receipt", 1, 2),
+        "changed-receipt": ("redeem-receipt", 4, "accepted"),
+        "stale-loglet": ("capture-fresh", 3, 0),
+        "revoked-cache": ("read-old-cache", 4, "page"),
+        "wrong-retirement": ("remove-version", 2, "new"),
+    }
+    for name, (kind, field, value) in replacements.items():
+        altered = [event.copy() for event in events]
+        index = positions[kind]
+        altered[index][field] = value
+        check_residence_trace(args, scratch, f"tlc-residence-authorities-{name}", altered, index, extended=True)
+
+    external = [event.copy() for event in events]
+    index = positions["attempt-outcome"]
+    external[index][1:3] = [3, "external"]
+    external[index][5] = 2
+    check_residence_trace(args, scratch, "tlc-residence-authorities-external-clamp", external, extended=True)
+    external[index][5] = 3
+    check_residence_trace(args, scratch, "tlc-residence-authorities-unclamped", external, index, extended=True)
+
+    for kind, field, value in (
+        ("capture-fresh", "loglet", "unknown-ensemble"),
+        ("revoke-key", "key_slot", "different-key"),
+        ("remove-version", "publication", {"key": "outside", "version": "replacement", "epoch": 0}),
+        ("copy-fork", "destination", "another-fork"),
+        ("collect-receipt", "attempt", "other-attempt"),
+    ):
+        altered = deepcopy(observed)
+        altered["events"][positions[kind]][field] = value
+        try:
+            project(altered)
+        except ValueError as error:
+            if f"observation {positions[kind] + 1}:" not in str(error):
+                raise
+        else:
+            raise ValueError(f"the trace projection accepted a substituted {field}")
 
 
 def verify_alloy(args, scratch):
@@ -5833,6 +5927,7 @@ def main():
         verify_lean(args, directory)
         verify_tla(args, directory)
         verify_residence_trace(args, directory, json.loads((ROOT / "verification/traces/residence-composition.json").read_text()))
+        verify_composed_residence_trace(args, directory)
         verify_verus(args, directory)
         if args.openjml:
             verify_jvm_leaf_merge(args, directory)

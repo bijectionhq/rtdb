@@ -35,9 +35,12 @@ struct LogletReadIndex { log: Arc<QuorumLog>, epoch: u64 }
 #[async_trait]
 impl ReplicaReadIndex for LogletReadIndex {
     async fn confirm(&self) -> Result<LogOffset> {
-        tokio::time::timeout(READ_INDEX_WITHIN, self.log.read_index(self.epoch)).await
-            .map_err(|_| Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/read-index-timeout", "Logkeepers did not confirm a read index in time"))?
-            .map_err(Into::into)
+        let index = tokio::time::timeout(READ_INDEX_WITHIN, self.log.read_index(self.epoch)).await
+            .map_err(|_| Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/read-index-timeout", "Logkeepers did not confirm a read index in time"))??;
+        crate::residence_trace::record("read-index", || serde_json::json!({
+            "stream": index.stream(), "epoch": index.epoch(), "ensemble": index.ensemble(), "through": index.through().0,
+        }));
+        Ok(index.through())
     }
 }
 
@@ -453,7 +456,9 @@ impl Log for SealedLog {
     }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
-        self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await
+        let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
+        let receipt = self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await?;
+        Ok(observe_attempt(receipt, outcome))
     }
     async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         self.inner.enqueue_maintenance(self.cipher.seal(&self.stream, &payload)?, timestamp).await
@@ -462,7 +467,9 @@ impl Log for SealedLog {
         self.inner.available_append_capacity().await
     }
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
-        self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await
+        let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
+        let receipt = self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await?;
+        Ok(observe_attempt(receipt, outcome))
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
     async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }
@@ -488,6 +495,15 @@ impl Log for SealedLog {
         if let Some(admission) = &self.recovery { admission.retain_offloaded(&mut records).await?; }
         Ok(records)
     }
+}
+
+fn observe_attempt(receipt: AppendReceipt, outcome: Option<crate::residence_trace::AttemptOutcome>) -> AppendReceipt {
+    let Some(outcome) = outcome else { return receipt; };
+    AppendReceipt::observed(async move {
+        let metadata = receipt.durable().await?;
+        outcome.observe(metadata);
+        Ok(metadata)
+    })
 }
 
 struct SealedTail {

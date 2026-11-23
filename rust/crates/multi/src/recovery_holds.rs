@@ -79,7 +79,12 @@ impl RecoveryAdmission {
             if attempted {
                 loop {
                     match crate::store::release_region(worker.holds.directory.as_ref(), &worker.deployment, id, !opened).await {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            crate::residence_trace::record("finish-recovery", || serde_json::json!({
+                                "installation": worker.deployment, "stream": worker.stream, "epoch": worker.log_epoch, "hold": id,
+                            }));
+                            break;
+                        }
                         Err(error) => eprintln!("Recovery hold {id} for {} is pending release: {}", worker.deployment, error.code),
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -134,7 +139,11 @@ impl RecoveryAdmission {
             let version = record.version;
             record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required, custody: self.holds.custody.clone() });
             *attempted = true;
-            if let Cas::Applied(_) = self.holds.directory.replace_deployment(record, version).await.map_err(|error| self.directory_error(error))? {
+            if let Cas::Applied(stored) = self.holds.directory.replace_deployment(record, version).await.map_err(|error| self.directory_error(error))? {
+                crate::residence_trace::record("admit-recovery", || serde_json::json!({
+                    "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation, "revision": stored.version,
+                    "stream": self.stream, "epoch": self.log_epoch, "hold": id, "first_required": first_required,
+                }));
                 return Ok(());
             }
         }

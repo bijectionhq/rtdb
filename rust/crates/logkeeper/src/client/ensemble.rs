@@ -76,6 +76,8 @@ impl Ensemble {
 
     pub fn stream(&self) -> String { self.config.stream.clone() }
 
+    pub(super) fn identity(&self) -> &Bytes { &self.identity }
+
     pub fn supports_guarded(&self) -> bool {
         self.config.write_quorum > self.len() - self.config.write_quorum
             && self.config.servers.iter().all(|server| server.journal().is_some())

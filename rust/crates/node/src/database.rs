@@ -91,25 +91,49 @@ impl Database {
     }
 
     pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
-        let Some(read_index) = &self.replica_read_index else { return Ok(()); };
-        let behind = || Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
-            format!("This replica of {} could not establish a fresh snapshot", self.name));
+        self.with_confirmed_replica(cancellation, |_| Ok(())).await
+    }
+
+    pub(crate) async fn capture_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<rtdb_index::Snapshot> {
+        self.with_confirmed_replica(cancellation, |confirmed| {
+            let snapshot = self.partition.snapshot();
+            if confirmed.is_some_and(|position| !snapshot.catalog_cut().is_some_and(|cut| {
+                cut.replica_epoch == self.logs.replica_epoch && cut.through >= position
+            })) {
+                return Err(self.replica_behind());
+            }
+            Ok(snapshot)
+        }).await
+    }
+
+    fn replica_behind(&self) -> Anomaly {
+        Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
+            format!("This replica of {} could not establish a fresh snapshot", self.name))
+    }
+
+    async fn with_confirmed_replica<T>(&self, cancellation: &CancellationToken,
+        capture: impl FnOnce(Option<ReplicaPosition>) -> Result<T>,
+    ) -> Result<T> {
+        let Some(read_index) = &self.replica_read_index else { return capture(None); };
         let confirm = async {
-            let barrier = read_index.protect().await.map_err(|error| behind().with_context("cause", error.code.into()))?;
+            let barrier = read_index.protect().await.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
             let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?;
+            let confirmed = (barrier.offset.0 != -1).then_some(position);
             let mut status = self.watch_status();
             let applied = status.wait_for(|status| status.role == Role::Stopped
-                || barrier.offset.0 == -1
-                || status.installed.is_some_and(|prefix| prefix.replica >= position));
-            let status = tokio::time::timeout(barrier.wait, applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
-            if status.role == Role::Stopped { return Err(behind()); }
+                || confirmed.is_none_or(|position| status.installed.is_some_and(|prefix| prefix.replica >= position)));
+            let status = tokio::time::timeout(barrier.wait, applied).await
+                .map_err(|_| self.replica_behind())?.map_err(|_| self.replica_behind())?;
+            if status.role == Role::Stopped { return Err(self.replica_behind()); }
+            drop(status);
+            let captured = capture(confirmed);
             drop(barrier);
-            Ok(())
+            captured
         };
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
-            _ = self.cancellation.cancelled() => Err(behind()),
+            _ = self.cancellation.cancelled() => Err(self.replica_behind()),
             result = confirm => result,
         }
     }

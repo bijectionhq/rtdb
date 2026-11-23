@@ -677,7 +677,9 @@ contract LogService {
         -- Unobserved journal slots count as possible holders, so each additional positive reply can rule out a minority tail.
         -- A published position or a position held by a full observed quorum can discharge that uncertainty.
         -- If the round cannot settle the uncertainty within its confirmation grace, it returns the conservative bound.
-        -- A subscriber waits for committed application through the result before taking its query snapshot.
+        -- The active loglet client carries the stream, epoch, ensemble identity and position together in its admitted read index.
+        -- A subscriber waits for committed application through the result before taking its query snapshot on the same attachment.
+        -- Fresh basis capture retains the read's protection until the partition snapshot is taken.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
@@ -725,6 +727,7 @@ contract ObjectStorage {
     @invariant OnlyTheReaperDeletes
         -- No node, gateway or worker holds a credential that can delete.
         -- The reaper deletes objects after a reachability release or a completed ordered-page retirement fence.
+        -- Directory-managed exact removal consumes a grant obtained from the lineage revision authorizing the same retirement token and publications.
 
     @invariant VisibilityIsByReference
         -- An object has effect only once a committed log record or a published manifest references it.

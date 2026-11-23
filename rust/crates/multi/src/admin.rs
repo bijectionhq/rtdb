@@ -610,7 +610,7 @@ pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorag
                 let stream = administration_stream(directory.as_ref(), &current, maximum_message_bytes.max(4 << 20)).await?;
                 tokio::time::timeout(CONTROL_TIMEOUT, async {
                     let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
-                    let through = reader.read_index(current.epoch).await?;
+                    let through = reader.read_index(current.epoch).await?.through();
                     let reader = crate::logs::SealedLog::new(reader, &material, &current.replica_seal_scope())?;
                     crate::logs::transactions_until(&reader, &store, &catalog, checkpoint.boundary, through, system_time).await
                 }).await.map_err(|_| fork_unavailable(parent))?

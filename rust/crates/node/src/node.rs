@@ -3638,10 +3638,15 @@ impl SessionService for NativeSessionService {
         Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
     async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken) -> Result<TimeBasis> {
-        if self.node.catalog.is_placed() {
-            self.database()?.confirm_replica_snapshot(cancellation).await?;
+        if !self.node.catalog.is_placed() { return self.snapshot_basis(); }
+        self.node.ensure_open()?;
+        let database = self.database()?;
+        let snapshot = database.capture_replica_snapshot(cancellation).await?;
+        if !Arc::ptr_eq(&database, &self.database()?) {
+            return Err(hosted_source_unavailable());
         }
-        self.snapshot_basis()
+        let time = snapshot.tx_basis().map(|key| key.system_time.into());
+        Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }

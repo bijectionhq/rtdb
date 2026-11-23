@@ -1365,7 +1365,15 @@ impl NodeAgent {
             next.checkpoint = Some(checkpoint);
             next.recovery_manifest_sha256 = Some(digest);
             match self.directory.replace_deployment(next, record.version).await? {
-                Cas::Applied(stored) => return Ok(Some((stored, checkpoint))),
+                Cas::Applied(stored) => {
+                    crate::residence_trace::record("publish-checkpoint", || serde_json::json!({
+                        "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
+                        "revision": stored.version, "writer_epoch": stored.epoch, "epoch": stored.log_epoch,
+                        "stream": stored.stream("replica"), "block": checkpoint.block, "through": checkpoint.boundary,
+                        "root": checkpoint.root_sha256, "manifest": digest,
+                    }));
+                    return Ok(Some((stored, checkpoint)));
+                }
                 Cas::Conflict(Some(current)) => record = current,
                 Cas::Conflict(None) => return Err(deposed()),
             }

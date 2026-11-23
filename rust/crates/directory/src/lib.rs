@@ -1273,7 +1273,7 @@ fn fork_conflict() -> Anomaly {
 
 mod reference_revision;
 mod lineage;
-pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
+pub use lineage::{ExactRetirementGrant, ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
 use lineage::{StoredLineage, lineage_busy};
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";

@@ -155,7 +155,10 @@ Retirement of every earlier copy remains open.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
-|Planned
+|Fresh snapshot capture retains the exact read index through capture, and hosted exact removal consumes a lineage deletion grant.
+The shared model and replay cover the R1–R8 authority transitions in a bounded residence.
+Multi records scoped native observations for diagnostic validation.
+Full storage-read and recovery-acknowledgement capability coverage, cross-owner native replay and execution evidence remain open.
 |===
 
 == Placed serving and search

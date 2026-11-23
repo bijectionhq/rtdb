@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use async_trait::async_trait;
-use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
+use rtdb_directory::{DeploymentRecord, Directory, ExactRetirementGrant, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
 use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget, StorageEpoch, TerminalObjectPublication};
@@ -207,16 +207,23 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
     };
     let target = ObjectKey::new(target)?;
     let release = ObjectKey::new(release)?;
-    if !state.exact_erasure_authorized() {
+    let authorized;
+    let grant = if let Some(grant) = state.exact_retirement_grant(retirement) {
+        grant
+    } else {
         let ready = prepare(directory, bucket, provider, lineage, retirement, &target, &release, keys, threshold).await;
         match ready {
             Ok(Some(owner_version)) => {
-                if let Err(error) = directory.authorize_owned_retirement(deployment, owner_version, retirement.clone()).await {
-                    if directory.lineage_state(lineage).await?.retirement() != Some(retirement) {
-                        super::release_region(directory, deployment, retirement.token, false).await?;
+                authorized = match directory.authorize_owned_retirement(deployment, owner_version, retirement.clone()).await {
+                    Ok(authorized) => authorized,
+                    Err(error) => {
+                        if directory.lineage_state(lineage).await?.retirement() != Some(retirement) {
+                            super::release_region(directory, deployment, retirement.token, false).await?;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
+                };
+                authorized.exact_retirement_grant(retirement).ok_or_else(changed)?
             }
             outcome => {
                 directory.change_lineage(lineage, LineageChange::AbandonExactRetirement { retirement: retirement.clone() }).await?;
@@ -224,18 +231,8 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
                 return outcome.map(|_| false);
             }
         }
-    }
-    match &retirement.work {
-        RetirementWork::S3 { version, release_version, .. } => {
-            provider.erase(&target, version).await?;
-            if let Some(release_version) = release_version { provider.erase(&release, release_version).await?; }
-        }
-        RetirementWork::Tombstones { data_tombstone, release_tombstone, .. } => {
-            let journal = TombstoneJournal::new(directory, lineage, retirement.token);
-            provider.retire_tombstones(&journal, [(&target, data_tombstone), (&release, release_tombstone)]).await?;
-        }
-        _ => return Err(changed()),
-    }
+    };
+    erase_granted(directory, provider, lineage, grant).await?;
     // An already-authorized legacy attempt can settle its data version. The
     // release remains for a new pass to identify and settle by exact version.
     settle(directory, lineage, deployment, retirement).await?;
@@ -243,6 +240,39 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
         forget_settled_replica_candidate(directory, deployment, &target, version).await?;
     }
     Ok(true)
+}
+
+async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvider, lineage: &str, grant: ExactRetirementGrant<'_>) -> Result<()> {
+    let retirement = grant.retirement();
+    match &retirement.work {
+        RetirementWork::S3 { target, release, version, release_version, .. } => {
+            let target = ObjectKey::new(target)?;
+            let release = ObjectKey::new(release)?;
+            for (key, publication) in std::iter::once((&target, version)).chain(release_version.iter().map(|version| (&release, version))) {
+                let observed = || serde_json::json!({
+                    "lineage": lineage, "revision": grant.revision(), "residence": retirement.source, "retirement": retirement.token,
+                    "key": key.as_str(), "publication": publication,
+                });
+                crate::residence_trace::record("authorize-version", observed);
+                provider.erase(key, publication).await?;
+                crate::residence_trace::record("remove-version", observed);
+            }
+        }
+        RetirementWork::Tombstones { target, release, data_tombstone, release_tombstone, .. } => {
+            let target = ObjectKey::new(target)?;
+            let release = ObjectKey::new(release)?;
+            let journal = TombstoneJournal::new(directory, lineage, retirement.token);
+            let observed = || serde_json::json!({
+                "lineage": lineage, "revision": grant.revision(), "residence": retirement.source, "retirement": retirement.token,
+                "key": target.as_str(), "release": release.as_str(), "data": data_tombstone, "marker": release_tombstone,
+            });
+            crate::residence_trace::record("authorize-tombstones", observed);
+            provider.retire_tombstones(&journal, [(&target, data_tombstone), (&release, release_tombstone)]).await?;
+            crate::residence_trace::record("remove-tombstones", observed);
+        }
+        _ => return Err(changed()),
+    }
+    Ok(())
 }
 
 fn replica_payload_store(owner: &DeploymentRecord) -> Result<String> {
