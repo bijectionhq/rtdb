@@ -26,8 +26,21 @@ impl OpenTransaction<'_> {
         let storage = relation.fixed_range_table(owner);
         let snapshot = self.snapshot()?;
         let table = relation.table(owner);
-        if snapshot.contains_table(&storage)
-            || snapshot.relation_event_frontier(&table)? != 0
+        if snapshot.contains_table(&storage) {
+            let context = self.context.query_context(
+                snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+            )?;
+            let current = rtdb_query::read_owned_fixed_range_rule(context, owner, relation).await?;
+            return if current.as_ref() == Some(&rule) {
+                Ok(())
+            } else {
+                Err(Anomaly::incorrect(
+                    "rtdb.owned/fixed-range-bootstrap",
+                    "The owned fixed range already has another rule",
+                ))
+            };
+        }
+        if snapshot.relation_event_frontier(&table)? != 0
             || !snapshot.trie_entries(&table).is_empty()
         {
             return Err(Anomaly::incorrect(
