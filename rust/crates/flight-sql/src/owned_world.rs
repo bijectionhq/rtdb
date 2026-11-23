@@ -125,7 +125,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn version<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId,
         from: Timestamp, through: Timestamp, group: Timestamp,
-    ) -> BoxFuture<'a, Result<Vec<(Interval, WorldPointResult)>>>;
+    ) -> BoxFuture<'a, Result<(Timestamp, Vec<(Interval, WorldPointResult)>)>>;
     fn path_touch<'a>(
         &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
         before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,

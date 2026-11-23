@@ -178,7 +178,7 @@ pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V1: &str = "rtdb.owned.OpenAppliedRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
-pub(crate) const HELD_WORLD_VERSION_V1: &str = "rtdb.owned.ReadHeldWorldVersion.v1";
+pub(crate) const HELD_WORLD_VERSION_V2: &str = "rtdb.owned.ReadHeldWorldVersion.v2";
 pub(crate) const HELD_WORLD_TOUCH_IMAGES_V1: &str = "rtdb.owned.ReadHeldWorldTouchImages.v1";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
@@ -1237,10 +1237,13 @@ impl Service {
         let (id, _identity) = point_identity(call, batch)?;
         let from = history_request_endpoint(batch, "system_from_micros")?;
         let through = history_request_endpoint(batch, "system_to_micros")?;
-        let slices = held.snapshot.version(&relation, &id, from, through, group).await.map_err(status)?;
+        let (clock, slices) = held.snapshot.version(&relation, &id, from, through, group).await.map_err(status)?;
         if slices.len() > 128 { return Err(history_invalid()); }
         let _framing = call.reserve(wire::mul(slices.len() + 1, 256)?)?;
-        let header = ActionResult { body: wire::retain(group.0.to_be_bytes().to_vec(), call.reserve(8)?) };
+        let mut header = Vec::with_capacity(16);
+        header.extend_from_slice(&group.0.to_be_bytes());
+        header.extend_from_slice(&clock.0.to_be_bytes());
+        let header = ActionResult { body: wire::retain(header, call.reserve(16)?) };
         let mut bytes = header.encoded_len();
         let mut replies = vec![Ok(header)];
         let mut last = Timestamp::MIN;

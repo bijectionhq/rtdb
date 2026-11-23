@@ -557,7 +557,7 @@ impl HeldCheckpointWorld {
 
     pub async fn version(
         &self, relation: &OwnedRelation, id: &EntityId, from: Timestamp, through: Timestamp, group: Timestamp,
-    ) -> Result<Vec<(Interval, WorldFact, bool)>> {
+    ) -> Result<(Timestamp, Vec<(Interval, WorldFact, bool)>)> {
         self.check_relation(relation)?;
         let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
         if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
@@ -566,6 +566,9 @@ impl HeldCheckpointWorld {
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         self.require_archive_coverage(vec![(relation.clone(), 0)], Arc::clone(&guard)).await?;
         self.open.snapshot.check_point_purge_floor(relation, id, self.parent_basis().system_time).await?;
+        let clock = self.open.snapshot.certify_world_accepted_scope(
+            &self.open.record, std::slice::from_ref(relation), group,
+        ).await?;
         let version = self.open.snapshot.world_version(self.open.record.id, relation, id, from, through, group).await?;
         let valid = Interval::ALL;
         let local = read_boundaries(version.boundaries().await?, valid).await?;
@@ -598,7 +601,7 @@ impl HeldCheckpointWorld {
         }
         guard()?;
         self.check_relation(relation)?;
-        Ok(slices)
+        Ok((clock, slices))
     }
 
     async fn archive_boundaries(

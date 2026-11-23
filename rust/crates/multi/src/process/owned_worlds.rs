@@ -230,12 +230,12 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn version<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId,
         from: Timestamp, through: Timestamp, group: Timestamp,
-    ) -> BoxFuture<'a, Result<Vec<(Interval, WorldPointResult)>>> {
+    ) -> BoxFuture<'a, Result<(Timestamp, Vec<(Interval, WorldPointResult)>)>> {
         Box::pin(async move {
-            let slices = HeldCheckpointWorld::version(self, relation, id, from, through, group).await?;
-            Ok(slices.into_iter().map(|(valid, fact, shadowed)| {
+            let (clock, slices) = HeldCheckpointWorld::version(self, relation, id, from, through, group).await?;
+            Ok((clock, slices.into_iter().map(|(valid, fact, shadowed)| {
                 (valid, path_touch_result(group, (Some(fact), shadowed)))
-            }).collect())
+            }).collect()))
         })
     }
 
