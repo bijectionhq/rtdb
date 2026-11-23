@@ -1,5 +1,5 @@
 use std::borrow::{Borrow, Cow};
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -10,6 +10,19 @@ use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, Tabl
 use crate::BlockStore;
 use crate::blocks::validate_uploaded_root;
 use crate::driver::artefact_entries;
+
+#[macro_use]
+#[path = "replay_closure_algorithm.rs"]
+mod replay_closure_algorithm;
+
+macro_rules! each_replay_input {
+    ($keys:ident, $items:expr, $item:ident => $body:block, [$($spec:tt)*]) => {
+        for $item in $items $body
+    };
+}
+
+type Slugs = BTreeMap<TableRef, BTreeSet<TableSlug>>;
+type AdoptedCatalogs = BTreeMap<BlockIndex, BlockCatalog>;
 
 /// The installed checkpoint that a replica suffix replays onto, and the storage root its objects live under.
 #[derive(Clone, Copy, Debug)]
@@ -42,16 +55,7 @@ pub fn checkpoint_dependencies(catalog: &BlockCatalog, tables: &BTreeMap<TableRe
 pub(crate) fn checkpoint_files(
     catalog: &BlockCatalog, tables: &BTreeMap<TableRef, TableBlock>, contents: CheckpointContents,
 ) -> Result<BTreeSet<ObjectKey>> {
-    let block = catalog.block_index();
-    let mut keys = BTreeSet::from([ObjectKey::new(block_key(block)?)?]);
-    for entry in catalog.table_entries()? {
-        let table = tables.get(&entry.table).ok_or_else(|| invalid("A checkpoint table has no table block"))?;
-        keys.insert(ObjectKey::new(entry.slug.block_key(block)?)?);
-        for file in table.checkpoint_trie_files(&entry, contents)? {
-            keys.insert(ObjectKey::new(file)?);
-        }
-    }
-    Ok(keys)
+    checkpoint_dependency_keys!(catalog, tables, contents; each_replay_input)
 }
 
 /// Every object that replaying the admitted suffix onto `base` can read, beyond the base checkpoint's own dependencies.
@@ -61,93 +65,68 @@ pub(crate) fn checkpoint_files(
 pub async fn tail_dependencies<E: Borrow<ReplicaEnvelope>>(base: ReplayBase<'_>, suffix: impl IntoIterator<Item = E>,
     sources: &dyn ReplayDependencySources) -> Result<BTreeSet<ObjectKey>> {
     let suffix = suffix.into_iter().collect::<Vec<_>>();
-    let mut keys = BTreeSet::new();
-    let mut bodies = Vec::with_capacity(suffix.len());
-    for envelope in &suffix {
-        let envelope = envelope.borrow();
-        match envelope.oversized_payload(base.storage_version, base.storage_epoch)? {
-            Some(path) => {
-                let key = ObjectKey::new(path)?;
-                let payload = sources.oversized_payload(&key).await?;
-                bodies.push(Cow::Owned(envelope.unwrap_payload(&payload)?.message));
-                keys.insert(key);
-            }
-            None => bodies.push(Cow::Borrowed(&envelope.message)),
-        }
+    macro_rules! each_resolved {
+        ($keys:ident, $bodies:ident, $items:expr, $item:ident => $body:block) => { for $item in $items $body };
     }
-
-    let mut slugs = BTreeMap::<TableRef, BTreeSet<TableSlug>>::new();
-    let mut record_slugs = |catalog: &BlockCatalog| -> Result<()> {
-        for entry in catalog.table_entries()? { slugs.entry(entry.table).or_default().insert(entry.slug); }
-        Ok(())
-    };
-    if let Some(checkpoint) = base.checkpoint { record_slugs(checkpoint)?; }
-    let mut adopted = BTreeMap::new();
-    for upload in bodies.iter().filter_map(|body| adopted_upload(&base, body)) {
-        let block = BlockIndex(upload.block_index.unwrap_or_default());
-        let catalog = match adopted.entry(block) {
-            Entry::Occupied(adopted) => adopted.into_mut(),
-            Entry::Vacant(slot) => {
-                let (catalog, tables) = sources.adopted_checkpoint(block).await?;
-                if catalog.block_index() != block { return Err(invalid("An adopted checkpoint has another block index")); }
-                keys.append(&mut checkpoint_dependencies(&catalog, &tables)?);
-                record_slugs(&catalog)?;
-                slot.insert(catalog)
-            }
+    macro_rules! each_adopted {
+        ($keys:ident, $slugs:ident, $adopted:ident, $items:expr, $base:ident, $item:ident => $body:block) => { for $item in $items $body };
+    }
+    macro_rules! each_body {
+        ($keys:ident, $slugs:ident, $items:expr, $item:ident => $body:block, [$($spec:tt)*]) => { for $item in $items $body };
+    }
+    macro_rules! borrow_envelope { ($item:ident) => { $item.borrow() }; }
+    macro_rules! read_payload { ($key:expr) => { sources.oversized_payload($key).await }; }
+    macro_rules! resolve {
+        ($envelope:ident, $base:ident, $keys:ident, $bodies:ident) => {
+            oversized_dependency!($envelope, $base, $keys, $bodies, read_payload)
         };
-        validate_uploaded_root(catalog, upload, false)?;
     }
-
-    for body in &bodies {
-        match body.as_ref() {
-            ReplicaBody::BlockUploaded(upload) => {
-                if adopted_upload(&base, body).is_some() { added_trie_keys(&slugs, &upload.tries, &mut keys)?; }
-            }
-            ReplicaBody::TriesAdded(message) => {
-                if same_storage(&base, message.storage_version, message.storage_epoch) { added_trie_keys(&slugs, &message.tries, &mut keys)?; }
-            }
-            ReplicaBody::ArtefactsAdded(message) => {
-                if same_storage(&base, message.storage_version, message.storage_epoch)
-                    && let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())
-                {
-                    for slug in table_slugs(&slugs, &table)? {
-                        for (trie, record) in artefact_entries(&message.entries) {
-                            if let Some(key) = replay_artefact_file(slug, &trie, &record)? {
-                                keys.insert(ObjectKey::new(key)?);
-                            }
-                        }
-                    }
-                }
-            }
-            ReplicaBody::ResolvedTx(_) | ReplicaBody::NoOp(_) | ReplicaBody::BlockBoundary(_)
-                | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsRemoved(_) => {}
-            ReplicaBody::OversizedMessage(_) => return Err(invalid("An oversized payload holds another oversized message")),
-        }
-    }
-    Ok(keys)
+    macro_rules! read_catalog { ($block:expr) => { sources.adopted_checkpoint($block).await }; }
+    tail_dependency_keys!(base, suffix, base.checkpoint;
+        each_resolved, each_adopted, each_body, borrow_envelope, resolve, read_catalog)
 }
 
-fn adopted_upload<'a>(base: &ReplayBase<'_>, body: &'a ReplicaBody) -> Option<&'a proto::BlockUploaded> {
-    let ReplicaBody::BlockUploaded(upload) = body else { return None; };
-    let installed = base.checkpoint.map_or(-1, |checkpoint| checkpoint.block_index().0);
-    (same_storage(base, upload.storage_version, upload.storage_epoch) && upload.block_index.unwrap_or_default() > installed).then_some(upload)
-}
-
-fn same_storage(base: &ReplayBase<'_>, version: Option<i32>, epoch: Option<i32>) -> bool {
-    StorageVersion(version.unwrap_or_default()) == base.storage_version && StorageEpoch(epoch.unwrap_or_default()) == base.storage_epoch
-}
-
-fn added_trie_keys(slugs: &BTreeMap<TableRef, BTreeSet<TableSlug>>, tries: &[proto::TrieDetails], keys: &mut BTreeSet<ObjectKey>) -> Result<()> {
-    for trie in tries {
-        let table = legacy_table_ref(trie.table_name.as_deref().unwrap_or_default())?;
-        for slug in table_slugs(slugs, &table)? {
-            for file in trie.checkpoint_files(slug, CheckpointContents::Replay)? { keys.insert(ObjectKey::new(file)?); }
-        }
+fn record_slugs(slugs: &mut Slugs, catalog: &BlockCatalog) -> Result<()> {
+    macro_rules! insert {
+        ($slugs:ident, $entry:ident) => { $slugs.entry($entry.table).or_default().insert($entry.slug) };
     }
+    record_catalog_slugs!(slugs, catalog; each_replay_input, insert)
+}
+
+fn adopt_catalog(catalog: &BlockCatalog, tables: &BTreeMap<TableRef, TableBlock>, keys: &mut BTreeSet<ObjectKey>, block: BlockIndex) -> Result<()> {
+    adopt_dependency!(catalog, tables, keys, block);
     Ok(())
 }
 
-fn table_slugs<'a>(slugs: &'a BTreeMap<TableRef, BTreeSet<TableSlug>>, table: &TableRef) -> Result<&'a BTreeSet<TableSlug>> {
+fn record_dependency_keys(base: ReplayBase<'_>, body: &ReplicaBody, slugs: &Slugs, keys: &mut BTreeSet<ObjectKey>) -> Result<()> {
+    record_dependency_keys!(base, body, slugs, keys; each_replay_input);
+    Ok(())
+}
+
+fn upload_block(upload: &proto::BlockUploaded) -> BlockIndex { BlockIndex(upload.block_index.unwrap_or_default()) }
+
+fn adopted_upload<'a>(base: &ReplayBase<'_>, body: &'a ReplicaBody) -> Option<&'a proto::BlockUploaded> {
+    let installed = base.checkpoint.map_or(-1, |checkpoint| checkpoint.block_index().0);
+    new_upload!(base, body, installed)
+}
+
+fn same_storage(base: &ReplayBase<'_>, version: Option<i32>, epoch: Option<i32>) -> bool {
+    matching_replay_storage!(version, epoch, base.storage_version.0, base.storage_epoch.0)
+}
+
+fn added_trie_keys(slugs: &Slugs, tries: &[proto::TrieDetails], keys: &mut BTreeSet<ObjectKey>) -> Result<()> {
+    added_trie_dependency_keys!(slugs, tries, keys; each_replay_input)
+}
+
+fn insert_object_keys(keys: &mut BTreeSet<ObjectKey>, files: BTreeSet<String>) -> Result<()> {
+    checked_object_keys!(keys, files; each_replay_input)
+}
+
+fn legacy_table_ref_from_wire(name: &Option<String>) -> Result<TableRef> {
+    legacy_table_ref(name.as_deref().unwrap_or_default())
+}
+
+fn table_slugs<'a>(slugs: &'a Slugs, table: &TableRef) -> Result<&'a BTreeSet<TableSlug>> {
     slugs.get(table).ok_or_else(|| invalid(format!("No replayed checkpoint records table {}", table.schema_and_table())))
 }
 

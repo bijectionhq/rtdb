@@ -11,6 +11,15 @@ use crate::generated::xtdb::{block::proto as pb, cols::proto as cpb, database::p
 use crate::keys::{TableSlug, TrieKey};
 use crate::log::proto::{TrieDetails, TrieState};
 
+#[macro_use]
+mod checkpoint_files;
+
+macro_rules! each_checkpoint_input {
+    ($files:ident, $items:expr, $item:ident => $body:block, [$($spec:tt)*]) => {
+        for $item in $items $body
+    };
+}
+
 pub const FIRST_TABLE_OID: u32 = 16_384;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,24 +180,22 @@ pub struct TableBlock {
 
 impl PartialEq for TableBlock { fn eq(&self, other: &Self) -> bool { self.wire == other.wire } }
 
+fn checkpoint_trie_state(detail: &TrieDetails) -> Result<TrieState> {
+    TrieState::try_from(detail.trie_state.unwrap_or_default())
+        .map_err(|_| invalid("Unknown trie state in checkpoint"))
+}
+
+fn checkpoint_trie_key(detail: &TrieDetails) -> Result<TrieKey> {
+    detail.trie_key.as_deref().unwrap_or_default().parse()
+}
+
 impl TrieDetails {
     pub fn encoded_size(&self) -> usize { self.encoded_len() }
 
     /// The objects of this trie that a checkpoint holding it preserves.
     pub fn checkpoint_files(&self, slug: &TableSlug, contents: CheckpointContents) -> Result<BTreeSet<String>> {
-        let state = TrieState::try_from(self.trie_state.unwrap_or_default())
-            .map_err(|_| invalid("Unknown trie state in checkpoint"))?;
-        let trie: TrieKey = self.trie_key.as_deref().unwrap_or_default().parse()?;
-        let mut files = BTreeSet::new();
-        if state == TrieState::Garbage && (contents == CheckpointContents::Primary || trie.level() != 0) { return Ok(files); }
-        files.insert(slug.data_key(&trie));
-        files.insert(slug.metadata_key(&trie));
-        if contents == CheckpointContents::Replay && state != TrieState::Garbage {
-            for record in &self.artefacts {
-                if let Some(path) = replay_artefact_file(slug, &trie, record)? { files.insert(path); }
-            }
-        }
-        Ok(files)
+        let detail = self;
+        trie_checkpoint_files!(detail, slug, contents; each_checkpoint_input)
     }
 }
 
@@ -318,19 +325,8 @@ impl TableBlock {
     }
 
     pub fn checkpoint_trie_files(&self, entry: &TableEntry, contents: CheckpointContents) -> Result<BTreeSet<String>> {
-        let mut files = BTreeSet::new();
-        for detail in self.trie_details() {
-            if entry.table.stores_expiring_transaction_metadata()
-                && detail.trie_state == Some(TrieState::Garbage as i32)
-            {
-                continue;
-            }
-            files.append(&mut detail.checkpoint_files(&entry.slug, contents)?);
-        }
-        if contents == CheckpointContents::Replay {
-            for run in &self.wire.search_runs { files.insert(run.object_key(&entry.slug)?); }
-        }
-        Ok(files)
+        let table = self;
+        table_checkpoint_files!(table, entry, contents; each_checkpoint_input)
     }
 
     pub fn column_types(&self) -> Result<StructFields<LogicalType>> {
