@@ -230,10 +230,12 @@ impl StatementHandle {
                         })
                     })?;
                     let _scratch = self.session.region.memory().reserve(super::mul(bytes, 2)?)?;
-                    let rows = bound.arguments.rows().map(|row| Ok(bound.names.iter().cloned().zip(row?.iter().cloned().map(|mut value| {
-                        rtdb_columnar::admit_execution_value(&mut value);
-                        value
-                    })).collect::<StructFields<_>>())).collect::<Result<_>>()?;
+                    let rows = bound.arguments.rows().map(|row| {
+                        bound.names.iter().cloned().zip(row?.iter().cloned()).map(|(name, mut value)| {
+                            rtdb_columnar::admit_execution_value(&mut value)?;
+                            Ok((name, value))
+                        }).collect::<Result<StructFields<_>>>()
+                    }).collect::<Result<_>>()?;
                     let operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, self.session.region.memory())?, valid_from: None, valid_to: None };
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(count)

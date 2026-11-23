@@ -212,7 +212,9 @@ impl Kind {
             DataType::FixedSizeBinary(_) => Key::Text(array.as_fixed_size_binary().value(row)),
             DataType::Boolean => Key::Integer(i64::from(u8::from(array.as_boolean().value(row)))),
             DataType::Date32 => Key::Integer(i64::from(value!(Date32Type))),
-            DataType::Date64 => Key::Integer(value!(Date64Type) / 86_400_000),
+            DataType::Date64 => Key::Integer(
+                value!(Date64Type).div_euclid(rtdb_types::java_date::MILLIS_PER_DAY),
+            ),
             DataType::Timestamp(ArrowTime::Microsecond, Some(_)) => {
                 Key::Integer(value!(TimestampMicrosecondType))
             }

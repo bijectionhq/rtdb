@@ -53,6 +53,24 @@ pub(crate) fn floating_value(value: f64, ty: &ScalarType) -> Value {
 
 pub(crate) fn overflow() -> Anomaly { Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Numeric overflow") }
 pub(crate) fn division_by_zero() -> Anomaly { Anomaly::incorrect("xtdb.expression/division-by-zero", "data exception - division by zero") }
+
+pub fn signed_modulo(left: i64, right: i64) -> Result<i64> {
+    if right == 0 { return Err(division_by_zero()); }
+    let remainder = left.wrapping_rem(right);
+    Ok(if remainder != 0 && (remainder < 0) != (right < 0) { remainder + right } else { remainder })
+}
+
+pub fn float_modulo(left: f64, right: f64) -> Result<f64> {
+    if right == 0.0 {
+        return Err(Anomaly::incorrect("xtdb.expression/unknown-arithmetic-error", "Divide by zero"));
+    }
+    let quotient = left / right;
+    if !quotient.is_finite() { return Err(number_format("Infinite or NaN".into())); }
+    // The reference truncates through a Java long in this range, including the saturated positive endpoint.
+    let quotient = if quotient.abs() <= -(i64::MIN as f64) { (quotient as i64) as f64 } else { quotient };
+    let remainder = left - quotient * right;
+    Ok(if remainder == 0.0 || (left > 0.0) == (right > 0.0) { remainder } else { remainder + right })
+}
 pub(crate) fn inapplicable(name: &str, values: &[&Value]) -> Anomaly {
     rtdb_types::function_type_mismatch(name, &values.iter().map(|value| value.logical_type()).collect::<Vec<_>>())
 }
@@ -99,6 +117,9 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
     let ty = LogicalType::least_upper_bound(&[left.logical_type(), right.logical_type()]);
     let Some(LogicalType::Scalar(ty)) = ty else { return Err(inapplicable(arithmetic_name(op), &[left, right])); };
     if let (Some(a), Some(b)) = (integer(left), integer(right)) {
+        if op == B::Modulo && let (Ok(a), Ok(b)) = (i64::try_from(a), i64::try_from(b)) {
+            return integer_value(i128::from(signed_modulo(a, b)?), &ty);
+        }
         if matches!(op, B::Divide | B::Modulo) && b == 0 { return Err(division_by_zero()); }
         let result = match op {
             B::Add => a.checked_add(b), B::Subtract => a.checked_sub(b), B::Multiply => a.checked_mul(b),
@@ -108,10 +129,10 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
         return integer_value(result, &ty);
     }
     if let (Some(a), Some(b)) = (number(left), number(right)) {
-        if matches!(op, B::Divide | B::Modulo) && b == 0.0 { return Err(division_by_zero()); }
+        if op == B::Divide && b == 0.0 { return Err(division_by_zero()); }
         let value = match op {
             B::Add => a + b, B::Subtract => a - b, B::Multiply => a * b, B::Divide => a / b,
-            B::Modulo => { let r = a % b; if r != 0.0 && r.is_sign_negative() != b.is_sign_negative() { r + b } else { r } },
+            B::Modulo => float_modulo(a, b)?,
             _ => return Err(inapplicable(arithmetic_name(op), &[left, right])),
         };
         return Ok(floating_value(value, &ty));

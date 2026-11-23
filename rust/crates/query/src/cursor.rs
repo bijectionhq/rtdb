@@ -233,14 +233,18 @@ impl PreparedQuery {
             || !self.is_parameter_projection() || !types.iter().all(direct_parameter_type) {
             return Ok(None);
         }
-        let schema = self.emit_result_schema(&context, types)?;
-        let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, types, &context.memory)?.output();
-        let mut metadata = context.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
+        let context = context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&[]))?;
+        let operator = if context.tracer.as_ref().is_some_and(|tracer| tracer.query_enabled()) {
+            context.operator_scope()
+        } else { Arc::clone(&context) };
+        let schema = self.emit_result_schema(&operator, types)?;
+        let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &operator.catalog, types, &operator.memory)?.output();
+        let mut metadata = operator.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
         let mut fields = Vec::with_capacity(runtime_schema.schema().len());
         let mut arrays = Vec::with_capacity(runtime_schema.schema().len());
         let computed = if projection_has_computation(&self.relation) {
-            let _parameter_fields = context.memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
-            let Some(columns) = project_bound_columns(&self.relation, arguments, &context.memory)? else { return Ok(None); };
+            let _parameter_fields = operator.memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
+            let Some(columns) = project_bound_columns(&self.relation, arguments, &operator.memory)? else { return Ok(None); };
             Some(columns)
         } else { None };
         let mut copy_cells = batch.num_rows() > 1 || computed.is_some();
@@ -285,12 +289,14 @@ impl PreparedQuery {
             Err(error) if error.code == "rtdb/undersized-reservation" => return Ok(None),
             Err(error) => return Err(error),
         };
-        let context = context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&[]))?;
         let query_span = crate::trace::QueryTrace::start(&context, text);
-        let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
+        let parent = query_span.as_ref().map(|span| span.context());
+        let operator = operator.with_tracer(context.tracer.clone(), parent);
+        let operator_trace = crate::trace::operator_trace(&self.relation, &operator);
+        let context = Arc::clone(&context).with_tracer(context.tracer.clone(), parent);
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
-        Ok(Some(QueryCursor { schema, runtime_schema, input: Some(QueryInput::Projection(Some(projected))), context,
+        Ok(Some(QueryCursor { schema, runtime_schema, input: Some(QueryInput::Projection { batch: Some(projected), trace: operator_trace }), context,
             sample, trace, query_span, plan_reservation: self._plan_reservation.clone() }))
     }
 
@@ -310,7 +316,7 @@ impl PreparedQuery {
         })?;
         let temporary = context.memory.reserve(bound)?;
         let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
-        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        parameters.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         let context = context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&parameters))?;
         self.open_bound(context, schema, text, batching, move |memory| {
             let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
@@ -377,7 +383,7 @@ impl PreparedQuery {
                 return Ok(QueryInput::Ordered(batches));
             }
             match batching {
-                Batching::Pages if analysis.is_none() => {
+                Batching::Pages => {
                     if let Some(batches) = crate::operators::build_column_pages(Arc::clone(&operators), execution.clone()).await? {
                         return Ok(QueryInput::ColumnPages(batches));
                     }
@@ -398,12 +404,6 @@ impl PreparedQuery {
                     }
                     None => Err(invalid("column-plan", "Query could not open as Arrow")),
                 },
-                Batching::Pages => {
-                    let input = crate::operators::build_columns(operators, execution).await?
-                        .ok_or_else(|| invalid("column-plan", "Analyzed query could not open as Arrow"))?;
-                    Ok(QueryInput::Columns(ColumnOutput { input, limit: usize::MAX, pending: None }))
-                }
-
             }
         })).await.flatten().ok_or_else(cancelled)??;
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
@@ -414,12 +414,12 @@ impl PreparedQuery {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Columns(ColumnOutput { mut input, .. }) | QueryInput::Ordered(mut input) => {
+                QueryInput::Columns(ColumnOutput { mut input, .. }) | QueryInput::ColumnPages(mut input) | QueryInput::Ordered(mut input) => {
                     while owner.run_until_cancelled(cancellation.run_until_cancelled(input.next_batch())).await.flatten().ok_or_else(cancelled)??.is_some() {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::ColumnPages(_) | QueryInput::Projection(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
+                QueryInput::Projection { .. } => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
             }
             let peak = context.memory.peak_bytes();
             let reservation = context.memory.reserve(analysis.output_bound()?)?;
@@ -558,7 +558,7 @@ enum QueryInput {
     Columns(ColumnOutput),
     ColumnPages(crate::columnar::BoxBatchCursor),
     Ordered(crate::columnar::BoxBatchCursor),
-    Projection(Option<OwnedBatch>),
+    Projection { batch: Option<OwnedBatch>, trace: Option<crate::trace::CursorTrace> },
 }
 
 fn uses_row_batch_limit(relation: &Relation) -> bool {
@@ -778,7 +778,13 @@ impl QueryCursor {
     async fn pull_batch(&mut self) -> Result<Option<OwnedBatch>> {
         let Some(input) = &mut self.input else { return Ok(None); };
         let page = match input {
-            QueryInput::Projection(batch) => return Ok(batch.take()),
+            QueryInput::Projection { batch, trace } => {
+                let started = std::time::Instant::now();
+                if let Some(trace) = trace { trace.start(); }
+                let batch = batch.take();
+                if let Some(trace) = trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); }
+                return Ok(batch);
+            }
             QueryInput::ColumnPages(input) => {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 batch.validate_readable(&self.context)?;

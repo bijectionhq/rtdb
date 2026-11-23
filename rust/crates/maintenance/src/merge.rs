@@ -246,7 +246,6 @@ impl<'a, State> EntityStates<'a, State> {
 struct SameTimeState {
     calculator: AdmittedPolygonCalculator,
     system_from: Option<Timestamp>,
-    seen_erase: bool,
     erased: bool,
 }
 
@@ -257,13 +256,12 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
     for event in events {
         let state = states.get(event, memory, || SameTimeState {
             calculator: AdmittedPolygonCalculator::new(None, Arc::clone(memory)),
-            system_from: None, seen_erase: false, erased: false,
+            system_from: None, erased: false,
         })?;
         if state.erased { continue; }
         if state.system_from != Some(event.system_from) {
             state.calculator.reset();
             state.system_from = Some(event.system_from);
-            state.seen_erase = false;
         }
         let header = event.header();
         let resolved = state.calculator.visit(&header, |polygon| {
@@ -284,13 +282,10 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
         })?;
         if header.op == EventOp::Erase { state.erased = true; }
         if resolved.is_none() {
-            if !state.seen_erase {
-                charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                let mut event = event.clone();
-                event.valid_time = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
-                result.push(event);
-            }
-            state.seen_erase = true;
+            charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+            let mut event = event.clone();
+            event.valid_time = Interval::ALL;
+            result.push(event);
         }
     }
     Ok((result, charges))

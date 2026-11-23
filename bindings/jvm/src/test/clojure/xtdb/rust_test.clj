@@ -74,6 +74,14 @@
     (is (= [{:xt/id 1}] (xt/q connection "SELECT _id FROM docs")))
     (is (thrown? xtdb.api.error.Incorrect (xt/q connection "SELECT 1" {:database :other})))))
 
+(deftest api-adbc-test-application-name
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (is (= [{:application-name "XTDB Clojure API"}]
+           (xt/q node "SHOW application_name")))
+    (is (= [{:application-name "embedded 'app'"}]
+           (xt/q node "SHOW application_name" {:application-name "embedded 'app'"})))))
+
 (deftest api-adbc-test-node-rejects-an-unknown-database-as-incorrect
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]

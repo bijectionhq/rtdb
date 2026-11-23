@@ -248,11 +248,21 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
         F32 => primitive!(values, Float32Array, Value::F32(v) => *v),
         F64 => primitive!(values, Float64Array, Value::F64(v) => *v),
         DateDay => Ok(Arc::new(Date32Array::from(values.iter().map(|value| match value {
-            Value::DateDay(value) => Some(*value), Value::Date(value) => Some(value.date().epoch_day() as i32), _ => None,
-        }).collect::<Vec<_>>()))),
+            Value::DateDay(value) => Ok(Some(*value)),
+            Value::Date(value) => match rtdb_types::CalendarDate::new(value.date(), rtdb_types::DateUnit::Day).object_value()? {
+                Value::DateDay(days) => Ok(Some(days)),
+                _ => Err(layout_error()),
+            },
+            _ => Ok(None),
+        }).collect::<Result<Vec<_>>>()?))),
         DateMilli => Ok(Arc::new(Date64Array::from(values.iter().map(|value| match value {
-            Value::DateMilli(value) => Some(*value), Value::Date(value) => Some(value.date().epoch_day().wrapping_mul(86_400_000)), _ => None,
-        }).collect::<Vec<_>>()))),
+            Value::DateMilli(value) => Ok(Some(*value)),
+            Value::Date(value) => match rtdb_types::CalendarDate::new(value.date(), rtdb_types::DateUnit::Millisecond).object_value()? {
+                Value::DateMilli(millis) => Ok(Some(millis)),
+                _ => Err(layout_error()),
+            },
+            _ => Ok(None),
+        }).collect::<Result<Vec<_>>>()?))),
         Oid => primitive!(values, Int32Array, Value::Oid(v) => *v),
         RegClass => primitive!(values, Int32Array, Value::RegClass(v) => *v),
         RegProc => primitive!(values, Int32Array, Value::RegProc(v) => *v),

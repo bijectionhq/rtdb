@@ -1,5 +1,6 @@
 package xtdb.api
 
+import org.apache.arrow.flight.FlightServer
 import org.apache.arrow.flight.FlightServer.builder
 import org.apache.arrow.flight.Location.forGrpcInsecure
 import xtdb.InternalApi
@@ -36,6 +37,15 @@ interface FlightSql : AutoCloseable {
             sweepInterval: Duration = Duration.ofSeconds(10),
         ): FlightSql = open(xtdb, config, clock, sweepInterval, UnknownDatabases.Reject(xtdb))
 
+        @InternalApi
+        fun open(
+            xtdb: Xtdb,
+            config: FlightSqlConfig,
+            clock: InstantSource,
+            sweepInterval: Duration,
+            configureServer: FlightServer.Builder.() -> Unit,
+        ): FlightSql = open(xtdb, config, clock, sweepInterval, UnknownDatabases.Reject(xtdb), configureServer)
+
         // `@InternalApi` rather than `internal` because the playground (Clojure) opens it.
         /**
          * Opens a Flight SQL server that attaches a database the first time a call names it.
@@ -52,6 +62,7 @@ interface FlightSql : AutoCloseable {
             clock: InstantSource,
             sweepInterval: Duration,
             unknownDbs: UnknownDatabases,
+            configureServer: FlightServer.Builder.() -> Unit = {},
         ): FlightSql {
             for ((key, timeout) in listOf(
                 "transactionIdleTimeout" to config.transactionIdleTimeout,
@@ -75,6 +86,7 @@ interface FlightSql : AutoCloseable {
                     .also { it.withErrorLoggingMiddleware() }
                     .also { it.withDatabaseMiddleware() }
                     .also { it.withSessionMiddleware(producer.sessionMiddlewareFactory) }
+                    .apply(configureServer)
                     .build()
                     .also { it.start() }
 

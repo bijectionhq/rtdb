@@ -8,7 +8,27 @@ use rtdb_types::{Anomaly, Result};
 use tokio::sync::Notify;
 
 const ATTRIBUTES: usize = 128;
-struct Attribute { name: String, value: String, _reservation: Arc<MemoryReservation> }
+struct Attribute { name: String, value: AttributeValue, _reservation: Arc<MemoryReservation> }
+
+enum AttributeValue { Text(String), Integer(String), Boolean(bool) }
+
+impl AttributeValue {
+    fn text(&self) -> &str {
+        match self {
+            Self::Text(value) | Self::Integer(value) => value,
+            Self::Boolean(true) => "true",
+            Self::Boolean(false) => "false",
+        }
+    }
+
+    fn otlp(&self) -> serde_json::Value {
+        match self {
+            Self::Text(value) => serde_json::json!({"stringValue": value}),
+            Self::Integer(value) => serde_json::json!({"intValue": value}),
+            Self::Boolean(value) => serde_json::json!({"boolValue": value}),
+        }
+    }
+}
 pub struct TraceRecord {
     pub context: SpanContext,
     pub parent: Option<SpanContext>,
@@ -20,12 +40,12 @@ pub struct TraceRecord {
     _reservation: Arc<MemoryReservation>,
 }
 impl TraceRecord {
-    pub fn attributes(&self) -> impl Iterator<Item = (&str, &str)> { self.attributes.iter().map(|attribute| (attribute.name.as_str(), attribute.value.as_str())) }
+    pub fn attributes(&self) -> impl Iterator<Item = (&str, &str)> { self.attributes.iter().map(|attribute| (attribute.name.as_str(), attribute.value.text())) }
     /// Encodes one span using the OTLP JSON mapping, retaining the complete payload allocation.
     pub fn encode(&self, service: &str, memory: &Arc<MemoryBudget>) -> Result<TracePayload> {
-        let bytes = self.attributes.iter().try_fold(size(size(self.name.len(), service.len())?, 8192)?, |bytes, attribute| size(bytes, size(attribute.name.len(), attribute.value.len())?))?;
+        let bytes = self.attributes.iter().try_fold(size(size(self.name.len(), service.len())?, 8192)?, |bytes, attribute| size(bytes, size(attribute.name.len(), attribute.value.text().len())?))?;
         let reservation = memory.reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?;
-        let attributes: Vec<_> = self.attributes().map(|(key, value)| serde_json::json!({"key": key, "value": {"stringValue": value}})).collect();
+        let attributes: Vec<_> = self.attributes.iter().map(|attribute| serde_json::json!({"key": attribute.name, "value": attribute.value.otlp()})).collect();
         let span = serde_json::json!({
             "traceId": hex(&self.context.trace_id), "spanId": hex(&self.context.span_id),
             "parentSpanId": self.parent.map_or_else(String::new, |parent| hex(&parent.span_id)),
@@ -95,7 +115,12 @@ impl TraceSpan for RecordedSpan {
         let length = match value { TraceValue::Text(value) => value.len(), _ => 32 };
         let reservation = name.len().checked_add(length).and_then(|bytes| bytes.checked_add(256)).and_then(|bytes| self.shared.memory.reserve(bytes).ok());
         let Some(reservation) = reservation else { record.dropped_attributes = record.dropped_attributes.saturating_add(1); return; };
-        let value = match value { TraceValue::Text(value) => value.to_owned(), TraceValue::Integer(value) => value.to_string(), TraceValue::Unsigned(value) => value.to_string() };
+        let value = match value {
+            TraceValue::Text(value) => AttributeValue::Text(value.to_owned()),
+            TraceValue::Integer(value) => AttributeValue::Integer(value.to_string()),
+            TraceValue::Unsigned(value) => AttributeValue::Integer(value.min(i64::MAX as u64).to_string()),
+            TraceValue::Boolean(value) => AttributeValue::Boolean(value),
+        };
         let attribute = Attribute { name: name.into(), value, _reservation: reservation };
         if let Some(index) = existing { record.attributes[index] = attribute; } else { record.attributes.push(attribute); }
     }

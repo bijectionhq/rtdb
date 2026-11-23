@@ -205,11 +205,30 @@ impl SessionIdentity for CapabilityIdentity {
 }
 
 pub(crate) async fn apply_startup<W: AsyncWrite + Unpin>(session: &mut NativeSession, parameters: &BTreeMap<String, String>, writer: &mut Writer<W>) -> Result<()> {
+    let preserve_application_name = session.state().parameter("application_name").is_some();
     for (key, value) in parameters {
-        if key == "timezone" { session.state_mut().set_timezone(value)?; }
-        else if key == "options" { for (key, value) in options(value) { session.state_mut().set_parameter(key, Some(value))?; } }
-        else { session.state_mut().set_parameter(key, Some(value.clone()))?; }
+        match key.as_str() {
+            "timezone" => session.state_mut().set_timezone(value)?,
+            "options" => for (key, value) in options(value) {
+                if !preserve_application_name || !key.eq_ignore_ascii_case("application_name") {
+                    session.state_mut().set_parameter(key, Some(value))?;
+                }
+            },
+            "application_name" => {
+                if !preserve_application_name {
+                    session.state_mut().set_parameter(key, Some(value.clone()))?;
+                }
+                continue;
+            }
+            _ => session.state_mut().set_parameter(key, Some(value.clone()))?,
+        }
         writer.parameter(display_parameter(key), if key == "standard_conforming_strings" { "on" } else { value }).await?;
+    }
+    if session.state().parameter("application_name").is_none() {
+        session.state_mut().set_parameter("application_name", Some("XTDB PGWire".into()))?;
+    }
+    if let Some(name) = session.state().parameter("application_name") {
+        writer.parameter("application_name", name).await?;
     }
     Ok(())
 }

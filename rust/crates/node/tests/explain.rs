@@ -23,7 +23,7 @@ async fn shared_preparation_exposes_explain_schema_and_analyze_executes_during_o
     drop(batch); drop(cursor); drop(plan);
 
     let analyze = PreparedSql::prepare_postgres("EXPLAIN ANALYZE SELECT 1 / $1 AS value", &context, vec!["public".into()], &[20]).unwrap();
-    assert_eq!(analyze.prepared_schema().unwrap().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["depth", "op", "attributes", "total_time", "self_time", "time_to_first_page", "page_count", "row_count", "pushdowns", "peak_memory_bytes"]);
+    assert_eq!(analyze.prepared_schema().unwrap().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["depth", "op", "attributes", "total_time", "self_time", "time_to_first_page", "page_count", "row_count", "pushdowns", "peak_memory_bytes", "query_peak_memory_bytes"]);
     assert!(analyze.open_query(Arc::clone(&context), vec![Value::I64(0)]).await.is_err());
     let mut cursor = analyze.open_query(Arc::clone(&context), vec![Value::I64(1)]).await.unwrap();
     assert!(cursor.next_batch().await.unwrap().is_some());

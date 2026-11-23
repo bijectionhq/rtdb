@@ -133,11 +133,12 @@ config {
 -- Similarly to the scan operator, we calculate a list of merge tasks.
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.
 -- Their order holds only within their page, and the recency split separates them into different files.
--- Within one IID and system time, a put or delete contributes only valid-time points outside all higher-priority command intervals.
--- The resulting fragments are disjoint and preserve the winning command at every valid-time point.
--- An erase marker excludes every older put or delete for the same entity from the resulting fragments.
+-- Within one IID and system time, an ordinary put or delete contributes only valid-time points outside all higher-priority command intervals.
+-- These fragments are disjoint and preserve the winning command at every valid-time point.
+-- Owned landing assertions retain their valid-time intervals and commit positions until erased.
+-- L0 normalization retains the latest erase marker and excludes every older event for the same entity.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.
--- The merge heap admits pages ordered by ascending IID and descending system time.
+-- The merge heap admits pages ordered by ascending IID and descending system position.
 -- It holds one cursor per nonempty page and advances the page that supplied the minimum key.
 --
 -- The behaviour differs depending on the compaction type:

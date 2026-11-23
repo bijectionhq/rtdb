@@ -32,6 +32,8 @@ async fn sql_registered_math_calls_reach_the_numeric_core() {
     assert_eq!(query("SELECT LOG10(NULL),COSH(NULL),MOD(1,NULL)").await.unwrap(), [vec![V::Null,V::Null,V::Null]]);
     assert_eq!(query("SELECT FLOOR(1.9),CEIL(-1.9),CEILING(1.2)").await.unwrap(), [vec![V::F64(1.0),V::F64(-1.0),V::F64(2.0)]]);
     assert_eq!(query("SELECT MOD(1,0)").await.unwrap_err().code, "xtdb.expression/division-by-zero");
+    assert_eq!(query("SELECT MOD(-5.5,3.0) AS positive, MOD(5.5,-3.0) AS negative").await.unwrap(),
+        [vec![V::F64(0.5),V::F64(-0.5)]]);
     assert!(query("SELECT SINH('invalid')").await.is_err());
 }
 
