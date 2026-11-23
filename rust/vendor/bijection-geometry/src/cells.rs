@@ -59,12 +59,12 @@ pub struct CellId(u64);
 impl CellId {
     /// A cell id read back from storage, or None when it names no cell.
     pub fn from_raw(raw: u64) -> Option<Self> {
-        let lsb = raw.isolate_lowest_one();
+        let sentinel = raw.trailing_zeros();
         (raw != 0
             && raw >> POS_BITS < 6
             && raw >> ID_BITS == 0
-            && lsb.trailing_zeros() % 2 == 0
-            && lsb.trailing_zeros() <= 2 * MAX_LEVEL)
+            && sentinel % 2 == 0
+            && sentinel <= 2 * MAX_LEVEL)
             .then_some(Self(raw))
     }
 

@@ -51,6 +51,7 @@ fn ids_round_trip_and_nest() {
         assert_eq!(CellId::from_raw(leaf.raw()), Some(leaf));
         for level in [0, 1, 5, 13, 26] {
             let parent = leaf.parent(level);
+            assert_eq!(CellId::from_raw(parent.raw()), Some(parent));
             assert_eq!(parent.level(), level);
             assert!(parent.contains(leaf));
             let shift = MAX_LEVEL - level;
@@ -63,6 +64,7 @@ fn ids_round_trip_and_nest() {
         }
     }
     assert!(CellId::from_raw(0).is_none());
+    assert!(CellId::from_raw(2).is_none());
     assert!(CellId::from_raw(6 << POS_BITS | 1).is_none());
     // Seven faces of ids fit under the class bits of a non-negative key.
     assert!(CellId::faces()[5].range().1 < 1 << ID_BITS);
