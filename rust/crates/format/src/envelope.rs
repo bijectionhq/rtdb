@@ -1,4 +1,4 @@
-use prost::Message;
+use prost::{Message, bytes::{BufMut, Bytes}, encoding::int64};
 use sha2::{Digest, Sha256};
 use rtdb_types::{Anomaly, BlockIndex, PhysicalObjectVersion, PlacedAttempt, Result, S3ObjectNamespace, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
@@ -47,7 +47,15 @@ impl SourceMessage {
 
     /// Legacy transaction bytes include their 0xff header.
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
-        Ok(Self::decode_wire(bytes)?.filter(|message| !matches!(message,
+        Self::processed(Self::decode_wire(bytes))
+    }
+
+    pub fn decode_bytes(bytes: Bytes) -> Result<Option<Self>> {
+        Self::processed(Self::decode_wire_bytes(bytes))
+    }
+
+    fn processed(message: Result<Option<Self>>) -> Result<Option<Self>> {
+        Ok(message?.filter(|message| !matches!(message,
             Self::Protobuf(SourceBody::FlushBlock(block)) if block.expected_block_idx.is_none())))
     }
 
@@ -56,9 +64,115 @@ impl SourceMessage {
         decoder::decode_source_wire(bytes)
     }
 
+    pub fn decode_wire_bytes(bytes: Bytes) -> Result<Option<Self>> {
+        match bytes.first().copied() {
+            Some(LEGACY_TX_HEADER) => Ok(Some(Self::LegacyTransaction(bytes))),
+            Some(LEGACY_FLUSH_HEADER) => Ok(None),
+            Some(PROTOBUF_LOG_HEADER) => {
+                let message = crate::log::proto::SourceLogMessage::decode(bytes.slice(1..)).map_err(|error| invalid(error.to_string()))?;
+                Ok(message.message.map(Self::Protobuf))
+            }
+            Some(header) => Err(decoder_leaves::unknown_header(header, "source")),
+            None => Err(invalid("Empty source message")),
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         decoder::encode_source_wire(self)
     }
+}
+
+fn wire_varint(bytes: &mut &[u8]) -> Result<u64> {
+    let mut value = 0;
+    for index in 0..10 {
+        let (&byte, remaining) = bytes.split_first().ok_or_else(|| invalid("Truncated protobuf varint"))?;
+        *bytes = remaining;
+        if index == 9 && byte > 1 { return Err(invalid("Protobuf varint exceeds 64 bits")); }
+        value |= u64::from(byte & 127) << (index * 7);
+        if byte < 128 { return Ok(value); }
+    }
+    Err(invalid("Unterminated protobuf varint"))
+}
+fn peek_key(bytes: &mut &[u8]) -> Result<(u32, u8)> {
+    let key = wire_varint(bytes)?;
+    let field = u32::try_from(key >> 3).ok().filter(|field| (1..=0x1fff_ffff).contains(field)).ok_or_else(|| invalid("Invalid protobuf field number"))?;
+    Ok((field, (key & 7) as u8))
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReplicaPeek<'a> {
+    pub term: Term,
+    pub term_sequence: Option<TermSequence>,
+    pub body: ReplicaPeekBody<'a>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplicaPeekBody<'a> {
+    Resolved { tx_id: Option<i64>, source: Option<i64>, time: Option<i64>, search_delta: Option<&'a [u8]> },
+    NoOp(Option<i64>),
+}
+
+impl<'a> ReplicaPeek<'a> {
+    /// Projects the common wire shapes. Other shapes go through the full decoder, including malformed records.
+    pub fn read(bytes: &'a [u8]) -> Option<Self> {
+        let (&PROTOBUF_LOG_HEADER, mut wire) = bytes.split_first()? else { return None; };
+        let mut term = Term(0);
+        let mut term_sequence = None;
+        let mut body = None;
+        while !wire.is_empty() {
+            match peek_key(&mut wire).ok()? {
+                (7, 0) => term = Term(wire_varint(&mut wire).ok()? as i64),
+                (9, 0) => term_sequence = Some(TermSequence(wire_varint(&mut wire).ok()? as i64)),
+                (1, 2) if body.is_none() => body = Some(Self::resolved(wire_bytes(&mut wire)?)?),
+                (5, 2) if body.is_none() => body = Some(ReplicaPeekBody::NoOp(Self::noop(wire_bytes(&mut wire)?)?)),
+                _ => return None,
+            }
+        }
+        Some(Self { term, term_sequence, body: body? })
+    }
+
+    fn resolved(mut wire: &'a [u8]) -> Option<ReplicaPeekBody<'a>> {
+        let (mut tx_id, mut source, mut time, mut search_delta) = (None, None, None, None);
+        while !wire.is_empty() {
+            match peek_key(&mut wire).ok()? {
+                (1, 0) => tx_id = Some(wire_varint(&mut wire).ok()? as i64),
+                (2, 0) => time = Some(wire_varint(&mut wire).ok()? as i64),
+                (3, 0) => { wire_varint(&mut wire).ok()?; }
+                (4 | 8, 2) => { wire_bytes(&mut wire)?; }
+                (5, 2) => Self::table_entry(wire_bytes(&mut wire)?)?,
+                (9, 0) => source = Some(wire_varint(&mut wire).ok()? as i64),
+                (12, 2) => search_delta = Some(wire_bytes(&mut wire)?),
+                _ => return None,
+            }
+        }
+        Some(ReplicaPeekBody::Resolved { tx_id, source, time, search_delta })
+    }
+
+    fn table_entry(mut wire: &[u8]) -> Option<()> {
+        while !wire.is_empty() {
+            match peek_key(&mut wire).ok()? {
+                (1, 2) => { std::str::from_utf8(wire_bytes(&mut wire)?).ok()?; }
+                (2, 2) => { wire_bytes(&mut wire)?; }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    fn noop(mut wire: &[u8]) -> Option<Option<i64>> {
+        let mut source = None;
+        while !wire.is_empty() {
+            if peek_key(&mut wire).ok()? != (1, 0) { return None; }
+            source = Some(wire_varint(&mut wire).ok()? as i64);
+        }
+        Some(source)
+    }
+}
+
+fn wire_bytes<'a>(wire: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let length = usize::try_from(wire_varint(wire).ok()?).ok()?;
+    let (field, remaining) = wire.split_at_checked(length)?;
+    *wire = remaining;
+    Some(field)
 }
 
 pub struct AcceptanceStageWitness {
@@ -110,6 +224,14 @@ impl ReplicaFrame {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         decoder::decode_replica_frame(bytes)
     }
+
+    pub fn decode_bytes(bytes: Bytes) -> Result<Self> {
+        let Some(&header) = bytes.first() else { return Err(invalid("Empty replica message")); };
+        if header != PROTOBUF_LOG_HEADER { return Err(decoder_leaves::unknown_header(header, "replica")); }
+        let message = crate::log::proto::ReplicaLogMessage::decode(bytes.slice(1..)).map_err(|error| invalid(error.to_string()))?;
+        decoder_leaves::check_stage(&message.message)?;
+        Ok(Self { term: Term(message.term_id.unwrap_or_default()), term_sequence: message.term_seq.map(TermSequence), message: message.message })
+    }
 }
 
 impl ReplicaEnvelope {
@@ -119,7 +241,11 @@ impl ReplicaEnvelope {
     }
 
     pub fn encoded_len(&self) -> usize {
-        Self::framed_len(&self.message, self.term.0 as u64, self.term_sequence.map(|sequence| sequence.0 as u64))
+        Self::encoded_body_len(self.term, self.term_sequence, &self.message)
+    }
+
+    pub fn encoded_body_len(term: Term, sequence: Option<TermSequence>, message: &ReplicaBody) -> usize {
+        Self::framed_len(message, term.0 as u64, sequence.map(|sequence| sequence.0 as u64))
     }
 
     fn framed_len(message: &ReplicaBody, term: u64, sequence: Option<u64>) -> usize {
@@ -135,15 +261,27 @@ impl ReplicaEnvelope {
         decoder::encode_replica_envelope(self)
     }
 
+    pub fn encode_body(term: Term, sequence: Option<TermSequence>, message: &ReplicaBody, output: &mut impl BufMut) {
+        output.put_u8(PROTOBUF_LOG_HEADER);
+        // Prost sorts the oneof by its smallest tag, ahead of both term fields.
+        message.encode(output);
+        int64::encode(7, &term.0, output);
+        if let Some(sequence) = sequence { int64::encode(9, &sequence.0, output); }
+    }
+
     pub fn with_sequence(mut self, sequence: TermSequence) -> Self {
         self.term_sequence = Some(sequence);
         self
     }
 
     pub fn offloaded(&self, version: StorageVersion, epoch: StorageEpoch, block: BlockIndex, payload_id: String, bytes: &[u8]) -> Self {
+        Self::offloaded_body(self.term, self.term_sequence, version, epoch, block, payload_id, bytes)
+    }
+
+    pub fn offloaded_body(term: Term, term_sequence: Option<TermSequence>, version: StorageVersion, epoch: StorageEpoch, block: BlockIndex, payload_id: String, bytes: &[u8]) -> Self {
         Self {
-            term: self.term,
-            term_sequence: self.term_sequence,
+            term,
+            term_sequence,
             message: ReplicaBody::OversizedMessage(crate::log::proto::OversizedMessage {
                 storage_version: Some(version.0),
                 storage_epoch: Some(epoch.0),

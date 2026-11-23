@@ -133,7 +133,7 @@ fn nullable_abort_messages_preserve_error_presence_and_release_all_retained_char
         assert!(!outcome.committed());
         assert_eq!(outcome.error().unwrap().message, message);
         let wire = outcome.encoded_error().unwrap().unwrap();
-        let encoded = rtdb_format::log::proto::ResolvedTx { tx_id: Some(1), system_time_micros: Some(2), committed: Some(false), error: Some(wire.as_slice().to_vec()), ..Default::default() };
+        let encoded = rtdb_format::log::proto::ResolvedTx { tx_id: Some(1), system_time_micros: Some(2), committed: Some(false), error: Some(wire.as_slice().to_vec().into()), ..Default::default() };
         let ReplayedTransaction { writes: staged, result: decoded, .. } = decode_replica(&encoded, None, BlockIndex(0), &memory).unwrap();
         assert_eq!(decoded, outcome);
         let clone = decoded.clone();

@@ -984,7 +984,15 @@ impl ReplicationDriver {
         let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, raw.metadata.offset.0)?;
         if position <= self.read_position { return Err(invalid("Replica reader did not advance")); }
         let own_term = self.leader.as_ref().map(|leader| leader.term);
-        let record = match self.logs.decode_readback(raw, decode_reservation, own_term)? {
+        // Buffered read-back may outlive this leader and be applied as follower replay.
+        let immediate = self.pending_block.is_none() && self.claim != Some(position)
+            && self.leader.as_ref().is_some_and(|leader| leader.resolution.is_none());
+        let decoded = {
+            let expected = |sequence| own_term.and_then(|term| self.own_pending_tx_at(term, sequence))
+                .and_then(|pending| pending.append_stamp()?.fingerprint);
+            self.logs.decode_readback(raw, decode_reservation, own_term, immediate.then_some(&expected as &dyn Fn(_) -> _))?
+        };
+        let record = match decoded {
             DecodedReplica::Known(record) => record,
             DecodedReplica::Unrecognized { term, sequence } => {
                 if let Some(pending) = self.own_pending_tx_at(term, sequence)
@@ -1018,7 +1026,10 @@ impl ReplicationDriver {
         if let Some(record) = record {
             if wins { self.try_promote().await?; }
             let sequence = record.envelope.term_sequence;
-            let record = record.resolve_payload(&self.logs).await.inspect_err(|error| {
+            let expected = if immediate && Some(observed_term) == own_term {
+                self.own_pending_tx_at(observed_term, sequence).and_then(|pending| pending.append_stamp()?.fingerprint)
+            } else { None };
+            let record = record.resolve_payload_for_readback(&self.logs, expected).await.inspect_err(|error| {
                 if let Some(pending) = self.own_pending_tx_at(observed_term, sequence) {
                     pending.finish_readback_failure(error.clone());
                 }
@@ -1514,7 +1525,7 @@ impl ReplicationDriver {
             Some(reservation) => reservation,
             None => self.resolve.memory.reserve(source_decode_bound(payload.len())?)?,
         };
-        let message = SourceMessage::decode(&payload)?;
+        let message = SourceMessage::decode_bytes(payload.clone())?;
         let durable = self.partition.snapshot();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }

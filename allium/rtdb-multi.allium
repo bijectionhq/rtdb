@@ -510,6 +510,7 @@ contract LogService {
         -- A worker reports readiness only after materialising that exact checkpoint and applying the chosen suffix through the grant cut.
         -- An offloaded record retains its replay hold through the read from its original writer's object scope.
         -- The loaded body matches the digest in the chosen record.
+        -- Replica suffix inspection preserves term admission and source offsets when it reads transaction coordinates from the recorded bytes.
         -- A gateway authenticates readiness against its invocation and the current installed journal grant.
         -- An installed journal route owns its session authority independently of the cell directory.
 
@@ -3244,6 +3245,7 @@ rule RetainServingReplayArchive {
     -- A capture with whole-object authenticated trie data supplies the same logical contents through a bounded whole-object read after framed writes begin.
     -- A fresh capture authenticates whole-object trie data in an older serving pack under its original logical key.
     -- The fresh capture publishes authenticated frames over the same logical bytes at the original checkpoint.
+    -- A framed file publication binds every frame to the digest and length of the complete plaintext file.
     -- A completed repair can be replaced by an independently verified replay archive of the same exact checkpoint before any replay archive has been selected.
     -- The source retains its residence while its selected capture still requires an envelope conversion for cell transfer.
     -- A held stage can serve whole-object reads before conversion, and requires the current serving envelope before terminal transfer.

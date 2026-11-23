@@ -13,7 +13,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures::FutureExt;
 use prost_types::Any;
-use rtdb_format::{catalog::BlockCatalog, envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame}, keys::CURRENT_STORAGE_VERSION};
+use rtdb_format::{catalog::BlockCatalog, envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody}, keys::CURRENT_STORAGE_VERSION};
 use rtdb_logkeeper::{QuorumLog, StreamConfig};
 use rtdb_node::{AwaitAuthority, ClosedEpochRecovery, LogAccess, LogFactory, OpenedLogs, PlacedReceiptCodec, ReplicaReadIndex};
 use rtdb_replication::{TermFence, Verdict};
@@ -517,17 +517,23 @@ enum Scanned { Position(i64), MayConsume, Consumes }
 /// What one replica record says about source positions allocated up to it.
 /// A claim or heartbeat (a no-op naming no source position) and a leader's own deletion notice consume none; anything else whose position it does not name may have consumed one.
 fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
-    let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(Scanned::MayConsume); };
-    let position = match &envelope.message {
-        ReplicaBody::ResolvedTx(tx) => tx.src_msg_id,
-        ReplicaBody::NoOp(noop) => match noop.placed_slot_reservation.as_deref() {
-            Some(wire) => Some(rtdb_types::PlacedReservation::decode(wire)?.attempt.position().0),
-            None => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
-        },
-        ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
-        ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
-        ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) => return Ok(Scanned::Consumes),
-        _ => None,
+    let position = match ReplicaPeek::read(payload).map(|frame| frame.body) {
+        Some(ReplicaPeekBody::Resolved { source, .. } | ReplicaPeekBody::NoOp(source @ Some(_))) => source,
+        Some(ReplicaPeekBody::NoOp(None)) => return Ok(Scanned::Consumes),
+        None => {
+            let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(Scanned::MayConsume); };
+            match &envelope.message {
+                ReplicaBody::ResolvedTx(tx) => tx.src_msg_id,
+                ReplicaBody::NoOp(noop) => match noop.placed_slot_reservation.as_deref() {
+                    Some(wire) => Some(rtdb_types::PlacedReservation::decode(wire)?.attempt.position().0),
+                    None => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
+                },
+                ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
+                ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
+                ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) => return Ok(Scanned::Consumes),
+                _ => None,
+            }
+        }
     };
     Ok(match position.filter(|position| *position >= 0).map(SourcePosition).filter(|position| position.epoch() == epoch) {
         Some(position) => Scanned::Position(position.offset()),
@@ -552,8 +558,16 @@ pub(crate) async fn transactions_until(
             if next >= through.0 { break 'capture; }
             if record.metadata.offset.0 != next + 1 { return Err(gap()); }
             next = record.metadata.offset.0;
-            let frame = ReplicaFrame::decode(&record.payload)?;
-            if fence.admit(frame.term, frame.term_sequence)?.verdict != Verdict::Apply { continue; }
+            let frame = if let Some(peek) = ReplicaPeek::read(&record.payload) {
+                if fence.admit(peek.term, peek.term_sequence)?.verdict != Verdict::Apply { continue; }
+                let ReplicaPeekBody::Resolved { time, .. } = peek.body else { continue; };
+                if time.ok_or_else(gap)? > system_time.0 { break 'capture; }
+                ReplicaFrame::decode_bytes(record.payload.clone())?
+            } else {
+                let frame = ReplicaFrame::decode_bytes(record.payload.clone())?;
+                if fence.admit(frame.term, frame.term_sequence)?.verdict != Verdict::Apply { continue; }
+                frame
+            };
             let envelope = frame.into_envelope().ok_or_else(gap)?;
             let envelope = if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) {
                 let body = read_payload(record.metadata.offset.0, &record.payload).await?;
@@ -938,7 +952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_time_fork_waits_for_a_confirmed_but_unpublished_record() {
+    async fn arrow_byte_path_a_time_fork_waits_for_a_confirmed_but_unpublished_record() {
         use rtdb_format::log::proto;
         use rtdb_types::Term;
 
@@ -1129,7 +1143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_intake_starts_beyond_every_source_position_the_replica_stream_may_hold() {
+    async fn arrow_byte_path_the_intake_starts_beyond_every_source_position_the_replica_stream_may_hold() {
         let replica = MemoryLog::new(1 << 20);
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 0, "a fresh deployment starts at 0");
         append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await;

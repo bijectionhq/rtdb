@@ -244,6 +244,9 @@ impl EncryptingStore {
     }
 
     async fn seal_missing(&self, key: &ObjectKey, bytes: Bytes) -> crate::Result<Option<Bytes>> {
+        if matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))) {
+            return Ok(Some(self.seal(key, bytes).await?));
+        }
         match self.get_fresh(key).await {
             Ok(existing) if existing == bytes => Ok(None),
             Ok(_) => Err(Error::ConflictingObject(key.to_string())),
@@ -659,6 +662,16 @@ impl ObjectStore for EncryptingStore {
         }
     }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> crate::Result<()> {
+        if let ObjectKeys::Deployment { cipher, .. } = &self.keys
+            && object::framed(key)
+            && matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_)))
+        {
+            let sealed = cipher.seal_framed_file(key, source).await?;
+            return match self.inner.put(key, sealed.clone()).await {
+                Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == cipher.open_object(key, &sealed)? => Ok(()),
+                written => written,
+            };
+        }
         let bytes = tokio::fs::read(source)
             .await
             .map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;
@@ -689,6 +702,15 @@ impl ObjectStore for EncryptingStore {
         key: &ObjectKey,
         source: &Path,
     ) -> crate::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        if let ObjectKeys::Deployment { cipher, .. } = &self.keys && object::framed(key) {
+            let sealed = cipher.seal_framed_file(key, source).await?;
+            return match self.inner.put_with_publication(key, sealed.clone()).await {
+                Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == cipher.open_object(key, &sealed)? => {
+                    self.inner.retirement_publication(key).await
+                }
+                written => written,
+            };
+        }
         let bytes = tokio::fs::read(source)
             .await
             .map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;

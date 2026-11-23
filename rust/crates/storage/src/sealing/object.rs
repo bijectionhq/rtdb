@@ -3,11 +3,13 @@
 //! Each frame binds that identity, the logical object key and its frame index.
 
 use std::ops::Range;
+use std::path::Path;
 
 use crate::{Error, ObjectKey, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use ring::digest::{SHA256, digest};
+use ring::digest::{Context, SHA256, digest};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::{Cipher, SEALED_OVERHEAD};
 
@@ -173,9 +175,7 @@ impl FramedObject {
         out: &mut Vec<u8>,
     ) -> Result<()> {
         for (offset, frame) in plaintext.chunks(FRAME_BYTES).enumerate() {
-            out.extend_from_slice(
-                &cipher.seal_deterministic(&self.frame_associated(key, first + offset), frame)?,
-            );
+            cipher.append_deterministic(&self.frame_associated(key, first + offset), frame, out)?;
         }
         Ok(())
     }
@@ -218,6 +218,50 @@ impl Cipher {
         let mut sealed = Vec::with_capacity(sealed_size(key, plaintext.len())?);
         sealed.extend_from_slice(&header.seal_header(self, key)?);
         header.seal_frames(self, key, 0, plaintext, &mut sealed)?;
+        Ok(sealed.into())
+    }
+
+    pub(crate) async fn seal_framed_file(&self, key: &ObjectKey, source: &Path) -> Result<Bytes> {
+        let read_error = |error| Error::Task(format!("cannot read {}: {error}", source.display()));
+        let mut file = tokio::fs::File::open(source).await.map_err(read_error)?;
+        if !file.metadata().await.map_err(read_error)?.is_file() {
+            let mut plaintext = Vec::new();
+            file.read_to_end(&mut plaintext).await.map_err(read_error)?;
+            return self.seal_object(key, &plaintext);
+        }
+        let mut frame = vec![0; FRAME_BYTES];
+        let mut first = Context::new(&SHA256);
+        let mut length = 0usize;
+        loop {
+            let count = file.read(&mut frame).await.map_err(read_error)?;
+            if count == 0 { break; }
+            length = length.checked_add(count).ok_or_else(|| Error::Task("Encrypted object length overflow".into()))?;
+            first.update(&frame[..count]);
+        }
+        let mut identity = [0; 32];
+        identity.copy_from_slice(first.finish().as_ref());
+        let layout = FramedObject { length, identity };
+        let mut sealed = Vec::with_capacity(sealed_size(key, length)?);
+        sealed.extend_from_slice(&layout.seal_header(self, key)?);
+        file.rewind().await.map_err(read_error)?;
+        let mut second = Context::new(&SHA256);
+        for index in 0..layout.frame_count() {
+            let count = (length - index * FRAME_BYTES).min(FRAME_BYTES);
+            if let Err(error) = file.read_exact(&mut frame[..count]).await {
+                if error.kind() != std::io::ErrorKind::UnexpectedEof { return Err(read_error(error)); }
+                break;
+            }
+            second.update(&frame[..count]);
+            self.append_deterministic(&layout.frame_associated(key, index), &frame[..count], &mut sealed)?;
+        }
+        let tail = file.read(&mut frame[..1]).await.map_err(read_error)?;
+        if sealed.len() != sealed_size(key, length)? || tail != 0 || second.finish().as_ref() != identity {
+            drop(sealed);
+            file.rewind().await.map_err(read_error)?;
+            let mut plaintext = Vec::new();
+            file.read_to_end(&mut plaintext).await.map_err(read_error)?;
+            return self.seal_object(key, &plaintext);
+        }
         Ok(sealed.into())
     }
 
@@ -304,6 +348,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn arrow_byte_path_framed_file_matches_the_original_authenticated_object_bytes() {
+        let cipher = Cipher::new(&[7; 32]).unwrap();
+        let name = ObjectKey::new("tables/orders/data/l00-rc-b00.arrow").unwrap();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        for size in [0, 1, FRAME_BYTES, FRAME_BYTES * 2 + 19] {
+            let plaintext: Vec<_> = (0..size).map(|index| (index % 251) as u8).collect();
+            std::fs::write(temp.path(), &plaintext).unwrap();
+            let layout = FramedObject::new(&plaintext);
+            let mut old = layout.seal_header(&cipher, &name).unwrap().to_vec();
+            for (index, frame) in plaintext.chunks(FRAME_BYTES).enumerate() {
+                old.extend_from_slice(&cipher.seal_deterministic(&layout.frame_associated(&name, index), frame).unwrap());
+            }
+            let sealed = cipher.seal_framed_file(&name, temp.path()).await.unwrap();
+            assert_eq!(sealed.as_ref(), old);
+            assert_eq!(cipher.open_object(&name, &sealed).unwrap().as_ref(), plaintext);
+        }
+    }
 
     #[test]
     fn retained_envelopes_require_the_authentic_logical_key_and_complete_body() {

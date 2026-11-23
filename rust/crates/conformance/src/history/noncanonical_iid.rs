@@ -54,13 +54,13 @@ fn replace_first_put_iids(message: &mut SourceMessage, iids: &[[u8; 16]]) -> Res
     let mut selected = None;
     for (offset, bytes) in stream.windows(canonical_bytes.len()).enumerate() {
         if bytes != canonical_bytes.as_slice() { continue; }
-        let mut candidate = stream.clone();
+        let mut candidate = stream.to_vec();
         candidate[offset..offset + replacement.len()].copy_from_slice(&replacement);
         if operation_values(&candidate).is_ok_and(|actual| actual == expected) {
             if selected.replace(candidate).is_some() { return Err("More than one buffer matched the IID replacement".into()); }
         }
     }
-    tx.tx_ops = Some(selected.ok_or("No buffer matched the IID replacement without changing other cells")?);
+    tx.tx_ops = Some(selected.ok_or("No buffer matched the IID replacement without changing other cells")?.into());
     Ok(())
 }
 

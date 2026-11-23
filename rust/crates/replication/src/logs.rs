@@ -1,9 +1,9 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key};
-use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendCapacity, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
+use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody, SourceMessage}, keys::oversized_key, log::proto};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendBuffer, AppendCapacity, AppendMode, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::maintenance_class::is_maintenance;
@@ -202,7 +202,7 @@ impl PartitionLogs {
         if matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some()) {
             return Err(Anomaly::fault("rtdb.replication/strict-dispatch-clock", "Strict replica writes require the live writer clock"));
         }
-        self.enqueue_replica_with(envelope, block, || now, true, |_| Ok(())).await
+        self.enqueue_replica_with(envelope.term, envelope.term_sequence, &envelope.message, block, || now, true, |_| Ok(())).await
     }
     pub(crate) fn data_suspended(&self) -> bool { self.data_suspended.load(Ordering::Acquire) }
     pub(crate) fn suspend_data(&self, suspend: bool) { self.data_suspended.store(suspend, Ordering::Release); }
@@ -222,17 +222,31 @@ impl PartitionLogs {
     pub(crate) fn replica_timed_original_append_limit(&self) -> Option<usize> {
         self.replica.maximum_timed_original_append_bytes()
     }
-    pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
+
+    fn encode_replica(&self, term: Term, sequence: Option<TermSequence>, body: &ReplicaBody) -> Result<AppendBuffer> {
+        let length = ReplicaEnvelope::encoded_body_len(term, sequence, body);
+        let (prefix, suffix) = self.replica.append_headroom();
+        let capacity = length.checked_add(prefix).and_then(|bytes| bytes.checked_add(suffix)).ok_or_else(size_overflow)?;
+        let mut charge = self.memory.reserve(encoded_allocation(length)?)?;
+        let mut output = BytesMut::with_capacity(capacity);
+        output.resize(prefix, 0);
+        ReplicaEnvelope::encode_body(term, sequence, body, &mut output);
+        let retained = output.capacity().max(length.checked_add(256).ok_or_else(size_overflow)?);
+        Arc::get_mut(&mut charge).expect("payload encoding owns its reservation").shrink_to(retained)?;
+        Ok(AppendBuffer::new(output, prefix, charge))
+    }
+
+    pub(crate) async fn enqueue_replica_with(&self, term: Term, sequence: Option<TermSequence>, body: &ReplicaBody, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
         allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
-        let stage = match &envelope.message {
+        let stage = match body {
             ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?,
             _ => None,
         };
-        let payload = EncodedPayload::encode(envelope.encoded_len(), &self.memory, || Ok(envelope.encode()))?;
-        before_enqueue(&payload)?;
+        let mut payload = self.encode_replica(term, sequence, body)?;
+        before_enqueue(payload.payload())?;
         if let Some(stage) = stage {
             let guard = GuardedAppend::new(&clock, stage.clock_upper, stage.cutoff, stage.journal);
-            let receipt = self.replica.enqueue_guarded(payload, guard).await.map_err(|error| match error {
+            let receipt = self.replica.enqueue_buffer(&mut payload, AppendMode::Guarded(guard)).await.map_err(|error| match error {
                 error @ StorageError::GuardedAppendCutoff => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_CUTOFF, error.to_string()),
                 error @ StorageError::GuardedAppendUnavailable => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_UNAVAILABLE, error.to_string()),
                 error => error.into(),
@@ -241,52 +255,72 @@ impl PartitionLogs {
         }
         let now = clock();
         // An offload reference is charged for the body it replaces.
-        let fenced = matches!(&envelope.message, ReplicaBody::NoOp(_)) && self.fences_writer_terms();
-        let fenced_terminal = match &envelope.message {
+        let fenced = matches!(body, ReplicaBody::NoOp(_)) && self.fences_writer_terms();
+        let fenced_terminal = match body {
             ReplicaBody::ResolvedTx(tx) => tx.placed_slot_terminal.as_deref()
                 .map(rtdb_types::PlacedTerminal::decode).transpose()?.is_some_and(|terminal| terminal.fenced),
             _ => false,
         };
         let maintenance = is_maintenance(
-            &envelope.message, envelope.term_sequence.map(|sequence| sequence.0), fenced, fenced_terminal,
+            body, sequence.map(|sequence| sequence.0), fenced, fenced_terminal,
         );
-        let enqueue = |payload| async move {
-            if maintenance { self.replica.enqueue_maintenance(payload, now).await }
-            else { self.replica.enqueue(payload, now).await }
-        };
-        let receipt = match enqueue(payload.clone()).await {
+        let mode = || if maintenance { AppendMode::Maintenance(now) } else { AppendMode::Ordinary(now) };
+        let receipt = match self.replica.enqueue_buffer(&mut payload, mode()).await {
             Ok(receipt) => receipt,
             Err(StorageError::MessageTooLarge { .. }) if allow_offload => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
                 let key = ObjectKey::new(oversized_key(block, &payload_id)?)?;
-                let mut proxy = envelope.offloaded(self.storage_version, self.storage_epoch, block, payload_id, &payload);
-                if let Some(version) = self.replica.publish_replica_payload(self.store.as_ref(), &key, payload).await? {
+                let mut proxy = ReplicaEnvelope::offloaded_body(term, sequence, self.storage_version, self.storage_epoch, block, payload_id, payload.payload());
+                if let Some(version) = self.replica.publish_replica_payload(self.store.as_ref(), &key, payload.into_bytes()).await? {
                     proxy.bind_offload_publication(version)?;
                 }
-                let payload = EncodedPayload::encode(proxy.encoded_len(), &self.memory, || Ok(proxy.encode()))?;
-                enqueue(payload).await?
+                let mut payload = self.encode_replica(proxy.term, proxy.term_sequence, &proxy.message)?;
+                self.replica.enqueue_buffer(&mut payload, mode()).await?
             }
             Err(error) => return Err(error.into()),
         };
         Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch })
     }
     pub fn decode_replica(&self, record: LogRecord) -> Result<Option<ReplicaRecord>> {
-        Ok(self.decode_readback(record, None, None)?.known())
+        Ok(self.decode_readback(record, None, None, None)?.known())
     }
     pub(crate) fn decode_reserved_replica(&self, record: LogRecord, reservation: Arc<MemoryReservation>) -> Result<Option<ReplicaRecord>> {
-        Ok(self.decode_readback(record, Some(reservation), None)?.known())
+        Ok(self.decode_readback(record, Some(reservation), None, None)?.known())
     }
-    pub(crate) fn decode_readback(&self, record: LogRecord, reservation: Option<Arc<MemoryReservation>>, own_term: Option<Term>) -> Result<DecodedReplica> {
+    pub(crate) fn decode_readback(&self, record: LogRecord, reservation: Option<Arc<MemoryReservation>>, own_term: Option<Term>,
+        pending_fingerprint: Option<&dyn Fn(Option<TermSequence>) -> Option<ReplicaFingerprint>>) -> Result<DecodedReplica> {
+        let separately_charged_delivery = reservation.is_some();
         let reservation = match reservation {
             Some(reservation) => reservation,
             None => self.memory.reserve(replica_decode_bound(record.payload.len())?)?,
         };
         let metadata = ReplicaMetadata { position: ReplicaPosition::from_epoch_offset(self.replica_epoch, record.metadata.offset.0)?, timestamp: record.metadata.timestamp };
-        let frame = ReplicaFrame::decode(&record.payload)?;
+        let mut observed = None;
+        if let Some(pending_fingerprint) = pending_fingerprint
+            && let Some(peek) = ReplicaPeek::read(&record.payload)
+            && Some(peek.term) == own_term
+            && let ReplicaPeekBody::Resolved { tx_id, search_delta, .. } = peek.body
+            && let Some(expected) = pending_fingerprint(peek.term_sequence)
+        {
+            let digest = fingerprint(&record.payload);
+            if expected == digest {
+                let envelope = ReplicaEnvelope { term: peek.term, term_sequence: peek.term_sequence,
+                    message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
+                        tx_id, search_delta: search_delta.map(|delta| record.payload.slice_ref(delta)), ..Default::default()
+                    }) };
+                return Ok(DecodedReplica::Known(ReplicaRecord {
+                    metadata, envelope: Arc::new(envelope), reservation, fingerprint: Some(digest), oversized_delivery: None,
+                }));
+            }
+            observed = Some(digest);
+        }
+        // A prepared replay delivery releases its separate read charge after decoding.
+        let frame = if separately_charged_delivery { ReplicaFrame::decode(&record.payload)? }
+            else { ReplicaFrame::decode_bytes(record.payload.clone())? };
         let (term, sequence) = (frame.term, frame.term_sequence);
         let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
         let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
-            .then(|| fingerprint(&record.payload));
+            .then(|| observed.unwrap_or_else(|| fingerprint(&record.payload)));
         let oversized = matches!(&envelope.message, ReplicaBody::OversizedMessage(_));
         if oversized && self.replica.requires_replica_payload_permit() && record.replica_objects.is_none() {
             return Err(Anomaly::fault("rtdb.replication/oversized-delivery",
@@ -296,18 +330,26 @@ impl PartitionLogs {
         Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery }))
     }
     /// Admission runs on the outer envelope before this fetch; a held block receives the resolved body.
-    pub async fn resolve_oversized(&self, mut record: ReplicaRecord) -> Result<ReplicaRecord> {
+    pub async fn resolve_oversized(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+        self.resolve_oversized_for_readback(record, None).await
+    }
+
+    pub(crate) async fn resolve_oversized_for_readback(&self, mut record: ReplicaRecord, expected: Option<ReplicaFingerprint>) -> Result<ReplicaRecord> {
         if record.oversized_delivery.as_ref().is_some_and(|delivery| delivery.replica_objects.is_some()) {
-            return self.resolve_oversized_fresh(record).await;
+            return self.resolve_oversized_fresh_with(record, expected).await;
         }
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
         let lease = IoRegion::retaining(Arc::new(delivery), self.cache.get(&key)).await?;
-        self.decode_oversized(record, lease.as_slice())
+        self.decode_oversized(record, lease.as_slice(), expected)
     }
 
-    pub(crate) async fn resolve_oversized_fresh(&self, mut record: ReplicaRecord) -> Result<ReplicaRecord> {
+    pub(crate) async fn resolve_oversized_fresh(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+        self.resolve_oversized_fresh_with(record, None).await
+    }
+
+    async fn resolve_oversized_fresh_with(&self, mut record: ReplicaRecord, expected: Option<ReplicaFingerprint>) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
@@ -317,7 +359,7 @@ impl PartitionLogs {
                     "The replica payload permit does not match this delivery"));
             }
             let payload = custody.redeem(self.store.as_ref(), &self.memory).await?;
-            return self.decode_oversized(record, payload.as_ref());
+            return self.decode_oversized(record, payload.as_ref(), expected);
         }
         IoRegion::retaining(Arc::new(delivery), async {
             let store = &self.store;
@@ -326,14 +368,24 @@ impl PartitionLogs {
             let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(size_overflow)?;
             let charge = self.memory.reserve(charge)?;
             let payload = IoRegion::retaining(charge.clone(), store.get_fresh_exact(&key, length)).await?;
-            self.decode_oversized(record, &payload)
+            self.decode_oversized(record, &payload, expected)
         }).await
     }
 
-    fn decode_oversized(&self, record: ReplicaRecord, payload: &[u8]) -> Result<ReplicaRecord> {
+    fn decode_oversized(&self, record: ReplicaRecord, payload: &[u8], expected: Option<ReplicaFingerprint>) -> Result<ReplicaRecord> {
         let reservation = self.memory.reserve(replica_decode_bound(payload.len())?)?;
-        let envelope = record.envelope.unwrap_payload(payload)?;
-        let fingerprint = record.fingerprint.map(|_| fingerprint(payload));
+        let digest = expected.map(|_| fingerprint(payload));
+        let envelope = if let (Some(digest), ReplicaBody::OversizedMessage(reference)) = (digest, &record.envelope.message)
+            && Some(digest) == expected && reference.payload_sha256.as_deref() == Some(digest.as_slice())
+            && let Some(peek) = ReplicaPeek::read(payload)
+            && (peek.term, peek.term_sequence) == (record.envelope.term, record.envelope.term_sequence)
+            && let ReplicaPeekBody::Resolved { tx_id, search_delta, .. } = peek.body
+        {
+            ReplicaEnvelope { term: peek.term, term_sequence: peek.term_sequence, message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
+                tx_id, search_delta: search_delta.map(Bytes::copy_from_slice), ..Default::default()
+            }) }
+        } else { record.envelope.unwrap_payload(payload)? };
+        let fingerprint = record.fingerprint.map(|_| digest.unwrap_or_else(|| fingerprint(payload)));
         Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery: None })
     }
 }

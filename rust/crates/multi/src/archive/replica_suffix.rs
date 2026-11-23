@@ -1099,7 +1099,7 @@ pub(super) fn admit_record(
     if !(1..=writer_epoch).contains(&entry.epoch) || previous_writer.is_some_and(|prior| prior > entry.epoch) {
         return Err(suffix_unavailable());
     }
-    let envelope = ReplicaFrame::decode(&entry.payload)?.into_envelope().ok_or_else(suffix_unavailable)?;
+    let envelope = ReplicaFrame::decode_bytes(entry.payload.clone())?.into_envelope().ok_or_else(suffix_unavailable)?;
     if envelope.term.0 <= 0 || envelope.term_sequence.is_none_or(|sequence| sequence.0 < 0) {
         return Err(suffix_unavailable());
     }
@@ -1113,7 +1113,8 @@ pub(super) fn admit_record(
         return Err(suffix_unavailable());
     }
     *previous_writer = Some(entry.epoch);
-    Ok((admitted.verdict == rtdb_replication::Verdict::Apply).then_some(envelope))
+    if admitted.verdict != rtdb_replication::Verdict::Apply { return Ok(None); }
+    Ok(Some(envelope))
 }
 
 #[cfg(test)]
@@ -1128,7 +1129,7 @@ mod custody_tests {
     use super::*;
 
     #[test]
-    fn archived_records_retain_fenced_offsets_without_admitting_their_payloads() -> Result<()> {
+    fn arrow_byte_path_archived_records_retain_fenced_offsets_without_admitting_their_payloads() -> Result<()> {
         let mut fence = TermFence::from_boundary(Term(2), Some(TermSequence(5)))?;
         let mut writer = None;
         let mut admit = |term, sequence, epoch, message| {
@@ -1138,6 +1139,10 @@ mod custody_tests {
         };
         let offloaded = || ReplicaBody::OversizedMessage(OversizedMessage::default());
         let claim = || ReplicaBody::NoOp(NoOp { src_msg_id: None, ..Default::default() });
+        let transaction = ReplicaBody::ResolvedTx(rtdb_format::log::proto::ResolvedTx {
+            table_data: [("public/table".into(), Bytes::from(vec![1; 65536]))].into(), ..Default::default()
+        });
+        assert!(admit(1, 0, 1, transaction.clone())?.is_none());
         assert!(admit(1, 1, 1, offloaded())?.is_none());
         assert!(admit(2, 5, 1, offloaded())?.is_none());
         assert!(admit(2, 7, 2, offloaded())?.is_none());
@@ -1145,7 +1150,9 @@ mod custody_tests {
         assert!(admit(3, 0, 3, claim())?.is_some());
         assert!(admit(3, 0, 3, claim())?.is_none());
         assert!(admit(3, 1, 3, offloaded())?.is_some());
-        assert_eq!(fence.position(), TermPosition::Expecting(TermSequence(2)));
+        let applied = admit(3, 2, 3, transaction.clone())?.unwrap();
+        assert_eq!(applied.message, transaction);
+        assert_eq!(fence.position(), TermPosition::Expecting(TermSequence(3)));
         Ok(())
     }
 
@@ -1245,7 +1252,7 @@ mod custody_tests {
                 term: Term(term), term_sequence: Some(TermSequence(1)),
                 message: ReplicaBody::ResolvedTx(ResolvedTx {
                     tx_id: Some(id), src_msg_id: Some(id), system_time_micros: Some(time), committed: Some(true),
-                    table_data: [("public/replayed".into(), table)].into(), ..Default::default()
+                    table_data: [("public/replayed".into(), table.into())].into(), ..Default::default()
                 }),
             })
         };
@@ -1275,8 +1282,8 @@ mod custody_tests {
             checkpoint: Checkpoint { block: 0, boundary: 0, source: 0, system_time: 10,
                 root_sha256: Some(rtdb_format::catalog::publication_digest(&root_bytes)) },
         };
-        let archive_key = keys.key(&archive_key_id(&point)).await?;
-        let sealed = crate::cipher::Cipher::new(&archive_key)?.seal_deterministic(root.as_str(), &root_bytes)?;
+        let archive_key = keys.archive_key(&archive_key_id(&point), true, IoRegion::new()).await?;
+        let sealed = archive_key.seal(root.as_str(), root_bytes.into()).await?;
         let captured = Capture {
             point: point.clone(), format: rtdb_format::catalog::CheckpointContents::Replay,
             objects: vec![ArchivedObject { name: root.to_string(), bytes: sealed.len() as u64, sha256: digest(&sealed), frame_header_sha256: None }],

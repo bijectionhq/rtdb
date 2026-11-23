@@ -1,6 +1,8 @@
 use crate::{PROTOBUF_LOG_HEADER, PlacedAttempt, ReplicaBody, SourceBody};
 use vstd::prelude::*;
 
+pub type SourceBytes = Vec<u8>;
+
 verus! {
 
 pub type Result<T> = core::result::Result<T, &'static str>;
@@ -75,6 +77,11 @@ pub fn encode_attempt(attempt: PlacedAttempt) -> (out: [u8; 96])
 pub fn strip_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> (out: Option<&'a [u8]>)
     ensures (out is Some) == (prefix@.len() <= bytes@.len() && bytes@.take(prefix@.len() as int) == prefix@),
         out matches Some(body) ==> bytes@ == prefix@ + body@ && body@ == bytes@.skip(prefix@.len() as int),
+{ unimplemented!() }
+
+#[verifier::external_body]
+pub fn legacy_source(bytes: &[u8]) -> (out: SourceBytes)
+    ensures out@ == bytes@,
 { unimplemented!() }
 
 #[verifier::external_body]

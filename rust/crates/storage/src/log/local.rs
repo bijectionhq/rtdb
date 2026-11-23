@@ -5,7 +5,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use rtdb_types::Timestamp;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -289,7 +289,8 @@ impl Writer {
         let start = self.file.seek(SeekFrom::End(0)).map_err(|error| Error::io(self.path.as_ref(), error))?;
         let result = (|| {
             let sealed = self.keys.is_some();
-            let mut bytes = Vec::with_capacity(records.iter().map(|record| record.frame_bytes(sealed)).sum());
+            let separator = if sealed { SEALED_SEPARATOR } else { RECORD_SEPARATOR };
+            let mut frames = Vec::with_capacity(records.len());
             let mut metadata = Vec::with_capacity(records.len());
             let mut offset = start;
             for record in records {
@@ -301,15 +302,14 @@ impl Writer {
                 let end = offset.checked_add(HEADER_BYTES + payload.len() as u64 + TRAILER_BYTES)
                     .filter(|end| *end < 1 << 48)
                     .ok_or_else(|| corrupt(&self.path, offset, "local log offset space exhausted"))?;
-                bytes.push(if sealed { SEALED_SEPARATOR } else { RECORD_SEPARATOR });
-                bytes.extend_from_slice(&(payload.len() as i32).to_be_bytes());
-                bytes.extend_from_slice(&timestamp.0.to_be_bytes());
-                bytes.extend_from_slice(&payload);
-                bytes.extend_from_slice(&(offset as i64).to_be_bytes());
+                frames.push((record_header(separator, payload.len(), timestamp), payload, (offset as i64).to_be_bytes()));
                 metadata.push(LogMetadata { offset: LogOffset(offset as i64), timestamp });
                 offset = end;
             }
-            self.file.write_all(&bytes).map_err(|error| Error::io(self.path.as_ref(), error))?;
+            let mut slices: Vec<_> = frames.iter().flat_map(|(header, payload, trailer)| {
+                [IoSlice::new(header), IoSlice::new(payload), IoSlice::new(trailer)]
+            }).collect();
+            write_frames(&mut self.file, &mut slices).map_err(|error| Error::io(self.path.as_ref(), error))?;
             crate::sync_file(&self.file).map_err(|error| Error::io(self.path.as_ref(), error))?;
             Ok(metadata)
         })();
@@ -319,6 +319,58 @@ impl Writer {
             }
         }
         result
+    }
+}
+
+fn record_header(separator: u8, payload_len: usize, timestamp: Timestamp) -> [u8; HEADER_BYTES as usize] {
+    let mut header = [separator; HEADER_BYTES as usize];
+    header[1..5].copy_from_slice(&(payload_len as i32).to_be_bytes());
+    header[5..].copy_from_slice(&timestamp.0.to_be_bytes());
+    header
+}
+
+fn write_frames(writer: &mut impl Write, mut remaining: &mut [IoSlice<'_>]) -> io::Result<()> {
+    while !remaining.is_empty() {
+        match writer.write_vectored(&remaining[..remaining.len().min(1024)]) {
+            Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "failed to write whole buffer")),
+            Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+            Err(error) if error.kind() == ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn arrow_byte_path_vectored_record_keeps_the_payload_slice_and_wire_bytes_after_short_writes() {
+    struct ShortWriter<'a> { payload: &'a [u8], output: Vec<u8>, calls: usize }
+    impl Write for ShortWriter<'_> {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("expected a vectored write") }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                assert_eq!(slices[1].as_ptr(), self.payload.as_ptr());
+                return Err(ErrorKind::Interrupted.into());
+            }
+            let prior = self.output.len();
+            self.output.extend(slices.iter().flat_map(|slice| slice.iter().copied()).take(6));
+            Ok(self.output.len() - prior)
+        }
+    }
+    for payload in [b"".as_slice(), b"0123456789".as_slice()] {
+        let mut writer = ShortWriter { payload, output: Vec::new(), calls: 0 };
+        let header = record_header(RECORD_SEPARATOR, payload.len(), Timestamp(-3));
+        let trailer = 21_i64.to_be_bytes();
+        let mut slices = [IoSlice::new(&header), IoSlice::new(payload), IoSlice::new(&trailer)];
+        write_frames(&mut writer, &mut slices).unwrap();
+        let mut expected = vec![0x1e];
+        expected.extend((payload.len() as i32).to_be_bytes());
+        expected.extend((-3_i64).to_be_bytes());
+        expected.extend(payload);
+        expected.extend(21_i64.to_be_bytes());
+        assert_eq!(writer.output, expected);
     }
 }
 
@@ -733,10 +785,12 @@ mod retention_tests {
     #[test]
     fn sealed_prefix_resumes_after_key_withdrawal_before_frame_settlement() -> Result<()> {
         let payloads = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
-        let vault = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
-        let vault = ClassicKeyVault::open(vault.path()).map_err(|error| Error::Task(error.to_string()))?;
+        use std::os::unix::fs::PermissionsExt;
+        let vault = tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700))
+            .tempdir().map_err(|error| Error::Task(error.to_string()))?;
+        let key_vault = ClassicKeyVault::open(vault.path()).map_err(|error| Error::Task(error.to_string()))?;
         let path = Arc::new(payloads.path().join("REPLICA_LOG"));
-        let keys = vault.log_keys(&path, true, IoRegion::new()).map_err(|error| Error::Task(error.to_string()))?;
+        let keys = key_vault.log_keys(&path, true, IoRegion::new()).map_err(|error| Error::Task(error.to_string()))?;
         let mut writer = Writer {
             file: File::options().read(true).write(true).create_new(true).open(path.as_ref())
                 .map_err(|error| Error::io(path.as_ref(), error))?,

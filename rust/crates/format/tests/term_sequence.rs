@@ -1,11 +1,11 @@
-use prost::Message;
+use prost::{Message, bytes::Bytes};
 use rtdb_format::catalog::BlockCatalog;
-use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
+use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody};
 use rtdb_format::generated::xtdb::{block::proto::Block, log::proto as pb};
 use rtdb_types::{PlacedAttemptScope, SourcePosition, Term, TermSequence, Timestamp};
 
 #[test]
-fn every_message_kind_carries_its_term_position_through_the_codec() {
+fn arrow_byte_path_every_message_kind_keeps_prost_envelope_bytes() {
     let messages = [
         ReplicaBody::ResolvedTx(pb::ResolvedTx { tx_id: Some(1), system_time_micros: Some(0), committed: Some(true), src_msg_id: Some(1), ..Default::default() }),
         ReplicaBody::TriesAdded(pb::TriesAdded { storage_version: Some(1), storage_epoch: Some(0), source_msg_id: Some(1), ..Default::default() }),
@@ -20,8 +20,36 @@ fn every_message_kind_carries_its_term_position_through_the_codec() {
     for message in messages {
         let stamped = ReplicaEnvelope { term: Term(3), term_sequence: Some(TermSequence(5)), message };
         assert_eq!(stamped.encoded_len(), stamped.encode().len());
+        let mut expected = vec![3];
+        pb::ReplicaLogMessage { term_id: Some(3), term_seq: Some(5), message: Some(stamped.message.clone()) }.encode(&mut expected).unwrap();
+        assert_eq!(stamped.encode(), expected);
         assert_eq!(ReplicaEnvelope::decode(&stamped.encode()).unwrap(), Some(stamped));
     }
+}
+
+#[test]
+fn arrow_byte_path_replica_wire_projection_and_prost_share_the_payload() {
+    let ipc = Bytes::from(vec![0xa5; 16_000]);
+    let delta = Bytes::from_static(b"binary\0delta");
+    let body = ReplicaBody::ResolvedTx(pb::ResolvedTx {
+        tx_id: Some(-3), src_msg_id: Some(0), system_time_micros: Some(-2), search_delta: Some(delta.clone()),
+        table_data: [("public/test".into(), ipc.clone())].into(), ..Default::default()
+    });
+    let encoded = Bytes::from(ReplicaEnvelope { term: Term(9), term_sequence: Some(TermSequence(0)), message: body }.encode());
+    let peek = ReplicaPeek::read(&encoded).unwrap();
+    assert_eq!((peek.term, peek.term_sequence), (Term(9), Some(TermSequence(0))));
+    let ReplicaPeekBody::Resolved { tx_id, source, time, search_delta: Some(found) } = peek.body else { panic!("expected projected transaction") };
+    assert_eq!((tx_id, source, time, found), (Some(-3), Some(0), Some(-2), delta.as_ref()));
+    let ReplicaBody::ResolvedTx(decoded) = ReplicaFrame::decode_bytes(encoded.clone()).unwrap().message.unwrap() else { panic!("expected decoded transaction") };
+    assert_eq!(decoded.search_delta.unwrap().as_ptr(), found.as_ptr());
+    let offset = encoded.windows(ipc.len()).position(|window| window == ipc.as_ref()).unwrap();
+    assert_eq!(decoded.table_data["public/test"].as_ptr(), encoded[offset..].as_ptr());
+
+    let mut bad_key = encoded.to_vec();
+    let key_offset = bad_key.windows(11).position(|window| window == b"public/test").unwrap();
+    bad_key[key_offset] = 0xff;
+    assert!(ReplicaPeek::read(&bad_key).is_none());
+    assert!(ReplicaFrame::decode(&bad_key).is_err());
 }
 
 #[test]
@@ -30,7 +58,7 @@ fn a_strict_replica_record_preserves_and_checks_its_original_staging_sample() {
     let placement = PlacedAttemptScope::new("replica", 1).unwrap().issue()
         .identify(source, Some("owner")).unwrap();
     let tx = pb::ResolvedTx { tx_id: Some(source.0), system_time_micros: Some(100),
-        src_msg_id: Some(source.0), committed: Some(true), placed_attempt: Some(placement.encode().to_vec()),
+        src_msg_id: Some(source.0), committed: Some(true), placed_attempt: Some(placement.encode().to_vec().into()),
         acceptance_stage: Some(pb::AcceptanceStage { clock_upper_micros: Some(198), cutoff_micros: Some(200), ..Default::default() }),
         ..Default::default() };
     let encode = |tx| ReplicaEnvelope { term: Term(5), term_sequence: Some(TermSequence(3)), message: ReplicaBody::ResolvedTx(tx) }.encode();
@@ -65,7 +93,7 @@ fn a_physical_acceptance_stage_seals_its_journal_cutoff_with_the_clock_certifica
         .identify(source, Some("owner")).unwrap();
     let stage = |journal_cutoff_micros, clock_certificate_sha256| pb::ResolvedTx {
         tx_id: Some(source.0), system_time_micros: Some(100), src_msg_id: Some(source.0), committed: Some(true),
-        placed_attempt: Some(placement.encode().to_vec()),
+        placed_attempt: Some(placement.encode().to_vec().into()),
         acceptance_stage: Some(pb::AcceptanceStage {
             clock_upper_micros: Some(198), cutoff_micros: Some(200), journal_cutoff_micros, clock_certificate_sha256,
         }),
@@ -92,7 +120,7 @@ fn envelope_sizes_keep_zero_presence_and_signed_varint_widths() {
         }
     }
     let messages = [
-        rtdb_format::envelope::SourceMessage::LegacyTransaction(vec![0xff, 0, 1]),
+        rtdb_format::envelope::SourceMessage::LegacyTransaction(vec![0xff, 0, 1].into()),
         rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::FlushBlock(pb::FlushBlock { expected_block_idx: Some(-1) })),
     ];
     for message in messages { assert_eq!(message.encoded_len(), message.encode().unwrap().len()); }

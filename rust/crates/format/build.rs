@@ -41,7 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
     config.btree_map(["."]);
-    config.bytes([".xtdb.log.proto.ResolvedTx.search_delta"]);
+    config.bytes([
+        ".xtdb.log.proto.Tx.tx_ops", ".xtdb.log.proto.Tx.user_metadata",
+        ".xtdb.log.proto.Tx.external_source_token", ".xtdb.log.proto.Tx.placed_attempt_seed",
+        // Prost resolves a map's synthetic value field under the containing message.
+        ".xtdb.log.proto.ResolvedTx.value", ".xtdb.log.proto.ResolvedTx.error",
+        ".xtdb.log.proto.ResolvedTx.placed_attempt", ".xtdb.log.proto.ResolvedTx.search_delta",
+    ]);
     config.include_file("xtdb.rs");
     for field in ["Listy.el", "FixedSizeList.el", "MapType.el", "Maybe.mono", "ColumnMeta.type",
         "VecType.type.decimal", "VecType.type.timestamp", "VecType.type.date", "VecType.type.time",

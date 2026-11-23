@@ -1,5 +1,5 @@
 use super::{Kind, Record, journal_codec_leaves::{
-    Bytes, BytesMut, IoResult, Read, append_frame, body_len, checksum, decode_record, empty_bytes, encode_record,
+    Bytes, BytesMut, IoResult, Read, encode_frame, body_len, checksum, decode_record, empty_bytes,
     header_fields, read_body, read_header, split_frame,
 }};
 
@@ -50,8 +50,7 @@ pub(super) fn frame(stream: u64, kind: Kind, buffer: &mut BytesMut) {
     ensures final(buffer)@ == old(buffer)@ + frame_bytes(encode(record)),
 ))]
 pub(super) fn frame_record(record: Record, buffer: &mut BytesMut) {
-    let body = encode_record(&record);
-    append_frame(buffer, body_len(&body) as u32, checksum(&body), &body);
+    encode_frame(buffer, &record);
 }
 
 /// Reads the next whole record of a segment of `remaining` bytes from here, with its framed length.

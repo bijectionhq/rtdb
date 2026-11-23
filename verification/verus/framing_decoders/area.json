@@ -325,8 +325,8 @@
       "mutate": [
         {
           "file": "rust/crates/format/src/envelope/decoder.rs",
-          "find": "SourceMessage::LegacyTransaction(join_bytes(&[], bytes))",
-          "replace": "SourceMessage::LegacyTransaction(join_bytes(&[], payload))"
+          "find": "SourceMessage::LegacyTransaction(legacy_source(bytes))",
+          "replace": "SourceMessage::LegacyTransaction(legacy_source(payload))"
         }
       ],
       "expect": [

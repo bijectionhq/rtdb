@@ -1,4 +1,4 @@
-use super::{AppendReceipt, AppendTimestampSource, GuardedAppend, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
+use super::{AppendBuffer, AppendMode, AppendReceipt, AppendTimestampSource, GuardedAppend, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
 use crate::{Error, Result, object_store::ReadReservation};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -85,22 +85,22 @@ impl MemoryLog {
         self.shared.progress.close();
     }
 
-    fn enqueue_at(&self, payload: Bytes, sample: impl FnOnce(&[u8]) -> Result<Timestamp>) -> Result<AppendReceipt> {
-        if payload.len() > self.shared.maximum_message_bytes {
-            return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.shared.maximum_message_bytes });
+    fn enqueue_at(&self, length: usize, take: impl FnOnce() -> Bytes, sample: impl FnOnce(&[u8]) -> Result<Timestamp>) -> Result<AppendReceipt> {
+        if length > self.shared.maximum_message_bytes {
+            return Err(Error::MessageTooLarge { size: length, maximum: self.shared.maximum_message_bytes });
         }
         let mut records = self.shared.records.lock();
         self.shared.progress.latest()?;
         let next = records.next.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         // Release the producer's allocation charge once this log owns the payload.
         let payload = if let Some(retained) = &self.shared.retained {
-            let required = payload.len().saturating_add(LOG_RECORD_OVERHEAD_BYTES);
+            let required = length.saturating_add(LOG_RECORD_OVERHEAD_BYTES);
             let unavailable = || Error::AppendCapacity { required_bytes: required as u64 };
             let charge = u32::try_from(required).map_err(|_| unavailable())?;
             let credit = Arc::clone(retained).try_acquire_many_owned(charge).map_err(|_| unavailable())?;
-            Bytes::from_owner(RetainedPayload { bytes: payload.to_vec(), _credit: credit })
+            Bytes::from_owner(RetainedPayload { bytes: take(), _credit: credit })
         } else {
-            Bytes::copy_from_slice(&payload)
+            take()
         };
         let timestamp = sample(&payload)?;
         let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
@@ -114,7 +114,7 @@ impl MemoryLog {
 }
 
 struct RetainedPayload {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     _credit: OwnedSemaphorePermit,
 }
 
@@ -131,7 +131,7 @@ fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
 
 impl MemoryLog {
     fn append_record(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, |payload| self.shared.timestamps.timestamp(payload, timestamp))
+        self.enqueue_at(payload.len(), || Bytes::copy_from_slice(&payload), |payload| self.shared.timestamps.timestamp(payload, timestamp))
     }
 
     fn open_tail(&self, after: LogOffset) -> Result<MemoryTail> {
@@ -167,7 +167,19 @@ impl Log for MemoryLog {
         if guard.journal_before().is_some() {
             return Err(Error::GuardedAppendUnsupported);
         }
-        self.enqueue_at(payload, |_| guard.sample())
+        self.enqueue_at(payload.len(), || Bytes::copy_from_slice(&payload), |_| guard.sample())
+    }
+
+    async fn enqueue_buffer(&self, buffer: &mut AppendBuffer, mode: AppendMode<'_>) -> Result<AppendReceipt> {
+        if let AppendMode::Guarded(guard) = &mode
+            && guard.journal_before().is_some()
+        {
+            return Err(Error::GuardedAppendUnsupported);
+        }
+        self.enqueue_at(buffer.payload().len(), || buffer.take_bytes(), |payload| match mode {
+            AppendMode::Ordinary(timestamp) | AppendMode::Maintenance(timestamp) => self.shared.timestamps.timestamp(payload, timestamp),
+            AppendMode::Guarded(guard) => guard.sample(),
+        })
     }
 
     fn latest(&self) -> Result<LogOffset> { super::SharedLog::latest(self) }
@@ -196,6 +208,25 @@ impl Log for MemoryLog {
         drop(records);
         Ok(Box::new(MemoryRange { shared: Arc::clone(&self.shared), next: from.0, end }))
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn arrow_byte_path_memory_log_takes_the_frame_without_retaining_the_producer_charge() {
+    use bytes::BytesMut;
+    use rtdb_types::MemoryBudget;
+
+    let log = MemoryLog::new(4096);
+    let memory = MemoryBudget::new(8192);
+    let payload = BytesMut::from(&b"encoded replica payload"[..]);
+    let original = payload.as_ptr();
+    let mut buffer = AppendBuffer::new(payload, 0, memory.reserve(4096).unwrap());
+    log.enqueue_buffer(&mut buffer, AppendMode::Ordinary(Timestamp(1))).await.unwrap().durable().await.unwrap();
+    drop(buffer);
+    let records = log.read_range(LogOffset(0), LogOffset(1)).await.unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(records[0].payload.as_ptr(), original);
+    assert_eq!(records[0].payload.as_ref(), b"encoded replica payload");
 }
 
 struct MemoryRange { shared: Arc<Shared>, next: i64, end: i64 }

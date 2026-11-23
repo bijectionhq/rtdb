@@ -158,6 +158,32 @@ fn record(event: &Event) -> Kind {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn arrow_byte_path_frames_encode_in_the_reserved_journal_buffer_with_the_original_length_and_crc() {
+    let record = Record {
+        stream: 42,
+        kind: Some(Kind::Append(Entry { lsn: 17, epoch: 3, timestamp: -4, payload: Bytes::from(vec![0xab; 70_000]),
+            guarded: true, guarded_before: Some(200), timed_origin: None })),
+        active_ensemble: Bytes::from_static(b"voters"), original_append: Some(true), certified: false,
+    };
+    use prost::Message;
+
+    let body = record.encode_to_vec();
+    let mut output = BytesMut::with_capacity(2 * (8 + body.len()) + 5);
+    output.extend_from_slice(b"prior");
+    let ptr = output.as_ptr();
+    frame_record(record.clone(), &mut output);
+    frame_record(record, &mut output);
+    assert_eq!(output.as_ptr(), ptr);
+    assert_eq!(&output[..5], b"prior");
+    for frame in output[5..].chunks_exact(8 + body.len()) {
+        assert_eq!(&frame[..4], &(body.len() as u32).to_be_bytes());
+        assert_eq!(&frame[4..8], &crc32fast::hash(&body).to_be_bytes());
+        assert_eq!(&frame[8..], body);
+    }
+}
+
 fn io_error(path: &Path, error: std::io::Error) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/io", format!("I/O at {}: {error}", path.display()))
 }

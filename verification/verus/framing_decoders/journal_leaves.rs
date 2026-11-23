@@ -82,18 +82,14 @@ pub fn checksum(body: &Bytes) -> (out: u32)
 { unimplemented!() }
 
 #[verifier::external_body]
-pub fn encode_record(record: &Record) -> (out: Bytes)
-    ensures out@ == encode(*record),
+pub fn encode_frame(buffer: &mut BytesMut, record: &Record)
+    requires encode(*record).len() <= u32::MAX,
+    ensures final(buffer)@ == old(buffer)@ + frame_bytes(encode(*record)),
 { unimplemented!() }
 
 #[verifier::external_body]
 pub fn decode_record(body: Bytes) -> (out: Option<Record>)
     ensures out == decode(body@),
-{ unimplemented!() }
-
-#[verifier::external_body]
-pub fn append_frame(buffer: &mut BytesMut, length: u32, checksum: u32, body: &Bytes)
-    ensures final(buffer)@ == old(buffer)@ + (encode_be32(length) + encode_be32(checksum) + body@),
 { unimplemented!() }
 
 #[verifier::external_body]

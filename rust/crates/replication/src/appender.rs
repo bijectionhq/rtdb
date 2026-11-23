@@ -195,25 +195,30 @@ impl ReplicaAppender {
                     };
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
-                    let mut envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
-                    if let Some(terminal) = request.write.placed_terminal
-                        && let ReplicaBody::ResolvedTx(tx) = &mut envelope.message
-                    {
-                        tx.placed_slot_terminal = Some(terminal.encode());
-                    }
-                    let _search_copy = if let Some(delta) = request.write.body.search_delta()
-                        && let ReplicaBody::ResolvedTx(tx) = &mut envelope.message
-                        && tx.acceptance_stage.is_none()
-                        && let Ok(charge) = self.memory.reserve(delta.encoded.len().saturating_mul(8)) {
-                        tx.search_delta = Some(delta.encoded.clone());
-                        Some(charge)
-                    } else { None };
-                    let guarded = matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());
+                    let updated;
+                    let search = request.write.body.search_delta().filter(|_| {
+                        matches!(body, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_none())
+                    });
+                    let _search_charge = search.and_then(|delta| self.memory.reserve(delta.encoded.len().saturating_mul(8)).ok());
+                    let body = match body {
+                        ReplicaBody::ResolvedTx(tx) if request.write.placed_terminal.is_some() || _search_charge.is_some() => {
+                            let mut tx = tx.clone();
+                            if let Some(terminal) = request.write.placed_terminal {
+                                tx.placed_slot_terminal = Some(terminal.encode());
+                            }
+                            if let Some(delta) = search.filter(|_| _search_charge.is_some()) {
+                                tx.search_delta = Some(delta.encoded.clone());
+                            }
+                            updated = ReplicaBody::ResolvedTx(tx);
+                            &updated
+                        }
+                        _ => body,
+                    };
+                    let guarded = matches!(body, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());
                     let observation = self.durable_commit_observation(&request.write.body);
-                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, || (self.clock)(), allow_offload,
+                    let enqueue = self.logs.enqueue_replica_with(self.term, Some(sequence), body, request.write.block, || (self.clock)(), allow_offload,
                         |frame| request.write.stamp_append(sequence, frame));
                     let enqueued = observe_enqueue(enqueue, &self.cancellation, &mut receipts).await;
-                    drop(envelope);
                     drop(_copy_reservation);
                     match enqueued {
                         Ok(Some(receipt)) => {

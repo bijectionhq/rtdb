@@ -1,7 +1,7 @@
 use super::{PlacedAttempt, ReplicaBody, SourceBody, Term, TermSequence, invalid};
 use super::decoder_leaves::{
     Result, check_stage, decode_attempt, decode_replica, decode_source, encode_attempt, encode_replica, encode_source, join_bytes,
-    split_header, strip_prefix, unknown_header,
+    legacy_source, SourceBytes, split_header, strip_prefix, unknown_header,
 };
 use super::wire::scan_external_payload;
 use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
@@ -17,7 +17,7 @@ pub const RETIREMENT_MARKER: &[u8; 34] = b"rtdb/placed-receipt-retirement/v1\0";
 
 #[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq))]
 pub enum SourceMessage {
-    LegacyTransaction(Vec<u8>),
+    LegacyTransaction(SourceBytes),
     Protobuf(SourceBody),
 }
 
@@ -50,7 +50,7 @@ pub struct ReplicaFrame {
 pub(super) fn decode_source_wire(bytes: &[u8]) -> Result<Option<SourceMessage>> {
     let (header, payload) = split_header(bytes).ok_or_else(|| invalid("Empty source message"))?;
     match header {
-        LEGACY_TX_HEADER => Ok(Some(SourceMessage::LegacyTransaction(join_bytes(&[], bytes)))),
+        LEGACY_TX_HEADER => Ok(Some(SourceMessage::LegacyTransaction(legacy_source(bytes)))),
         LEGACY_FLUSH_HEADER => Ok(None),
         PROTOBUF_LOG_HEADER => {
             let message = match decode_source(payload)? {

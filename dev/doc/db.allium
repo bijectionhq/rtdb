@@ -414,6 +414,7 @@ variant TxMessage : SourceMessage {
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
     -- The encoder transfers uniquely owned Arrow IPC payloads into their protobuf fields with their allocation reservations.
+    -- Source intake retains legacy transaction bytes and protobuf byte fields from the delivered record through operation decoding.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
     -- Pgwire SQL arguments are admitted as an Arrow row with canonical source fields and buffers.
     -- Pgwire integer-array Bind preserves source IPC bytes beneath null components.
@@ -694,6 +695,7 @@ variant OversizedMessage : ReplicaMessage {
     -- Readers resolve it as the record is read, ahead of both the pending-block hold and the staleness check: an offloaded upload closes a block, and one left unresolved would be held behind the block it closes.
     -- block_index is the block the standing-in record lands in — the open one, not the last completed — because block-gc.allium collects on it.
     -- New references authenticate the exact encoded body with SHA-256; older references still verify the decoded term and sequence.
+    -- Leader read-back compares the authenticated body digest to the pending append's digest.
     storage_version: Integer
     storage_epoch: Integer
     block_index: Integer
@@ -1289,7 +1291,7 @@ rule AppendReplicaMessage {
     -- Append the message to the replica log, in resolution order, STAMPED with this leader's term and the next position within it.
     -- Every record the term writes goes through this one ordered path, the block upload included, so the term's positions follow the log's order.
     -- The native writer requires a journal provider that supports guarded append before it stages a strict placed transaction.
-    -- The quorum writer samples after encoding, fingerprinting, encryption and its own payload copy with the append lock held.
+    -- The quorum writer samples with the append lock held after encoding, fingerprinting, encryption and transfer of the frame to journal custody.
     -- The rounded upper sample must be at least the retained staging sample and strictly before the guarded cutoff.
     -- A staged strict write holds later resolution, appender commands and a full block's cut until its admitted read-back.
     -- On failure the appender submits no frame and the driver discards the term's speculative suffix before reclaiming and resolving the durable source again.

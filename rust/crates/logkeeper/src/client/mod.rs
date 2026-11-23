@@ -14,7 +14,7 @@ use crate::decision::{DecisionCertificate, HandoffCertificate, StableDecision};
 use ensemble::{Ack, Ensemble, MAXIMUM_BATCH_BYTES, MAXIMUM_BATCH_ENTRIES, check_retained};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message;
-use rtdb_storage::log::{AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, ReplayHead};
+use rtdb_storage::log::{AppendBuffer, AppendMode, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_storage::{Error, Result};
 use rtdb_types::{Anomaly, JournalEndpoint, Timestamp, valid_journal_identity};
@@ -369,7 +369,7 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()>
 }
 
 impl QuorumLog {
-    fn enqueue_at(&self, payload: Bytes, time: AppendTime<'_>) -> Result<AppendReceipt> {
+    fn enqueue_at(&self, payload: writer::AppendInput<'_>, time: AppendTime<'_>) -> Result<AppendReceipt> {
         let maximum = self.shared.ensemble.config.maximum_message_bytes;
         if payload.len() > maximum { return Err(Error::MessageTooLarge { size: payload.len(), maximum }); }
         self.shared.check_open()?;
@@ -705,11 +705,19 @@ impl Log for QuorumLog {
     }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, AppendTime::Ordinary(timestamp))
+        self.enqueue_at(writer::AppendInput::External(payload), AppendTime::Ordinary(timestamp))
     }
 
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, AppendTime::Guarded(guard))
+        self.enqueue_at(writer::AppendInput::External(payload), AppendTime::Guarded(guard))
+    }
+
+    async fn enqueue_buffer(&self, buffer: &mut AppendBuffer, mode: AppendMode<'_>) -> Result<AppendReceipt> {
+        let time = match mode {
+            AppendMode::Ordinary(time) | AppendMode::Maintenance(time) => AppendTime::Ordinary(time),
+            AppendMode::Guarded(guard) => AppendTime::Guarded(guard),
+        };
+        self.enqueue_at(writer::AppendInput::Buffer(buffer), time)
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.latest().map(LogOffset) }

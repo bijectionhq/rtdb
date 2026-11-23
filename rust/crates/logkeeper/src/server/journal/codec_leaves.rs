@@ -34,12 +34,15 @@ pub(super) fn header_fields(header: [u8; 8]) -> (u32, u32) {
 
 pub(super) fn checksum(body: &Bytes) -> u32 { crc32fast::hash(body) }
 
-pub(super) fn encode_record(record: &Record) -> Bytes { Bytes::from(record.encode_to_vec()) }
+pub(super) fn encode_frame(buffer: &mut BytesMut, record: &Record) {
+    let start = buffer.len();
+    let length = record.encoded_len();
+    buffer.reserve(8 + length);
+    buffer.put_u32(length as u32);
+    buffer.put_u32(0);
+    record.encode_raw(buffer);
+    let crc = crc32fast::hash(&buffer[start + 8..]);
+    buffer[start + 4..start + 8].copy_from_slice(&crc.to_be_bytes());
+}
 
 pub(super) fn decode_record(body: Bytes) -> Option<Record> { Record::decode(body).ok() }
-
-pub(super) fn append_frame(buffer: &mut BytesMut, length: u32, checksum: u32, body: &Bytes) {
-    buffer.put_u32(length);
-    buffer.put_u32(checksum);
-    buffer.put_slice(body);
-}

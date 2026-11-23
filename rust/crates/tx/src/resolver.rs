@@ -201,7 +201,7 @@ impl ResolvedTx {
             let name = format!("{}/{}", table.schema, table.table);
             bound = bound.checked_add(name.capacity()).and_then(|bound| bound.checked_add(512)).ok_or_else(overflow)?;
             let (bytes, reservation) = bytes.into_parts();
-            tables.push((name, bytes));
+            tables.push((name, bytes.into()));
             table_reservations.push(reservation);
         }
         let error = self.result.encoded_error()?;
@@ -209,11 +209,11 @@ impl ResolvedTx {
         let reservation = memory.reserve(bound)?;
         let key = self.result.tx_key();
         let placed_attempt = match self.input {
-            ResolvedInput::Placed { attempt, retirement } => Some(rtdb_format::envelope::encode_replica_outcome_attempt(attempt, retirement)),
+            ResolvedInput::Placed { attempt, retirement } => Some(rtdb_format::envelope::encode_replica_outcome_attempt(attempt, retirement).into()),
             ResolvedInput::Position(_) => None,
         };
         let body = ReplicaBody::ResolvedTx(WireResolvedTx {
-            tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
+            tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| bytes::Bytes::copy_from_slice(error.as_slice())),
             table_data: tables.into_iter().collect(),
             db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position().0),
             placed_attempt, acceptance_stage, search_delta: None, placed_slot_terminal: None,

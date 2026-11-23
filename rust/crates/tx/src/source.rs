@@ -407,11 +407,11 @@ impl SourceTransaction {
         let tx = rtdb_format::generated::xtdb::log::proto::Tx {
             tx_ops: Some(tx_ops),
             default_tz: Some(self.options.default_tz.clone()), user: self.options.user.clone(),
-            user_metadata, external_source_token: None,
+            user_metadata: user_metadata.map(Into::into), external_source_token: None,
             idempotency_guard,
             replay_submission,
             bounded_retry,
-            placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec()),
+            placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec().into()),
         };
         let wire = rtdb_format::generated::xtdb::log::proto::SourceLogMessage { message: Some(SourceBody::Tx(tx)) };
         let reservation = self.memory.reserve(wire.encoded_len().checked_add(128).ok_or_else(overflow)?)?;
@@ -4631,7 +4631,7 @@ mod tests {
         let operations = Arc::new(UnionArray::try_new(fields, vec![tag].into(), Some(vec![0i32].into()), vec![body]).unwrap());
         let schema = Arc::new(Schema::new(vec![batch.schema_ref().field(0).clone().with_data_type(operations.data_type().clone())]));
         let legacy = RecordBatch::try_new(Arc::clone(&schema), vec![operations]).unwrap();
-        tx.tx_ops = Some(crate::ipc::encode(&schema, [&legacy], &memory).unwrap().as_slice().to_vec());
+        tx.tx_ops = Some(crate::ipc::encode(&schema, [&legacy], &memory).unwrap().as_slice().to_vec().into());
         let decoded = SourceTransaction::decode(&message, &memory).unwrap();
         let [Operation::PutReplayArrow { documents, iids: None, .. }] = decoded.operations.as_slice() else {
             panic!("Expected legacy Arrow put");
@@ -4703,7 +4703,7 @@ mod tests {
         assert_eq!(roundtrip(&source).options.user_metadata.unwrap().value(), &value);
         let mut message = SourceMessage::decode(source.encode().unwrap().as_slice()).unwrap().unwrap();
         let SourceMessage::Protobuf(SourceBody::Tx(tx)) = &mut message else { panic!("wrong envelope") };
-        tx.user_metadata = Some(vec![]);
+        tx.user_metadata = Some(bytes::Bytes::new());
         assert!(SourceTransaction::decode(&message, &memory).unwrap().options.user_metadata.is_none());
     }
 }

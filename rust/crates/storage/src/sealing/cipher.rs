@@ -46,34 +46,35 @@ impl Cipher {
 
     /// Seals with a nonce derived from `associated` and `plaintext`: the same pair always seals to the same bytes, and two different ones never share a nonce.
     pub fn seal_deterministic(&self, associated: &str, plaintext: &[u8]) -> crate::Result<Bytes> {
+        let mut sealed = Vec::with_capacity(plaintext.len() + SEALED_OVERHEAD);
+        self.append_deterministic(associated, plaintext, &mut sealed)?;
+        Ok(Bytes::from(sealed))
+    }
+
+    pub(super) fn append_deterministic(&self, associated: &str, plaintext: &[u8], sealed: &mut Vec<u8>) -> crate::Result<()> {
         let mut context = ring::hmac::Context::with_key(&self.nonces);
         context.update(&(associated.len() as u64).to_be_bytes());
         context.update(associated.as_bytes());
         context.update(plaintext);
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(&context.sign().as_ref()[..NONCE_LEN]);
-        self.seal_with(nonce, associated, plaintext)
+        self.append_sealed(nonce, associated, plaintext, sealed)
     }
 
-    fn seal_with(
-        &self,
-        nonce: [u8; NONCE_LEN],
-        associated: &str,
-        plaintext: &[u8],
-    ) -> crate::Result<Bytes> {
+    fn seal_with(&self, nonce: [u8; NONCE_LEN], associated: &str, plaintext: &[u8]) -> crate::Result<Bytes> {
         let mut sealed = Vec::with_capacity(plaintext.len() + SEALED_OVERHEAD);
+        self.append_sealed(nonce, associated, plaintext, &mut sealed)?;
+        Ok(Bytes::from(sealed))
+    }
+
+    fn append_sealed(&self, nonce: [u8; NONCE_LEN], associated: &str, plaintext: &[u8], sealed: &mut Vec<u8>) -> crate::Result<()> {
         sealed.extend_from_slice(&nonce);
+        let start = sealed.len();
         sealed.extend_from_slice(plaintext);
-        let tag = self
-            .key
-            .seal_in_place_separate_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(associated.as_bytes()),
-                &mut sealed[NONCE_LEN..],
-            )
+        let tag = self.key.seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from(associated.as_bytes()), &mut sealed[start..])
             .map_err(|_| Error::Task("encryption failed".into()))?;
         sealed.extend_from_slice(tag.as_ref());
-        Ok(Bytes::from(sealed))
+        Ok(())
     }
 
     pub fn open(&self, associated: &str, sealed: &[u8]) -> crate::Result<Bytes> {

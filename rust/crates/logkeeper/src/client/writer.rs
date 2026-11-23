@@ -14,13 +14,32 @@ use crate::protocol::{Accepted, Entry, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
-use rtdb_storage::log::{AppendReceipt, GuardedAppend, LogMetadata, LogOffset, LogRecord};
+use rtdb_storage::log::{AppendBuffer, AppendReceipt, GuardedAppend, LogMetadata, LogOffset, LogRecord};
 use rtdb_storage::{Error, Result};
 use rtdb_types::Timestamp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
+
+pub(super) enum AppendInput<'a> {
+    External(Bytes),
+    Buffer(&'a mut AppendBuffer),
+}
+
+impl AppendInput<'_> {
+    pub(super) fn len(&self) -> usize {
+        match self { Self::External(bytes) => bytes.len(), Self::Buffer(buffer) => buffer.payload().len() }
+    }
+
+    fn into_provider_bytes(self) -> Bytes {
+        match self {
+            // An opaque owner can carry a charge with a lifetime outside the journal's repair window.
+            Self::External(bytes) => Bytes::copy_from_slice(&bytes),
+            Self::Buffer(buffer) => buffer.take_bytes(),
+        }
+    }
+}
 
 const REPAIR_BACKOFF: Duration = Duration::from_millis(200);
 const SEAL_GRACE: Duration = Duration::from_millis(100);
@@ -697,7 +716,7 @@ impl Writer {
         }
     }
 
-    pub fn enqueue(self: &Arc<Self>, payload: Bytes, time: AppendTime<'_>) -> Result<AppendReceipt> {
+    pub(super) fn enqueue(self: &Arc<Self>, payload: AppendInput<'_>, time: AppendTime<'_>) -> Result<AppendReceipt> {
         let mut state = self.state.lock();
         let pipeline = match &mut *state {
             State::Open(pipeline) => pipeline,
@@ -719,8 +738,7 @@ impl Writer {
                 if matches!(replica.link, Link::Live) { Mark::Pending } else { Mark::Failed }
             }).collect(), witnesses: None })
         } else { None };
-        // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
-        let payload = Bytes::copy_from_slice(&payload);
+        let payload = payload.into_provider_bytes();
         let (timestamp, guarded_before, timed_origin) = match time {
             AppendTime::Ordinary(timestamp) => (timestamp, None, None),
             AppendTime::Guarded(guard) => {
@@ -1293,6 +1311,23 @@ impl Writer {
     }
 
     pub fn epoch(&self) -> u64 { self.epoch }
+}
+
+#[cfg(test)]
+#[test]
+fn arrow_byte_path_quorum_takes_allocation_without_pinning_the_producer_charge() {
+    use bytes::BytesMut;
+    let memory = rtdb_types::MemoryBudget::new(8192);
+    let mut input = BytesMut::with_capacity(4096);
+    input.extend_from_slice(b"encoded replica entry");
+    let pointer = input.as_ptr();
+    let mut buffer = AppendBuffer::new(input, 0, memory.reserve(4096).unwrap());
+    let provider = AppendInput::Buffer(&mut buffer).into_provider_bytes();
+    assert_eq!(provider.as_ptr(), pointer);
+    assert_eq!(memory.used_bytes(), 4096);
+    drop(buffer);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(provider.as_ref(), b"encoded replica entry");
 }
 
 #[cfg(test)]

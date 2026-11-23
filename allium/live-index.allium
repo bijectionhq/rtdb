@@ -570,6 +570,8 @@ rule ApplyResolvedTx {
     -- This is where a committed transaction becomes queryable: durably replicated AND confirmed unfenced.
     --
     -- The native read-back must confirm the encoded transaction at its pending append sequence before the leader can buffer or apply it.
+    -- Immediate read-back of a confirmed body uses the staged transaction and its authenticated search delta.
+    -- Buffered read-back retains the complete effect for application after demotion.
     -- Before importing rows from the queue head, the native leader checks that it is the transaction owned by that pending append.
     -- Both engines apply the queue head's catalog operation after matching the transaction.
     -- A native read-back fault reaches the pending caller when the admitted term and sequence identify its submission.

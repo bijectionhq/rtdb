@@ -502,6 +502,16 @@ Query-private spill paths write and replay Arrow batches.
 | 22 | Dynamic PostgreSQL JSON and row-facing extension hooks | `pg-codec/src/text.rs` `read_json`, `pg-source/src/indexer.rs` `PgIndexer` | JSON and JSONB infer arbitrary document shapes and JSON-LD extensions. Multidimensional and explicitly bounded float arrays retain their PostgreSQL text. Legacy indexers can opt into row maps through their existing public interface. |
 | 22 | Complex and logical Kafka values | `kafka/src/connect/converter.rs`, `kafka/src/connect/avro` | Logical elements retain their Connect value semantics. Avro reader unions with multiple value branches expose a Connect record for each non-null member. Avro schema migration can request JSON. |
 
+#### Storage and replication byte paths
+
+| Path | Site | Route |
+| --- | --- | --- |
+| Replica write | `replication/src/appender.rs`, `replication/src/logs.rs`, `format/src/envelope.rs`, `multi/src/logs.rs`, `logkeeper/src/client/writer.rs` | The encoder borrows the body into one reserved frame, directory-managed logs retain brokered sealing, and quorum repair can take an admitted allocation under its existing capacity policy. |
+| Source intake and replica scans | `format/src/envelope.rs`, `replication/src/driver.rs`, `replication/src/logs.rs`, `multi/src/logs.rs`, `multi/src/archive/replica_suffix.rs` | Intake retains delivered byte slices, replica scans can read transaction and no-op coordinates directly, and immediate leader read-back checks the pending digest before using the staged effect. |
+| Offload verification | `replication/src/logs.rs` | The SHA-256 that authenticates the fetched durable body also serves as the read-back fingerprint. |
+| Journal and local-log framing | `logkeeper/src/server/journal.rs`, `storage/src/log/local.rs` | The journal fills its frame and CRC in the round buffer, and the local writer passes the header, borrowed payload and trailer to a vectored write. |
+| Encrypted file publication | `storage/src/sealing/object.rs`, `storage/src/sealing/mod.rs` | A deployment-key framed input seals one plaintext frame at a time into the provider's ciphertext buffer, and an ordinary put uses a missing-object observation or compares the existing plaintext to confirm a retry. |
+
 Some of these gaps need a decision before the engineering work.
 Decoding pgvector source columns into lists changes externally visible types.
 Supporting `float4[]` and `float8[]` Bind parameters changes externally visible types.

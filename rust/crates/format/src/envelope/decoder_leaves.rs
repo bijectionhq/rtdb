@@ -1,6 +1,10 @@
 use crate::generated::xtdb::log::proto::{ReplicaLogMessage, SourceLogMessage};
 use super::{PlacedAttempt, ReplicaBody, SourceBody, headered, invalid};
-use prost::Message;
+use prost::{Message, bytes::Bytes};
+
+pub(super) type SourceBytes = Bytes;
+
+pub(super) fn legacy_source(bytes: &[u8]) -> SourceBytes { Bytes::copy_from_slice(bytes) }
 pub(super) use rtdb_types::Result;
 
 pub(super) fn split_header(bytes: &[u8]) -> Option<(u8, &[u8])> {

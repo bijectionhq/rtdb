@@ -1740,7 +1740,7 @@ async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_cur
     assert!(decode_replica(&wrong_decision, predecessor, state.snapshot().block_index(), &context.memory).is_err());
 
     let mut unmarked = tx.clone();
-    unmarked.placed_attempt = Some(attempt.encode().to_vec());
+    unmarked.placed_attempt = Some(attempt.encode().to_vec().into());
     assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());
     unmarked.placed_attempt = None;
     assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());

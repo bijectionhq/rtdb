@@ -9,7 +9,8 @@ pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 
 use crate::{Error, Result, object_store::ReadReservation};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use rtdb_columnar::MemoryReservation;
 use rtdb_types::Timestamp;
 use std::{sync::Arc, time::Duration};
 use std::{future::Future, pin::Pin};
@@ -212,6 +213,64 @@ pub trait SharedLog: Send + Sync {
     async fn read_after(&self, after: LogOffset) -> Result<Box<dyn LogReplayTail>>;
 }
 
+pub enum AppendMode<'a> {
+    Ordinary(Timestamp),
+    Maintenance(Timestamp),
+    Guarded(GuardedAppend<'a>),
+}
+
+/// A producer's exclusive frame buffer and the charge covering its allocation.
+pub struct AppendBuffer {
+    bytes: BytesMut,
+    prefix: usize,
+    reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl AppendBuffer {
+    pub fn new(bytes: BytesMut, prefix: usize, reservation: Arc<MemoryReservation>) -> Self {
+        Self { bytes, prefix, reservation: Some(reservation) }
+    }
+
+    pub fn payload(&self) -> &[u8] { &self.bytes[self.prefix..] }
+    pub fn headroom(&self) -> (usize, usize) { (self.prefix, self.bytes.capacity() - self.bytes.len()) }
+    pub fn storage_mut(&mut self) -> &mut BytesMut { &mut self.bytes }
+    pub fn set_prefix(&mut self, prefix: usize) { self.prefix = prefix; }
+    pub fn take_reservation(&mut self) -> Option<Arc<MemoryReservation>> { self.reservation.take() }
+    pub fn restore_reservation(&mut self, reservation: Option<Arc<MemoryReservation>>) { self.reservation = reservation; }
+
+    pub fn take_bytes(&mut self) -> Bytes {
+        std::mem::take(&mut self.bytes).freeze().slice(self.prefix..)
+    }
+
+    pub fn into_bytes(mut self) -> Bytes {
+        let bytes = self.take_bytes();
+        self.retain(bytes)
+    }
+
+    fn retain(&self, bytes: Bytes) -> Bytes {
+        struct Charged { bytes: Bytes, _reservation: Arc<MemoryReservation> }
+        impl AsRef<[u8]> for Charged { fn as_ref(&self) -> &[u8] { &self.bytes } }
+        match &self.reservation {
+            Some(reservation) => Bytes::from_owner(Charged { bytes, _reservation: Arc::clone(reservation) }),
+            None => bytes,
+        }
+    }
+
+    pub async fn enqueue_shared(&mut self, log: &(impl Log + ?Sized), mode: AppendMode<'_>) -> Result<AppendReceipt> {
+        let bytes = std::mem::take(&mut self.bytes).freeze();
+        let payload = self.retain(bytes.slice(self.prefix..));
+        let result = match mode {
+            AppendMode::Ordinary(time) => log.enqueue(payload, time).await,
+            AppendMode::Maintenance(time) => log.enqueue_maintenance(payload, time).await,
+            AppendMode::Guarded(guard) => log.enqueue_guarded(payload, guard).await,
+        };
+        if matches!(result, Err(Error::MessageTooLarge { .. })) {
+            self.bytes = bytes.try_into_mut().unwrap_or_else(|bytes| BytesMut::from(bytes.as_ref()));
+        }
+        result
+    }
+}
+
 #[async_trait]
 pub trait Log: Send + Sync {
     fn needs_published_recovery_checkpoint(&self) -> bool { false }
@@ -247,6 +306,12 @@ pub trait Log: Send + Sync {
     /// The provider can enforce an exclusive cutoff on the durable sync of an
     /// exact original quorum, including when a successor resolves the append.
     fn maximum_timed_original_append_bytes(&self) -> Option<usize> { None }
+    /// Extra prefix and suffix bytes a provider can fill in the encoded allocation.
+    fn append_headroom(&self) -> (usize, usize) { (0, 0) }
+    /// Consumes the buffer on acceptance and preserves its payload on a size refusal.
+    async fn enqueue_buffer(&self, buffer: &mut AppendBuffer, mode: AppendMode<'_>) -> Result<AppendReceipt> {
+        buffer.enqueue_shared(self, mode).await
+    }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
     /// Appends a recovery record through reserved maintenance capacity when the provider has it.

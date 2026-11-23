@@ -269,16 +269,18 @@ async fn admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applie
 
 #[tokio::test]
 async fn skipped_malformed_arrow_keeps_diagnostics_and_orders_the_original_attempt() {
-    let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
-    let seed = rtdb_types::PlacedAttemptScope::new("deployment/1/replica", 7).unwrap().issue();
+    let mut fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
+    let scope = rtdb_types::PlacedAttemptScope::new("deployment/1/replica", 7).unwrap();
+    Arc::get_mut(&mut fixture.driver.resolve).unwrap().owned_witness_scope = Some(scope);
+    let seed = scope.issue();
     use rtdb_format::envelope::{SourceBody, SourceMessage};
 
     let diagnostic = proto::Tx {
-        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()),
+        tx_ops: Some(vec![1, 2, 3].into()), default_tz: Some("UTC".into()),
         user: Some("alice".into()), ..Default::default()
     };
     let message = SourceMessage::Protobuf(SourceBody::Tx(proto::Tx {
-        user_metadata: Some(vec![4, 5, 6]), placed_attempt_seed: Some(seed.encode().to_vec()),
+        user_metadata: Some(vec![4, 5, 6].into()), placed_attempt_seed: Some(seed.encode().to_vec().into()),
         bounded_retry: Some(proto::BoundedRetry {
             nonce: Some(b"0123456789abcdef0123456789abcdef".to_vec()),
             not_after_micros: Some(100_000),
@@ -795,7 +797,7 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };
-    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), || Timestamp(100), false, |_| Ok(())).await
+    let Err(error) = fixture.logs.enqueue_replica_with(envelope.term, envelope.term_sequence, &envelope.message, BlockIndex(0), || Timestamp(100), false, |_| Ok(())).await
         else { panic!("an inline-only append must fail before emitting an oversized proxy"); };
     assert_eq!(error.code, "rtdb.storage/message-too-large");
     assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
@@ -824,7 +826,7 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
             src_msg_id: Some(position.0),
             system_time_micros: Some(100),
             committed: Some(true),
-            placed_attempt: Some(attempt.encode().to_vec()),
+            placed_attempt: Some(attempt.encode().to_vec().into()),
             acceptance_stage: Some(proto::AcceptanceStage {
                 clock_upper_micros: Some(120), cutoff_micros: Some(125), ..Default::default()
             }),
@@ -834,7 +836,8 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
     let wall = AtomicI64::new(119);
     for sample in [118, 124, 130] {
         let Err(error) = fixture.logs.enqueue_replica_with(
-            &envelope, BlockIndex(0), || Timestamp(wall.load(Ordering::Relaxed)), false,
+            envelope.term, envelope.term_sequence, &envelope.message, BlockIndex(0),
+            || Timestamp(wall.load(Ordering::Relaxed)), false,
             |_| { wall.store(sample, Ordering::Relaxed); Ok(()) },
         ).await else { panic!("An invalid dispatch clock must leave the replica log untouched"); };
         assert_eq!(error.code, crate::logs::STRICT_DISPATCH_CUTOFF);
@@ -845,7 +848,7 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
     assert!(fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(119)).await.is_err());
     assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
     let receipt = fixture.logs.enqueue_replica_with(
-        &envelope, BlockIndex(0), || Timestamp(123), false, |_| Ok(()),
+        envelope.term, envelope.term_sequence, &envelope.message, BlockIndex(0), || Timestamp(123), false, |_| Ok(()),
     ).await.unwrap();
     assert_eq!(receipt.durable().await.unwrap().position, ReplicaPosition(0));
 }
@@ -2151,7 +2154,7 @@ async fn own_readback_requires_the_frame_written_for_the_staged_head() {
         ("changed source position", |message| message.src_msg_id = Some(17)),
         ("unwritten external token", |message| message.external_source_token = Some(vec![17])),
         ("missing catalog operation", |message| message.db_op = None),
-        ("unwritten error bytes", |message| message.error = Some(vec![17])),
+        ("unwritten error bytes", |message| message.error = Some(vec![17].into())),
     ];
     for (field, mutate) in mutations {
         let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
@@ -2287,12 +2290,46 @@ async fn confirmed_append_cannot_publish_without_its_staged_head() {
 }
 
 #[tokio::test]
+async fn own_transaction_readback_projects_verified_wire_bytes_without_decoding_table_data() {
+    let fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
+    let body = proto::ResolvedTx {
+        tx_id: Some(99), src_msg_id: Some(99), search_delta: Some(Bytes::from_static(b"delta")),
+        table_data: [("public/large".into(), Bytes::from(vec![0xab; 64 * 1024]))].into(), ..Default::default()
+    };
+    let envelope = ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(9)), message: ReplicaBody::ResolvedTx(body) };
+    let payload = Bytes::from(envelope.encode());
+    let digest = crate::readback_identity::fingerprint(&payload);
+    let record = LogRecord::new(LogMetadata { offset: LogOffset(1), timestamp: Timestamp(42) }, payload.clone());
+    let expected = |sequence| (sequence == Some(TermSequence(9))).then_some(digest);
+    let super::DecodedReplica::Known(projected) = fixture.driver.logs.decode_readback(record.clone(), None, Some(Term(2)), Some(&expected)).unwrap() else { panic!("expected replica transaction") };
+    let ReplicaBody::ResolvedTx(tx) = &projected.envelope.message else { panic!("expected projected transaction") };
+    assert!(tx.table_data.is_empty());
+    let offset = payload.windows(5).position(|window| window == b"delta").unwrap();
+    assert_eq!(tx.search_delta.as_ref().unwrap().as_ptr(), payload[offset..].as_ptr());
+
+    let full = fixture.driver.logs.decode_replica(record).unwrap().unwrap();
+    let ReplicaBody::ResolvedTx(tx) = &full.envelope.message else { panic!("expected decoded transaction") };
+    assert_eq!(tx.table_data["public/large"].len(), 64 * 1024);
+
+    let reference = envelope.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "readback".into(), &payload);
+    let path = rtdb_storage::ObjectKey::new(reference.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().unwrap()).unwrap();
+    fixture.store.put(&path, payload).await.unwrap();
+    let raw = LogRecord::new(LogMetadata { offset: LogOffset(1), timestamp: Timestamp(42) }, reference.encode().into());
+    let super::DecodedReplica::Known(proxy) = fixture.logs.decode_readback(raw, None, Some(Term(2)), Some(&expected)).unwrap() else { panic!("expected offload reference") };
+    let projected = fixture.logs.resolve_oversized_for_readback(proxy, Some(digest)).await.unwrap();
+    assert_eq!(projected.fingerprint, Some(digest));
+    let ReplicaBody::ResolvedTx(tx) = &projected.envelope.message else { panic!("expected projected offload") };
+    assert!(tx.table_data.is_empty());
+    assert_eq!(tx.search_delta.as_deref(), Some(b"delta".as_slice()));
+}
+
+#[tokio::test]
 async fn own_oversized_readback_checks_the_stored_transaction_bytes() {
     let substitutions: [Option<(&str, fn(&mut ReplicaEnvelope))>; 3] = [
         None,
         Some(("rtdb.format/oversized-payload-mismatch", |frame| {
             let ReplicaBody::ResolvedTx(message) = &mut frame.message else { panic!("expected a stored transaction"); };
-            message.table_data.insert("public/forged".into(), vec![1, 2, 3]);
+            message.table_data.insert("public/forged".into(), vec![1, 2, 3].into());
         })),
         Some(("rtdb.format/oversized-payload-mismatch", |frame| {
             frame.term_sequence = Some(frame.term_sequence.unwrap().next().unwrap());
