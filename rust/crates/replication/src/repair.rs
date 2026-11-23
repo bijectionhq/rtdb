@@ -75,15 +75,33 @@ pub struct RetainRepairBase {
 impl RetainRepairBase {
     /// Installs a durable block-collection bound after verifying the detached base and its journal boundary.
     pub async fn install(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<ReplicaPosition> {
+        self.install_with_retention(memory, cancellation, false).await
+    }
+
+    pub async fn install_and_reclaim(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<ReplicaPosition> {
+        self.install_with_retention(memory, cancellation, true).await
+    }
+
+    async fn install_with_retention(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, reclaim: bool) -> Result<ReplicaPosition> {
         cancelled(cancellation)?;
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
         let source_root = fs::canonicalize(self.source_storage.join(&root)).map_err(io)?;
         let base_root = fs::canonicalize(self.base_storage.join(&root)).map_err(io)?;
         require_detached_base(&source_root, &base_root)?;
         let (journal, region) = exclusive_journal(&self.replica_log)?;
-        let result = self.install_locked(source_root, base_root, &journal, &region, &memory, cancellation).await;
+        let result = self.install_locked(source_root.clone(), base_root, &journal, &region, &memory, cancellation).await;
         region.close_and_wait().await;
-        result
+        drop(region);
+        let boundary = result?;
+        if reclaim {
+            cancelled(cancellation)?;
+            let source = LocalStore::open(source_root)?.with_catalog_ledger(boundary.epoch());
+            let anchor = LocalRepairAnchor { block: self.base.block, boundary, sha256: self.base.sha256 };
+            let result = source.retire_classic_log_prefixes(anchor, &journal, ReadOnlyLocalLogOptions::default().maximum_message_bytes).await;
+            source.close_and_wait().await;
+            result?;
+        }
+        Ok(boundary)
     }
 
     async fn install_locked(
@@ -136,7 +154,8 @@ impl RetainRepairBase {
         let record = logs.decode_replica(record)?.ok_or_else(|| invalid("The trusted base has an unknown replica record"))?;
         require_boundary(&record, &base)?;
         cancelled(cancellation)?;
-        source.install_repair_anchor(LocalRepairAnchor { block: self.base.block, boundary, sha256: self.base.sha256 }).await?;
+        let anchor = LocalRepairAnchor { block: self.base.block, boundary, sha256: self.base.sha256 };
+        source.install_repair_anchor(anchor).await?;
         Ok(boundary)
     }
 }

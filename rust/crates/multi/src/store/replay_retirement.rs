@@ -114,10 +114,16 @@ async fn covered_pack(
     let mut has_l0 = false;
     for (name, entry) in &index.entries {
         if checkpoint_metadata_block(name) == Some(block) { continue; }
-        if !is_block_l0(name, block) || entry.length > MAXIMUM_MEMBER_BYTES { return Ok(None); }
-        let original = pack.read_member(entry).await?;
-        if !archive.matches_original(&key(name)?, &original).await? { return Ok(None); }
+        if !is_block_l0(name, block) { return Ok(None); }
         has_l0 = true;
+        let object = key(name)?;
+        if rtdb_format::keys::is_receipt_l0_file(name) && !archive.contains_original(&object) {
+            // A complete successor does not need receipt L0 after compaction covers it.
+            continue;
+        }
+        if entry.length > MAXIMUM_MEMBER_BYTES { return Ok(None); }
+        let original = pack.read_member(entry).await?;
+        if !archive.matches_original(&object, &original).await? { return Ok(None); }
     }
     Ok(has_l0.then_some(boundary))
 }

@@ -15,6 +15,11 @@ use tokio_util::sync::CancellationToken;
 const HEADER_BYTES: u64 = 13;
 const TRAILER_BYTES: u64 = 8;
 const RECORD_SEPARATOR: u8 = 0x1e;
+const RETIRED_SEPARATOR: u8 = 0x1d;
+
+pub(super) fn is_record_separator(byte: u8) -> bool {
+    matches!(byte, RECORD_SEPARATOR | RETIRED_SEPARATOR)
+}
 const MAXIMUM_POLL_RECORDS: usize = 1024;
 const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 
@@ -48,6 +53,7 @@ pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Er
 pub(super) struct RecordHeader {
     metadata: LogMetadata,
     payload_size: usize,
+    retired: bool,
 }
 
 impl RecordHeader {
@@ -74,7 +80,7 @@ pub(super) fn read_record_header_at(file: &mut File, path: &Path, maximum: usize
 fn parse_record_header(file: &mut File, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
     let mut header = [0; HEADER_BYTES as usize];
     file.read_exact(&mut header).map_err(|error| corrupt(path, offset, format!("incomplete record header: {error}")))?;
-    if header[0] != RECORD_SEPARATOR { return Err(corrupt(path, offset, "expected record separator 0x1e")); }
+    if !is_record_separator(header[0]) { return Err(corrupt(path, offset, "invalid local log record separator")); }
     let size = i32::from_be_bytes(header[1..5].try_into().expect("fixed header size"));
     if size < 0 || size as usize > maximum {
         return Err(corrupt(path, offset, format!("invalid payload size {size}, maximum {maximum}")));
@@ -83,7 +89,8 @@ fn parse_record_header(file: &mut File, path: &Path, maximum: usize, offset: u64
         .ok_or_else(|| corrupt(path, offset, "record end overflows"))?;
     if end > length { return Err(corrupt(path, offset, format!("incomplete record ends at {end}, file length {length}"))); }
     let timestamp = Timestamp(i64::from_be_bytes(header[5..13].try_into().expect("fixed header size")));
-    Ok(RecordHeader { metadata: LogMetadata { offset: LogOffset(offset as i64), timestamp }, payload_size: size as usize })
+    Ok(RecordHeader { metadata: LogMetadata { offset: LogOffset(offset as i64), timestamp },
+        payload_size: size as usize, retired: header[0] == RETIRED_SEPARATOR })
 }
 
 fn read_record_trailer(file: &mut File, path: &Path, offset: LogOffset) -> Result<()> {
@@ -101,6 +108,12 @@ pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Resul
 }
 
 pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogRecord> {
+    if header.retired {
+        let requested = header.metadata.offset.0;
+        return Err(Error::UnavailableLogRange {
+            requested, first_retained: requested + HEADER_BYTES as i64 + header.payload_size as i64 + TRAILER_BYTES as i64,
+        });
+    }
     let mut payload = vec![0; header.payload_size];
     file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
     read_record_trailer(file, path, header.metadata.offset)?;
@@ -113,6 +126,11 @@ pub(super) fn inspect_record(file: &mut File, path: &Path, maximum: usize) -> Re
 }
 
 pub(super) fn inspect_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogMetadata> {
+    if header.retired {
+        file.seek(SeekFrom::Current(header.payload_size as i64)).map_err(|error| Error::io(path, error))?;
+        read_record_trailer(file, path, header.metadata.offset)?;
+        return Ok(header.metadata);
+    }
     let mut remaining = header.payload_size;
     let mut scratch = [0; 8 * 1024];
     while remaining > 0 {
@@ -122,6 +140,40 @@ pub(super) fn inspect_record_body(file: &mut File, path: &Path, header: RecordHe
     }
     read_record_trailer(file, path, header.metadata.offset)?;
     Ok(header.metadata)
+}
+
+pub(crate) fn prefix_end(file: &mut File, path: &Path, maximum: usize, boundary: LogOffset, inclusive: bool) -> Result<u64> {
+    let mut next = 0;
+    let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+    let boundary = u64::try_from(boundary.0).map_err(|_| corrupt(path, 0, "negative checkpoint log boundary"))?;
+    while next <= boundary && next < length {
+        let header = read_record_header_at(file, path, maximum, next, length)?;
+        let end = next + HEADER_BYTES + header.payload_size as u64 + TRAILER_BYTES;
+        file.seek(SeekFrom::Start(end - TRAILER_BYTES)).map_err(|error| Error::io(path, error))?;
+        read_record_trailer(file, path, header.metadata.offset)?;
+        if next == boundary { return Ok(if inclusive { end } else { next }); }
+        next = end;
+    }
+    Err(corrupt(path, boundary, "the checkpoint boundary does not name a complete record"))
+}
+
+pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u64) -> Result<()> {
+    let zeros = [0; 8192];
+    let mut next = 0;
+    while next < end {
+        let header = read_record_header_at(file, path, maximum, next, end)?;
+        file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
+        file.write_all(&[RETIRED_SEPARATOR]).map_err(|error| Error::io(path, error))?;
+        file.seek(SeekFrom::Start(next + HEADER_BYTES)).map_err(|error| Error::io(path, error))?;
+        let mut remaining = header.payload_size;
+        while remaining > 0 {
+            let count = remaining.min(zeros.len());
+            file.write_all(&zeros[..count]).map_err(|error| Error::io(path, error))?;
+            remaining -= count;
+        }
+        next += HEADER_BYTES + header.payload_size as u64 + TRAILER_BYTES;
+    }
+    crate::sync_file(file).map_err(|error| Error::io(path, error))
 }
 
 fn inspect(file: &mut File, path: &Path, maximum: usize) -> Result<LogOffset> {
@@ -462,5 +514,37 @@ mod tests {
         shutdown.cancel();
         writer.await.unwrap().unwrap();
         log.close_and_wait().await;
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn settling_a_prefix_keeps_frame_offsets_and_excludes_its_payloads() -> Result<()> {
+        let scratch = tempfile::NamedTempFile::new().map_err(|error| Error::Task(error.to_string()))?;
+        let path = Arc::new(scratch.path().to_path_buf());
+        let mut writer = Writer {
+            file: scratch.reopen().map_err(|error| Error::io(&path, error))?,
+            path: Arc::clone(&path),
+            timestamps: Arc::new(SuppliedTimestamp),
+        };
+        let record = |payload: &'static [u8]| Queued {
+            payload: Bytes::from_static(payload), timestamp: Timestamp(5), durable: oneshot::channel().0,
+        };
+        let records = writer.append(&[record(b"old receipt"), record(b"surviving suffix")])?;
+        let before = records[1].offset;
+        let end = prefix_end(&mut writer.file, &path, 1024, before, false)?;
+        for _ in 0..2 { settle_prefix(&mut writer.file, &path, 1024, end)?; }
+
+        let bytes = fs::read(path.as_ref()).map_err(|error| Error::io(&path, error))?;
+        assert!(bytes[HEADER_BYTES as usize..HEADER_BYTES as usize + b"old receipt".len()].iter().all(|byte| *byte == 0));
+        assert_eq!(inspect(&mut writer.file, &path, 1024)?, before);
+        writer.file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(&path, error))?;
+        assert!(matches!(read_record(&mut writer.file, &path, 1024), Err(Error::UnavailableLogRange { requested: 0, .. })));
+        writer.file.seek(SeekFrom::Start(before.0 as u64)).map_err(|error| Error::io(&path, error))?;
+        assert_eq!(read_record(&mut writer.file, &path, 1024)?.payload.as_ref(), b"surviving suffix");
+        Ok(())
     }
 }

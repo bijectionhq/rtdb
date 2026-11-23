@@ -132,8 +132,8 @@ fn reset_compactor_accepts_a_retained_export_only_for_reset() {
 #[test]
 fn retain_repair_base_requires_a_detached_store_and_checkpoint_receipt() {
     let base = format!("9@{}", "a1".repeat(32));
-    let Command::RetainRepairBase { request, memory_bytes } = parse(&[
-        "retain-repair-base", "source", "logs/REPLICA_LOG", "export", &base, "--memory-limit", "104857600",
+    let Command::RetainRepairBase { request, memory_bytes, reclaim_receipts } = parse(&[
+        "retain-repair-base", "source", "logs/REPLICA_LOG", "export", &base, "--reclaim-receipts", "--memory-limit", "104857600",
     ]) else { panic!("expected repair base retention") };
     assert_eq!(request.source_storage.to_str(), Some("source"));
     assert_eq!(request.base_storage.to_str(), Some("export"));
@@ -141,6 +141,7 @@ fn retain_repair_base_requires_a_detached_store_and_checkpoint_receipt() {
     assert_eq!(request.base.block.0, 9);
     assert_eq!(request.base.sha256, [0xa1; 32]);
     assert_eq!(memory_bytes, 104857600);
+    assert!(reclaim_receipts);
     assert!(cli::parse(["retain-repair-base", "source", "logs/REPLICA_LOG", &base].map(str::to_owned), &|_| None).is_err());
 }
 

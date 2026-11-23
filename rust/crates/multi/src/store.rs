@@ -284,7 +284,6 @@ impl RemoteStorageFactory for CellStoreFactory {
             }
             let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
             serving.index_pages = Some(pages);
-            serving.releases_receipt_l0 = self.replica_payload_reclamation && matches!(config.storage, CellStorage::S3 { .. });
             serving.catalog_readers = Some(CatalogReaders::new(
                 self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
@@ -1380,7 +1379,6 @@ pub struct GarbageStore {
     packing: Option<Arc<crate::packing::PackingStore>>,
     index_pages: Option<HostedIndexPages>,
     catalog_readers: Option<CatalogReaders>,
-    releases_receipt_l0: bool,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeMap<ObjectKey, Vec<PhysicalObjectVersion>>>,
     clock: Clock,
@@ -1392,7 +1390,7 @@ impl GarbageStore {
     pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self::new(inner, clock, None))) }
 
     fn new(inner: Arc<dyn ObjectStore>, clock: Clock, packing: Option<Arc<crate::packing::PackingStore>>) -> Self {
-        Self { inner, packing, index_pages: None, catalog_readers: None, releases_receipt_l0: false, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
+        Self { inner, packing, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
     }
 
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
@@ -1501,7 +1499,7 @@ impl ObjectStore for GarbageStore {
         readers.retain(cut).await.map(Some)
     }
     fn defers_trie_releases(&self) -> bool { self.catalog_readers.is_some() }
-    fn releases_receipt_l0(&self) -> bool { self.releases_receipt_l0 }
+    fn releases_receipt_l0(&self) -> bool { self.catalog_readers.is_some() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { return Ok(true); };
         readers.advance(installed).await

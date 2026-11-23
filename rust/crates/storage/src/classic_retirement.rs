@@ -1,10 +1,13 @@
-use std::sync::Arc;
+use std::{fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::Arc};
+
+use fs2::FileExt;
 
 use bytes::Bytes;
-use rtdb_format::trie_retirement::InstalledRetirement;
-use rtdb_types::{Anomaly, Result};
+use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_receipt_l0_file, skipped_tx_position}, trie_retirement::InstalledRetirement};
+use rtdb_types::{Anomaly, Result, SourcePosition};
 
-use crate::{IoRegion, ObjectKey, ObjectStore};
+use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
+    log::{LogOffset, local::{prefix_end, settle_prefix}}};
 
 struct TrieDeletionGrant<'a> {
     store: &'a dyn ObjectStore,
@@ -28,6 +31,13 @@ impl<'a> TrieDeletionGrant<'a> {
 
         let recovery_gate = if let Some(local) = store.local_maintenance_store() {
             let Some(gate) = local.try_lock_recovery_deletion().await? else { return Ok(None); };
+            let cut = installed.cut();
+            if files.iter().any(|file| is_receipt_l0_file(file.as_str()))
+                && !local.retained_repair_anchor().await?.is_some_and(|anchor|
+                    anchor.boundary.epoch() == cut.replica_epoch && anchor.boundary >= cut.through)
+            {
+                return Ok(None);
+            }
             Some(gate)
         } else { None };
 
@@ -47,6 +57,79 @@ impl<'a> TrieDeletionGrant<'a> {
             None => erase.await,
         }
     }
+}
+
+struct ClassicLogDeletionGrant {
+    source: (PathBuf, File, u64),
+    replica: (PathBuf, File, u64),
+    source_through: SourcePosition,
+    maximum: usize,
+    _recovery_gate: Arc<dyn Send + Sync>,
+}
+
+impl ClassicLogDeletionGrant {
+    async fn authorize(store: &LocalStore, anchor: LocalRepairAnchor, replica: &Path,
+        maximum: usize,
+    ) -> Result<Self> {
+        let unavailable = || Anomaly::incorrect("rtdb.storage/log-retirement", "Retiring a local log requires its exact retained checkpoint and exclusive custody");
+        let gate = store.try_lock_recovery_deletion().await?.ok_or_else(unavailable)?;
+        if store.retained_repair_anchor().await? != Some(anchor) || replica.file_name().and_then(|name| name.to_str()) != Some("REPLICA_LOG") {
+            return Err(unavailable());
+        }
+        let root = ObjectKey::new(block_key(anchor.block)?)?;
+        let catalog = BlockCatalog::decode(&store.get_fresh(&root).await?)?;
+        if catalog.publication_sha256() != Some(anchor.sha256)
+            || catalog.boundary_replica_position() != Some(anchor.boundary)
+        {
+            return Err(unavailable());
+        }
+        let source_through = catalog.latest_source_position()
+            .filter(|source| source.after_offset(anchor.boundary.epoch()) >= 0).ok_or_else(unavailable)?;
+        let replica = replica.to_path_buf();
+        store.io_region().run(move || {
+            let source = replica.with_file_name("LOG");
+            let open = |path: &Path| OpenOptions::new().read(true).write(true).open(path)
+                .map_err(|error| Error::io(path, error));
+            let mut source_file = open(&source)?;
+            FileExt::try_lock_exclusive(&source_file).map_err(|error| Error::io(&source, error))?;
+            let mut replica_file = open(&replica)?;
+            FileExt::try_lock_exclusive(&replica_file).map_err(|error| Error::io(&replica, error))?;
+            let source_end = prefix_end(&mut source_file, &source, maximum,
+                LogOffset(source_through.after_offset(anchor.boundary.epoch())), true)?;
+            let replica_end = prefix_end(&mut replica_file, &replica, maximum,
+                LogOffset(anchor.boundary.offset()), false)?;
+            Ok(Self { source: (source, source_file, source_end), replica: (replica, replica_file, replica_end),
+                source_through, maximum, _recovery_gate: gate })
+        }).await.map_err(Into::into)
+    }
+
+    async fn settle(mut self, store: &LocalStore) -> Result<()> {
+        let through = self.source_through;
+        IoRegion::retaining(Arc::clone(&self._recovery_gate), async {
+            let locked = store.io_region().run(move || {
+                let (path, file, end) = &mut self.source;
+                settle_prefix(file, path, self.maximum, *end)?;
+                let (path, file, end) = &mut self.replica;
+                settle_prefix(file, path, self.maximum, *end)?;
+                Ok(self)
+            }).await?;
+            for object in store.list(Some(&ObjectKey::new("skipped-txs")?)).await? {
+                if skipped_tx_position(object.key.as_str()).is_some_and(|position|
+                    position.epoch() == through.epoch() && position <= through)
+                {
+                    store.delete(&object.key).await?;
+                }
+            }
+            drop(locked);
+            Ok(())
+        }).await
+    }
+}
+
+pub(crate) async fn retire_log_prefixes(store: &LocalStore, anchor: LocalRepairAnchor,
+    replica: &Path, maximum: usize,
+) -> Result<()> {
+    ClassicLogDeletionGrant::authorize(store, anchor, replica, maximum).await?.settle(store).await
 }
 
 pub(crate) async fn retire(store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {

@@ -1431,8 +1431,7 @@ impl ReplicationDriver {
                         tx.replay_submission = None;
                         tx.placed_attempt_seed = None;
                     }
-                    let digits = position.0.to_string();
-                    let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
+                    let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::skipped_tx_key(position))?;
                     let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
                     let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
                     context.storage.object_store().put(&key, payload).await?;

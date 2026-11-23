@@ -1,5 +1,5 @@
 mod guarded_sample;
-mod local;
+pub(crate) mod local;
 mod memory;
 mod read_only;
 

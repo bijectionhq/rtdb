@@ -28,10 +28,13 @@ async fn run() -> Result<()> {
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
         Command::CompactorReset { options, database, dry_run, retained_base } => reset_compactor(options, database, dry_run, retained_base).await,
-        Command::RetainRepairBase { request, memory_bytes } => {
+        Command::RetainRepairBase { request, memory_bytes, reclaim_receipts } => {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
-            let installation = request.install(memory, &cancellation);
+            let installation = async {
+                if reclaim_receipts { request.install_and_reclaim(memory, &cancellation).await }
+                else { request.install(memory, &cancellation).await }
+            };
             tokio::pin!(installation);
             let boundary = tokio::select! {
                 result = &mut installation => result?,

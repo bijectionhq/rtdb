@@ -80,7 +80,11 @@
 -- The cell reaper admits the release when its directory observation carries that residence and namespace and covers the installed cut in the same storage root and journal.
 -- The published recovery inventory must cover the installed removal.
 -- Older recovery and metadata admissions retain the released files until their provider work drains.
--- A coordinated receipt L0 release also requires an installed successor that omits the compacted input, its exact provider publication, and a certified replay anchor excluding the removal position.
+-- A coordinated receipt L0 release requires a successor omitting the compacted input.
+-- Directory custody authenticates the exact publication and uses the certified replay anchor to exclude the removal position.
+-- On Classic local storage, the same grant owner requires the retained repair anchor and the exclusive recovery gate before deleting a receipt L0.
+-- Offline classic log-prefix settlement compares the retained root and locks both journal files.
+-- It overwrites covered payloads in place and disposes of skipped diagnostics through the selected source position.
 -- Files in that plan release in artefact, data and metadata order.
 -- An interrupted release retains the plan so a successor can retry the files before releasing the intent marker.
 -- Hosted collection waits for an installed catalog cut before selecting a batch.

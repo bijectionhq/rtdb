@@ -136,11 +136,21 @@ Native skip diagnostics keep the operation bytes and omit user metadata, retry g
 The original source still supplies the skipped attempt's ordered abort.
 
 In the hosted directory path, new receipt L0 data and metadata are loose objects with their own publication identities.
-Deployments enrolled in exact replica payload reclamation can settle those objects through the existing versioned reaper.
+Directory deployments can submit those objects to the current reaper.
+The versioned or terminal provider still has to identify the original publication precisely.
 The grant owner requires an authenticated successor, an installed catalog floor, released recovery references, and a certified replay anchor that excludes the receipt's removal position.
 Physical journal trim retains its own media obligations.
 
-M1 remains open for durable source and replica copies outside the settled trim, receipt L0 on other storage profiles, previously packed inputs, older checkpoints and archives with live recovery rights, and previously archived or legacy skipped payloads.
+For stopped Classic local storage, `retain-repair-base --reclaim-receipts` installs a verified detached recovery anchor and submits both covered log prefixes to the Classic deletion-grant owner.
+The grant validates the source and replica offsets against that checkpoint, overwrites covered payloads with durable retired framing, and deletes covered skip diagnostics after log settlement.
+The operation retains the boundary frame needed by replica repair.
+Classic loose receipt tries additionally require a retained repair anchor covering their removal cut.
+Directory-managed local receipt tries use the existing local custodian and certified recovery exclusion.
+The old-pack grant can settle a mixed pack whose independent replay manifest omits covered receipt L0 and authenticates every retained ordinary member.
+
+M1 remains open for still-held archives, Classic remote receipt objects without exact provider disposal, active installed journal grant files, offloaded or legacy copies outside these grants, and untracked media snapshots.
 Closure needs exact custodian settlement after the successor and all such references are released.
+A captured archive's existing whole-capture settlement can run after release of its last entitlement.
+An archive that must still provide exact business history needs independent receipt custody before those receipt bytes can be withdrawn.
 A quiet history still needs ordered receipt-clock progress to trigger collection.
 Early erasure of associated metadata enters the same copy-settlement path as expiry.

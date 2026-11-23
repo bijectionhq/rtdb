@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
 use super::{AppendReceipt, Log, LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead};
-use super::local::{corrupt, inspect_record, inspect_record_body, read_record, read_record_body, read_record_header_at};
+use super::local::{corrupt, inspect_record, inspect_record_body, is_record_separator, read_record, read_record_body, read_record_header_at};
 use crate::{Error, IoRegion, Result, object_store::ReadReservation};
 
 #[derive(Clone, Debug)]
@@ -175,7 +175,7 @@ fn frame_end(file: &mut File, path: &Path, start: u64, maximum: usize) -> Result
     let mut header = [0; 13];
     file.read_exact(&mut header).map_err(|error| corrupt(path, start, error.to_string()))?;
     let size = i32::from_be_bytes(header[1..5].try_into().expect("fixed header"));
-    if header[0] != 0x1e || size < 0 || size as usize > maximum { return Err(corrupt(path, start, "invalid record header")); }
+    if !is_record_separator(header[0]) || size < 0 || size as usize > maximum { return Err(corrupt(path, start, "invalid record header")); }
     let end = start.checked_add(21 + size as u64).ok_or_else(|| corrupt(path, start, "record end overflow"))?;
     file.seek(SeekFrom::Start(end - 8)).map_err(|error| Error::io(path, error))?;
     let mut trailer = [0; 8];

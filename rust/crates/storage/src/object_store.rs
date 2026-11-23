@@ -404,6 +404,15 @@ struct AdmittedFile {
 
 impl LocalStore {
     pub fn root(&self) -> &Path { &self.root }
+
+    pub(crate) fn io_region(&self) -> &Arc<IoRegion> { &self.io }
+
+    /// Settles the prefixes selected by the verified offline repair anchor.
+    pub async fn retire_classic_log_prefixes(&self, anchor: crate::LocalRepairAnchor,
+        replica: &Path, maximum: usize,
+    ) -> rtdb_types::Result<()> {
+        crate::classic_retirement::retire_log_prefixes(self, anchor, replica, maximum).await
+    }
     /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         Self::open_in(root, IoRegion::new())
@@ -559,6 +568,7 @@ impl ObjectStore for LocalStore {
     }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
+    fn releases_receipt_l0(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         let Some(ledger) = self.catalog.clone() else { return Ok(true); };
