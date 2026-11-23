@@ -1024,6 +1024,10 @@ impl<'a> OpenTransaction<'a> {
                 if self.hosted_replay.as_ref().is_some_and(|replay| replay.is_transient_world_control(control)) {
                     return Ok(());
                 }
+                if let Some(documents) = control.arrow_replacement() {
+                    return self.put_arrow_documents(&control.table(), documents, Some(&[control.id().iid()]),
+                        Some(Timestamp(0)), Some(Timestamp::MAX), false).await;
+                }
                 if let Some(replacement) = control.replacement() {
                     let valid = interval(Timestamp(0), Timestamp::MAX)?;
                     let mut document = replacement.clone();

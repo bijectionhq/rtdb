@@ -544,6 +544,14 @@ fn owned_field_presence(documents: &Documents) -> Value {
 fn encode_owned_arrow_fields(documents: &ArrowDocuments, body: &mut StructFields<Value>) -> Result<Vec<Iid>> {
     let array = documents.array();
     let iids = (0..array.len()).map(|row| documents.owned_id_ref(row).map(rtdb_columnar::EntityIdRef::iid)).collect::<Result<_>>()?;
+    body.insert("iids".into(), Value::Null);
+    body.insert("field_presence".into(), arrow_field_presence(documents)?);
+    body.insert("arrow_payload".into(), Value::Bool(true));
+    Ok(iids)
+}
+
+fn arrow_field_presence(documents: &ArrowDocuments) -> Result<Value> {
+    let array = documents.array();
     let presence = (0..array.len()).map(|row| {
         let mut names = Vec::new();
         for (field, column) in array.fields().iter().zip(array.columns()) {
@@ -552,10 +560,7 @@ fn encode_owned_arrow_fields(documents: &ArrowDocuments, body: &mut StructFields
         }
         Ok(Value::List(names.into()))
     }).collect::<Result<Vec<_>>>()?;
-    body.insert("iids".into(), Value::Null);
-    body.insert("field_presence".into(), Value::List(presence.into()));
-    body.insert("arrow_payload".into(), Value::Bool(true));
-    Ok(iids)
+    Ok(Value::List(presence.into()))
 }
 
 fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections::BTreeSet<String>>>> {
@@ -763,8 +768,17 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             }
         }
         Operation::Public(TxOp::HostedControl(control)) => {
-            body = control.body();
-            if control.is_check() { "rtdb-hosted-control-check-v1" } else { "rtdb-hosted-control-v1" }
+            body = control.source_header();
+            if let Some(documents) = control.arrow_replacement() {
+                body.insert("iids".into(), Value::Null);
+                body.insert("field_presence".into(), arrow_field_presence(documents)?);
+                docs = Some((control.name().to_owned(), SourceDocuments::Arrow(documents)));
+                "rtdb-hosted-catalog-arrow-v1"
+            } else {
+                let document = control.source_row().ok_or_else(|| invalid("Hosted control has no source document"))?;
+                body.insert("document".into(), Value::Struct(document.clone()));
+                if control.is_check() { "rtdb-hosted-control-check-v1" } else { "rtdb-hosted-control-v1" }
+            }
         }
         Operation::Public(TxOp::HostedConstraintRefusal) => {
             body.insert("version".into(), Value::I64(1));
@@ -1679,6 +1693,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1" => &["relation", "name", "columns"],
             "rtdb-owned-spatial-path-v2" | "rtdb-owned-require-spatial-path-v1" => &["relation", "name", "columns", "geometry_encoding"],
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
+            "rtdb-hosted-catalog-arrow-v1" => &["relation", "scope", "expected", "field_presence"],
             "rtdb-owned-clock-slot-v1" => &["predecessor_id", "predecessor_micros"],
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => &["until"],
             "rtdb-hosted-constraint-refusal-v1" => &["version"],
@@ -1939,9 +1954,9 @@ impl SourceOperationReader<'_> {
                 } else { None };
                 TxOp::OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope::decode(&scope)?, clock }
             }
-            "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => {
-                let (Value::Utf8(relation), Value::Binary(scope), expected, Value::Struct(document)) =
-                    (value("relation")?, value("scope")?, value("expected")?, value("document")?)
+            "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" | "rtdb-hosted-catalog-arrow-v1" => {
+                let (Value::Utf8(relation), Value::Binary(scope), expected) =
+                    (value("relation")?, value("scope")?, value("expected")?)
                 else { return Err(invalid("Hosted control has invalid fields")); };
                 let expected = match expected {
                     Value::I64(time) => Some(Timestamp(time)),
@@ -1950,11 +1965,28 @@ impl SourceOperationReader<'_> {
                 };
                 let relation = rtdb_types::OwnedRelation::new(relation)?;
                 let scope = rtdb_types::PlacedAttemptScope::decode(&scope)?;
-                TxOp::HostedControl(if name == "rtdb-hosted-control-check-v1" {
-                    crate::HostedControlWrite::check(relation, scope, expected, document)?
+                let control = if name == "rtdb-hosted-catalog-arrow-v1" {
+                    let (table, rows) = source_document_rows(body, offset)?;
+                    let structs = rows.as_any().downcast_ref::<StructArray>()
+                        .filter(|rows| rows.len() == 1).ok_or_else(|| invalid("Hosted catalog needs one document"))?;
+                    if table != relation.name() { return Err(invalid("Hosted catalog document has another relation")); }
+                    let layout = DecodedDocumentLayout::new(structs.fields(), memory)?;
+                    let documents = ArrowDocuments::from_source(structs, layout, source_bytes, memory)?
+                        .ok_or_else(|| invalid("Hosted catalog document is null"))?;
+                    let presence = read_owned_field_presence(value("field_presence")?)?.unwrap_or_default();
+                    let [fields] = presence.as_slice() else { return Err(invalid("Hosted catalog needs one field set")); };
+                    let documents = documents.select_owned_fields(fields, memory)?;
+                    crate::HostedControlWrite::arrow_catalog(relation, scope, expected, documents)?
+                        .ok_or_else(|| invalid("Hosted catalog document has an invalid layout"))?
                 } else {
-                    crate::HostedControlWrite::new(relation, scope, expected, document)?
-                })
+                    let Value::Struct(document) = value("document")? else { return Err(invalid("Hosted control document is not a struct")); };
+                    if name == "rtdb-hosted-control-check-v1" {
+                        crate::HostedControlWrite::check(relation, scope, expected, document)?
+                    } else {
+                        crate::HostedControlWrite::new(relation, scope, expected, document)?
+                    }
+                };
+                TxOp::HostedControl(control)
             }
             "rtdb-hosted-constraint-refusal-v1" => {
                 if value("version")? != Value::I64(1) {
@@ -2032,16 +2064,11 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1"
             | "rtdb-owned-relative-insert-v2" | "rtdb-owned-relative-replace-v2"
             | "insert-docs" | "put-docs" | "patch-docs" => {
-                let docs_array = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
-                let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
-                let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
+                let (table, rows) = source_document_rows(body, offset)?;
                 let relative = matches!(name.as_str(), "rtdb-owned-relative-insert-v2" | "rtdb-owned-relative-replace-v2");
                 let owned = (relative || matches!(name.as_str(), "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1"))
                     .then(|| rtdb_types::OwnedRelation::from_source(table.clone())).transpose()?;
                 let table = if owned.is_none() { Some(parse_table(&table)?) } else { None };
-                let lists = docs_array.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Documents are not a list"))?;
-                if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
-                let rows = lists.value(docs_offset);
                 let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
                 let (valid_from, valid_to) =
                     (optional_timestamp(value("_valid_from")?)?, optional_timestamp(value("_valid_to")?)?);
@@ -2185,6 +2212,15 @@ fn decode_metadata(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<UserMetad
     if pages.len() != 1 || pages[0].batch().num_rows() != 1 { return Err(invalid("User metadata must contain one row")); }
     UserMetadata::new(cell(pages[0].batch(), "user-metadata", 0)?, memory)
 }
+fn source_document_rows(body: &StructArray, row: usize) -> Result<(String, ArrayRef)> {
+    let documents = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
+    let tables = documents.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
+    let (table, array, offset) = union_leg(tables, row)?;
+    let lists = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Documents are not a list"))?;
+    if lists.is_null(offset) { return Err(invalid("Documents are not a list")); }
+    Ok((table, lists.value(offset)))
+}
+
 fn union_leg(union: &UnionArray, row: usize) -> Result<(String, ArrayRef, usize)> {
     let id = union.type_id(row);
     let DataType::Union(fields, UnionMode::Dense) = union.data_type() else { return Err(invalid("Transaction union must be dense")); };
@@ -2369,6 +2405,50 @@ mod tests {
         assert_eq!(documents.columns(), ["_id", "location"]);
         let payload = documents.array().column(1).as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
         assert_eq!(payload.value(0), b"wkb");
+    }
+
+    #[test]
+    fn hosted_catalog_source_retains_arrow_payload_and_exact_field_presence() {
+        use arrow_array::{BinaryArray, Int64Array, StringArray};
+        use rtdb_types::PlacedAttemptScope;
+
+        let memory = budget();
+        let scope = PlacedAttemptScope::new("hosted-catalog", 1).unwrap();
+        let declarations = rtdb_types::OwnedRelation::new("bj_relation_declarations").unwrap();
+        let payload = vec![0x9a; 700 * 1024];
+        let write = |id, history_days: Option<i64>| {
+            let mut columns = vec![
+                ("_id", Arc::new(StringArray::from(vec![id])) as ArrayRef),
+                ("declaration", Arc::new(BinaryArray::from_iter_values([payload.as_slice()])) as ArrayRef),
+            ];
+            if let Some(days) = history_days {
+                columns.push(("history_days", Arc::new(Int64Array::from(vec![days]))));
+            }
+            let batch = OwnedBatch::new(RecordBatch::try_from_iter(columns).unwrap(), &memory).unwrap();
+            let docs = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+            TxOp::HostedControl(crate::HostedControlWrite::arrow_catalog(
+                declarations.clone(), scope, Some(Timestamp(11)), docs,
+            ).unwrap().unwrap())
+        };
+        let legacy = crate::HostedControlWrite::new(
+            rtdb_types::OwnedRelation::new("bj_fact_root_program").unwrap(), scope, None,
+            StructFields::from([("_id".into(), Value::Utf8("active".into())), ("generation".into(), Value::I64(7))]),
+        ).unwrap();
+        let tx = SourceTransaction::new(vec![write("with-retention", Some(7)), write("without-retention", None),
+            TxOp::HostedControl(legacy)], SubmitOptions::default(), &memory).unwrap();
+        let restored = roundtrip(&tx);
+        for (i, id) in ["with-retention", "without-retention"].into_iter().enumerate() {
+            let Operation::Public(TxOp::HostedControl(control)) = &restored.operations[i] else { panic!("expected catalog control"); };
+            let documents = control.arrow_replacement().unwrap();
+            assert_eq!(control.id(), &rtdb_types::EntityId::String(id.into()));
+            assert_eq!(control.expected(), Some(Timestamp(11)));
+            assert_eq!(control.scope(), scope);
+            assert_eq!(documents.columns().contains(&"history_days".to_owned()), i == 0);
+            let bytes = documents.array().column_by_name("declaration").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(bytes.value(0), payload);
+        }
+        let Operation::Public(TxOp::HostedControl(legacy)) = &restored.operations[2] else { panic!("expected legacy control"); };
+        assert_eq!(legacy.replacement().unwrap().get("generation"), Some(&Value::I64(7)));
     }
 
     #[test]

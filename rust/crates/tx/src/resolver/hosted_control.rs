@@ -149,20 +149,26 @@ impl OpenTransaction<'_> {
             if control.scope() != scope || !base.contains_table(&table) {
                 return Err(unavailable());
             }
-            if let Some(document) = control.replacement() {
+            let shape = || Anomaly::incorrect(
+                "rtdb.hosted/control-shape",
+                "Hosted control fields must match the installed ordinary column types",
+            );
+            let accepts = |kind: Option<&LogicalType>, observed: &LogicalType| {
+                kind.is_some_and(|kind| !matches!(kind, LogicalType::Nothing | LogicalType::Null)
+                    && *observed != LogicalType::Nothing && kind.join(observed) == *kind)
+            };
+            if let Some(documents) = control.arrow_replacement() {
+                let array = documents.array();
+                let existing = base.column_types_for(&table, documents.columns().iter().cloned());
+                for (field, array) in array.fields().iter().zip(array.columns()) {
+                    let cell = ArrowCell { field, array: array.as_ref(), row: 0 };
+                    if !accepts(existing.get(field.name()), &cell.observed_type()?) { return Err(shape()); }
+                }
+            } else if let Some(document) = control.replacement() {
                 let fields = document.keys().cloned();
                 let existing = base.column_types_for(&table, fields);
-                if document.iter().any(|(name, value)| {
-                    existing.get(name).is_none_or(|kind| {
-                        matches!(kind, LogicalType::Nothing | LogicalType::Null)
-                            || matches!(value, Value::Undefined)
-                            || kind.join(&value.logical_type()) != *kind
-                    })
-                }) {
-                    return Err(Anomaly::incorrect(
-                        "rtdb.hosted/control-shape",
-                        "Hosted control fields must match the installed ordinary column types",
-                    ));
+                if document.iter().any(|(name, value)| !accepts(existing.get(name), &value.logical_type())) {
+                    return Err(shape());
                 }
             }
             charges.push(self.context.memory.reserve(table.table.len() + 512)?);

@@ -80,9 +80,10 @@ The application result materializes after the row is selected.
 Transaction resolution still orders admission, locality, and final-state checks.
 
 | Hosted Root catalog replacement
-| The Flight decoder materializes the hosted catalog payload as generic document fields.
-| The ordered source encoder and resolver rebuild Arrow from those fields.
-The hosted control path still uses a row representation between Arrow boundaries.
+| The Flight decoder materialized the hosted catalog payload as generic document fields before source encoding and resolution.
+| The supported Root owner, program and relation-declaration payloads retain Arrow columns through the placed source log and ordered event write.
+The source operation carries exact field presence, including independently omitted fields in a bulk declaration.
+Previously logged hosted controls and other control formats retain their original decoder.
 
 | Spatial path declaration and removal
 | Declaration and catalog checks materialized generic row and list values for path names and columns.

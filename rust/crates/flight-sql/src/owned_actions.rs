@@ -1197,7 +1197,9 @@ impl Service {
     fn decode_hosted_control_groups(
         &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, scope: rtdb_types::PlacedAttemptScope,
         rows_left: &mut usize, require_checks: bool,
-    ) -> Result<(Vec<rtdb_tx::HostedControlWrite>, Vec<(Arc<MemoryReservation>, Arc<MemoryReservation>)>), Status> {
+    ) -> Result<(Vec<rtdb_tx::HostedControlWrite>, Vec<Arc<MemoryReservation>>), Status> {
+        use rtdb_tx::HostedControlWrite;
+
         let mut held = Vec::with_capacity(groups.len());
         let mut controls = Vec::new();
         for (relation, arrow) in groups {
@@ -1215,28 +1217,38 @@ impl Service {
             *rows_left = rows_left.checked_sub(rows).ok_or_else(|| invalid("Hosted commit exceeds its total row limit"))?;
             let reservation = call.reserve(wire::mul(rows, std::mem::size_of::<TxOp>() + 512)?)?;
             controls.try_reserve_exact(rows).map_err(|_| Status::resource_exhausted("Hosted control allocation failed"))?;
-            let (rows, documents) = upload::owned_documents(batch.batch(), call.memory())?;
-            for mut row in rows {
-                strip_owned_absence(&mut row)?;
-                let expected = match row.remove("_expected_micros") {
-                    Some(Value::I64(time)) => Some(Timestamp(time)),
-                    Some(Value::Null) => None,
-                    _ => return Err(invalid("Hosted control expectation must be Int64 or null")),
-                };
-                let check_only = match row.remove("_check_only") {
-                    Some(Value::Bool(check_only)) => check_only,
-                    None => false,
-                    _ => return Err(invalid("Hosted control check flag must be Boolean")),
-                };
-                if require_checks && !check_only { return Err(invalid("Read validation permits only hosted control checks")); }
-                let control = if check_only {
-                    rtdb_tx::HostedControlWrite::check(relation.clone(), scope, expected, row)
-                } else {
-                    rtdb_tx::HostedControlWrite::new(relation.clone(), scope, expected, row)
-                }.map_err(status)?;
-                controls.push(control);
+            held.push(reservation);
+            if !require_checks && HostedControlWrite::supports_arrow_catalog(&relation)
+                && schema.fields().iter().all(|field| field.metadata().is_empty())
+            {
+                let expected = batch.batch().column_by_name("_expected_micros").and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                    .ok_or_else(|| invalid("Hosted control expectation must be Int64 or null"))?;
+                let checks = batch.batch().column_by_name("_check_only").and_then(|column| column.as_any().downcast_ref::<BooleanArray>());
+                for row in 0..rows {
+                    if checks.is_none_or(|checks| !checks.is_null(row) && !checks.value(row)) {
+                        let positions = owned_payload_columns(batch.batch(), row, &["_expected_micros", "_check_only"])?;
+                        if let Some(documents) = self.owned_payload(&batch, row, &positions)? {
+                            let time = (!expected.is_null(row)).then(|| Timestamp(expected.value(row)));
+                            if let Some(control) = HostedControlWrite::arrow_catalog(relation.clone(), scope, time, documents).map_err(status)? {
+                                controls.push(control);
+                                continue;
+                            }
+                        }
+                    }
+                    let (decoded, charge) = upload::owned_documents(&batch.batch().slice(row, 1), call.memory())?;
+                    for row in decoded {
+                        controls.push(hosted_control_row(&relation, scope, row, require_checks)?);
+                    }
+                    held.push(charge);
+                }
+                held.push(Arc::clone(batch.reservation()));
+                continue;
             }
-            held.push((reservation, documents));
+            let (rows, documents) = upload::owned_documents(batch.batch(), call.memory())?;
+            for row in rows {
+                controls.push(hosted_control_row(&relation, scope, row, require_checks)?);
+            }
+            held.push(documents);
         }
         Ok((controls, held))
     }
@@ -4693,6 +4705,30 @@ fn owned_payload_columns(batch: &RecordBatch, row: usize, controls: &[&str]) -> 
         }
     }
     Ok(positions)
+}
+
+fn hosted_control_row(
+    relation: &OwnedRelation, scope: rtdb_types::PlacedAttemptScope, mut row: StructFields<Value>, require_checks: bool,
+) -> Result<rtdb_tx::HostedControlWrite, Status> {
+    use rtdb_tx::HostedControlWrite;
+
+    strip_owned_absence(&mut row)?;
+    let expected = match row.remove("_expected_micros") {
+        Some(Value::I64(time)) => Some(Timestamp(time)),
+        Some(Value::Null) => None,
+        _ => return Err(invalid("Hosted control expectation must be Int64 or null")),
+    };
+    let check_only = match row.remove("_check_only") {
+        Some(Value::Bool(check_only)) => check_only,
+        None => false,
+        _ => return Err(invalid("Hosted control check flag must be Boolean")),
+    };
+    if require_checks && !check_only { return Err(invalid("Read validation permits only hosted control checks")); }
+    if check_only {
+        HostedControlWrite::check(relation.clone(), scope, expected, row)
+    } else {
+        HostedControlWrite::new(relation.clone(), scope, expected, row)
+    }.map_err(status)
 }
 
 fn strip_owned_absence(row: &mut rtdb_types::StructFields<Value>) -> Result<(), Status> {

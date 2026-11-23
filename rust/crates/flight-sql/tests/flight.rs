@@ -1238,14 +1238,17 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
         owned_native_actions: true,
         hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
             owner: "xtdb".into(),
-            relations: ["bj_fact_root_owner".to_owned()].into(),
+            relations: ["bj_fact_root_owner", "bj_fact_root_program", "bj_relation_declarations"].map(str::to_owned).into(),
         }),
         ..FlightConfig::default()
     }, &["application"]).await;
     let mut client = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
     client.update("INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', revision: 1, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
-    let owner = client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await;
-    let expected = owner[0].column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
+    client.update("INSERT INTO bj_fact_root_program RECORDS {_id: 'active', application_schema: 'old', _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
+    client.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', declaration: X'01', history_days: 7, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
+    let clock = |batches: &[RecordBatch]| batches[0].column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
+    let expected = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await);
+    let expected_program = clock(&client.query("SELECT _system_from FROM bj_fact_root_program WHERE _id = 'active'").await);
 
     let mut relation = Vec::new();
     frame(&mut relation, b"places");
@@ -1298,6 +1301,22 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
         ("_expected_micros", Arc::new(Int64Array::from(vec![expected]))),
         ("revision", Arc::new(Int64Array::from(vec![2]))),
     ]);
+    let program = ipc([
+        ("_id", Arc::new(StringArray::from(vec!["active"])) as ArrayRef),
+        ("_expected_micros", Arc::new(Int64Array::from(vec![expected_program]))),
+        ("application_schema", Arc::new(StringArray::from(vec!["new"]))),
+    ]);
+    let mut absent = ListBuilder::new(StringBuilder::new());
+    absent.values().append_value("history_days");
+    absent.append(true);
+    absent.append(true);
+    let declarations = ipc([
+        ("_id", Arc::new(StringArray::from(vec!["places", "later"])) as ArrayRef),
+        ("_expected_micros", Arc::new(Int64Array::from(vec![None, None]))),
+        ("_absent", Arc::new(absent.finish())),
+        ("declaration", Arc::new(BinaryArray::from_iter_values([b"p".as_slice(), b"l".as_slice()]))),
+        ("history_days", Arc::new(Int64Array::from(vec![None, Some(30)]))),
+    ]);
 
     let facts = groups(&[("places", &hook), ("places", &requirement)]);
     let mut body = vec![1];
@@ -1311,17 +1330,22 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
     body.extend_from_slice(&i64::MAX.to_be_bytes());
     body.extend_from_slice(&u32::try_from(facts.len()).unwrap().to_be_bytes());
     body.extend(facts);
-    body.extend(groups(&[("bj_fact_root_owner", &owner)]));
+    body.extend(groups(&[("bj_fact_root_owner", &owner), ("bj_fact_root_program", &program), ("bj_relation_declarations", &declarations)]));
     let body = Bytes::from(body);
 
     let refused = client.action("rtdb.owned.DecideHosted.v1", body.clone()).await.unwrap_err();
     assert!(refused.message().contains("lacks coverage"), "{refused}");
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 1);
+    assert_eq!(integer(&client.query("SELECT count(*) FROM bj_relation_declarations").await[0], 0, 0), 1);
 
     relation.extend(declaration);
     client.action("rtdb.owned.DeclareSpatialPath.v1", relation.into()).await.unwrap();
     client.action("rtdb.owned.DecideHosted.v1", body).await.unwrap();
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 2);
+    let ordered = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner").await);
+    assert_eq!(clock(&client.query("SELECT _system_from FROM bj_fact_root_program WHERE application_schema = 'new'").await), ordered);
+    assert_eq!(clock(&client.query("SELECT _system_from FROM bj_relation_declarations WHERE _id = 'places' AND history_days IS NULL").await), ordered);
+    assert_eq!(clock(&client.query("SELECT _system_from FROM bj_relation_declarations WHERE _id = 'later' AND history_days = 30").await), ordered);
     running.stop().await;
 }
 

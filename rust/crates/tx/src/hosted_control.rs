@@ -650,8 +650,14 @@ pub struct HostedControlWrite {
     scope: PlacedAttemptScope,
     id: EntityId,
     expected: Option<Timestamp>,
-    document: StructFields<Value>,
+    document: HostedControlDocument,
     check_only: bool,
+}
+
+#[derive(Clone, Debug)]
+enum HostedControlDocument {
+    Row(StructFields<Value>),
+    Arrow { documents: crate::ArrowDocuments, bytes: usize },
 }
 
 impl HostedControlWrite {
@@ -681,7 +687,7 @@ impl HostedControlWrite {
             scope,
             id,
             expected,
-            document,
+            document: HostedControlDocument::Row(document),
             check_only: false,
         };
         if result.retained_bytes()? > 1024 * 1024 {
@@ -702,6 +708,50 @@ impl HostedControlWrite {
         let mut result = Self::new(relation, scope, expected, document)?;
         result.check_only = true;
         Ok(result)
+    }
+
+    pub fn supports_arrow_catalog(relation: &OwnedRelation) -> bool {
+        matches!(relation.name(), "bj_fact_root_owner" | "bj_fact_root_program" | "bj_relation_declarations")
+    }
+
+    pub fn arrow_catalog(
+        relation: OwnedRelation,
+        scope: PlacedAttemptScope,
+        expected: Option<Timestamp>,
+        documents: crate::ArrowDocuments,
+    ) -> Result<Option<Self>> {
+        use arrow_array::Array;
+        use arrow_schema::{DataType, Field};
+
+        fn compatible(field: &Field) -> bool {
+            field.metadata().is_empty() && match field.data_type() {
+                DataType::Utf8 | DataType::Binary | DataType::Int64 | DataType::Boolean => true,
+                DataType::Null => field.is_nullable(),
+                DataType::List(item) => item.data_type() == &DataType::Utf8 && item.metadata().is_empty(),
+                _ => false,
+            }
+        }
+
+        let array = documents.array();
+        if !Self::supports_arrow_catalog(&relation) || array.len() != 1
+            || array.fields().len() > 128
+            || array.fields().iter().any(|field| field.name() != "_id" && field.name().starts_with('_'))
+        {
+            return Err(invalid());
+        }
+        if !array.fields().iter().all(|field| compatible(field)) {
+            return Ok(None);
+        }
+        let id = documents.owned_id(0)?;
+        if !matches!(&id, EntityId::String(id) if !id.is_empty() && id.len() <= 4096) {
+            return Err(invalid());
+        }
+        let bytes = array.fields().iter().zip(array.columns()).try_fold(0usize, |bytes, (field, column)| {
+            let cell = rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), 0)?.div_ceil(2);
+            bytes.checked_add(field.name().len()).and_then(|bytes| bytes.checked_add(cell)).ok_or_else(invalid)
+        })?;
+        let result = Self { relation, scope, id, expected, document: HostedControlDocument::Arrow { documents, bytes }, check_only: false };
+        Ok((result.retained_bytes()? <= 1024 * 1024).then_some(result))
     }
 
     pub fn is_check(&self) -> bool {
@@ -731,17 +781,31 @@ impl HostedControlWrite {
         self.expected
     }
     pub fn replacement(&self) -> Option<&StructFields<Value>> {
-        (!self.check_only).then_some(&self.document)
+        match &self.document {
+            HostedControlDocument::Row(document) if !self.check_only => Some(document),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn arrow_replacement(&self) -> Option<&crate::ArrowDocuments> {
+        match &self.document {
+            HostedControlDocument::Arrow { documents, .. } => Some(documents),
+            HostedControlDocument::Row(_) => None,
+        }
     }
 
     pub fn retained_bytes(&self) -> Result<usize> {
-        Value::document_retained_bytes(&self.document)?
+        let document = match &self.document {
+            HostedControlDocument::Row(document) => Value::document_retained_bytes(document)?,
+            HostedControlDocument::Arrow { bytes, .. } => *bytes,
+        };
+        document
             .checked_add(self.id.as_value().retained_bytes()?)
             .and_then(|n| n.checked_add(self.relation.name().len() + 512))
             .ok_or_else(invalid)
     }
 
-    pub(crate) fn body(&self) -> StructFields<Value> {
+    pub(crate) fn source_header(&self) -> StructFields<Value> {
         StructFields::from([
             ("relation".into(), Value::Utf8(self.relation.name().into())),
             ("scope".into(), Value::Binary(self.scope.encode().to_vec())),
@@ -749,8 +813,14 @@ impl HostedControlWrite {
                 "expected".into(),
                 self.expected.map_or(Value::Null, |time| Value::I64(time.0)),
             ),
-            ("document".into(), Value::Struct(self.document.clone())),
         ])
+    }
+
+    pub(crate) fn source_row(&self) -> Option<&StructFields<Value>> {
+        match &self.document {
+            HostedControlDocument::Row(document) => Some(document),
+            HostedControlDocument::Arrow { .. } => None,
+        }
     }
 }
 
