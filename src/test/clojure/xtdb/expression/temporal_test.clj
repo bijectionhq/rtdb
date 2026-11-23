@@ -1346,12 +1346,16 @@
   (with-open [rel (vr/rel-reader [(tu/open-vec "ts" #xt/type [:timestamp-local :micro] [#xt/date-time "1969-12-15T13:00"])
                                   (tu/open-vec "tstz" #xt/type [:timestamp-tz :micro "UTC"] [#xt/zoned-date-time "1969-12-15T13:00Z"])
                                   (tu/open-vec "s" #xt/type :utf8 ["1969-12-15"])])]
-    (t/are [form] (= {:res [#xt/date "1969-12-15"], :res-type #xt/type [:date :milli]}
-                     (et/run-projection rel form))
-      (list 'cast 'ts (types/->type [:date :milli]))
-      (list 'cast 'tstz (types/->type [:date :milli]))
-      (list 'cast 's (types/->type [:date :milli]))
-      (list 'cast (list 'cast 'ts (types/->type [:date :day])) (types/->type [:date :milli])))))
+    (binding [expr/*default-tz* ZoneOffset/UTC]
+      (t/are [form] (= {:res [#xt/date "1969-12-15"], :res-type #xt/type [:date :milli]}
+                       (et/run-projection rel form))
+        (list 'cast 'ts (types/->type [:date :milli]))
+        (list 'cast 'tstz (types/->type [:date :milli]))
+        (list 'cast 's (types/->type [:date :milli]))
+        (list 'cast (list 'cast 'ts (types/->type [:date :day])) (types/->type [:date :milli]))))
+    (binding [expr/*default-tz* (ZoneOffset/ofHours 12)]
+      (t/is (= {:res [#xt/date "1969-12-16"], :res-type #xt/type [:date :milli]}
+               (et/run-projection rel (list 'cast 'tstz (types/->type [:date :milli]))))))))
 
 (t/deftest test-uoe-thrown-for-unsupported-div
   (t/is (anomalous? [:unsupported nil]
