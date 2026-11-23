@@ -127,6 +127,13 @@ fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) 
     }
 }
 
+#[derive(Clone, Copy)]
+enum HostedReadCheck {
+    Ordinary,
+    AudienceRoute,
+    AudienceCapture,
+}
+
 struct LocalHolding {
     id: String,
     epoch: u64,
@@ -456,6 +463,15 @@ impl NodeAgent {
     }
 
     pub async fn confirm_hosted_read(&self, database: &Database) -> Result<String> {
+        self.confirm_placed_read(database, HostedReadCheck::Ordinary).await
+    }
+
+    pub(crate) async fn confirm_audience_read(&self, database: &Database, require_quorum: bool) -> Result<String> {
+        let check = if require_quorum { HostedReadCheck::AudienceCapture } else { HostedReadCheck::AudienceRoute };
+        self.confirm_placed_read(database, check).await
+    }
+
+    async fn confirm_placed_read(&self, database: &Database, check: HostedReadCheck) -> Result<String> {
         let name = database.name();
         let unavailable = || Anomaly::new(
             AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node does not hold a linearizable database for {name}"),
@@ -464,13 +480,29 @@ impl NodeAgent {
             .filter(|holding| holding.linearizable && std::ptr::eq(holding.database.as_ptr(), database))
             .map(|holding| (holding.id.clone(), holding.epoch))
             .ok_or_else(unavailable)?;
-        let record = self.directory.deployment(&id).await?
-            .filter(|record| record.linearizable_reads && record.epoch == epoch
-                && record.holder.as_ref() == Some(&self.member())
-                && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined))
+        let member_id = self.member();
+        let record = match check {
+            HostedReadCheck::Ordinary => self.directory.deployment(&id).await?,
+            HostedReadCheck::AudienceRoute | HostedReadCheck::AudienceCapture => {
+                let (record, member) = tokio::try_join!(self.directory.deployment(&id), self.directory.member(&member_id))?;
+                record.zip(member).and_then(|(record, member)| {
+                    (member.id == member_id && record.may_hold_on(&member, now_ms())).then_some(record)
+                })
+            }
+        }.filter(|record| record.id == id && record.name == name && record.linearizable_reads && record.epoch == epoch
+            && record.holder.as_ref() == Some(&member_id)
+            && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined))
             .ok_or_else(unavailable)?;
+        if !matches!(check, HostedReadCheck::Ordinary) {
+            let scope = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
+            if database.placed_writer_scope() != Some(scope) {
+                return Err(unavailable());
+            }
+        }
         require_recovered_checkpoint(&record, database)?;
-        self.confirm_holder(name, &id).await?;
+        if !matches!(check, HostedReadCheck::AudienceRoute) {
+            self.confirm_holder(name, &id).await?;
+        }
         Ok(id)
     }
 

@@ -67,6 +67,10 @@ pub trait ReadFence: Send + Sync {
     async fn confirm_hosted(&self, _database: &Database) -> Result<String> {
         Err(hosted_source_unavailable())
     }
+    /// Confirms the complete current placement. Applied snapshots also require journal leadership.
+    async fn confirm_audience(&self, _database: &Database, _require_quorum: bool) -> Result<String> {
+        Err(hosted_source_unavailable())
+    }
 }
 
 pub(crate) struct HostedSourceReceipt {
@@ -98,8 +102,15 @@ enum CatalogReadCut<'a> {
         minimum: TransactionKey,
         history: uuid::Uuid,
         memory: &'a Arc<MemoryBudget>,
-        preparation: Option<&'a PreparedAppliedCatalog>,
+        admission: AppliedCatalogAdmission<'a>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum AppliedCatalogAdmission<'a> {
+    Ordinary,
+    PrepareAudience,
+    PreparedAudience(&'a PreparedAppliedCatalog),
 }
 
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
@@ -238,6 +249,17 @@ impl Node {
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
     pub fn hold_active_call(&self, database: &Database) -> Option<Box<dyn Send + Sync>> {
         self.read_fence.as_ref()?.hold_active_call(database)
+    }
+    /// Rechecks the serving placement before reading an already-held audience snapshot.
+    pub async fn confirm_audience_route(&self, database: &Arc<Database>, source: uuid::Uuid) -> Result<()> {
+        self.ensure_open()?;
+        let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
+        let history = fence.confirm_audience(database, false).await?;
+        let attached = self.attached_database(database.name(), None)?;
+        if uuid::Uuid::parse_str(&history).ok() != Some(source) || !Arc::ptr_eq(&attached, database) {
+            return Err(hosted_source_unavailable());
+        }
+        Ok(())
     }
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
@@ -403,10 +425,10 @@ impl Node {
         let placed = self.catalog.is_placed();
         let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
         let hosted_fence = match cut {
-            CatalogReadCut::HostedApplied { history, preparation, .. } => {
+            CatalogReadCut::HostedApplied { history, admission, .. } => {
                 self.ensure_indexing()?;
                 if !placed || placement.is_none() { return Err(hosted_source_unavailable()); }
-                Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, preparation))
+                Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, admission))
             }
             CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
                 if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
@@ -462,15 +484,18 @@ impl Node {
             let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
             let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             let snapshot = snapshot.with_system_time_cap(cap)?;
-            let snapshot = if let Some((fence, expected_history, preparation)) = hosted_fence {
+            let snapshot = if let Some((fence, expected_history, admission)) = hosted_fence {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
-                let permit = if let Some(preparation) = preparation {
-                    preparation.pin(&database, cut)?
-                } else {
-                    database.storage.object_store().retain_catalog(Some(cut)).await?
-                        .ok_or_else(applied_catalog_unretained)?
+                let permit = match admission {
+                    AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
+                    AppliedCatalogAdmission::Ordinary | AppliedCatalogAdmission::PrepareAudience =>
+                        database.storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
                 };
-                let history = fence.confirm_hosted(&database).await?;
+                let history = match admission {
+                    AppliedCatalogAdmission::Ordinary => fence.confirm_hosted(&database).await?,
+                    AppliedCatalogAdmission::PrepareAudience | AppliedCatalogAdmission::PreparedAudience(_) =>
+                        fence.confirm_audience(&database, true).await?,
+                };
                 if uuid::Uuid::parse_str(&history).ok() != Some(expected_history) {
                     return Err(hosted_source_unavailable());
                 }
@@ -2988,7 +3013,12 @@ impl NativeSession {
         let (reserved, cut) = match applied_floor {
             Some(floor) => {
                 applied_memory = node.factory.options.query.query_memory(&self.service.memory);
-                (None, floor.cut(None, &applied_memory, applied_preparation.as_deref())?)
+                let admission = match applied_preparation.as_deref() {
+                    Some(preparation) => AppliedCatalogAdmission::PreparedAudience(preparation),
+                    None if self.service.memory.prepaid_by(node.memory()) => AppliedCatalogAdmission::PrepareAudience,
+                    None => AppliedCatalogAdmission::Ordinary,
+                };
+                (None, floor.cut(None, &applied_memory, admission)?)
             }
             None => {
                 let present = self.reserve_ordered_present().await?;

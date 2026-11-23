@@ -5,7 +5,7 @@ use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
 
 use crate::Database;
-use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, prepare_query, read_value};
+use super::{AppliedCatalogAdmission, CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, prepare_query, read_value};
 use rtdb_query::QueryContext;
 
 /// One storage registration for a lower bound on the physical catalogs read by a prepared session.
@@ -98,13 +98,13 @@ impl AppliedReadFloor {
 
     pub(super) fn cut<'a>(
         &self, original: Option<TransactionKey>, memory: &'a Arc<MemoryBudget>,
-        preparation: Option<&'a PreparedAppliedCatalog>,
+        admission: AppliedCatalogAdmission<'a>,
     ) -> Result<CatalogReadCut<'a>> {
         let minimum = match original {
             Some(original) => confirmation_floor(original, self.minimum)?,
             None => self.minimum,
         };
-        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history, memory, preparation })
+        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history, memory, admission })
     }
 
     pub(super) async fn require_transactions(
@@ -325,9 +325,12 @@ impl OwnedReadSession {
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),
         };
+        let admission = self.applied_preparation.as_deref().map_or(
+            AppliedCatalogAdmission::Ordinary, AppliedCatalogAdmission::PreparedAudience,
+        );
         let current = self.node.query_context_in_placement(
             &self.database, &basis, self.identity.as_ref(), Some(&self.attachment),
-            floor.cut(Some(self.present), &self.context.memory, self.applied_preparation.as_deref())?, &self.cancellation,
+            floor.cut(Some(self.present), &self.context.memory, admission)?, &self.cancellation,
         ).await?;
         let database = current.catalog.database(&self.database)?;
         let [captured] = database.partitions.as_slice() else {
