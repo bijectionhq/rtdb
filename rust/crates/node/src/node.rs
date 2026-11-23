@@ -1157,7 +1157,8 @@ impl OwnedReadSession {
             }
             let table = logical.purge_table(&self.owner);
             let expected = snapshot.relation_event_frontier(&table)?;
-            Ok((table, expected, lifetime, governed))
+            let lifetime_frontier = governed.then(|| snapshot.relation_event_frontier(&lifetime)).transpose()?;
+            Ok((table, expected, lifetime, lifetime_frontier))
         }).collect::<Result<Vec<_>>>()?;
         let charge = self.context.memory.reserve(frontiers.len() * 512)?;
         let node = self.node.clone();
@@ -1171,9 +1172,15 @@ impl OwnedReadSession {
             if current.contains_table(&obsolete) {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native held reads"));
             }
-            for (table, expected, lifetime, governed) in &frontiers {
-                if current.contains_table(lifetime) != *governed {
+            for (table, expected, lifetime, lifetime_frontier) in &frontiers {
+                if current.contains_table(lifetime) != lifetime_frontier.is_some() {
                     return Err(lifetime_read_unavailable());
+                }
+                if let Some(frontier) = lifetime_frontier
+                    && current.relation_event_frontier(lifetime)? != *frontier
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/lifetime-collected",
+                        "The held relation's lifetime replay admission changed"));
                 }
                 if current.relation_event_frontier(table)? != *expected {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The held relation was revoked by an ordered erase"));
@@ -1265,6 +1272,7 @@ impl OwnedReadSession {
             .await?.and_then(|(schema, _)| schema.lifetime_micros())
             .ok_or_else(lifetime_read_unavailable)?;
         let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&self.context), &self.owner, relation).await?;
+        floor.admit_recorded_present(self.present.system_time)?;
         floor.check(schema, self.present.system_time)?;
         Ok(Some(floor))
     }
