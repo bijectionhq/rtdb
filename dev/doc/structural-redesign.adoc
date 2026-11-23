@@ -222,7 +222,8 @@ Directory deployments can retire loose receipt L0 through their custodian after 
 An exact record erase co-orders erasure of transaction metadata explicitly associated with that record.
 Classic local repair-base maintenance settles covered log payloads and skip diagnostics, and pack retirement accepts an independent successor that omits covered receipt members.
 New held-world suffixes authenticate exact business effects before leaving receipt state with its original authority. Held checkpoint reads open only business members of the authenticated manifest.
-Physical withdrawal from previously materialized archives and remaining provider custody stay open. Quiet histories depend on the ordered clock work in T4.
+Classic S3 can settle an exact compacted receipt version bound to an installed release and the publication recorded by compaction.
+Earlier mixed archives, unbound provider versions and active installed-grant files still need physical settlement. Quiet histories depend on the ordered clock work in T4.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.

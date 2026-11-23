@@ -6,7 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{Error, ObjectKey, remote::{PublicationResult, PublicationUploads, valid_object_version}};
+use rtdb_storage::{Error, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, valid_object_version}};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneCondition};
 
 #[path = "never_versioned.rs"]
@@ -33,6 +33,44 @@ enum VersionStatus {
     Absent,
     WouldExposeOlderData,
     SafeToRemove,
+}
+
+#[async_trait::async_trait]
+impl ClassicVersionRetirement for VersionedInventory {
+    async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> rtdb_storage::Result<bool> {
+        self.exact_retirement_available(key, version).await.map_err(|error| retirement_error(key, error))
+    }
+
+    async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> rtdb_storage::Result<()> {
+        self.retire_observed_version(key, version).await.map_err(|error| retirement_error(key, error))
+    }
+
+    async fn require_never_versioned(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        self.never_versioned_retirement().await.map(drop).map_err(|error| retirement_error(key, error))
+    }
+
+    async fn settle_staging_upload(&self, upload: uuid::Uuid, version: Option<&str>) -> rtdb_storage::Result<()> {
+        let path = Path::from(format!("{}/.tmp/upload-{upload}", self.root));
+        let result = async {
+            if let Some(version) = version.filter(|version| valid_object_version(version.as_bytes())) {
+                return self.retire_version_at_path(path.as_ref(), version).await;
+            }
+            self.never_versioned_retirement().await?;
+            self.client.delete_object().bucket(&self.namespace.bucket).key(path.as_ref())
+                .set_request_payer(self.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Removing the Classic staging upload failed: {error}")))?;
+            if self.version_status(path.as_ref(), "null").await? != VersionStatus::Absent {
+                return Err(unavailable("The Classic staging upload is still present"));
+            }
+            Ok(())
+        }.await;
+        result.map_err(|error| Error::Remote { key: path.to_string(), message: error.to_string() })
+    }
+
+}
+
+fn retirement_error(key: &ObjectKey, error: Anomaly) -> Error {
+    Error::Remote { key: key.to_string(), message: error.to_string() }
 }
 
 impl VersionedInventory {
@@ -96,19 +134,23 @@ impl VersionedInventory {
     /// Success means a fresh version inventory confirmed absence of that exact object.
     pub async fn retire_observed_version(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<()> {
         let path = self.observed_path(key, observed)?;
-        match self.version_status(path.as_ref(), &observed.version).await? {
+        self.retire_version_at_path(path.as_ref(), &observed.version).await
+    }
+
+    async fn retire_version_at_path(&self, path: &str, version: &str) -> Result<()> {
+        match self.version_status(path, version).await? {
             VersionStatus::Absent => return Ok(()),
             VersionStatus::WouldExposeOlderData => return Err(unavailable("Retiring the current version would expose older data")),
             VersionStatus::SafeToRemove => {},
         }
-        match self.client.delete_object().bucket(&self.namespace.bucket).key(path.as_ref()).version_id(&observed.version)
+        match self.client.delete_object().bucket(&self.namespace.bucket).key(path).version_id(version)
             .set_request_payer(self.request_payer.clone()).send().await
         {
             Ok(_) => {},
             Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("NoSuchVersion") => {},
             Err(error) => return Err(unavailable(format!("Removing the observed version failed: {error}"))),
         }
-        if self.version_status(path.as_ref(), &observed.version).await? != VersionStatus::Absent {
+        if self.version_status(path, version).await? != VersionStatus::Absent {
             return Err(unavailable("The retired object version is still present"));
         }
         Ok(())

@@ -4,7 +4,7 @@ use fs2::FileExt;
 
 use bytes::Bytes;
 use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_receipt_l0_file, skipped_tx_position}, trie_retirement::InstalledRetirement};
-use rtdb_types::{Anomaly, Result, SourcePosition};
+use rtdb_types::{Anomaly, PhysicalObjectVersion, Result, SourcePosition};
 
 use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
     log::{LogOffset, local::{prefix_end, settle_prefix}}, sealing::ObjectCipher};
@@ -12,7 +12,7 @@ use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectSto
 
 struct TrieDeletionGrant<'a> {
     store: &'a dyn ObjectStore,
-    files: Vec<ObjectKey>,
+    files: Vec<(ObjectKey, Option<PhysicalObjectVersion>)>,
     recovery_gate: Option<Arc<dyn Send + Sync>>,
 }
 
@@ -27,13 +27,16 @@ impl<'a> TrieDeletionGrant<'a> {
         }
         let mut selected: Vec<_> = installed.files().iter().collect();
         selected.sort_by_key(|file| file.release_order());
-        let files = selected.into_iter().map(|file| ObjectKey::new(&file.key))
-            .collect::<crate::Result<Vec<_>>>()?;
+        let files = selected.into_iter().map(|file| {
+            let key = ObjectKey::new(&file.key)?;
+            let version = file.version.as_ref().filter(|_| file.matches_publication).cloned();
+            Ok((key, version))
+        }).collect::<crate::Result<Vec<_>>>()?;
 
         let recovery_gate = if let Some(local) = store.local_maintenance_store() {
             let Some(gate) = local.try_lock_recovery_deletion().await? else { return Ok(None); };
             let cut = installed.cut();
-            if files.iter().any(|file| is_receipt_l0_file(file.as_str()))
+            if files.iter().any(|(file, _)| is_receipt_l0_file(file.as_str()))
                 && !local.retained_repair_anchor().await?.is_some_and(|anchor|
                     anchor.boundary.epoch() == cut.replica_epoch && anchor.boundary >= cut.through)
             {
@@ -45,16 +48,19 @@ impl<'a> TrieDeletionGrant<'a> {
         // The current conservative predicate uses the installed cut. Admission
         // and this grant can evolve independently once holds carry reachability.
         if !store.advance_catalog_floor(installed.cut()).await? { return Ok(None); }
+        for (file, version) in &files {
+            if !store.classic_trie_retirement_ready(file, version.as_ref()).await? { return Ok(None); }
+        }
         Ok(Some(Self { store, files, recovery_gate }))
     }
 
     async fn erase(self, keys: Option<&dyn ObjectCipher>) -> Result<()> {
         let erase = async {
-            for file in self.files {
+            for (file, version) in self.files {
                 if let Some(keys) = keys {
                     keys.withdraw(&file).await?;
                 }
-                self.store.delete(&file).await?;
+                self.store.settle_classic_trie(&file, version.as_ref()).await?;
             }
             Ok(())
         };

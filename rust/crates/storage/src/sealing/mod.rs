@@ -297,6 +297,17 @@ impl ObjectStore for EncryptingStore {
         self.inner.release_trie_files(receipt, contents).await
     }
 
+    async fn classic_trie_retirement_ready(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> Result<bool> {
+        self.inner.classic_trie_retirement_ready(key, version).await
+    }
+
+    async fn settle_classic_trie(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> Result<()> {
+        if self.classic_control.as_ref() == Some(key) {
+            return Err(Error::InvalidKey(key.to_string()).into());
+        }
+        self.inner.settle_classic_trie(key, version).await
+    }
+
     async fn release_search_run(
         &self,
         key: &ObjectKey,

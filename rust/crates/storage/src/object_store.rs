@@ -180,6 +180,18 @@ pub trait ObjectStore: Send + Sync {
     async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<bool> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
     }
+    /// Provider preflight for an exact publication selected by the Classic grant.
+    async fn classic_trie_retirement_ready(&self, _key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> rtdb_types::Result<bool> {
+        Ok(version.is_none())
+    }
+    /// Physical settlement, called by the Classic retirement owner after admission closes.
+    async fn settle_classic_trie(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> rtdb_types::Result<()> {
+        if version.is_some() {
+            return Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "The provider cannot settle an exact object version"));
+        }
+        self.delete(key).await?;
+        Ok(())
+    }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         if self.defers_trie_releases() {

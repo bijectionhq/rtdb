@@ -56,6 +56,15 @@ pub trait PublicationUploads: Send + Sync {
     async fn abort(&self, path: &Path, upload: &str) -> Result<()>;
 }
 
+/// Provider inventory used to settle exactly the Classic publication selected by a grant.
+#[async_trait]
+pub trait ClassicVersionRetirement: Send + Sync {
+    async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool>;
+    async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()>;
+    async fn require_never_versioned(&self, key: &ObjectKey) -> Result<()>;
+    async fn settle_staging_upload(&self, upload: uuid::Uuid, version: Option<&str>) -> Result<()>;
+}
+
 #[derive(Clone)]
 pub struct RemoteStore {
     objects: Arc<RemoteObjects>,
@@ -64,6 +73,7 @@ pub struct RemoteStore {
     version_namespace: Option<Arc<S3ObjectNamespace>>,
     terminal_allocation: Option<uuid::Uuid>,
     catalog: Option<Arc<catalog::CatalogLedger>>,
+    classic_versions: Option<Arc<dyn ClassicVersionRetirement>>,
 }
 
 impl RemoteStore {
@@ -76,13 +86,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -93,7 +103,7 @@ impl RemoteStore {
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
         let objects = Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
-        Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None }
+        Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     pub fn with_catalog_ledger(mut self) -> Result<Self> {
@@ -115,6 +125,11 @@ impl RemoteStore {
     /// Enables version observations for a store backed by the specified S3 namespace.
     pub fn with_s3_versioning(mut self, namespace: S3ObjectNamespace) -> Self {
         self.version_namespace = Some(Arc::new(namespace));
+        self
+    }
+
+    pub fn with_classic_versions(mut self, inventory: Arc<dyn ClassicVersionRetirement>) -> Self {
+        self.classic_versions = Some(inventory);
         self
     }
 
@@ -174,6 +189,49 @@ impl ObjectStore for RemoteStore {
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
         crate::classic_retirement::retire(self, receipt, contents).await
+    }
+
+    async fn classic_trie_retirement_ready(&self, key: &ObjectKey, version: Option<&PhysicalObjectVersion>) -> rtdb_types::Result<bool> {
+        let Some(inventory) = self.classic_versions.clone() else { return Ok(version.is_none()); };
+        // Key authority in a sealed Classic root is scoped to the logical
+        // path. Refuse to withdraw that slot if another version is visible.
+        if let Some(version) = version {
+            match self.observe_head(key).await {
+                Ok(current) if current.version.as_ref() == Some(version) => (),
+                Ok(_) => return Ok(false),
+                Err(Error::MissingObject(_)) => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let (key, version) = (key.clone(), version.cloned());
+        Ok(self.io.run_async(async move {
+            match version {
+                Some(version) => inventory.available(&key, &version).await,
+                None => inventory.require_never_versioned(&key).await.map(|()| true),
+            }
+        }).await?)
+    }
+
+    async fn settle_classic_trie(&self, key: &ObjectKey, version: Option<&PhysicalObjectVersion>) -> rtdb_types::Result<()> {
+        let Some(inventory) = self.classic_versions.clone() else {
+            if version.is_some() {
+                return Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "The provider cannot settle an exact object version"));
+            }
+            return self.delete(key).await.map_err(Into::into);
+        };
+        let (objects, key, version) = (Arc::clone(&self.objects), key.clone(), version.cloned());
+        Ok(self.io.run_async(async move {
+            if let Some(version) = version {
+                return inventory.erase(&key, &version).await;
+            }
+            inventory.require_never_versioned(&key).await?;
+            objects.delete(&key).await?;
+            match objects.head(&key).await {
+                Err(Error::MissingObject(_)) => Ok(()),
+                Err(error) => Err(error),
+                Ok(_) => Err(Error::ConflictingObject(key.to_string())),
+            }
+        }).await?)
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
@@ -304,13 +362,22 @@ impl ObjectStore for RemoteStore {
         }).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
+        self.put_file_with_publication(key, source).await.map(drop)
+    }
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &std::path::Path) -> Result<Option<PhysicalObjectPublication>> {
         if self.cell {
             return Err(Error::Remote { key: key.to_string(), message: "Cell writes must supply the final sealed bytes".into() });
         }
         let admission = self.io.admit()?;
         let input = std::fs::File::open(source).map_err(|error| Error::io(source, error))?;
-        let (objects, key, source) = (Arc::clone(&self.objects), key.clone(), source.to_owned());
-        IoRegion::run_async_admitted(admission, async move { objects.put_opened_file(&key, tokio::fs::File::from_std(input), &source).await }).await
+        let (objects, key, source, namespace) = (Arc::clone(&self.objects), key.clone(), source.to_owned(), self.version_namespace.clone());
+        let inventory = self.classic_versions.clone();
+        IoRegion::run_async_admitted(admission, async move {
+            objects.put_opened_file(&key, tokio::fs::File::from_std(input), &source, inventory.as_deref()).await?;
+            let Some(namespace) = namespace else { return Ok(None); };
+            let published = objects.metadata(&key).await?;
+            Ok(physical_version(Some(&namespace), &objects.path(&key), published.version).map(PhysicalObjectPublication::Version))
+        }).await
     }
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { self.copy_to(source, self, destination).await }
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
@@ -609,7 +676,7 @@ impl RemoteObjects {
         }
     }
 
-    async fn put_opened_file(&self, key: &ObjectKey, mut input: tokio::fs::File, source: &std::path::Path) -> Result<()> {
+    async fn put_opened_file(&self, key: &ObjectKey, mut input: tokio::fs::File, source: &std::path::Path, inventory: Option<&dyn ClassicVersionRetirement>) -> Result<()> {
         let length = input.metadata().await.map_err(|error| Error::io(source, error))?.len();
         match self.head(key).await {
             Ok(_) => return self.compare_file(key, &mut input, source, length).await,
@@ -617,10 +684,11 @@ impl RemoteObjects {
             Err(error) => return Err(error),
         }
         if length == 0 { return self.put(key, Bytes::new(), None).await.map(drop); }
-        let temporary = format!(".tmp/upload-{}", uuid::Uuid::new_v4());
+        let upload_id = uuid::Uuid::new_v4();
+        let temporary = format!(".tmp/upload-{upload_id}");
         let temporary = Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{temporary}"), None => temporary });
         let mut upload = self.client.put_multipart(&temporary).await.map_err(|error| provider_error(key, error))?;
-        let uploaded: Result<()> = async {
+        let uploaded: Result<Option<String>> = async {
             let mut remaining = length;
             while remaining != 0 {
                 let count = remaining.min(5 * 1024 * 1024) as usize;
@@ -629,15 +697,18 @@ impl RemoteObjects {
                 upload.put_part(Bytes::from(bytes).into()).await.map_err(|error| provider_error(key, error))?;
                 remaining -= count as u64;
             }
-            upload.complete().await.map_err(|error| provider_error(key, error))?;
-            Ok(())
+            let published = upload.complete().await.map_err(|error| provider_error(key, error))?;
+            Ok(published.version)
         }.await;
-        if let Err(error) = uploaded {
-            if let Err(cleanup) = upload.abort().await {
-                return Err(Error::MultipartAbort { upload: Box::new(error), abort: Box::new(provider_error(key, cleanup)) });
+        let version = match uploaded {
+            Ok(version) => version,
+            Err(error) => {
+                if let Err(cleanup) = upload.abort().await {
+                    return Err(Error::MultipartAbort { upload: Box::new(error), abort: Box::new(provider_error(key, cleanup)) });
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         let published = match self.client.copy_if_not_exists(&temporary, &self.path(key)).await {
             Ok(()) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => self.compare_file(key, &mut input, source, length).await,
@@ -645,7 +716,10 @@ impl RemoteObjects {
             Err(error) if copy_outcome_unknown(&error) => return Err(provider_error(key, error)),
             Err(error) => Err(provider_error(key, error)),
         };
-        let cleanup = self.client.delete(&temporary).await.map_err(|error| provider_error(key, error));
+        let cleanup = match inventory {
+            Some(inventory) => inventory.settle_staging_upload(upload_id, version.as_deref()).await,
+            None => self.client.delete(&temporary).await.map_err(|error| provider_error(key, error)),
+        };
         published.and(cleanup)
     }
 

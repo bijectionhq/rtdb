@@ -148,7 +148,13 @@ Classic loose receipt tries additionally require a retained repair anchor coveri
 Directory-managed local receipt tries use the existing local custodian and certified recovery exclusion.
 The old-pack grant can settle a mixed pack whose independent replay manifest omits covered receipt L0 and authenticates every retained ordinary member.
 
-M1 remains open for still-held archives, Classic remote receipt objects without exact provider disposal, active installed journal grant files, offloaded or legacy copies outside these grants, and untracked media snapshots.
+The Classic trie deletion grant settles S3 compacted receipt files by the exact versions captured at publication and retained in the installed retirement.
+The provider inventories the exact version before and after deletion, blocks a deletion that would expose older data, and refuses to withdraw a path slot while another version is visible.
+Classic streamed file publication also settles the private staging version after the conditional copy completes.
+A legacy object without original publication evidence in a versioned bucket remains pending.
+Other Classic providers lack this version-bound settlement.
+
+M1 remains open for prior still-held archives, unbound Classic remote objects, active installed journal grant files, detached or legacy copies outside these grants, and untracked media snapshots.
 Closure needs exact custodian settlement after the successor and all such references are released.
 A captured archive's existing whole-capture settlement can run after release of its last entitlement.
 Held-world suffixes verify the original certified journal interval and all placed transaction witnesses before materializing the business projection.
