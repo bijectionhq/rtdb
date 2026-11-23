@@ -532,6 +532,8 @@ impl TerminalReplayProgress {
                         let terminal = rtdb_types::PlacedTerminal::decode(terminal)?;
                         let (attempt, _) = rtdb_format::envelope::decode_replica_outcome_attempt(attempt)?;
                         if attempt != reserved.attempt || terminal.commitment != reserved.commitment
+                            || message.tx_id != Some(attempt.position().0) || message.src_msg_id != message.tx_id
+                            || message.committed.is_none()
                             || if terminal.fenced { envelope.term <= term || message.committed != Some(false) }
                                else { envelope.term != term }
                         {
