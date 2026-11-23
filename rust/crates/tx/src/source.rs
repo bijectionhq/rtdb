@@ -20,8 +20,9 @@ pub(crate) enum Operation {
     Public(TxOp),
     OwnedWriteIids { create_only: bool, relation: rtdb_types::OwnedRelation, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     InsertIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    InsertArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
-    PutArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PutReplayArrow { table: TableRef, documents: ArrowDocuments, iids: Option<Vec<Iid>>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     Removed(String),
@@ -97,7 +98,10 @@ impl SourceTransaction {
                 Operation::OwnedWriteIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
                 Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
-                Operation::InsertIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } | Operation::PatchArrowIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::InsertIids { table, iids, .. } | Operation::InsertArrowIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } | Operation::PatchArrowIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::PutReplayArrow { table, iids, .. } => {
+                    (0, Some(table), iids.as_ref().map_or(0, Vec::capacity).checked_mul(16).ok_or_else(overflow)?)
+                }
                 Operation::Removed(name) => (name.capacity(), None, 0),
             };
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
@@ -241,7 +245,7 @@ impl SourceTransaction {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         let mut field = |bytes: &[u8]| { hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes); };
-        let batch = self.operation_batch(None)?;
+        let batch = self.operation_batch(None, SourcePurpose::Receipt)?;
         field(crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?.as_slice());
         field(self.options.default_tz.as_bytes());
         field(&self.options.system_time.map_or([0; 9], |time| { let mut bytes = [1; 9]; bytes[1..].copy_from_slice(&time.0.to_be_bytes()); bytes }));
@@ -257,7 +261,7 @@ impl SourceTransaction {
         let prefix = matches!(self.guard, Some(SourceGuard::Replay(_))).then(|| {
             Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
         });
-        let batch = self.operation_batch(prefix.as_ref())?;
+        let batch = self.operation_batch(prefix.as_ref(), SourcePurpose::Log)?;
         let bytes = crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?;
         let metadata = self.options.user_metadata.as_ref().map(|metadata| encode_metadata(metadata, &self.memory)).transpose()?;
         let body_size = bytes.as_slice().len().checked_add(metadata.as_ref().map_or(0, |bytes| bytes.as_slice().len())).and_then(|bytes| bytes.checked_add(self.options.default_tz.capacity())).and_then(|bytes| bytes.checked_add(self.options.user.as_ref().map_or(0, String::capacity))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
@@ -290,12 +294,12 @@ impl SourceTransaction {
         RetainedBytes::with_reservation(encoded, reservation)
     }
 
-    fn operation_batch(&self, prefix: Option<&Operation>) -> Result<OwnedBatch> {
+    fn operation_batch(&self, prefix: Option<&Operation>, purpose: SourcePurpose) -> Result<OwnedBatch> {
         let operations = || prefix.into_iter().chain(&self.operations);
         let scratch = operations().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
                 Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::OwnedReplaceDocs { documents, .. } | TxOp::InsertDocs { documents, .. } | TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::OwnedWriteIids { documents, .. } | Operation::InsertIids { documents, .. } | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
-                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } | Operation::PatchArrowIids { documents, .. } => {
+                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::InsertArrowIids { documents, .. } | Operation::PutReplayArrow { documents, .. } | Operation::PatchArrowIids { documents, .. } => {
                     documents.array().len().checked_mul(64).ok_or_else(overflow)?
                 }
                 Operation::Public(TxOp::Sql { sql, args }) => {
@@ -334,7 +338,7 @@ impl SourceTransaction {
         for operation in operations() {
             check_writable_table(operation)?;
             if matches!(operation, Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) if ids.ids().is_empty()) { continue; }
-            entries.push(operation_value(operation, &self.memory)?);
+            entries.push(operation_value(operation, &self.memory, purpose)?);
         }
         // Operations on one table with the same columns share one document schema, so its fields are charged once.
         // Each operation still adds its cells to the type, offset and list buffers that hold the operations together.
@@ -371,14 +375,21 @@ struct SourceOperation<'a> {
     documents: Option<(String, SourceDocuments<'a>)>,
 }
 
-enum SourceDocuments<'a> { Rows(&'a Documents), Arrow(&'a ArrowDocuments) }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourcePurpose { Log, Receipt }
+
+enum SourceDocuments<'a> {
+    Rows(&'a Documents),
+    Arrow(&'a ArrowDocuments),
+    Receipt { documents: &'a ArrowDocuments, omit_nulls: bool },
+}
 
 impl SourceDocuments<'_> {
     fn columns(&self) -> &[String] {
-        match self { Self::Rows(documents) => documents.columns(), Self::Arrow(documents) => documents.columns() }
+        match self { Self::Rows(documents) => documents.columns(), Self::Arrow(documents) | Self::Receipt { documents, .. } => documents.columns() }
     }
     fn len(&self) -> usize {
-        match self { Self::Rows(documents) => documents.rows().len(), Self::Arrow(documents) => documents.array().len() }
+        match self { Self::Rows(documents) => documents.rows().len(), Self::Arrow(documents) | Self::Receipt { documents, .. } => documents.array().len() }
     }
 }
 
@@ -415,7 +426,7 @@ fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections
     Ok(Some(rows))
 }
 
-fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
+fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, purpose: SourcePurpose) -> Result<(String, SourceOperation<'a>)> {
     let mut body = StructFields::new();
     let mut docs = None;
     let mut identities = Cow::Borrowed(&[][..]);
@@ -635,13 +646,47 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
             "put-docs"
         }
-        Operation::PutArrowIids { table, documents, iids, valid_from, valid_to }
-        | Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => {
+        Operation::InsertArrowIids { table, documents, iids, valid_from, valid_to } => {
             identities = Cow::Borrowed(iids);
             body.insert("iids".into(), Value::Null);
             time_fields(&mut body, *valid_from, *valid_to);
-            docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
-            if matches!(operation, Operation::PatchArrowIids { .. }) { "patch-docs" } else { "put-docs" }
+            let documents = if purpose == SourcePurpose::Receipt {
+                SourceDocuments::Receipt { documents, omit_nulls: true }
+            } else {
+                SourceDocuments::Arrow(documents)
+            };
+            docs = Some((table_name(table), documents));
+            "insert-docs"
+        }
+        Operation::PutReplayArrow { table, documents, iids, valid_from, valid_to } => {
+            identities = match iids {
+                Some(iids) => Cow::Borrowed(iids),
+                None => {
+                    let reader = documents.id_reader()?;
+                    Cow::Owned((0..documents.array().len()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<_>>()?)
+                }
+            };
+            body.insert("iids".into(), Value::Null);
+            time_fields(&mut body, *valid_from, *valid_to);
+            let payload = if purpose == SourcePurpose::Receipt && (iids.is_none() || documents.requires_legacy_receipt(false)) {
+                SourceDocuments::Receipt { documents, omit_nulls: true }
+            } else {
+                SourceDocuments::Arrow(documents)
+            };
+            docs = Some((table_name(table), payload));
+            "put-docs"
+        }
+        Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => {
+            identities = Cow::Borrowed(iids);
+            body.insert("iids".into(), Value::Null);
+            time_fields(&mut body, *valid_from, *valid_to);
+            let payload = if purpose == SourcePurpose::Receipt && documents.requires_legacy_receipt(true) {
+                SourceDocuments::Receipt { documents, omit_nulls: false }
+            } else {
+                SourceDocuments::Arrow(documents)
+            };
+            docs = Some((table_name(table), payload));
+            "patch-docs"
         }
         Operation::InsertIids { table, documents, iids, valid_from, valid_to } | Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
             identities = Cow::Borrowed(iids);
@@ -787,21 +832,19 @@ fn iid_vector(lists: &[Cow<'_, [Iid]>], field: &Field, arrays: &mut BatchBuilder
 fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
     let arrow = lists.iter().map(|list| match list {
         SourceDocuments::Arrow(documents) => Some(documents.array()),
-        SourceDocuments::Rows(_) => None,
+        SourceDocuments::Rows(_) | SourceDocuments::Receipt { .. } => None,
     }).collect::<Option<Vec<_>>>();
-    if let Some(pages) = arrow {
-        if let Some(leg) = arrow_document_leg(&pages, arrays)? { return Ok(leg); }
-    } else if lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
+    if let Some(pages) = arrow
+        && let Some(leg) = arrow_document_leg(&pages, arrays)? {
+        return Ok(leg);
+    }
+    if lists.iter().all(|list| !matches!(list, SourceDocuments::Receipt { .. }))
+        && lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
         && let Some(leg) = mixed_document_leg(&lists, arrays)? {
         return Ok(leg);
     }
-    let rows = lists.iter().map(|list| match list {
-        SourceDocuments::Rows(documents) => Ok((*documents).clone()),
-        SourceDocuments::Arrow(documents) => documents.to_rows(false, memory),
-    }).collect::<Result<Vec<_>>>()?;
-    let rows = rows.iter().collect::<Vec<_>>();
-    let offsets = document_offsets(rows.iter().map(|documents| documents.rows().len()))?;
-    let structs = row_document_struct(&rows, *offsets.last().unwrap() as usize, arrays)?;
+    let offsets = document_offsets(lists.iter().map(SourceDocuments::len))?;
+    let structs = canonical_document_struct(&lists, *offsets.last().expect("document origin") as usize, arrays, memory)?;
     document_list(structs, offsets)
 }
 
@@ -815,7 +858,7 @@ fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) 
         let mut present = 0;
         for list in lists {
             match list {
-                SourceDocuments::Arrow(documents) => {
+                SourceDocuments::Arrow(documents) | SourceDocuments::Receipt { documents, .. } => {
                     if let Some((field, _)) = document_column(documents.array(), name) {
                         let Some(actual) = document_relayout_type(field)? else { return Ok(None); };
                         if !canonical_union_layouts(field) { return Ok(None); }
@@ -843,17 +886,16 @@ fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) 
             let mut cells = Vec::with_capacity(length);
             cells.extend(lists.iter().flat_map(|list| {
                 let column = match list {
-                    SourceDocuments::Arrow(documents) => document_column(documents.array(), name),
+                    SourceDocuments::Arrow(documents) | SourceDocuments::Receipt { documents, .. } => document_column(documents.array(), name),
                     SourceDocuments::Rows(_) => None,
                 };
                 (0..list.len()).map(move |row| match list {
                     SourceDocuments::Rows(documents) => documents.rows()[row].get(name).map_or(WriterCell::Null, WriterCell::of),
-                    SourceDocuments::Arrow(_) => column.map_or(WriterCell::Null, |(field, array)| WriterCell::arrow(field, array, row)),
+                    SourceDocuments::Arrow(_) | SourceDocuments::Receipt { .. } => column.map_or(WriterCell::Null, |(field, array)| WriterCell::arrow(field, array, row)),
                 })
             }));
             ty = backfilled_nullability(ty, &cells);
         }
-        if !document_relayout_supported(&ty) { return Ok(None); }
         layout.push((to_field(name, &ty)?, ty));
     }
 
@@ -866,7 +908,7 @@ fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) 
                     let values = documents.rows().iter().map(|row| struct_field_cell(row, field.name(), &ty));
                     estimate_builder_bytes_refs(&ty, values)?
                 }
-                SourceDocuments::Arrow(documents) => document_column_bound(documents.array(), &field, &ty)?,
+                SourceDocuments::Arrow(documents) | SourceDocuments::Receipt { documents, .. } => document_column_bound(documents.array(), &field, &ty)?,
             };
             bytes.checked_add(size).ok_or_else(overflow)
         })?;
@@ -876,7 +918,7 @@ fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) 
                     let values = documents.rows().iter().map(|row| struct_field_cell(row, field.name(), &ty).clone()).collect::<Vec<_>>();
                     copy_array(&ty, &values)
                 }
-                SourceDocuments::Arrow(documents) => align_document_column(documents.array(), &field, selection, scratch),
+                SourceDocuments::Arrow(documents) | SourceDocuments::Receipt { documents, .. } => align_document_column(documents.array(), &field, selection, scratch),
             }).collect()
         })?);
         fields.push(Arc::new(field));
@@ -1044,7 +1086,6 @@ fn merge_document_fields(left: &Field, right: &Field) -> Result<Option<Field>> {
         return Ok(None);
     };
     let joint = left.join(&right_type);
-    if !document_relayout_supported(&joint) { return Ok(None); }
     to_field(right.name(), &joint).map(Some)
 }
 
@@ -1052,7 +1093,8 @@ fn document_relayout_type(field: &Field) -> Result<Option<LogicalType>> {
     fn supported_field(field: &Field) -> bool {
         crate::values::compatible_document_metadata(field) && match field.data_type() {
             DataType::Struct(fields) => fields.iter().all(|field| supported_field(field)),
-            DataType::List(field) | DataType::FixedSizeList(field, _) => supported_field(field),
+            DataType::List(field) | DataType::FixedSizeList(field, _) | DataType::Map(field, _)
+            | DataType::RunEndEncoded(_, field) => supported_field(field),
             DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| {
                 supported_field(field) && (!field.is_nullable() || field.data_type() == &DataType::Null)
             }),
@@ -1060,57 +1102,126 @@ fn document_relayout_type(field: &Field) -> Result<Option<LogicalType>> {
         }
     }
     if !supported_field(field) { return Ok(None); }
-    let logical = from_field(field)?;
-    Ok(document_relayout_supported(&logical).then_some(logical))
+    from_field(field).map(Some)
 }
 
-fn document_relayout_supported(logical: &LogicalType) -> bool {
-    match logical {
-        LogicalType::Maybe(value) => document_relayout_supported(value),
-        LogicalType::Struct(fields) => fields.values().all(document_relayout_supported),
-        LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::FixedSizeList(_), element } =>
-            document_relayout_supported(element),
-        LogicalType::Union(legs) => legs.iter().all(document_relayout_supported),
-        LogicalType::Scalar(_) | LogicalType::Null | LogicalType::Nothing => true,
-        _ => false,
+pub(crate) fn owned_row_documents(documents: &Documents, memory: &Arc<MemoryBudget>) -> Result<ArrowDocuments> {
+    let mut builder = BatchBuilder::new(4096, memory)?;
+    let array = canonical_document_struct(&[SourceDocuments::Rows(documents)], documents.rows().len(), &mut builder, memory)?;
+    own_documents(array, builder, memory)
+}
+
+pub(crate) fn coalesce_arrow_documents(mut pages: Vec<ArrowDocuments>, memory: &Arc<MemoryBudget>) -> Result<ArrowDocuments> {
+    if pages.len() == 1 { return Ok(pages.pop().expect("The document group has one page")); }
+    let mut builder = BatchBuilder::new(4096, memory)?;
+    let documents = pages.iter().map(ArrowDocuments::array).collect::<Vec<_>>();
+    let list = if let Some(array) = arrow_document_leg(&documents, &mut builder)? {
+        array
+    } else {
+        document_leg(pages.iter().map(SourceDocuments::Arrow).collect(), &mut builder, memory)?
+    };
+    let array = Arc::clone(list.as_list::<i32>().values());
+    own_documents(array, builder, memory)
+}
+
+fn own_documents(array: ArrayRef, builder: BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrowDocuments> {
+    let batch = builder.finish(RecordBatch::from(array.as_struct().clone()))?;
+    let array = StructArray::from(batch.batch().clone());
+    let layout = DecodedDocumentLayout::new(array.fields(), memory)?;
+    ArrowDocuments::from_source(&array, layout, batch.batch().get_array_memory_size(), memory)?
+        .ok_or_else(|| invalid("Document array contains a null row"))
+}
+
+enum DocumentCell<'a> {
+    Value(&'a Value),
+    Arrow { field: &'a Field, column: &'a dyn Array, logical: &'a LogicalType, row: usize },
+}
+
+impl DocumentCell<'_> {
+    fn value(&self) -> Result<Cow<'_, Value>> {
+        Ok(match self {
+            Self::Value(value) => Cow::Borrowed(value),
+            Self::Arrow { logical, .. } if **logical == LogicalType::Nothing => Cow::Owned(Value::Undefined),
+            Self::Arrow { field, column, logical, row } => {
+                let mut value = rtdb_columnar::read_value_as(logical, field, *column, *row)?;
+                value.admit_object_dates();
+                Cow::Owned(value)
+            }
+        })
+    }
+
+    fn bound(&self) -> Result<usize> {
+        match self {
+            Self::Value(value) => value.retained_bytes(),
+            Self::Arrow { logical, .. } if **logical == LogicalType::Nothing => Ok(0),
+            Self::Arrow { field, column, row, .. } => rtdb_columnar::estimate_read_cell_bytes(field, *column, *row),
+        }
+    }
+
+    fn writer(&self) -> WriterCell<'_> {
+        match self {
+            Self::Value(value) => WriterCell::of(value),
+            Self::Arrow { field, column, row, .. } => WriterCell::arrow(field, *column, *row),
+        }
     }
 }
 
-fn row_document_struct(lists: &[&Documents], length: usize, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
-    let mut fields = BTreeMap::<&str, (LogicalType, usize)>::new();
-    let mut order = Vec::new();
-    for list in lists {
-        for name in list.columns() {
-            let declared = list.declared_types().and_then(|columns| columns.get(name));
-            if let std::collections::btree_map::Entry::Vacant(field) = fields.entry(name.as_str()) {
-                field.insert((declared.cloned().unwrap_or(LogicalType::Nothing), 0));
-                order.push(name.as_str());
-            } else if let Some(declared) = declared {
-                let (ty, _) = fields.get_mut(name.as_str()).expect("ordered document column has a type");
-                if ty != declared { *ty = ty.join(declared); }
+fn canonical_document_struct(
+    lists: &[SourceDocuments<'_>], length: usize, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>,
+) -> Result<ArrayRef> {
+    let names = lists.iter().flat_map(SourceDocuments::columns).collect::<OrderedSet<_>>();
+    let inventory = length.checked_mul(std::mem::size_of::<Option<DocumentCell<'_>>>() + std::mem::size_of::<WriterCell<'_>>())
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let _inventory = memory.reserve(inventory)?;
+    let mut columns = Vec::with_capacity(names.len());
+    let mut schema = Vec::with_capacity(names.len());
+    for name in names {
+        let mut ty = LogicalType::Nothing;
+        let mut present = 0usize;
+        let mut cells = Vec::with_capacity(length);
+        for list in lists {
+            let start = cells.len();
+            match list {
+                SourceDocuments::Rows(documents) => {
+                    if let Some(declared) = documents.declared_types().and_then(|columns| columns.get(name))
+                        && ty != *declared {
+                        ty = ty.join(declared);
+                    }
+                    cells.extend(documents.rows().iter().map(|row| row.get(name).map(DocumentCell::Value)));
+                }
+                SourceDocuments::Arrow(documents) | SourceDocuments::Receipt { documents, .. } => {
+                    if let Some((field, array)) = document_column(documents.array(), name) {
+                        let declared = documents.column_type(name).ok_or_else(|| invalid("Document column has no logical type"))?;
+                        if &ty != declared { ty = ty.join(declared); }
+                        let preserve_null = !matches!(list, SourceDocuments::Receipt { omit_nulls: true, .. }) || name == "_id";
+                        cells.extend((0..array.len()).map(|row| {
+                            if !preserve_null && !matches!(declared, LogicalType::Nothing)
+                                && matches!(WriterCell::arrow(field, array.as_ref(), row), WriterCell::Null) { return None; }
+                            Some(DocumentCell::Arrow { field, column: array.as_ref(), logical: declared, row })
+                        }));
+                    } else {
+                        cells.extend(std::iter::repeat_with(|| None).take(list.len()));
+                    }
+                }
+            }
+            for cell in cells[start..].iter().flatten() {
+                let _scratch = memory.reserve(cell.bound()?)?;
+                let actual = cell.value()?.logical_type();
+                if ty != actual { ty = ty.join(&actual); }
+                present = present.checked_add(1).ok_or_else(overflow)?;
             }
         }
-        for document in list.rows() {
-            for (name, value) in document {
-                let (ty, present) = fields.get_mut(name.as_str()).expect("document fields have column names");
-                let actual = value.logical_type();
-                if *ty != actual { *ty = ty.join(&actual); }
-                *present = present.checked_add(1).ok_or_else(overflow)?;
-            }
+        if present < length || present == 0 { ty = ty.maybe(); }
+        if struct_backfill_depth(&ty) != 0 {
+            let writers = cells.iter().map(|cell| cell.as_ref().map_or(WriterCell::Null, DocumentCell::writer)).collect::<Vec<_>>();
+            ty = backfilled_nullability(ty, &writers);
         }
-    }
-
-    let mut columns = Vec::new();
-    let mut schema = Vec::new();
-    for name in order {
-        let (ty, present) = fields.remove(name).expect("ordered document column has a type");
-        let ty = if present < length || present == 0 { ty.maybe() } else { ty };
-        let cells = lists.iter().flat_map(|list| list.rows()).map(|document| document.get(name).map_or(WriterCell::Null, WriterCell::of)).collect::<Vec<_>>();
-        let ty = backfilled_nullability(ty, &cells);
-        let values = || lists.iter().flat_map(|list| list.rows()).map(|document| struct_field_cell(document, name, &ty));
-        let estimate = estimate_builder_bytes_refs(&ty, values())?;
-        let array = arrays.column(estimate, || copy_array(&ty, &values().cloned().collect::<Vec<_>>()))?;
-        columns.push(array);
+        let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
+        let (array, _writer) = rtdb_columnar::copy_evaluated_cells(&ty, length, memory,
+            |row| cells[row].as_ref().map_or(Ok(0), DocumentCell::bound),
+            |row| cells[row].as_ref().map_or_else(|| Ok(missing.clone()), |cell| cell.value().map(Cow::into_owned)),
+        )?;
+        columns.push(arrays.column(array.get_array_memory_size(), || Ok(array))?);
         schema.push(Arc::new(to_field(name, &ty)?));
     }
     rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))
@@ -1136,7 +1247,7 @@ enum WriterCell<'a> { Undefined, Null, Value(&'a Value), ArrowStruct(&'a StructA
 
 impl<'a> WriterCell<'a> {
     fn of(value: &'a Value) -> Self { match value { Value::Null => Self::Null, Value::Undefined => Self::Undefined, value => Self::Value(value) } }
-    fn arrow(field: &Field, array: &'a ArrayRef, row: usize) -> Self {
+    fn arrow(field: &Field, array: &'a dyn Array, row: usize) -> Self {
         if field.data_type() == &DataType::Null {
             return if field.is_nullable() { Self::Null } else { Self::Undefined };
         }
@@ -1144,7 +1255,7 @@ impl<'a> WriterCell<'a> {
             let id = union.type_id(row);
             let DataType::Union(legs, _) = field.data_type() else { unreachable!("Arrow union field has union legs"); };
             let leg = legs.iter().find(|(tag, _)| *tag == id).expect("Arrow union tag has a field").1;
-            return Self::arrow(leg, union.child(id), union.value_offset(row));
+            return Self::arrow(leg, union.child(id).as_ref(), union.value_offset(row));
         }
         if array.is_null(row) { return Self::Null; }
         array.as_struct_opt().map_or(Self::ArrowScalar, |array| Self::ArrowStruct(array, row))
@@ -1152,7 +1263,7 @@ impl<'a> WriterCell<'a> {
     fn field(&self, name: &str) -> Option<Self> {
         match self {
             Self::Value(Value::Struct(fields)) => fields.get(name).map(Self::of),
-            Self::ArrowStruct(array, row) => document_column(array, name).map(|(field, array)| Self::arrow(field, array, *row)),
+            Self::ArrowStruct(array, row) => document_column(array, name).map(|(field, array)| Self::arrow(field, array.as_ref(), *row)),
             _ => None,
         }
     }
@@ -1499,14 +1610,18 @@ impl SourceOperationReader<'_> {
                     std::collections::btree_map::Entry::Occupied(layout) => Arc::clone(layout.get()),
                     std::collections::btree_map::Entry::Vacant(layout) => Arc::clone(layout.insert(DecodedDocumentLayout::new(structs.fields(), memory)?)),
                 };
-                if name == "put-docs" && iids.is_some()
-                    && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
-                    return Ok(Operation::PutArrowIids { table: table.expect("plain put has a table"), documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
-                }
-                if name == "patch-docs" && iids.is_some()
-                    && let Some(documents) = ArrowDocuments::from_patch_source(structs, Arc::clone(&layout), source_bytes, memory)? {
-                    return Ok(Operation::PatchArrowIids {
-                        table: table.expect("patch has a table"), documents, iids: iids.expect("patch contains IIDs"), valid_from, valid_to,
+                if let Some(table) = table {
+                    let documents = ArrowDocuments::from_source(structs, layout, source_bytes, memory)?
+                        .ok_or_else(|| invalid("Document is not a struct"))?;
+                    return Ok(match name.as_str() {
+                        "put-docs" => Operation::PutReplayArrow { table, documents, iids, valid_from, valid_to },
+                        "insert-docs" => Operation::InsertArrowIids {
+                            table, documents, iids: iids.ok_or_else(|| invalid("Insert operation has no IIDs"))?, valid_from, valid_to,
+                        },
+                        "patch-docs" => Operation::PatchArrowIids {
+                            table, documents, iids: iids.ok_or_else(|| invalid("Patch operation has no IIDs"))?, valid_from, valid_to,
+                        },
+                        _ => unreachable!("ordinary document tag"),
                     });
                 }
                 if let Some(relation) = owned {
@@ -1516,19 +1631,7 @@ impl SourceOperationReader<'_> {
                     let iids = iids.ok_or_else(|| invalid("Owned insert operation has no IIDs"))?;
                     return Ok(Operation::OwnedWriteIids { create_only: name == "rtdb-owned-insert-v1", relation, documents, iids, valid_from, valid_to });
                 }
-                let documents = Documents::read_arrow(structs, layout, name != "patch-docs", memory)?;
-                let table = table.expect("ordinary document operation has a table");
-                if name == "insert-docs" {
-                    let iids = iids.ok_or_else(|| invalid("Insert operation has no IIDs"))?;
-                    return Ok(Operation::InsertIids { table, documents, iids, valid_from, valid_to });
-                }
-                if name == "put-docs" {
-                    if let Some(iids) = iids { return Ok(Operation::PutIids { table, documents, iids, valid_from, valid_to }); }
-                    TxOp::PutDocs { table, documents, valid_from, valid_to }
-                } else {
-                    if let Some(iids) = iids { return Ok(Operation::PatchIids { table, documents, iids, valid_from, valid_to }); }
-                    return Err(invalid("Patch operation has no IIDs"));
-                }
+                return Err(invalid("Document operation has no table"));
             }
             "delete-docs" | "erase-docs" => {
                 let table = match value("table")? { Value::Utf8(table) => parse_table(&table)?, _ => return Err(invalid("Delete/erase has no table")) };
@@ -1565,24 +1668,8 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
             .map_err(|error| invalid(error.to_string()))?;
         return crate::ipc::encode(&schema, [&page], memory);
     }
-    if let Ok(Some(batch)) = arguments.source_columnar_batch(memory) {
-        return crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory);
-    }
-    let rows = arguments.rows().collect::<Result<Vec<_>>>()?;
-    let bound = arguments.types().iter().enumerate().try_fold(4096usize, |bytes, (index, ty)| {
-        bytes.checked_add(rtdb_columnar::estimate_builder_bytes_refs(ty, rows.iter().map(|row| &row[index]))?).ok_or_else(overflow)
-    })?;
-    let reservation = memory.reserve(bound)?;
-    let mut fields = Vec::new();
-    let mut arrays = Vec::new();
-    for (index, ty) in arguments.types().iter().enumerate() {
-        fields.push(to_field(&format!("?_{index}"), ty)?);
-        arrays.push(copy_array(ty, &rows.iter().map(|row| row[index].clone()).collect::<Vec<_>>())?);
-    }
-    let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(arguments.row_count()));
-    let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options).map_err(|error| invalid(error.to_string()))?;
-    let owned = OwnedBatch::with_reservation(batch, reservation)?;
-    crate::ipc::encode(owned.batch().schema().as_ref(), [owned.batch()], memory)
+    let batch = arguments.source_columnar_batch(memory)?;
+    crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory)
 }
 
 pub(crate) fn decode_arguments(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
@@ -1687,7 +1774,7 @@ pub(crate) fn is_reserved_write_schema(schema: &str) -> bool {
 fn check_writable_table(operation: &Operation) -> Result<()> {
     let table = match operation {
         Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::InsertIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } | Operation::PatchIids { table, .. } | Operation::PatchArrowIids { table, .. } => table,
+        | Operation::InsertIids { table, .. } | Operation::InsertArrowIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutReplayArrow { table, .. } | Operation::PatchIids { table, .. } | Operation::PatchArrowIids { table, .. } => table,
         _ => return Ok(()),
     };
     parse_table(&table_name(table))?;
@@ -1796,7 +1883,7 @@ mod tests {
         arguments.append(SqlArguments::from_rows(vec![vec![Value::Null, Value::Null]], &memory).unwrap()).unwrap();
         assert!(arguments.uniform_arrow_pages().is_none());
 
-        let batch = arguments.source_columnar_batch(&memory).unwrap().unwrap();
+        let batch = arguments.source_columnar_batch(&memory).unwrap();
         let schema = batch.batch().schema();
         assert_eq!(schema.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["?_0", "?_1"]);
         assert!(batch.batch().column(0).as_any().is::<UnionArray>());
@@ -1831,7 +1918,7 @@ mod tests {
         let mut arguments = chunk(["left_list", "left_pair"], &first);
         arguments.append(chunk(["right_list", "right_pair"], &second)).unwrap();
         assert!(arguments.uniform_arrow_pages().is_none());
-        assert!(arguments.source_columnar_batch(&memory).unwrap().is_some());
+        assert_eq!(arguments.source_columnar_batch(&memory).unwrap().batch().num_rows(), 2);
 
         let bytes = encode_arguments(&arguments, &memory).unwrap();
         let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
@@ -1856,7 +1943,7 @@ mod tests {
         };
         let mut arguments = chunk(["record", "list"], 0);
         arguments.append(chunk(["document", "items"], 1)).unwrap();
-        let batch = arguments.source_columnar_batch(&memory).unwrap().unwrap();
+        let batch = arguments.source_columnar_batch(&memory).unwrap();
         let records = batch.batch().column(0).as_struct();
         let lists = batch.batch().column(1).as_list::<i32>();
         assert_eq!(records.column(0).as_binary::<i32>().value_data(), b"keep");
@@ -1916,7 +2003,7 @@ mod tests {
 
         assert_eq!(row_put.encode().unwrap().as_slice(), arrow_put.encode().unwrap().as_slice());
         let replayed = roundtrip(&arrow_put);
-        let [Operation::PutArrowIids { documents, iids, .. }] = replayed.operations.as_slice() else { panic!("expected columnar replay"); };
+        let [Operation::PutReplayArrow { documents, iids: Some(iids), .. }] = replayed.operations.as_slice() else { panic!("expected columnar replay"); };
         assert_eq!(documents.array().len(), 2);
         assert_eq!(iids, &[EntityId::Integer(1).iid(), EntityId::Integer(2).iid()]);
     }
@@ -1945,7 +2032,7 @@ mod tests {
         let replay = roundtrip(&transaction);
 
         for (operation, expected) in replay.operations.iter().zip([Value::Uuid([3; 16]), opaque, Value::Null]) {
-            let Operation::PutArrowIids { documents, .. } = operation else { panic!("Expected an Arrow operation") };
+            let Operation::PutReplayArrow { documents, .. } = operation else { panic!("Expected an Arrow operation") };
             assert_eq!(documents.to_rows(false, &memory).unwrap().rows()[0]["v"], expected);
         }
         assert_eq!(replay.operations.len(), 3);
@@ -2062,7 +2149,7 @@ mod tests {
 
         let expected = [Value::I64(7), Value::Utf8("text".into())];
         for (operation, expected) in replay.operations.iter().zip(expected) {
-            let Operation::PutArrowIids { documents, .. } = operation else {
+            let Operation::PutReplayArrow { documents, .. } = operation else {
                 panic!("Expected Arrow documents on replay");
             };
             let array = documents.array().column_by_name("v").unwrap();
@@ -2100,7 +2187,7 @@ mod tests {
         let expected = [vec![Value::I64(7), Value::Null, Value::I64(9)], vec![Value::Utf8("text".into())], vec![Value::Null], vec![Value::Null]];
         assert_eq!(replay.operations.len(), expected.len());
         for (operation, expected) in replay.operations.iter().zip(expected) {
-            let Operation::PutArrowIids { documents, .. } = operation else {
+            let Operation::PutReplayArrow { documents, .. } = operation else {
                 panic!("Expected Arrow documents on replay");
             };
             let array = documents.array().column_by_name("v").unwrap();
@@ -2143,7 +2230,7 @@ mod tests {
         ];
         assert_eq!(replay.operations.len(), expected.len());
         for (operation, expected) in replay.operations.iter().zip(expected) {
-            let Operation::PutArrowIids { documents, .. } = operation else { panic!("Expected Arrow documents on replay"); };
+            let Operation::PutReplayArrow { documents, .. } = operation else { panic!("Expected Arrow documents on replay"); };
             let v = documents.array().column_by_name("v").unwrap();
             let field = documents.array().fields().iter().find(|field| field.name() == "v").unwrap();
             let union = v.as_any().downcast_ref::<UnionArray>().unwrap();
@@ -2204,7 +2291,7 @@ mod tests {
         assert_eq!(replay.operations.len(), values.len());
         let ids: [&[i64]; 2] = [&[1, 2], &[3]];
         for (position, ((operation, values), ids)) in replay.operations.iter().zip(values).zip(ids).enumerate() {
-            let Operation::PutArrowIids { documents, iids, .. } = operation else { panic!("Expected Arrow documents on replay"); };
+            let Operation::PutReplayArrow { documents, iids: Some(iids), .. } = operation else { panic!("Expected Arrow documents on replay"); };
             let batch = documents.array();
             assert_eq!(documents.columns(), ["row_field", "_id", "v", "arrow_field"]);
             assert_eq!(iids, &ids.iter().map(|id| EntityId::Integer(*id).iid()).collect::<Vec<_>>());
@@ -2262,7 +2349,7 @@ mod tests {
 
             assert_eq!(replay.operations.len(), 2);
             for (operation, expected) in replay.operations.iter().zip([expected, vec![Value::I64(9)]]) {
-                let Operation::PutArrowIids { documents, .. } = operation else { panic!("Expected Arrow documents on replay"); };
+                let Operation::PutReplayArrow { documents, .. } = operation else { panic!("Expected Arrow documents on replay"); };
                 let array = documents.array();
                 let (field, values) = document_column(array, "v").unwrap();
                 let actual = (0..array.len()).map(|row| read_value(field, values.as_ref(), row).unwrap()).collect::<Vec<_>>();
@@ -2386,7 +2473,7 @@ mod tests {
 
         assert_eq!(replay.operations.len(), 2);
         for (operation, expected) in replay.operations.iter().zip([Value::FixedSizeList(vec![Value::I64(-1), Value::I64(7)]), second]) {
-            let Operation::PutArrowIids { documents, .. } = operation else { panic!("Expected Arrow replay"); };
+            let Operation::PutReplayArrow { documents, .. } = operation else { panic!("Expected Arrow replay"); };
             let (field, array) = document_column(documents.array(), "items").unwrap();
             assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), expected);
         }
@@ -2542,7 +2629,7 @@ mod tests {
         let expected = [(true, false, Value::I64(7)), (false, true, Value::Utf8("text".into()))];
         assert_eq!(replay.operations.len(), expected.len());
         for (operation, (first, later, number)) in replay.operations.iter().zip(expected) {
-            let Operation::PutArrowIids { documents, .. } = operation else {
+            let Operation::PutReplayArrow { documents, .. } = operation else {
                 panic!("Expected Arrow documents on replay");
             };
             let list = documents.array().column_by_name("items").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
@@ -2566,7 +2653,7 @@ mod tests {
         ])))]);
         let source = SourceTransaction::new(vec![put(StructFields::from([("_id".to_owned(), Value::I64(1))])), put(quux)], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
-        let Operation::PutArrowIids { documents, .. } = &decoded.operations[0] else { panic!("put"); };
+        let Operation::PutReplayArrow { documents, .. } = &decoded.operations[0] else { panic!("put"); };
         let documents = documents.to_rows(true, &memory).unwrap();
         let utf8 = LogicalType::Scalar(ScalarType::Utf8);
         let expected = LogicalType::Struct(StructFields::from([
@@ -2599,18 +2686,18 @@ mod tests {
         let replayed = roundtrip(&decoded);
         for tx in [&decoded, &replayed] {
             let mut operations = tx.operations.iter();
-            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("first put"); };
+            let Operation::PutReplayArrow { documents, .. } = operations.next().unwrap() else { panic!("first put"); };
             let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::Utf8("last".into()));
             assert_eq!(documents.declared_types().unwrap()["n"], LogicalType::Null);
             assert!(!documents.rows()[0].contains_key("n"));
-            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("second put"); };
+            let Operation::PutReplayArrow { documents, .. } = operations.next().unwrap() else { panic!("second put"); };
             let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["_id", "e"]);
             assert_eq!(documents.declared_types().unwrap()["e"], LogicalType::Null);
             assert!(!documents.rows()[0].contains_key("e"));
-            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("third put"); };
+            let Operation::PutReplayArrow { documents, .. } = operations.next().unwrap() else { panic!("third put"); };
             let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::I64(7));
@@ -2660,7 +2747,7 @@ mod tests {
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         let decoded = SourceTransaction::decode(&message, &memory).unwrap();
         assert_eq!(decoded.operations.len(), 100);
-        let Operation::PutArrowIids { documents, .. } = &decoded.operations[99] else { panic!("Expected columnar decoded put"); };
+        let Operation::PutReplayArrow { documents, .. } = &decoded.operations[99] else { panic!("Expected columnar decoded put"); };
         let documents = documents.to_rows(true, &memory).unwrap();
         assert_eq!(documents.columns().len(), 1001);
         assert_eq!(documents.rows()[0]["field_99_9"], Value::Utf8("value_99_9".into()));
@@ -2705,7 +2792,11 @@ mod tests {
     #[test]
     fn replay_keeps_explicit_put_and_patch_iids_even_when_the_document_id_hash_differs() {
         let memory = budget();
-        let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::Utf8("different-id".into()))])], &memory).unwrap();
+        let documents = Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::Utf8("different-id".into())),
+            ("tags".into(), Value::Set(vec![Value::Utf8("open".into()), Value::Null])),
+            ("optional".into(), Value::Null),
+        ])], &memory).unwrap();
         let table = TableRef::new("public", "docs");
         let iid = Iid([42; 16]);
         assert_ne!(iid, EntityId::String("different-id".into()).iid());
@@ -2714,9 +2805,85 @@ mod tests {
             Operation::PatchIids { table, documents, iids: vec![iid], valid_from: Some(Timestamp(30)), valid_to: None },
         ], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
-        assert!(matches!(&decoded.operations[0], Operation::PutArrowIids { iids, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
-        assert!(matches!(&decoded.operations[1], Operation::PatchArrowIids { iids, valid_from: Some(Timestamp(30)), valid_to: None, .. } if iids == &vec![iid]));
+        assert!(matches!(&decoded.operations[0], Operation::PutReplayArrow { iids: Some(iids), valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
+        assert!(matches!(&decoded.operations[1], Operation::PatchArrowIids { documents, iids, valid_from: Some(Timestamp(30)), valid_to: None, .. }
+            if iids == &vec![iid] && documents.requires_legacy_receipt(true)));
         assert_eq!(decoded.body_digest().unwrap(), source.body_digest().unwrap());
+    }
+
+    #[test]
+    fn compatible_insert_replays_arrow_documents_and_keeps_the_legacy_receipt_digest() {
+        let memory = budget();
+        let documents = Documents::new(vec![
+            StructFields::from([("_id".into(), Value::I64(1)), ("value".into(), Value::I64(10))]),
+            StructFields::from([("_id".into(), Value::I64(2))]),
+        ], &memory).unwrap();
+        let iids = vec![Iid([1; 16]), Iid([2; 16])];
+        let table = TableRef::new("public", "docs");
+        let source = SourceTransaction::from_operations(vec![
+            Operation::InsertIids { table: table.clone(), documents, iids: iids.clone(), valid_from: Some(Timestamp(10)), valid_to: None },
+        ], SubmitOptions::default(), &memory).unwrap();
+        let decoded = roundtrip(&source);
+        let Operation::InsertArrowIids { documents, iids: decoded_iids, valid_from, valid_to, .. } = &decoded.operations[0]
+        else { panic!("expected Arrow insert"); };
+        assert_eq!(decoded_iids, &iids);
+        assert_eq!(*valid_from, Some(Timestamp(10)));
+        assert_eq!(documents.array().len(), 2);
+        let legacy = SourceTransaction::from_operations(vec![
+            Operation::InsertIids { table, documents: documents.to_rows(true, &memory).unwrap(), iids, valid_from: *valid_from, valid_to: *valid_to },
+        ], SubmitOptions::default(), &memory).unwrap();
+        assert_eq!(decoded.body_digest().unwrap(), legacy.body_digest().unwrap());
+        assert!(matches!(&roundtrip(&decoded).operations[0], Operation::InsertArrowIids { .. }));
+    }
+
+    #[test]
+    fn legacy_put_without_iid_vector_keeps_arrow_documents_and_the_receipt_digest() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let id = Value::Utf8("legacy-put".into());
+        let source = SourceTransaction::new(vec![TxOp::PutDocs {
+            table,
+            documents: Documents::new(vec![StructFields::from([("_id".into(), id.clone()), ("v".into(), Value::I64(2))])], &memory).unwrap(),
+            valid_from: None,
+            valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let mut message = SourceMessage::decode(source.encode().unwrap().as_slice()).unwrap().unwrap();
+        let SourceMessage::Protobuf(SourceBody::Tx(tx)) = &mut message else { panic!("Expected a transaction envelope"); };
+        let pages = crate::ipc::decode(tx.tx_ops.as_ref().unwrap(), &memory).unwrap();
+        let batch = pages[0].batch();
+        let operations = batch.column(0).as_union();
+        let tag = operations.type_id(0);
+        let put = operations.child(tag).as_struct();
+        let fields = put.fields().iter().map(|field| {
+            if field.name() == "iids" { Arc::new(Field::new("iids", DataType::Null, true)) }
+            else { Arc::clone(field) }
+        }).collect::<Vec<_>>();
+        let columns = put.fields().iter().zip(put.columns()).map(|(field, column)| {
+            if field.name() == "iids" { Arc::new(arrow_array::NullArray::new(1)) as ArrayRef }
+            else { Arc::clone(column) }
+        }).collect::<Vec<_>>();
+        let body = Arc::new(StructArray::new(fields.into(), columns, None));
+        let fields = UnionFields::try_new([tag], [Field::new("put-docs", body.data_type().clone(), false)]).unwrap();
+        let operations = Arc::new(UnionArray::try_new(fields, vec![tag].into(), Some(vec![0i32].into()), vec![body]).unwrap());
+        let schema = Arc::new(Schema::new(vec![batch.schema_ref().field(0).clone().with_data_type(operations.data_type().clone())]));
+        let legacy = RecordBatch::try_new(Arc::clone(&schema), vec![operations]).unwrap();
+        tx.tx_ops = Some(crate::ipc::encode(&schema, [&legacy], &memory).unwrap().as_slice().to_vec());
+        let decoded = SourceTransaction::decode(&message, &memory).unwrap();
+        let [Operation::PutReplayArrow { documents, iids: None, .. }] = decoded.operations.as_slice() else {
+            panic!("Expected legacy Arrow put");
+        };
+        let reader = documents.id_reader().unwrap();
+        assert_eq!(documents.iid(0, reader.as_ref(), &memory).unwrap(), id.entity_id().unwrap().iid());
+        assert_eq!(decoded.body_digest().unwrap(), source.body_digest().unwrap());
+    }
+
+    #[test]
+    fn receipt_reader_can_charge_and_preserve_an_undefined_document_cell() {
+        let array = arrow_array::NullArray::new(1);
+        let field = Field::new("omitted", DataType::Null, false);
+        let cell = DocumentCell::Arrow { field: &field, column: &array, logical: &LogicalType::Nothing, row: 0 };
+        assert_eq!(cell.bound().unwrap(), 0);
+        assert_eq!(*cell.value().unwrap(), Value::Undefined);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use arrow_array::RecordBatch;
 use arrow_flight::{FlightData, PutResult, sql::{Command, CommandStatementIngest, DoPutUpdateResult, TableExistsOption, TableNotExistOption}};
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes};
-use rtdb_tx::{ArrowDocuments, Documents, SqlArguments, TxOp};
+use rtdb_tx::{ArrowDocuments, SqlArguments, TxOp};
 use rtdb_types::{TableRef, Value};
 use tonic::{Response, Status, Streaming};
 use crate::{error::{cancelled, invalid, status, unsupported}, service::{Call, Output, Service, command, result_stream}, wire};
@@ -71,12 +71,14 @@ impl Service {
                     let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?;
                     let mut native = connection.borrow().await?;
                     while let Some(batch) = upload.next().await? {
-                        let operation = if let Some(documents) = ArrowDocuments::from_batch(&batch, self.memory()).map_err(status)? {
-                            TxOp::PutArrowDocs { table: table.clone(), documents }
-                        } else {
-                            let (rows, _scratch) = documents(batch.batch(), self)?;
-                            TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, self.memory()).map_err(status)?, valid_from: None, valid_to: None }
+                        let documents = match ArrowDocuments::from_batch(&batch, self.memory()).map_err(status)? {
+                            Some(documents) => documents,
+                            None => {
+                                let Some(documents) = ArrowDocuments::from_ingest_batch(&batch, self.memory()).map_err(status)? else { continue; };
+                                documents
+                            }
                         };
+                        let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
                         if let Some(result) = native.state_mut().execute_operation(operation).await.map_err(status)? { if let Some(error) = result.error() { return Err(status(error.clone())); } }
                     }
                     Ok(update_ack())

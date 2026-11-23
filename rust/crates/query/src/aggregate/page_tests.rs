@@ -130,7 +130,7 @@ async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
     let output = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
     let relation = Arc::new(Relation::new(output, RelationNode::Aggregate { input, groups: vec![], aggregates: aggregates.clone() }).unwrap());
     let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
-    assert!(AggregateCursor::supports_columnar(&runtime, &[], &aggregates).unwrap());
+    assert!(AggregateCursor::positions(&schema, &[], &aggregates, true).is_some());
     for (values, expected) in [
         (vec![Some(2.0), None, Some(3.0)], [Value::I64(3), Value::I64(2), Value::F64(5.0), Value::F64(2.5)]),
         (vec![], [Value::I64(0), Value::I64(0), Value::Null, Value::Null]),

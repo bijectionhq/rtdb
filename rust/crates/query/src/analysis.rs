@@ -145,6 +145,9 @@ impl crate::columnar::BatchCursor for MeasuredBatches {
         self.node.observe(started.elapsed(), result.as_ref().ok().and_then(|batch| batch.as_ref()).map(|batch| batch.len), self.input.scan_counts())?;
         result
     }
+    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> {
+        self.input.skip_complete_pages(rows)
+    }
     fn scan_counts(&self) -> Option<ScanCounts> { self.input.scan_counts() }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
 }

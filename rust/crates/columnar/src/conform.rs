@@ -4,7 +4,7 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{Schema, SchemaRef};
 use rtdb_types::{Anomaly, LogicalType as L, Result, Value};
 
-use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_builder_bytes, estimate_read_value_bytes, from_field, leg_name, read_value, to_field};
+use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_evaluated_cells, estimate_read_value_bytes, from_field, leg_name, read_value, to_field};
 
 mod physical;
 
@@ -93,22 +93,20 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
             }
         }
         let rows = batch.batch().num_rows();
-        let base = multiply(rows, std::mem::size_of::<Value>())?;
-        let bound = match input {
-            Some((source_field, array)) => (0..rows).try_fold(base, |bytes, row| {
-                add(bytes, estimate_read_value_bytes(source_field, array.as_ref(), row)?)
-            })?,
-            None => base,
-        };
-        let _decoded = memory.reserve(bound)?;
-        let column = (0..rows).map(|row| match input {
-            Some((source_field, array)) => read_value(source_field, array.as_ref(), row),
-            None => Ok(Value::Null),
-        }).collect::<Result<Vec<_>>>()?;
-        let physical = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
-        let bound = multiply(estimate_builder_bytes(&ty, &column)?, 2)?;
-        output.grow_to(add(output.bytes(), bound)?)?;
-        let (physical, array) = physical::relayout(copy_array(&ty, &column)?, &physical, field, false)?;
+        let (column, _scratch) = copy_evaluated_cells(&ty, rows, memory,
+            |row| match input {
+                Some((field, array)) => estimate_read_value_bytes(field, array.as_ref(), row),
+                None => Ok(0),
+            },
+            |row| match input {
+                Some((field, array)) => read_value(field, array.as_ref(), row),
+                None => Ok(Value::Null),
+            },
+        )?;
+        let source = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
+        let _relayout = memory.reserve(arrow_relayout_bound(column.as_ref(), &source, field)?)?;
+        let (physical, array) = physical::relayout(column, &source, field, false)?;
+        output.grow_to(add(output.bytes(), array.get_array_memory_size())?)?;
         fields.push(physical);
         arrays.push(array);
     }

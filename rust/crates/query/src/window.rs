@@ -16,8 +16,8 @@ pub(crate) struct BatchWindow {
 }
 
 impl BatchWindow {
-    pub fn supports(schema: &Schema, partition_by: &[ColumnId], order_by: &[SortExpr], expressions: &[WindowExpr]) -> bool {
-        partition_by.iter().all(|column| schema.position(*column).is_some()) && !expressions.is_empty()
+    pub fn supports(schema: &Schema, partition_by: &[ColumnId], order_by: &[SortExpr], _expressions: &[WindowExpr]) -> bool {
+        partition_by.iter().all(|column| schema.position(*column).is_some())
             && (order_by.is_empty() || crate::sort::batches::BatchSort::supports(schema, order_by))
     }
 

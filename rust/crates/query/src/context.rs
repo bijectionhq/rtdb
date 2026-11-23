@@ -288,14 +288,51 @@ pub(crate) struct Execution {
     pub analysis: Option<Arc<crate::analysis::AnalysisNode>>,
 }
 
-pub(crate) struct OuterRows { rows: Vec<(rtdb_plan::Schema, Arc<crate::cursor::OwnedRow>)>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
+#[derive(Clone)]
+enum OuterInput {
+    Values(Arc<crate::cursor::OwnedRow>),
+    Arrow { batch: Arc<crate::columnar::ColumnBatch>, row: usize },
+}
+
+impl OuterInput {
+    fn expression(&self) -> rtdb_expr::ExpressionRow<'_> {
+        match self {
+            Self::Values(row) => rtdb_expr::ExpressionRow::Values(&row.values),
+            Self::Arrow { .. } => rtdb_expr::ExpressionRow::Borrowed(self),
+        }
+    }
+}
+
+impl rtdb_expr::RowInput for OuterInput {
+    fn value(&self, index: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
+        let Self::Arrow { batch, row } = self else { return Ok(None); };
+        batch.columns.get(index).map(|column| column.expression_value(*row, false, scope)).transpose()
+    }
+
+    fn arrow_cell(&self, index: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
+        let Self::Arrow { batch, row } = self else { return None; };
+        batch.columns.get(index)?.expression_cell(*row)
+    }
+}
+
+pub(crate) struct OuterRows { rows: Vec<(rtdb_plan::Schema, OuterInput)>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl OuterRows {
+    fn expression_rows(&self) -> Vec<rtdb_expr::OuterRow<'_>> {
+        self.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow {
+            schema,
+            values: match row {
+                OuterInput::Values(row) => &row.values,
+                OuterInput::Arrow { .. } => &[],
+            },
+        }).collect()
+    }
+
     pub fn schemas(&self) -> impl Iterator<Item = &rtdb_plan::Schema> { self.rows.iter().map(|(schema, _)| schema) }
     pub fn empty(memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(256)?;
         Ok(Arc::new(Self { rows: Vec::new(), _reservation: reservation }))
     }
-    pub fn prepend(&self, schema: &rtdb_plan::Schema, row: Arc<crate::cursor::OwnedRow>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    fn prepend(&self, schema: &rtdb_plan::Schema, row: OuterInput, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let bound = self.rows.iter().try_fold(crate::runtime_schema::schema_bound(schema)?, |bytes, (schema, _)| {
             bytes.checked_add(crate::runtime_schema::schema_bound(schema)?).ok_or_else(|| crate::invalid("outer-size", "Outer schema allocation exceeds addressable memory"))
         })?;
@@ -305,8 +342,30 @@ impl OuterRows {
     }
 }
 
+struct ExpressionInputs<'a> { parameters: &'a crate::parameters::BoundParameters, outer: &'a OuterRows }
+
+impl rtdb_expr::ParameterLookup for ExpressionInputs<'_> {
+    fn width(&self) -> usize { rtdb_expr::ParameterLookup::width(self.parameters) }
+    fn value(&self, position: usize) -> Result<Option<&Value>> { self.parameters.get(position) }
+    fn known_value(&self, position: usize) -> Option<&Value> { rtdb_expr::ParameterLookup::known_value(self.parameters, position) }
+    fn arrow_cell(&self, position: usize) -> Option<rtdb_columnar::ArrowCell<'_>> { rtdb_expr::ParameterLookup::arrow_cell(self.parameters, position) }
+
+    fn correlated_value(&self, depth: usize, position: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
+        self.outer.rows.get(depth).map_or(Ok(None), |(_, row)| rtdb_expr::RowInput::value(row, position, scope))
+    }
+}
+
 impl Execution {
     pub async fn bind_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: Arc<crate::cursor::OwnedRow>) -> Result<Self> {
+        self.bind_outer(arguments, schema, OuterInput::Values(row)).await
+    }
+
+    pub async fn bind_arrow_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema,
+        batch: Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<Self> {
+        self.bind_outer(arguments, schema, OuterInput::Arrow { batch, row }).await
+    }
+
+    async fn bind_outer(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: OuterInput) -> Result<Self> {
         let scope = self.scope()?;
         let parameter_count = arguments.iter().try_fold(self.parameters.types().len(), |count, (index, _)| index.checked_add(1).map(|next| count.max(next)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameter index overflow")))?;
         let slots = parameter_count.checked_mul(std::mem::size_of::<rtdb_types::LogicalType>())
@@ -322,7 +381,8 @@ impl Execution {
         types.resize(parameter_count, rtdb_types::LogicalType::Null);
         for (index, expression) in arguments {
             types[*index] = self.expression_type(&scope, expression, schema)?;
-            parameters.push((*index, self.evaluate(&scope, expression, schema, &row.values).await?));
+            let invocation = self.prepare_expression(expression, schema, &scope)?;
+            parameters.push((*index, self.evaluate_invocation_row(&scope, &invocation, row.expression()).await?));
         }
         let outer = self.outer.prepend(schema, row, &self.context.memory)?;
         Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(self.parameters.overlay(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
@@ -333,8 +393,9 @@ impl Execution {
     pub fn scope(&self) -> Result<rtdb_expr::EvaluationScope> { rtdb_expr::EvaluationScope::new(&self.context.memory) }
     pub fn expression_type(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema) -> Result<rtdb_types::LogicalType> {
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema,row)|rtdb_expr::OuterRow { schema,values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.evaluator(),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
         rtdb_expr::expression_type(expression,schema,&context)
     }
     pub async fn evaluate(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, row: &[Value]) -> Result<Value> {
@@ -344,18 +405,26 @@ impl Execution {
     pub fn prepare_expression<'a>(&self, expression: &'a rtdb_plan::Expr, schema: &'a rtdb_plan::Schema, scope: &rtdb_expr::EvaluationScope) -> Result<rtdb_expr::ExpressionInvocation<'a>> {
         self.context.check_cancelled()?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema,row)|rtdb_expr::OuterRow { schema,values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.evaluator(),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
         rtdb_expr::ExpressionInvocation::prepare(expression,schema,&context)
     }
     pub async fn evaluate_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &[Value]) -> Result<Value> {
+        self.evaluate_invocation_row(scope, invocation, rtdb_expr::ExpressionRow::Values(row)).await
+    }
+    pub async fn evaluate_invocation_row(
+        &self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>,
+        row: rtdb_expr::ExpressionRow<'_>,
+    ) -> Result<Value> {
         self.context.check_cancelled()?;
         scope.reserve(4096)?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.evaluator(), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
-            invocation.evaluate_projection_async(row,&context))).await.flatten().ok_or_else(cancelled)?
+            invocation.evaluate_projection_row_async(row,&context))).await.flatten().ok_or_else(cancelled)?
     }
     pub async fn open_list(&self, expression: rtdb_plan::Expr, page_rows: Option<std::num::NonZeroUsize>) -> Result<crate::list::ListCursor> {
         let execution = self.clone();
@@ -364,8 +433,9 @@ impl Execution {
             let scope = execution.scope()?;
             let schema = rtdb_plan::Schema::default();
             scope.reserve(execution.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| crate::invalid("outer-size", "Outer row bindings exceed addressable memory"))?)?;
-            let outer_rows: Vec<_> = execution.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
-            let eval = rtdb_expr::EvalContext { parameters: execution.parameters.evaluator(), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
+            let outer_rows = execution.outer.expression_rows();
+            let inputs = ExpressionInputs { parameters: &execution.parameters, outer: &execution.outer };
+            let eval = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
                 timezone: &execution.context.timezone, outer_rows: &outer_rows, snapshot_token: execution.context.snapshot_token(), allocation: Some(&scope), catalog: Some(&execution.context.catalog) };
             let invocation = rtdb_expr::ExpressionInvocation::prepare(&expression, &schema, &eval)?;
             let page_rows = page_rows.map_or(execution.context.options.list_batch_rows,std::num::NonZeroUsize::get);
@@ -382,13 +452,14 @@ impl Execution {
         };
         crate::list::ListCursor::open(Box::pin(stream), context).await
     }
-    pub async fn evaluate_list_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &[Value]) -> Result<rtdb_expr::EvaluatedList> {
+    pub async fn evaluate_list_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: rtdb_expr::ExpressionRow<'_>) -> Result<rtdb_expr::EvaluatedList> {
         self.context.check_cancelled()?;
         scope.reserve(4096)?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.evaluator(), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
-            invocation.evaluate_list_async(row,&context))).await.flatten().ok_or_else(cancelled)?
+            invocation.evaluate_list_row_async(row,&context))).await.flatten().ok_or_else(cancelled)?
     }
 }

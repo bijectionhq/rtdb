@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, build_array, read_value, to_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, read_value};
 use rtdb_plan::{Scan, TemporalFilter};
 use rtdb_storage::IoRegion;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey};
 use serde::{Deserialize, Serialize};
 
 use crate::columnar::{Column, ColumnBatch, compact_arrow_rows, fragment_column, nested_layout};
@@ -213,6 +213,13 @@ impl Write for FragmentBytes {
 
 /// Appends length-prefixed Arrow IPC streams in scan order, splitting where selected vectors require different schemas.
 pub(crate) fn encode_batch(batch: &ColumnBatch, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes) -> Result<()> {
+    let packed;
+    let batch = if batch.columns.iter().any(|column| matches!(column, Column::Values(_))) {
+        packed = batch.pack_evaluated(memory)?;
+        &packed
+    } else {
+        batch
+    };
     if !batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
         return append_frame(batch, 0..batch.len, memory, out);
     }
@@ -281,17 +288,7 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
                 reservations.push(reservation);
                 vector
             }
-            column => {
-                let values = rows.clone().map(|row| column.value(row)).collect::<Result<Vec<_>>>()?;
-                let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
-                let mut field = to_field(wire_name, &logical)?;
-                let mut metadata = field.metadata().clone();
-                metadata.insert(COLUMN_KEY.into(), "values".into());
-                field = field.with_metadata(metadata);
-                arrays.push(build_array(&logical, &values)?);
-                fields.push(field);
-                continue;
-            }
+            _ => return Err(invalid("fragment-encode", "Fragment column lacks its packed Arrow vector")),
         };
         let mut metadata = field.metadata().clone();
         metadata.insert(COLUMN_KEY.into(), "arrow".into());
@@ -363,6 +360,7 @@ pub(crate) fn decode_batches(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result
 
 #[cfg(test)]
 mod tests {
+    use rtdb_types::Value;
     use super::*;
 
     #[test]
@@ -435,10 +433,10 @@ mod tests {
         encode_batch(&batch, &memory, &mut bytes).unwrap();
         encode_batch(&ColumnBatch::settled(Vec::new(), 2, memory.reserve(256).unwrap()).unwrap(), &memory, &mut bytes).unwrap();
         let decoded = decode_batches(&bytes.into_bytes(), &memory).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!((decoded[1].len, decoded[1].columns.len()), (2, 0), "a batch of no columns keeps its row count");
+        let (empty_width, payload) = decoded.split_last().unwrap();
+        assert_eq!((empty_width.len, empty_width.columns.len()), (2, 0), "a batch of no columns keeps its row count");
         let cells = |batch: &ColumnBatch| -> Vec<Vec<String>> { (0..batch.len).map(|row| batch.columns.iter().map(|column| format!("{:?}", column.value(row).unwrap())).collect()).collect() };
-        assert_eq!(cells(&decoded[0]), cells(&batch));
+        assert_eq!(payload.iter().flat_map(cells).collect::<Vec<_>>(), cells(&batch));
         let Column::Arrow { field, .. } = &decoded[0].columns[0] else { panic!("an Arrow column stays one") };
         assert_eq!(field.name(), "total");
     }

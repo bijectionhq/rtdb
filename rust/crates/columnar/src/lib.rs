@@ -1,4 +1,5 @@
 mod allocation;
+mod cell;
 mod conform;
 mod decimal;
 mod execution;
@@ -12,6 +13,7 @@ mod schema;
 mod values;
 
 pub use allocation::{estimate_builder_bytes, estimate_builder_bytes_refs};
+pub use cell::ArrowCell;
 pub use conform::{DeclaredBatch, arrow_relayout_bound, conform_batch, event_relayout_bound, relayout_arrow_column, relayout_event_column};
 pub use decimal::{DecimalParameters, INTERNAL_DECIMAL_PRECISION_KEY, INTERNAL_DECIMAL_SCALE_KEY, decimal_field_parameters, decimal_parameters, decimal_scale, decimal_storage_precision, decimal_storage_scale, map_schema_fields, with_decimal_parameters, with_decimal_scale};
 pub use execution::{admit_execution_value, execution_field_type, execution_type, read_execution_value, read_execution_value_as};
@@ -23,7 +25,7 @@ pub use interleave::{copy_event_cells, copy_nullable_cells, copy_selected_cells,
 pub use hash::{decimal_cell_as_f64, hash_cell, hash_value, hash_value_murmur3, murmur3_32, xxhash32};
 pub use memory::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn, Selection, retain_array, retain_buffer, retain_buffer_with_owner, shared_allocation_size};
 pub use schema::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY, from_field, leg_name, to_field};
-pub use values::{ColumnReader, build_array, build_struct_array, copy_array, read_value, read_value_as, struct_field_cell};
+pub use values::{ColumnReader, build_array, build_struct_array, copy_array, copy_evaluated_cells, read_value, read_value_as, struct_field_cell};
 
 use rtdb_types::Anomaly;
 

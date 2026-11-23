@@ -63,8 +63,8 @@ impl SpillSchema {
         })
     }
 
-    fn record(&self, source: ColumnBatch, context: &QueryContext) -> Result<SpillRecord> {
-        if source.columns.len() != self.logical.len() { return Err(layout_error()); }
+    fn record(&self, source: &ColumnBatch, context: &QueryContext) -> Result<Option<(RecordBatch, Vec<Arc<MemoryReservation>>, Arc<MemoryReservation>)>> {
+        if source.columns.len() != self.logical.len() { return Ok(None); }
         let metadata = source.columns.len().checked_mul(192).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
         let reservation = context.memory.reserve(metadata)?;
         let mut arrays = Vec::with_capacity(source.columns.len());
@@ -78,20 +78,36 @@ impl SpillSchema {
                 Column::Arrow { array, field, logical: Some(ty) } if same_layout(field, ty) => Arc::clone(array),
                 Column::Selected(selected) if selected.source_layouts().all(|(_, field, ty)| ty.is_some_and(|ty| same_layout(field, ty))) => {
                     let Some((array, charge)) = relayout_output(column, &logical.data_type, target, &context.memory)? else {
-                        return Err(layout_error());
+                        return Ok(None);
                     };
                     copied.push(charge);
                     array
                 }
-                _ => return Err(layout_error()),
+                _ => return Ok(None),
             };
-            if !target.is_nullable() && array.logical_null_count() != 0 { return Err(layout_error()); }
+            if !target.is_nullable() && array.logical_null_count() != 0 { return Ok(None); }
             arrays.push(array);
         }
         let options = RecordBatchOptions::new().with_row_count(Some(source.len));
         let record = RecordBatch::try_new_with_options(Arc::clone(&self.physical), arrays, &options).map_err(|_| layout_error())?;
-        Ok(SpillRecord { record, _source: source, _copied: copied, _reservation: reservation })
+        Ok(Some((record, copied, reservation)))
     }
+
+    fn write_record(&self, writer: &mut SpillWriter, record: &RecordBatch, context: &QueryContext) -> Result<()> {
+        writer.write_frame(&[3])?;
+        writer.write_record(record, &context.memory)
+    }
+
+    fn read(&self, reader: &mut SpillReader) -> Result<Option<ColumnBatch>> {
+        let Some((marker, _charge)) = reader.read_frame(1)? else { return Ok(None); };
+        if marker == [3] {
+            let record = reader.read_record(&self.physical, self.batch_metadata)?
+                .ok_or_else(|| invalid("join-spill", "Join spill ended before its frame"))?;
+            return ColumnBatch::from_owned(record).map(Some);
+        }
+        reader.read_columns_frame(&marker, self.logical.len())
+    }
+
 }
 
 struct SpillRecord {
@@ -137,7 +153,12 @@ impl BlockWriter {
             self.block_rows = 0;
         }
 
-        let record = self.schema.record(batch, context)?;
+        let layout = if compatible_schema(&self.schema.logical) { self.schema.record(&batch, context)? } else { None };
+        let Some((record, copied, reservation)) = layout else {
+            self.flush(context)?;
+            return self.writer.write_columns(&batch, &self.schema.logical, &context.memory);
+        };
+        let record = SpillRecord { record, _source: batch, _copied: copied, _reservation: reservation };
         let rows = record.record.num_rows();
         let bytes = rtdb_columnar::shared_allocation_size(&record.record)?;
         if !self.queued.is_empty() && (self.queued_rows.saturating_add(rows) > FRAME_ROWS
@@ -156,7 +177,7 @@ impl BlockWriter {
         context.check_cancelled()?;
         match self.queued.as_slice() {
             [] => return Ok(()),
-            [record] => self.writer.write_record(&record.record, &context.memory)?,
+            [record] => self.schema.write_record(&mut self.writer, &record.record, context)?,
             many => {
                 let bytes = self.queued_bytes.checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
                 let _compact = context.memory.reserve(bytes)?;
@@ -165,7 +186,7 @@ impl BlockWriter {
                         arrow_schema::ArrowError::OffsetOverflowError(_) => layout_error(),
                         error => invalid("join-spill", error),
                     })?;
-                self.writer.write_record(&batch, &context.memory)?;
+                self.schema.write_record(&mut self.writer, &batch, context)?;
             }
         }
         self.queued.clear();
@@ -202,8 +223,7 @@ impl SpilledBlocks {
         let positions: Vec<_> = (0..width).collect();
         let mut input = self.file.reader(Arc::clone(memory))?;
         let mut writer = context.spill.create()?;
-        while let Some(batch) = input.read_record(&self.schema.physical, self.schema.batch_metadata)? {
-            let batch = ColumnBatch::from_owned(batch)?;
+        while let Some(batch) = self.schema.read(&mut input)? {
             let scratch = count.checked_mul(size_of::<Vec<(usize, usize)>>())
                 .and_then(|bytes| batch.len.checked_mul(4 * size_of::<(usize, usize)>()).and_then(|rows| bytes.checked_add(rows)))
                 .ok_or_else(size_error)?;
@@ -218,9 +238,13 @@ impl SpilledBlocks {
                 if picks.is_empty() { continue; }
                 context.check_cancelled()?;
                 let selected = ColumnBatch::take_rows(&[&batch], &picks, &positions, memory)?;
-                let selected = self.schema.record(selected, context)?;
                 let at = writer.position()?;
-                writer.write_record(&selected.record, memory)?;
+                if compatible_schema(&self.schema.logical)
+                    && let Some((record, _copied, _reservation)) = self.schema.record(&selected, context)? {
+                    self.schema.write_record(&mut writer, &record, context)?;
+                } else {
+                    writer.write_columns(&selected, &self.schema.logical, memory)?;
+                }
                 let lease = Arc::get_mut(&mut reservation).expect("The shuffle owns its frame inventory");
                 lease.grow_to(lease.bytes().checked_add(4 * size_of::<u64>()).ok_or_else(size_error)?)?;
                 offsets.push(at);
@@ -245,9 +269,8 @@ impl Partitions {
         let offset = self.offsets.get(partition).and_then(|frames| frames.get(frame))
             .ok_or_else(|| invalid("join-spill", "Join spill frame is absent"))?;
         self.reader.seek(*offset)?;
-        let batch = self.reader.read_record(&self.schema.physical, self.schema.batch_metadata)?
-            .ok_or_else(|| invalid("join-spill", "Join spill ended before its frame"))?;
-        ColumnBatch::from_owned(batch)
+        self.schema.read(&mut self.reader)?
+            .ok_or_else(|| invalid("join-spill", "Join spill ended before its frame"))
     }
 }
 

@@ -378,15 +378,14 @@ impl PreparedQuery {
             }
             match batching {
                 Batching::Pages if analysis.is_none() => {
-                    if matches!(operators.relation().node(), rtdb_plan::RelationNode::Scan(_))
-                        && let Some(batches) = crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
+                    if let Some(batches) = crate::operators::build_column_pages(Arc::clone(&operators), execution.clone()).await? {
                         return Ok(QueryInput::ColumnPages(batches));
                     }
-                    crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages)
+                    Err(invalid("column-plan", "Semantic-page query could not open as Arrow"))
                 }
-                Batching::Columns | Batching::ColumnRows if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
+                Batching::Rows | Batching::Columns | Batching::ColumnRows => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
                     Some(input) => {
-                        if matches!(batching, Batching::ColumnRows) || fills_row_batches(operators.relation()) {
+                        if matches!(batching, Batching::Rows | Batching::ColumnRows) || fills_row_batches(operators.relation()) {
                             let input = Box::new(RowBatchedColumns { input, pending: None, context: Arc::clone(&context) });
                             return Ok(QueryInput::Columns(ColumnOutput { input, limit: usize::MAX, pending: None }));
                         }
@@ -397,9 +396,14 @@ impl PreparedQuery {
                         };
                         Ok(QueryInput::Columns(ColumnOutput { input, limit, pending: None }))
                     }
-                    None => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
+                    None => Err(invalid("column-plan", "Query could not open as Arrow")),
                 },
-                _ => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
+                Batching::Pages => {
+                    let input = crate::operators::build_columns(operators, execution).await?
+                        .ok_or_else(|| invalid("column-plan", "Analyzed query could not open as Arrow"))?;
+                    Ok(QueryInput::Columns(ColumnOutput { input, limit: usize::MAX, pending: None }))
+                }
+
             }
         })).await.flatten().ok_or_else(cancelled)??;
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
@@ -415,7 +419,7 @@ impl PreparedQuery {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Pages(_) | QueryInput::ColumnPages(_) | QueryInput::Projection(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
+                QueryInput::ColumnPages(_) | QueryInput::Projection(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
             }
             let peak = context.memory.peak_bytes();
             let reservation = context.memory.reserve(analysis.output_bound()?)?;
@@ -551,7 +555,6 @@ fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory
 
 enum QueryInput {
     Rows(BoxCursor),
-    Pages(crate::pages::BoxPageCursor),
     Columns(ColumnOutput),
     ColumnPages(crate::columnar::BoxBatchCursor),
     Ordered(crate::columnar::BoxBatchCursor),
@@ -786,10 +789,6 @@ impl QueryCursor {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }
             },
-            QueryInput::Pages(input) => {
-                let Some(page) = input.next_page().await? else { return Ok(None); };
-                page
-            }
             QueryInput::Rows(input) => {
                 let mut rows = crate::pages::PageBuilder::new(self.context.options.batch_rows, &self.context.memory)?;
                 while rows.len() < self.context.options.batch_rows {
@@ -838,14 +837,11 @@ pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: c
             arrays.push(array);
             continue;
         }
-        let mut cells = batch.len.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
-        for row in 0..batch.len { cells = cells.checked_add(column.bound(row)?).ok_or_else(overflow)?; }
-        let _cells = memory.reserve(cells)?;
-        let values = (0..batch.len).map(|row| column.value(row)).collect::<Result<Vec<_>>>()?;
-        let bytes = estimate_builder_bytes_refs(&field.data_type, values.iter())?;
-        let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("batch-size", "An output batch's charge is shared"))?;
-        lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(overflow)?)?;
-        arrays.push(copy_array(&field.data_type, &values)?);
+        let (array, _scratch) = rtdb_columnar::copy_evaluated_cells(&field.data_type, batch.len, memory,
+            |row| column.bound(row), |row| column.value(row))?;
+        let lease = Arc::get_mut(&mut reservation).expect("An output batch owns its reservation");
+        lease.grow_to(lease.bytes().checked_add(array.get_array_memory_size()).ok_or_else(overflow)?)?;
+        arrays.push(array);
     }
     let options = RecordBatchOptions::new().with_row_count(Some(batch.len));
     let output = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;

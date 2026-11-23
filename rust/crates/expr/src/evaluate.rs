@@ -30,34 +30,12 @@ pub trait ParameterLookup: Sync {
     fn value(&self, index: usize) -> Result<Option<&Value>>;
     fn known_value(&self, index: usize) -> Option<&Value>;
     fn arrow_cell(&self, index: usize) -> Option<ArrowParameterCell<'_>>;
-}
-
-#[derive(Clone, Copy)]
-pub struct ArrowParameterCell<'a> {
-    pub field: &'a arrow_schema::Field,
-    pub array: &'a dyn arrow_array::Array,
-    pub row: usize,
-}
-
-impl ArrowParameterCell<'_> {
-    pub fn signed_integer(self) -> Option<i64> {
-        use arrow_array::{cast::AsArray, types::*};
-        use arrow_schema::DataType;
-
-        if self.array.is_null(self.row) || !self.field.metadata().is_empty() { return None; }
-        Some(match self.array.data_type() {
-            DataType::Int8 => i64::from(self.array.as_primitive::<Int8Type>().value(self.row)),
-            DataType::Int16 => i64::from(self.array.as_primitive::<Int16Type>().value(self.row)),
-            DataType::Int32 => i64::from(self.array.as_primitive::<Int32Type>().value(self.row)),
-            DataType::Int64 => self.array.as_primitive::<Int64Type>().value(self.row),
-            DataType::UInt8 => i64::from(self.array.as_primitive::<UInt8Type>().value(self.row) as i8),
-            DataType::UInt16 => i64::from(self.array.as_primitive::<UInt16Type>().value(self.row) as i16),
-            DataType::UInt32 => i64::from(self.array.as_primitive::<UInt32Type>().value(self.row) as i32),
-            DataType::UInt64 => self.array.as_primitive::<UInt64Type>().value(self.row) as i64,
-            _ => return None,
-        })
+    fn correlated_value(&self, _depth: usize, _position: usize, _scope: Option<&crate::EvaluationScope>) -> Result<Option<Value>> {
+        Ok(None)
     }
 }
+
+pub type ArrowParameterCell<'a> = rtdb_columnar::ArrowCell<'a>;
 
 #[derive(Clone, Copy)]
 pub enum Parameters<'a> {
@@ -316,6 +294,36 @@ fn binary_value(op: BinaryOp, left: Value, right: Value, context: &EvalContext<'
     }
 }
 
+/// An input provider for the current expression row. Values are decoded only when demanded.
+pub trait RowInput: Sync {
+    fn value(&self, index: usize, allocation: Option<&crate::EvaluationScope>) -> Result<Option<Value>>;
+    fn arrow_cell(&self, _index: usize) -> Option<ArrowParameterCell<'_>> { None }
+}
+
+#[derive(Clone, Copy)]
+pub enum ExpressionRow<'a> {
+    Values(&'a [Value]),
+    Borrowed(&'a dyn RowInput),
+}
+
+impl<'a> ExpressionRow<'a> {
+    fn arrow_cell(self, index: usize) -> Option<ArrowParameterCell<'a>> {
+        match self {
+            Self::Values(_) => None,
+            Self::Borrowed(row) => row.arrow_cell(index),
+        }
+    }
+
+    fn value(self, schema: &Schema, id: rtdb_plan::ColumnId, context: &EvalContext<'_>) -> Result<Value> {
+        let missing = || Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", id.0));
+        let index = schema.position(id).ok_or_else(missing)?;
+        match self {
+            Self::Values(row) => retained_clone(row.get(index).ok_or_else(missing)?, context),
+            Self::Borrowed(row) => row.value(index, context.allocation)?.ok_or_else(missing),
+        }
+    }
+}
+
 macro_rules! expression_body {
     ($expression:expr, $input_schema:expr, $input_row:expr, $inputs:expr, $eval:ident, $call:ident, $reader:ident) => {{
     let (expr, schema, row, context) = ($expression, $input_schema, $input_row, $inputs);
@@ -327,13 +335,19 @@ macro_rules! expression_body {
             ))?;
             Ok(Value::Duration { value: nanos / 1000, unit: rtdb_types::TimeUnit::Microsecond })
         }
-        Expr::Column { id, .. } => retained_clone(schema.position(*id).and_then(|index| row.get(index))
-            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", id.0)))?, context),
+        Expr::Column { id, .. } => row.value(schema, *id, context),
         Expr::Parameter { index, .. } => retained_clone(context.parameters.get(*index)?
             .ok_or_else(|| Anomaly::incorrect("xtdb/missing-parameter", format!("Missing parameter ${}", index + 1)))?, context),
-        Expr::Correlated { depth, id, .. } => retained_clone(context.outer_rows.get(*depth)
-            .and_then(|outer| outer.schema.position(*id).and_then(|index| outer.values.get(index)))
-            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-correlated-column", "Correlated row is unavailable"))?, context),
+        Expr::Correlated { depth, id, .. } => {
+            let missing = || Anomaly::fault("rtdb.expr/missing-correlated-column", "Correlated row is unavailable");
+            let outer = context.outer_rows.get(*depth).ok_or_else(missing)?;
+            let index = outer.schema.position(*id).ok_or_else(missing)?;
+            if let Parameters::Lookup(inputs) = context.parameters
+                && let Some(value) = inputs.correlated_value(*depth, index, context.allocation)? {
+                return Ok(value);
+            }
+            retained_clone(outer.values.get(index).ok_or_else(missing)?, context)
+        }
         Expr::Unary { op, expr } => {
             let value = $eval!(expr)?;
             unary_value(*op,value)
@@ -426,10 +440,8 @@ macro_rules! expression_body {
             Ok(Value::Struct(values))
         },
         Expr::RowCopy(fields) => Ok(Value::Struct(fields.iter().map(|field| {
-            let value = schema.position(field.id).and_then(|index| row.get(index))
-                .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", field.id.0)))?;
             context.reserve(field.name.len().checked_add(4096).ok_or_else(overflow)?)?;
-            Ok((field.name.clone(), retained_clone(value, context)?))
+            Ok((field.name.clone(), row.value(schema, field.id, context)?))
         }).collect::<Result<_>>()?)),
         Expr::In { expr, values, negated } => {
             let value = $eval!(expr)?;
@@ -458,7 +470,7 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate(row,context)
 }
 
-fn evaluate_inner(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+fn evaluate_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<Value> {
     macro_rules! eval { ($child:expr) => { evaluate_inner($child, schema, row, context) }; }
     macro_rules! call { ($name:expr, $args:expr) => { scalar_call($name, $args, context) }; }
     macro_rules! reader { ($expression:expr) => { reader::execute_sync($expression,schema,row,context) }; }
@@ -472,12 +484,12 @@ pub async fn evaluate_async(expr: &Expr, schema: &Schema, row: &[Value], context
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate_async(row,context).await
 }
 
-async fn evaluate_async_inner(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+async fn evaluate_async_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<Value> {
     if !expr.requires_suspension() { return evaluate_inner(expr, schema, row, context); }
     evaluate_suspending(expr, schema, row, context)?.await
 }
 
-fn evaluate_suspending<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Value], context: &'a EvalContext<'a>) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>> {
+fn evaluate_suspending<'a>(expr: &'a Expr, schema: &'a Schema, row: ExpressionRow<'a>, context: &'a EvalContext<'a>) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>> {
     let future = async move {
         macro_rules! eval { ($child:expr) => { evaluate_async_inner($child, schema, row, context).await }; }
         macro_rules! call { ($name:expr, $args:expr) => { crate::functions::scalar_call_async($name, $args, context).await }; }

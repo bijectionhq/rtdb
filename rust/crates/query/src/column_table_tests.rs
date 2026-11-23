@@ -361,3 +361,18 @@ async fn cancelled_or_dropped_column_table_opening_releases_its_unpublished_page
         assert_eq!(execution.context.memory.used_bytes(), baseline);
     }
 }
+
+#[tokio::test]
+async fn a_computed_column_table_keeps_one_batch_across_list_pages() {
+    let execution = execution(1, vec![]);
+    let expression = Expr::List((1..=7).map(|value| Expr::Literal(Value::I64(value))).collect());
+    let relation = column_table("value", expression);
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut batches = crate::operators::build_columns(runtime, execution).await.unwrap().unwrap();
+    let batch = batches.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.len, 7);
+    for row in 0..batch.len {
+        assert_eq!(batch.columns[0].value(row).unwrap(), Value::I64(row as i64 + 1));
+    }
+    assert!(batches.next_batch().await.unwrap().is_none());
+}

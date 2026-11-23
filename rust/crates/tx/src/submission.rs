@@ -12,7 +12,7 @@ use rtdb_sql::StaticMutationKind;
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
 use crate::source::Operation;
-use crate::values::{canonical_argument_column, plain_scalar_field};
+use crate::values::{BoundArgumentRow, canonical_argument_column, plain_scalar_field};
 
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
@@ -96,61 +96,90 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
             Err(error) => return Err(error),
         }
     }
-    let parameter_rows: Box<dyn Iterator<Item = Result<crate::values::ArgumentRow<'_>>> + '_> = match args {
-        Some(args) => Box::new(args.rows()),
-        None => Box::new(std::iter::once(Ok(crate::values::ArgumentRow::borrowed(&[])))),
+    let parameter_rows: Box<dyn Iterator<Item = Result<BoundArgumentRow<'_>>> + '_> = match args {
+        Some(args) => Box::new(args.indexed_bound_rows().map(|row| row.map(|(_, row)| row))),
+        None => Box::new(std::iter::once(Ok(BoundArgumentRow::Values { values: &[], types: None }))),
     };
-    let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<StructFields<Value>>)> = Vec::new();
-    // Where each valid time's group is, so that rows each carrying their own find theirs without searching them all.
-    let mut group_of: std::collections::BTreeMap<(Option<Timestamp>, Option<Timestamp>), usize> = Default::default();
-    let mut document_charges = Vec::new();
-    let mut expression_count = 0usize;
-    fn count(input: &Relation, total: &mut usize) { for expr in input.expressions() { expr.visit(&mut |_| *total += 1); } for child in input.children() { count(child, total); } }
-    count(&plan.input, &mut expression_count);
+    let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<ArrowDocuments>)> = Vec::new();
+    let mut group_of: BTreeMap<(Option<Timestamp>, Option<Timestamp>), usize> = Default::default();
+    let mut inventory = memory.reserve(4096)?;
+    let columns = plan.input.schema().fields().iter().map(|field| field.name.as_str())
+        .filter(|name| matches!(&plan.kind, StaticMutationKind::Patch(_)) || !valid_time_column(name))
+        .map(str::to_owned).collect::<Vec<_>>();
+    let mut pending_bounds = (None, None);
+    let mut pending = Vec::with_capacity(128);
+    let mut pending_charge = memory.reserve(4096)?;
+    let mut flush = |bounds, pending: &mut Vec<_>, pending_charge: &mut Arc<rtdb_columnar::MemoryReservation>| -> Result<()> {
+        if pending.is_empty() { return Ok(()); }
+        let rows = std::mem::replace(pending, Vec::with_capacity(128));
+        let documents = Documents::with_column_order(rows, columns.clone(), memory)?;
+        Arc::get_mut(pending_charge).expect("Static document buffer owns its reservation").shrink_to(4096)?;
+        let page = crate::source::owned_row_documents(&documents, memory)?;
+        let lease = Arc::get_mut(&mut inventory).expect("Static mutation owns its document groups");
+        lease.grow_to(lease.bytes().checked_add(512).ok_or_else(overflow)?)?;
+        match group_of.entry(bounds) {
+            std::collections::btree_map::Entry::Occupied(group) => groups[*group.get()].1.push(page),
+            std::collections::btree_map::Entry::Vacant(group) => { group.insert(groups.len()); groups.push((bounds, vec![page])); }
+        }
+        Ok(())
+    };
     for parameters in parameter_rows {
         let row_scope = scope.scratch();
-        let parameters = parameters?;
-        let parameters = &parameters[..parameter_count];
-        let parameter_bytes = parameters.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
-        // Literal values come from the statement text, so their copies scale with its length; only parameters can be copied per expression.
-        let bound = parameter_bytes.checked_mul(expression_count.checked_add(8).ok_or_else(overflow)?).and_then(|bytes| bytes.checked_add(sql.len().checked_mul(128)?)).ok_or_else(overflow)?;
-        let _evaluation = memory.reserve(bound)?;
-        let mut parameters = parameters.to_vec();
-        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
-        let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
+        let arrow;
+        let values;
+        let parameters = match parameters? {
+            BoundArgumentRow::Arrow { batch, row, types } => {
+                arrow = rtdb_query::BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), memory)?;
+                arrow.evaluator()
+            }
+            BoundArgumentRow::Values { values: input, .. } => {
+                let input = &input[..parameter_count];
+                let bytes = input.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
+                row_scope.reserve(bytes)?;
+                values = input.iter().cloned().map(|mut value| {
+                    rtdb_columnar::admit_execution_value(&mut value);
+                    value
+                }).collect::<Vec<_>>();
+                rtdb_expr::Parameters::Values(&values)
+            }
+        };
+        let context = EvalContext { parameters, parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
         let temporal = match valid_time {
             TemporalFilter::Default => (None, None),
             TemporalFilter::All => (Some(Timestamp::MIN), Some(Timestamp::MAX)),
             TemporalFilter::FromTo { from, to } => (patch_bound_value(from, Timestamp::MIN, &context)?, patch_bound_value(to, Timestamp::MAX, &context)?),
             _ => return Err(Anomaly::incorrect("xtdb/sql-error", "Static PATCH requires ALL or FROM/TO valid time")),
         };
-        for row in materialize(&plan.input, &context)? {
+        materialize(&plan.input, &context, &mut |row| {
             let mut document: StructFields<_> = plan.input.schema().fields().iter().zip(row).map(|(field, value)| (field.name.clone(), value)).collect();
             let bounds = if matches!(&plan.kind, StaticMutationKind::Patch(_)) { temporal } else {
                 let from = insert_bound(&document.remove("_valid_from").unwrap_or(Value::Null), &options.default_tz)?;
                 let to = insert_bound(&document.remove("_valid_to").unwrap_or(Value::Null), &options.default_tz)?;
                 (from, to)
             };
-            let document_bytes = document.iter().try_fold(256usize, |bytes, (name, value)| bytes.checked_add(name.capacity())?.checked_add(std::mem::size_of::<(String, Value)>())?.checked_add(value.retained_bytes().ok()?)).ok_or_else(overflow)?;
-            document_charges.push(memory.reserve(document_bytes)?);
-            match group_of.entry(bounds) {
-                std::collections::btree_map::Entry::Occupied(group) => groups[*group.get()].1.push(document),
-                std::collections::btree_map::Entry::Vacant(group) => { group.insert(groups.len()); groups.push((bounds, vec![document])); }
+            for value in document.values_mut() { infer_document_decimals(value)?; }
+            if pending.len() == 128 || pending_bounds != bounds {
+                flush(pending_bounds, &mut pending, &mut pending_charge)?;
+                pending_bounds = bounds;
             }
-        }
+            let lease = Arc::get_mut(&mut pending_charge).expect("Static document buffer owns its reservation");
+            lease.grow_to(lease.bytes().checked_add(Value::document_retained_bytes(&document)?).ok_or_else(overflow)?)?;
+            pending.push(document);
+            Ok(())
+        })?;
     }
-    let operations = groups.into_iter().map(|((valid_from, valid_to), documents)| {
-        let mut documents = documents;
-        for document in &mut documents { for value in document.values_mut() { infer_document_decimals(value)?; } }
-        let columns = plan.input.schema().fields().iter().map(|field| field.name.as_str())
-            .filter(|name| matches!(&plan.kind, StaticMutationKind::Patch(_)) || !matches!(*name, "_valid_from" | "_valid_to"))
-            .map(str::to_owned).collect();
-        let documents = Documents::with_column_order(documents, columns, memory)?;
+    flush(pending_bounds, &mut pending, &mut pending_charge)?;
+    let operations = groups.into_iter().map(|((valid_from, valid_to), pages)| {
+        let documents = crate::source::coalesce_arrow_documents(pages, memory)?;
         let table = plan.table.table.clone();
-        Ok(Operation::Public(match &plan.kind {
-            StaticMutationKind::Patch(_) => TxOp::PatchDocs { table, documents, valid_from, valid_to },
-            StaticMutationKind::Put => TxOp::PutDocs { table, documents, valid_from, valid_to },
-        }))
+        Ok(match &plan.kind {
+            StaticMutationKind::Patch(_) => {
+                let reader = documents.id_reader()?;
+                let iids = (0..documents.array().len()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<_>>()?;
+                Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to }
+            }
+            StaticMutationKind::Put => Operation::PutReplayArrow { table, documents, iids: None, valid_from, valid_to },
+        })
     }).collect::<Result<Vec<_>>>()?;
     Ok((!operations.is_empty()).then_some(operations))
 }
@@ -253,7 +282,7 @@ fn projected_timed_puts(
         let reader = documents.id_reader()?;
         let iids = (0..batch.num_rows()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<Vec<_>>>();
         let Ok(iids) = iids else { return Ok(None); };
-        operations.push(Operation::PutArrowIids { table: table.clone(), documents, iids, valid_from, valid_to });
+        operations.push(Operation::PutReplayArrow { table: table.clone(), documents, iids: Some(iids), valid_from, valid_to });
     }
     Ok(Some(operations))
 }
@@ -329,10 +358,21 @@ fn infer_document_decimals(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
-fn materialize(input: &Relation, context: &EvalContext<'_>) -> Result<Vec<Vec<Value>>> {
+fn materialize(input: &Relation, context: &EvalContext<'_>, emit: &mut dyn FnMut(Vec<Value>) -> Result<()>) -> Result<()> {
     match input.node() {
-        RelationNode::Values { rows } => rows.iter().map(|row| row.iter().map(|expr| evaluate(expr, &Schema::default(), &[], context)).collect()).collect(),
-        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => materialize(input, context)?.iter().map(|row| expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), row, context)).collect()).collect(),
+        RelationNode::Values { rows } => {
+            for row in rows {
+                let values = row.iter().map(|expr| evaluate(expr, &Schema::default(), &[], context)).collect::<Result<_>>()?;
+                emit(values)?;
+            }
+            Ok(())
+        }
+        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
+            materialize(input, context, &mut |row| {
+                let values = expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), &row, context)).collect::<Result<_>>()?;
+                emit(values)
+            })
+        }
         _ => Err(Anomaly::fault("rtdb.tx/static-plan", "Static SQL source contains a data-dependent operator")),
     }
 }
@@ -386,14 +426,14 @@ mod tests {
         let ordinary = submit(SqlArguments::new(arguments.types().to_vec(), rows, &memory).unwrap());
         let projected = submit(arguments);
 
-        let [Operation::PutArrowIids { documents: bounded, valid_from: Some(_), valid_to: Some(_), .. },
-            Operation::PutArrowIids { documents: defaulted, valid_from: None, valid_to: None, .. }] = projected.operations.as_slice()
+        let [Operation::PutReplayArrow { documents: bounded, valid_from: Some(_), valid_to: Some(_), .. },
+            Operation::PutReplayArrow { documents: defaulted, valid_from: None, valid_to: None, .. }] = projected.operations.as_slice()
             else { panic!("Expected two Arrow writes in first-seen valid-time order"); };
         assert_eq!((bounded.array().len(), defaulted.array().len()), (2, 2));
         assert_eq!(projected.encode().unwrap().as_slice(), ordinary.encode().unwrap().as_slice());
 
         let null_first = submit(page(vec![5, 6], vec![None, Some("six")], vec![Some(start); 2], vec![Some(end); 2]));
-        assert!(matches!(null_first.operations.as_slice(), [Operation::Public(TxOp::PutDocs { .. })]));
+        assert!(matches!(null_first.operations.as_slice(), [Operation::PutReplayArrow { .. }]));
     }
 
     #[test]
@@ -504,9 +544,9 @@ mod tests {
         prepare_submission(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (1, ?)".into(), args: Some(args) }], SubmitOptions::default(), "xtdb", memory).unwrap()
     }
 
-    fn document(source: &SourceTransaction) -> &StructFields<Value> {
-        let crate::source::Operation::Public(TxOp::PutDocs { documents, .. }) = &source.operations[0] else { panic!("Expected static documents") };
-        &documents.rows()[0]
+    fn document(source: &SourceTransaction, memory: &Arc<MemoryBudget>) -> StructFields<Value> {
+        let Operation::PutReplayArrow { documents, .. } = &source.operations[0] else { panic!("Expected static Arrow documents") };
+        documents.to_rows(false, memory).unwrap().rows()[0].clone()
     }
 
     #[test]
@@ -514,13 +554,13 @@ mod tests {
         let memory = MemoryBudget::new(1 << 24);
         let args = SqlArguments::new(vec![rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64)], vec![vec![Value::U64(u64::MAX)]], &memory).unwrap();
         let source = prepare_submission(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (1, ?)".into(), args: Some(args.clone()) }], SubmitOptions::default(), "xtdb", &memory).unwrap();
-        assert_eq!(document(&source)["v"], Value::I64(-1));
+        assert_eq!(document(&source, &memory)["v"], Value::I64(-1));
         assert_eq!(&*args.rows().next().unwrap().unwrap(), &[Value::U64(u64::MAX)]);
         assert_eq!(args.types(), &[rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64)]);
         let encoded = source.encode().unwrap();
         let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         let replay = SourceTransaction::decode(&message, &memory).unwrap();
-        let crate::source::Operation::PutArrowIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
+        let crate::source::Operation::PutReplayArrow { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
         assert_eq!(documents.to_rows(true, &memory).unwrap().rows()[0]["v"], Value::I64(-1));
     }
 
@@ -529,15 +569,15 @@ mod tests {
         let memory = MemoryBudget::new(1 << 24);
         for precision in [i32::MIN, -1, 0, 1, 256, i32::MAX] {
             let source = expanded(decimal(18, precision, i32::MAX), &memory);
-            assert_eq!(document(&source)["v"], decimal(18, 32, i32::MAX));
+            assert_eq!(document(&source, &memory)["v"], decimal(18, 32, i32::MAX));
             let encoded = source.encode().unwrap();
             let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
             let replay = SourceTransaction::decode(&message, &memory).unwrap();
-            let crate::source::Operation::PutIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
-            assert_eq!(documents.rows()[0]["v"], decimal(18, 32, i32::MAX));
+            let crate::source::Operation::PutReplayArrow { documents, .. } = &replay.operations[0] else { panic!("Expected Arrow replay of static documents") };
+            assert_eq!(documents.to_rows(true, &memory).unwrap().rows()[0]["v"], decimal(18, 32, i32::MAX));
         }
         let source = expanded(decimal(i128::MAX, -1, i32::MIN), &memory);
-        let Value::Decimal(value) = &document(&source)["v"] else { panic!("Expected decimal") };
+        let Value::Decimal(value) = &document(&source, &memory)["v"] else { panic!("Expected decimal") };
         assert_eq!((value.precision, value.scale, value.bit_width), (64, i32::MIN, 256));
         assert_eq!(&value.unscaled[16..], &i128::MAX.to_be_bytes());
         drop(source);
@@ -555,7 +595,7 @@ mod tests {
             ("struct".into(), Value::Struct(StructFields::from([("child".into(), value)]))),
         ]));
         let source = expanded(nested(decimal(18, -1, 129)), &memory);
-        assert_eq!(document(&source)["v"], nested(decimal(18, 32, 129)));
+        assert_eq!(document(&source, &memory)["v"], nested(decimal(18, 32, 129)));
     }
 
     #[test]
@@ -588,8 +628,8 @@ mod argument_tests {
             assert!(matches!(&source.operations[..], [Operation::Public(TxOp::Sql { .. })]));
         }
         let source = submit(Some(batch(vec![Value::I64(3), Value::I64(4), Value::I64(5)])));
-        let [Operation::Public(TxOp::PutDocs { documents, .. })] = &source.operations[..] else { panic!("expanded documents") };
-        assert_eq!(documents.rows(), &[StructFields::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(4))])]);
+        let [Operation::PutReplayArrow { documents, .. }] = &source.operations[..] else { panic!("expanded Arrow documents") };
+        assert_eq!(documents.to_rows(false, &memory).unwrap().rows(), &[StructFields::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(4))])]);
     }
 }
 
@@ -615,7 +655,7 @@ mod patch_endpoint_tests {
     use super::*;
 
     fn bounds(source: &SourceTransaction) -> (Option<Timestamp>,Option<Timestamp>) {
-        let [crate::source::Operation::Public(TxOp::PatchDocs { valid_from,valid_to,.. })] = source.operations.as_slice() else { panic!("static patch") };
+        let [Operation::PatchArrowIids { valid_from,valid_to,.. }] = source.operations.as_slice() else { panic!("static patch") };
         (*valid_from,*valid_to)
     }
 

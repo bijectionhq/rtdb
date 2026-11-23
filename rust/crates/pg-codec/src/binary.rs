@@ -1,6 +1,6 @@
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
-use rtdb_types::{Anomaly, DecimalValue, PgType, Result, TimeUnit, Value};
+use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::invalid;
 
 pub(crate) const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
@@ -73,18 +73,17 @@ fn numeric_read(input: &mut Input<'_>) -> Result<Value> {
     crate::text::decimal_parts(coefficient, scale)
 }
 
-pub(crate) fn numeric_allocation_bound(value: &DecimalValue) -> Result<usize> {
-    if value.scale == i32::MIN { return Err(invalid("PostgreSQL numeric scale magnitude exceeds signed integer range")); }
-    let zero_groups = if value.scale < 0 && value.unscaled.iter().any(|byte| *byte != 0) { value.scale.unsigned_abs() as usize / 4 } else { 0 };
-    zero_groups.checked_add(value.unscaled.len()).and_then(|groups| groups.checked_mul(2)).and_then(|bytes| bytes.checked_add(8)).ok_or_else(crate::size_error)
+pub(crate) fn numeric_allocation_bound(unscaled: &[u8], scale: i32) -> Result<usize> {
+    if scale == i32::MIN { return Err(invalid("PostgreSQL numeric scale magnitude exceeds signed integer range")); }
+    let zero_groups = if scale < 0 && unscaled.iter().any(|byte| *byte != 0) { scale.unsigned_abs() as usize / 4 } else { 0 };
+    zero_groups.checked_add(unscaled.len()).and_then(|groups| groups.checked_mul(2)).and_then(|bytes| bytes.checked_add(8)).ok_or_else(crate::size_error)
 }
 
-pub(crate) fn numeric_write(value: &DecimalValue) -> Result<Vec<u8>> {
-    numeric_allocation_bound(value)?;
-    let signed = BigInt::from_signed_bytes_be(&value.unscaled);
+pub(crate) fn numeric_write(unscaled: &[u8], scale: i32) -> Result<Vec<u8>> {
+    numeric_allocation_bound(unscaled, scale)?;
+    let signed = BigInt::from_signed_bytes_be(unscaled);
     let negative = signed <= BigInt::zero();
     let mut coefficient = signed.abs();
-    let scale = value.scale;
     let fraction_groups = if scale > 0 { scale.wrapping_add(3) / 4 } else { 0 };
     let zero_groups = if scale < 0 && !coefficient.is_zero() { scale.unsigned_abs() as usize / 4 } else { 0 };
     let mut digits = Vec::<u16>::new();

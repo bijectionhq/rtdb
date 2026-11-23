@@ -267,11 +267,21 @@ impl PushdownBuilder {
             let Expr::Column { id, .. } = &key.expression else {
                 return Err(invalid("pushdown-key", "Arrow join filter requires a column key"));
             };
-            let value = schema.position(*id).and_then(|position| ScalarKey::read(&batch.columns[position], row))
-                .ok_or_else(|| invalid("pushdown-key", "Arrow join filter could not read its key"))?;
-            key.add(rtdb_format::bloom::hashes(value.hash() as i32, value.murmur3() as i32));
-            if value != ScalarKey::Null && let Some(iids) = &mut key.filter.iids
-                && !iids.insert_scalar(value, memory)? {
+            let column = schema.position(*id).and_then(|position| batch.columns.get(position))
+                .ok_or_else(|| invalid("pushdown-key", "Build key column is outside its batch"))?;
+            if let Some(value) = ScalarKey::read(column, row) {
+                key.add(rtdb_format::bloom::hashes(value.hash() as i32, value.murmur3() as i32));
+                if value != ScalarKey::Null && let Some(iids) = &mut key.filter.iids
+                    && !iids.insert_scalar(value, memory)? {
+                    key.filter.iids = None;
+                }
+                continue;
+            }
+            let scope = rtdb_expr::EvaluationScope::new(memory)?;
+            let value = column.expression_value(row, true, Some(&scope))?;
+            key.add(BloomFilter::value_positions(&value)?);
+            if !matches!(value, Value::Null | Value::Undefined)
+                && let Some(iids) = &mut key.filter.iids && !iids.insert(&value, &scope, memory)? {
                 key.filter.iids = None;
             }
         }

@@ -2140,7 +2140,7 @@ mod tests {
         use rtdb_plan::{BinaryOp, JoinKind, Relation};
 
         let (state, table, _, store, _) = persisted_page_fixture().await;
-        for (spill_limit, arrow) in [(8192, true), (900, false)] {
+        for spill_limit in [8192, 1] {
             let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
             let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
             let context = Arc::get_mut(&mut execution.context).unwrap();
@@ -2154,6 +2154,12 @@ mod tests {
                 JoinKind::Inner, Some(condition),
             ).unwrap());
             let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            if spill_limit == 1 {
+                let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow join");
+                assert_eq!(cursor.next_batch().await.err().unwrap().code, "rtdb.query/spill-limit");
+                assert_eq!(execution.context.spill_bytes(), 0);
+                continue;
+            }
             let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
             let mut expected = Vec::new();
             while let Some(page) = baseline.next_page().await.unwrap() {
@@ -2164,7 +2170,7 @@ mod tests {
             let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
             let mut actual = Vec::new();
             while let Some(batch) = cursor.next_batch().await.unwrap() {
-                assert_eq!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })), arrow);
+                assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
                 actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
             }
             assert_eq!(actual, expected);

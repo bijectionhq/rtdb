@@ -182,11 +182,6 @@ impl AggregateCursor {
         Self::positions(&self.schema, &self.groups, &self.aggregates, collect_vectors)
     }
 
-    pub fn supports_columnar(runtime: &EmittedRelation, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Result<bool> {
-        if aggregates.is_empty() { return Ok(false); }
-        let child = runtime.child(0)?;
-        Ok(Self::positions(child.schema(), groups, aggregates, true).is_some())
-    }
     /// The input positions every aggregate and group reads, when each reads only its argument or key column.
     pub fn reads_columns(schema: &Schema, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Option<Vec<usize>> {
         Self::positions(schema, groups, aggregates, false)
@@ -200,9 +195,11 @@ impl AggregateCursor {
         }
         for aggregate in aggregates {
             if !aggregate.order_by.is_empty() {
-                if !collect_vectors || aggregate.function.canonical() != AggregateFunction::ArrayAgg { return None; }
-                for order in &aggregate.order_by {
-                    positions.push(argument_position(&order.expr, schema).ok()?);
+                if !collect_vectors { return None; }
+                if aggregate.function.canonical() == AggregateFunction::ArrayAgg {
+                    for order in &aggregate.order_by {
+                        positions.push(argument_position(&order.expr, schema).ok()?);
+                    }
                 }
             }
             match aggregate.function.canonical() {
@@ -428,12 +425,9 @@ impl BatchCursor for AggregateCursor {
                         values.push(value);
                         scope.reset()?;
                     }
-                    if let Some((column, scratch)) = crate::columnar::scalar_result(&values, &context.memory)? {
-                        drop((values, reservation));
-                        batch.append_column(column, scratch, &context.memory)?;
-                    } else {
-                        batch.append_column(Column::Values(values), reservation, &context.memory)?;
-                    }
+                    let (column, scratch) = crate::columnar::pack_evaluated_column(&values, &context.memory)?;
+                    drop((values, reservation));
+                    batch.append_column(column, scratch, &context.memory)?;
                     continue;
                 }
             };
@@ -622,7 +616,15 @@ impl GroupKeys {
 
 struct AggregateColumn { accumulation: Accumulation, distinct: Option<DistinctSeen> }
 /// The distinct arguments each group has taken so far, by the group and the hash of the argument.
-struct DistinctSeen { index: std::collections::HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow> }
+struct DistinctSeen {
+    index: std::collections::HashMap<(usize, u32), Vec<usize>>,
+    values: Vec<DistinctCell>,
+}
+
+enum DistinctCell {
+    Value(OwnedRow),
+    Arrow { key: Arc<ColumnBatch>, row: usize, projected: bool },
+}
 enum Accumulation { Scalar(ScalarGroups), Collected(PageBuilder), Vectors(CollectionVectors) }
 impl AggregateColumn {
     fn new(aggregate: &AggregateExpr,schema: &Schema,execution: &Execution,collect_vectors: bool) -> Result<Self> {
@@ -643,22 +645,22 @@ impl AggregateColumn {
         let mut mask = vec![true;input.len()];
         if let Some(filter) = &aggregate.filter {
             let invocation = execution.prepare_expression(filter,schema,&scope)?;
-            let positions = crate::columnar::expression_columns(filter, schema)?;
             for (row, selected) in mask.iter_mut().enumerate() {
                 let row_scope = execution.scope()?;
-                let scratch;
+                let borrowed;
                 let values = match input {
-                    Rows::Page(page) => &page.rows()[row].values,
-                    Rows::Columns { batch, memory, .. } => {
-                        scratch = batch.expression_row(row, &positions, memory)?;
-                        &scratch.values
+                    Rows::Page(page) => rtdb_expr::ExpressionRow::Values(&page.rows()[row].values),
+                    Rows::Columns { batch, .. } => {
+                        borrowed = crate::columnar::BatchRow { batch, row, admit_dates: false };
+                        rtdb_expr::ExpressionRow::Borrowed(&borrowed)
                     }
                 };
-                *selected = is_true(&execution.evaluate_invocation(&row_scope, &invocation, values).await?)?;
+                *selected = is_true(&execution.evaluate_invocation_row(&row_scope, &invocation, values).await?)?;
             }
         }
         let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,schema)).transpose()?;
         if let Some(seen) = &mut self.distinct {
+            let mut vector = None;
             let mut admitted = false;
             for (row, (group, selected)) in mapping.iter().zip(&mut mask).enumerate() {
                 execution.context.check_cancelled()?;
@@ -670,12 +672,30 @@ impl AggregateColumn {
                 if let Some(candidates) = seen.index.get(&(*group, hash)) {
                     for &candidate in candidates {
                         let allocation = rtdb_expr::EvaluationScope::new(&execution.context.memory)?;
-                        if sql_eq_in_timezone(value,&seen.values[candidate].values[0],&execution.context.timezone,&allocation)? == Some(true) { *selected = false; break; }
+                        let decoded;
+                        let other = match &seen.values[candidate] {
+                            DistinctCell::Value(row) => &row.values[0],
+                            DistinctCell::Arrow { key, row, projected } => {
+                                decoded = key.columns[0].expression_value(*row, *projected, Some(&allocation))?;
+                                &decoded
+                            }
+                        };
+                        if sql_eq_in_timezone(value, other, &execution.context.timezone, &allocation)? == Some(true) {
+                            *selected = false;
+                            break;
+                        }
                     }
                 }
                 if *selected {
                     seen.index.entry((*group, hash)).or_default().push(seen.values.len());
-                    seen.values.push(OwnedRow::copy_parts(&[std::slice::from_ref(value)],0,0,&execution.context.memory)?);
+                    let cell = match (input, argument) {
+                        (Rows::Columns { batch, projected, memory }, Some(position)) => {
+                            if vector.is_none() { vector = Some(Arc::new(batch.key_projection(&[position], memory)?)); }
+                            DistinctCell::Arrow { key: Arc::clone(vector.as_ref().expect("The input key vector is retained")), row, projected }
+                        }
+                        _ => DistinctCell::Value(OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?),
+                    };
+                    seen.values.push(cell);
                 }
             }
         }
@@ -837,7 +857,8 @@ impl CollectionVectors {
     async fn finish(mut self, groups: usize, aggregate: &AggregateExpr, output: &rtdb_plan::Field,
         execution: &Execution) -> Result<(Column, Arc<rtdb_columnar::MemoryReservation>)> {
         if let AggregateFunction::Percentile { kind, fraction: PercentileFraction::Literal(fraction), descending } = aggregate.function {
-            return self.percentiles(groups, kind, fraction, descending, output, execution).await;
+            let input = aggregate.argument.as_ref().map_or(LogicalType::Nothing, rtdb_plan::Expr::data_type);
+            return self.percentiles(groups, kind, fraction, descending, input, output, execution).await;
         }
         if let Some(order) = self.order.take() {
             self = order.sort(self, groups, &aggregate.order_by, execution).await?;
@@ -866,7 +887,7 @@ impl CollectionVectors {
         selected.collect_lists(offsets, valid, output, memory)
     }
 
-    async fn percentiles(self, groups: usize, kind: PercentileKind, fraction: f64, descending: bool,
+    async fn percentiles(self, groups: usize, kind: PercentileKind, fraction: f64, descending: bool, input_type: LogicalType,
         output: &rtdb_plan::Field, execution: &Execution) -> Result<(Column, Arc<rtdb_columnar::MemoryReservation>)> {
         use crate::scalar_key::ScalarKey;
         let context = &execution.context;
@@ -885,15 +906,19 @@ impl CollectionVectors {
                 if gather { picks.push(None); } else { values.push(Value::Null); }
                 continue;
             }
-            let key = |(batch, row): (usize, usize)| ScalarKey::read(&self.batches[batch].columns[0], row);
-            let indices = crate::sort::sort_ordinals(rows.len(), context, |left, right| {
-                let (left, right) = if descending { (rows[right], rows[left]) } else { (rows[left], rows[right]) };
-                if let (Some(left), Some(right)) = (key(left), key(right))
-                    && let Some(order) = left.ordered_compare(right) { return Ok(order); }
-                rtdb_expr::ordered_compare_in_timezone(read(left)?.as_ref(), read(right)?.as_ref(), false, &context.timezone)
-            })?;
             let (low, high, weight) = percentile_ranks(kind, fraction, rows.len() as i32)?;
-            let lower = rows[indices.values[low as usize]];
+            let (lower, upper) = if rows.len().saturating_mul(std::mem::size_of::<usize>()) > context.options.sort_memory_bytes {
+                self.spilled_ranks(rows, low as u64, high as u64, descending, &input_type, execution).await?
+            } else {
+                let key = |(batch, row): (usize, usize)| ScalarKey::read(&self.batches[batch].columns[0], row);
+                let indices = crate::sort::sort_ordinals(rows.len(), context, |left, right| {
+                    let (left, right) = if descending { (rows[right], rows[left]) } else { (rows[left], rows[right]) };
+                    if let (Some(left), Some(right)) = (key(left), key(right))
+                        && let Some(order) = left.ordered_compare(right) { return Ok(order); }
+                    rtdb_expr::ordered_compare_in_timezone(read(left)?.as_ref(), read(right)?.as_ref(), false, &context.timezone)
+                })?;
+                (rows[indices.values[low as usize]], rows[indices.values[high as usize]])
+            };
             if gather {
                 picks.push(Some(lower));
                 continue;
@@ -909,7 +934,7 @@ impl CollectionVectors {
                 if low == high {
                     Value::F64(lower)
                 } else {
-                    let upper = read(rows[indices.values[high as usize]])?;
+                    let upper = read(upper)?;
                     let upper = number(upper.as_ref()).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))?;
                     Value::F64(lower + weight * (upper - lower))
                 }
@@ -921,9 +946,41 @@ impl CollectionVectors {
         if gather {
             return crate::columnar::gather_nullable_column(|batch| &self.batches[batch], &picks, 0, memory);
         }
-        if let Some(column) = crate::columnar::scalar_result(&values, memory)? { return Ok(column); }
-        Ok((Column::Values(values), reservation))
+        crate::columnar::pack_evaluated_column(&values, memory)
     }
+
+    async fn spilled_ranks(&self, rows: &[(usize, usize)], low: u64, high: u64, descending: bool, ty: &LogicalType,
+        execution: &Execution) -> Result<((usize, usize), (usize, usize))> {
+        use crate::sort::batches::BatchSort;
+        use rtdb_plan::SortExpr;
+
+        let context = &execution.context;
+        let mut binder = Binder::default();
+        let key = binder.field("value", None, ty.clone())?;
+        let ordinal = binder.field("position", None, LogicalType::Scalar(ScalarType::I64))?;
+        let schema = Schema::new(vec![key.clone(), ordinal])?;
+        let mut batch = ColumnBatch::take_rows_with_custody(&self.batches, rows, &[0], true, &context.memory)?;
+        let (column, charge) = crate::columnar::ordinal_column(batch.len, 0, "position", context)?;
+        batch.append_column(column, charge, &context.memory)?;
+        let input = crate::columnar::single_batch(Some(batch), Arc::clone(context));
+        let order = vec![SortExpr { expr: key.expression(), descending, nulls_first: false }];
+        let mut sorted = BatchSort::new(input, schema, order, execution.clone(), self.projected, low, high + 1)?;
+        let mut first = None;
+        let mut last = None;
+        while let Some(batch) = sorted.next_batch().await? {
+            for row in 0..batch.len {
+                let Value::I64(ordinal) = batch.columns[1].value(row)? else {
+                    return Err(invalid("percentile-state", "Sorted percentile position is absent"));
+                };
+                let value = rows.get(ordinal as usize).copied()
+                    .ok_or_else(|| invalid("percentile-state", "Sorted percentile position is outside its group"))?;
+                first.get_or_insert(value);
+                last = Some(value);
+            }
+        }
+        first.zip(last).ok_or_else(|| invalid("percentile-state", "Sorted percentile has no ranks"))
+    }
+
 }
 
 struct CollectionOrder {
@@ -934,7 +991,7 @@ struct CollectionOrder {
 
 impl CollectionOrder {
     fn new(aggregate: &AggregateExpr, input: &Schema) -> Result<Option<Self>> {
-        if aggregate.order_by.is_empty() { return Ok(None); }
+        if aggregate.order_by.is_empty() || aggregate.function != AggregateFunction::ArrayAgg { return Ok(None); }
         let argument = aggregate.argument.as_ref().ok_or_else(|| invalid("aggregate-state", "Ordered aggregate argument is absent"))?;
         let argument = argument_position(argument, input)?;
         let mut positions = vec![argument];
@@ -1021,6 +1078,31 @@ struct CollectedRows(std::collections::VecDeque<OwnedRow>);
 impl RowCursor for CollectedRows {
     async fn next(&mut self) -> Result<Option<OwnedRow>> { Ok(self.0.pop_front()) }
 }
+pub(crate) fn project_group_keys(
+    input: crate::columnar::BoxBatchCursor, schema: Schema, groups: &[NamedExpr], execution: &Execution,
+) -> Result<(crate::columnar::BoxBatchCursor, Schema, Vec<NamedExpr>)> {
+    use rtdb_plan::Expr;
+
+    let mut fields = schema.fields().to_vec();
+    let mut expressions = fields.iter().map(rtdb_plan::Field::expression).collect::<Vec<_>>();
+    let mut binder = Binder::after(&schema)?;
+    let scope = execution.scope()?;
+    let mut project = |expression: &mut Expr| -> Result<()> {
+        if matches!(expression, Expr::Column { .. }) { return Ok(()); }
+        let ty = execution.expression_type(&scope, expression, &schema)?;
+        let field = binder.field("_aggregate_input", None, ty)?;
+        expressions.push(std::mem::replace(expression, field.expression()));
+        fields.push(field);
+        Ok(())
+    };
+    let mut groups = groups.to_vec();
+    for group in &mut groups { project(&mut group.expr)?; }
+    if fields.len() == schema.len() { return Ok((input, schema, groups)); }
+    let output = Schema::new(fields)?;
+    let input = crate::columnar::BatchExpressions::new(input, schema, expressions, execution.clone()).validating_input(true);
+    Ok((Box::new(input), output, groups))
+}
+
 fn argument_position(argument: &rtdb_plan::Expr,schema: &Schema) -> Result<usize> {
     match argument { rtdb_plan::Expr::Column { id,.. } => schema.position(*id).ok_or_else(||invalid("aggregate-column","Aggregate argument column is absent")),_ => Err(invalid("aggregate-column","Aggregate argument must be projected before aggregation")) }
 }

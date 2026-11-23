@@ -207,8 +207,10 @@ entity StagedTx {
 entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
     -- Staging retains the completed rows and their schema.
+    -- Ordinary document operations and SQL put mutations stage document vectors with the event headers for their selected positions.
     -- Staging copies compatible Arrow document columns from their input arrays when combining writes in transaction order.
     -- Native SQL puts can stage scalar document columns directly from the mutation query batch.
+    -- A create-only insert checks each requested interval against the transaction snapshot before staging that document from its Arrow vector.
     -- Staging views retain shared Arrow source allocations while exposing only the buffer spans they use.
     -- When memory admits the copy, a put with a large shared source allocation copies its selected cells into compact Arrow buffers.
     -- A staged put preserves its declared column types, including columns with only null cells.

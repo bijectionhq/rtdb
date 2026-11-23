@@ -4948,6 +4948,8 @@ dependencies = [
 name = "rtdb-pg-source"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "bigdecimal",
  "bytes",

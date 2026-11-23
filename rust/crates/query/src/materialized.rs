@@ -2,14 +2,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{MaterializedBinding, Schema};
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Anomaly, Result};
 use tokio::sync::Mutex;
 use crate::{
     QueryContext,
     columnar::{BatchCursor, BatchRows, BoxBatchCursor, ColumnBatch, poll_nested_batch},
     invalid,
-    pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor},
-    spill::{SpillFile, SpillReader, SpillWriter},
+    pages::{BoxPageCursor, OwnedPage, PageCursor},
+    spill::{SpillFile, SpillReader},
 };
 
 pub(crate) struct BindingScope {
@@ -17,40 +17,28 @@ pub(crate) struct BindingScope {
 }
 impl BindingScope {
     pub fn new(definition: Arc<MaterializedBinding>, input: BoxPageCursor, parent: Option<Arc<Self>>, context: Arc<QueryContext>) -> Result<Arc<Self>> {
-        Self::with_input(definition, Input::Rows(input), parent, context)
+        let schema = definition.relation.schema().clone();
+        let input = crate::columnar::batches_from_pages(input, schema.len(), Arc::clone(&context.memory));
+        Self::columns(definition, input, schema, parent, context)
     }
 
     pub fn columns(definition: Arc<MaterializedBinding>, input: BoxBatchCursor, schema: Schema, parent: Option<Arc<Self>>, context: Arc<QueryContext>) -> Result<Arc<Self>> {
-        Self::with_input(definition, Input::Columns { input, schema }, parent, context)
-    }
-
-    fn with_input(definition: Arc<MaterializedBinding>, input: Input, parent: Option<Arc<Self>>, context: Arc<QueryContext>) -> Result<Arc<Self>> {
         let reservation = context.memory.reserve(4096)?;
-        Ok(Arc::new(Self { binding: Arc::new(ReplayBinding { definition, state: Mutex::new(State::Unopened(input)), context, _reservation: reservation }), parent }))
+        Ok(Arc::new(Self { binding: Arc::new(ReplayBinding {
+            definition, state: Mutex::new(State::Unopened { input, schema }), context, _reservation: reservation,
+        }), parent }))
     }
 
     pub async fn open(&self, definition: &MaterializedBinding) -> Result<BoxPageCursor> {
         let binding = self.find(definition)?;
-        let context = &binding.context;
-        match binding.replay().await? {
-            Replay::Rows(file) => Ok(Box::new(Reference { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context) })),
-            Replay::Columns(file) => {
-                let batches = Box::new(ColumnReference::new(&file, context, definition.relation.schema().len())?);
-                Ok(Box::new(BatchRows::new(batches, Arc::clone(&context.memory))))
-            }
-        }
+        let batches = self.open_columns(definition).await?;
+        Ok(Box::new(BatchRows::new(batches, Arc::clone(&binding.context.memory))))
     }
 
     pub async fn open_columns(&self, definition: &MaterializedBinding) -> Result<BoxBatchCursor> {
         let binding = self.find(definition)?;
-        let context = &binding.context;
-        match binding.replay().await? {
-            Replay::Columns(file) => Ok(Box::new(ColumnReference::new(&file, context, definition.relation.schema().len())?)),
-            Replay::Rows(file) => {
-                let pages = Box::new(Reference { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context) });
-                Ok(crate::columnar::batches_from_pages(pages, definition.relation.schema().len(), Arc::clone(&context.memory)))
-            }
-        }
+        let file = binding.replay().await?;
+        Ok(Box::new(ColumnReference::new(&file, &binding.context, definition.relation.schema().len())?))
     }
 
     fn find(&self, definition: &MaterializedBinding) -> Result<&ReplayBinding> {
@@ -66,106 +54,39 @@ impl BindingScope {
     }
 }
 
-enum Input {
-    Rows(BoxPageCursor),
-    Columns { input: BoxBatchCursor, schema: Schema },
+enum State {
+    Unopened { input: BoxBatchCursor, schema: Schema },
+    Ready(Arc<SpillFile>),
+    Failed(Anomaly),
 }
-
-#[derive(Clone)]
-enum Replay { Rows(Arc<SpillFile>), Columns(Arc<SpillFile>) }
-
-enum State { Unopened(Input), Ready(Replay), Failed(Anomaly) }
 struct ReplayBinding {
     definition: Arc<MaterializedBinding>, state: Mutex<State>, context: Arc<QueryContext>, _reservation: Arc<MemoryReservation>,
 }
 impl ReplayBinding {
-    async fn replay(&self) -> Result<Replay> {
+    async fn replay(&self) -> Result<Arc<SpillFile>> {
         self.context.check_cancelled()?;
         let mut state = self.state.lock().await;
-        if matches!(&*state, State::Unopened(_)) {
-            let State::Unopened(input) = std::mem::replace(&mut *state, State::Failed(crate::context::cancelled())) else { unreachable!() };
-            let result = self.write(input).await;
+        if matches!(&*state, State::Unopened { .. }) {
+            let State::Unopened { input, schema } = std::mem::replace(&mut *state, State::Failed(crate::context::cancelled())) else { unreachable!() };
+            let result = self.write(input, schema).await;
             *state = match result { Ok(file) => State::Ready(file), Err(error) => State::Failed(error) };
         }
         match &*state {
-            State::Ready(file) => Ok(file.clone()),
+            State::Ready(file) => Ok(Arc::clone(file)),
             State::Failed(error) => Err(error.clone()),
-            State::Unopened(_) => unreachable!(),
+            State::Unopened { .. } => unreachable!(),
         }
     }
 
-    async fn write(&self, input: Input) -> Result<Replay> {
+    async fn write(&self, mut input: BoxBatchCursor, schema: Schema) -> Result<Arc<SpillFile>> {
         let memory = &self.context.memory;
         let mut writer = self.context.spill.create()?;
-        match input {
-            Input::Rows(mut input) => {
-                while let Some(page) = input.next_page().await? {
-                    write_rows(&mut writer, page, &self.context)?;
-                }
-                writer.finish().map(Replay::Rows)
-            }
-            Input::Columns { mut input, schema } => {
-                let schema_bytes = crate::runtime_schema::schema_bound(&schema)?;
-                while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
-                    self.context.check_cancelled()?;
-                    batch.validate_readable(&self.context)?;
-                    match batch.spill_record(&schema, memory) {
-                        Ok(Some(record)) => {
-                            let start = writer.position()?;
-                            let written = writer.write(&[Value::I64(-1)], memory)
-                                .and_then(|()| writer.write_arrow(&record, schema_bytes, memory, "materialized-spill-arrow"));
-                            match written {
-                                Ok(()) => continue,
-                                Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => {
-                                    writer.discard_from(start)?;
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        Ok(None) => {},
-                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {},
-                        Err(error) => return Err(error),
-                    }
-                    write_rows(&mut writer, batch.rows(memory)?, &self.context)?;
-                }
-                writer.finish().map(Replay::Columns)
-            }
+        while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
+            self.context.check_cancelled()?;
+            batch.validate_readable(&self.context)?;
+            writer.write_columns(&batch, &schema, memory)?;
         }
-    }
-}
-fn write_rows(writer: &mut SpillWriter, mut page: OwnedPage, context: &QueryContext) -> Result<()> {
-    context.check_cancelled()?;
-    let count = i64::try_from(page.len()).map_err(|_| invalid("materialized-page", "Materialized page exceeds signed row count"))?;
-    writer.write(&[Value::I64(count)], &context.memory)?;
-    while let Some(row) = page.next() {
-        context.check_cancelled()?;
-        writer.write(&row.values, &context.memory)?;
-    }
-    Ok(())
-}
-
-fn read_rows(reader: &mut SpillReader, count: i64, context: &QueryContext) -> Result<OwnedPage> {
-    let count = usize::try_from(count).map_err(|_| invalid("materialized-page", "Invalid materialized page row count"))?;
-    let mut page = PageBuilder::new(count, &context.memory)?;
-    for _ in 0..count {
-        context.check_cancelled()?;
-        page.push(reader.next()?.ok_or_else(|| invalid("materialized-page", "Materialized page ended before its declared row count"))?)?;
-    }
-    Ok(page.finish())
-}
-
-fn page_header(reader: &mut SpillReader) -> Result<Option<i64>> {
-    let Some(header) = reader.next()? else { return Ok(None); };
-    let [Value::I64(count)] = header.values.as_slice() else { return Err(invalid("materialized-page", "Invalid materialized page header")); };
-    Ok(Some(*count))
-}
-
-struct Reference { reader: SpillReader, context: Arc<QueryContext> }
-#[async_trait]
-impl PageCursor for Reference {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        self.context.check_cancelled()?;
-        page_header(&mut self.reader)?.map(|count| read_rows(&mut self.reader, count, &self.context)).transpose()
+        writer.finish()
     }
 }
 
@@ -181,21 +102,7 @@ impl ColumnReference {
 impl BatchCursor for ColumnReference {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         self.context.check_cancelled()?;
-        match page_header(&mut self.reader)? {
-            Some(-1) => {
-                let batch = self.reader.read_arrow(true, "materialized-spill-arrow")?
-                    .ok_or_else(|| invalid("materialized-page", "Materialized Arrow page is absent"))?;
-                ColumnBatch::from_owned(batch).map(Some)
-            }
-            Some(0) => {
-                ColumnBatch::empty_with_width(self.width, &self.context.memory).map(Some)
-            }
-            Some(count) => {
-                let page = read_rows(&mut self.reader, count, &self.context)?;
-                ColumnBatch::from_page(&page, &self.context.memory).map(Some)
-            }
-            None => Ok(None),
-        }
+        self.reader.read_columns(self.width)
     }
 }
 
@@ -225,7 +132,7 @@ mod tests {
     use rtdb_types::{LogicalType, ScalarType, Timestamp, Value};
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
-    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, cursor::OwnedRow};
+    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, cursor::OwnedRow, pages::PageBuilder};
 
     struct GateInput { emitted: bool, started: Option<oneshot::Sender<()>>, release: oneshot::Receiver<()>, closed: Arc<AtomicBool>, memory: Arc<MemoryBudget> }
     #[async_trait]
@@ -397,10 +304,10 @@ mod tests {
     #[tokio::test]
     async fn incomplete_framed_spill_is_rejected_without_retaining_output_rows() {
         let context = context(1);let mut writer = context.spill.create().unwrap();
-        writer.write(&[Value::I64(2)],&context.memory).unwrap();writer.write(&[Value::I64(1)],&context.memory).unwrap();
+        writer.write_frame(&[1]).unwrap();
         let file = writer.finish().unwrap();
-        let mut cursor = Reference { reader: file.reader(Arc::clone(&context.memory)).unwrap(),context: Arc::clone(&context) };
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/materialized-page");
+        let mut cursor = ColumnReference::new(&file, &context, 1).unwrap();
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, "rtdb.query/invalid-spill");
         assert_eq!(context.memory.used_bytes(),0);drop(cursor);drop(file);assert_eq!(context.spill_bytes(),0);
     }
 

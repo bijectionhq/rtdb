@@ -6,7 +6,7 @@ use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeS
 use rtdb_plan::ControlStatement;
 use rtdb_query::QueryCursor;
 use rtdb_sql::{AdmittedControl, parse_admitted_control_in};
-use rtdb_tx::{ArrowDocuments, Documents, SqlArguments, TxOp};
+use rtdb_tx::{Documents, SqlArguments, TxOp};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
 use rtdb_types::StructFields;
@@ -214,17 +214,14 @@ impl StatementHandle {
                 Source::Bulk { table, .. } => {
                     let Some(bound) = state.bound.take() else { return Ok(0); };
                     let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
-                    if let Some(page) = bound.arguments.single_arrow_page() {
-                        match ArrowDocuments::from_ingest_batch(page, self.session.region.memory()) {
-                            Ok(Some(documents)) => {
-                                let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
-                                token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
-                                return Ok(count);
-                            }
-                            Ok(None) => {}
-                            Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
-                            Err(error) => return Err(error),
+                    match bound.arguments.ingest_named_documents(&bound.names, self.session.region.memory()) {
+                        Ok(Some(documents)) => {
+                            let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
+                            token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
+                            return Ok(count);
                         }
+                        Ok(None) => {}
+                        Err(error) => return Err(error),
                     }
                     let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;
                     let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| {

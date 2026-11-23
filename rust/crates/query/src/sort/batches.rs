@@ -9,7 +9,6 @@ use rtdb_types::{ObjectSort, Result, Value};
 use crate::{
     columnar::{BatchCursor, BoxBatchCursor, ColumnBatch},
     context::Execution,
-    cursor::column_batch,
     invalid,
     spill::{SpillFile, SpillReader, SpillWriter},
 };
@@ -118,12 +117,12 @@ impl BatchSort {
                     &mut block,
                     Block::new(&context.memory, self.native.is_some())?,
                 );
-                self.used_native |= full.keys.is_none();
+                self.used_native |= full.native;
                 runs.push(
                     Self::spill(
                         &self.plan,
                         &self.projection,
-                        full.order(&self.plan, self.key_columns.len(), self.native.as_ref())?,
+                        full.order(&self.plan, &self.key_columns, self.native.as_ref(), self.projected)?,
                     )
                     .await?,
                 )?;
@@ -147,9 +146,10 @@ impl BatchSort {
         if !block.positions.is_empty() || !runs.files.is_empty() {
             key_types.validate()?;
         }
-        self.used_native |= block.keys.is_none() && !block.positions.is_empty();
-        let tail = block.order(&self.plan, self.key_columns.len(), self.native.as_ref())?;
-        if runs.files.is_empty() {
+        self.used_native |= block.native && !block.positions.is_empty();
+        let spill_tail = !block.positions.is_empty() && block.charged() > context.options.sort_memory_bytes;
+        let tail = block.order(&self.plan, &self.key_columns, self.native.as_ref(), self.projected)?;
+        if runs.files.is_empty() && !spill_tail {
             return Ok(Sorted::Memory(tail));
         }
         if tail.order.len() != 0 {
@@ -302,8 +302,8 @@ impl BatchCursor for BatchSort {
             let batch = match output {
                 Sorted::Memory(run) => run.next(&self.plan, &self.projection, self.semantic_page_rows.unwrap_or(context.options.batch_rows))?,
                 Sorted::Spill(reader) => match self.semantic_page_rows {
-                    Some(rows) => read_semantic_page(reader, &mut self.spill_pending, rows, context)?,
-                    None => read_batch(reader)?,
+                    Some(rows) => read_semantic_page(reader, &mut self.spill_pending, rows, self.projection.len(), context)?,
+                    None => reader.read_columns(self.projection.len())?,
                 },
             };
             let Some(batch) = batch else {
@@ -346,7 +346,7 @@ enum Sorted {
 struct Block {
     batches: Vec<ColumnBatch>,
     positions: Vec<(usize, usize)>,
-    keys: Option<Vec<Value>>,
+    native: bool,
     payload_bytes: usize,
     scratch: Arc<MemoryReservation>,
 }
@@ -356,7 +356,7 @@ impl Block {
         Ok(Self {
             batches: vec![],
             positions: vec![],
-            keys: (!native).then(Vec::new),
+            native,
             payload_bytes: 0,
             scratch: memory.reserve(256)?,
         })
@@ -383,16 +383,13 @@ impl Block {
             .ok_or_else(size_error)?;
         let scratch = Arc::get_mut(&mut self.scratch).expect("sort block owns its reservation");
         scratch.grow_to(scratch.bytes().checked_add(base).ok_or_else(size_error)?)?;
-        if self.keys.is_none() && !native.is_some_and(|native| native.accepts(&batch)) {
-            let mut keys = Vec::new();
+        if self.native && !native.is_some_and(|native| native.accepts(&batch)) {
             for earlier in &self.batches {
-                append_scalar_keys(&mut keys, scratch, earlier, columns, projected, types, plan)?;
+                observe_scalar_keys(earlier, columns, projected, types, plan)?;
             }
-            self.keys = Some(keys);
+            self.native = false;
         }
-        if let Some(keys) = &mut self.keys {
-            append_scalar_keys(keys, scratch, &batch, columns, projected, types, plan)?;
-        }
+        if !self.native { observe_scalar_keys(&batch, columns, projected, types, plan)?; }
         self.positions.reserve_exact(batch.len);
         let source = self.batches.len();
         self.positions
@@ -405,8 +402,9 @@ impl Block {
     fn order(
         self,
         plan: &SortPlan,
-        key_width: usize,
+        key_columns: &[usize],
         native: Option<&NativeOrder>,
+        projected: bool,
     ) -> Result<MemoryRun> {
         let context = &plan.execution.context;
         let algorithm = context.options.object_sort;
@@ -419,21 +417,16 @@ impl Block {
         let mut order: Vec<_> = (0..len).collect();
         let compare = |left, right| {
             context.check_cancelled()?;
-            if let Some(keys) = &self.keys {
-                let key = |index| &keys[index * key_width..(index + 1) * key_width];
-                return plan.compare(key(left), key(right));
-            }
             let (left, left_row) = self.positions[left];
             let (right, right_row) = self.positions[right];
-            Ok(native
-                .expect("only an admitted sort can borrow its keys")
-                .compare(
-                    &self.batches[left],
-                    left_row,
-                    &self.batches[right],
-                    right_row,
-                    &plan.order,
-                ))
+            let (left, right) = (&self.batches[left], &self.batches[right]);
+            if !self.native {
+                let left = scalar_key(left, left_row, plan, key_columns, projected)?;
+                let right = scalar_key(right, right_row, plan, key_columns, projected)?;
+                return plan.compare(&left.values, &right.values);
+            }
+            Ok(native.expect("only an admitted sort can borrow its keys")
+                .compare(left, left_row, right, right_row, &plan.order))
         };
         match algorithm {
             ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
@@ -443,11 +436,9 @@ impl Block {
         let Self {
             batches,
             positions,
-            keys,
             mut scratch,
             ..
         } = self;
-        drop(keys);
         let bytes = positions
             .capacity()
             .saturating_mul(size_of::<(usize, usize)>())
@@ -469,38 +460,13 @@ impl Block {
     }
 }
 
-fn append_scalar_keys(
-    keys: &mut Vec<Value>,
-    scratch: &mut MemoryReservation,
-    batch: &ColumnBatch,
-    columns: &[usize],
-    projected: bool,
-    types: &mut KeyTypes,
-    plan: &SortPlan,
+fn observe_scalar_keys(
+    batch: &ColumnBatch, columns: &[usize], projected: bool, types: &mut KeyTypes, plan: &SortPlan,
 ) -> Result<()> {
-    let bound = (0..batch.len).try_fold(0usize, |bound, row| {
-        bound
-            .checked_add(key_bound(batch, columns, row)?)
-            .ok_or_else(size_error)
-    })?;
-    scratch.grow_to(scratch.bytes().checked_add(bound).ok_or_else(size_error)?)?;
-    keys.reserve_exact(
-        batch
-            .len
-            .checked_mul(columns.len())
-            .ok_or_else(size_error)?,
-    );
     for row in 0..batch.len {
         plan.execution.context.check_cancelled_at(row)?;
-        let start = keys.len();
-        for &column in columns {
-            let mut value = batch.columns[column].value(row)?;
-            if projected {
-                value.admit_expression_dates()?;
-            }
-            keys.push(value);
-        }
-        types.observe(&keys[start..], plan)?;
+        let key = scalar_key(batch, row, plan, columns, projected)?;
+        types.observe(&key.values, plan)?;
     }
     Ok(())
 }
@@ -634,7 +600,7 @@ impl Run {
         self.batch = None;
         self.key = None;
         self.row = 0;
-        self.batch = read_batch(&mut self.reader)?;
+        self.batch = self.reader.read_columns(plan.schema.len())?;
         self.native = self
             .batch
             .as_ref()
@@ -646,7 +612,7 @@ impl Run {
         if !self.native
             && let Some(batch) = &self.batch
         {
-            self.key = Some(scalar_key(batch, self.row, plan, columns)?);
+            self.key = Some(scalar_key(batch, self.row, plan, columns, false)?);
         }
         Ok(())
     }
@@ -666,12 +632,12 @@ impl Run {
                 .compare(left, self.row, right, other.row, &plan.order));
         }
         let left_key = if self.native {
-            Some(scalar_key(left, self.row, plan, columns)?)
+            Some(scalar_key(left, self.row, plan, columns, false)?)
         } else {
             None
         };
         let right_key = if other.native {
-            Some(scalar_key(right, other.row, plan, columns)?)
+            Some(scalar_key(right, other.row, plan, columns, false)?)
         } else {
             None
         };
@@ -689,7 +655,7 @@ impl Run {
     }
 }
 
-fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize]) -> Result<Key> {
+fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize], projected: bool) -> Result<Key> {
     let reservation = plan
         .execution
         .context
@@ -697,7 +663,7 @@ fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize
         .reserve(256 + key_bound(batch, columns, row)?)?;
     let values = columns
         .iter()
-        .map(|&column| batch.columns[column].value(row))
+        .map(|&column| batch.columns[column].expression_value(row, projected, None))
         .collect::<Result<Vec<_>>>()?;
     Ok(Key {
         values,
@@ -706,24 +672,34 @@ fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize
 }
 
 fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) -> Result<()> {
-    let memory = &plan.execution.context.memory;
-    let schema = crate::runtime_schema::schema_bound(&plan.schema)?;
-    match batch.spill_record(&plan.schema, memory) {
-        Ok(Some(raw)) => match writer.write_arrow(&raw, schema, memory, "sort-spill-arrow") {
-            Ok(()) => return Ok(()),
-            Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => {},
-            Err(error) => return Err(error),
-        },
-        Ok(None) => {},
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {},
-        Err(error) => return Err(error),
+    let mut spans = vec![0..batch.len];
+    let context = &plan.execution.context;
+    let memory = &context.memory;
+    let positions = (0..plan.schema.len()).collect::<Vec<_>>();
+    while let Some(span) = spans.pop() {
+        let start = writer.position()?;
+        let result = if span.len() == batch.len {
+            writer.write_columns(&batch, &plan.schema, memory)
+        } else {
+            let bytes = span.len().checked_mul(size_of::<(usize, usize)>()).ok_or_else(size_error)?;
+            let _picks = memory.reserve(bytes)?;
+            let picks = span.clone().map(|row| (0, row)).collect::<Vec<_>>();
+            let slice = ColumnBatch::take_rows_with_custody(&[&batch], &picks, &positions, true, memory)?;
+            writer.write_columns(&slice, &plan.schema, memory)
+        };
+        if let Err(error) = result {
+            if error.code != "rtdb/memory-budget-exceeded" || span.len() < 2 { return Err(error); }
+            writer.discard_from(start)?;
+            let mid = span.start + span.len() / 2;
+            spans.push(mid..span.end);
+            spans.push(span.start..mid);
+        }
     }
-    let owned = column_batch(&plan.schema, memory, batch)?;
-    writer.write_arrow(&owned, schema, memory, "sort-spill-arrow")
+    Ok(())
 }
 
 fn read_semantic_page(
-    reader: &mut SpillReader, pending: &mut Option<(Arc<ColumnBatch>, usize)>, limit: usize, context: &crate::QueryContext,
+    reader: &mut SpillReader, pending: &mut Option<(Arc<ColumnBatch>, usize)>, limit: usize, width: usize, context: &crate::QueryContext,
 ) -> Result<Option<ColumnBatch>> {
     let mut sources = Vec::new();
     let mut spans = Vec::new();
@@ -734,7 +710,7 @@ fn read_semantic_page(
         let (batch, offset) = match pending.take() {
             Some(next) => next,
             None => {
-                let Some(batch) = read_batch(reader)? else { break; };
+                let Some(batch) = reader.read_columns(width)? else { break; };
                 if rows == 0 && batch.len == limit { return Ok(Some(batch)); }
                 (Arc::new(batch), 0)
             }
@@ -748,8 +724,4 @@ fn read_semantic_page(
         rows += count;
     }
     ColumnBatch::take_ranges(sources, &spans, rows, &context.memory)
-}
-
-fn read_batch(reader: &mut SpillReader) -> Result<Option<ColumnBatch>> {
-    reader.read_arrow(false, "sort-spill-arrow")?.map(ColumnBatch::from_owned).transpose()
 }

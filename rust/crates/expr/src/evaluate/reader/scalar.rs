@@ -256,6 +256,9 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 ready(calls::subscript(input.demand().await?,index.demand().await?,frame)?.await?,frame)
             }
             Expr::Field { expr: input,name,.. } => {
+                if let Some(cell) = frame.arrow_input(expr) {
+                    return ready(box_cell(from_arrow(cell, frame)?)?, frame);
+                }
                 let input = prepare(input,frame)?.await?;
                 if rtdb_plan::field_type(&input.ty,name) == LogicalType::Null { return nil(frame); }
                 deferred(ty,async move {

@@ -46,11 +46,6 @@ impl SelectedColumn {
         self.sources.iter().flatten().map(|(array, field, logical, _)| (array.as_ref(), field.as_ref(), logical.as_ref()))
     }
 
-    pub(crate) fn source_cell(&self, row: usize) -> Option<(&dyn Array, usize)> {
-        let (source, offset) = self.cells[row];
-        self.sources[source].as_ref().map(|(array, ..)| (array.as_ref(), offset))
-    }
-
     fn select(self, mask: &[bool], selected: usize) -> Self {
         let mut cells = Vec::with_capacity(selected);
         cells.extend(self.cells.iter().zip(mask).filter_map(|(&cell, &keep)| keep.then_some(cell)));
@@ -65,6 +60,78 @@ impl SelectedColumn {
                 *boundary = true;
             }
         }
+    }
+
+    fn list_values(&self, name: &str, memory: &Arc<MemoryBudget>) -> Result<(ArrayRef, Arc<ArrowField>, Arc<MemoryReservation>)> {
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::UnionFields;
+
+        type Leg = (ArrayRef, Arc<ArrowField>, Arc<MemoryReservation>);
+
+        fn union(name: &str, mut legs: Vec<Leg>, memory: &Arc<MemoryBudget>) -> Result<Leg> {
+            if legs.len() == 1 { return Ok(legs.into_iter().next().unwrap()); }
+            let rows = legs.iter().try_fold(0usize, |rows, (array, _, _)| rows.checked_add(array.len()).ok_or_else(size_error))?;
+            let metadata = legs.iter().try_fold(rows.checked_mul(16).ok_or_else(size_error)?, |bytes, (_, field, _)| {
+                bytes.checked_add(field.size().checked_mul(4).ok_or_else(size_error)?).ok_or_else(size_error)
+            })?;
+            let mut reservation = memory.reserve(metadata.checked_add(4096).ok_or_else(size_error)?)?;
+            let mut tags = Vec::with_capacity(rows);
+            let mut offsets = Vec::with_capacity(rows);
+            let mut fields = Vec::with_capacity(legs.len());
+            let mut children = Vec::with_capacity(legs.len());
+            for (tag, (array, field, _)) in legs.iter().enumerate() {
+                tags.extend(std::iter::repeat_n(tag as i8, array.len()));
+                offsets.extend(0..i32::try_from(array.len()).map_err(|_| size_error())?);
+                fields.push(Arc::new(field.as_ref().clone().with_name(format!("layout-{tag}"))));
+                children.push(Arc::clone(array));
+            }
+            let fields = UnionFields::try_new((0..fields.len()).map(|tag| tag as i8), fields)
+                .map_err(|error| invalid("column-list", error))?;
+            let array: ArrayRef = Arc::new(UnionArray::try_new(fields, ScalarBuffer::from(tags), Some(ScalarBuffer::from(offsets)), children)
+                .map_err(|error| invalid("column-list", error))?);
+            let field = Arc::new(ArrowField::new(name, array.data_type().clone(), array.is_nullable()));
+            let retained = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
+            let lease = Arc::get_mut(&mut reservation).expect("A list union owns its reservation");
+            for (_, _, charge) in &mut legs {
+                lease.absorb(Arc::get_mut(charge).expect("A list union owns each fragment reservation"))?;
+            }
+            if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
+            Ok((array, field, reservation))
+        }
+
+        let _inventory = memory.reserve(self.cells.len().checked_mul(96).ok_or_else(size_error)?)?;
+        let mut boundaries = vec![false; self.cells.len()];
+        self.fragment_boundaries(&mut boundaries);
+        let ends = boundaries.into_iter().enumerate().filter_map(|(index, boundary)| boundary.then_some(index))
+            .chain(std::iter::once(self.cells.len()));
+        let mut legs = Vec::new();
+        let mut start = 0;
+        for end in ends {
+            let ((array, field, _), charge) = self.fragment_vector(start..end, memory)?;
+            let logical = rtdb_columnar::from_field(&field)?;
+            let unencoded = logical.unencoded();
+            let leg = if logical != unencoded {
+                let target = rtdb_columnar::to_field(field.name(), &unencoded)?;
+                let bound = rtdb_columnar::arrow_relayout_bound(array.as_ref(), &field, &target)?;
+                let _relayout = memory.reserve(bound)?;
+                let (field, array) = rtdb_columnar::relayout_arrow_column(array, &field, &target)?;
+                let retained = memory.reserve(array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?)?;
+                (array, Arc::new(field), retained)
+            } else {
+                (array, field, charge)
+            };
+            legs.push(leg);
+            start = end;
+        }
+        const FAN_OUT: usize = 128;
+        while legs.len() > FAN_OUT {
+            let mut children = legs.into_iter();
+            legs = Vec::new();
+            while children.len() != 0 {
+                legs.push(union(name, children.by_ref().take(FAN_OUT).collect(), memory)?);
+            }
+        }
+        union(name, legs, memory)
     }
 
     pub(crate) fn fragment_vector(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>)
@@ -515,31 +582,54 @@ impl ColumnBatch {
             Err(error) if error.code == "rtdb/memory-budget-exceeded" => None,
             Err(error) => return Err(error),
         } };
-        if self.len == 0 || record.is_some() {
-            let (child, item, mut reservation) = match record {
-                Some((record, reservation)) => (Arc::clone(record.column(0)), Arc::clone(&record.schema_ref().fields()[0]), reservation),
-                None => (arrow_array::new_empty_array(item.data_type()), Arc::clone(item), memory.reserve(item.size())?),
+        let (child, item, mut reservation) = match record {
+            Some((record, reservation)) => (Arc::clone(record.column(0)), Arc::clone(&record.schema_ref().fields()[0]), reservation),
+            None if self.len == 0 => (arrow_array::new_empty_array(item.data_type()), Arc::clone(item), memory.reserve(item.size())?),
+            None => match &self.columns[0] {
+                Column::Selected(selected) => selected.list_values(item.name(), memory)?,
+                Column::Arrow { array, field, .. } => {
+                    let bytes = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
+                    (Arc::clone(array), Arc::clone(field), memory.reserve(bytes)?)
+                }
+                Column::Values(values) => {
+                    let (column, charge) = pack_evaluated_column(values, memory)?;
+                    match column {
+                        Column::Arrow { array, field, .. } => (array, field, charge),
+                        Column::Selected(selected) => selected.list_values(item.name(), memory)?,
+                        Column::Values(_) => unreachable!("Evaluated cells are in Arrow"),
+                    }
+                }
+            },
+        };
+        let lease = Arc::get_mut(&mut reservation).expect("The list owns its child reservation");
+        let bytes = valid.len().checked_mul(32).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+        let array = ListArray::try_new(item, OffsetBuffer::new(ScalarBuffer::from(offsets)), child, Some(NullBuffer::from(valid)))
+            .map_err(|error| invalid("column-list", error))?;
+        let field = Arc::new(ArrowField::new(physical.name(), array.data_type().clone(), physical.is_nullable() || array.null_count() != 0));
+        let logical = rtdb_columnar::from_field(&field)?;
+        Ok((Column::Arrow { array: Arc::new(array), field, logical: Some(logical) }, reservation))
+    }
+
+    pub(crate) fn pack_evaluated(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bytes = self.columns.len().checked_mul(std::mem::size_of::<Column>() + std::mem::size_of::<Arc<MemoryReservation>>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let reservation = memory.reserve(bytes)?;
+        let mut columns = Vec::with_capacity(self.columns.len());
+        let mut appended = Vec::with_capacity(self.columns.len());
+        for (index, column) in self.columns.iter().enumerate() {
+            let (column, charge) = match column {
+                Column::Arrow { array, field, logical } => {
+                    (Column::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical: logical.clone() },
+                     Arc::clone(self.column_reservation(index)))
+                }
+                Column::Selected(selected) => (Column::Selected(selected.clone()), Arc::clone(self.column_reservation(index))),
+                Column::Values(values) => pack_evaluated_column(values, memory)?,
             };
-            let lease = Arc::get_mut(&mut reservation).expect("The list owns its child reservation");
-            let bytes = valid.len().checked_mul(32).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
-            lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
-            let array = ListArray::try_new(item, OffsetBuffer::new(ScalarBuffer::from(offsets)), child, Some(NullBuffer::from(valid)))
-                .map_err(|error| invalid("column-list", error))?;
-            let field = Arc::new(ArrowField::new(physical.name(), array.data_type().clone(), physical.is_nullable() || array.null_count() != 0));
-            let logical = rtdb_columnar::from_field(&field)?;
-            return Ok((Column::Arrow { array: Arc::new(array), field, logical: Some(logical) }, reservation));
+            columns.push(column);
+            appended.push(charge);
         }
-        let child = &self.columns[0];
-        let base = valid.len().checked_mul(std::mem::size_of::<Value>() + 64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
-        let bound = (0..self.len).try_fold(base, |bytes, row| bytes.checked_add(child.bound(row)?).ok_or_else(size_error))?;
-        let reservation = memory.reserve(bound)?;
-        let values = offsets.windows(2).zip(valid).map(|(range, valid)| {
-            if !valid { return Ok(Value::Null); }
-            (range[0] as usize..range[1] as usize).map(|row| child.value(row).map(|value| {
-                if matches!(value, Value::Undefined) { Value::Null } else { value }
-            })).collect::<Result<_>>().map(Value::List)
-        }).collect::<Result<_>>()?;
-        Ok((Column::Values(values), reservation))
+        Ok(Self { columns, len: self.len, reservation, appended })
     }
 
     pub(crate) fn spill_record(&self, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<Option<rtdb_columnar::OwnedBatch>> {
@@ -561,7 +651,8 @@ impl ColumnBatch {
                     Err(error) => return Err(error),
                 },
                 Column::Values(values) => {
-                    let Some((Column::Arrow { array, field, logical }, scratch)) = scalar_result(values, memory)? else { return Ok(None); };
+                    let (column, scratch) = pack_evaluated_column(values, memory)?;
+                    let Column::Arrow { array, field, logical } = column else { return Ok(None); };
                     ((array, field, logical), Some(scratch))
                 }
             };
@@ -669,12 +760,23 @@ impl ColumnBatch {
                     columns.push(detached);
                     continue;
                 }
-                let bytes = (0..self.len).try_fold(256usize, |bytes, row| {
-                    column.bound(row)?.checked_mul(2).and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
-                })?;
-                lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
-                let values = (0..self.len).map(|row| column.value(row)).collect::<Result<_>>()?;
-                columns.push(Column::Values(values));
+                let _boundaries = memory.reserve(self.len)?;
+                let mut boundaries = vec![false; self.len];
+                selection.fragment_boundaries(&mut boundaries);
+                let ends = boundaries.into_iter().enumerate().filter_map(|(index, boundary)| boundary.then_some(index))
+                    .chain(std::iter::once(self.len));
+                let mut sources = Vec::new();
+                let mut cells = Vec::with_capacity(self.len);
+                let mut start = 0;
+                for end in ends {
+                    let ((array, field, logical), charge) = selection.fragment_vector(start..end, memory)?;
+                    cells.extend((0..end - start).map(|row| (sources.len(), row)));
+                    sources.push(Some((array, field, logical, Some(charge))));
+                    start = end;
+                }
+                let detached = Column::Selected(SelectedColumn::new(sources, Arc::new(cells)));
+                lease.grow_to(lease.bytes().checked_add(detached.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(detached);
             } else {
                 lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
                 columns.push(column.duplicate());
@@ -738,7 +840,8 @@ impl ColumnBatch {
             values.extend(page.rows().iter().map(|row| row.values[position].clone()));
             columns.push(Column::Values(values));
         }
-        Ok(Self { columns, len: page.len(), reservation, appended: Vec::new() })
+        let output = Self { columns, len: page.len(), reservation, appended: Vec::new() };
+        output.pack_evaluated(memory)
     }
 
     pub(crate) fn empty_with_width(width: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -890,8 +993,10 @@ fn gather_column_cells<'a>(
         let values = rows.map(|cell| match cell {
             Some((batch, row)) => source(batch).columns[position].value(row),
             None => Ok(Value::Null),
-        }).collect::<Result<_>>()?;
-        return Ok((Column::Values(values), scratch));
+        }).collect::<Result<Vec<_>>>()?;
+        let packed = pack_evaluated_column(&values, memory)?;
+        drop((values, scratch));
+        return Ok(packed);
     }
     take_arrow_rows(source, rows, count, position, retain_sources, memory)
 }
@@ -1885,7 +1990,13 @@ fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
 fn stable_values(logical: &LogicalType) -> bool {
     match logical {
         LogicalType::Null | LogicalType::Nothing => true,
-        LogicalType::Scalar(scalar) => copyable(scalar) || *scalar == rtdb_types::ScalarType::DateDay,
+        LogicalType::Scalar(scalar) => copyable(scalar) || matches!(scalar,
+            rtdb_types::ScalarType::F16 | rtdb_types::ScalarType::DateDay | rtdb_types::ScalarType::DateMilli
+            | rtdb_types::ScalarType::Decimal { .. } | rtdb_types::ScalarType::Time { .. }
+            | rtdb_types::ScalarType::Duration(_) | rtdb_types::ScalarType::Interval(_)
+            | rtdb_types::ScalarType::IntervalMonthDayMicro | rtdb_types::ScalarType::Keyword
+            | rtdb_types::ScalarType::Transit | rtdb_types::ScalarType::Oid
+            | rtdb_types::ScalarType::RegClass | rtdb_types::ScalarType::RegProc),
         LogicalType::Maybe(ty) => stable_values(ty),
         LogicalType::Struct(fields) => fields.values().all(stable_values),
         LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set | ListKind::Map { .. }, element } => {
@@ -1908,7 +2019,13 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
         }
         (LogicalType::Union(legs), LogicalType::Union(expected)) => {
             let kept = legs.iter().all(|leg| match leg {
-                LogicalType::Scalar(scalar) => copyable(scalar) || *scalar == rtdb_types::ScalarType::DateDay,
+                LogicalType::Scalar(scalar) => copyable(scalar) || matches!(scalar,
+            rtdb_types::ScalarType::F16 | rtdb_types::ScalarType::DateDay | rtdb_types::ScalarType::DateMilli
+            | rtdb_types::ScalarType::Decimal { .. } | rtdb_types::ScalarType::Time { .. }
+            | rtdb_types::ScalarType::Duration(_) | rtdb_types::ScalarType::Interval(_)
+            | rtdb_types::ScalarType::IntervalMonthDayMicro | rtdb_types::ScalarType::Keyword
+            | rtdb_types::ScalarType::Transit | rtdb_types::ScalarType::Oid
+            | rtdb_types::ScalarType::RegClass | rtdb_types::ScalarType::RegProc),
                 LogicalType::Null => true,
                 _ => stable_values(leg) && rtdb_columnar::execution_type(leg) == *leg,
             });
@@ -1940,6 +2057,7 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
 #[async_trait::async_trait]
 pub(crate) trait BatchCursor: Send {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>>;
+    fn skip_complete_pages(&mut self, _rows: u64) -> Result<u64> { Ok(0) }
     fn trace_attributes(&self, _span: &mut dyn rtdb_plan::TraceSpan) {}
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { None }
 }
@@ -1980,7 +2098,49 @@ impl BatchCursor for RetainedBatchState {
         tokio::task::consume_budget().await;
         self.input.next_batch().await
     }
+    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> { self.input.skip_complete_pages(rows) }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+pub(crate) fn coalesce_pages(input: BoxBatchCursor, context: Arc<crate::QueryContext>) -> BoxBatchCursor {
+    Box::new(CoalescingBatches { input, context, seen: 0 })
+}
+
+struct CoalescingBatches { input: BoxBatchCursor, context: Arc<crate::QueryContext>, seen: usize }
+
+#[async_trait::async_trait]
+impl BatchCursor for CoalescingBatches {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        let mut sources = Vec::new();
+        let mut spans = Vec::new();
+        let mut rows = 0usize;
+        let memory = &self.context.memory;
+        let mut inventory = None;
+        loop {
+            self.context.check_cancelled()?;
+            let Some(batch) = poll_nested_batch(self.input.as_mut()).await? else { break; };
+            if self.seen < 100 {
+                self.seen = self.seen.saturating_add(batch.len);
+                return Ok(Some(batch));
+            }
+            if batch.len >= 100 && sources.is_empty() { return Ok(Some(batch)); }
+            if batch.len == 0 { continue; }
+            let bytes = (sources.len() + 1).checked_mul(128).ok_or_else(size_error)?;
+            let lease = match &mut inventory {
+                Some(reservation) => reservation,
+                slot => slot.insert(memory.reserve(0)?),
+            };
+            Arc::get_mut(lease).expect("Coalescer owns its batch inventory").grow_to(bytes)?;
+            spans.push(0..batch.len);
+            rows = rows.checked_add(batch.len).ok_or_else(size_error)?;
+            sources.push(Arc::new(batch));
+            if rows >= 100 { break; }
+        }
+        ColumnBatch::take_ranges(sources, &spans, rows, memory)
+    }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
@@ -2091,46 +2251,46 @@ pub(crate) async fn predicate_mask(
     let metadata = execution.scope()?;
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
     let scope = execution.scope()?;
-    let _slots = execution.context.memory.reserve(256 + schema.len().saturating_mul(std::mem::size_of::<Value>() + 32))?;
-    let fields = expression_columns(predicate, schema)?;
     let mut mask = Vec::with_capacity(batch.len);
-    let mut values = vec![Value::Null; batch.columns.len()];
     for row in 0..batch.len {
-        let _row = batch.load_expression_inputs(row, &fields, &mut values, &execution.context.memory)?;
-        mask.push(rtdb_expr::is_true(&execution.evaluate_invocation(&scope, &invocation, &values).await?)?);
-        for &column in &fields { values[column] = Value::Null; }
+        let input = BatchRow { batch, row, admit_dates: false };
+        let value = execution.evaluate_invocation_row(
+            &scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input),
+        ).await?;
+        mask.push(rtdb_expr::is_true(&value)?);
         scope.reset()?;
     }
     Ok(mask)
 }
 
-pub(crate) fn expression_columns(expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema) -> Result<Vec<usize>> {
-    expression.referenced_columns().into_iter().map(|id| {
-        schema.position(id).ok_or_else(|| invalid("column-expression", "Expression refers to a missing column"))
-    }).collect()
-}
+pub(crate) struct BatchRow<'a> { pub batch: &'a ColumnBatch, pub row: usize, pub admit_dates: bool }
 
-impl ColumnBatch {
-    pub(crate) fn expression_row(&self, row: usize, fields: &[usize], memory: &Arc<MemoryBudget>) -> Result<OwnedRow> {
-        let base = self.columns.len().checked_mul(std::mem::size_of::<Value>())
-            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
-        let bound = fields.iter().try_fold(base, |bytes, &column| {
-            bytes.checked_add(self.columns[column].bound(row)?).ok_or_else(size_error)
-        })?;
-        let reservation = memory.reserve(bound)?;
-        let mut values = vec![Value::Null; self.columns.len()];
-        for &column in fields { values[column] = self.columns[column].value(row)?; }
-        OwnedRow::with_reservation(values, reservation)
+impl Column {
+    pub(crate) fn expression_cell(&self, row: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
+        let (array, field, logical, row) = self.arrow_cell(row)??;
+        if logical.is_some_and(|logical| rtdb_columnar::from_field(field).ok().as_ref() != Some(logical)) {
+            return None;
+        }
+        let cell = rtdb_columnar::ArrowCell { field, array, row };
+        if cell.is_undefined().ok()? { return None; }
+        Some(cell)
     }
 
-    fn load_expression_inputs(&self, row: usize, fields: &[usize], values: &mut [Value], memory: &Arc<MemoryBudget>)
-        -> Result<Arc<MemoryReservation>> {
-        let bound = fields.iter().try_fold(256usize, |bound, &column| {
-            bound.checked_add(self.columns[column].bound(row)?).ok_or_else(size_error)
-        })?;
-        let reservation = memory.reserve(bound)?;
-        for &column in fields { values[column] = self.columns[column].value(row)?; }
-        Ok(reservation)
+    pub(crate) fn expression_value(&self, row: usize, admit_dates: bool, allocation: Option<&rtdb_expr::EvaluationScope>) -> Result<Value> {
+        if let Some(scope) = allocation { scope.reserve(self.bound(row)?)?; }
+        let mut value = self.value(row)?;
+        if admit_dates { value.admit_expression_dates()?; }
+        Ok(value)
+    }
+}
+
+impl rtdb_expr::RowInput for BatchRow<'_> {
+    fn arrow_cell(&self, index: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
+        self.batch.columns.get(index)?.expression_cell(self.row)
+    }
+
+    fn value(&self, index: usize, allocation: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
+        self.batch.columns.get(index).map(|column| column.expression_value(self.row, self.admit_dates, allocation)).transpose()
     }
 }
 
@@ -2439,8 +2599,65 @@ mod tests {
         let modulo = Expr::binary(BinaryOp::Modulo, schema.fields()[0].expression(), Expr::Literal(Value::I64(3)));
         let mut cursor = BatchExpressions::new(Box::new(Input(Some(batch))), schema, vec![modulo], execution);
         let page = cursor.next_batch().await.unwrap().unwrap();
-        let [Column::Values(values)] = page.columns.as_slice() else { panic!("Expected the evaluator's modulo results"); };
-        assert_eq!(values, &[Value::I64(1), Value::I64(2)]);
+        let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected the evaluator's modulo results in Arrow"); };
+        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[1, 2]);
+    }
+
+    #[tokio::test]
+    async fn residual_predicates_borrow_selected_struct_fields_and_list_cells() {
+        let source = MemoryBudget::new(1 << 25);
+        let large = "x".repeat(1 << 21);
+        let ty = LogicalType::Struct(rtdb_types::StructFields::from([
+            ("selected".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("untouched".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ]));
+        let field = Arc::new(rtdb_columnar::to_field("doc", &ty).unwrap());
+        let content = rtdb_columnar::build_struct_array(
+            match field.data_type() {
+                DataType::Struct(fields) => fields.clone(),
+                _ => panic!("record layout"),
+            },
+            &[
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![large.as_str(), large.as_str()])),
+            ], 2, None,
+        ).unwrap();
+        let batch = ColumnBatch::settled(vec![Column::Arrow { field, array: content, logical: Some(ty.clone()) }],
+            2, source.reserve(0).unwrap()).unwrap();
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: ColumnId(0), name: "doc".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty,
+        }]).unwrap();
+        let memory = MemoryBudget::new(1 << 18);
+        let database = crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        };
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(),
+            &tokio_util::sync::CancellationToken::new()).unwrap();
+        let execution = crate::context::Execution {
+            context, parameters: Arc::new(crate::parameters::BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: crate::context::OuterRows::empty(&memory).unwrap(), bindings: None, analysis: None,
+        };
+        let leaf = Expr::Field {
+            expr: Box::new(schema.fields()[0].expression()), name: "selected".into(), data_type: LogicalType::Scalar(ScalarType::I64),
+        };
+        let predicate = Expr::binary(BinaryOp::Eq, leaf, Expr::Literal(Value::I64(2)));
+        assert_eq!(predicate_mask(&batch, &predicate, &schema, &execution).await.unwrap(), [false, true]);
+
+        let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8));
+        let array = rtdb_columnar::copy_array(&ty, &[Value::List(vec![Value::Utf8("keep".into()), Value::Utf8(large)])]).unwrap();
+        let field = Arc::new(rtdb_columnar::to_field("xs", &ty).unwrap());
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: ColumnId(0), name: "xs".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone(),
+        }]).unwrap();
+        let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(ty) }], 1, source.reserve(0).unwrap()).unwrap();
+        let first = Expr::Subscript {
+            expr: Box::new(schema.fields()[0].expression()), index: Box::new(Expr::Literal(Value::I64(0))),
+            data_type: LogicalType::Scalar(ScalarType::Utf8).maybe(),
+        };
+        let predicate = Expr::binary(BinaryOp::Eq, first, Expr::Literal(Value::Utf8("keep".into())));
+        assert_eq!(predicate_mask(&batch, &predicate, &schema, &execution).await.unwrap(), [true]);
     }
 
     #[test]
@@ -2479,7 +2696,7 @@ mod tests {
             let input = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![array]).unwrap();
             ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(input, &memory).unwrap()).unwrap()
         };
-        let sources = [read(&first), read(&second)];
+        let sources = [read(&first), read(&second), read(&Value::Null)];
         let mut output = field(0, ScalarType::I64);
         output.data_type = LogicalType::list(first.logical_type().join(&second.logical_type()));
         let homogeneous = ColumnBatch::take_rows(&sources, &[(0, 0)], &[0], &memory).unwrap();
@@ -2489,7 +2706,10 @@ mod tests {
 
         let heterogeneous = ColumnBatch::take_rows(&sources, &[(0, 0), (1, 0)], &[0], &memory).unwrap();
         let (column, _charge) = heterogeneous.collect_lists(vec![0, 2], vec![true], &output, &memory).unwrap();
-        assert_eq!(column.value(0).unwrap(), Value::List(vec![first, second]));
+        assert_eq!(column.value(0).unwrap(), Value::List(vec![first.clone(), second]));
+        let sparse = ColumnBatch::take_rows(&sources, &[(0, 0), (2, 0)], &[0], &memory).unwrap();
+        let (column, _charge) = sparse.collect_lists(vec![0, 2], vec![true], &output, &memory).unwrap();
+        assert_eq!(column.value(0).unwrap(), Value::List(vec![first, Value::Null]));
     }
 
     #[test]
@@ -2907,6 +3127,7 @@ impl BatchCursor for BatchProject {
         }
         ColumnBatch::settled(output, len, reservation).map(Some)
     }
+    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> { self.input.skip_complete_pages(rows) }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
@@ -3006,23 +3227,21 @@ impl BatchCursor for BatchExpressions {
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
             let scope = self.execution.scope()?;
-            let _slots = self.execution.context.memory.reserve(256 + self.schema.len().saturating_mul(std::mem::size_of::<Value>() + 32))?;
-            let fields = expression_columns(expression, &self.schema)?;
-            let mut inputs = vec![Value::Null; batch.columns.len()];
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             let retained = lease.bytes();
             lease.grow_to(retained.checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
             let mut values = Vec::with_capacity(batch.len);
             for row in 0..batch.len {
-                let _row = batch.load_expression_inputs(row, &fields, &mut inputs, &self.execution.context.memory)?;
-                let value = self.execution.evaluate_invocation(&scope, &invocation, &inputs).await?;
+                let input = BatchRow { batch: &batch, row, admit_dates: false };
+                let value = self.execution.evaluate_invocation_row(
+                    &scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input),
+                ).await?;
                 // The value is charged before the evaluator's scope releases what it allocated it under.
                 lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size_error)?)?;
                 values.push(value);
-                for &column in &fields { inputs[column] = Value::Null; }
                 scope.reset()?;
             }
-            if self.validate_input && let Some((column, scratch)) = scalar_result(&values, &self.execution.context.memory)? {
+            if let Some((column, scratch)) = scalar_result(&values, &self.execution.context.memory)? {
                 let bytes = retained.checked_add(column.retained_bytes()?).ok_or_else(size_error)?;
                 let admission = if bytes <= lease.bytes() { Ok(()) } else { lease.grow_to(bytes) };
                 match admission {
@@ -3039,7 +3258,11 @@ impl BatchCursor for BatchExpressions {
                 columns.push(Column::Values(values));
             }
         }
-        ColumnBatch::settled(columns, batch.len, reservation).map(Some)
+        let output = ColumnBatch::settled(columns, batch.len, reservation)?;
+        if output.columns.iter().any(|column| matches!(column, Column::Values(values) if !values.is_empty())) {
+            return output.pack_evaluated(&self.execution.context.memory).map(Some);
+        }
+        Ok(Some(output))
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
@@ -3063,6 +3286,50 @@ fn pack_scalar_values(values: &[Value], ty: LogicalType, memory: &Arc<MemoryBudg
     Ok((Column::Arrow { array, field, logical: Some(ty) }, scratch))
 }
 
+pub(crate) fn pack_evaluated_column(values: &[Value], memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {
+    if let Some(ty) = scalar_result_type(values.iter()) {
+        return pack_scalar_values(values, ty, memory);
+    }
+    let bytes = values.len().checked_mul(
+        2 * std::mem::size_of::<(usize, usize)>() + 2 * std::mem::size_of::<Option<StoredVector>>(),
+    ).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+    let mut inventory = memory.reserve(bytes)?;
+    let mut sources = Vec::new();
+    let mut cells = Vec::with_capacity(values.len());
+    let cell_type = |value: &Value| {
+        if matches!(value, Value::Undefined) { LogicalType::Null } else { value.logical_type() }
+    };
+    let mut start = 0;
+    while start < values.len() {
+        let ty = cell_type(&values[start]);
+        let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
+        let mut end = start + 1;
+        while end < values.len()
+            && rtdb_columnar::to_field("value", &cell_type(&values[end]))? == *field {
+            end += 1;
+        }
+        let run = &values[start..end];
+        let bound = rtdb_columnar::estimate_builder_bytes(&ty, run)?;
+        let mut custody = memory.reserve(bound)?;
+        let array = rtdb_columnar::copy_array(&ty, run)?;
+        let lease = Arc::get_mut(&mut custody).expect("The evaluated column owns its run");
+        let retained = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
+        if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
+        if start == 0 && end == values.len() {
+            return Ok((Column::Arrow { array, field, logical: Some(ty) }, custody));
+        }
+        let source = sources.len();
+        cells.extend((0..run.len()).map(|row| (source, row)));
+        sources.push(Some((array, field, Some(ty), Some(custody))));
+        start = end;
+    }
+    let column = Column::Selected(SelectedColumn::new(sources, Arc::new(cells)));
+    let bytes = column.retained_bytes()?.checked_add(256).ok_or_else(size_error)?;
+    let lease = Arc::get_mut(&mut inventory).expect("The evaluated column owns its selection");
+    if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
+    Ok((column, inventory))
+}
+
 fn literal_cell(expression: &rtdb_plan::Expr) -> Option<&Value> {
     match expression { rtdb_plan::Expr::Literal(value) => Some(value), _ => None }
 }
@@ -3074,14 +3341,17 @@ fn scalar_result_type<'a>(values: impl Iterator<Item = &'a Value>) -> Option<Log
     for value in values {
         match value {
             Value::Utf8(value) => remaining_variable_bytes = remaining_variable_bytes.checked_sub(value.len())?,
+            Value::Keyword(value) => remaining_variable_bytes = remaining_variable_bytes.checked_sub(value.as_str().len())?,
             Value::Binary(value) => remaining_variable_bytes = remaining_variable_bytes.checked_sub(value.len())?,
             _ => {}
         }
         match value {
             Value::Null => nullable = true,
             Value::Bool(_) | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_)
-            | Value::F32(_) | Value::F64(_) | Value::Utf8(_) | Value::Binary(_)
-            | Value::Uuid(_) | Value::FixedSizeBinary(_) | Value::Timestamp { .. } => {
+            | Value::F16(_) | Value::F32(_) | Value::F64(_) | Value::Utf8(_) | Value::Keyword(_) | Value::Binary(_)
+            | Value::Uuid(_) | Value::FixedSizeBinary(_) | Value::Timestamp { .. }
+            | Value::DateDay(_) | Value::DateMilli(_) | Value::Duration { .. }
+            | Value::Oid(_) | Value::RegClass(_) | Value::RegProc(_) => {
                 let next = value.logical_type();
                 match &ty {
                     Some(ty) if *ty != next => return None,

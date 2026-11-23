@@ -200,6 +200,18 @@ impl MemoryReservation {
         Ok(())
     }
 
+    /// Moves an existing charge between reservations on the same budget without acquiring it again.
+    pub fn absorb(&mut self, other: &mut Self) -> Result<()> {
+        if !Arc::ptr_eq(&self.budget, &other.budget) {
+            return Err(Anomaly::incorrect("rtdb/reservation-budget", "Reservations belong to different budgets"));
+        }
+        let bytes = self.bytes.checked_add(other.bytes)
+            .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory"))?;
+        self.bytes = bytes;
+        other.bytes = 0;
+        Ok(())
+    }
+
     fn release_to(&mut self, bytes: usize) {
         let released = self.bytes - bytes;
         self.bytes = bytes;

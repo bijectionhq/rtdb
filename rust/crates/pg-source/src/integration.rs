@@ -22,25 +22,31 @@ async fn exported_snapshot_and_copyboth_preserve_concurrent_updates_and_full_toa
     let start = snapshot.lsn;
     control.query(&format!("UPDATE {table} SET value = 'after' WHERE _id = 1")).await.unwrap();
     let batch = snapshot.next_batch().await.unwrap().unwrap();
-    assert_eq!(batch.operations.len(), 1); assert_eq!(batch.operations[0].row["value"], Value::Utf8("before".into()));
-    let toast = batch.operations[0].row["toast"].clone();
+    assert_eq!(batch.row_count(), 1); assert_eq!(change_cell(&batch, "value"), Value::Utf8("before".into()));
+    let toast = change_cell(&batch, "toast");
     assert!(snapshot.next_batch().await.unwrap().is_none()); snapshot.finish().await.unwrap();
     wait_for_slot_release(&mut control, &slot).await;
     let mut stream = ChangeStream::open(&remote, &config, start, Arc::clone(&memory)).await.unwrap();
     let changed = tokio::time::timeout(Duration::from_secs(20), async { loop { if let Some(transaction) = stream.read().await.unwrap().transaction { break transaction; } } }).await.unwrap();
-    assert!(changed.lsn > start); assert_eq!(changed.operations[0].row["value"], Value::Utf8("after".into())); assert_eq!(changed.operations[0].row["toast"], toast);
+    assert!(changed.lsn > start); assert_eq!(change_cell(&changed, "value"), Value::Utf8("after".into())); assert_eq!(change_cell(&changed, "toast"), toast);
     stream.acknowledge(changed.lsn).await.unwrap();
     drop(stream);
     wait_for_slot_release(&mut control, &slot).await;
     let mut resumed = ChangeStream::open(&remote, &config, changed.lsn, Arc::clone(&memory)).await.unwrap();
     control.query(&format!("DELETE FROM {table} WHERE _id = 1")).await.unwrap();
     let deleted = tokio::time::timeout(Duration::from_secs(20), async { loop { if let Some(transaction) = resumed.read().await.unwrap().transaction { if transaction.lsn > changed.lsn { break transaction; } } } }).await.unwrap();
-    assert_eq!(deleted.operations[0].kind, crate::RowKind::Delete); assert_eq!(deleted.operations[0].row["_id"], Value::I32(1));
+    assert_eq!(deleted.batches[0].kind, crate::RowKind::Delete); assert_eq!(change_cell(&deleted, "_id"), Value::I32(1));
     drop(resumed);
     wait_for_slot_release(&mut control, &slot).await;
     control.query(&format!("SELECT pg_drop_replication_slot('{slot}')")).await.unwrap();
     control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap();
     control.query(&format!("DROP TABLE {table}")).await.unwrap();
+}
+
+fn change_cell(transaction: &crate::ArrowPgTransaction, field: &str) -> Value {
+    let batch = transaction.batches[0].rows.batch();
+    let column = batch.schema_ref().index_of(field).unwrap();
+    rtdb_columnar::read_value(batch.schema_ref().field(column), batch.column(column).as_ref(), 0).unwrap()
 }
 
 struct Effects;

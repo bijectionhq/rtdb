@@ -475,6 +475,15 @@ impl<'a> OpenTransaction<'a> {
         if is_replay_table(&table) || table == receipts_table() || TableRef::owned_schema(&table.schema) { check_table(&table)?; }
         self.buffer.append(table, event)
     }
+    /// Stages a source's Arrow documents in their input order under this transaction's system time.
+    pub fn append_arrow_puts(
+        &mut self, table: &TableRef, documents: arrow_array::ArrayRef, headers: &[EventHeader],
+    ) -> Result<()> {
+        self.context.check_cancelled()?;
+        if is_replay_table(table) || *table == receipts_table() || TableRef::owned_schema(&table.schema) { check_table(table)?; }
+        let batch = rtdb_format::data::owned_put_batch(documents, headers, None, &self.context.memory)?;
+        self.buffer.append_batch(table, batch)
+    }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
 
     pub async fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
@@ -678,17 +687,41 @@ impl<'a> OpenTransaction<'a> {
         let mut cursor = execute(input, context, arguments, syntax).await?;
         let system_time = self.tx_key().system_time;
         while let Some(batch) = cursor.next_batch().await? {
-            if matches!(kind, MutationKind::Put) {
-                match mutation_put_batch(batch.batch(), system_time, &self.context.memory)
-                    .and_then(|put| put.map(|put| self.buffer.append_batch(&table.table, put)).transpose())
-                {
-                    Ok(Some(())) => continue,
-                    Ok(None) => {},
-                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
-                    Err(error) => return Err(error),
-                }
+            let batch = batch.batch();
+            match kind {
+                MutationKind::Put => self.stage_mutation_puts(&table.table, batch, system_time)?,
+                _ => mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event))?,
             }
-            mutation_events(batch.batch(), kind, system_time, |event| self.buffer.append_to(&table.table, event))?;
+        }
+        Ok(())
+    }
+
+    fn stage_mutation_puts(&mut self, table: &TableRef, batch: &RecordBatch, system_time: Timestamp) -> Result<()> {
+        if batch.num_rows() == 0 { return Ok(()); }
+        let memory = &self.context.memory;
+        match mutation_put_batch(batch, system_time, memory) {
+            Ok(Some(put)) => return self.buffer.append_batch(table, put),
+            Ok(None) => (),
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+            Err(error) => return Err(error),
+        }
+
+        let iids = mutation_column(batch, "_iid")?;
+        let from = mutation_column(batch, "_valid_from")?;
+        let to = mutation_column(batch, "_valid_to")?;
+        let documents = batch.column_by_name("doc")
+            .ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document column"))?;
+        for row in 0..batch.num_rows() {
+            let header = EventHeader {
+                commit_position: 0,
+                iid: iids.iid(row)?, system_from: system_time,
+                valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
+            };
+            let (document, index) = mutation_document(documents.as_ref(), row)
+                .ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document"))?;
+            let content = document.slice(index, 1);
+            let batch = rtdb_format::data::owned_put_batch(Arc::new(content), &[header], None, memory)?;
+            self.buffer.append_batch(table, batch)?;
         }
         Ok(())
     }
@@ -731,8 +764,8 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
-            Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
-            Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None, false).await,
+            Operation::PutReplayArrow { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, iids.as_deref(), *valid_from, *valid_to, false).await,
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                 self.declare_owned_relation(relation, schema).await,
             Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) => self.declare_fixed_range(relation, rule).await,
@@ -803,6 +836,8 @@ impl<'a> OpenTransaction<'a> {
                 self.write_owned(relation, documents, Some(iids), *valid_from, *valid_to, *create_only).await,
             Operation::Public(TxOp::InsertDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Insert).await,
             Operation::InsertIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to, DocumentWrite::Insert).await,
+            Operation::InsertArrowIids { table, documents, iids, valid_from, valid_to } =>
+                self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to, true).await,
             Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Put).await,
             Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to, DocumentWrite::Put).await,
             Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
@@ -812,44 +847,33 @@ impl<'a> OpenTransaction<'a> {
                 Ok(())
             }
             Operation::Public(TxOp::EraseDocs { table, ids }) => { check_table(table)?; for id in ids.ids() { self.buffer.erase(table.clone(), id)?; } Ok(()) }
-            Operation::Public(TxOp::PatchDocs { table, documents, valid_from, valid_to }) => self.patch_documents(table, documents.rows(), None, *valid_from, *valid_to).await,
-            Operation::PatchIids { table, documents, iids, valid_from, valid_to } => self.patch_documents(table, documents.rows(), Some(iids), *valid_from, *valid_to).await,
-            Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => self.patch_arrow_documents(table, documents, iids, *valid_from, *valid_to).await,
+            Operation::Public(TxOp::PatchDocs { table, documents, valid_from, valid_to }) => self.patch_documents(table, documents, None, *valid_from, *valid_to).await,
+            Operation::PatchIids { table, documents, iids, valid_from, valid_to } => self.patch_documents(table, documents, Some(iids), *valid_from, *valid_to).await,
+            Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => self.patch_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to).await,
             Operation::Removed(name) => Err(Anomaly::unsupported(if name == "xtql" { "xtdb/xtql-dml-removed" } else { "xtdb/tx-fns-removed" }, if name == "xtql" { "XTQL DML is no longer supported, as of 2.0.0-beta7. Please use SQL DML statements instead - see the release notes for more information." } else { "tx-fns are no longer supported, as of 2.0.0-beta7. Please use ASSERTs and SQL DML statements instead - see the release notes for more information." })),
         }
     }
-    async fn patch_documents(&mut self, table: &TableRef, documents: &[StructFields<Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
-        use rtdb_plan::{Binder, Expr, Relation, RelationNode, Schema};
-        use rtdb_types::{LogicalType, ScalarType};
-        if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
-        let interval = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
-        let bytes = documents.iter().try_fold(65_536usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?.checked_mul(8).ok_or_else(overflow)?).ok_or_else(overflow))?;
-        let _reservation = self.context.memory.reserve(bytes)?;
-        let mut rows = Vec::with_capacity(documents.len());
-        let mut document_type = LogicalType::Struct(StructFields::new());
-        for (index, document) in documents.iter().enumerate() {
-            let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
-            let document = Value::Struct(document.clone());
-            document_type = document_type.join(&document.logical_type());
-            rows.push(vec![Expr::Literal(Value::FixedSizeBinary(iid.0.to_vec())), Expr::Literal(document)]);
-        }
-        let mut binder = Binder::default();
-        let fields = vec![binder.field("_iid", None, LogicalType::Scalar(ScalarType::FixedSizeBinary(16)))?, binder.field("doc", None, document_type)?];
-        let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?);
-        self.execute_patch(table, input, interval, None).await
+    async fn patch_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        let documents = crate::source::owned_row_documents(documents, &self.context.memory)?;
+        self.patch_arrow_documents(table, &documents, iids, from, to).await
     }
 
-    async fn patch_arrow_documents(&mut self, table: &TableRef, documents: &ArrowDocuments, iids: &[Iid], from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+    async fn patch_arrow_documents(&mut self, table: &TableRef, documents: &ArrowDocuments, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         use rtdb_plan::{Binder, Expr, NamedExpr, Relation, RelationNode, Schema};
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
-        let batch = match documents.patch_parameter(iids, &self.context.memory) {
-            Ok(batch) => batch,
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
-                let rows = documents.to_rows(false, &self.context.memory)?;
-                return self.patch_documents(table, rows.rows(), Some(iids), from, to).await;
-            }
-            Err(error) => return Err(error),
+        if documents.array().is_empty() { return Ok(()); }
+        let derived;
+        let _iids;
+        let iids = if let Some(iids) = iids {
+            iids
+        } else {
+            let memory = &self.context.memory;
+            _iids = memory.reserve(documents.array().len().checked_mul(std::mem::size_of::<Iid>()).ok_or_else(overflow)?)?;
+            let reader = documents.id_reader()?;
+            derived = (0..documents.array().len()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<Vec<_>>>()?;
+            &derived
         };
+        let batch = documents.patch_parameter(iids, &self.context.memory)?;
         let ty = rtdb_columnar::from_field(batch.batch().schema_ref().field(0))?;
         let LogicalType::List { element, .. } = &ty else {
             return Err(Anomaly::fault("rtdb.tx/patch-parameters", "Patch argument has no documents"));
@@ -2069,12 +2093,19 @@ impl<'a> OpenTransaction<'a> {
             iids: Some([iid].into()), predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         })?;
         let query = PreparedQuery::new_in(Arc::new(scan), &context.memory)?;
-        require_empty_insert(query.execute(context, Vec::new()).await?).await
+        require_empty_insert(query.execute_columns(context, Vec::new()).await?).await
     }
 
     async fn put_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, write: DocumentWrite<'_>) -> Result<()> {
 
         if iids.is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
+        let (relation, owner, create_only) = match write {
+            DocumentWrite::Owned { relation, owner, create_only } => (relation, owner, create_only),
+            DocumentWrite::Put | DocumentWrite::Insert => {
+                let documents = crate::source::owned_row_documents(documents, &self.context.memory)?;
+                return self.put_arrow_documents(table, &documents, iids, from, to, matches!(write, DocumentWrite::Insert)).await;
+            }
+        };
         let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
         for (index, document) in documents.rows().iter().enumerate() {
             let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
@@ -2084,38 +2115,32 @@ impl<'a> OpenTransaction<'a> {
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
             let valid_time = interval(row_from, row_to)?;
             let mut entity_key = None;
-            match write {
-                DocumentWrite::Put => (),
-                DocumentWrite::Insert => self.require_absent(table, iid, valid_time).await?,
-                DocumentWrite::Owned { relation, owner, create_only } => {
-                    let id = crate::source::document_id(document, &self.context.memory)?;
-                    if !relation.is_world_catalog() {
-                        entity_key = Some(id.handle_bytes().into());
-                        if iid != id.iid() {
-                            return Err(Anomaly::incorrect("rtdb.owned/invalid-locality", "Owned row locality differs from the canonical key"));
-                        }
-                        self.track_unique_mutation(owner, relation, &id, valid_time).await?;
-                        self.track_capacity_mutation(owner, relation, &id, valid_time).await?;
-                    }
-                    if self.snapshot()?.contains_table(table) {
-                        let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
-                        if create_only && self.read_owned_revision(owner, relation, &id, valid_time).await?.is_some() {
-                            return Err(insert_exists());
-                        }
-                    }
-                    if !relation.is_world_catalog() {
-                        use rtdb_types::OwnedChangeKind;
-                        // The world write path already validates the shadow carrier.
-                        let kind = if relation.world().is_some()
-                            && rtdb_types::WorldShadow::is_tombstone(document)
-                        {
-                            OwnedChangeKind::Delete
-                        } else {
-                            OwnedChangeKind::Put
-                        };
-                        self.record_owned_change(relation, id, kind, valid_time)?;
-                    }
+            let id = crate::source::document_id(document, &self.context.memory)?;
+            if !relation.is_world_catalog() {
+                entity_key = Some(id.handle_bytes().into());
+                if iid != id.iid() {
+                    return Err(Anomaly::incorrect("rtdb.owned/invalid-locality", "Owned row locality differs from the canonical key"));
                 }
+                self.track_unique_mutation(owner, relation, &id, valid_time).await?;
+                self.track_capacity_mutation(owner, relation, &id, valid_time).await?;
+            }
+            if self.snapshot()?.contains_table(table) {
+                let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
+                if create_only && self.read_owned_revision(owner, relation, &id, valid_time).await?.is_some() {
+                    return Err(insert_exists());
+                }
+            }
+            if !relation.is_world_catalog() {
+                use rtdb_types::OwnedChangeKind;
+                // The world write path already validates the shadow carrier.
+                let kind = if relation.world().is_some()
+                    && rtdb_types::WorldShadow::is_tombstone(document)
+                {
+                    OwnedChangeKind::Delete
+                } else {
+                    OwnedChangeKind::Put
+                };
+                self.record_owned_change(relation, id, kind, valid_time)?;
             }
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
             self.buffer.append_to(table, StoredEvent { commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
@@ -2207,16 +2232,17 @@ impl<'a> OpenTransaction<'a> {
         Ok(())
     }
 
-    fn put_arrow_documents(&mut self, table: &TableRef, documents: &crate::ArrowDocuments, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+    async fn put_arrow_documents(&mut self, table: &TableRef, documents: &crate::ArrowDocuments, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool) -> Result<()> {
         let array = documents.array();
-        let memory = &self.context.memory;
+        let memory = Arc::clone(&self.context.memory);
         let bytes = array.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let _scratch = memory.reserve(bytes)?;
         let id = if iids.is_none() { documents.id_reader()? } else { None };
         let endpoint = |name: &str| -> Result<_> {
-            array.fields().iter().position(|field| field.name() == name).map(|index| {
-                OutputColumn::new(&array.fields()[index], array.column(index).as_ref())
-            }).transpose()
+            array.fields().iter().enumerate()
+                .find(|(_, field)| field.name() == name && field.data_type() != &arrow_schema::DataType::Null)
+                .map(|(index, field)| OutputColumn::new(field, array.column(index).as_ref()))
+                .transpose()
         };
         let row_from = endpoint("_valid_from")?;
         let row_to = endpoint("_valid_to")?;
@@ -2224,19 +2250,29 @@ impl<'a> OpenTransaction<'a> {
             match column { Some(column) => column.time(row, default), None => Ok(default) }
         };
         let system_from = self.tx_key().system_time;
-        let headers = (0..array.len()).map(|row| {
+        let header = |row| {
             let iid = match iids {
                 Some(iids) => iids.get(row).copied().ok_or_else(|| Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"))?,
-                None => documents.iid(row, id.as_ref(), memory)?,
+                None => documents.iid(row, id.as_ref(), &memory)?,
             };
             let valid_time = interval(row_time(&row_from, row, from.unwrap_or(system_from))?, row_time(&row_to, row, to.unwrap_or(Timestamp::MAX))?)?;
             Ok(EventHeader { commit_position: 0, iid, system_from, valid_time, op: EventOp::Put })
-        }).collect::<Result<Vec<_>>>()?;
+        };
         let (fields, columns): (Vec<_>, Vec<_>) = array.fields().iter().zip(array.columns())
             .filter(|(field, _)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
             .map(|(field, column)| (Arc::clone(field), Arc::clone(column))).unzip();
         let content = rtdb_columnar::build_struct_array(fields.into(), &columns, array.len(), None)?;
-        let batch = rtdb_format::data::owned_put_batch(content, &headers, documents.source_bytes(), memory)?;
+        if create_only {
+            for row in 0..array.len() {
+                let event = header(row)?;
+                self.require_absent(table, event.iid, event.valid_time).await?;
+                let batch = rtdb_format::data::owned_put_batch(content.slice(row, 1), &[event], documents.source_bytes(), &memory)?;
+                self.buffer.append_batch(table, batch)?;
+            }
+            return Ok(());
+        }
+        let headers = (0..array.len()).map(header).collect::<Result<Vec<_>>>()?;
+        let batch = rtdb_format::data::owned_put_batch(content, &headers, documents.source_bytes(), &memory)?;
         self.buffer.append_batch(table, batch)
     }
     async fn check_replay_marker(&self, replay: &ReplaySubmission) -> Result<()> {
@@ -2383,9 +2419,11 @@ fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Re
     let (table, columns, verb, permitted) = match operation {
         Operation::Public(TxOp::InsertDocs { table, documents, .. }) | Operation::InsertIids { table, documents, .. } =>
             (table, documents.columns(), "insert", put_columns),
+        Operation::InsertArrowIids { table, documents, .. } =>
+            (table, documents.columns(), "insert", put_columns),
         Operation::Public(TxOp::PutDocs { table, documents, .. }) | Operation::PutIids { table, documents, .. } =>
             (table, documents.columns(), "put", put_columns),
-        Operation::Public(TxOp::PutArrowDocs { table, documents }) | Operation::PutArrowIids { table, documents, .. } =>
+        Operation::Public(TxOp::PutArrowDocs { table, documents }) | Operation::PutReplayArrow { table, documents, .. } =>
             (table, documents.columns(), "put", put_columns),
         Operation::Public(TxOp::PatchDocs { table, documents, .. }) | Operation::PatchIids { table, documents, .. } =>
             (table, documents.columns(), "patch", &["_id", "_fn"][..]),
@@ -2411,7 +2449,7 @@ fn validate_document_columns(table: &TableRef, columns: &[String], verb: &str, p
 fn document_table(operation: &Operation) -> Option<&TableRef> {
     match operation {
         Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::InsertIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } => Some(table),
+        | Operation::InsertIids { table, .. } | Operation::InsertArrowIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutReplayArrow { table, .. } => Some(table),
         _ => None,
     }
 }
@@ -2492,6 +2530,14 @@ fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<
     let content = RecordBatch::try_new(schema, columns).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
     let Some(documents) = ArrowDocuments::from_record_batch(&content, memory)? else { return Ok(None); };
     rtdb_format::data::owned_put_batch(Arc::new(documents.array().clone()), &headers, None, memory).map(Some)
+}
+
+fn mutation_document(array: &dyn Array, row: usize) -> Option<(&arrow_array::StructArray, usize)> {
+    if let Some(document) = array.as_struct_opt() {
+        return document.is_valid(row).then_some((document, row));
+    }
+    let union = array.as_any().downcast_ref::<arrow_array::UnionArray>()?;
+    mutation_document(union.child(union.type_id(row)).as_ref(), union.value_offset(row))
 }
 
 fn mutation_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<OutputColumn<'a>> {

@@ -343,6 +343,7 @@ async fn create_only_insert_checks_staged_intervals_and_replays_atomic_outcomes(
         table: table(),
         documents: Documents::new(vec![StructFields::from([
             ("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id)),
+            ("_valid_from".into(), Value::Null),
         ])], &context.memory).unwrap(),
         valid_from: Some(Timestamp(from)),
         valid_to: Some(Timestamp(to)),
@@ -373,8 +374,20 @@ async fn create_only_insert_checks_staged_intervals_and_replays_atomic_outcomes(
     assert_eq!(intra_transaction.result().error().unwrap().code, "rtdb.tx/exists");
     assert!(!intra_transaction.writes().tables().contains_key(&table()));
 
+    let same_operation = TxOp::InsertDocs {
+        table: table(),
+        documents: Documents::new(vec![document(4), document(4)], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(10)),
+        valid_to: Some(Timestamp(20)),
+    };
+    let intra_batch = resolver.resolve_source(
+        state.snapshot(), SourcePosition(4), Timestamp(104), logged(vec![same_operation]), &context,
+    ).await.unwrap();
+    assert_eq!(intra_batch.result().error().unwrap().code, "rtdb.tx/exists");
+    assert!(!intra_batch.writes().tables().contains_key(&table()));
+
     let follower = PartitionState::empty(Default::default()).unwrap();
-    for resolved in [first, adjacent, overlapping, intra_transaction] {
+    for resolved in [first, adjacent, overlapping, intra_transaction, intra_batch] {
         let body = resolved.to_replica_body(&context.memory).unwrap();
         let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("expected resolved payload"); };
         let snapshot = follower.snapshot();

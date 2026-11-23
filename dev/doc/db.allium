@@ -86,6 +86,7 @@ external entity Compactor {
 external entity ExternalSource {
     -- A system outside XTDB that feeds a database by change data capture, e.g. Postgres logical replication.
     -- On assignment it is handed an indexing callback and an opaque resume token to start after, and feeds transactions in directly.
+    -- The native PostgreSQL direct mirror stages snapshots and logical changes from Arrow arrays.
     -- An external-source database assigns its own monotonically increasing tx_id off the RESOLVED head rather than taking it from the source-log position.
     -- A client submit is rejected for such a database: transactions enter only through the source.
 }
@@ -374,14 +375,19 @@ variant TxMessage : SourceMessage {
     -- Source encoding writes IID lists from their fixed-size bytes.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
     -- PATCH replay binds compatible document and IID vectors to the mutation plan as one list of records.
+    -- Put and create-only insert replay retain their Arrow document vectors.
+    -- A put record without an IID vector derives its IIDs from the document ID cells.
     -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
     -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
     -- Rows are grouped by their evaluated bounds in first-seen order and retain their order within each group.
+    -- A document layout retains its schema and column metadata while releasing translation scratch after construction.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
-    -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit compatible document columns in Arrow.
+    -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
+    -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
     -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
     -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
+    -- Admitted bulk uploads can retain date, time and duration vectors through source replay.
     -- Compatible document vectors retain the UUID extension for their UUID values through source encoding and replay.
     -- When an upload adds fields inside a fixed-size list, layout alignment copies only the selected entries and required null padding.
     -- Struct fields added across compatible uploads join in Arrow with typed nulls for earlier documents, including structs inside lists.
@@ -1911,15 +1917,20 @@ surface QueryAccess {
         -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
-        -- An Arrow join can evaluate a residual predicate from its referenced cells while gathering the result payloads from the input batches.
-        -- Compatible join partitions retain flat and nested Arrow layouts in spill files.
+        -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
+        -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
+        -- A shared mark can replay its candidate Arrow pages to evaluate arbitrary Boolean comparisons.
+        -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
         -- Outer joins track unmatched build positions through partition replay.
-        -- A correlated query can read Arrow batches from both inputs and gather its output from their selected positions.
+        -- A correlated query retains its outer Arrow row position and gathers its output from the selected dependent positions.
         -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
         -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
-        -- Scalar evaluation within a columnar projection reads the cells referenced by the expression.
+        -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
+        -- A nested field read can select its child from an input struct vector.
+        -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
+        -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
         -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
         -- Adjacent compatible projections can pass computed scalar results as Arrow columns, including into a mutation's document projection.
         -- A literal table with stable scalar columns builds one Arrow batch before its consumers run.

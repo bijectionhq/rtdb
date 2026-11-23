@@ -23,10 +23,11 @@
 -- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
 -- Logical relation cursors expose the root operator's pages as separate batches.
--- A logical relation whose root is a table scan can stream those pages from its Arrow vectors.
+-- Logical relation queries use Arrow vectors for semantic pages, including pages that downstream operators observe before transport batching.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
 -- Ordinary native SQL and XTQL queries and pgwire result portals retain compatible Arrow query batches while gathering the configured number of output rows.
 -- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
+-- A pgwire portal can encode numeric coefficients and structured JSON, JSON-LD, and Transit results from their Arrow cells.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
@@ -41,12 +42,16 @@
 -- A sort can combine computed keys with keys taken directly from its input columns.
 -- Its Arrow spill records retain compatible physical payload layouts.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
--- A materialized relation can write compatible pages once as Arrow IPC and open an independent reader for each reference.
+-- A materialized relation writes each page as Arrow IPC and opens an independent reader for each reference.
 -- Those spill pages retain each record's fields and preserve their original page boundaries.
+-- Computed VALUES and replayed literal pages admit their results column by column.
+-- Column tables preserve one semantic page across the input list's batches.
+-- Computed UNNEST gathers the original payload from Arrow positions and evaluates only its list operands.
+-- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
 -- Its Bloom and entity ID filters use those same build-side vectors.
--- An inner equijoin over repeatable scans with compatible Arrow layouts can partition and replay its spill as Arrow record batches.
+-- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
 -- Supported computed keys and integer residual comparisons retain the payload positions through match selection.
 -- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
 -- Their columnar output keeps the configured transport row limit.
@@ -186,7 +191,7 @@
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
 --      COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream') uses the connection's read basis.
 --      The connection streams Arrow IPC in CopyData frames and ends it before the CopyDone and command completion frames.
---      COPY FROM STDIN with an Arrow format submits compatible document columns as Arrow batches.
+--      COPY FROM STDIN with an Arrow format submits Arrow document batches.
 --      Without an explicit transaction, each input batch commits separately.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
 --      An implicit basis on a linearizable subscriber follows the installed replica prefix confirmed by its active loglet.

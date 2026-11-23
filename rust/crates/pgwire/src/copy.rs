@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{AccessSettings, CommitResult, NativeSession, Node, TransactionSettings, TransactionStatus};
 use rtdb_pg_codec::Format;
 use rtdb_plan::{CopyFormat, Identifier};
@@ -101,24 +101,11 @@ impl CopyInput {
                     let batch = batch?;
                     count = count.checked_add(batch.num_rows() as u64).ok_or_else(|| protocol("COPY row count overflow"))?;
                     // An explicit transaction can hold this batch after COPY releases its decoder reservation.
-                    let documents = OwnedBatch::new(batch.clone(), node.memory())
-                        .and_then(|batch| ArrowDocuments::from_ingest_batch(&batch, node.memory()));
-                    match documents {
-                        Ok(Some(documents)) => {
-                            let operation = TxOp::PutArrowDocs { table: self.table.clone(), documents };
-                            self.submit(|| Ok(operation), session, node, cancellation).await?;
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
-                        Err(error) => return Err(error),
+                    let batch = OwnedBatch::new(batch, node.memory())?;
+                    if let Some(documents) = ArrowDocuments::from_ingest_batch(&batch, node.memory())? {
+                        let operation = TxOp::PutArrowDocs { table: self.table.clone(), documents };
+                        self.submit(|| Ok(operation), session, node, cancellation).await?;
                     }
-                    let schema = batch.schema();
-                    let mut bound = 8192usize;
-                    for row in 0..batch.num_rows() { for column in 0..batch.num_columns() { bound = bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.column(column).as_ref(), row)?).ok_or_else(|| protocol("COPY row allocation overflow"))?; } }
-                    let _values = node.memory().reserve(bound)?;
-                    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), rtdb_columnar::read_execution_value(field, batch.column(column).as_ref(), row)?))).collect::<Result<StructFields<_>>>()).collect::<Result<Vec<_>>>()?;
-                    self.submit(|| self.put_rows(rows, node.memory()), session, node, cancellation).await?;
                 }
                 Ok(count)
             }

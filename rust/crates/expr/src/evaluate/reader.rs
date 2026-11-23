@@ -1,8 +1,9 @@
 use rtdb_types::StructFields;
 use std::{future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
+use rtdb_columnar::ArrowCell;
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
-use super::{EvalContext, boolean, integer, nullish, overflow};
+use super::{EvalContext, ExpressionRow, boolean, integer, nullish, overflow};
 
 mod compare;
 mod calls;
@@ -23,13 +24,25 @@ enum EvalValue<'a> {
 enum ListReader<'a> {
     Expressions(&'a [Expr]),
     Values(Vec<Value>),
+    Arrow(ArrowCell<'a>),
     Cast { input: EvalValue<'a>, element: Target<'a> },
     Trim { input: EvalValue<'a>, size: i64 },
     IntegerSeries(crate::series::IntegerSeries),
     RangeBins(crate::temporal_functions::RangeBins),
 }
 
-struct EvaluationFrame<'a> { schema: &'a Schema, row: &'a [Value], context: &'a EvalContext<'a>, asynchronous: bool, replacements: Option<&'a super::invocation::Replacements<'a>> }
+struct EvaluationFrame<'a> { schema: &'a Schema, row: ExpressionRow<'a>, context: &'a EvalContext<'a>, asynchronous: bool, replacements: Option<&'a super::invocation::Replacements<'a>> }
+
+impl<'a> EvaluationFrame<'a> {
+    fn arrow_input(&self, expr: &Expr) -> Option<ArrowCell<'a>> {
+        match expr {
+            Expr::Column { id, .. } => self.row.arrow_cell(self.schema.position(*id)?),
+            Expr::Field { expr, name, .. } => self.arrow_input(expr)?.structure()?
+                .find(|child| child.field.name() == name),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone,Copy)]
 enum Target<'a> { Cast(&'a CastTarget), Fixed(&'a LogicalType) }
@@ -120,6 +133,11 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
                     frame.context.reserve(items.iter().try_fold(0usize,|bytes,item|bytes.checked_add(item.retained_bytes()?).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
                     LogicalType::join_all(&items.iter().map(Value::logical_type).collect::<Vec<_>>())
                 }
+                ListReader::Arrow(cell) => {
+                    frame.context.reserve(cell.observed_type_bytes()?)?;
+                    let LogicalType::List { element, .. } = cell.observed_type()? else { return Err(invalid("list type")); };
+                    rtdb_columnar::execution_type(&element)
+                }
                 ListReader::Cast { input,element } => {
                     if let Some(target) = union_target(*element) {
                         frame.context.reserve(target.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;
@@ -171,7 +189,7 @@ pub(super) fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<
         return Err(Anomaly::fault("rtdb.expr/parameter-schema", "Parameter values and declared types have different widths"));
     }
     context.reserve(expression_type_bound(expr)?.checked_mul(8).ok_or_else(overflow)?)?;
-    scalar::emitted_type(expr,&EvaluationFrame { schema,row: &[],context,asynchronous: false,replacements: None })
+    scalar::emitted_type(expr,&EvaluationFrame { schema,row: ExpressionRow::Values(&[]),context,asynchronous: false,replacements: None })
 }
 
 pub(super) fn required(expr: &Expr) -> bool {
@@ -191,10 +209,10 @@ pub(super) fn required(expr: &Expr) -> bool {
     }
 }
 
-pub(super) fn execute_sync(expr: &Expr,schema: &Schema,row: &[Value],context: &EvalContext<'_>) -> Result<Value> {
+pub(super) fn execute_sync(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &EvalContext<'_>) -> Result<Value> {
     poll_sync(execute(expr,schema,row,context,false,None))
 }
-pub(super) fn execute_sync_prepared(expr: &Expr,schema: &Schema,row: &[Value],context: &EvalContext<'_>,replacements: &super::invocation::Replacements<'_>) -> Result<Value> {
+pub(super) fn execute_sync_prepared(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &EvalContext<'_>,replacements: &super::invocation::Replacements<'_>) -> Result<Value> {
     poll_sync(execute(expr,schema,row,context,false,Some(replacements)))
 }
 fn poll_sync(future: impl Future<Output=Result<Value>>) -> Result<Value> {
@@ -204,9 +222,9 @@ fn poll_sync(future: impl Future<Output=Result<Value>>) -> Result<Value> {
         Poll::Pending => Err(Anomaly::fault("rtdb.expr/unexpected-suspension","Synchronous collection evaluation suspended")),
     }
 }
-pub(super) async fn execute_async(expr: &Expr,schema: &Schema,row: &[Value],context: &EvalContext<'_>) -> Result<Value> { execute(expr,schema,row,context,true,None).await }
-pub(super) async fn execute_async_prepared(expr: &Expr,schema: &Schema,row: &[Value],context: &EvalContext<'_>,replacements: &super::invocation::Replacements<'_>) -> Result<Value> { execute(expr,schema,row,context,true,Some(replacements)).await }
-async fn execute(expr: &Expr,schema: &Schema,row: &[Value],context: &EvalContext<'_>,asynchronous: bool,replacements: Option<&super::invocation::Replacements<'_>>) -> Result<Value> {
+pub(super) async fn execute_async(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &EvalContext<'_>) -> Result<Value> { execute(expr,schema,row,context,true,None).await }
+pub(super) async fn execute_async_prepared(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &EvalContext<'_>,replacements: &super::invocation::Replacements<'_>) -> Result<Value> { execute(expr,schema,row,context,true,Some(replacements)).await }
+async fn execute(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &EvalContext<'_>,asynchronous: bool,replacements: Option<&super::invocation::Replacements<'_>>) -> Result<Value> {
     let frame = EvaluationFrame { schema,row,context,asynchronous,replacements };
     let value = evaluate(expr,&frame)?.await?;
     materialize(value,&frame)?.await
@@ -217,7 +235,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
     Box::pin(async_stream::try_stream! {
         if batch_rows == 0 { Err(Anomaly::incorrect("xtdb/invalid-batch-size", "List page size must be positive"))?; }
         let allocation = context.allocation.ok_or_else(|| Anomaly::fault("rtdb.expr/allocation-scope", "List cursor requires an allocation scope"))?;
-        let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
+        let frame = EvaluationFrame { schema, row: ExpressionRow::Values(row), context, asynchronous: true, replacements: Some(replacements) };
         let continuation = scalar::prepare(expr, &frame)?.await?;
         let value = if continuation.is_list() { Some(continuation.demand().await?) } else { None };
         if let Some(EvalValue::List(_, reader)) = &value
@@ -239,7 +257,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                 let mut values = Vec::with_capacity(count);
                 {
                     let page_context = context.with_allocation(&scope);
-                    let page_frame = EvaluationFrame { schema, row, context: &page_context, asynchronous: true, replacements: Some(replacements) };
+                    let page_frame = EvaluationFrame { schema, row: ExpressionRow::Values(row), context: &page_context, asynchronous: true, replacements: Some(replacements) };
                     for index in position..position + count {
                         let cell = nth(clone_value(&value, &page_frame)?, index, &page_frame)?.await?;
                         let mut cell = materialize(cell, &page_frame)?.await?;
@@ -255,7 +273,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
     })
 }
 
-pub(super) async fn execute_list_async(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>,replacements: Option<&super::invocation::Replacements<'_>>) -> Result<super::EvaluatedList> {
+pub(super) async fn execute_list_async(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>,replacements: Option<&super::invocation::Replacements<'_>>) -> Result<super::EvaluatedList> {
     let frame = EvaluationFrame { schema, row, context, asynchronous: true,replacements };
     let continuation = scalar::prepare(expr, &frame)?.await?;
     if !continuation.is_list() { return Ok(super::EvaluatedList { storage: super::ListStorage::Values(Vec::new()) }); }
@@ -304,6 +322,25 @@ fn from_value<'a>(value: Value,frame: &EvaluationFrame<'_>) -> Result<EvalValue<
         value => Ok(EvalValue::Scalar(value)),
     }
 }
+fn from_arrow<'a>(cell: ArrowCell<'a>, frame: &EvaluationFrame<'_>) -> Result<EvalValue<'a>> {
+    let cell = cell.physical()?;
+    if cell.is_undefined()? { return Ok(scalar(Value::Undefined)); }
+    if cell.is_null()? { return Ok(scalar(Value::Null)); }
+    if let LogicalType::List { kind, .. } = cell.logical_type()? {
+        let kind = match kind {
+            ListKind::List => Some(Kind::List),
+            ListKind::Set => Some(Kind::Set),
+            ListKind::FixedSizeList(_) => Some(Kind::Fixed),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return make_list(kind, ListReader::Arrow(cell), frame);
+        }
+    }
+    frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)?;
+    from_value(rtdb_columnar::read_execution_value(cell.field, cell.array, cell.row)?, frame)
+}
+
 fn size(value: &EvalValue<'_>) -> Result<i32> {
     if let EvalValue::List(_,reader) = value {
         match reader.as_ref() {
@@ -318,6 +355,7 @@ fn len(value: &EvalValue<'_>) -> Result<usize> {
     let EvalValue::List(_,reader) = value else { return Err(invalid("list length")); };
     match reader.as_ref() {
         ListReader::Expressions(items) => Ok(items.len()), ListReader::Values(items) => Ok(items.len()),
+        ListReader::Arrow(cell) => Ok(cell.sequence().ok_or_else(|| invalid("list length"))?.len()),
         ListReader::Cast { input, .. } => len(input),
         ListReader::Trim { size,.. } => crate::collection::view_size(*size),
         ListReader::IntegerSeries(series) => Ok(series.len()),
@@ -330,6 +368,10 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
         let value = match reader.as_ref() {
             ListReader::Expressions(items) => evaluate((*items).get(index).ok_or_else(|| invalid("nth"))?,frame)?.await?,
             ListReader::Values(items) => from_value(super::retained_clone(items.get(index).ok_or_else(|| invalid("nth"))?,frame.context)?,frame)?,
+            ListReader::Arrow(cell) => {
+                let item = cell.sequence().and_then(|mut values| values.nth(index)).ok_or_else(|| invalid("nth"))?;
+                from_arrow(item, frame)?
+            }
             ListReader::Cast { input,element } => {
                 let value = nth(clone_value(input,frame)?,index,frame)?.await?;
                 if let Some(target) = union_target(*element) {
@@ -430,6 +472,10 @@ fn cast_value<'a>(value: EvalValue<'a>,target: Target<'a>,frame: &'a EvaluationF
 
 fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
     boxed(async move {
+        if let Some(cell) = frame.arrow_input(expr) {
+            let value = from_arrow(cell, frame)?;
+            return if matches!(expr, Expr::Field { .. }) { box_cell(value) } else { Ok(value) };
+        }
         if !required(expr) {
             let value = if frame.asynchronous { super::evaluate_async_inner(expr,frame.schema,frame.row,frame.context).await? }
                 else { super::evaluate_inner(expr,frame.schema,frame.row,frame.context)? };
@@ -486,7 +532,7 @@ mod tests {
     fn repeated_reads_of_one_list_reader_rerun_random() {
         let expression = Expr::List(vec![Expr::Call { name: "random".into(),args: vec![],return_type: LogicalType::Scalar(rtdb_types::ScalarType::F64) }]);
         let schema = Schema::default();let context = EvalContext::default();
-        let frame = EvaluationFrame { schema: &schema,row: &[],context: &context,asynchronous: false,replacements: None };
+        let frame = EvaluationFrame { schema: &schema,row: ExpressionRow::Values(&[]),context: &context,asynchronous: false,replacements: None };
         let reader = immediate(evaluate(&expression,&frame).unwrap());
         let first = immediate(materialize(immediate(nth(clone_value(&reader,&frame).unwrap(),0,&frame).unwrap()),&frame).unwrap());
         let mut changed = false;

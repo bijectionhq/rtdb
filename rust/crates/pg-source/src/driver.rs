@@ -5,7 +5,7 @@ use rtdb_replication::{DriverStatus, ExternalReceipt, TermHandle};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use crate::{ConfirmationState, DirectMirror, Lsn, PgIndexer, PgTransaction, Remote, ResumeToken, SourceConfig, config::DIRECT_MIRROR_TYPE, indexer::ImportWriter, snapshot::{SnapshotReader, publication_exists}, stream::ChangeStream};
+use crate::{ArrowPgTransaction, ConfirmationState, DirectMirror, Lsn, PgIndexer, Remote, ResumeToken, SourceConfig, config::DIRECT_MIRROR_TYPE, indexer::ImportWriter, snapshot::{SnapshotReader, publication_exists}, stream::ChangeStream};
 
 #[derive(Clone, Debug)]
 pub struct ReconnectPolicy { pub initial_delay: Duration, pub maximum_delay: Duration, pub jitter: f64, pub reset_after: Duration }
@@ -90,10 +90,10 @@ impl SourceDriver {
         let resume = match after { Some(token) => ResumeToken::decode(&token)?.require_complete()?, None => self.snapshot(term).await? };
         self.stream(term, resume, blocks).await
     }
-    async fn submit(&self, term: &TermHandle, transaction: PgTransaction, completed: bool) -> Result<BoxFuture<'static, Result<Applied>>> {
-        let events = transaction.operations.len(); let commit_time = transaction.commit_time;
+    async fn submit(&self, term: &TermHandle, transaction: ArrowPgTransaction, completed: bool) -> Result<BoxFuture<'static, Result<Applied>>> {
+        let events = transaction.row_count(); let commit_time = transaction.commit_time;
         let token = ResumeToken::new(transaction.lsn, completed).encode();
-        let receipt = term.submit_external(Box::new(ImportWriter { transaction, indexer: Arc::clone(&self.indexer) }), commit_time, Some(token)).await?;
+        let receipt = term.submit_external(Box::new(ImportWriter { transaction, indexer: Arc::clone(&self.indexer), memory: Arc::clone(&self.memory) }), commit_time, Some(token)).await?;
         Ok(applied(receipt, events, commit_time))
     }
     async fn snapshot(&self, term: &TermHandle) -> Result<Lsn> {
@@ -105,7 +105,7 @@ impl SourceDriver {
             pending.push_back(self.submit(term, transaction, false).await?);
         }
         let lsn = snapshot.lsn;
-        pending.push_back(self.submit(term, PgTransaction::empty(lsn), true).await?);
+        pending.push_back(self.submit(term, ArrowPgTransaction::empty(lsn), true).await?);
         while let Some(result) = pending.next().await { result?; }
         snapshot.finish().await?;
         Ok(lsn)

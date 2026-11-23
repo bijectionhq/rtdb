@@ -344,6 +344,10 @@ surface TargetIngestion {
     contracts:
         demands TargetDurability
 
+    @guarantee NativeMirrorPayloads
+        -- The native mirror builds Arrow batches for snapshot and WAL fields in their received order.
+        -- It stages Arrow document vectors with separately resolved event headers.
+
     @guarantee SubmissionIsOrdered
         -- Transactions are submitted in lsn order, so submitted_lsn is a
         -- watermark rather than a maximum.

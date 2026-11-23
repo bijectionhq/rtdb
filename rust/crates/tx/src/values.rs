@@ -52,12 +52,23 @@ pub(crate) struct DecodedDocumentLayout {
 impl DecodedDocumentLayout {
     pub(crate) fn new(fields: &Fields, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let schema = Schema::new(fields.clone());
-        let reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
-        let columns = fields.iter().map(|field| field.name().clone()).collect();
+        let mut reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let columns = fields.iter().map(|field| field.name().clone()).collect::<Vec<_>>();
         let types = fields.iter().map(|field| Ok((field.name().clone(), from_field(field)?))).collect::<Result<StructFields<_>>>()?;
         if types.len() != fields.len() {
             return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique"));
         }
+        let base = types.table_bytes_bound().and_then(|bytes| bytes.checked_add(fields.size()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>() + 64))
+            .and_then(|bytes| bytes.checked_add(columns.capacity().checked_mul(std::mem::size_of::<String>())?))
+            .ok_or_else(overflow)?;
+        let retained = types.iter().zip(&columns).try_fold(base, |bytes, ((name, ty), column)| {
+            let type_bytes = ty.retained_bytes()?;
+            bytes.checked_add(type_bytes).and_then(|bytes| bytes.checked_add(name.capacity()))
+                .and_then(|bytes| bytes.checked_add(column.capacity())).ok_or_else(overflow)
+        })?;
+        let lease = Arc::get_mut(&mut reservation).expect("Document layout owns its reservation");
+        if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
         Ok(Arc::new(Self { physical: fields.clone(), columns, types, _reservation: reservation }))
     }
 }
@@ -185,30 +196,79 @@ impl ArrowDocuments {
         Self::from_record_batch(batch.batch(), memory)
     }
 
-    /// Admits uploads whose Arrow layout can reproduce the row encoder's source representation.
+    /// Validates an upload and prepares its Arrow document columns for source storage.
     pub fn from_ingest_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        let batch = batch.batch();
-        if batch.schema_ref().index_of("_id").is_err() { return Ok(None); }
-        Self::from_canonical_ingest(batch, IngestMode::External, memory)
+        Self::from_external_pages(&[batch.batch()], memory)
+    }
+
+    fn from_external_pages(pages: &[&RecordBatch], memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        if pages.is_empty() { return Ok(None); }
+        let Some(page) = pages.iter().copied().find(|page| page.num_rows() != 0) else {
+            let fields = Fields::from(Vec::<Arc<arrow_schema::Field>>::new());
+            let layout = DecodedDocumentLayout::new(&fields, memory)?;
+            let array = StructArray::new_empty_fields(0, None);
+            return Ok(Some(Self { array, layout, source_bytes: None }));
+        };
+        if let Some(documents) = Self::from_canonical_ingest_pages(pages, IngestMode::External, memory)? {
+            return Ok(Some(documents));
+        }
+
+        let original = page.schema_ref();
+        let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(original)?)?;
+        let rows = pages.iter().try_fold(0usize, |rows, page| rows.checked_add(page.num_rows()).ok_or_else(overflow))?;
+        let mut fields = Vec::with_capacity(original.fields().len());
+        let mut columns = Vec::with_capacity(original.fields().len());
+        for (index, field) in original.fields().iter().enumerate() {
+            let logical = from_field(field)?;
+            let canonical = rtdb_columnar::to_field(field.name(), &logical)?;
+            let array = canonical_argument_column(pages, index, memory)?;
+            fields.push(field.as_ref().clone().with_metadata(canonical.metadata().clone()));
+            columns.push(array);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        Self::prepare_columns(&batch, &schema, memory, true)?
+            .ok_or_else(|| Anomaly::incorrect("rtdb.tx/document-schema", "Arrow upload cannot be aligned to a document layout"))
+            .map(Some)
     }
 
     pub(crate) fn from_canonical_ingest(batch: &RecordBatch, mode: IngestMode, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        Self::from_canonical_ingest_pages(&[batch], mode, memory)
+    }
+
+    fn from_canonical_ingest_pages(pages: &[&RecordBatch], mode: IngestMode, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let Some(batch) = pages.iter().copied().find(|page| page.num_rows() != 0) else { return Ok(None); };
         let schema = batch.schema();
-        if batch.num_rows() == 0 || batch.num_columns() == 0 { return Ok(None); }
+        if batch.num_columns() == 0 { return Ok(None); }
         let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
-        let types = schema.fields().iter().zip(batch.columns()).map(|(field, column)| ingest_type(field, column.as_ref(), mode))
-            .collect::<Result<Option<Vec<_>>>>()?;
-        let Some(types) = types else { return Ok(None); };
-        let mut fields = Vec::with_capacity(types.len());
-        let mut columns = Vec::with_capacity(types.len());
-        for (index, (field, ty)) in schema.fields().iter().zip(types).enumerate() {
+        let mut fields = Vec::with_capacity(schema.fields().len());
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for (index, field) in schema.fields().iter().enumerate() {
+            let known = if let [page] = pages {
+                let Some(ty) = ingest_type(field, page.column(index).as_ref(), mode)? else { return Ok(None); };
+                Some(ty)
+            } else { None };
             let array = match mode {
-                IngestMode::External => canonical_argument_column(&[batch], index, memory)?,
-                IngestMode::Mutation => copy_argument_column(&[batch], index, memory)?,
+                IngestMode::External => canonical_argument_column(pages, index, memory)?,
+                IngestMode::Mutation => copy_argument_column(pages, index, memory)?,
             };
-            let Some(array) = normalized_document_array(&array, memory, true)? else { return Ok(None); };
+            let ty = match known {
+                Some(ty) => ty,
+                None => match ingest_type(field, array.as_ref(), mode)? {
+                    Some(ty) => ty,
+                    None => return Ok(None),
+                },
+            };
             let target = rtdb_columnar::to_field(field.name(), &ty)?;
-            let Ok(array) = ingest_layout(array, target.data_type()) else { return Ok(None); };
+            let array = if ty == LogicalType::Null {
+                Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
+            } else {
+                let Some(array) = normalized_document_array(&array, memory, true)? else { return Ok(None); };
+                let Ok(array) = ingest_layout(array, target.data_type()) else { return Ok(None); };
+                array
+            };
             fields.push(target);
             columns.push(array);
         }
@@ -244,10 +304,8 @@ impl ArrowDocuments {
         let mut fields = Vec::with_capacity(schema.fields().len());
         let mut columns = Vec::with_capacity(schema.fields().len());
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
-            if contains_fixed_size_list(field.data_type()) {
-                let logical = from_field(field)?;
-                rtdb_columnar::validate_readable_column(field, array.as_ref(), &logical, memory)?;
-            }
+            let logical = from_field(field)?;
+            rtdb_columnar::validate_readable_column(field, array.as_ref(), &logical, memory)?;
             let nulls = array.logical_null_count();
             let array = if nulls == array.len() {
                 Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
@@ -270,24 +328,23 @@ impl ArrowDocuments {
     fn compatible(field: &arrow_schema::Field, normalize: bool) -> bool {
         compatible_document_metadata(field) && match field.data_type() {
             DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field, normalize)),
-            DataType::List(field) | DataType::FixedSizeList(field, _) => Self::compatible(field, normalize),
+            DataType::List(field) | DataType::FixedSizeList(field, _) | DataType::Map(field, _)
+            | DataType::RunEndEncoded(_, field) => Self::compatible(field, normalize),
             DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| {
                 Self::compatible(field, normalize) && (normalize || from_field(field).is_ok_and(|ty| rtdb_columnar::execution_type(&ty) == ty))
             }),
             DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
-            DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) |
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)) => true,
+            DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) |
+            DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) |
+            DataType::Timestamp(..) | DataType::Interval(_) | DataType::Decimal32(..) | DataType::Decimal64(..)
+            | DataType::Decimal128(..) | DataType::Decimal256(..) => true,
             _ => false,
         }
     }
 
     pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>, source_bytes: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        if array.is_empty() || array.null_count() != 0 || !array.fields().iter().all(|field| {
-            Self::compatible(field, false) && canonical_uuid_unions(field)
-        }) {
-            return Ok(None);
-        }
+        if array.null_count() != 0 { return Ok(None); }
         let fixed = || array.fields().iter().zip(array.columns()).filter(|(field, _)| contains_fixed_size_list(field.data_type()));
         if fixed().next().is_some() {
             let bound = fixed().try_fold(4096usize, |bytes, (field, _)| {
@@ -302,20 +359,37 @@ impl ArrowDocuments {
         Ok(Some(Self { array: array.clone(), layout, source_bytes: Some(source_bytes) }))
     }
 
-    pub(crate) fn from_patch_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>, source_bytes: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        fn supported(ty: &LogicalType) -> bool {
+    pub(crate) fn requires_legacy_receipt(&self, patch: bool) -> bool {
+        use arrow_schema::TimeUnit as ArrowTime;
+
+        fn physical(field: &arrow_schema::Field) -> bool {
+            (field.metadata().is_empty() || uuid_field(field)) && match field.data_type() {
+                DataType::Struct(fields) => fields.iter().all(|field| physical(field)),
+                DataType::List(field) | DataType::FixedSizeList(field, _) => physical(field),
+                DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| {
+                    physical(field) && from_field(field).is_ok_and(|ty| rtdb_columnar::execution_type(&ty) == ty)
+                }),
+                DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
+                DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) |
+                DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) |
+                DataType::Timestamp(ArrowTime::Microsecond, Some(_)) => true,
+                _ => false,
+            }
+        }
+
+        fn patch_kind(ty: &LogicalType) -> bool {
             match ty {
-                LogicalType::Struct(fields) => fields.values().all(supported),
-                LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => supported(element),
-                LogicalType::Maybe(inner) => supported(inner),
+                LogicalType::Struct(fields) => fields.values().all(patch_kind),
+                LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => patch_kind(element),
+                LogicalType::Maybe(inner) => patch_kind(inner),
                 LogicalType::Null | LogicalType::Scalar(_) => true,
                 _ => false,
             }
         }
-        if !layout.types.values().all(|ty| supported(ty) && rtdb_columnar::execution_type(ty) == *ty) {
-            return Ok(None);
-        }
-        Self::from_source(array, layout, source_bytes, memory)
+
+        self.array.is_empty() || !self.array.fields().iter().all(|field| physical(field) && canonical_uuid_unions(field))
+            || patch && !self.layout.types.values().all(|ty| patch_kind(ty) && rtdb_columnar::execution_type(ty) == *ty)
     }
 
     pub(crate) fn patch_parameter(&self, iids: &[rtdb_types::Iid], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
@@ -326,7 +400,7 @@ impl ArrowDocuments {
         let bound = self.array.get_array_memory_size().checked_add(iids.len().checked_mul(32).ok_or_else(overflow)?)
             .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?;
         let reservation = memory.reserve(bound)?;
-        let iid_array = arrow_array::FixedSizeBinaryArray::try_from_iter(iids.iter().map(|iid| iid.0.as_slice()))
+        let iid_array = arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(iids.iter().map(|iid| Some(iid.0.as_slice())), 16)
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
         let fields = vec![
             Field::new("_iid", DataType::FixedSizeBinary(16), false),
@@ -345,6 +419,7 @@ impl ArrowDocuments {
 
     pub(crate) fn array(&self) -> &StructArray { &self.array }
     pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
+    pub(crate) fn column_type(&self, name: &str) -> Option<&LogicalType> { self.layout.types.get(name) }
     pub(crate) fn source_bytes(&self) -> Option<usize> { self.source_bytes }
 
     pub(crate) fn to_rows(&self, omit_nulls: bool, memory: &Arc<MemoryBudget>) -> Result<Documents> {
@@ -372,7 +447,14 @@ impl ArrowDocuments {
 }
 
 fn ingest_type(field: &arrow_schema::Field, array: &dyn Array, mode: IngestMode) -> Result<Option<LogicalType>> {
-    if !field.metadata().is_empty() || array.is_empty() || !array.is_valid(0) { return Ok(None); }
+    if !field.metadata().is_empty() || array.is_empty()
+        || matches!(mode, IngestMode::Mutation) && !array.is_valid(0) {
+        return Ok(None);
+    }
+    if matches!(mode, IngestMode::External) && array.logical_null_count() == array.len() {
+        if field.data_type() == &DataType::Null && !field.is_nullable() { return Ok(None); }
+        return Ok(Some(LogicalType::Null));
+    }
     Ok(Some(match field.data_type() {
         DataType::Struct(fields) if array.null_count() == 0 => {
             let array = array.as_struct();
@@ -397,8 +479,9 @@ fn ingest_type(field: &arrow_schema::Field, array: &dyn Array, mode: IngestMode)
             let Some(element) = ingest_type(field, array.values().as_ref(), mode)? else { return Ok(None); };
             LogicalType::List { kind: ListKind::FixedSizeList(*width), element: Box::new(element) }
         }
-        ty if ty != &DataType::Null && plain_scalar_field(field)
-            && (matches!(mode, IngestMode::External) || !matches!(ty, DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)) => {
+        ty if ty != &DataType::Null && (plain_scalar_field(field) || field.metadata().is_empty() && matches!(
+            ty, DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_)
+        )) && (matches!(mode, IngestMode::External) || !matches!(ty, DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)) => {
             rtdb_columnar::execution_field_type(&field.clone().with_nullable(array.null_count() != 0))?
         }
         _ => return Ok(None),
@@ -407,6 +490,9 @@ fn ingest_type(field: &arrow_schema::Field, array: &dyn Array, mode: IngestMode)
 
 fn ingest_layout(array: ArrayRef, target: &DataType) -> Result<ArrayRef> {
     if array.data_type() == target { return Ok(array); }
+    if *target == DataType::Null && array.logical_null_count() == array.len() {
+        return Ok(Arc::new(arrow_array::NullArray::new(array.len())));
+    }
     let data = array.to_data();
     let layout_error = |message| Anomaly::incorrect("rtdb.tx/document-schema", message);
     let children = match target {
@@ -436,7 +522,9 @@ pub(crate) fn contains_fixed_size_list(layout: &DataType) -> bool {
 }
 
 pub(crate) fn compatible_document_metadata(field: &arrow_schema::Field) -> bool {
-    field.metadata().is_empty() || uuid_field(field)
+    let metadata = field.metadata();
+    metadata.is_empty() || from_field(field).and_then(|ty| rtdb_columnar::to_field(field.name(), &ty))
+        .is_ok_and(|canonical| canonical.metadata() == metadata)
 }
 
 fn uuid_field(field: &arrow_schema::Field) -> bool {
@@ -529,6 +617,43 @@ pub(crate) fn plain_scalar_field(field: &arrow_schema::Field) -> bool {
 }
 
 #[test]
+fn temporal_ingest_preserves_arrow_layout_and_source_bytes() {
+    use rtdb_types::TimeUnit;
+    use arrow_schema::Field;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let docs = vec![
+        StructFields::from([
+            ("_id".into(), Value::I64(1)),
+            ("day".into(), Value::DateDay(2)),
+            ("millis".into(), Value::DateMilli(-86_400_001)),
+            ("time".into(), Value::Time { value: 3, unit: TimeUnit::Microsecond, bit_width: 64 }),
+            ("duration".into(), Value::Duration { value: 4, unit: TimeUnit::Nanosecond }),
+        ]),
+        StructFields::from([("_id".into(), Value::I64(2))]),
+    ];
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(arrow_array::Int64Array::from(vec![1, 2])),
+        Arc::new(arrow_array::Date32Array::from(vec![Some(2), None])),
+        Arc::new(arrow_array::Date64Array::from(vec![Some(-86_400_001), None])),
+        Arc::new(arrow_array::Time64MicrosecondArray::from(vec![Some(3), None])),
+        Arc::new(arrow_array::DurationNanosecondArray::from(vec![Some(4), None])),
+    ];
+    let fields = docs[0].keys().zip(&columns).map(|(name, column)| {
+        Field::new(name, column.data_type().clone(), name != "_id")
+    }).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let batch = OwnedBatch::new(batch, &memory).unwrap();
+    let documents = ArrowDocuments::from_ingest_batch(&batch, &memory).unwrap().expect("temporal Arrow admission");
+    let table = TableRef::new("public", "docs");
+    let arrow = TxOp::PutArrowDocs { table: table.clone(), documents };
+    let rows = TxOp::PutDocs { table, documents: Documents::new(docs, &memory).unwrap(), valid_from: None, valid_to: None };
+    let encode = |op| crate::SourceTransaction::new(vec![op], SubmitOptions::default(), &memory).unwrap().encode().unwrap();
+    let arrow = encode(arrow);
+    assert_eq!(arrow.as_slice(), encode(rows).as_slice());
+}
+
+#[test]
 fn scalar_ingest_batches_match_row_encoded_source_bytes() {
     use arrow_array::{BooleanArray, Int64Array, StringArray, UInt64Array};
     use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
@@ -565,7 +690,35 @@ fn scalar_ingest_batches_match_row_encoded_source_bytes() {
     assert_eq!(encoded(arrow_operation).as_slice(), encoded(row_operation).as_slice());
 
     let null_first = OwnedBatch::new(batch.batch().slice(1, 1), &memory).unwrap();
-    assert!(ArrowDocuments::from_ingest_batch(&null_first, &memory).unwrap().is_none());
+    let null_first = ArrowDocuments::from_ingest_batch(&null_first, &memory).unwrap().unwrap();
+    assert_eq!(null_first.array().column_by_name("number").unwrap().data_type(), &DataType::Null);
+}
+
+#[test]
+fn bulk_argument_pages_keep_source_order_and_canonicalize_leading_nulls() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::Field;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, true),
+    ]));
+    let page = |id, payload: Option<&str>| {
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(StringArray::from(vec![payload])),
+        ];
+        OwnedBatch::new(RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap(), &memory).unwrap()
+    };
+    let mut args = SqlArguments::from_arrow(page(7, None), &memory).unwrap();
+    args.append(SqlArguments::from_arrow(page(3, Some("next")), &memory).unwrap()).unwrap();
+    let docs = args.ingest_documents(&memory).unwrap().unwrap();
+    let ids = docs.array().column_by_name("_id").unwrap().as_primitive::<Int64Type>();
+    assert_eq!(ids.values().as_ref(), &[7, 3]);
+    let payload = docs.array().column_by_name("payload").unwrap().as_string::<i32>();
+    assert!(payload.is_null(0));
+    assert_eq!(payload.value(1), "next");
 }
 
 #[test]
@@ -684,6 +837,30 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
                 Ok(data) => arrow_array::make_array(data),
                 Err(_) => return Ok(None),
             }
+        }
+        DataType::Map(field, sorted) => {
+            let source = array.as_map();
+            let entries = Arc::new(source.entries().clone()) as ArrayRef;
+            let Some(values) = normalized_document_array(&entries, memory, normalize_unions)? else { return Ok(None); };
+            if Arc::ptr_eq(&values, &entries) { return Ok(Some(Arc::clone(array))); }
+            let field = Arc::new(normalized_field(field, &values));
+            let result = source.to_data().into_builder().data_type(DataType::Map(field, *sorted))
+                .child_data(vec![values.to_data()]).build();
+            match result {
+                Ok(data) => arrow_array::make_array(data),
+                Err(_) => return Ok(None),
+            }
+        }
+        DataType::RunEndEncoded(ends, values) => {
+            let source = arrow_schema::Field::new("", DataType::RunEndEncoded(Arc::clone(ends), Arc::clone(values)), false);
+            let mut target = values.as_ref().clone();
+            if array.logical_null_count() != 0 { target = target.with_nullable(true); }
+            let bytes = rtdb_columnar::arrow_relayout_bound(array.as_ref(), &source, &target)?;
+            let _scratch = memory.reserve(bytes)?;
+            let (_, expanded) = rtdb_columnar::relayout_arrow_column(Arc::clone(array), &source, &target)?;
+            let owned = memory.reserve(expanded.get_array_memory_size())?;
+            let expanded = rtdb_columnar::retain_array(expanded, &owned)?;
+            return normalized_document_array(&expanded, memory, normalize_unions);
         }
         DataType::Union(_, arrow_schema::UnionMode::Dense) if normalize_unions => return union::normalize(array, memory),
         _ => Arc::clone(array),
@@ -869,6 +1046,28 @@ impl SqlArguments {
             _ => None,
         }
     }
+    /// Builds one document operation from a stream bound as uniformly typed Arrow pages.
+    pub fn ingest_documents(&self, memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
+        let _pages = memory.reserve(self.chunks.len().checked_mul(2 * std::mem::size_of::<&RecordBatch>()).ok_or_else(overflow)?)?;
+        let Some(pages) = self.uniform_arrow_pages() else { return Ok(None); };
+        ArrowDocuments::from_external_pages(&pages, memory)
+    }
+
+    pub fn ingest_named_documents(&self, names: &[String], memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
+        if let Some(documents) = self.ingest_documents(memory)? { return Ok(Some(documents)); }
+        if !self.chunks.iter().any(|(_, chunk)| matches!(chunk.as_ref(), ArgumentChunk::Arrow { .. })) { return Ok(None); }
+        let batch = self.source_columnar_batch(memory)?;
+        let batch = batch.batch();
+        if names.len() != batch.num_columns() {
+            return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Ingest column names disagree with their Arrow pages"));
+        }
+        let fields = batch.schema_ref().fields().iter().zip(names).map(|(field, name)| field.as_ref().clone().with_name(name)).collect::<Vec<_>>();
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        let record = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), batch.columns().to_vec(), &options)
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        ArrowDocuments::from_external_pages(&[&record], memory)
+    }
+
     pub fn rows(&self) -> impl Iterator<Item = Result<ArgumentRow<'_>>> {
         self.indexed_rows().map(|row| row.map(|(_, values)| values))
     }
@@ -1079,6 +1278,18 @@ fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tx/allocation-overflow", "Tr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_document_layouts_release_translation_scratch_before_the_next_layout() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let fields = Fields::from(vec![arrow_schema::Field::new("_id", DataType::Int64, false)]);
+        let layouts = (0..128).map(|_| DecodedDocumentLayout::new(&fields, &memory)).collect::<Result<Vec<_>>>()?;
+        assert!(memory.used_bytes() > 0);
+        drop(layouts);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
     #[test]
     fn empty_allocated_messages_retain_their_capacity_and_absent_messages_allocate_none() {
         let absent = Anomaly::new_nullable(rtdb_types::AnomalyCategory::Fault, "test/error", None);

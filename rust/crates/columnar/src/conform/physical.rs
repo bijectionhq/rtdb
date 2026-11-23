@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use arrow_array::{Array, ArrayRef, NullArray, UnionArray, make_array};
-use arrow_buffer::ScalarBuffer;
+use arrow_array::{Array, ArrayRef, NullArray, PrimitiveArray, RunArray, UnionArray, make_array, types::{Int16Type, Int32Type, Int64Type, RunEndIndexType}};
+use arrow_buffer::{ArrowNativeType, ScalarBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_types::{LogicalType as L, Result};
@@ -15,6 +15,22 @@ pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field,
     };
     if undefined_union(source, target, event) {
         return null_bytes(target, null_copy_bytes(target, Padding::Undefined)?);
+    }
+    if let DataType::RunEndEncoded(ends, values) = target.data_type() {
+        if let DataType::RunEndEncoded(source_ends, source_values) = source.data_type()
+            && source_ends.data_type() == ends.data_type() {
+            return additional_bytes(&data.child_data()[1], source_values, values, event);
+        }
+        let end_bytes = super::multiply(data.len(), 64)?;
+        return super::add(end_bytes, additional_bytes(data, source, values, event)?);
+    }
+    if matches!(source.data_type(), DataType::RunEndEncoded(..)) {
+        let array = make_array(data.clone());
+        let initial = super::multiply(target.size(), 8)?;
+        return (0..data.len()).try_fold(initial, |bytes, row| {
+            let source = estimate_copy_cell_bytes(source, array.as_ref(), row)?;
+            super::add(bytes, super::add(super::multiply(source, 4)?, super::multiply(target.size(), 2)?)?)
+        });
     }
     match (source.data_type(), target.data_type()) {
         (source_type, DataType::Union(targets, UnionMode::Dense)) => {
@@ -65,6 +81,29 @@ fn undefined_union(source: &Field, target: &Field, event: bool) -> bool {
 pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field, event: bool) -> Result<(Field, ArrayRef)> {
     if undefined_union(source, target, event) {
         return Ok((target.clone(), undefined_cells(target.data_type(), array.len())?));
+    }
+    if let DataType::RunEndEncoded(ends, values) = target.data_type()
+        && !matches!(source.data_type(), DataType::RunEndEncoded(source_ends, _) if source_ends.data_type() == ends.data_type()) {
+        let (field, array) = relayout(array, source, values, event)?;
+        let runs = match ends.data_type() {
+            DataType::Int16 => pack_runs::<Int16Type>(&array)?,
+            DataType::Int32 => pack_runs::<Int32Type>(&array)?,
+            DataType::Int64 => pack_runs::<Int64Type>(&array)?,
+            _ => return Err(incompatible()),
+        };
+        let layout = DataType::RunEndEncoded(Arc::clone(ends), Arc::new(field));
+        let data = runs.to_data().into_builder().data_type(layout.clone()).build().map_err(crate::arrow_error)?;
+        return Ok((target.clone().with_data_type(layout), make_array(data)));
+    }
+    if let DataType::RunEndEncoded(ends, values) = source.data_type()
+        && !matches!(target.data_type(), DataType::RunEndEncoded(..)) {
+        let expanded = match ends.data_type() {
+            DataType::Int16 => unpack_runs::<Int16Type>(array.as_ref(), event)?,
+            DataType::Int32 => unpack_runs::<Int32Type>(array.as_ref(), event)?,
+            DataType::Int64 => unpack_runs::<Int64Type>(array.as_ref(), event)?,
+            _ => return Err(incompatible()),
+        };
+        return relayout(expanded, values, target, event);
     }
     if let DataType::Union(fields, UnionMode::Dense) = target.data_type() {
         return union(array, source, target, fields, event);
@@ -121,6 +160,19 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field, event: b
     let field = target.clone().with_data_type(data_type.clone()).with_nullable(target.is_nullable() || source.is_nullable());
     let data = data.into_builder().data_type(data_type).child_data(children).build().map_err(crate::arrow_error)?;
     Ok((field, make_array(data)))
+}
+
+fn pack_runs<R: RunEndIndexType>(array: &ArrayRef) -> Result<ArrayRef> {
+    let ends = (1..=array.len()).map(|end| R::Native::from_usize(end).ok_or_else(incompatible)).collect::<Result<Vec<_>>>()?;
+    let ends = PrimitiveArray::<R>::new(ends.into(), None);
+    Ok(Arc::new(RunArray::<R>::try_new(&ends, array.as_ref()).map_err(crate::arrow_error)?))
+}
+
+fn unpack_runs<R: RunEndIndexType>(array: &dyn Array, event: bool) -> Result<ArrayRef> {
+    let runs = array.as_any().downcast_ref::<RunArray<R>>().ok_or_else(incompatible)?;
+    let selected = (0..runs.len()).map(|row| Some((0, runs.get_physical_index(row)))).collect::<Vec<_>>();
+    let values = &[runs.values().as_ref()];
+    if event { crate::copy_event_cells(values, &selected) } else { copy_nullable_cells(values, &selected) }
 }
 
 fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields, event: bool) -> Result<(Field, ArrayRef)> {

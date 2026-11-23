@@ -596,9 +596,8 @@ impl ProtocolSession {
                 for (index, column) in columns.iter().enumerate() {
                     let array = batch.batch().column(index).as_ref();
                     if direct_cell(column.ty, column.format, schema.field(index), array, row, &environment, &mut body)? { continue; }
-                    let _cell = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(schema.field(index), array, row)?)?;
-                    let value = rtdb_columnar::read_value_as(&query.types[index], schema.field(index), array, row)?;
-                    match rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)? {
+                    let cell = rtdb_columnar::ArrowCell { field: schema.field(index), array, row };
+                    match rtdb_pg_codec::encode_arrow(column.ty, column.format, &query.types[index], cell, &environment, &memory)? {
                         None => body.null_cell()?,
                         Some(encoded) => body.cell(encoded.as_slice())?,
                     }

@@ -1,0 +1,107 @@
+= Arrow boundaries in the ordinary RTDB database
+
+This inventory follows ordinary Rust RTDB table data from ingress through the source and replica logs, live staging, persisted tries, query execution, and result encoding.
+Owned relations, ordered and secondary search index internals, and the JVM XTDB engine have separate execution paths.
+An Arrow payload can be one physical array or a selection over several arrays whose physical fields differ.
+Scalars decoded while computing an expression, comparing cells, or interpreting an external protocol are listed at the stage where they are needed.
+
+[cols="1,3,3",options="header"]
+|===
+|Stage
+|Payload representation
+|Conversion boundary
+
+|Arrow uploads
+|Embedded ADBC, Flight SQL and pgwire Arrow COPY construct Arrow document batches from the bound record batches.
+ADBC can combine bound pages in input order.
+The uploader aligns physical layouts for source encoding and preserves empty upload operations.
+|Arrow C Data import copies foreign buffers into native allocations.
+Arrow file and stream imports open IPC buffers and validate document fields before submission.
+See link:../../rust/crates/tx/src/values.rs[document admission].
+
+|PostgreSQL CDC and non-Arrow ingress
+|The built-in PostgreSQL mirror builds snapshot and WAL batches and stages their document vectors into the live index.
+|The PostgreSQL wire decoder interprets the text of each reached field, including the old tuple for unchanged TOAST fields.
+The public PostgreSQL decoder and custom indexer interface expose row operations through compatibility adapters.
+Text COPY, Transit and document-map APIs provide their data in their documented input representation.
+See link:../../rust/crates/pg-source/src/decoder.rs[WAL], link:../../rust/crates/pg-source/src/snapshot.rs[snapshots], and link:../../rust/crates/pg-source/src/indexer.rs[mirror staging].
+
+|SQL arguments and static mutations
+|Bound Arrow arguments keep their vectors through source encoding and bind by position at replay.
+Static mutation projections select argument buffers where the projection supports it and write computed results to Arrow document groups.
+|Generic expressions read their reached arguments and compute scalar or nested result cells.
+Static DML infers decimal precision from coefficients where the document writer requires it.
+See link:../../rust/crates/tx/src/submission.rs[static SQL] and link:../../rust/crates/tx/src/values/arguments.rs[argument alignment].
+
+|Source transactions and receipts
+|Ordinary puts, patches, and create-only inserts replay as Arrow documents.
+Old puts without an IID vector derive identities from the document ID column.
+The source writer combines document arrays and preserves the existing operation and field tags.
+|IID calculation reads the ID cell.
+A missing ID includes the affected document in the public anomaly context.
+Receipt hashing canonicalizes legacy document and argument layouts, decoding the cells needed to reproduce historical bytes.
+See link:../../rust/crates/tx/src/source.rs[source encoding and replay].
+
+|Resolution and staging
+|Put, create-only insert, and SQL DML stage Arrow document payloads.
+PATCH binds document and IID vectors and carries selected payloads through gap filling and staging.
+|Valid-time bounds and IIDs are interpreted as event headers.
+Create-only inserts check the transaction's preceding writes before staging.
+Delete and erase controls, transaction results, and retry and receipt markers construct their own small records.
+See link:../../rust/crates/tx/src/resolver.rs[resolution] and link:../../rust/crates/query/src/patch.rs[gap filling].
+
+|Replica log, live index and persistence
+|The live index, replica event payloads, persisted tries and compaction carry Arrow events.
+|Trie navigation, event headers, temporal resolution, file metadata and compaction decisions use Rust control values.
+Explicit event readers can produce a row for callers of the event API.
+See link:../../rust/crates/index/src/live.rs[live index], link:../../rust/crates/format/src/data.rs[event codec] and link:../../rust/crates/maintenance/src[maintenance].
+
+|Dispatch, scans and expressions
+|Ordinary plans, including semantic-page queries, scan, filter and project Arrow payloads and selected positions.
+General expressions publish Arrow output, including mixed layouts represented by positions in their original arrays.
+|System and inspection relations synthesize control and metadata records.
+Generic expression evaluation may decode a scalar or a structured operand when its semantics require the full operand.
+See link:../../rust/crates/query/src/operators.rs[dispatch] and link:../../rust/crates/query/src/columnar.rs[expression and selection operators].
+
+|Literal, list and page operators
+|Literal and evaluated list relations publish Arrow columns.
+UNNEST carries parent positions and gathers its output elements, and ordinality appends an Arrow vector.
+|Computed list operands are evaluated as required by the expression.
+See link:../../rust/crates/query/src/column_table.rs[column tables] and link:../../rust/crates/query/src/list.rs[lists and ordinality].
+
+|Sort, top-N and windows
+|Sorts and windows retain their payload positions, including for computed keys.
+Spill runs carry Arrow IPC and can preserve different field layouts in the same semantic page.
+|Sorts compare native keys directly where available and otherwise read the reached key operands.
+Row numbers, ranks and partition boundaries use native scalar state.
+See link:../../rust/crates/query/src/sort/batches.rs[sort] and link:../../rust/crates/query/src/window.rs[windows].
+
+|Joins, membership and correlation
+|Batch joins and marks gather selected payloads and spill Arrow batches and selections.
+Correlated execution binds its outer positions and retains dependent payload vectors.
+|Generic predicates read the cells on either side that their expression demands.
+Lookup hashes, join positions and match flags remain native state.
+See link:../../rust/crates/query/src/batch_join.rs[joins], link:../../rust/crates/query/src/mark.rs[marks], and link:../../rust/crates/query/src/context.rs[outer bindings].
+
+|Grouping, aggregate collections and set operations
+|Grouping, DISTINCT and set operations retain key vectors and payload positions.
+Collection and percentile aggregates identify their arguments by position and emit Arrow columns.
+|Evaluated aggregate predicates, generic key comparisons and scalar accumulator updates use their reached cells.
+See link:../../rust/crates/query/src/aggregate.rs[aggregation] and link:../../rust/crates/query/src/set_keys.rs[set and group keys].
+
+|Materialization, exchange and result encoding
+|Materialized bindings, delegated fragments and spill records carry Arrow IPC.
+ADBC and Flight SQL publish Arrow results.
+Compatible result fields retain their buffers and format changes are confined to the affected column.
+|The result adapter can decode bounded groups of cells for layouts that need a semantic conversion.
+Pgwire encodes PostgreSQL result cells, including nested or typed values handled by its scalar codec.
+The fragment reader can read older frames that contain serialized values.
+See link:../../rust/crates/query/src/cursor.rs[results], link:../../rust/crates/query/src/spill.rs[spill], and link:../../rust/crates/query/src/fragment.rs[exchange].
+|===
+
+== Control and protocol representations
+
+* SQL and XTQL parsing, planning, catalog lookup, transaction dispatch, hashes and selected addresses use Rust control representations.
+* The source and replica log envelopes transport Arrow payloads with transaction and durability metadata.
+* PostgreSQL protocols and explicit row APIs retain their public representations.
+* Block, table and trie catalogs retain the metadata needed to open persisted Arrow files.

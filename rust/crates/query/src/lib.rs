@@ -2,6 +2,7 @@ mod accelerate;
 mod aggregate;
 mod context;
 mod parameters;
+pub use parameters::BoundParameters;
 mod cursor;
 mod runtime_schema;
 mod operators;

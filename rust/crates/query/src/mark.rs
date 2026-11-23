@@ -98,15 +98,14 @@ pub(crate) struct BatchMembership {
     state: MembershipState,
     keys: (usize, usize),
     facts: CandidateFacts,
-    spill_comparison: Option<Expr>,
+    spill: bool,
     execution: Execution,
 }
 
 enum MembershipState {
     Build { build: ProbeInput, probe: ProbeInput },
     Memory { probe: BoxBatchCursor, projected: bool, index: BatchKeyIndex },
-    Spill { disk: MembershipSpill, restart: Option<(ProbeInput, ProbeInput)> },
-    Rows(BoxPageCursor),
+    Spill(MembershipSpill),
     Done,
 }
 
@@ -121,18 +120,14 @@ struct MembershipSpill {
 
 impl BatchMembership {
     pub fn new(build: ProbeInput, probe: ProbeInput, keys: (usize, usize),
-        spill_comparison: Option<Expr>, execution: Execution) -> Self {
-        Self { state: MembershipState::Build { build, probe }, keys, spill_comparison,
+        spill: bool, execution: Execution) -> Self {
+        Self { state: MembershipState::Build { build, probe }, keys, spill,
             facts: CandidateFacts { empty: true, null: false, nested: false }, execution }
     }
 
     async fn open(input: ProbeInput) -> Result<(BoxBatchCursor, bool)> {
-        let batches = crate::operators::build_batch_input(Arc::clone(&input.runtime), input.execution.clone(), input.pushdowns, input.output).await?;
-        if let Some(batches) = batches { return Ok(batches); }
-        let memory = Arc::clone(&input.execution.context.memory);
-        let width = input.runtime.schema().len();
-        let pages = build_pages(input.runtime, input.execution).await?;
-        Ok((crate::columnar::batches_from_pages(pages, width, memory), false))
+        crate::operators::build_batch_input(input.runtime, input.execution, input.pushdowns, input.output).await?
+            .ok_or_else(|| invalid("mark-input", "Membership input cannot open as Arrow"))
     }
 
     fn is_null(column: &Column, row: usize, context: &crate::QueryContext) -> Result<bool> {
@@ -142,7 +137,7 @@ impl BatchMembership {
     }
 
     async fn build(&mut self, build: ProbeInput, probe: ProbeInput) -> Result<MembershipState> {
-        use crate::join_spill::{BlockWriter, compatible_schema, layout_error};
+        use crate::join_spill::BlockWriter;
         let context = &self.execution.context;
         let memory = &context.memory;
         let (probe_key, build_key) = self.keys;
@@ -168,7 +163,7 @@ impl BatchMembership {
                 let key = ColumnBatch::take_rows_with_custody(&[&batch], &rows, &[build_key], true, memory)?;
                 key.compact_group_keys(&rows, memory)?
             };
-            if self.spill_comparison.is_none() {
+            if !self.spill {
                 index.build(key, projected, context)?;
                 continue;
             }
@@ -178,7 +173,6 @@ impl BatchMembership {
             }
             count = count.checked_add(i64::try_from(key.len).map_err(|_| mark_size())?).ok_or_else(mark_size)?;
             if count > context.options.join_build_rows {
-                if !compatible_schema(&schema) || !compatible_schema(probe.runtime.schema()) { return Err(layout_error()); }
                 let mut spill = BlockWriter::new(&schema, context)?;
                 for key in held.drain(..) { spill.append(key, context)?; }
                 spill.append(key, context)?;
@@ -205,14 +199,7 @@ impl BatchMembership {
         }
         let probe = writer.finish(context)?.shuffle(build.count(), context, |batch, row| membership_hash(batch, row, probe_key, context))?;
         let disk = MembershipSpill { build, probe, index: None, build_partition: 0, probe_partition: 0, ready: None };
-        Ok(MembershipState::Spill { disk, restart: None })
-    }
-
-    fn rows(&self, build: ProbeInput, probe: ProbeInput) -> Result<MembershipState> {
-        let comparison = self.spill_comparison.as_ref().expect("Spilled membership retains its comparison");
-        let input = DeferredInput::new(Arc::clone(&probe.runtime), probe.execution, crate::inspection::Constraints::default(), probe.pushdowns);
-        let cursor = Mark::new(input, &probe.runtime, build.runtime, Vec::new(), None, comparison.clone(), self.execution.clone())?;
-        Ok(MembershipState::Rows(Box::new(cursor)))
+        Ok(MembershipState::Spill(disk))
     }
 
     fn mark_batch(&self, mut batch: ColumnBatch, index: &mut BatchKeyIndex, projected: bool) -> Result<ColumnBatch> {
@@ -296,21 +283,11 @@ fn mark_size() -> rtdb_types::Anomaly {
 #[async_trait]
 impl BatchCursor for BatchMembership {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        use crate::batch_join::retry_row_spill;
         loop {
             self.execution.context.check_cancelled()?;
             match std::mem::replace(&mut self.state, MembershipState::Done) {
                 MembershipState::Build { build, probe } => {
-                    let restart = self.spill_comparison.as_ref().map(|_| (build.clone(), probe.clone()));
-                    self.state = match self.build(build, probe).await {
-                        Ok(MembershipState::Spill { disk, .. }) => MembershipState::Spill { disk, restart },
-                        Ok(state) => state,
-                        Err(error) if retry_row_spill(&error) && restart.is_some() => {
-                            let (build, probe) = restart.expect("Repeatable membership inputs are retained");
-                            self.rows(build, probe)?
-                        }
-                        Err(error) => return Err(error),
-                    };
+                    self.state = self.build(build, probe).await?;
                 }
                 MembershipState::Memory { mut probe, projected, mut index } => {
                     while let Some(batch) = poll_nested_batch(probe.as_mut()).await? {
@@ -322,24 +299,10 @@ impl BatchCursor for BatchMembership {
                     }
                     return Ok(None);
                 }
-                MembershipState::Spill { mut disk, restart } => match disk.next(self) {
-                    Ok(Some(batch)) => {
-                        self.state = MembershipState::Spill { disk, restart: None };
-                        return Ok(Some(batch));
-                    }
-                    Ok(None) => return Ok(None),
-                    Err(error) if retry_row_spill(&error) && restart.is_some() => {
-                        let (build, probe) = restart.expect("Repeatable membership inputs are retained");
-                        drop(disk);
-                        self.state = self.rows(build, probe)?;
-                    }
-                    Err(error) => return Err(error),
-                },
-                MembershipState::Rows(mut rows) => {
-                    let Some(page) = rows.next_page().await? else { return Ok(None); };
-                    let batch = ColumnBatch::from_page(&page, &self.execution.context.memory)?;
-                    self.state = MembershipState::Rows(rows);
-                    return Ok(Some(batch));
+                MembershipState::Spill(mut disk) => {
+                    let output = disk.next(self)?;
+                    if output.is_some() { self.state = MembershipState::Spill(disk); }
+                    return Ok(output);
                 }
                 MembershipState::Done => return Ok(None),
             }
@@ -543,33 +506,175 @@ pub(crate) async fn correlated_mark(row: &OwnedRow,mut dependent: BoxPageCursor,
     Ok(result)
 }
 
-pub(crate) async fn correlated_batch_mark(row: &OwnedRow, mut dependent: BoxBatchCursor, comparison: &Expr,
-    schema: &Schema, execution: &Execution) -> Result<Value> {
-    let context = &execution.context;
-    let memory = &context.memory;
-    let width = row.values.len();
-    let positions = crate::columnar::expression_columns(comparison, schema)?.into_iter()
-        .filter_map(|position| position.checked_sub(width)).collect::<Vec<_>>();
-    let mut result = Value::Bool(false);
+struct MarkRow<'a> {
+    probe: crate::columnar::BatchRow<'a>,
+    candidate: crate::columnar::BatchRow<'a>,
+}
+
+impl rtdb_expr::RowInput for MarkRow<'_> {
+    fn arrow_cell(&self, index: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
+        if index < self.probe.batch.columns.len() { self.probe.arrow_cell(index) }
+        else { self.candidate.arrow_cell(index - self.probe.batch.columns.len()) }
+    }
+
+    fn value(&self, index: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
+        if index < self.probe.batch.columns.len() { self.probe.value(index, scope) }
+        else { self.candidate.value(index - self.probe.batch.columns.len(), scope) }
+    }
+}
+
+async fn compare_page(
+    probe: &crate::columnar::BatchRow<'_>, page: &ColumnBatch, invocation: &rtdb_expr::ExpressionInvocation<'_>,
+    mark: &mut Option<bool>, short_circuit: bool, execution: &Execution,
+) -> Result<()> {
+    for row in 0..page.len {
+        execution.context.check_cancelled_at(row)?;
+        let input = MarkRow {
+            probe: crate::columnar::BatchRow { batch: probe.batch, row: probe.row, admit_dates: probe.admit_dates },
+            candidate: crate::columnar::BatchRow { batch: page, row, admit_dates: true },
+        };
+        let scope = execution.scope()?;
+        match execution.evaluate_invocation_row(&scope, invocation, rtdb_expr::ExpressionRow::Borrowed(&input)).await? {
+            Value::Bool(true) => {
+                *mark = Some(true);
+                if short_circuit { break; }
+            }
+            Value::Null if *mark != Some(true) => *mark = None,
+            Value::Bool(false) | Value::Null => (),
+            _ => return Err(invalid("mark-type", "Mark comparison must return Boolean or null")),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn correlated_batch_mark(batch: &ColumnBatch, row: usize, mut dependent: BoxBatchCursor, comparison: &Expr,
+    schema: &Schema, execution: &Execution) -> Result<Option<bool>> {
+    let mut mark = Some(false);
+    let probe = crate::columnar::BatchRow { batch, row, admit_dates: true };
     while let Some(page) = poll_nested_batch(dependent.as_mut()).await? {
-        page.validate_readable(context)?;
+        page.validate_readable(&execution.context)?;
         let metadata = execution.scope()?;
         let invocation = execution.prepare_expression(comparison, schema, &metadata)?;
-        for candidate in 0..page.len {
-            context.check_cancelled_at(candidate)?;
-            let right = page.expression_row(candidate, &positions, memory)?;
-            let combined = OwnedRow::copy_parts(&[&row.values, &right.values], 0, 0, memory)?;
-            let scope = execution.scope()?;
-            match execution.evaluate_invocation(&scope, &invocation, &combined.values).await? {
-                Value::Bool(true) => result = Value::Bool(true),
-                Value::Null if result != Value::Bool(true) => result = Value::Null,
-                Value::Bool(false) | Value::Null => (),
-                _ => return Err(invalid("mark-type", "Mark comparison must return Boolean or null")),
+        compare_page(&probe, &page, &invocation, &mut mark, false, execution).await?;
+        if mark == Some(true) { break; }
+    }
+    Ok(mark)
+}
+
+pub(crate) struct SharedBatchMark {
+    state: SharedState,
+    schema: Schema,
+    comparison: Expr,
+    execution: Execution,
+}
+
+enum SharedState {
+    Unopened { build: ProbeInput, probe: ProbeInput },
+    Open { candidates: CandidatePages, probe: BoxBatchCursor },
+    Done,
+}
+
+enum CandidatePages {
+    Memory(Vec<ColumnBatch>, Arc<rtdb_columnar::MemoryReservation>),
+    Spill(Arc<crate::spill::SpillFile>, usize),
+}
+
+impl SharedBatchMark {
+    pub fn new(build: ProbeInput, probe: ProbeInput, schema: Schema, comparison: Expr, execution: Execution) -> Self {
+        Self { state: SharedState::Unopened { build, probe }, schema, comparison, execution }
+    }
+
+    async fn candidates(&mut self, build: ProbeInput) -> Result<CandidatePages> {
+        let context = &self.execution.context;
+        let schema = build.runtime.schema().clone();
+        let (mut input, _) = BatchMembership::open(build).await?;
+        let mut batches = Vec::new();
+        let mut rows = 0i64;
+        let mut inventory = context.memory.reserve(256)?;
+        let mut spill = None::<crate::spill::SpillWriter>;
+        while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
+            batch.validate_readable(context)?;
+            if batch.len == 0 { continue; }
+            rows = rows.checked_add(i64::try_from(batch.len).map_err(|_| mark_size())?).ok_or_else(mark_size)?;
+            if spill.is_none() && rows > context.options.join_build_rows {
+                let mut writer = context.spill.create()?;
+                for held in batches.drain(..) { writer.write_columns(&held, &schema, &context.memory)?; }
+                spill = Some(writer);
+            }
+            if let Some(writer) = &mut spill {
+                writer.write_columns(&batch, &schema, &context.memory)?;
+            } else {
+                let bytes = (batches.len() + 1).checked_mul(4 * std::mem::size_of::<ColumnBatch>()).ok_or_else(mark_size)?;
+                Arc::get_mut(&mut inventory).expect("Mark owns its batch inventory").grow_to(bytes)?;
+                batches.push(batch);
             }
         }
-        if result == Value::Bool(true) { break; }
+        match spill {
+            Some(writer) => Ok(CandidatePages::Spill(writer.finish()?, schema.len())),
+            None => Ok(CandidatePages::Memory(batches, inventory)),
+        }
     }
-    Ok(result)
+
+    async fn apply(&mut self, mut batch: ColumnBatch, candidates: &CandidatePages) -> Result<ColumnBatch> {
+        let context = &self.execution.context;
+        batch.validate_readable(context)?;
+        let memory = &context.memory;
+        let reservation = memory.reserve(batch.len.checked_mul(2).and_then(|bytes| bytes.checked_add(256)).ok_or_else(mark_size)?)?;
+        let metadata = self.execution.scope()?;
+        let invocation = self.execution.prepare_expression(&self.comparison, &self.schema, &metadata)?;
+        let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
+        let mut spill = match candidates {
+            CandidatePages::Spill(file, width) => Some((file.reader(Arc::clone(memory))?, *width)),
+            _ => None,
+        };
+        for row in 0..batch.len {
+            context.check_cancelled_at(row)?;
+            let probe = crate::columnar::BatchRow { batch: &batch, row, admit_dates: true };
+            let mut mark = Some(false);
+            match candidates {
+                CandidatePages::Memory(pages, _charge) => for page in pages {
+                    compare_page(&probe, page, &invocation, &mut mark, true, &self.execution).await?;
+                    if mark == Some(true) { break; }
+                },
+                CandidatePages::Spill(_, _) => {
+                    let (reader, width) = spill.as_mut().expect("The mark opened its candidate spill");
+                    reader.rewind()?;
+                    while let Some(page) = reader.read_columns(*width)? {
+                        compare_page(&probe, &page, &invocation, &mut mark, true, &self.execution).await?;
+                        if mark == Some(true) { break; }
+                    }
+                }
+            }
+            marks.append_option(mark);
+        }
+        let ty = LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("mark", &ty)?);
+        batch.append_column(Column::Arrow { array: Arc::new(marks.finish()), field, logical: Some(ty) }, reservation, memory)?;
+        Ok(batch)
+    }
+}
+
+#[async_trait]
+impl BatchCursor for SharedBatchMark {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        loop {
+            self.execution.context.check_cancelled()?;
+            match std::mem::replace(&mut self.state, SharedState::Done) {
+                SharedState::Unopened { build, probe } => {
+                    let candidates = self.candidates(build).await?;
+                    let (probe, _) = BatchMembership::open(probe).await?;
+                    self.state = SharedState::Open { candidates, probe };
+                }
+                SharedState::Open { candidates, mut probe } => {
+                    let Some(batch) = poll_nested_batch(probe.as_mut()).await? else { return Ok(None); };
+                    let output = self.apply(batch, &candidates).await?;
+                    self.state = SharedState::Open { candidates, probe };
+                    return Ok(Some(output));
+                }
+                SharedState::Done => return Ok(None),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

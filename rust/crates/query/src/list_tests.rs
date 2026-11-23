@@ -187,3 +187,21 @@ fn emissions_of_one_definition_retain_their_own_complete_parameter_fields() {
     }
     assert_eq!(execution.context.memory.used_bytes(), baseline);
 }
+
+#[tokio::test]
+async fn list_batches_keep_arrow_ordinals_after_skipping_semantic_pages() {
+    let execution = execution(1);
+    let input = list(series(1, 2_000_000_000, 1, false));
+    let field = Field { id: ColumnId(1), name: "n".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+    let relation = Arc::new(input.with_ordinality(field, OrdinalityScope::Relation).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut batches = crate::operators::build_columns(runtime, execution).await.unwrap().unwrap();
+    assert_eq!(batches.skip_complete_pages(1_500_000_001).unwrap(), 1_500_000_000);
+    let batch = batches.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.len, 3);
+    for column in &batch.columns {
+        let crate::columnar::Column::Arrow { array, .. } = column else { panic!("expected Arrow series and ordinality"); };
+        let values = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), [1_500_000_001, 1_500_000_002, 1_500_000_003]);
+    }
+}

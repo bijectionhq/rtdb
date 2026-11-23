@@ -5,7 +5,7 @@ use rtdb_types::{LogicalType, Result, Value};
 
 use crate::{cursor::OwnedRow, invalid};
 
-pub(crate) struct BoundParameters {
+pub struct BoundParameters {
     input: Input,
     types: Vec<LogicalType>,
     _reservation: Arc<MemoryReservation>,
