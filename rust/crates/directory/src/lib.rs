@@ -760,6 +760,9 @@ pub struct CheckpointStage {
     pub source_log_epoch: i32,
     pub checkpoint: Checkpoint,
     pub media: CellMedia,
+    /// Only the closed terminal transfer owner may open this staged inventory.
+    #[serde(default)]
+    pub transfer_only: bool,
     /// Digest of the exact target object inventory under the destination key.
     pub staged_manifest_sha256: Option<String>,
 }
@@ -1115,7 +1118,7 @@ fn prepare_checkpoint_transfer(
     if source.id != intent.source.to_string() || destination.id != intent.destination.to_string()
         || source.id == destination.id || source.org != intent.org || destination.org != intent.org
         || destination.name != intent.name || intent.operation.is_nil()
-        || intent.capture.is_nil() || stage.staged_manifest_sha256.is_none()
+        || intent.capture.is_nil() || !stage.transfer_only || stage.staged_manifest_sha256.is_none()
         || source.incarnation != stage.source_incarnation || source.log_epoch != stage.source_log_epoch
         || source.checkpoint != Some(stage.checkpoint) || stage.checkpoint.root_sha256.is_none()
         || capture.checkpoint != stage.checkpoint || capture.incarnation != source.incarnation

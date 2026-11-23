@@ -77,6 +77,7 @@ pub(crate) async fn discard_checkpoint_stage(
                 source_log_epoch: point.log_epoch,
                 checkpoint: point.checkpoint,
                 media: media.clone(),
+                transfer_only: false,
                 staged_manifest_sha256: None,
             }));
             match directory.create_deployment(tombstone).await {
@@ -85,7 +86,7 @@ pub(crate) async fn discard_checkpoint_stage(
             }
         }
     };
-    staged(&record, &request, &media)?;
+    staged(&record, &request, &media, false)?;
     if record.incarnation != 1
         || record.holder.is_some()
         || record.checkpoint.is_some()
@@ -121,6 +122,18 @@ pub async fn stage_checkpoint(
     request: CheckpointStageIntent,
     hosted_task: Option<HostedTask>,
 ) -> Result<CheckpointStage> {
+    stage_checkpoint_for(directory, archive, storage, keys, request, hosted_task, false).await
+}
+
+pub(super) async fn stage_checkpoint_for(
+    directory: Arc<dyn Directory>,
+    archive: &CellStorage,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    request: CheckpointStageIntent,
+    hosted_task: Option<HostedTask>,
+    transfer_only: bool,
+) -> Result<CheckpointStage> {
     if request.source.is_nil()
         || request.capture.is_nil()
         || request.operation.is_nil()
@@ -139,7 +152,7 @@ pub async fn stage_checkpoint(
         keys: keys.custody_namespace()?,
     };
     if let Some(stored) = directory.deployment(&target_id).await? {
-        if let Some(complete) = staged(&stored, &request, &media)? {
+        if let Some(complete) = staged(&stored, &request, &media, transfer_only)? {
             return Ok(complete);
         }
     }
@@ -151,8 +164,13 @@ pub async fn stage_checkpoint(
         .filter(|(_, manifest)| manifest == &request.source_manifest_sha256)
         .ok_or_else(|| inconsistent("The source capture has another manifest"))?;
     require_capture_open(&source, request.capture)?;
+    if transfer_only && (source.writer_pool().is_none()
+        || !super::same_incarnation(&source, &point) || source.checkpoint != Some(point.checkpoint))
+    {
+        return Err(inconsistent("A terminal transfer requires the original current source checkpoint"));
+    }
     super::admit_lifetime_restore(
-        directory.as_ref(), archive, keys, &point, &manifest, hosted_task.as_ref(), false,
+        directory.as_ref(), archive, keys, &point, &manifest, hosted_task.as_ref(), transfer_only,
     ).await?;
     let intent = CheckpointStage {
         intent: request,
@@ -160,6 +178,7 @@ pub async fn stage_checkpoint(
         source_log_epoch: point.log_epoch,
         checkpoint: point.checkpoint,
         media,
+        transfer_only,
         staged_manifest_sha256: None,
     };
     let bucket = storage.bucket(IoRegion::new()).await?;
@@ -174,7 +193,7 @@ pub async fn stage_checkpoint(
             Err(error) => directory.deployment(&target_id).await?.ok_or(error)?,
         },
     };
-    if let Some(complete) = staged(&retained, &intent.intent, &intent.media)? {
+    if let Some(complete) = staged(&retained, &intent.intent, &intent.media, transfer_only)? {
         return Ok(complete);
     }
     crate::deployment::require_storage_namespaces(&retained, namespaces)?;
@@ -242,7 +261,7 @@ pub async fn stage_checkpoint(
     )
     .await?;
     let result = update_installation(directory.as_ref(), &target_id, |current| {
-        if let Some(prior) = staged(current, &intent.intent, &intent.media)? {
+        if let Some(prior) = staged(current, &intent.intent, &intent.media, transfer_only)? {
             if prior.staged_manifest_sha256.as_deref() == Some(staged_digest.as_str()) {
                 return Ok(());
             }
@@ -266,7 +285,7 @@ pub async fn stage_checkpoint(
         Ok(())
     })
     .await?;
-    staged(&result, &intent.intent, &intent.media)?
+    staged(&result, &intent.intent, &intent.media, transfer_only)?
         .ok_or_else(|| inconsistent("The stage lost its positive receipt"))
 }
 
@@ -274,6 +293,7 @@ fn staged(
     record: &DeploymentRecord,
     request: &CheckpointStageIntent,
     media: &CellMedia,
+    transfer_only: bool,
 ) -> Result<Option<CheckpointStage>> {
     let retained = record
         .checkpoint_stage
@@ -281,6 +301,7 @@ fn staged(
         .filter(|stage| {
             &stage.intent == request
                 && &stage.media == media
+                && stage.transfer_only == transfer_only
                 && record.name == request.name
                 && record.org == request.org
         })
