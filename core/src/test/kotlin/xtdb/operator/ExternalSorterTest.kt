@@ -4,6 +4,7 @@ import org.apache.arrow.memory.BufferAllocator
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.extension.ExtendWith
 import org.junit.jupiter.api.io.TempDir
 import xtdb.api.ICursor
@@ -80,6 +81,32 @@ class ExternalSorterTest {
             assertEquals(10, spillFiles().size, "a run per page")
             assertEquals((0L until 110).toList(), sorter.finish().drain())
         }
+    }
+
+    @Test
+    fun `a cancelled merge stops before writing another spill page`(al: BufferAllocator) {
+        var mergeComparisons = 0
+        val comparator = ExternalSorter.ComparatorFactory { left, right ->
+            val byValue = byA.build(left, right)
+            Comparator { l, r ->
+                if (left !== right && ++mergeComparisons == 200) Thread.currentThread().interrupt()
+                byValue.compare(l, r)
+            }
+        }
+        val blockSize = 4096
+        ExternalSorter(al, mapOf("a" to I64), comparator, Long.MAX_VALUE, blockSize) {
+            Files.createTempDirectory(spillRoot, "external-sort")
+        }.use { sorter ->
+            sorter.appendPages(al, List(blockSize + 1) { 2L * it }, blockSize + 1)
+            sorter.appendPages(al, List(blockSize + 1) { 2L * it + 1 }, blockSize + 1)
+            try {
+                assertThrows<InterruptedException> { sorter.finish() }
+            } finally {
+                Thread.interrupted()
+            }
+            assertTrue(mergeComparisons in 200..1224, "merge comparisons: $mergeComparisons")
+        }
+        assertEquals(emptyList<Path>(), spillRoot.listDirectoryEntries())
     }
 
     @Test

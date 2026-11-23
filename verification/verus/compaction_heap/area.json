@@ -1,13 +1,13 @@
 {
   "summary": "The compaction heap initializes one head per ordered page, extracts the minimum occurrence and retains exactly the remaining cursors.",
-  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws", "--rlimit", "30"],
-  "min_verified_functions": 20,
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws", "--rlimit", "90"],
+  "min_verified_functions": 21,
   "controls": {
     "reverse_system_time": {
       "mutate": [{
         "file": "rust/crates/maintenance/src/merge/row_heap.rs",
-        "find": "(left.1 > right.1 || (left.1 == right.1 && left.2 > right.2))",
-        "replace": "(left.1 < right.1 || (left.1 == right.1 && left.2 > right.2))"
+        "find": "return left.1 > right.1;",
+        "replace": "return left.1 < right.1;"
       }],
       "expect": [{
         "file": "rust/crates/maintenance/src/merge/row_heap.rs",
@@ -28,6 +28,19 @@
         "category": "assertion failed"
       }],
       "min_verified_functions": 19
+    },
+    "reverse_source_precedence": {
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "find": "return left.3 < right.3;",
+        "replace": "return left.3 > right.3;"
+      }],
+      "expect": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "function": "precedes",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 20
     },
     "skip_page_order_validation": {
       "mutate": [{

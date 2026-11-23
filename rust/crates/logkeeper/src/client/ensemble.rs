@@ -119,6 +119,11 @@ impl Ensemble {
         self.ack(server, reply)
     }
 
+    pub async fn trim_durable(&self, server: usize, through: i64) -> Result<Ack> {
+        let reply = self.links[server].call(RequestBody::TrimDurable(Trim { stream: self.stream(), through_lsn: through })).await;
+        self.ack(server, reply)
+    }
+
     pub async fn drop_stream(&self, server: usize, epoch: u64) -> Result<Ack> {
         let reply = self.links[server].call(RequestBody::DropStream(DropStream { stream: self.stream(), epoch })).await;
         self.ack(server, reply)

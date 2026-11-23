@@ -31,7 +31,7 @@ fn retention_never_selects_the_current_block() {
 }
 
 #[tokio::test]
-async fn block_gc_collects_old_blocks_and_offloaded_payloads() {
+async fn block_gc_collects_old_metadata_but_preserves_offloaded_replica_payloads() {
     let store = Arc::new(MemoryStore::default());
     for index in 1..=10 {
         store.put(&ObjectKey::new(block_key(BlockIndex(index)).unwrap()).unwrap(), Bytes::from(block(index).encode())).await.unwrap();
@@ -44,7 +44,10 @@ async fn block_gc_collects_old_blocks_and_offloaded_payloads() {
     let collector = BlockCollector::new(store.clone(), state, observer.clone(), GarbageConfig { blocks_to_keep: 3, ..Default::default() }).unwrap();
     collector.collect(&CancellationToken::new()).await.unwrap();
     assert_eq!(store.list(Some(&ObjectKey::new("blocks").unwrap())).await.unwrap().len(), 3);
-    assert_eq!(store.list(Some(&ObjectKey::new("oversized").unwrap())).await.unwrap().len(), 1);
+    for index in [6, 9] {
+        let payload = ObjectKey::new(oversized_key(BlockIndex(index), "payload").unwrap()).unwrap();
+        assert_eq!(store.get(&payload).await.unwrap(), Bytes::from_static(b"payload"));
+    }
     assert!(observer.0.lock().unwrap().is_empty());
 }
 

@@ -309,7 +309,7 @@ impl PagedRanked {
                         else { scoring.term_bound(index, impact.frequency, impact.length) })
                 }).fold(0.0, |score, bound| score + bound);
                 let id = ascending_id.then(|| file.manifest.window_id(window)).flatten();
-                windows.push((RankKey { score, id }, window));
+                windows.push((RankKey::integer(score, id), window));
             }
         }
         windows.sort_unstable_by(|left, right| right.0.compare(left.0).then_with(|| left.1.cmp(&right.1)));

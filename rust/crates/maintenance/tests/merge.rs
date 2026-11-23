@@ -101,6 +101,62 @@ async fn mixed_trie_depths_preserve_every_row_in_the_requested_partition() {
 }
 
 #[tokio::test]
+async fn scan_tie_cutover_reuses_existing_legacy_bytes_and_publishes_new_bytes_at_the_new_epoch() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let table = TableRef::new("public", "docs");
+    let slug = TableSlug::for_unrecorded_table(&table).unwrap();
+    let fields = StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let mut inputs = Vec::new();
+    for value in [2, 1] {
+        let key = TrieKey::new(1, None, Vec::new(), BlockIndex(value)).unwrap();
+        let rows = [StoredEvent {
+            commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(100),
+            valid_time: Interval::from_micros(10, 20).unwrap(),
+            operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(value))])),
+            recency: None,
+        }];
+        let data = build_event_batch(&rows, Some(fields.clone()), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, true);
+        metadata.write_leaf(&data).unwrap();
+        let (metadata, _) = metadata.finish().unwrap();
+        store.put(&ObjectKey::new(slug.data_key(&key)).unwrap(), write_file(&data.schema(), &[data]).unwrap().into()).await.unwrap();
+        store.put(&ObjectKey::new(slug.metadata_key(&key)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        inputs.push(key);
+    }
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let memory = MemoryBudget::new(64 * 1024 * 1024);
+    let executor = |cutover| {
+        SegmentCompactor::new(store.clone(), state.clone(), Arc::clone(&memory), StorageVersion(6), StorageEpoch(0), MergeConfig {
+            temporary_directory: temporary.path().into(), scan_tie_order_from_naming_epoch: cutover, ..Default::default()
+        }).unwrap()
+    };
+    let output = TrieKey::new(2, None, Vec::new(), BlockIndex(2)).unwrap();
+    let mut job = CompactionJob { table, inputs, part: vec![], output: output.clone(), recency_mode: RecencyMode::Preserve };
+    let cancel = CancellationToken::new();
+    executor(None).execute(&job, &cancel).await.unwrap();
+    let legacy = ObjectKey::new(slug.data_key(&output)).unwrap();
+    let before = store.get(&legacy).await.unwrap();
+
+    let upgraded = executor(std::num::NonZeroU64::new(1));
+    upgraded.execute(&job, &cancel).await.unwrap();
+    assert_eq!(store.get(&legacy).await.unwrap(), before);
+
+    job.output = output.with_epoch(1);
+    upgraded.execute(&job, &cancel).await.unwrap();
+    let replacement = store.get(&ObjectKey::new(slug.data_key(&job.output)).unwrap()).await.unwrap();
+    let first = |bytes: Bytes| {
+        let mut reader = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
+        let batch = EventBatch::new(reader.read_page(0).unwrap()).unwrap();
+        let StoredOperation::Put(document) = batch.read_event(0).unwrap().operation else { panic!("expected a put") };
+        document.get("value").unwrap().clone()
+    };
+    assert_eq!(first(before), Value::I64(2));
+    assert_eq!(first(replacement), Value::I64(1));
+}
+
+#[tokio::test]
 async fn same_time_clipping_and_erase_preserve_the_surrounding_history() {
     let temporary = tempfile::tempdir().unwrap();
     let table = TableRef::new("public", "docs");

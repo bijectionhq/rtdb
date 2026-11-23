@@ -123,6 +123,8 @@ class ExternalSorter(
 
                         var copied = 0L
                         while (copied < rowLimit && pq.isNotEmpty()) {
+                            if (copied % 1024 == 0L && Thread.interrupted()) throw InterruptedException()
+
                             val i = pq.poll()
                             val pos = positions[i]
                             positions[i] = pos + 1

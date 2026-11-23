@@ -659,7 +659,7 @@ impl Node {
             generate_series_end_exclusive: context.options.generate_series_end_exclusive,
             ..Default::default()
         };
-        let sql = "SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM public.rtdb_idempotency_keys FOR SYSTEM_TIME AS OF ? FOR VALID_TIME FROM ? TO NULL AS k WHERE k._id = ? ORDER BY k._system_from DESC LIMIT 1)";
+        let sql = rtdb_tx::HISTORICAL_KEYED_TRANSACTION_SQL;
         let prepared = match prepare_query(sql, &context, &options) {
             Ok(prepared) => prepared,
             Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
@@ -704,11 +704,23 @@ impl Node {
         Ok(None)
     }
 
-    async fn redeem_placed_attempt(&self, db: &Database, attempt: PlacedAttempt, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<(TransactionResult, String)> {
-        let codec = db.await_authority.codec().ok_or_else(invalid_token)?;
-        if self.now().0 >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS) {
+    async fn check_placed_receipt_window(&self, database: &str, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<()> {
+        let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let [installed] = context.catalog.database(database)?.partitions.as_slice() else {
+            return Err(bad_attempt_outcome());
+        };
+        let Some(latest) = installed.tx_basis() else { return Ok(()); };
+        if rtdb_tx::installed_receipt_time(context, latest).await?
+            .is_some_and(|value| value.0 >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS))
+        {
             return Err(Anomaly::incorrect("rtdb/await-token-expired", "The transaction attempt receipt has expired"));
         }
+        Ok(())
+    }
+
+    async fn redeem_placed_attempt(&self, db: &Database, attempt: PlacedAttempt, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<(TransactionResult, String)> {
+        let codec = db.await_authority.codec().ok_or_else(invalid_token)?;
         let epoch = attempt.scope().writer_epoch();
         let current = codec.scope().writer_epoch();
         let through = match &db.await_authority {
@@ -730,6 +742,7 @@ impl Node {
             }
             _ => return Err(invalid_token()),
         };
+        self.check_placed_receipt_window(db.name(), submitted_at, identity, placement, cancellation).await?;
         let key = match db.progress().current().placed_outcome(attempt) {
             Some(key) => Some(key),
             None => self.placed_outcome_key(db.name(), attempt, identity, placement, cancellation).await?,
@@ -762,6 +775,11 @@ impl Node {
                 && let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten()
             {
                 return Ok(TransactionResult::Committed { tx_key: original });
+            }
+            if !db.external_source()
+                && let Some(original) = result.error().map(rtdb_tx::bounded_retry_original).transpose()?.flatten()
+            {
+                return self.read_bounded_outcome(database, tx_id, original, identity, placement, cancellation).await;
             }
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
@@ -799,6 +817,19 @@ impl Node {
                 }
                 if !db.external_source()
                     && let Some(error) = &error
+                    && let Some(original) = rtdb_tx::bounded_retry_original(error)?
+                {
+                    return self.read_bounded_outcome(database, tx_id, original, identity, placement, cancellation).await;
+                }
+                if !db.external_source()
+                    && let Some(error) = &error
+                    && is_historical_guard_abort(error)
+                    && let Some(original) = rtdb_tx::attributed_historical_guard_original(error)?
+                {
+                    return Ok(TransactionResult::Committed { tx_key: original });
+                }
+                if !db.external_source()
+                    && let Some(error) = &error
                     && is_historical_guard_abort(error)
                     && let Some(key) = idempotency_key(&cell("user_metadata")?)
                     && let Some(submitted_at) = historical_guard_sample(error)
@@ -811,6 +842,40 @@ impl Node {
             }
             _ => Err(Anomaly::fault("rtdb.node/tx-result-status", "Stored transaction result has no commit status")),
         }
+    }
+    async fn read_bounded_outcome(&self, database: &str, retry: TxId, original: TransactionKey, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
+        let invalid = || Anomaly::fault("rtdb.node/bounded-retry-outcome", "The bounded retry has no matching original outcome");
+        if original.tx_id >= retry { return Err(invalid()); }
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]),
+            default_timezone: context.timezone.clone(),
+            ..Default::default()
+        };
+        let mut cursor = prepare_query("SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
+            .execute(context, vec![Value::I64(original.tx_id.0)]).await?;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            if batch.num_rows() == 0 { continue; }
+            let cell = |index: usize| read_value(batch.schema().field(index), batch.column(index).as_ref(), 0);
+            if !matches!(cell(0)?, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == original.system_time.0) {
+                return Err(invalid());
+            }
+            return match cell(1)? {
+                Value::Bool(true) => Ok(TransactionResult::Committed { tx_key: original }),
+                Value::Bool(false) => {
+                    let error = match cell(2)? {
+                        Value::Null | Value::Undefined => None,
+                        Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?),
+                        _ => return Err(invalid()),
+                    };
+                    Ok(TransactionResult::Aborted { tx_key: original, error })
+                }
+                _ => Err(invalid()),
+            };
+        }
+        Err(invalid())
     }
     pub async fn attach_database(&self, name: String, configuration: DatabaseConfig, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit("xtdb", DatabaseAccess::Write, identity, cancellation).await?;
@@ -3269,8 +3334,8 @@ impl SessionService for NativeSessionService {
         let token = PlacedToken::open(token, authority, self.identity.user())?;
         if let PlacedToken::Pending { attempt, submitted_at } = token
             && attempt.scope() == authority.scope()
-            && self.node.now().0 < submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS)
         {
+            self.node.check_placed_receipt_window(database, submitted_at, self.identity.as_ref(), self.placement.as_ref(), cancellation).await?;
             // A later submission in this intake can only resolve after earlier attempts in the same epoch.
             return Ok(());
         }
@@ -3319,7 +3384,8 @@ pub const IDEMPOTENCY_KEY_PARAMETER: &str = "rtdb_idempotency_key";
 
 pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_tx::UserMetadata> {
     let mut fields = match metadata.as_ref().map(|metadata| metadata.value()) {
-        Some(value) if idempotency_key(value).is_some() => return Ok(metadata.expect("present")),
+        Some(value) if idempotency_key(value).is_some()
+            || matches!(value, Value::Struct(fields) if fields.contains_key(rtdb_tx::BOUNDED_RETRY_METADATA_KEY)) => return Ok(metadata.expect("present")),
         Some(Value::Struct(fields)) => fields.clone(),
         _ => rtdb_types::StructFields::new(),
     };
