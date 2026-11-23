@@ -401,7 +401,7 @@ pub async fn path_columns_at_cut(
     Ok(owned_definition(context, owner, relation, path).await?.columns)
 }
 
-pub(crate) async fn stable_owned_path_columns(
+pub async fn stable_owned_path_columns(
     before: &Arc<QueryContext>,
     after: &Arc<QueryContext>,
     owner: &str,

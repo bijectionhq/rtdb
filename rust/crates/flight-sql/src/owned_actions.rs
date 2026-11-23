@@ -1858,7 +1858,12 @@ impl Service {
     pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], order: WorldOrder) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = if matches!(order, WorldOrder::ParentRange | WorldOrder::OverlayRange) {
+            self.owned_world_resource(call, &handle)?
+        } else {
+            self.owned_world_read(call, &handle)?
+        };
         let (system, request) = if matches!(order, WorldOrder::OverlayRangeAt | WorldOrder::ParentRangeAt | WorldOrder::ParentCountAt) {
             let (system, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world range has no revision"))?;
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
