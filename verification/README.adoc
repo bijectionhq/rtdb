@@ -139,6 +139,13 @@ It also exercises the Azure adapter against a loopback provider and separately m
 
 == Evidence boundaries
 
+* link:verus/guarded_tail_recovery/area.json[Guarded-tail recovery] imports the Rust decisions called by the Logkeeper writer.
+  On 2026-11-23 Verus 0.2026.11.20.9da409b checked 12 items, and all 16 production mutations failed at their declared laws.
+  The checked decisions correspond to Bijection's `recoverGuardedTail` and `decideFromSealedProbes`, with post-sync clock samples required to be strictly below the cutoff before counting an original.
+  Each roster slot contributes at most one vote, and the possible-vote bound includes trim, non-response and missing samples.
+  The checked commit target and quorum guard implement the retained-tip condition of `mayTransferGuardedHistory`.
+  Source inspection traced the writer's durable acknowledgment inputs and the await of predecessor recovery before either destination path.
+  The correspondence assumes distinct authenticated roster slots, faithful durable seal and commit replies, exact entry and origin digest matching, and valid journal clock samples.
 * `lean/History.lean` proves laws over a mathematical history and audits the axioms used.
   `lean/Trace.lean` and the Rust temporal tests read the same fixture in `traces/temporal.tsv`.
   `lean/Minimality.lean` exhibits requirements that need a distinct admission horizon, a private resolution prefix, a whole batch boundary, or intra-batch order.

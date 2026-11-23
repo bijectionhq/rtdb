@@ -1,0 +1,235 @@
+{
+  "summary": "Exact guarded-tail recovery on distinct predecessor journal slots and its commit gate for moves.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production"
+  ],
+  "min_verified_functions": 12,
+  "controls": {
+    "treat_trim_as_absence": {
+      "defect": "A trimmed journal can hide an original vote.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    if trimmed {\n        JournalEvidence::Unavailable",
+        "replace": "    if trimmed {\n        JournalEvidence::Excluded"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "sealed_journal_evidence",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "trust_another_entry_commit": {
+      "defect": "A commit at the recovery offset for a different entry epoch cannot witness this entry.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    } else if !holds_entry {\n        JournalEvidence::Excluded",
+        "replace": "    } else if !holds_entry {\n        if committed { JournalEvidence::CommitWitness } else { JournalEvidence::Excluded }"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "sealed_journal_evidence",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "ignore_recorded_roster_and_threshold": {
+      "defect": "An unsettled timed entry can be decided with a different ensemble or threshold.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    offset == through && digest_len == 32 && (cutoff.is_none() || origin_matches)\n}",
+        "replace": "    offset == through && digest_len == 32\n}"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "valid_guarded_source",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "vote_with_a_foreign_probe": {
+      "defect": "A probe for different entry bytes supplies a vote.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    if !exact {\n        return JournalEvidence::Holding;",
+        "replace": "    if !exact {\n        return JournalEvidence::TimelyOriginal;"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "guarded_probe_evidence",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "accept_at_the_cutoff": {
+      "defect": "An original sampled exactly at the cutoff supplies a vote.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "Some(cutoff) if upper >= cutoff => JournalEvidence::Excluded",
+        "replace": "Some(cutoff) if upper > cutoff => JournalEvidence::Excluded"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "guarded_probe_evidence",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "count_a_copy_as_original": {
+      "defect": "A copy with no original sample supplies an original vote.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "(Some(false), None) => JournalEvidence::Excluded,",
+        "replace": "(Some(false), None) => JournalEvidence::TimelyOriginal,"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "guarded_probe_evidence",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "exclude_an_original_missing_its_sample": {
+      "defect": "Missing a post-sync sample is treated as proof against an original vote.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "        _ => JournalEvidence::Holding,",
+        "replace": "        (Some(true), None) => JournalEvidence::Excluded,\n        _ => JournalEvidence::Holding,"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "guarded_probe_evidence",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "count_one_journal_twice": {
+      "defect": "A timely journal in the first slot supplies votes for other slots.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "if matches!(evidence, JournalEvidence::TimelyOriginal) {",
+        "replace": "if matches!(evidence, JournalEvidence::TimelyOriginal) || matches!(journals[0], JournalEvidence::TimelyOriginal) {"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "count_guarded_journals",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 11
+    },
+    "forget_nonresponding_journals": {
+      "defect": "The possible-vote bound omits journals that did not answer.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "!matches!(evidence, JournalEvidence::Excluded) {",
+        "replace": "!matches!(evidence, JournalEvidence::Excluded | JournalEvidence::Unavailable) {"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "count_guarded_journals",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 11
+    },
+    "keep_without_a_quorum": {
+      "defect": "A lone original can retain the tail without a durable commit witness.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    if committed || timely >= quorum {",
+        "replace": "    if committed || timely == 1 || timely >= quorum {"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "recover_guarded_tail",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "ignore_durable_commit_witness": {
+      "defect": "Recovery loses an already committed tail when original samples are missing.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    if committed || timely >= quorum {",
+        "replace": "    if timely >= quorum {"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "recover_guarded_tail",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "discard_with_a_possible_quorum": {
+      "defect": "Recovery discards a tip when exactly a quorum could have voted.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    } else if possible < quorum {",
+        "replace": "    } else if possible <= quorum {"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "recover_guarded_tail",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "replace_recorded_probe_threshold": {
+      "defect": "The probe decision uses a quorum of one in place of the recorded threshold.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    recover_guarded_tail(false, timely, possible, quorum)",
+        "replace": "    recover_guarded_tail(false, timely, possible, 1)"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "decide_from_sealed_probes",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "move_commits_only_the_prefix": {
+      "defect": "Predecessor recovery can certify a move without persisting the retained guarded tip.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    guarded_tip.unwrap_or(prefix)",
+        "replace": "    prefix"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "predecessor_commit_target",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "count_commit_below_the_required_tip": {
+      "defect": "A predecessor acknowledgment of one position below the tip counts toward transferring it.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    acknowledged >= target\n}",
+        "replace": "    acknowledged >= target || (acknowledged < i64::MAX && acknowledged + 1 == target)\n}"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "covers_recovered_commit",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "transfer_with_a_predecessor_minority": {
+      "defect": "A nonempty minority can release the move before its retained tip reaches a predecessor quorum.",
+      "mutate": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "find": "    quorum > 0 && committed >= quorum\n}",
+        "replace": "    quorum > 0 && committed > 0\n}"
+      }],
+      "expect": [{
+        "file": "rust/crates/logkeeper/src/client/guarded_recovery.rs",
+        "function": "recovery_commit_quorum",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    }
+  }
+}

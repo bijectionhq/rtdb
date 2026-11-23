@@ -84,8 +84,16 @@ Each journal records its own upper clock sample after syncing the original guard
 The sample is synced as local metadata before the reply and survives restart and compaction with the exact entry.
 Only a sample strictly below the record's journal cutoff supplies a vote, including after recovery.
 Recovery copies carry the entry without creating observations of the original append.
+Recovery keeps a sealed guarded tip on an exact durable commit witness or a timely original quorum from the recorded journal roster.
+Trimmed or non-responding journals and originals missing samples remain possible voters.
+Recovery drops the tip only when those still capable of supplying a timely original vote cannot form the recorded write quorum.
+The successor stays closed while the outcome is unknown.
 Recovery of a retained guarded tip records its commit on the predecessor quorum before copying the tip to a new ensemble.
 An interrupted copy can therefore recover the predecessor's selected outcome while the directory still names that predecessor.
+On 2026-11-23 Verus 0.2026.11.20.9da409b checked 12 items in the [guarded-tail recovery area](../../verification/verus/guarded_tail_recovery/area.json), and all 16 mutations failed at their declared laws.
+The checked Rust functions classify sealed and exact probe evidence, count each journal slot once, decide the tail, and check the predecessor commit target and threshold.
+Source inspection traced journal identity and digest binding and the await of predecessor recovery before either destination copy path.
+Durable journal acknowledgments, authenticated journal identity, exact digest equality, single-writer epoch ownership, and valid journal clock bounds remain premises.
 The raw timed entry binds the original stream, journal identities and quorum size across moves and archives.
 The audit reports current quorum agreement separately from the original quorum's sync bound.
 It can read a retained original sample matching the certified entry even when that journal lacks a local commit marker.

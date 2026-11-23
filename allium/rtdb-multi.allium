@@ -540,11 +540,12 @@ contract LogService {
         -- Each original append requires this ensemble's activation in the same journal decision as the epoch and position checks.
         -- The owner first attests an exact quorum of original appends, then durably records its decision on a write quorum before release.
         -- Copies preserve the admission kind but supply no original reply or observation.
-        -- A sealed tip can be recovered from a durable commit witness or original observations for the exact record on a write quorum.
+        -- A sealed tip can be retained on a durable commit witness for the exact record or on timely original observations from distinct journals of its recorded roster at its recorded write quorum.
         -- Moves seal the predecessor with its own quorum threshold.
         -- Before transferring a retained guarded tip, recovery durably records its commit on a quorum of the predecessor journals.
-        -- Recovery drops the guarded tip only if surviving and unobserved holders combined could not have supplied a quorum.
-        -- A journal proved to hold only an exact copy is excluded from that upper bound. An original with a missing sample is still possible.
+        -- Recovery drops the guarded tip only if the journals still compatible with a timely original vote cannot form that quorum.
+        -- Trimmed holders, non-responding journals, and originals with missing samples remain possible voters.
+        -- A journal proved to hold only an exact copy or an original with a late sample is excluded from the possible voters.
         -- If neither decision follows from the evidence, the successor remains closed and the outcome stays unknown.
 
     @invariant SealIsAPromise

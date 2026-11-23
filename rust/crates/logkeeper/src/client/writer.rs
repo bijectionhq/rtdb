@@ -3,8 +3,12 @@
 use super::connection::CALL_TIMEOUT;
 use super::ensemble::{Ack, Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::CopyFrom;
+use super::guarded_recovery::{
+    JournalEvidence, TailDecision, covers_recovered_commit, decide_from_sealed_probes, guarded_probe_evidence,
+    predecessor_commit_target, recover_guarded_tail, recovery_commit_quorum, sealed_journal_evidence, valid_guarded_source,
+};
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Accepted, Commit, Entry, PageDigest, RequestBody, Sealed, before_guarded_cutoff};
+use crate::protocol::{Accepted, Commit, Entry, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -246,7 +250,7 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
     let mut committed = 0;
     let mut grace = None;
     loop {
-        if committed >= quorum {
+        if recovery_commit_quorum(committed, quorum) {
             grace.get_or_insert_with(|| tokio::time::Instant::now() + RECOVERY_GRACE);
         } else if synced.len() >= quorum {
             for server in uncommitted.drain(..) {
@@ -260,7 +264,7 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
             Some((server, reply)) = syncing.next(), if !syncing.is_empty() => match reply {
                 Ok(ack) => {
                     synced.push(server);
-                    if ack.commit_lsn >= commit { committed += 1; }
+                    if covers_recovered_commit(ack.commit_lsn, commit) { committed += 1; }
                     else { uncommitted.push(server); }
                 }
                 Err(Error::Deposed { promised, .. }) => return Err(Error::Deposed { epoch, promised }),
@@ -269,7 +273,7 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
             Some(reply) = committing.next(), if !committing.is_empty() => {
                 if let Ok(reply) = reply {
                     let ack = deposed_by(epoch, reply)?;
-                    committed += usize::from(ack.commit_lsn >= commit);
+                    committed += usize::from(covers_recovered_commit(ack.commit_lsn, commit));
                 }
             }
             _ = async {
@@ -280,7 +284,7 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
             } => break,
         }
     }
-    if committed < quorum {
+    if !recovery_commit_quorum(committed, quorum) {
         return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!(
             "recovered on {} servers and confirmed commit on {committed}, a write quorum is {quorum}", synced.len()) });
     }
@@ -292,71 +296,43 @@ fn winning_seal(replies: &[(usize, Sealed)]) -> &(usize, Sealed) {
     &replies[winner(&sealed)]
 }
 
-enum TailDecision { Keep, Discard, Unknown }
-
-struct GuardedEvidence {
-    possible: usize,
-    observed: usize,
-}
-
-impl GuardedEvidence {
-    fn record_exact(&mut self, proof: &PageDigest) {
-        match (proof.original_append, proof.synced_clock_upper_micros) {
-            (Some(true), Some(upper)) if upper > 0 => {
-                if before_guarded_cutoff(upper, proof.guarded_before) { self.observed += 1; }
-                else { self.possible -= 1; }
-            }
-            (Some(false), None) => self.possible -= 1,
-            // An original that survived without its post-sync sample still
-            // may have synced before the cutoff. An incomplete probe is open.
-            _ => {}
-        }
-    }
-
-    fn decision(&self, quorum: usize) -> TailDecision {
-        if self.observed >= quorum { TailDecision::Keep }
-        else if self.possible < quorum { TailDecision::Discard }
-        else { TailDecision::Unknown }
-    }
-}
-
 async fn settle_guarded_tail(ensemble: &Ensemble, epoch: u64, source: usize, history: &Holding, replies: &[(usize, Sealed)]) -> Result<TailDecision> {
     let offset = history.last;
     let unknown = || Error::Remote { key: ensemble.stream(), message: format!("guarded tail at position {offset} has an unknown outcome") };
     let entry_epoch = history.epoch_at(offset).filter(|entry_epoch| *entry_epoch < epoch).ok_or_else(unknown)?;
-    let mut holding = Vec::new();
-    let mut possible = ensemble.len() - replies.len();
-    for (server, sealed) in replies {
-        if sealed.trim_lsn >= offset {
-            // Trimming can hide an original observation. Its removal is not a negative vote.
-            possible += 1;
-        } else if Holding::from(sealed).epoch_at(offset) == Some(entry_epoch) {
-            // The sole writer assigns an entry at most once at this epoch and position.
-            // A durable commit covering it already attests the original quorum.
-            if sealed.commit_lsn >= offset { return Ok(TailDecision::Keep); }
-            holding.push(*server);
-            possible += 1;
-        }
-    }
     let quorum = ensemble.config.write_quorum;
+    let mut evidence = vec![JournalEvidence::Unavailable; ensemble.len()];
+    for (server, sealed) in replies {
+        // The sole writer assigns an entry at most once at this epoch and position.
+        let trimmed = sealed.trim_lsn >= offset;
+        let state = sealed_journal_evidence(trimmed,
+            !trimmed && Holding::from(sealed).epoch_at(offset) == Some(entry_epoch),
+            covers_recovered_commit(sealed.commit_lsn, offset));
+        if matches!(state, JournalEvidence::CommitWitness) {
+            return Ok(recover_guarded_tail(true, 0, 0, quorum));
+        }
+        evidence[*server] = state;
+    }
     let Ok(exact) = ensemble.guarded_digest(source, offset, epoch).await else { return Ok(TailDecision::Unknown); };
-    if exact.through_lsn != offset || exact.digest.len() != 32
-        || (exact.guarded_before.is_some() && !ensemble.matches_timed_origin(&exact.timed_origin_identity))
-    {
+    if !valid_guarded_source(offset, exact.through_lsn, exact.digest.len(), exact.guarded_before,
+        exact.guarded_before.is_some() && ensemble.matches_timed_origin(&exact.timed_origin_identity)) {
         return Ok(TailDecision::Unknown);
     }
-    let mut evidence = GuardedEvidence { possible, observed: 0 };
-    evidence.record_exact(&exact);
-    let mut pending: FuturesUnordered<_> = holding.into_iter().filter(|server| *server != source)
-        .map(|server| ensemble.guarded_digest(server, offset, epoch)).collect();
-    while matches!(evidence.decision(quorum), TailDecision::Unknown) && let Some(reply) = pending.next().await {
-        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest
-            && proof.guarded_before == exact.guarded_before && proof.timed_origin_identity == exact.timed_origin_identity
-        {
-            evidence.record_exact(&proof);
+    evidence[source] = guarded_probe_evidence(true, exact.original_append, exact.synced_clock_upper_micros, exact.guarded_before);
+    let mut pending: FuturesUnordered<_> = replies.iter().map(|(server, _)| *server)
+        .filter(|&server| server != source && matches!(evidence[server], JournalEvidence::Holding))
+        .map(|server| async move { (server, ensemble.guarded_digest(server, offset, epoch).await) })
+        .collect();
+    loop {
+        let decision = decide_from_sealed_probes(&evidence, quorum);
+        if !matches!(decision, TailDecision::Unknown) { return Ok(decision); }
+        let Some((server, reply)) = pending.next().await else { return Ok(decision); };
+        if let Ok(proof) = reply {
+            let matches = proof.through_lsn == offset && proof.digest == exact.digest
+                && proof.guarded_before == exact.guarded_before && proof.timed_origin_identity == exact.timed_origin_identity;
+            evidence[server] = guarded_probe_evidence(matches, proof.original_append, proof.synced_clock_upper_micros, exact.guarded_before);
         }
     }
-    Ok(evidence.decision(quorum))
 }
 
 /// An unsettled guarded flight is exclusive at the tip. Unlike an ordinary
@@ -369,14 +345,16 @@ struct SealedHistory {
 }
 
 async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usize, Sealed)>) -> Result<SealedHistory> {
+    let quorum = ensemble.config.write_quorum;
     let mut checked_remaining = false;
     loop {
         let (source, winning) = winning_seal(replies);
         let source = *source;
         let mut sealed = SealedHistory { source, history: Holding::from(winning), guarded_commit: None };
         if !winning.guarded_tail { return Ok(sealed); }
-        let resolution = if winning.commit_lsn >= sealed.history.last {
-            TailDecision::Keep
+        let witness = covers_recovered_commit(winning.commit_lsn, sealed.history.last);
+        let resolution = if witness {
+            recover_guarded_tail(witness, 0, 0, quorum)
         } else {
             if !ensemble.supports_guarded() { return Err(Error::GuardedAppendUnsupported); }
             settle_guarded_tail(ensemble, epoch, source, &sealed.history, replies).await?
@@ -496,7 +474,7 @@ impl Writer {
         let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone() };
         // A move can stop before the destination is durable or recorded. The
         // predecessor quorum must already retain the guarded outcome.
-        let commit = guarded_commit.unwrap_or(start - 1);
+        let commit = predecessor_commit_target(guarded_commit, start - 1);
         sync_quorum(previous, epoch, &previous_replies, &in_place, commit).await?;
         Ok(Recovered { source: (previous, source), history, start })
     }
@@ -1097,9 +1075,10 @@ mod tests {
 
     #[test]
     fn an_original_without_a_sample_is_possible_but_has_no_positive_vote() {
-        let mut evidence = GuardedEvidence { possible: 2, observed: 0 };
-        evidence.record_exact(&PageDigest { original_append: Some(true), synced_clock_upper_micros: Some(10), ..Default::default() });
-        evidence.record_exact(&PageDigest { original_append: Some(true), ..Default::default() });
-        assert!(matches!(evidence.decision(2), TailDecision::Unknown));
+        let evidence = [
+            guarded_probe_evidence(true, Some(true), Some(10), None),
+            guarded_probe_evidence(true, Some(true), None, None),
+        ];
+        assert!(matches!(decide_from_sealed_probes(&evidence, 2), TailDecision::Unknown));
     }
 }

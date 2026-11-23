@@ -3,6 +3,7 @@
 mod audit;
 mod connection;
 mod ensemble;
+mod guarded_recovery;
 pub(crate) mod recovery;
 mod writer;
 
