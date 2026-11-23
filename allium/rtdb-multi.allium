@@ -1358,6 +1358,7 @@ rule ConsumeIntake {
 -- The child pages the merged identities of both cuts, applying the same tombstone rule before emitting a candidate.
 -- The child seeks both retained orders for a declared path only when its definition agrees across the two cuts.
 -- The owner merges only the covered prefix and resolves the winning point for each ordered candidate.
+-- An exact count starts with the original Root order total and corrects membership for every bounded Held shadow, including tombstones.
 -- Dropping the source line leaves both independently retained positions available to the child.
 -- A complete valid window includes covered absence across both sources.
 -- An authenticated placed hold can witness the completed window under its original archive pin and the selected relation's local event and Root purge frontiers.

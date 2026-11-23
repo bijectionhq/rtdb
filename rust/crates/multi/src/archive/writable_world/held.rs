@@ -210,6 +210,7 @@ enum AncestorRead {
     Point { id: EntityId, valid: Interval },
     Schedule { id: EntityId, valid: Interval },
     Identities { valid: Timestamp, after: Option<String>, limit: usize },
+    OverlayIdentities { valid: Timestamp, after: Option<String>, limit: usize },
     Range {
         path: OwnedRelation,
         lower: Option<StructFields<Value>>,
@@ -624,7 +625,7 @@ impl HeldCheckpointWorld {
         let guard = match &read {
             AncestorRead::Point { id, .. } | AncestorRead::Schedule { id, .. } =>
                 self.open.snapshot.parent_point_release_guard(relation, id, self.open.retained.basis.system_time).await?,
-            AncestorRead::Identities { .. } | AncestorRead::Range { .. } =>
+            AncestorRead::Identities { .. } | AncestorRead::OverlayIdentities { .. } | AncestorRead::Range { .. } =>
                 self.open.snapshot.relation_release_guard([relation])?,
         };
         let (reply, result) = oneshot::channel();
@@ -654,6 +655,23 @@ impl HeldCheckpointWorld {
         if self.ancestor().is_some() {
             return self.ancestor_point(relation, id, valid_at, observed).await;
         }
+        self.root_parent_point(relation, id, valid_at, observed).await
+    }
+
+    pub async fn ancestor_root_point(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
+    ) -> Result<WorldPoint> {
+        if self.ancestor().is_none() { return Err(OwnedWorld::unavailable()); }
+        self.historical_parent_schema(relation)?;
+        if self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?.purge_frontier() != 0 {
+            return Err(OwnedWorld::unavailable());
+        }
+        self.root_parent_point(relation, id, valid, false).await
+    }
+
+    async fn root_parent_point(
+        &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool,
+    ) -> Result<WorldPoint> {
         self.check()?;
         let policy = self.open.snapshot.lifetime_point_policy(relation).await?;
         let lifetime = policy.map(|policy| ArchiveLifetimeRead { policy, present: self.present().system_time });
@@ -1323,6 +1341,14 @@ impl HeldCheckpointWorld {
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
+        if self.ancestor().is_some() {
+            Interval::at(valid)?;
+            let (result, _) = self.read_ancestor(relation, AncestorRead::OverlayIdentities {
+                valid, after: after.map(str::to_owned), limit,
+            }).await?;
+            let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
+            return Ok(page);
+        }
         let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
             .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
         self.require_overlay_coverage(relation, &witness).await?;
@@ -1447,6 +1473,18 @@ impl<'a> InheritedRelation<'a> {
         }
         self.root.check_cancelled()?;
         Ok(fact)
+    }
+
+    async fn overlay_identity_page(
+        &self, valid: Timestamp, after: Option<&str>, limit: usize,
+    ) -> Result<WorldIdentityPage> {
+        let page = rtdb_query::owned_identity_candidates(
+            Arc::clone(&self.overlay), self.owner, &self.shadow, self.overlay_basis, valid, after, limit + 1,
+        ).await?;
+        let (mut keys, reservations) = page.into_parts();
+        let more = keys.len() > limit;
+        keys.truncate(limit);
+        Ok(WorldIdentityPage { keys, more, reservations })
     }
 
     async fn overlay_range(
@@ -1751,6 +1789,8 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             Ok(AncestorResult::Schedule(inherited.schedule(&id, valid).await?)),
                                                         AncestorRead::Identities { valid, after, limit } =>
                                                             Ok(AncestorResult::Identities(inherited.identities(valid, after, limit).await?)),
+                                                        AncestorRead::OverlayIdentities { valid, after, limit } =>
+                                                            Ok(AncestorResult::Identities(inherited.overlay_identity_page(valid, after.as_deref(), limit).await?)),
                                                         AncestorRead::Range { path, lower, upper, after, descending, limit, valid } => {
                                                             let request = OwnedRangeRequest {
                                                                 lower: lower.as_ref(), upper: upper.as_ref(), after: after.as_ref(),
