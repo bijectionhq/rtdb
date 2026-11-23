@@ -28,6 +28,14 @@ struct ManualClock(AtomicI64);
 impl Clock for ManualClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
 struct HostedFixtureResources(rtdb_node::NativeResources);
 struct HostedFixtureReceipts(rtdb_types::PlacedAttemptScope);
+struct FixtureOwner;
+
+#[async_trait]
+impl rtdb_node::SessionIdentity for FixtureOwner {
+    fn user(&self) -> Option<&str> { Some("xtdb") }
+    async fn revalidate(&self, _: Timestamp) -> Result<()> { Ok(()) }
+    fn authorize_database(&self, _: &str, _: rtdb_node::DatabaseAccess) -> Result<()> { Ok(()) }
+}
 
 impl rtdb_node::PlacedReceiptCodec for HostedFixtureReceipts {
     fn scope(&self) -> rtdb_types::PlacedAttemptScope { self.0 }
@@ -76,14 +84,17 @@ impl Running {
     async fn start_with_placements(password: Option<&str>, config: FlightConfig, placements: &[&str]) -> Self {
         Self::start_with_tracer(password, config, placements, None).await
     }
-    async fn start_with_tracer(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
+    async fn start_with_tracer(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
+        Self::start_with_options(password, config, placements, tracer, NodeOptions::default()).await
+    }
+    async fn start_with_options(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
         let mut services = NodeServices { clock: node_clock, tracer, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         if config.hosted_controls.is_some() {
             services.resources = Arc::new(HostedFixtureResources(rtdb_node::NativeResources::default()));
         }
-        let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
+        options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         options.owned_relations = config.owned_native_actions;
         if !placements.is_empty() { options.membership = Membership::Placed; }
         let (node, driver) = Node::open(options, services).await.unwrap(); let node_task = tokio::spawn(driver.run());
@@ -1291,14 +1302,7 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
     let mut schema = relation.clone();
     schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#);
     client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
-    struct FrameOwner;
-    #[async_trait]
-    impl rtdb_node::SessionIdentity for FrameOwner {
-        fn user(&self) -> Option<&str> { Some("xtdb") }
-        async fn revalidate(&self, _: Timestamp) -> Result<()> { Ok(()) }
-        fn authorize_database(&self, _: &str, _: rtdb_node::DatabaseAccess) -> Result<()> { Ok(()) }
-    }
-    let mut installation = running.node.session("application", Arc::new(FrameOwner)).unwrap();
+    let mut installation = running.node.session("application", Arc::new(FixtureOwner)).unwrap();
     let capacity = installation.state_mut().execute_tx(vec![rtdb_tx::TxOp::OwnedDeclareCapacity {
         relation: rtdb_types::OwnedRelation::new("places").unwrap(),
         column: "location".into(),
@@ -1382,6 +1386,74 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
     assert_eq!(clock(&client.query("SELECT _system_from FROM bj_fact_root_program WHERE application_schema = 'new'").await), ordered);
     assert_eq!(clock(&client.query("SELECT _system_from FROM bj_relation_declarations WHERE _id = 'places' AND history_days IS NULL").await), ordered);
     assert_eq!(clock(&client.query("SELECT _system_from FROM bj_relation_declarations WHERE _id = 'later' AND history_days = 30").await), ordered);
+    running.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "serves an isolated placed database for the paired Bijection Flight test"]
+async fn serve_hosted_spatial_pair() {
+    use rtdb_types::{OwnedRelation, OwnedSchema};
+    use std::path::Path;
+
+    async fn wait_for(directory: &Path, marker: &str) {
+        tokio::time::timeout(Duration::from_secs(40), async {
+            while !directory.join(marker).is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("Bijection did not reach {marker}"));
+    }
+
+    let directory = std::path::PathBuf::from(std::env::var_os("RTDB_SPATIAL_PAIR_DIR").unwrap());
+    let password = std::env::var("RTDB_SPATIAL_FLIGHT_PASSWORD").unwrap();
+    let options = NodeOptions { file_size_target: 1, automatic_artefacts: false, ..NodeOptions::default() };
+    let running = Running::start_with_options(Some(&password), FlightConfig {
+        owned_native_actions: true,
+        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
+            owner: "xtdb".into(),
+            relations: ["bj_installation", "bj_fact_root_owner", "bj_fact_root_program"].map(str::to_owned).into(),
+        }),
+        ..FlightConfig::default()
+    }, &["application"], None, options).await;
+    let mut client = Client::connect_with_database(&running.server, Some(&format!("xtdb:{password}")), Some("application")).await;
+    for statement in [
+        "INSERT INTO bj_installation RECORDS {_id: 'authority', _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', layout_digest: X'01', _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_fact_root_program RECORDS {_id: 'active', generation: 1, application_schema: 'original', _valid_from: TIMESTAMP '1970-01-01Z'}",
+    ] {
+        client.update(statement, None).await;
+    }
+    let relation = OwnedRelation::new("paired_places").unwrap();
+    let geometry = "c_01010101010101010101010101010101";
+    let schema = OwnedSchema::from_json(format!(r#"{{"fields":[{{"name":"{geometry}","type":{{"kind":"binary"}},"optional":false,"nullable":false}}]}}"#).as_bytes()).unwrap();
+    let mut installation = running.node.session("application", Arc::new(FixtureOwner)).unwrap();
+    let installed = installation.state_mut().execute_tx(vec![
+        rtdb_tx::TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
+        rtdb_tx::TxOp::OwnedDeclareCapacity { relation: relation.clone(), column: geometry.into(), prefix_bytes: 0, cap: 2, when: Vec::new() },
+    ], Default::default()).await.unwrap();
+    assert!(installed.committed(), "{:?}", installed.error());
+    drop(installation);
+
+    std::fs::write(directory.join("listen"), running.server.address().to_string()).unwrap();
+    wait_for(&directory, "original-written").await;
+    let database = running.node.catalog().database("application").unwrap();
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    let table = relation.table("xtdb");
+    let catalog = database.trie_catalog();
+    assert!(catalog.current_tries(&table).iter().any(|trie| trie.key.level() > 0));
+    std::fs::write(directory.join("original-durable"), []).unwrap();
+
+    wait_for(&directory, "backfill-requested").await;
+    database.build_artefacts().await.unwrap();
+    assert!(database.trie_catalog().current_tries(&table).iter().any(|trie| {
+        trie.artefacts.iter().any(|record| record.kind() == "spatial")
+    }));
+    std::fs::write(directory.join("backfill-published"), []).unwrap();
+
+    wait_for(&directory, "release-committed").await;
+    let program = client.query("SELECT generation FROM bj_fact_root_program WHERE application_schema = 'successor'").await;
+    assert_eq!(integer(&program[0], 0, 0), 2);
     running.stop().await;
 }
 
