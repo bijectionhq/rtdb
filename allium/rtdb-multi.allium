@@ -1467,6 +1467,7 @@ rule ConsumeIntake {
 -- Ordinary world publications may include independent read-only worlds under the same ordered guard. Data witnesses and clocks of the observers are checked before any publication is applied.
 -- Every publication carries the original held parent pin. An ordinary overlay or explicit clock advance can order from that standing and its expected clock without reading a user fact.
 -- A held reading may exceed the physical publication timestamp.
+-- A held world read exposes its last local clock publication with both the physical revision and logical reading from the original held catalog.
 -- A timed overlay orders a strictly increasing held reading and the overlay facts together.
 -- Acceptance-valid overlay facts begin at that publication's held reading.
 -- Acceptance-valid capacity and unique occupancy checks use that same held reading.

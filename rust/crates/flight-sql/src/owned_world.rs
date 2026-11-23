@@ -121,7 +121,11 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>>;
     fn present(&self) -> Timestamp;
     fn ancestor(&self) -> Option<(rtdb_types::Iid, Timestamp)>;
-    fn application_clock(&self) -> Option<Timestamp>;
+    /// Local logical reading and its ordered physical revision.
+    fn application_publication(&self) -> Option<(Timestamp, Timestamp)>;
+    fn application_clock(&self) -> Option<Timestamp> {
+        self.application_publication().map(|(reading, _)| reading)
+    }
     fn initial_clock(&self) -> Timestamp;
     fn clock_mode(&self) -> WorldClockMode;
     fn parent_basis(&self) -> TransactionKey;

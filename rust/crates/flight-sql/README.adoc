@@ -563,6 +563,11 @@ The host resolves deployment and archive authority from the authenticated placem
 
 `rtdb.owned.OpenWorldRead.v4` takes the world UUID and admits one live cut and its verified archived parent.
 The 57-byte result contains the opaque handle, live present, archived parent transaction ID and system time, last local application clock, initial data clock and one mode byte (0 retained, 1 held). Int64 minimum identifies an absent local application publication. Each integer is signed big-endian. Times are Unix microseconds.
+`rtdb.owned.ReadHeldWorldHead.v1` takes the original 16-byte held world read handle in Held clock mode.
+The reply contains the local publication's exact physical revision and logical reading, in that order as signed big-endian microseconds.
+A single zero byte means the line has published no local clock row.
+The result stays fixed for the life of the handle.
+
 `rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then a relation prefix and a terminated single-row Arrow IPC stream with `_id` and non-null `valid_micros: Int64`.
 The response reports the held present and valid instant in schema metadata. A found row also carries its exact winning revision.
 Retained worlds are read-only. Held worlds accept fixed-valid replacements, tombstones and explicit clock advances.

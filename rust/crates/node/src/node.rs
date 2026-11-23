@@ -1650,12 +1650,16 @@ impl OwnedReadSession {
         self.guard_context(Arc::clone(&self.context), relations)
     }
 
-    pub async fn world_application_clock(&self, world: rtdb_types::Iid) -> Result<Option<Timestamp>> {
+    pub async fn world_application_publication(
+        &self, world: rtdb_types::Iid,
+    ) -> Result<Option<(Timestamp, Timestamp)>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
-        let clock = rtdb_query::read_owned_world_clock(Arc::clone(&self.context), &self.owner, world).await?;
+        let publication = rtdb_query::read_owned_world_clock_revision(
+            Arc::clone(&self.context), &self.owner, world,
+        ).await?;
         self.check()?;
-        Ok(clock)
+        Ok(publication)
     }
 
     pub async fn read_world_shadow(

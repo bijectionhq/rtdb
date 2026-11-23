@@ -168,7 +168,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
     fn ancestor(&self) -> Option<(rtdb_types::Iid, Timestamp)> { HeldCheckpointWorld::ancestor(self) }
 
-    fn application_clock(&self) -> Option<Timestamp> { HeldCheckpointWorld::application_clock(self) }
+    fn application_publication(&self) -> Option<(Timestamp, Timestamp)> {
+        HeldCheckpointWorld::application_publication(self)
+    }
     fn initial_clock(&self) -> Timestamp { HeldCheckpointWorld::initial_clock(self) }
     fn clock_mode(&self) -> WorldClockMode { HeldCheckpointWorld::clock_mode(self) }
 

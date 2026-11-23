@@ -247,6 +247,7 @@ pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParen
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
 pub(crate) const RETAIN_REPLAYED_WORLD_V3: &str = "rtdb.owned.RetainReplayedWorld.v3";
 pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
+pub(crate) const READ_HELD_WORLD_HEAD_V1: &str = "rtdb.owned.ReadHeldWorldHead.v1";
 pub(crate) const SELECT_HELD_WORLD_PARENT_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldParentAsOf.v1";
 pub(crate) const HELD_WORLD_PARENT_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentPointAt.v1";
 
@@ -3357,6 +3358,28 @@ impl Service {
         });
         self.0.owned_world_reads.insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
         Ok(ActionResult { body: wire::retain(reply, reply_charge) })
+    }
+
+    pub(crate) fn read_held_world_head_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() {
+            return Err(unsupported());
+        }
+        if body.len() != 16 { return Err(invalid("Held world head requires its original read handle")); }
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(body))?;
+        held.snapshot.check().map_err(status)?;
+        if !matches!(held.snapshot.clock_mode(), rtdb_types::WorldClockMode::Held { .. }) {
+            return Err(status(rtdb_types::OwnedWorld::unavailable()));
+        }
+        let Some((reading, revision)) = held.snapshot.application_publication() else {
+            return Ok(ActionResult { body: Bytes::from_static(&[0]) });
+        };
+        if revision <= held.snapshot.parent_basis().system_time || revision > held.snapshot.present() {
+            return Err(status(rtdb_types::OwnedWorld::unavailable()));
+        }
+        let mut reply = Vec::with_capacity(16);
+        reply.extend_from_slice(&revision.0.to_be_bytes());
+        reply.extend_from_slice(&reading.0.to_be_bytes());
+        Ok(ActionResult { body: wire::retain(reply, call.reserve(16)?) })
     }
 
     fn owned_world_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedWorldReadResource>, Status> {

@@ -263,7 +263,9 @@ pub(crate) struct WorldIdentityPage {
 impl HeldCheckpointWorld {
     pub fn present(&self) -> TransactionKey { self.open.snapshot.present() }
 
-    pub fn application_clock(&self) -> Option<Timestamp> { self.open.clock }
+    pub fn application_publication(&self) -> Option<(Timestamp, Timestamp)> {
+        self.open.publication
+    }
     pub fn initial_clock(&self) -> Timestamp { self.open.record.initial_clock() }
     pub fn clock_mode(&self) -> WorldClockMode { self.open.record.mode }
 

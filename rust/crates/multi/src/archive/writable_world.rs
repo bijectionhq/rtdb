@@ -995,7 +995,7 @@ struct OpenWorld {
     retained: CheckpointWorldRetention,
     snapshot: OwnedReadSession,
     record: OwnedWorld,
-    clock: Option<Timestamp>,
+    publication: Option<(Timestamp, Timestamp)>,
     _schema_charge: Arc<MemoryReservation>,
 }
 
@@ -1030,15 +1030,17 @@ async fn open_world(
     {
         return Err(OwnedWorld::unavailable());
     }
-    let clock = snapshot.world_application_clock(world.id).await?;
-    if clock.is_some_and(|clock| !world.admits_clock_publication(clock, snapshot.present().system_time)) {
+    let publication = snapshot.world_application_publication(world.id).await?;
+    if publication.is_some_and(|(reading, revision)| {
+        revision > snapshot.present().system_time || !world.admits_clock_publication(reading, revision)
+    }) {
         return Err(OwnedWorld::unavailable());
     }
     Ok(OpenWorld {
         retained: retained.clone(),
         snapshot,
         record: world,
-        clock,
+        publication,
         _schema_charge: charge,
     })
 }
