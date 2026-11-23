@@ -3,7 +3,7 @@
 pub mod cipher;
 mod classic;
 mod delivery;
-pub use delivery::{PlaintextDelivery, PlaintextView, drain_unit_delivery};
+pub use delivery::{PlaintextDelivery, PlaintextDependencies, PlaintextScopes, PlaintextView, drain_unit_delivery};
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
 pub use classic::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD};
 

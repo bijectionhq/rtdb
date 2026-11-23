@@ -33,7 +33,7 @@ struct Unit {
     cipher: Arc<dyn ObjectCipher>,
     name: ObjectKey,
     expires: Mutex<Option<Instant>>,
-    read_lease: Option<Arc<ReadLease>>,
+    read_lease: Mutex<Option<Arc<ReadLease>>>,
     _allocation: Arc<MemoryReservation>,
 }
 
@@ -74,11 +74,20 @@ impl PlaintextView {
     }
 
     pub fn track(cipher: &Arc<dyn ObjectCipher>, name: &ObjectKey) -> Result<()> {
+        Self::track_at(cipher, name, IoRegion::current_read_lease())
+    }
+
+    fn track_at(cipher: &Arc<dyn ObjectCipher>, name: &ObjectKey, lease: Option<Arc<ReadLease>>) -> Result<()> {
         let tracked = PLAINTEXT_VIEWS.try_with(|views| {
             for view in views.iter() {
                 let key = (Arc::as_ptr(cipher) as *const () as usize, name.clone());
                 let mut units = view.units.lock();
-                if let std::collections::btree_map::Entry::Vacant(entry) = units.entry(key) {
+                if let Some(unit) = units.get(&key) {
+                    if let Some(lease) = &lease {
+                        let mut original = unit.read_lease.lock();
+                        *original = Some(original.take().map_or_else(|| lease.clone(), |prior| prior.earlier(lease.clone())));
+                    }
+                } else {
                     let bytes = name.as_str().len().saturating_mul(2).saturating_add(512);
                     let allocation =
                         view.memory.reserve(bytes).map_err(|_| Error::MemoryLimit {
@@ -86,11 +95,11 @@ impl PlaintextView {
                             limit: view.memory.limit_bytes(),
                             retained: view.memory.used_bytes(),
                         })?;
-                    entry.insert(Arc::new(Unit {
+                    units.insert(key, Arc::new(Unit {
                         cipher: Arc::clone(cipher),
                         name: name.clone(),
                         expires: Mutex::new(None),
-                        read_lease: IoRegion::current_read_lease(),
+                        read_lease: Mutex::new(lease.clone()),
                         _allocation: allocation,
                     }));
                 }
@@ -115,7 +124,8 @@ impl PlaintextView {
         for unit in units {
             let now = Instant::now();
             let mut cutoff = now + GRANT_WINDOW;
-            if let Some(lease) = &unit.read_lease {
+            let read_lease = unit.read_lease.lock().clone();
+            if let Some(lease) = &read_lease {
                 lease.check()?;
                 if let Some(read_cutoff) = now.checked_add(lease.remaining()) {
                     cutoff = cutoff.min(read_cutoff);
@@ -132,7 +142,7 @@ impl PlaintextView {
                 Some(expires) => expires.min(cutoff),
                 None => {
                     let check = IoRegion::leased(
-                        unit.read_lease.clone(),
+                        read_lease,
                         unit.cipher.operate(&unit.name, UnitOperation::Grant),
                     );
                     let checked = tokio::time::timeout_at(cutoff.into(), check)
@@ -158,6 +168,44 @@ impl PlaintextView {
         };
         delivery.check()?;
         Ok(delivery)
+    }
+}
+
+/// The caller's delivery scopes travel with an asynchronous read request.
+pub struct PlaintextScopes(Arc<[Arc<PlaintextView>]>);
+
+impl PlaintextScopes {
+    pub fn capture() -> Self {
+        Self(PLAINTEXT_VIEWS.try_with(Arc::clone).unwrap_or_default())
+    }
+
+    pub async fn reading<F: Future>(self, work: F) -> F::Output {
+        PLAINTEXT_VIEWS.scope(self.0, work).await
+    }
+}
+
+/// The original object keys needed by a replayed in-memory snapshot.
+pub struct PlaintextDependencies {
+    units: Vec<Arc<Unit>>,
+    _allocation: Arc<MemoryReservation>,
+}
+
+impl PlaintextDependencies {
+    pub fn capture(memory: &Arc<MemoryBudget>) -> rtdb_types::Result<Self> {
+        let view = PLAINTEXT_VIEWS.try_with(|views| views.last().cloned()).ok().flatten();
+        let units = view.as_ref().map(|view| view.units.lock());
+        let bytes = units.as_ref().map_or(0, |units| units.len()).saturating_mul(std::mem::size_of::<Arc<Unit>>());
+        let allocation = memory.reserve(bytes)?;
+        let units = units.map_or_else(Vec::new, |units| units.values().cloned().collect());
+        Ok(Self { units, _allocation: allocation })
+    }
+
+    pub fn admit(&self) -> Result<()> {
+        for unit in &self.units {
+            let lease = unit.read_lease.lock().clone();
+            PlaintextView::track_at(&unit.cipher, &unit.name, lease)?;
+        }
+        Ok(())
     }
 }
 
@@ -249,6 +297,25 @@ mod tests {
         async fn operate(&self, _: &ObjectKey, _: UnitOperation) -> Result<UnitOutput> {
             Ok(UnitOutput::Granted)
         }
+    }
+
+    #[tokio::test]
+    async fn detached_reply_spends_dependencies_of_the_replayed_snapshot() {
+        let memory = MemoryBudget::new(64 << 10);
+        let original = PlaintextView::new(memory.clone());
+        let key: Arc<dyn ObjectCipher> = Arc::new(AvailableKey);
+        let name = ObjectKey::new("tables/data").unwrap();
+        let dependencies = original.reading(async {
+            PlaintextView::track(&key, &name).unwrap();
+            PlaintextDependencies::capture(&memory).unwrap()
+        }).await;
+
+        let reply = PlaintextView::new(memory.clone());
+        reply.reading(async {
+            let caller = PlaintextScopes::capture();
+            tokio::spawn(caller.reading(async move { dependencies.admit().unwrap() })).await.unwrap();
+        }).await;
+        assert!(reply.grant().await.unwrap().is_bounded());
     }
 
     #[tokio::test]
