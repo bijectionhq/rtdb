@@ -203,6 +203,13 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relations: &[OwnedRelation],
         after: Timestamp, through: Timestamp, limit: usize,
     ) -> Result<OwnedMergedChanges> {
+        self.world_merged_changes_ordered(world, relations, after, through, limit, false).await
+    }
+
+    pub async fn world_merged_changes_ordered(
+        &self, world: rtdb_types::Iid, relations: &[OwnedRelation],
+        after: Timestamp, through: Timestamp, limit: usize, descending: bool,
+    ) -> Result<OwnedMergedChanges> {
         let (record, _charge) = self.world_registration(world).await?
             .filter(|(record, _)| !record.dropped && self.present.system_time < record.until)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
@@ -224,7 +231,8 @@ impl OwnedReadSession {
             }
             relation.in_world(world)
         }).collect::<Result<Vec<_>>>()?;
-        let mut page = self.merged_change_journals(&scoped, after, through, limit, ChangeScan::Forward).await?;
+        let scan = if descending { ChangeScan::Reverse } else { ChangeScan::Forward };
+        let mut page = self.merged_change_journals(&scoped, after, through, limit, scan).await?;
         for commit in &mut page.commits {
             for group in &mut commit.changes {
                 group.relation = group.relation.root_relation().ok_or_else(change_feed_uncovered)?;

@@ -198,9 +198,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn close(&self) { HeldCheckpointWorld::close(self); }
 
     fn changes<'a>(
-        &'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
+        &'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize, descending: bool,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedMergedChanges>> {
-        Box::pin(HeldCheckpointWorld::changes(self, relations, after, through, limit))
+        Box::pin(HeldCheckpointWorld::changes(self, relations, after, through, limit, descending))
     }
 
     fn valid_during<'a>(

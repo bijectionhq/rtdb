@@ -214,6 +214,7 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
+pub(crate) const READ_HELD_WORLD_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldWorldChangesDescending.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V3: &str = "rtdb.owned.ReadHeldWorldChanges.v3";
 pub(crate) const HELD_OWNED_STORAGE_USAGE_V1: &str = "rtdb.owned.ReadHeldStorageUsage.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v1";
@@ -1885,13 +1886,13 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_changes_action(&self, call: &Call, body: &[u8], descending: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World changes require a held world handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = held.snapshot.changes(&relations, after, through, limit).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), false)?;
+        let page = held.snapshot.changes(&relations, after, through, limit, descending).await.map_err(status)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }

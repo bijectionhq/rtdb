@@ -136,12 +136,12 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn changes(
-        &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
+        &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize, descending: bool,
     ) -> Result<rtdb_node::OwnedMergedChanges> {
         self.check()?;
         let guard = self.open.snapshot.relation_release_guard(relations)?;
         self.require_archive_coverage(Vec::new(), Arc::clone(&guard)).await?;
-        let page = self.open.snapshot.world_merged_changes(self.open.record.id, relations, after, through, limit).await?;
+        let page = self.open.snapshot.world_merged_changes_ordered(self.open.record.id, relations, after, through, limit, descending).await?;
         guard()?;
         self.check()?;
         Ok(page)
@@ -245,7 +245,7 @@ impl HeldCheckpointWorld {
         let parent_columns = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
-        if parent_columns != columns || columns.last().is_none_or(|column| column != "_id")
+        if parent_columns.as_slice() != columns || columns.last().is_none_or(|column| column != "_id")
             || columns[..columns.len() - 1].iter().any(|column| schema.path_column_type(column).is_none())
         {
             return Err(OwnedWorld::unavailable());
