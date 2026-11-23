@@ -640,6 +640,36 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
         .outcome,
         Ok(Outcome::CheckpointPrepared(preparation))
     );
+    let checkpoint_replay = |from| Operation::CheckpointReplay {
+        preparation,
+        base: view.checkpoint,
+        from,
+        maximum_bytes: ORDINARY + 1024,
+    };
+    assert!(matches!(
+        next.call(checkpoint_replay(view.checkpoint.cut))
+            .await
+            .unwrap(),
+        Reply::Refused(Refusal::Unauthorized)
+    ));
+    let mut alien = view.checkpoint.cut;
+    alien.history[0] ^= 1;
+    assert!(matches!(
+        custody.call(checkpoint_replay(alien)).await.unwrap(),
+        Reply::Refused(Refusal::Invalid)
+    ));
+    let Reply::Replay(prepared) = custody
+        .call(checkpoint_replay(view.checkpoint.cut))
+        .await
+        .unwrap()
+    else {
+        panic!("the custodian lost its exact chosen input under ordinary pressure");
+    };
+    assert_eq!(prepared.through, maintained.cut);
+    assert_eq!(prepared.records.len(), 2);
+    assert_eq!(prepared.records[0].result, appended);
+    assert_eq!(prepared.records[1].result, maintained);
+
     assert_eq!(
         execute(
             &custody,
@@ -654,6 +684,13 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
         .outcome,
         Ok(Outcome::Published(exact))
     );
+    assert!(matches!(
+        custody
+            .call(checkpoint_replay(view.checkpoint.cut))
+            .await
+            .unwrap(),
+        Reply::Refused(Refusal::Stale)
+    ));
 
     release(&old, first_recovery).await;
     release(&next, second_recovery).await;
