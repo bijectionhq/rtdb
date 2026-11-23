@@ -212,20 +212,29 @@ pub(super) fn apply_terminal(
     memory: &Arc<rtdb_columnar::MemoryBudget>,
 ) -> Result<()> {
     let checkpoint = fence.destination.checkpoint;
-    let mut position = None;
+    let mut writer_epoch = None;
     let log_epoch = StorageEpoch(fence.destination.source_log_epoch);
     let mut source = checkpoint.source;
     let mut last_offset = checkpoint.boundary;
     for entry in entries {
         let body = ReplicaFrame::decode(&entry.payload)?;
-        let sequence = body.term_sequence.filter(|sequence| sequence.0 >= 0).ok_or_else(suffix_unavailable)?;
-        if last_offset.checked_add(1) != Some(entry.lsn) || entry.epoch != fence.source_writer_epoch
-            || body.term.0 <= 0 || position.is_some_and(|(term, prior): (_, i64)|
-                body.term != term || prior.checked_add(1) != Some(sequence.0))
+        if last_offset.checked_add(1) != Some(entry.lsn)
+            || !(1..=fence.source_writer_epoch).contains(&entry.epoch)
+            || writer_epoch.is_some_and(|previous| entry.epoch < previous)
+            || body.term.0 <= 0
+            || body.term_sequence.is_none_or(|sequence| sequence.0 < 0)
+            || !matches!(recovered.fence.position(), rtdb_replication::TermPosition::Expecting(_))
         {
             return Err(suffix_unavailable());
         }
-        position = Some((body.term, sequence.0));
+        let admission = recovered.fence.admit(body.term, body.term_sequence)?;
+        if admission.verdict != rtdb_replication::Verdict::Apply
+            || (admission.opens_term() && !matches!(&body.message,
+                Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none()))
+        {
+            return Err(suffix_unavailable());
+        }
+        writer_epoch = Some(entry.epoch);
         last_offset = entry.lsn;
         match body.message {
             Some(ReplicaBody::ResolvedTx(message)) => {
