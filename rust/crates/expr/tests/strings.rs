@@ -79,7 +79,7 @@ fn reader_text_keeps_nested_extension_and_transit_forms() {
     let decimal = V::Decimal(rtdb_types::DecimalValue::new(123i128.to_be_bytes().to_vec(), 3, 2, 128).unwrap());
     assert_eq!(call("str", &[decimal.clone()]), text("1.23"));
     assert_eq!(call("str", &[V::List(vec![decimal, V::Keyword(rtdb_types::Keyword::from_name("foo/bar")), V::Uuid([0; 16]), V::Uri("https://example.org/é".into())])]),
-        text("[1.23M \"foo/bar\" #bytes \"00000000000000000000000000000000\" #xt/uri \"https://example.org/%C3%A9\"]"));
+        text("[1.23M :foo/bar #uuid \"00000000-0000-0000-0000-000000000000\" #xt/uri \"https://example.org/%C3%A9\"]"));
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     let value = V::Transit(encode_msgpack(&T::Array(vec![T::Keyword("x".into()), T::String("hello".into())])).unwrap());
     assert_eq!(call("str", &[value.clone()]), text("[:x \"hello\"]"));
@@ -88,16 +88,36 @@ fn reader_text_keeps_nested_extension_and_transit_forms() {
 }
 
 #[test]
+fn arrow_list_text_uses_the_elements_logical_objects() {
+    let keyword = |name| V::Keyword(rtdb_types::Keyword::from_name(name));
+    let record = |name: &str, number| V::Struct([(name.to_owned(), V::I64(number))].into_iter().collect());
+    for (values, expected) in [
+        (vec![keyword("foo"), keyword("bar")], "[:foo :bar]"),
+        (vec![V::Uuid(uuid::uuid!("123e4567-e89b-12d3-a456-426614174000").into_bytes())], "[#uuid \"123e4567-e89b-12d3-a456-426614174000\"]"),
+        (vec![V::Set(vec![V::I64(1)])], "[#{1}]"),
+        (vec![record("a", 1), record("b", 2)], "[{\"a\" 1} {\"b\" 2}]"),
+        (vec![V::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }], "[#xt/tstz-range [nil nil]]"),
+    ] {
+        let source = V::List(values);
+        let ty = source.logical_type();
+        let field = rtdb_columnar::to_field("x", &ty).unwrap();
+        let array = rtdb_columnar::build_array(&ty, &[source]).unwrap();
+        let value = rtdb_columnar::read_value(&field, array.as_ref(), 0).unwrap();
+        assert_eq!(rtdb_expr::cast(&value, &L::Scalar(S::Utf8), "UTC").unwrap(), text(expected));
+    }
+}
+
+#[test]
 fn temporal_text_casts_keep_java_spelling_and_format_reads_primitive_units() {
     use rtdb_types::TimeUnit as U;
-    assert_eq!(call("str", &[V::DateMilli(-1)]), text("1970-01-01"));
-    assert_eq!(call("str", &[V::DateMilli(-86_400_001)]), text("1969-12-31"));
-    assert_eq!(call("str", &[V::List(vec![V::DateMilli(-1)])]), text("[#time/date \"1970-01-01\"]"));
+    assert_eq!(call("str", &[V::DateMilli(-1)]), text("1969-12-31"));
+    assert_eq!(call("str", &[V::DateMilli(-86_400_001)]), text("1969-12-30"));
+    assert_eq!(call("str", &[V::List(vec![V::DateMilli(-1)])]), text("[#time/date \"1969-12-31\"]"));
     assert_eq!(call("str", &[V::Timestamp { value: 1, unit: U::Nanosecond, timezone: None }]), text("1970-01-01T00:00:00.000000001"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("UTC".into()) }]), text("1970-01-01T00:00Z[UTC]"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("+02:30".into()) }]), text("1970-01-01T02:30+02:30"));
     assert_eq!(call("str", &[V::Time { value: 1, unit: U::Millisecond, bit_width: 32 }]), text("00:00:00.001"));
-    assert_eq!(call("format", &[text("%s/%s"), V::DateMilli(-86_400_001), V::Timestamp { value: 42, unit: U::Microsecond, timezone: Some("UTC".into()) }]), text("-1/42"));
+    assert_eq!(call("format", &[text("%s/%s"), V::DateMilli(-86_400_001), V::Timestamp { value: 42, unit: U::Microsecond, timezone: Some("UTC".into()) }]), text("-2/42"));
     for (value, expected) in [(V::F64(1e7), "1.0E7"), (V::F64(1e-4), "1.0E-4"), (V::F64(-0.0), "-0.0"), (V::F64(f64::INFINITY), "Infinity")] { assert_eq!(call("str", &[value]), text(expected)); }
 }
 

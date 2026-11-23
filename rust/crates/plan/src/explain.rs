@@ -20,6 +20,6 @@ pub fn explain_analyze_schema() -> Result<Schema> {
         ("depth", string), ("op", LogicalType::Scalar(ScalarType::Keyword)), ("attributes", attributes),
         ("total_time", duration.clone()), ("self_time", duration.clone()), ("time_to_first_page", duration.maybe()),
         ("page_count", int.clone()), ("row_count", int.clone()), ("pushdowns", LogicalType::Scalar(ScalarType::Transit).maybe()),
-        ("peak_memory_bytes", int),
+        ("peak_memory_bytes", int.clone()), ("query_peak_memory_bytes", int),
     ].into_iter().enumerate().map(|(index, (name, data_type))| Field { id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type }).collect())
 }

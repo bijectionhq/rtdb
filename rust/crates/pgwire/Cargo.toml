@@ -33,6 +33,7 @@ tokio-rustls = "=0.26.6"
 [dev-dependencies]
 async-trait.workspace = true
 rtdb-maintenance.workspace = true
+rtdb-metrics.workspace = true
 
 [lints]
 workspace = true

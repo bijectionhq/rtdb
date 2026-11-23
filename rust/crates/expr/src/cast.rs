@@ -102,6 +102,7 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
     let data_type = data_type.unencoded();
     let data_type = match &data_type { LogicalType::Maybe(ty) => ty.as_ref(), ty => ty };
+    if value.logical_type() == *data_type { return Ok(value.clone()); }
     if let Some(days) = crate::temporal::date_days(value) {
         match data_type {
             LogicalType::Scalar(ScalarType::DateDay) => return Ok(Value::calendar_date(CivilDate::from_epoch_day(days)?, DateUnit::Day)),
@@ -109,7 +110,6 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             _ => {}
         }
     }
-    if value.logical_type() == *data_type { return Ok(value.clone()); }
     if let LogicalType::List { kind: rtdb_types::ListKind::List, element } = data_type {
         return cast_target(value, &rtdb_plan::CastTarget::List(Box::new(rtdb_plan::CastTarget::fixed(element.as_ref().clone()))), timezone);
     }

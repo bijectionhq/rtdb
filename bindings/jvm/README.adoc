@@ -58,6 +58,8 @@ Loading `xtdb.rust` extends the existing `xtdb.protocols/Connectable` protocol o
 Queries remain reducible, early reduction closes their cursor, node operations merge their await token, and connection operations reject a `:database` override.
 The passive database adapter owns the merged await token; each borrowed connection owns its native transaction state.
 Existing transaction-op parsing, key functions and value readers come from `xtdb-api`.
+Clojure queries opened on a native database use `XTDB Clojure API` as the default application name.
+Set the `:application-name` query option or use `NativeConnection.setApplicationName` on an existing connection to customize `SHOW application_name` and query trace attribution.
 
 == Explicit compatibility boundary
 
