@@ -327,6 +327,11 @@ impl TableRef {
         self.supported_owned_name().then(|| self.table.split_once('-').map(|(_, name)| name)).flatten()
     }
 
+    pub fn is_owned_lifetime_replica_table(name: &str) -> bool {
+        name.split_once('/').is_some_and(|(schema, table)|
+            Self::owned_schema(schema) && Self::new(schema, table).owned_lifetime_relation().is_some())
+    }
+
     pub fn owned_lifetime_relation(&self) -> Option<&str> {
         self.owned_storage_name()?.strip_prefix(OWNED_LIFETIME_PREFIX)
     }

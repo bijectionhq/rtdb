@@ -101,9 +101,11 @@ impl RetainRepairBase {
         }
         let serving = source_blocks.load_fresh_catalog(self.base.block).await?;
         require_root(&serving, self.base)?;
+        require_offline_lifetime_admission(&serving)?;
         let base_blocks = BlockStore::new(base_store.clone(), pool(base_store.clone(), &cache, memory), memory.clone(), file_size_target)?;
         let (base, tables) = base_blocks.load(self.base.block).await?;
         require_root(&base, self.base)?;
+        require_offline_lifetime_admission(&base)?;
         for entry in base.table_entries()? {
             cancelled(cancellation)?;
             let table = tables.get(&entry.table).ok_or_else(|| invalid("The base has no bound table block"))?;
@@ -236,8 +238,10 @@ impl RepairRange {
         };
         let (base, tables) = base_blocks.load(base_receipt.block).await?;
         require_root(&base, base_receipt)?;
+        require_offline_lifetime_admission(&base)?;
         let target = source_blocks.load_fresh_catalog(self.through.block).await?;
         require_root(&target, self.through)?;
+        require_offline_lifetime_admission(&target)?;
         let after = base.boundary_replica_position().ok_or_else(|| invalid("The base has no replica boundary"))?;
         if !repair_decision::matches_retained_boundary(retained_boundary, after.0) {
             return Err(invalid("The retained repair boundary differs from its exported checkpoint"));
@@ -297,6 +301,13 @@ impl RepairRange {
     }
 }
 
+fn require_offline_lifetime_admission(catalog: &BlockCatalog) -> Result<()> {
+    if catalog.table_entries()?.iter().any(|entry| entry.table.owned_lifetime_relation().is_some()) {
+        return Err(unavailable("Offline repair requires the original placed authority for lifetime replay"));
+    }
+    Ok(())
+}
+
 async fn replay(
     logs: &PartitionLogs, blocks: &BlockStore, destination: &LocalStore, repair: &mut RecoveredPartition,
     base: &BlockCatalog, target: &BlockCatalog, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
@@ -326,6 +337,9 @@ async fn replay(
         let installed = repair.partition.value();
         match &record.envelope.message {
             ReplicaBody::ResolvedTx(message) => {
+                if message.table_data.keys().any(|name| rtdb_types::TableRef::is_owned_lifetime_replica_table(name)) {
+                    return Err(unavailable("Offline replay cannot apply a placed lifetime floor"));
+                }
                 repair.apply_archived_transaction(message, memory)?;
             }
             ReplicaBody::BlockBoundary(message) => {
