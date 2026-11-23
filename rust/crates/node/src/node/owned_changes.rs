@@ -21,13 +21,15 @@ pub struct OwnedMergedChanges {
     pub retained_bytes: usize,
     _reservations: Vec<Arc<MemoryReservation>>,
     complete: bool,
-    upper: Timestamp,
+    complete_boundary: Timestamp,
 }
 
 impl OwnedMergedChanges {
+    pub fn is_complete(&self) -> bool { self.complete }
+
     pub fn covered_through(&self) -> Result<Timestamp> {
         if self.complete {
-            return Ok(self.upper);
+            return Ok(self.complete_boundary);
         }
         self.commits
             .last()
@@ -53,6 +55,9 @@ struct CoveredJournal {
     head: OwnedJournalHeader,
     head_revision: i64,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChangeScan { Forward, RetainedStart, Reverse }
 
 struct Journal<'a> {
     relation: &'a OwnedRelation,
@@ -137,7 +142,7 @@ impl OwnedReadSession {
             // Decode one accepted group. Its successors are unnecessary
             // while it still has a candidate or needs a later held present.
             let page = self.merged_change_journals(
-                std::slice::from_ref(relation), through, self.present.system_time, 1, through == Timestamp::MIN,
+                std::slice::from_ref(relation), through, self.present.system_time, 1, if through == Timestamp::MIN { ChangeScan::RetainedStart } else { ChangeScan::Forward },
             ).await?;
             let Some(group) = page.commits.first() else {
                 through = page.covered_through()?;
@@ -218,7 +223,7 @@ impl OwnedReadSession {
             }
             relation.in_world(world)
         }).collect::<Result<Vec<_>>>()?;
-        let mut page = self.merged_change_journals(&scoped, after, through, limit, false).await?;
+        let mut page = self.merged_change_journals(&scoped, after, through, limit, ChangeScan::Forward).await?;
         for commit in &mut page.commits {
             for group in &mut commit.changes {
                 group.relation = group.relation.root_relation().ok_or_else(change_feed_uncovered)?;
@@ -245,7 +250,17 @@ impl OwnedReadSession {
         if relations.iter().any(|relation| relation.world().is_some() || relation.is_world_catalog()) {
             return Err(change_feed_uncovered());
         }
-        self.merged_change_journals(relations, after, through, limit, false).await
+        self.merged_change_journals(relations, after, through, limit, ChangeScan::Forward).await
+    }
+
+    /// Merges whole Root groups in descending order within (after, through].
+    pub async fn merged_changes_descending(
+        &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
+    ) -> Result<OwnedMergedChanges> {
+        if relations.iter().any(|relation| relation.world().is_some() || relation.is_world_catalog()) {
+            return Err(change_feed_uncovered());
+        }
+        self.merged_change_journals(relations, after, through, limit, ChangeScan::Reverse).await
     }
 
     /// Admits an exact ordinary journal touch and returns its stable declared path projection.
@@ -283,7 +298,7 @@ impl OwnedReadSession {
 
     async fn merged_change_journals(
         &self, relations: &[OwnedRelation], after: Timestamp, upper: Timestamp,
-        limit: usize, from_retained_start: bool,
+        limit: usize, scan: ChangeScan,
     ) -> Result<OwnedMergedChanges> {
         if !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
             || !(1..=OWNED_MERGED_CHANGE_RELATIONS).contains(&relations.len())
@@ -317,28 +332,34 @@ impl OwnedReadSession {
                 "Merged change relations must be distinct",
             ));
         }
+        let reverse = scan == ChangeScan::Reverse;
         let mut journals = Vec::with_capacity(relations.len());
         for relation in names {
             guarded.check_cancelled()?;
-            if let Some(journal) = self.seek_changes(snapshot, relation, after, from_retained_start).await? {
-                journals.push(journal);
-            }
+            let journal = if reverse {
+                self.seek_changes_reverse(snapshot, relation, after, upper).await?
+            } else {
+                self.seek_changes(snapshot, relation, after, scan == ChangeScan::RetainedStart).await?
+            };
+            if let Some(journal) = journal { journals.push(journal); }
         }
+        let in_window = |journal: &Journal<'_>| journal.active()
+            && if reverse { journal.next.committed_at > after } else { journal.next.committed_at <= upper };
 
         let mut page = OwnedMergedChanges {
             commits: Vec::with_capacity(limit),
             retained_bytes: initial_bytes,
             _reservations: vec![initial_charge],
             complete: false,
-            upper,
+            complete_boundary: if reverse { after } else { upper },
         };
         while page.commits.len() < limit {
             guarded.check_cancelled()?;
             let Some(revision) = journals
                 .iter()
-                .filter(|journal| journal.active() && journal.next.committed_at <= upper)
+                .filter(|journal| in_window(journal))
                 .map(|journal| journal.next.committed_at)
-                .min()
+                .reduce(|a, b| if reverse { a.max(b) } else { a.min(b) })
             else {
                 break;
             };
@@ -403,14 +424,18 @@ impl OwnedReadSession {
                     touches,
                 });
                 charges.push(charge);
-                journal.advance(self).await?;
+                if reverse {
+                    journal.retreat(self).await?;
+                } else {
+                    journal.advance(self).await?;
+                }
             }
             page.retained_bytes += bytes;
             page._reservations.extend(charges);
             page.commits.push(OwnedChangeCommit { revision, changes });
         }
         guarded.check_cancelled()?;
-        page.complete = journals.iter().all(|journal| !journal.active() || journal.next.committed_at > upper);
+        page.complete = journals.iter().all(|journal| !in_window(journal));
         Ok(page)
     }
 
@@ -780,6 +805,41 @@ impl OwnedReadSession {
         }))
     }
 
+    async fn seek_changes_reverse<'a>(
+        &self, snapshot: &Snapshot, relation: &'a OwnedRelation, after: Timestamp, upper: Timestamp,
+    ) -> Result<Option<Journal<'a>>> {
+        let Some(covered) = self.covered_journal(snapshot, relation, after).await? else { return Ok(None); };
+        if after == upper || upper < covered.first.committed_at {
+            return Ok(None);
+        }
+        // Head checks and binary seek read headers only. No later payload
+        // is needed to prove the exact upper boundary.
+        let revision = if upper >= covered.head.committed_at {
+            covered.head_revision
+        } else {
+            self.version_boundary(relation, &covered, upper.next()?).await? - 1
+        };
+        if revision < 1 { return Err(change_feed_uncovered()); }
+        let next = self.journal_header(relation, revision).await?;
+        if next.committed_at > upper
+            || !ordered_or_same(covered.head_revision, revision, covered.head, next)
+        {
+            return Err(change_feed_uncovered());
+        }
+        if next.committed_at <= after { return Ok(None); }
+        let previous = if revision == 1 { covered.floor }
+            else { self.journal_header(relation, revision - 1).await? };
+        if previous.through_events >= next.through_events
+            || (revision > 1 && previous.committed_at >= next.committed_at)
+        {
+            return Err(change_feed_uncovered());
+        }
+        Ok(Some(Journal {
+            relation, revision, head: covered.head_revision, head_through: covered.head.through_events,
+            previous_through: previous.through_events, next,
+        }))
+    }
+
     async fn require_journal_head(
         &self,
         relation: &OwnedRelation,
@@ -816,7 +876,25 @@ impl OwnedReadSession {
 
 impl Journal<'_> {
     fn active(&self) -> bool {
-        self.revision <= self.head
+        (1..=self.head).contains(&self.revision)
+    }
+
+    async fn retreat(&mut self, held: &OwnedReadSession) -> Result<()> {
+        self.revision -= 1;
+        if !self.active() { return Ok(()); }
+        let next = held.journal_header(self.relation, self.revision).await?;
+        let previous = held.journal_header(self.relation, self.revision - 1).await?;
+        if next.through_events != self.previous_through
+            || !ordered_or_same(self.revision + 1, self.revision, self.next, next)
+            || previous.through_events >= next.through_events
+            || (self.revision > 1 && previous.committed_at >= next.committed_at)
+            || (self.revision == 1 && previous.committed_at != next.committed_at)
+        {
+            return Err(change_feed_uncovered());
+        }
+        self.next = next;
+        self.previous_through = previous.through_events;
+        Ok(())
     }
 
     async fn advance(&mut self, held: &OwnedReadSession) -> Result<()> {
