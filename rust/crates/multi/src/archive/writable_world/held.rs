@@ -740,15 +740,18 @@ impl HeldCheckpointWorld {
         let (result, witness) = self.read_ancestor(relation, AncestorRead::Point {
             id: id.clone(), valid: Interval::at(valid)?,
         }).await?;
-        let AncestorResult::Point(fact, _) = result else { return Err(OwnedWorld::unavailable()); };
-        Ok(WorldPoint { present: self.present(), fact, until: None, shadowed: false, witness: observed.then_some(witness) })
+        let AncestorResult::Point(fact, shadowed) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok(WorldPoint { present: self.present(), fact, until: None, shadowed, witness: observed.then_some(witness) })
     }
 
     pub async fn parent_point(
         &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool,
     ) -> Result<WorldPoint> {
         if self.ancestor().is_some() {
-            return self.ancestor_point(relation, id, valid_at, observed).await;
+            let mut point = self.ancestor_point(relation, id, valid_at, observed).await?;
+            // This route asks for the alias's inherited image.
+            point.shadowed = false;
+            return Ok(point);
         }
         self.root_parent_point(relation, id, valid_at, observed).await
     }
