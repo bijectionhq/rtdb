@@ -236,6 +236,16 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
+    fn identity_page_at<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        system: Timestamp, parent_only: bool,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
+        Box::pin(async move {
+            let page = HeldCheckpointWorld::identity_page_at(self, relation, valid, after, limit, system, parent_only).await?;
+            Ok(WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations })
+        })
+    }
+
     fn overlay_identities<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
