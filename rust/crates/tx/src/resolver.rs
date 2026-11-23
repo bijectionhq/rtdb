@@ -1205,13 +1205,13 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         for operation in operations {
-            let Some((relation, _, from, to)) = crate::hosted_control::proposal_overlay_write(operation) else { continue; };
-            let world = relation.world().ok_or_else(unavailable)?;
-            let root = relation.root_relation().ok_or_else(unavailable)?;
+            let Some(write) = crate::hosted_control::proposal_overlay_write(operation) else { continue; };
+            let world = write.relation.world().ok_or_else(unavailable)?;
+            let root = write.relation.root_relation().ok_or_else(unavailable)?;
             let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
             let bounded = record.schemas.relation(&root).is_some_and(|schema| schema.requires_bounded_period());
-            if (bounded && proposal_overlay != Some(world))
-                || (proposal_overlay == Some(world) && bounded != (from.is_some() && to.is_some()))
+            if ((bounded || write.create_only) && proposal_overlay != Some(world))
+                || (proposal_overlay == Some(world) && bounded != (write.from.is_some() && write.to.is_some()))
             {
                 return Err(unavailable());
             }
@@ -1231,6 +1231,17 @@ impl<'a> OpenTransaction<'a> {
                 ).await? != Some(parent))
             {
                 return Err(unavailable());
+            }
+            for operation in operations {
+                let (relation, documents) = match operation {
+                    Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. })
+                    | Operation::OwnedWriteIids { relation, documents, create_only: true, .. } =>
+                        (relation, documents),
+                    _ => continue,
+                };
+                let document = documents.rows().first().ok_or_else(unavailable)?;
+                let id = crate::source::document_id(document, &self.context.memory)?;
+                self.require_proposal_create_absence(owner, relation, relation, &id).await?;
             }
         } else if let Some(world) = retained_release {
             let original_pin = operations.iter().find_map(|op| match op {
@@ -1271,8 +1282,8 @@ impl<'a> OpenTransaction<'a> {
                         root_rows += 1;
                         1
                     }
-                    Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, .. })
-                    | Operation::OwnedWriteIids { relation, documents, create_only: false, .. }
+                    Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
+                    | Operation::OwnedWriteIids { relation, documents, .. }
                         if !documents.rows().is_empty() => {
                         let world = relation.world().ok_or_else(unavailable)?;
                         let count = documents.rows().len();
@@ -1424,6 +1435,20 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         Ok(latest)
+    }
+
+    async fn require_proposal_create_absence(
+        &self, owner: &str, root: &rtdb_types::OwnedRelation, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+    ) -> Result<()> {
+        let context = self.context.query_context(
+            self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+        )?;
+        if rtdb_query::owned_purge_floor(context, owner, root, id).await?.is_some()
+            || self.read_owned_revision(owner, relation, id, Interval::ALL).await?.is_some()
+        {
+            return Err(insert_exists());
+        }
+        Ok(())
     }
 
     async fn publish_owned_world(
@@ -1732,7 +1757,9 @@ impl<'a> OpenTransaction<'a> {
                 (rtdb_types::WorldClockMode::Proposal, None, None) => (self.tx_key().system_time, Timestamp::MAX, false),
                 _ => return Err(unavailable()),
             };
-            if create_only || from >= to || !documents.has_exact_presence() {
+            if (create_only && (record.mode != rtdb_types::WorldClockMode::Proposal || explicit))
+                || from >= to || !documents.has_exact_presence()
+            {
                 return Err(unavailable());
             }
             let schema = record.schemas.relation(&root)
@@ -1749,10 +1776,15 @@ impl<'a> OpenTransaction<'a> {
                     .checked_mul(2).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
                 let id = crate::source::document_id(row, &self.context.memory)?;
                 let shadow = rtdb_types::WorldShadow::from_record(row.clone())?;
-                if let rtdb_types::WorldShadow::Present(fact) = &shadow {
-                    validate_owned_schema(schema, fact)?;
+                match &shadow {
+                    rtdb_types::WorldShadow::Present(fact) => validate_owned_schema(schema, fact)?,
+                    rtdb_types::WorldShadow::Deleted if create_only => return Err(unavailable()),
+                    rtdb_types::WorldShadow::Deleted => (),
                 }
                 if &shadow.record(&id)? != row { return Err(unavailable()); }
+                if create_only {
+                    self.require_proposal_create_absence(owner, &root, relation, &id).await?;
+                }
             }
             return self.put_documents(&table, documents, iids, Some(from), Some(to),
                 DocumentWrite::Owned { relation, owner, create_only }).await;

@@ -1848,6 +1848,11 @@ enum OwnedWorldObservation {
 impl OwnedWorldWitness {
     pub fn purge_frontier(&self) -> i64 { self.purge_frontier }
 
+    pub fn is_absent_point(&self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> bool {
+        self.relation.root_relation().as_ref() == Some(relation)
+            && matches!(&self.observation, OwnedWorldObservation::Point { id: observed, revision: None, .. } if observed == id)
+    }
+
     pub fn allocation_bound(&self) -> usize {
         use rtdb_types::EntityId;
         let point = match &self.observation {
@@ -1953,6 +1958,7 @@ pub struct OwnedWorldWrite {
     pub relation: rtdb_types::OwnedRelation,
     pub id: rtdb_types::EntityId,
     pub shadow: rtdb_types::WorldShadow,
+    pub create_only: bool,
     pub valid: Option<rtdb_types::Interval>,
 }
 
@@ -2264,7 +2270,7 @@ impl NativeSession {
             Self::append_world_checks(&mut ops, section.checks);
             let (advance_to, drop_world, settlement_pin) = match section.effect {
                 OwnedWorldEffect::Overlay(writes) => {
-                    self.append_world_writes(&mut ops, section.world, writes)?;
+                    self.append_world_writes(&mut ops, section.world, writes, proposal_overlay)?;
                     (None, false, None)
                 }
                 OwnedWorldEffect::Clock(to) => (Some(to), false, None),
@@ -2324,13 +2330,24 @@ impl NativeSession {
 
     fn append_world_writes(
         &self, ops: &mut Vec<TxOp>, world: rtdb_types::Iid, writes: Vec<OwnedWorldWrite>,
+        proposal_overlay: bool,
     ) -> Result<()> {
-        for OwnedWorldWrite { relation, id, shadow, valid } in writes {
+        for OwnedWorldWrite { relation, id, shadow, valid, create_only } in writes {
+            if create_only && (!proposal_overlay || valid.is_some()
+                || !matches!(&shadow, rtdb_types::WorldShadow::Present(_)))
+            {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
             let relation = relation.in_world(world)?;
             let _encode = self.service.node.memory().reserve(shadow.allocation_bound()?)?;
             let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)?], self.service.node.memory())?;
-            ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: valid.map(|valid| valid.lower()),
-                valid_to: valid.map(|valid| valid.upper()) });
+            let valid_from = valid.map(|valid| valid.lower());
+            let valid_to = valid.map(|valid| valid.upper());
+            ops.push(if create_only {
+                TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }
+            } else {
+                TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
+            });
         }
         Ok(())
     }

@@ -563,6 +563,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
     let mut controls = Vec::new();
     let mut writes = Vec::new();
     let mut terminal = false;
+    let mut create = false;
     let mut points = BTreeMap::<_, BTreeSet<_>>::new();
     let mut timelines = BTreeSet::new();
     for operation in operations {
@@ -573,48 +574,71 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation, local_frontier, .. }) => {
                 if local_frontier.is_some() { timelines.insert(relation); }
             }
-            Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, .. }) => {
-                points.entry((relation, id.handle_bytes())).or_default().insert(*valid_at);
+            Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) => {
+                points.entry((relation, id.handle_bytes())).or_default().insert((*valid_at, expected.is_none()));
             }
             Operation::Public(TxOp::OwnedPublishWorld {
-                world: next, advance_to: None, drop_world: false, settlement_pin, delete_root: None, ..
+                world: next, advance_to: None, drop_world: false, settlement_pin, delete_root: None, expected, ..
             }) if world.is_none() => {
-                world = Some(*next);
+                world = Some((*next, expected.is_none()));
                 terminal = settlement_pin.is_some();
             },
             operation => {
-                let (relation, documents, from, to) = proposal_overlay_write(operation)?;
-                let start = match (from, to) {
+                let write = proposal_overlay_write(operation)?;
+                let start = match (write.from, write.to) {
                     (None, None) => None,
                     (Some(from), Some(to)) if Timestamp::MIN < from && from < to && to < Timestamp::MAX => Some(from),
                     _ => return None,
                 };
-                if documents.rows().len() != 1 { return None; }
-                let id = documents.rows()[0].get("_id")?.entity_id().ok()?;
-                writes.push((relation, id.handle_bytes(), start));
+                if write.documents.rows().len() != 1 { return None; }
+                let id = write.documents.rows()[0].get("_id")?.entity_id().ok()?;
+                if write.create_only {
+                    if start.is_some() || create { return None; }
+                    create = true;
+                }
+                writes.push((write.relation, id.handle_bytes(), start));
             }
         }
     }
-    let world = world?;
+    let (world, initial) = world?;
+    if create && (!initial || writes.len() != 1) { return None; }
     let controls_allowed = if terminal { retained_delete_controls(controls) } else { proposal_overlay_controls(controls) };
     (terminal == writes.is_empty() && controls_allowed && writes.into_iter().all(|(relation, id, start)| {
         relation.world() == Some(world)
             && points.remove(&(relation, id)).is_some_and(|instants| {
-                start.is_none_or(|start| instants.contains(&start) && timelines.contains(&relation))
+                if create {
+                    instants.iter().all(|(_, absent)| *absent)
+                } else {
+                    start.is_none_or(|start| instants.iter().any(|(at, _)| *at == start) && timelines.contains(&relation))
+                }
             })
     })).then_some(world)
 }
 
+pub(crate) struct ProposalOverlayWrite<'a> {
+    pub(crate) relation: &'a OwnedRelation,
+    pub(crate) documents: &'a crate::Documents,
+    pub(crate) from: Option<Timestamp>,
+    pub(crate) to: Option<Timestamp>,
+    pub(crate) create_only: bool,
+}
+
 pub(crate) fn proposal_overlay_write(
     operation: &crate::source::Operation,
-) -> Option<(&OwnedRelation, &crate::Documents, Option<Timestamp>, Option<Timestamp>)> {
+) -> Option<ProposalOverlayWrite<'_>> {
     use crate::{TxOp, source::Operation};
-    match operation {
-        Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
-        | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. }
-            if relation.world().is_some() => Some((relation, documents, *valid_from, *valid_to)),
-        _ => None,
-    }
+    let (relation, documents, from, to, create_only) = match operation {
+        Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) =>
+            (relation, documents, valid_from, valid_to, false),
+        Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
+            (relation, documents, valid_from, valid_to, true),
+        Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only, .. } =>
+            (relation, documents, valid_from, valid_to, *create_only),
+        _ => return None,
+    };
+    relation.world().map(|_| ProposalOverlayWrite {
+        relation, documents, from: *from, to: *to, create_only,
+    })
 }
 
 /// A landing settles its existing owner and one new immutable receipt.
