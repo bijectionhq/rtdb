@@ -392,7 +392,15 @@ where
     .await;
     let uncertain = admitted.is_err();
     let result = match admitted {
-        Ok(record) => run(record, region, io.clone()).await,
+        Ok(record) => {
+            let work = run(record, region, io.clone());
+            if capture.is_some() {
+                let view = rtdb_storage::HeldView::recovery(io.clone());
+                IoRegion::reading(view, work).await
+            } else {
+                work.await
+            }
+        }
         Err(error) => Err(error),
     };
     io.close_and_wait().await;

@@ -16,7 +16,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, compacted_event_schema, copy_compaction_batch}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_index::{PartitionValue, TrieState};
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, ReadReservation};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
 use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -324,20 +324,15 @@ pub fn recency_partition(recency: Timestamp, partition: RecencyPartition) -> Res
 impl CompactionExecutor for SegmentCompactor {
     async fn execute(&self, job: &CompactionJob, cancellation: &CancellationToken) -> Result<TriesAdded> {
         let snapshot = self.snapshots.snapshot();
-        let permit = if self.store.defers_trie_releases() {
-            if job.inputs.iter().any(|key| !snapshot.trie_catalog().trie(&job.table, key).is_some_and(|trie| trie.state == TrieState::Live)) {
-                return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.maintenance/compaction-input-retired",
-                    "The compaction selection no longer names live inputs"));
-            }
-            let hold = self.store.retain_catalog(snapshot.snapshot().catalog_cut()).await?
-                .ok_or_else(|| crate::invalid("Coordinated storage returned no compaction hold"))?;
-            Some(hold)
-        } else { None };
-        let work = self.execute_job(job, snapshot, cancellation);
-        match permit {
-            Some(permit) => IoRegion::retaining(permit, work).await,
-            None => work.await,
+        if self.store.defers_trie_releases() && job.inputs.iter().any(|key| {
+            !snapshot.trie_catalog().trie(&job.table, key).is_some_and(|trie| trie.state == TrieState::Live)
+        }) {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.maintenance/compaction-input-retired",
+                "The compaction selection no longer names live inputs"));
         }
+        let captured = snapshot.snapshot();
+        let view = HeldView::catalog(self.store.as_ref(), snapshot.clone(), captured.catalog_cut(), captured.compacted_primary_paths()).await?;
+        IoRegion::reading(view, self.execute_job(job, snapshot, cancellation)).await
     }
 }
 

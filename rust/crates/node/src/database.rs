@@ -479,7 +479,7 @@ impl DatabaseFactory {
                 (None, None) => None,
             };
             match hold {
-                Some(hold) => IoRegion::retaining(hold, assembly).await,
+                Some(hold) => IoRegion::reading(rtdb_storage::HeldView::recovery(hold), assembly).await,
                 None => assembly.await,
             }
         }.await;

@@ -15,7 +15,7 @@ use rtdb_format::{
 };
 use rtdb_index::{TableCatalog, TrieCatalog, TrieState};
 use rtdb_storage::{
-    IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
+    HeldView, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
     cache::{BufferPool, CacheBudget},
     log::{MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions},
     object_store::ReadReservation,
@@ -190,7 +190,7 @@ pub struct PrimaryReset {
     source: Arc<PartitionLogs>,
     staged: Option<Arc<LocalStore>>,
     store: Arc<dyn ObjectStore>,
-    hold: Option<Arc<dyn Send + Sync>>,
+    hold: Arc<HeldView>,
     catalog: Arc<TrieCatalog>,
     tables: Arc<TableCatalog>,
     target: TransactionKey,
@@ -211,7 +211,8 @@ impl PrimaryReset {
     ) -> Result<Self> {
         let target = installed.latest_completed_tx().ok_or_else(no_reset_transactions)?;
         let store = Arc::clone(source.storage());
-        let hold = store.retain_catalog(cut).await?;
+        // The repair opens every primary referenced by the installed manifest, including superseded files.
+        let hold = HeldView::catalog(store.as_ref(), Arc::new(installed.clone()), cut, None).await?;
         let load = async {
             let blocks = source.recovery_block_store(file_size_target)?;
             let (root, tables) = blocks.load(installed.block_index()).await?;
@@ -233,10 +234,7 @@ impl PrimaryReset {
             let catalog = TrieCatalog::load(&primary, file_size_target, target.system_time)?;
             Ok((Arc::new(table_catalog), Arc::new(catalog)))
         };
-        let (tables, catalog) = match &hold {
-            Some(hold) => IoRegion::retaining(Arc::clone(hold), load).await?,
-            None => load.await?,
-        };
+        let (tables, catalog) = IoRegion::reading(Arc::clone(&hold), load).await?;
         Ok(Self { source, staged: None, store, hold, catalog, tables, target })
     }
 
@@ -261,7 +259,8 @@ impl PrimaryReset {
             .ok_or_else(|| invalid("The adopted checkpoint has no publication digest"))? };
         require_advancing_cut(base_receipt, target_receipt)?;
         let current = source.recovery_block_store(file_size_target)?;
-        let target = current.load_fresh_catalog(target_receipt.block).await?;
+        let recovery = HeldView::recovery(local.hold_recovery_open().await?);
+        let target = IoRegion::reading(recovery, current.load_fresh_catalog(target_receipt.block)).await?;
         require_root(&target, target_receipt)?;
         require_offline_lifetime_admission(&target)?;
         let target_tx = target.latest_completed_tx().ok_or_else(|| invalid("The target has no completed transaction"))?;
@@ -289,7 +288,8 @@ impl PrimaryReset {
         let catalog = Arc::clone(value.trie_catalog());
         let tables = Arc::clone(value.table_catalog());
         let store = Arc::clone(source.storage());
-        Ok(Self { source, staged: Some(staged), store, hold: None, catalog, tables, target: target_tx })
+        let hold = HeldView::recovery(staged.clone());
+        Ok(Self { source, staged: Some(staged), store, hold, catalog, tables, target: target_tx })
     }
 
     pub fn catalog(&self) -> &TrieCatalog { &self.catalog }
@@ -319,10 +319,7 @@ impl PrimaryReset {
             }
             Ok::<_, Anomaly>(())
         };
-        match &self.hold {
-            Some(hold) => IoRegion::retaining(Arc::clone(hold), publish).await?,
-            None => publish.await?,
-        }
+        IoRegion::reading(Arc::clone(&self.hold), publish).await?;
         Ok(PublishedPrimaryReset { source: self.source, expected, block, catalog, target: self.target })
     }
 }

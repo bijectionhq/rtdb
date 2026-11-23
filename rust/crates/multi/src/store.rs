@@ -226,7 +226,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
-        let (opened, audience_reads) = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
+        let (opened, audience_reads) = IoRegion::reading(rtdb_storage::HeldView::recovery(Arc::clone(&checkpoint_metadata)), async {
             let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
                 crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone(), audience_writer).await?
             } else {

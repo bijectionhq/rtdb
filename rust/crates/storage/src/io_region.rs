@@ -23,6 +23,27 @@ impl HeldView {
         let owners = std::iter::once(catalog).chain(registrations.into_iter().map(|hold| hold as Arc<dyn Send + Sync>)).collect();
         Self { _owners: owners }
     }
+
+    /// Carries a recovery registration issued by the owner of the opened storage residence.
+    pub fn recovery(registration: Arc<dyn Send + Sync>) -> Arc<Self> {
+        Arc::new(Self { _owners: Arc::from([registration]) })
+    }
+
+    /// Acquires the serving hold before reading files selected from the captured catalog.
+    pub async fn catalog(
+        store: &dyn crate::ObjectStore, owner: Arc<dyn Send + Sync>, cut: Option<rtdb_types::CatalogCut>,
+        compacted_primary: Option<Arc<[String]>>,
+    ) -> rtdb_types::Result<Arc<Self>> {
+        let registration = match compacted_primary {
+            Some(paths) => store.retain_catalog_with_primary(cut, paths).await?,
+            None => store.retain_catalog(cut).await?,
+        };
+        if store.defers_trie_releases() && registration.is_none() {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
+                "The coordinated storage owner returned no catalog hold"));
+        }
+        Ok(Arc::new(Self { _owners: std::iter::once(owner).chain(registration).collect() }))
+    }
 }
 
 pub struct IoRegion {
