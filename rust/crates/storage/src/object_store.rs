@@ -2,7 +2,7 @@ use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -42,24 +42,57 @@ pub struct StoredObject {
     pub size: u64,
 }
 
+/// Metadata or bytes and the physical version named by the same provider response.
+pub struct ObjectObservation<T> {
+    pub value: T,
+    pub version: Option<rtdb_types::PhysicalObjectVersion>,
+}
+
+/// The retained and temporary buffers of an object read, excluding provider transport metadata.
+pub struct ObjectReadAllocation {
+    pub retained_bytes: usize,
+    pub scratch_bytes: usize,
+}
+
 pub struct ReadReservation {
     length: usize,
-    retention: Box<dyn Send + Sync>,
+    retention: Arc<dyn Send + Sync>,
+    retained_bytes: usize,
+    scratch: Option<Arc<rtdb_types::MemoryReservation>>,
 }
 
 impl ReadReservation {
     /// `retention` must hold the memory charge for `length` bytes until it is dropped.
     pub fn new<T: Send + Sync + 'static>(length: usize, retention: T) -> Self {
-        Self { length, retention: Box::new(retention) }
+        Self { length, retention: Arc::new(retention), retained_bytes: 0, scratch: None }
+    }
+
+    pub(crate) fn funded(length: usize, retained: Arc<rtdb_types::MemoryReservation>, scratch: Option<Arc<rtdb_types::MemoryReservation>>) -> Self {
+        let retained_bytes = retained.bytes();
+        Self { length, retention: retained, retained_bytes, scratch }
+    }
+
+    pub fn covers(&self, allocation: &ObjectReadAllocation) -> bool {
+        self.retained_bytes >= allocation.retained_bytes
+            && self.scratch.as_ref().map_or(0, |scratch| scratch.bytes()) >= allocation.scratch_bytes
     }
 
     pub fn length(&self) -> usize { self.length }
 
-    pub(crate) fn check_range(&self, range: &Range<u64>) -> Result<()> {
+    pub fn check_range(&self, range: &Range<u64>) -> Result<()> {
         if range.end.checked_sub(range.start) != Some(self.length as u64) {
             return Err(Error::Task("reserved read range does not match its allocation reservation".into()));
         }
         Ok(())
+    }
+
+    /// Keeps output and temporary charges alive in provider tasks admitted while polling this read.
+    pub async fn retaining_io<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        let owner: Arc<dyn Send + Sync> = match &self.scratch {
+            Some(scratch) => Arc::new((Arc::clone(&self.retention), Arc::clone(scratch))),
+            None => Arc::clone(&self.retention),
+        };
+        crate::IoRegion::retaining(owner, work).await
     }
 
     /// Transfers the charge to the completed allocation; mismatched byte counts are rejected.
@@ -71,7 +104,7 @@ impl ReadReservation {
 
 pub struct RetainedBytes {
     bytes: Bytes,
-    _retention: Box<dyn Send + Sync>,
+    _retention: Arc<dyn Send + Sync>,
 }
 
 impl RetainedBytes {
@@ -80,41 +113,149 @@ impl RetainedBytes {
     pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
 }
 
+/// A derived ordered index's published page namespace.
+#[derive(Clone, Copy)]
+pub struct IndexPageScope<'a> {
+    pub index: &'a ObjectKey,
+    pub generation: u64,
+}
+
+/// The hosted store's authority over indexed page copies and their retirement.
+/// A retained permit covers decoded pages and provider requests spawned while
+/// holding it. The retirement operation records the obligation before returning.
+#[async_trait]
+pub trait IndexPageLifecycle: Send + Sync {
+    async fn retain(&self, scope: IndexPageScope<'_>) -> Result<Arc<dyn Send + Sync>>;
+    async fn retire_before(&self, scope: IndexPageScope<'_>) -> Result<()>;
+    async fn retire_dropped(&self, active: &BTreeSet<ObjectKey>, through: i64) -> Result<()>;
+}
+
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
+    /// Published checkpoint files survive a process restart on the same storage.
+    fn syncs_checkpoints(&self) -> bool { false }
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
+    /// Registers a captured catalog in a shared serving store.
+    /// A missing cut represents an opaque capture. Standalone stores need no remote registration.
+    async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        Ok(None)
+    }
+    /// Whether physical trie retirement waits for an installed receipt and the catalog floor.
+    fn defers_trie_releases(&self) -> bool { false }
+    /// Records an installed retirement as a lower bound for new catalog captures.
+    /// Returns false while a reader still needs a catalog before the proposed floor.
+    async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        Ok(true)
+    }
+    /// Releases the files selected by an installed trie-removal receipt.
+    async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
+    }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.
     /// Store wrappers must forward this request to the wrapped store's `head_fresh`.
     /// A missing key returns `Error::MissingObject`.
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.head(key).await }
+    /// A fresh metadata read, with a provider version when the store can observe one.
+    async fn observe_head(&self, key: &ObjectKey) -> Result<ObjectObservation<StoredObject>> {
+        Ok(ObjectObservation { value: self.head_fresh(key).await?, version: None })
+    }
+    /// Observes every logical key from storage, sharing evidence for members of one physical publication.
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
+        let mut observed = BTreeMap::new();
+        for key in keys { observed.insert(key.clone(), self.observe_head(key).await?); }
+        Ok(observed)
+    }
+    /// Observes the current provider version of a loose object owned by this store.
+    /// Missing, inherited, packed or unversioned objects return no evidence.
+    async fn retirement_version(&self, _key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        Ok(None)
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
     /// Reads without creating or trusting a node-local durable cache copy.
     /// Store wrappers must forward this request across any cache boundary.
     async fn get_fresh(&self, key: &ObjectKey) -> Result<Bytes> { self.get(key).await }
+    /// Reads an immutable object of the expected size without creating a durable cache entry.
+    /// Providers with response metadata can validate the size and read the body in one operation.
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        if self.head_fresh(key).await?.size != length as u64 {
+            return Err(wrong_size(key, length));
+        }
+        let bytes = self.get_fresh(key).await?;
+        if bytes.len() != length { return Err(wrong_size(key, length)); }
+        Ok(bytes)
+    }
+    /// Reads exactly the expected full object length and returns the physical version from
+    /// the response supplying the bytes when the provider can identify that version.
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<ObjectObservation<Bytes>> {
+        Ok(ObjectObservation { value: self.get_fresh_exact(key, length).await?, version: None })
+    }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
+    /// Reads the exact range and carries the physical version from this read, when available.
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<ObjectObservation<Bytes>> {
+        Ok(ObjectObservation { value: self.get_range(key, range).await?, version: None })
+    }
+    /// Whether a scan can read a slice without repeatedly loading the whole object.
+    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { true }
     /// Retains the allocation charge during the read and with the returned bytes.
     /// Implementations that offload work beyond this future must move the reservation into that work.
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
         reservation.finish(self.get_range(key, range).await?)
     }
+    /// How much storage the pool must admit before reading the object body.
+    fn whole_object_allocation(&self, _key: &ObjectKey, length: usize) -> Result<ObjectReadAllocation> {
+        Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes: 0 })
+    }
+    /// Reads a whole immutable object of the reserved length.
+    async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> Result<RetainedBytes> {
+        self.get_reserved_range(key, 0..reservation.length() as u64, reservation).await
+    }
+    /// Charges any expanded storage window needed for a scan's requested plaintext bytes.
+    fn scan_range_allocation(&self, _key: &ObjectKey, length: usize) -> Result<ObjectReadAllocation> {
+        Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes: 0 })
+    }
+    /// Reads part of an object without filling a whole-object disk cache on a miss.
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        self.get_reserved_range(key, range, reservation).await
+    }
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
+    /// Returns the identity from the successful write or from the read that verified an identical existing object.
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.put(key, bytes).await?;
+        Ok(None)
+    }
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.put_file(key, source).await?;
+        Ok(None)
+    }
     /// Returns the object names reported under a directory, ordered lexicographically.
     /// A listing may observe concurrent writes or deletions while enumerating the names.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
+    /// Collects an eligible checkpoint or offloaded replica file unless recovery still retains its block.
+    async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
+        self.delete(key).await.map_err(Into::into)
+    }
     /// Drops any copy of the object held on this node, leaving the remote object untouched.
     async fn forget(&self, _key: &ObjectKey) -> Result<()> { Ok(()) }
     /// The object as a file on this node's disk, for a reader that maps it rather than holding its bytes; `None` where the store keeps no local file.
     async fn local_file(&self, _key: &ObjectKey) -> Result<Option<LocalFile>> { Ok(None) }
+    /// Opens an existing local copy while leaving storage untouched on a cache miss.
+    async fn cached_local_file(&self, key: &ObjectKey) -> Result<Option<LocalFile>> { self.local_file(key).await }
 
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
         self.put(destination, self.get(source).await?).await
     }
+}
+
+pub(crate) fn wrong_size(key: &ObjectKey, length: usize) -> Error {
+    Error::Task(format!("Immutable object {key} has a different length from {length}"))
 }
 
 #[derive(Default)]
@@ -141,6 +282,12 @@ impl ObjectStore for MemoryStore {
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         self.objects.read().get(key).cloned().ok_or_else(|| Error::MissingObject(key.to_string()))
+    }
+
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        let bytes = self.get(key).await?;
+        if bytes.len() != length { return Err(wrong_size(key, length)); }
+        Ok(bytes)
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
@@ -182,9 +329,24 @@ impl LocalFile {
     pub fn file(&self) -> &std::fs::File { &self.file }
 }
 
+pub(crate) fn map_range(file: LocalFile, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+    reservation.check_range(&range)?;
+    let length = file.file().metadata().map_err(|error| Error::io(Path::new(key.as_str()), error))?.len();
+    let range = checked_range(key, range, length)?;
+    if range.is_empty() { return reservation.finish(Bytes::new()); }
+
+    struct MappedRange { map: memmap2::Mmap, _lease: Option<crate::disk_cache::DiskLease> }
+    impl AsRef<[u8]> for MappedRange { fn as_ref(&self) -> &[u8] { &self.map } }
+    // SAFETY: object files are published atomically and never modified in place. The mapping retains any disk-cache lease.
+    let map = unsafe { memmap2::MmapOptions::new().offset(range.start as u64).len(range.len()).map(file.file()) }
+        .map_err(|error| Error::io(Path::new(key.as_str()), error))?;
+    reservation.finish(Bytes::from_owner(MappedRange { map, _lease: file._lease }))
+}
+
 pub struct LocalStore {
     root: Arc<PathBuf>,
     io: Arc<IoRegion>,
+    catalog: Option<Arc<crate::local_catalog::LocalCatalogLedger>>,
 }
 
 struct AdmittedFile {
@@ -193,6 +355,7 @@ struct AdmittedFile {
 }
 
 impl LocalStore {
+    pub fn root(&self) -> &Path { &self.root }
     /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         Self::open_in(root, IoRegion::new())
@@ -203,8 +366,39 @@ impl LocalStore {
         let root = root.as_ref();
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
-        Ok(Self { root: Arc::new(root), io })
+        Ok(Self { root: Arc::new(root), io, catalog: None })
     }
+    /// Joins the catalog admission and retirement ledger on a shared local filesystem.
+    pub fn with_catalog_ledger(mut self, replica_epoch: rtdb_types::StorageEpoch) -> Self {
+        self.catalog = Some(Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), replica_epoch)));
+        self
+    }
+    /// Synchronizes an existing immutable object and its directory entries through the storage root.
+    pub async fn sync_existing(&self, key: &ObjectKey) -> Result<()> {
+        let root = self.root.clone();
+        let path = self.path(key);
+        let key = key.clone();
+        self.io.run(move || {
+            let file = open_object(&path, &key)?;
+            crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
+            sync_parents(&path, &root)
+        }).await
+    }
+
+    /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
+    pub async fn install_repair_anchor(&self, anchor: crate::LocalRepairAnchor) -> rtdb_types::Result<()> {
+        let ledger = crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch());
+        self.io.run(move || Ok(ledger.install_repair_anchor(anchor))).await?
+    }
+
+    /// Loads the durable repair anchor at this local storage root.
+    pub async fn retained_repair_anchor(&self) -> rtdb_types::Result<Option<crate::LocalRepairAnchor>> {
+        let ledger = self.catalog.clone().unwrap_or_else(|| {
+            Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), rtdb_types::StorageEpoch(0)))
+        });
+        self.io.run(move || Ok(ledger.retained_repair_anchor())).await?
+    }
+
     /// Rejects new work and joins this store's I/O region, including cancelled callers' blocking work.
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
 
@@ -293,6 +487,40 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 
 #[async_trait]
 impl ObjectStore for LocalStore {
+    fn local_maintenance_store(&self) -> Option<&LocalStore> { Some(self) }
+    fn syncs_checkpoints(&self) -> bool { true }
+
+    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        let Some(ledger) = self.catalog.clone() else { return Ok(None); };
+        Ok(Some(Arc::new(self.io.run(move || Ok(ledger.retain(cut))).await??)))
+    }
+
+    fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
+
+    async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        let Some(ledger) = self.catalog.clone() else { return Ok(true); };
+        self.io.run(move || Ok(ledger.advance(installed))).await?
+    }
+
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<()> {
+        use rtdb_format::trie_retirement::InstalledRetirement;
+        let unavailable = || rtdb_types::Anomaly::incorrect("rtdb.storage/trie-release",
+            "The local catalog floor does not authorize this installed trie release");
+        let ledger = self.catalog.clone().ok_or_else(unavailable)?;
+        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
+        let cut = installed.cut();
+        if self.get_fresh_exact(receipt, contents.len()).await? != contents
+            || !self.io.run(move || Ok(ledger.permits_retirement(cut))).await??
+        {
+            return Err(unavailable());
+        }
+        let mut files = installed.files().iter().collect::<Vec<_>>();
+        files.sort_by_key(|file| file.release_order());
+        let files = files.into_iter().map(|file| ObjectKey::new(&file.key)).collect::<Result<Vec<_>>>()?;
+        for file in files { self.delete(&file).await?; }
+        Ok(())
+    }
+
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let (path, key) = (self.path(key), key.clone());
         self.io.run(move || {
@@ -312,6 +540,22 @@ impl ObjectStore for LocalStore {
         }).await
     }
 
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        let (path, key) = (self.path(key), key.clone());
+        self.io.run(move || {
+            let mut file = open_object(&path, &key)?;
+            if file.metadata().map_err(|error| Error::io(&path, error))?.len() != length as u64 {
+                return Err(wrong_size(&key, length));
+            }
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes).map_err(|error| Error::io(&path, error))?;
+            if file.read(&mut [0]).map_err(|error| Error::io(&path, error))? != 0 {
+                return Err(wrong_size(&key, length));
+            }
+            Ok(Bytes::from(bytes))
+        }).await
+    }
+
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let (path, key) = (self.path(key), key.clone());
         self.io.run(move || read_local_range(&path, &key, range)).await
@@ -321,6 +565,11 @@ impl ObjectStore for LocalStore {
         reservation.check_range(&range)?;
         let (path, key) = (self.path(key), key.clone());
         self.io.run(move || reservation.finish(read_local_range(&path, &key, range)?)).await
+    }
+
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        let (path, key) = (self.path(key), key.clone());
+        self.io.run(move || map_range(LocalFile::new(open_object(&path, &key)?, None), &key, range, reservation)).await
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
@@ -399,24 +648,39 @@ impl ObjectStore for LocalStore {
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let path = self.path(key);
         let root = self.root.clone();
-        self.io.run(move || {
-            match fs::remove_file(&path) {
-                Ok(()) => (),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                Err(error) => return Err(Error::io(&path, error)),
+        self.io.run(move || remove_local_object(&root, &path)).await
+    }
+
+    async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
+        use rtdb_format::keys::{block_index_from_key, oversized_block_index};
+        let block = if key.as_str().starts_with("oversized/") {
+            oversized_block_index(key.as_str()).ok_or_else(|| Error::InvalidKey(key.to_string()))?
+        } else {
+            block_index_from_key(key.as_str())?
+        };
+        let path = self.path(key);
+        let root = self.root.clone();
+        let ledger = crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0));
+        self.io.run(move || Ok(ledger.collect_recovery_file(block, || remove_local_object(&root, &path)))).await?
+    }
+}
+
+fn remove_local_object(root: &Path, path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(Error::io(path, error)),
+    }
+    // A retry can observe an unlink whose parent was not flushed.
+    // If a containing directory is also absent, confirm its removal.
+    let mut parent = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
+    loop {
+        match crate::sync_directory(parent) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && parent != root => {
+                parent = parent.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
             }
-            // A retry can observe an unlink whose parent was not flushed.
-            // If a containing directory is also absent, confirm its removal.
-            let mut parent = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
-            loop {
-                match crate::sync_directory(parent) {
-                    Ok(()) => return Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && parent != root.as_path() => {
-                        parent = parent.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
-                    }
-                    Err(error) => return Err(Error::io(parent, error)),
-                }
-            }
-        }).await
+            Err(error) => return Err(Error::io(parent, error)),
+        }
     }
 }

@@ -4,19 +4,18 @@ use std::{
     sync::Arc,
 };
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_cell_bytes};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch, PutColumn};
 use rtdb_temporal::HistoryResolver;
-use rtdb_types::{
-    EventHeader, EventOp, Iid, Interval, LogicalType, Result, TemporalBounds, Timestamp,
-};
+use rtdb_types::{EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, Value, WorldShadow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     format_error,
-    key::{Atom, Bucket},
+    key::{AtomRef, Bucket},
     maintenance::cancelled,
-    tree::{Cursor, Entry, Item, Key, Link, Root, Span, Tree},
+    postings::{BatchKind, KeyBatch, KeyRow, ProjectedKeys, Tuple},
+    tree::{Address, AddressRef, Cursor, Hit, Item, Key, KeyRef, Link, Root, Span, Tree},
 };
 
 /// The roots for the partition's system-time points, with erasures applied to every affected root.
@@ -29,7 +28,7 @@ pub(super) struct RevisionRoots {
 impl RevisionRoots {
     pub async fn at(
         &self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         system_from: Timestamp,
     ) -> Result<Option<(Timestamp, Root)>> {
         if let Some((&time, root)) = self.changes.range(..=system_from).next_back() {
@@ -38,9 +37,9 @@ impl RevisionRoots {
         let mut cursor = Cursor::new(self.archived.clone(), true);
         cursor
             .next(tree, |key| match key {
-                Key::Revision(time) if *time <= system_from => Ordering::Equal,
-                Key::Revision(_) => Ordering::Greater,
-                Key::Posting { .. } | Key::Row(_) => Ordering::Less,
+                KeyRef::Revision(time) if time <= system_from => Ordering::Equal,
+                KeyRef::Revision(_) => Ordering::Greater,
+                KeyRef::Posting(..) | KeyRef::Row(_) => Ordering::Less,
             })
             .await?
             .map(archived_revision)
@@ -49,7 +48,7 @@ impl RevisionRoots {
 
     async fn stage_archived(
         &mut self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         cancellation: &CancellationToken,
     ) -> Result<()> {
         let mut cursor = Cursor::new(self.archived.take(), false);
@@ -65,7 +64,7 @@ impl RevisionRoots {
 
     pub async fn apply(
         &mut self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         changes: Changes,
         order: EventOrder,
         cancellation: &CancellationToken,
@@ -85,24 +84,27 @@ impl RevisionRoots {
             }
             let mut edits = BTreeMap::new();
             let mut cut_at_revision = false;
-            for (iid, mut events) in rows {
+            for (address, mut events) in rows {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
                 if matches!(order, EventOrder::OldestFirst) {
                     events.reverse();
                 }
-                let before = tree.spans(&root, iid).await?;
+                if events.iter().any(|event| event.header.commit_position != 0) {
+                    events.sort_by_key(|event| std::cmp::Reverse(event.header.commit_position));
+                }
+                let before = tree.spans(&root, &address).await?;
                 let cut = events.iter().any(|event| event.header.op == EventOp::Erase);
-                let after = resolve(iid, time, &before, &events, tree.memory)?;
+                let after = resolve(address.iid, time, &before, &events, &tree.memory)?;
                 if cut {
                     cut_at_revision = true;
                     self.stage_archived(tree, cancellation).await?;
                     for (_, historical) in self.changes.range_mut(..time) {
-                        let spans = tree.spans(historical, iid).await?;
+                        let spans = tree.spans(historical, &address).await?;
                         if !spans.is_empty() {
                             let mut removals = BTreeMap::new();
-                            project(&mut removals, iid, &spans, Arc::from([]));
+                            project(&mut removals, &address, &spans, Arc::from([]));
                             *historical = tree
                                 .edit(historical.clone(), removals.into_iter().collect())
                                 .await?;
@@ -110,7 +112,7 @@ impl RevisionRoots {
                     }
                 }
                 if before.as_ref() != after.as_slice() {
-                    project(&mut edits, iid, &before, after.into());
+                    project(&mut edits, &address, &before, after.into());
                 }
             }
             if cut_at_revision || !edits.is_empty() {
@@ -123,7 +125,8 @@ impl RevisionRoots {
     }
 }
 
-fn archived_revision(entry: Entry) -> Result<(Timestamp, Root)> {
+fn archived_revision(hit: Hit) -> Result<(Timestamp, Root)> {
+    let entry = hit.into_entry();
     match (entry.key, entry.item) {
         (Key::Revision(time), Item::Revision(pointer)) => Ok((time, pointer.map(Link::Stored))),
         _ => Err(format_error(
@@ -150,7 +153,7 @@ fn resolve(
             if let Some(tuple) = &event.tuple {
                 after.push(Span {
                     valid,
-                    tuple: Arc::clone(tuple),
+                    tuple: tuple.clone(),
                 });
             }
             Ok(())
@@ -159,6 +162,7 @@ fn resolve(
     // The previous projection contains exactly the older intervals that can still win.
     for span in before {
         let header = EventHeader {
+            commit_position: 0,
             iid,
             system_from: Timestamp::MIN,
             valid_time: span.valid,
@@ -167,7 +171,7 @@ fn resolve(
         resolver.resolve_fragments(&header, |valid, _| {
             after.push(Span {
                 valid,
-                tuple: Arc::clone(&span.tuple),
+                tuple: span.tuple.clone(),
             });
             Ok(())
         })?;
@@ -187,15 +191,15 @@ fn resolve(
     Ok(coalesced)
 }
 
-fn project(edits: &mut BTreeMap<Key, Option<Item>>, iid: Iid, before: &[Span], after: Arc<[Span]>) {
+fn project(edits: &mut BTreeMap<Key, Option<Item>>, address: &Address, before: &[Span], after: Arc<[Span]>) {
     let postings = |spans: &[Span]| -> BTreeSet<Key> {
         spans
             .iter()
             .flat_map(|span| {
                 Bucket::cover(span.valid).map(|bucket| Key::Posting {
                     bucket,
-                    tuple: Arc::clone(&span.tuple),
-                    iid,
+                    tuple: span.tuple.clone(),
+                    address: address.clone(),
                 })
             })
             .collect()
@@ -209,7 +213,7 @@ fn project(edits: &mut BTreeMap<Key, Option<Item>>, iid: Iid, before: &[Span], a
         edits.insert(key.clone(), Some(Item::Posting));
     }
     let spans = (!after.is_empty()).then_some(Item::Row(after));
-    edits.insert(Key::Row(iid), spans);
+    edits.insert(Key::Row(address.clone()), spans);
 }
 
 pub(super) enum EventOrder {
@@ -217,22 +221,41 @@ pub(super) enum EventOrder {
     NewestFirst,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum KeyLayout {
+    Plain,
+    Governed,
+    World,
+}
+
+impl KeyLayout {
+    pub fn for_table(table: &TableRef) -> Self {
+        if table.owned_world_root_table().is_some() {
+            Self::World
+        } else if table.is_owned_event_data() {
+            Self::Governed
+        } else {
+            Self::Plain
+        }
+    }
+}
+
 struct Event {
     header: EventHeader,
-    tuple: Option<Arc<[Atom]>>,
+    tuple: Option<KeyRow>,
     _allocation: Arc<MemoryReservation>,
 }
 
 #[derive(Default)]
 pub(super) struct Changes {
-    revisions: BTreeMap<Timestamp, BTreeMap<Iid, Vec<Event>>>,
+    revisions: BTreeMap<Timestamp, BTreeMap<Address, Vec<Event>>>,
 }
 
 impl Changes {
     /// A read keeps only its selected root. Later erasures still remove older facts from it.
     pub async fn read(
         self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         mut root: Root,
         system_at: Timestamp,
         order: EventOrder,
@@ -240,7 +263,7 @@ impl Changes {
     ) -> Result<Root> {
         for (time, rows) in self.revisions {
             let mut edits = BTreeMap::new();
-            for (iid, mut events) in rows {
+            for (address, mut events) in rows {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
@@ -248,17 +271,17 @@ impl Changes {
                 {
                     continue;
                 }
-                let before = tree.spans(&root, iid).await?;
+                let before = tree.spans(&root, &address).await?;
                 let after = if time > system_at {
                     Vec::new()
                 } else {
                     if matches!(order, EventOrder::OldestFirst) {
                         events.reverse();
                     }
-                    resolve(iid, time, &before, &events, tree.memory)?
+                    resolve(address.iid, time, &before, &events, &tree.memory)?
                 };
                 if before.as_ref() != after.as_slice() {
-                    project(&mut edits, iid, &before, after.into());
+                    project(&mut edits, &address, &before, after.into());
                 }
             }
             root = tree.edit(root, edits.into_iter().collect()).await?;
@@ -273,57 +296,120 @@ impl Changes {
         columns: &[String],
         memory: &Arc<MemoryBudget>,
         cancellation: &CancellationToken,
-        retain: impl Fn(EventHeader) -> bool,
+        layout: KeyLayout,
+        retain: impl Fn(EventHeader, AddressRef<'_>) -> bool,
     ) -> Result<()> {
+        let keyed = !matches!(layout, KeyLayout::Plain);
+        if batch.has_entity_keys() != keyed {
+            return Err(format_error("Ordered source events have the wrong physical identity layout"));
+        }
         let _headers = memory.reserve(batch.len().saturating_mul(256))?;
-        for event in batch.page_events()?.into_iter().skip(skip) {
-            if cancellation.is_cancelled() {
-                return Err(cancelled());
-            }
-            let header = event.header();
-            if !retain(header) {
-                continue;
-            }
-            let bytes = if header.op == EventOp::Put {
-                columns.iter().try_fold(256usize, |bytes, name| {
-                    let cell = match event.put_column(name) {
-                        Some(PutColumn::Stored(field, array, row)) => {
-                            estimate_read_cell_bytes(field, array, row)?
+        let events = batch.page_events()?;
+        for events in events[skip.min(events.len())..].chunks(128) {
+            let _cells = memory.reserve(
+                events
+                    .len()
+                    .saturating_mul(columns.len())
+                    .saturating_mul(size_of::<AtomRef<'_>>())
+                    .saturating_add(8192),
+            )?;
+            let mut retained = Vec::new();
+            let mut rows = Vec::new();
+            let mut payload = 0usize;
+            for event in events {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                let header = event.header();
+                let address = AddressRef { iid: header.iid, key: event.entity_key().unwrap_or_default() };
+                let _key = memory.reserve(address.key.len().saturating_add(128))?;
+                let id = if keyed {
+                    Some(rtdb_types::EntityId::from_handle_bytes(address.key)?)
+                } else {
+                    None
+                };
+                if !retain(header, address) { continue; }
+                if header.op == EventOp::Put {
+                    if let Some(id) = id {
+                        let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
+                            return Err(format_error("Governed ordered put omitted its identity"));
+                        };
+                        let _id = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
+                        if event.put_cell("_id", &rtdb_types::LogicalType::Null)?.entity_id()? != id {
+                            return Err(format_error("Governed ordered put differs from its physical identity"));
                         }
-                        Some(PutColumn::Absent) | None => 0,
+                    }
+                }
+                let local_tombstone = if matches!(layout, KeyLayout::World) && header.op == EventOp::Put {
+                    let Some(PutColumn::Stored(field, array, row)) = event.put_column(WorldShadow::FIELDS) else {
+                        return Err(format_error("Ordered world shadow omitted its field marker"));
                     };
-                    Ok::<_, rtdb_types::Anomaly>(
-                        bytes
-                            .saturating_add(cell.saturating_mul(3))
-                            .saturating_add(size_of::<Atom>()),
-                    )
-                })?
-            } else {
-                256
-            };
-            let allocation = memory.reserve(bytes)?;
-            let tuple = if header.op == EventOp::Put {
-                let values = columns
-                    .iter()
-                    .map(|name| {
-                        let value = event.put_cell(name, &LogicalType::Null)?;
-                        Ok(Atom::of(&value).unwrap_or(Atom::Unordered))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Some(values.into())
-            } else {
+                    let _charge = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
+                    match event.put_cell(WorldShadow::FIELDS, &LogicalType::Null)?.as_ref() {
+                        Value::Null => true,
+                        Value::List(_) => false,
+                        _ => return Err(format_error("Invalid ordered world shadow field marker")),
+                    }
+                } else {
+                    false
+                };
+                let row = if header.op == EventOp::Put && !local_tombstone {
+                    let cells = columns
+                        .iter()
+                        .map(|name| match event.put_column(name) {
+                            Some(PutColumn::Stored(field, array, row)) => {
+                                AtomRef::from_arrow(field, array, row)
+                            }
+                            Some(PutColumn::Absent) => Ok(AtomRef::Null),
+                            None => Err(format_error("An indexed put has no Arrow document")),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    payload = cells.iter().fold(payload, |bytes, cell| {
+                        bytes.saturating_add(cell.retained_bytes())
+                    });
+                    let row = rows.len();
+                    rows.push(cells);
+                    Some(row)
+                } else {
+                    None
+                };
+                retained.push((header, address, row));
+            }
+            let keys = if rows.is_empty() {
                 None
+            } else {
+                let mut allocation = memory.reserve(
+                    payload
+                        .saturating_mul(3)
+                        .saturating_add(columns.len().saturating_mul(4096))
+                        .saturating_add(
+                            rows.len().saturating_mul(columns.len()).saturating_mul(64),
+                        ),
+                )?;
+                let views = rows
+                    .iter()
+                    .map(|cells| Tuple::Cells(cells))
+                    .collect::<Vec<_>>();
+                let keys = KeyBatch::build(&views, BatchKind::Keys, Vec::new())?;
+                Arc::get_mut(&mut allocation)
+                    .expect("key builder owns its reservation")
+                    .shrink_to(keys.retained_bytes())?;
+                Some(ProjectedKeys::new(keys, allocation))
             };
-            self.revisions
-                .entry(header.system_from)
-                .or_default()
-                .entry(header.iid)
-                .or_default()
-                .push(Event {
-                    header,
-                    tuple,
-                    _allocation: allocation,
-                });
+            for (header, address, row) in retained {
+                let allocation = memory.reserve(address.key.len().saturating_add(256))?;
+                self.revisions
+                    .entry(header.system_from)
+                    .or_default()
+                    .entry(address.owned())
+                    .or_default()
+                    .push(Event {
+                        header,
+                        tuple: row
+                            .map(|row| keys.as_ref().expect("a put has projected keys").row(row)),
+                        _allocation: allocation,
+                    });
+            }
         }
         Ok(())
     }
@@ -338,6 +424,8 @@ mod tests {
 
     fn put(id: i64, system: i64, valid: Interval, key: i64) -> StoredEvent {
         StoredEvent {
+            commit_position: 0,
+            entity_key: None,
             iid: Value::I64(id).entity_id().unwrap().iid(),
             system_from: Timestamp(system),
             valid_time: valid,
@@ -363,33 +451,36 @@ mod tests {
                 &["key".into()],
                 memory,
                 cancellation,
-                |_| true,
+                if events.first().is_some_and(|event| event.entity_key.is_some()) {
+                    KeyLayout::Governed
+                } else {
+                    KeyLayout::Plain
+                },
+                |_, _| true,
             )
             .unwrap();
         changes
     }
 
-    async fn keys(tree: &Tree<'_>, root: Root, valid: Timestamp) -> Vec<(i128, Iid)> {
+    async fn keys(tree: &Tree, root: Root, valid: Timestamp) -> Vec<(i128, Iid)> {
         let mut keys = Vec::new();
         for bucket in Bucket::at(valid) {
             let mut cursor = Cursor::new(root.clone(), false);
             while let Some(entry) = cursor
                 .next(tree, |key| match key {
-                    Key::Posting {
-                        bucket: candidate, ..
-                    } => candidate.cmp(&bucket),
-                    Key::Row(_) | Key::Revision(_) => Ordering::Greater,
+                    KeyRef::Posting(candidate, _, _) => candidate.cmp(&bucket),
+                    KeyRef::Row(_) | KeyRef::Revision(_) => Ordering::Greater,
                 })
                 .await
                 .unwrap()
             {
-                let Key::Posting { tuple, iid, .. } = entry.key else {
+                let Key::Posting { tuple, address, .. } = entry.into_entry().key else {
                     panic!("Expected posting");
                 };
-                let [Atom::Integer(value)] = tuple.as_ref() else {
+                let AtomRef::Integer(value) = tuple.view().cell(0) else {
                     panic!("Expected integer");
                 };
-                keys.push((*value, iid));
+                keys.push((value, address.iid));
             }
         }
         keys.sort_unstable();
@@ -399,9 +490,9 @@ mod tests {
     #[tokio::test]
     async fn a_correction_retracts_the_original_bucket_and_a_pin_keeps_its_root() {
         let directory = ObjectKey::new("index").unwrap();
-        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
         let memory = MemoryBudget::new(32 << 20);
-        let tree = Tree::new(&storage, &directory, &memory, 0);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
         let token = CancellationToken::new();
         let mut roots = RevisionRoots::default();
         let original = put(1, 0, Interval::from_micros(0, 16).unwrap(), 90);
@@ -438,11 +529,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_erase_removes_only_the_complete_key_at_a_shared_iid() {
+        use rtdb_types::EntityId;
+
+        let directory = ObjectKey::new("shared-iid-index").unwrap();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
+        let memory = MemoryBudget::new(32 << 20);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
+        let token = CancellationToken::new();
+        let mut roots = RevisionRoots::default();
+        let mut first = put(1, 0, Interval::ALL, 2);
+        let iid = first.iid;
+        first.entity_key = Some(EntityId::Integer(1).handle_bytes().into());
+        let peer_id = EntityId::Uuid(iid.0);
+        let mut peer = put(1, 0, Interval::ALL, 9);
+        let StoredOperation::Put(row) = &mut peer.operation else { unreachable!(); };
+        row.insert("_id".into(), peer_id.as_value());
+        peer.entity_key = Some(peer_id.handle_bytes().into());
+        let erase = StoredEvent {
+            commit_position: 0,
+            entity_key: first.entity_key.clone(), iid, system_from: Timestamp(1),
+            valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None,
+        };
+        roots.apply(&tree, changes(&[first, peer], &memory, &token), EventOrder::OldestFirst, &token)
+            .await.unwrap();
+        let (_, original) = roots.at(&tree, Timestamp(0)).await.unwrap().unwrap();
+        assert_eq!(keys(&tree, original, Timestamp(0)).await, vec![(2, iid), (9, iid)]);
+        roots.apply(&tree, changes(&[erase], &memory, &token), EventOrder::OldestFirst, &token)
+            .await.unwrap();
+        for at in [0, 1] {
+            let (_, root) = roots.at(&tree, Timestamp(at)).await.unwrap().unwrap();
+            assert_eq!(keys(&tree, root, Timestamp(0)).await, vec![(9, iid)]);
+        }
+    }
+
+    #[tokio::test]
     async fn an_erasure_scrubs_older_revisions_and_respects_commit_order() {
         let directory = ObjectKey::new("index").unwrap();
-        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
         let memory = MemoryBudget::new(32 << 20);
-        let tree = Tree::new(&storage, &directory, &memory, 0);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
         let token = CancellationToken::new();
         let mut roots = RevisionRoots::default();
         let original = put(1, 0, Interval::ALL, 2);
@@ -456,7 +582,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let erase = StoredEvent {
+        let erase = StoredEvent { commit_position: 0, entity_key: None,
             iid,
             system_from: Timestamp(1),
             valid_time: Interval::ALL,

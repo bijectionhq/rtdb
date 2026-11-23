@@ -175,6 +175,16 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
    - otherwise `Column::Values(Vec<Value>)`.
    - `_valid_from`, `_valid_to`, `_system_from`, `_system_to` and `_iid` are **always `Column::Values`**. Each timestamp cell is `Value::Timestamp { timezone: Some("UTC".into()) }`, a heap `String` per cell (`fn time`). Each `_iid` cell is a `Vec<u8>`.
 7. Column predicates are applied above the scan by `BatchFilter`. Its kernels cover plain scalar columns only; anything else materialises every column of the batch into rows (§4).
+8. An `_id` range confines the scan to an IID interval (`id_interval`), which XTDB has no counterpart for.
+   - It applies where every `_id` of the table is a UUID, because a UUID is its own IID and orders as its bytes do. The conjuncts `_id <`, `<=`, `>`, `>=` and `BETWEEN` a UUID literal or parameter give one inclusive interval.
+   - `path_matches` drops trie files, metadata paths, live leaves and scan tasks outside the interval, and `buffer_task` starts and ends its merge inside it.
+   - The predicate still runs on the rows read. Like the `_id = v` narrowing, the interval trusts each row's IID to be the one its ID derives: a row replayed under another IID is not found by its ID.
+   - A table holding an ID of any other type is not narrowed, since its IDs are hashed into their IIDs.
+9. `ORDER BY _id ... LIMIT n` over such a table reads in IID order and stops (`iid_ordered_input`), which XTDB also has no counterpart for.
+   - The scan hands its tasks out in ascending or descending IID order, and keeps each task's merged rows in one batch in that order.
+   - The scan's predicates run on those batches, and the limit above stops pulling once it has its rows, so the remaining tasks load no page.
+   - `initialize` walks the interval's metadata paths but leaves each leaf's statistics undecoded; `read_statistics` tests them when the scan reaches the leaf's task, from the metadata the pool holds.
+   - It serves one `_id` sort key over a single partition, where no ordered index answers first. Any other sort is sorted as before.
 
 ### Divergence and impact
 

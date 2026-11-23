@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
@@ -9,46 +10,140 @@ use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, Artefac
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
-use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, SourcePosition, TableRef, Term, TransactionKey};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::ordered_index::OrderedIndexMaintenance;
-use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
+use crate::read_currency::ReadCurrency;
+use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, REPLICA_BEHIND, ReplicaReadIndex, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
 type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
 
+struct ReplicaReadSession(std::sync::Weak<Database>);
+
+impl Drop for ReplicaReadSession {
+    fn drop(&mut self) {
+        if let Some(database) = self.0.upgrade() {
+            database.replica_read_sessions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct Database {
+    pub(crate) protected_equality_epoch: uuid::Uuid,
     name: String,
     configuration: DatabaseConfig,
     read_only: bool,
     pub(crate) partition: Arc<PartitionState>,
     pub(crate) storage: Arc<BufferPool>,
+    pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
+    replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
+    pub(crate) await_authority: crate::AwaitAuthority,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
+    submitted_bytes: AtomicU64,
+    replica_read_sessions: AtomicUsize,
+    query_cpu: Option<Arc<rtdb_query::QueryCpu>>,
+    fragment_residence: Option<rtdb_query::FragmentResidence>,
     compaction: Option<CompactionHandle>,
     artefacts: Vec<ArtefactHandle>,
     ordered_cycle: Option<OrderedIndexCycle>,
     cancellation: CancellationToken,
     io: Arc<IoRegion>,
+    currency: Arc<ReadCurrency>,
 }
 
 impl Database {
+    pub fn serves_audience_storage(&self, source: uuid::Uuid) -> bool {
+        self.audience_storage.as_ref().is_some_and(|storage| storage.source == source)
+    }
     pub fn name(&self) -> &str { &self.name }
     pub fn configuration(&self) -> &DatabaseConfig { &self.configuration }
+    /// The immutable receipt authority of this live writer attachment.
+    pub fn placed_writer_scope(&self) -> Option<rtdb_types::PlacedAttemptScope> {
+        match &self.await_authority {
+            crate::AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
+            _ => None,
+        }
+    }
     pub fn read_only(&self) -> bool { self.read_only }
+    pub fn fragment_residence(&self) -> Option<&rtdb_query::FragmentResidence> { self.fragment_residence.as_ref() }
     pub fn is_critical(&self) -> bool { self.name == "xtdb" || self.configuration.critical.unwrap_or(false) }
     pub fn startup_replica_target(&self) -> Result<Option<ReplicaPosition>> { self.logs.startup_replica_target() }
     pub fn latest_submitted_position(&self) -> Result<SourcePosition> { self.logs.latest_source_position() }
-    pub(crate) async fn await_durable_source(&self, cancellation: &CancellationToken) -> Result<()> {
+    pub(crate) async fn await_installed(
+        &self, ready: impl Fn(rtdb_replication::InstalledPrefix) -> bool, cancellation: &CancellationToken,
+    ) -> Result<ReplicaPosition> {
+        let mut status = self.watch_status();
+        let waiting = status.wait_for(|status| status.role == Role::Stopped || status.installed.is_some_and(&ready));
+        let stopped = || Anomaly::new(AnomalyCategory::Unavailable, crate::NOT_HELD, format!("This node no longer applies {}", self.name));
+        let status = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
+            _ = self.cancellation.cancelled() => return Err(stopped()),
+            status = waiting => status.map_err(|_| stopped())?,
+        };
+        if status.role == Role::Stopped { return Err(stopped()); }
+        status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
+    }
+
+    pub(crate) async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
+        let Some(read_index) = &self.replica_read_index else { return Ok(()); };
+        let behind = || Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
+            format!("This replica of {} could not establish a fresh snapshot", self.name));
+        let confirm = async {
+            let offset = read_index.confirm().await.map_err(|error| behind().with_context("cause", error.code.into()))?;
+            let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, offset.0)?;
+            let mut status = self.watch_status();
+            let applied = status.wait_for(|status| status.role == Role::Stopped
+                || status.installed.is_some_and(|prefix| prefix.replica >= position));
+            let status = tokio::time::timeout(Duration::from_millis(20), applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
+            if status.role == Role::Stopped { return Err(behind()); }
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
+            _ = self.cancellation.cancelled() => Err(behind()),
+            result = confirm => result,
+        }
+    }
+
+    pub(crate) async fn await_durable_source(&self, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         if self.external_source() {
             return Err(Anomaly::incorrect("rtdb/source-barrier", "The database ingests transactions outside its source log"));
         }
         let logs = Arc::clone(&self.logs);
         let position = self.io.run_blocking(move || Ok(logs.latest_source_position())).await??;
-        self.replication.await_source(position, cancellation).await
+        self.replication.await_source(position, cancellation).await?;
+        Ok(self.progress().current().tx_key)
+    }
+
+    /// The lease for a snapshot of this database captured after this returns.
+    /// A node whose catalog cannot be confirmed current waits up to the lease margin for it, then returns an expired lease for admission to refuse.
+    pub(crate) async fn read_lease(&self, clock: &Arc<dyn Clock>, garbage: &rtdb_maintenance::GarbageConfig) -> Result<Arc<rtdb_storage::ReadLease>> {
+        use rtdb_storage::read_lease::{lease_admits, lease_deadline};
+        let (lease, margin) = (garbage.reader_lease_micros()?, garbage.reader_lease_margin_micros()?);
+        let deadline = |anchor: Option<i64>| anchor.and_then(|anchor| lease_deadline(anchor, lease, margin));
+        let observed_at = clock.monotonic_micros();
+        if self.currency.needs_observation(observed_at, lease / 4) {
+            let logs = Arc::clone(&self.logs);
+            if let Ok(Ok(tip)) = self.io.run_blocking(move || Ok(logs.latest_replica_position())).await { self.currency.observe(observed_at, tip); }
+        }
+        let mut current = deadline(self.currency.anchor(self.replication.status().installed.map(|prefix| prefix.replica)));
+        if current.is_none_or(|deadline| !lease_admits(clock.monotonic_micros(), deadline)) {
+            if let Some(tip) = self.currency.pending_tip() {
+                let mut status = self.replication.watch_status();
+                let caught_up = status.wait_for(|status| status.installed.is_some_and(|prefix| prefix.replica >= tip));
+                let _ = tokio::time::timeout(garbage.reader_lease_margin, self.cancellation.run_until_cancelled(caught_up)).await;
+                current = deadline(self.currency.anchor(self.replication.status().installed.map(|prefix| prefix.replica)));
+            }
+        }
+        let clock = Arc::clone(clock);
+        Ok(Arc::new(rtdb_storage::ReadLease::new(current, Arc::new(move || clock.monotonic_micros()))))
     }
 
     pub async fn block_lag(&self) -> Result<i64> {
@@ -66,6 +161,19 @@ impl Database {
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     /// Rows applied since the last block, held in the live index until the next flush.
     pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
+    pub fn live_batch_bytes(&self) -> u64 { self.partition.value().live().live_batch_bytes() }
+    pub fn cache_bytes(&self) -> u64 { self.storage.pool_retained_bytes() as u64 }
+    pub fn replica_read_sessions(&self) -> usize { self.replica_read_sessions.load(Ordering::Relaxed) }
+    pub(crate) fn track_replica_read_session(self: &Arc<Self>) -> impl Send + use<> {
+        self.replica_read_sessions.fetch_add(1, Ordering::Relaxed);
+        ReplicaReadSession(Arc::downgrade(self))
+    }
+    pub fn observe_query_cpu(&self) -> Option<u64> { self.query_cpu.as_ref()?.observe() }
+    pub(crate) fn query_cpu_tracker(&self) -> Option<Arc<rtdb_query::QueryCpu>> {
+        self.query_cpu.as_ref().filter(|counter| counter.is_observed()).cloned()
+    }
+    pub fn submitted_bytes(&self) -> u64 { self.submitted_bytes.load(Ordering::Relaxed) }
+    pub(crate) fn record_submission(&self, bytes: u64) { self.submitted_bytes.fetch_add(bytes, Ordering::Relaxed); }
     /// Pauses new user submissions and waits for the admitted ones to apply.
     pub async fn pause_transactions(&self) -> Result<PausedTransactions<'_>> {
         let paused = self.transaction_admission.write().await;
@@ -134,6 +242,7 @@ pub(crate) struct DatabaseFactory {
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub external_sources: ExternalSources,
     pub compaction_relay: Option<Arc<dyn CompactionRelay>>,
+    pub world_constraints: Option<Arc<dyn rtdb_tx::WorldConstraintArchive>>,
     pub artefact_kinds: Vec<Arc<dyn ArtefactKind>>,
     pub accelerators: Arc<[Arc<dyn rtdb_query::ScanAccelerator>]>,
     pub compaction_slots: Option<Arc<Semaphore>>,
@@ -175,26 +284,57 @@ impl DatabaseFactory {
         let cancellation = parent.child_token();
         let log_cancellation = CancellationToken::new();
         let access = if read_only { crate::LogAccess::ReadOnly } else if self.options.replication.may_lead { crate::LogAccess::ReadWrite } else { crate::LogAccess::SourceWriter };
-        let resources = self.resources.open_storage(&name, &configuration).await?;
+        let mut resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
-        let opened = async {
+        let checkpoint_metadata = resources.checkpoint_metadata.take();
+        let assembly = async {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
             let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now(), resources.blocks).await?;
             let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
+            if let crate::AwaitAuthority::Checkpoint { block, through, root, .. } = &opened_logs.await_authority
+                && (!read_only || through.0 < 0 || through.epoch() != opened_logs.replica_epoch
+                    || resources.blocks != rtdb_replication::BlockDiscovery::AtPublished(rtdb_replication::PublishedCheckpoint {
+                        block: *block, boundary: *through, root_sha256: Some(*root),
+                    })
+                    || !recovered.block.as_ref().is_some_and(|loaded| loaded.block_index() == *block
+                        && loaded.boundary_replica_position() == Some(*through) && loaded.publication_sha256() == Some(*root)))
+            {
+                return Err(Anomaly::fault("rtdb.node/checkpoint-await-cut", "The opened checkpoint does not establish its await-token cut"));
+            }
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
                 resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
             let recovered = if self.options.replication.enabled {
                 blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
-            } else { recovered.with_source_floor(logs.source_floor()?) };
+            } else {
+                let through = match &recovered.block {
+                    Some(block) => block.boundary_replica_position()
+                        .filter(|position| position.after_offset(logs.replica_epoch) >= 0),
+                    None => Some(logs.replica_floor()?),
+                };
+                if let Some(through) = through {
+                    recovered.partition.publish_catalog_cut(CatalogCut {
+                        storage_version: logs.storage_version, storage_epoch: logs.storage_epoch,
+                        replica_epoch: logs.replica_epoch, through,
+                    })?;
+                }
+                recovered.with_source_floor(logs.source_floor()?)
+            };
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
-            let resolve = Arc::new(ResolveContext { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
+            let resolve = Arc::new(ResolveContext {
+                owned_witness_scope: match &opened_logs.await_authority {
+                    crate::AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
+                    _ => None,
+                },
+                world_constraints: self.world_constraints.clone(),
+                database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
                 query_options: self.options.query.clone(),
                 scan_accelerators: Arc::clone(&self.accelerators),
                 cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization),
                 execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone() });
+            let query_cpu = catalog.is_placed().then(|| Arc::new(rtdb_query::QueryCpu::default()));
             let effects = Arc::new(CatalogEffects { catalog, commands, primary: name == "xtdb" });
             let mut replication_options = self.options.replication.clone();
             replication_options.may_lead &= !read_only;
@@ -225,7 +365,9 @@ impl DatabaseFactory {
             } };
             let mut artefact_drivers = Vec::new();
             let mut artefacts = Vec::new();
+            let mut live_artefacts = Vec::new();
             for (kind, builder) in builders {
+                if builder.builds_live_pages() { live_artefacts.push(Arc::clone(&builder)); }
                 let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
                     self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
@@ -236,15 +378,29 @@ impl DatabaseFactory {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };
             let ordered_worker = (!read_only && self.options.replication.enabled && self.options.replication.may_lead).then(|| Arc::new(OrderedIndexMaintenance::new(
-                name.clone(), Arc::clone(&storage), Arc::clone(&self.memory), Arc::clone(&self.clock), Arc::clone(&snapshots),
+                name.clone(), Arc::clone(&storage), Arc::clone(&self.memory), Arc::clone(&self.clock), Arc::clone(&snapshots), Arc::clone(&logs),
+                self.options.ordered_index_arrow_references,
             )));
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
-            let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
-                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
-            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
+            let currency = Arc::<ReadCurrency>::default();
+            let supervisor = MaintenanceSupervisor { currency: Arc::clone(&currency), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
+                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone(), clock: Arc::clone(&self.clock) };
+            let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
+                storage, replica_epoch: logs.replica_epoch.0,
+            });
+            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage,
+                audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
+                await_authority: opened_logs.await_authority,
+                transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
+                query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
+            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor,
+                artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
-        }.await;
+        };
+        let opened = match checkpoint_metadata {
+            Some(hold) => IoRegion::retaining(hold, assembly).await,
+            None => assembly.await,
+        };
         if opened.is_err() { io.close_and_wait().await; }
         opened
     }
@@ -255,6 +411,7 @@ pub(crate) struct DatabaseDriver {
     replication: ReplicationDriver,
     compactor: Option<CompactionDriver>,
     artefacts: Vec<ArtefactDriver>,
+    live_artefacts: Vec<Arc<dyn rtdb_maintenance::ArtefactBuilder>>,
     supervisor: MaintenanceSupervisor,
     logs: Vec<ResourceDriver>,
     log_cancellation: CancellationToken,
@@ -268,6 +425,27 @@ impl DatabaseDriver {
         tasks.spawn(self.replication.run());
         if let Some(compactor) = self.compactor { tasks.spawn(compactor.run(self.database.cancellation.clone())); }
         for lane in self.artefacts { tasks.spawn(lane.run(self.database.cancellation.clone())); }
+        if !self.live_artefacts.is_empty() {
+            let database = Arc::clone(&self.database);
+            let builders = self.live_artefacts;
+            tasks.spawn(async move {
+                let mut applied = database.replication.watch_status();
+                loop {
+                    if database.cancellation.is_cancelled() { return Ok(()); }
+                    let partition = database.partition.value();
+                    for builder in &builders {
+                        if let Err(error) = builder.build_live_pages(&partition, &database.cancellation).await
+                            && !database.cancellation.is_cancelled() {
+                            eprintln!("{} live search coverage: {error}", database.name);
+                        }
+                    }
+                    tokio::select! {
+                        _ = database.cancellation.cancelled() => return Ok(()),
+                        result = applied.changed() => if result.is_err() { return Ok(()); },
+                    }
+                }
+            });
+        }
         tasks.spawn(self.supervisor.run(self.database.cancellation.clone()));
         let failure = tokio::select! {
             biased;
@@ -314,7 +492,7 @@ impl ArtefactPublisher for PublishArtefacts {
     async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> { self.replication.publish_artefacts(message, &self.cancellation).await }
     async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> { self.replication.remove_artefacts(message, &self.cancellation).await }
 }
-struct PublishDeletions(TermHandle);
+pub(crate) struct PublishDeletions(pub(crate) TermHandle);
 #[async_trait]
 impl TrieDeletionPublisher for PublishDeletions {
     async fn publish(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> { self.0.publish_deletions(table, keys).await }
@@ -341,13 +519,19 @@ struct MaintenanceSupervisor {
     source: Option<Box<dyn ExternalSource>>,
     ordered_worker: Option<Arc<OrderedIndexMaintenance>>,
     ordered_cycle: Option<OrderedIndexCycle>,
+    clock: Arc<dyn Clock>,
+    currency: Arc<ReadCurrency>,
+    logs: Arc<PartitionLogs>,
 }
 
 impl MaintenanceSupervisor {
     async fn start_term(&mut self, handle: TermHandle, parent: &CancellationToken) -> Result<TermRegion> {
         let cancellation = parent.child_token();
         let publisher = Arc::new(PublishDeletions(handle.clone()));
-        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?);
+        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone(), {
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move || clock.monotonic_micros())
+        })?);
         let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;
@@ -378,9 +562,24 @@ impl MaintenanceSupervisor {
         let mut status = self.replication.watch_status();
         let mut region: Option<TermRegion> = None;
         let mut adopted = None;
+        let mut trie_retry = tokio::time::interval(self.options.garbage.reader_lease.clamp(
+            std::time::Duration::from_millis(100), std::time::Duration::from_secs(60),
+        ));
+        trie_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result = loop {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
+            // Keeps the read lease anchor fresh while the log processor applies records, so queries rarely observe the tip themselves.
+            if self.options.replication.enabled {
+                if let Ok(lease) = self.options.garbage.reader_lease_micros() {
+                    let observed_at = self.clock.monotonic_micros();
+                    if self.currency.needs_observation(observed_at, lease / 4) {
+                        let logs = Arc::clone(&self.logs);
+                        if let Ok(Ok(tip)) = tokio::task::spawn_blocking(move || logs.latest_replica_position()).await { self.currency.observe(observed_at, tip); }
+                    }
+                    self.currency.anchor(current.installed.map(|prefix| prefix.replica));
+                }
+            }
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };
             if region.as_ref().map(|region| region.term) != term {
                 if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(None); }
@@ -390,7 +589,10 @@ impl MaintenanceSupervisor {
                         biased;
                         _ = cancellation.cancelled() => break Ok(()),
                         changed = status.changed() => { if changed.is_err() { break Err(closed()); } continue; }
-                        started = self.start_term(handle, &cancellation) => match started { Ok(next) => region = Some(next), Err(error) => break Err(error) },
+                        started = self.start_term(handle, &cancellation) => match started {
+                            Ok(next) => { region = Some(next); trie_retry.reset_immediately(); }
+                            Err(error) => break Err(error),
+                        },
                     }
                 }
             }
@@ -408,6 +610,9 @@ impl MaintenanceSupervisor {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break Ok(()),
+                _ = trie_retry.tick(), if self.options.automatic_gc && region.is_some() => {
+                    if let Some(region) = &region { region.trie.signal(); }
+                }
                 changed = status.changed() => if changed.is_err() { break Err(closed()); },
                 result = async { region.as_mut().expect("guarded term region").tasks.join_next().await }, if region.is_some() => break Err(component_exit(result)),
             }

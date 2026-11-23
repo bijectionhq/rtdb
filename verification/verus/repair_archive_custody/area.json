@@ -1,0 +1,95 @@
+{
+  "summary": "A storage region retains every archive it names and authorizes reads only while open.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "omit_repair": {
+      "defect": "A region retains only its destination archive.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "find": " || matches!(repair, Some(id) if id == capture)",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "function": "covers_archive",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "omit_repair_with_weakened_contract": {
+      "defect": "A region retains only its destination archive.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "find": " || matches!(repair, Some(id) if id == capture)",
+          "replace": ""
+        },
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "find": "\n                   || (repair.is_some() && repair.unwrap() == capture)",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/repair_archive_custody/laws.rs",
+          "function": "a_repair_is_held_independently",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "read_after_close": {
+      "defect": "A closed region authorizes new reads.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "find": "    covered && !closed\n",
+          "replace": "    covered\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "function": "may_read_archive",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "read_after_close_with_weakened_contract": {
+      "defect": "A closed region authorizes new reads.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "find": "    covered && !closed\n",
+          "replace": "    covered\n"
+        },
+        {
+          "file": "rust/crates/directory/src/archive_custody.rs",
+          "find": "admitted <==> covered && !closed",
+          "replace": "admitted <==> covered"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/repair_archive_custody/laws.rs",
+          "function": "a_closed_region_cannot_authorize_a_read",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}

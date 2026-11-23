@@ -15,6 +15,10 @@ impl BatchBuilder {
         Ok(Self { reservation: memory.reserve(metadata)? })
     }
 
+    pub fn reserve_scratch(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        self.reservation.budget().reserve(bytes)
+    }
+
     pub fn column(&mut self, temporary: usize, build: impl FnOnce() -> Result<ArrayRef>) -> Result<ArrayRef> {
         let reservation = Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation");
         let retained = reservation.bytes();
@@ -130,7 +134,7 @@ impl OwnedBatch {
     }
 }
 
-/// The bytes a batch's distinct allocations hold, counting a buffer that several arrays share once.
+/// Counts each buffer base address once, using the largest capacity reported for it.
 pub fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
     let mut buffers = BTreeMap::new();
     let mut descriptors = std::mem::size_of::<RecordBatch>();
@@ -193,26 +197,38 @@ fn check_slice(offset: usize, length: usize, total: usize) -> Result<()> {
 
 struct RetainedAllocation {
     _buffer: Buffer,
-    _reservation: Arc<MemoryReservation>,
+    _owner: std::panic::AssertUnwindSafe<Arc<dyn Send + Sync>>,
 }
 
-fn attach_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> Result<Buffer> {
-    let offset = buffer.ptr_offset();
-    let span = offset.checked_add(buffer.len()).ok_or_else(|| Anomaly::fault("rtdb/buffer-span-overflow", "Arrow buffer span exceeds usize"))?;
-    let owner = Arc::new(RetainedAllocation { _buffer: buffer.clone(), _reservation: Arc::clone(reservation) });
-    // SAFETY: the owner retains the original immutable allocation; its base pointer covers this existing slice's offset and length.
-    let retained = unsafe { Buffer::from_custom_allocation(buffer.data_ptr(), span, owner) };
-    Ok(retained.slice_with_length(offset, buffer.len()))
+/// Retains an existing allocation and its charge through this exact byte view.
+pub fn retain_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> Buffer {
+    retain_buffer_with_owner(buffer, reservation.clone())
+}
+
+/// Retains an exact byte view along with a memory charge and any required custody.
+pub fn retain_buffer_with_owner(buffer: &Buffer, owner: Arc<dyn Send + Sync>) -> Buffer {
+    let start = std::ptr::NonNull::from(buffer.as_slice()).cast();
+    // The erased owner only holds the allocation charge or permit until drop.
+    let owner = Arc::new(RetainedAllocation {
+        _buffer: buffer.clone(), _owner: std::panic::AssertUnwindSafe(owner),
+    });
+    // SAFETY: the owner keeps the original immutable buffer alive for this slice's address and length.
+    unsafe { Buffer::from_custom_allocation(start, buffer.len(), owner) }
 }
 
 fn attach_data(data: ArrayData, reservation: &Arc<MemoryReservation>) -> Result<ArrayData> {
-    let buffers = data.buffers().iter().map(|buffer| attach_buffer(buffer, reservation)).collect::<Result<Vec<_>>>()?;
+    let buffers = data.buffers().iter().map(|buffer| retain_buffer(buffer, reservation)).collect::<Vec<_>>();
     let children = data.child_data().iter().map(|child| attach_data(child.clone(), reservation)).collect::<Result<Vec<_>>>()?;
     let nulls = data.nulls().map(|nulls| {
-        let buffer = attach_buffer(nulls.buffer(), reservation)?;
-        Ok::<NullBuffer, Anomaly>(NullBuffer::new(BooleanBuffer::new(buffer, nulls.offset(), nulls.len())))
-    }).transpose()?;
+        let buffer = retain_buffer(nulls.buffer(), reservation);
+        NullBuffer::new(BooleanBuffer::new(buffer, nulls.offset(), nulls.len()))
+    });
     data.into_builder().buffers(buffers).child_data(children).nulls(nulls).build().map_err(super::arrow_error)
+}
+
+/// Keeps a copy's allocation charge with its Arrow buffers through moves and slices.
+pub fn retain_array(array: ArrayRef, reservation: &Arc<MemoryReservation>) -> Result<ArrayRef> {
+    attach_data(array.to_data(), reservation).map(make_array)
 }
 
 fn selection_bound(batch: &RecordBatch, indices: &[u32]) -> Result<usize> {

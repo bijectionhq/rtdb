@@ -88,6 +88,8 @@ fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
 
 #[async_trait]
 impl Log for MemoryLog {
+    fn maximum_append_bytes(&self) -> Option<usize> { Some(self.shared.maximum_message_bytes) }
+
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         if payload.len() > self.shared.maximum_message_bytes {
             return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.shared.maximum_message_bytes });
@@ -110,6 +112,10 @@ impl Log for MemoryLog {
 
     async fn retained_floor(&self) -> Result<Option<LogOffset>> {
         Ok(Some(LogOffset(self.shared.records.lock().first)))
+    }
+
+    async fn recovery_tail(&self, after: LogOffset) -> Result<Option<Box<dyn LogTail>>> {
+        self.tail(after).await.map(Some)
     }
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {

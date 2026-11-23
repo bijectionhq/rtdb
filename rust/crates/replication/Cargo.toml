@@ -17,12 +17,14 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
+fs2.workspace = true
 parking_lot.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 serde.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

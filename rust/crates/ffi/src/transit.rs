@@ -64,6 +64,7 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
             if asynchronous {
                 let submitted = state.state_mut().submit_tx(operations, options).await?;
                 values.insert("tx_id".into(), Value::I64(submitted.tx_id.0));
+                if let Some(receipt) = submitted.placed_receipt { values.insert("await_token".into(), Value::Utf8(receipt)); }
             } else {
                 let result = state.state_mut().execute_tx(operations, options).await?;
                 if let Some(error) = result.error() { return Err(error.clone()); }
@@ -152,7 +153,7 @@ fn deletes_and_erases_are_submitted_as_sql_dml() {
     };
     let Some(TxOp::Sql { sql, args: Some(args) }) = op("delete-docs", vec![Value::I64(1)], true) else { panic!("expected SQL") };
     assert_eq!(sql, "DELETE FROM \"public\".\"docs\" FOR VALID_TIME FROM ? TO ? WHERE _id = ?");
-    assert_eq!(args.rows().collect::<Vec<_>>(), [&[time.clone(), Value::Null, Value::I64(1)][..]]);
+    assert_eq!(args.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [&[time.clone(), Value::Null, Value::I64(1)][..]]);
     let Some(TxOp::Sql { sql, .. }) = op("delete-docs", vec![Value::I64(1)], false) else { panic!("expected SQL") };
     assert_eq!(sql, "DELETE FROM \"public\".\"docs\" WHERE _id = ?");
     let Some(TxOp::Sql { sql, .. }) = op("erase-docs", vec![Value::I64(1)], false) else { panic!("expected SQL") };

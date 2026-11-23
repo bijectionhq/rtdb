@@ -1,0 +1,95 @@
+{
+  "summary": "Production persisted-leaf validation establishes IID order or returns a reader or order error.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "leaf_load_step",
+    "--rlimit",
+    "40"
+  ],
+  "min_verified_functions": 3,
+  "controls": {
+    "admits_inversion": {
+      "defect": "The importer accepts a run with an inverted adjacent pair.",
+      "mutate": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "find": "if let Ordering::Greater = compared {",
+          "replace": "if false && compared == Ordering::Greater {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "function": "validate_persisted_order",
+          "category": "precondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "rejects_duplicates": {
+      "defect": "The importer rejects a repeated row even when the run is ordered.",
+      "mutate": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "find": "if let Ordering::Greater = compared {",
+          "replace": "if compared != Ordering::Less {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "function": "validate_persisted_order",
+          "category": "assertion failed"
+        },
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "function": "validate_persisted_order",
+          "category": "precondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "skips_final_pair": {
+      "defect": "The importer never checks the final pair for an inversion.",
+      "mutate": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "find": "while next < rows.len() {",
+          "replace": "while next < rows.len() - 1 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "function": "validate_persisted_order",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "reads_wrong_row": {
+      "defect": "The right lookup reads the left row's IID.",
+      "mutate": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "find": "let seen_right = read_iid(right);",
+          "replace": "let seen_right = read_iid(left);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "function": "validate_persisted_order",
+          "category": "assertion failed"
+        },
+        {
+          "file": "rust/crates/trie/src/leaf_load_step.rs",
+          "function": "validate_persisted_order",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 2
+    }
+  }
+}

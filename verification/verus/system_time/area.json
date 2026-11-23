@@ -1,91 +1,172 @@
 {
   "summary": "The resolver admits strictly advancing system times and handles a stalled or exhausted clock.",
-  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 8,
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 11,
   "controls": {
     "reuse_the_previous_tick": {
-      "mutate": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "last.checked_add(1)",
-        "replace": "Some(last)"
-      }],
-      "expect": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "function": "automatic_time",
-        "category": "postcondition not satisfied"
-      }],
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "last.checked_add(1)",
+          "replace": "Some(last)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "automatic_time",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 7
     },
     "reuse_the_previous_tick_with_weakened_contract": {
-      "mutate": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "last.checked_add(1)",
-        "replace": "Some(last)"
-      }, {
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "if last == i64::MAX { None } else { Some((last + 1) as i64) }",
-        "replace": "Some(last)"
-      }],
-      "expect": [{
-        "file": "verification/verus/system_time/laws.rs",
-        "function": "every_automatic_assignment_advances",
-        "category": "assertion failed"
-      }, {
-        "file": "verification/verus/system_time/laws.rs",
-        "function": "a_stalled_clock_advances_one_tick",
-        "category": "assertion failed"
-      }, {
-        "file": "verification/verus/system_time/laws.rs",
-        "function": "the_maximum_cannot_be_advanced",
-        "category": "assertion failed"
-      }],
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "last.checked_add(1)",
+          "replace": "Some(last)"
+        },
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "if last == i64::MAX { None } else { Some((last + 1) as i64) }",
+          "replace": "Some(last)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "every_automatic_assignment_advances",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "a_stalled_clock_advances_one_tick",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "the_maximum_cannot_be_advanced",
+          "category": "assertion failed"
+        }
+      ],
       "min_verified_functions": 5
     },
     "admit_a_tied_timestamp": {
-      "mutate": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "        Some(last) => last < candidate,\n        None => true,\n    }\n}",
-        "replace": "        Some(last) => last <= candidate,\n        None => true,\n    }\n}"
-      }],
-      "expect": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "function": "advances",
-        "category": "postcondition not satisfied"
-      }],
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "        Some(last) => last < candidate,\n        None => true,\n    }\n}",
+          "replace": "        Some(last) => last <= candidate,\n        None => true,\n    }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "advances",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 7
     },
     "admit_a_tied_timestamp_with_weakened_contracts": {
-      "mutate": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "        Some(last) => last < candidate,\n        None => true,\n    }\n}",
-        "replace": "        Some(last) => last <= candidate,\n        None => true,\n    }\n}"
-      }, {
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "        Some(last) => last < candidate,\n        None => true,\n    },",
-        "replace": "        Some(last) => last <= candidate,\n        None => true,\n    },"
-      }, {
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "Some(last) if candidate <= last =>",
-        "replace": "Some(last) if candidate < last =>"
-      }],
-      "expect": [{
-        "file": "verification/verus/system_time/laws.rs",
-        "function": "every_automatic_assignment_advances",
-        "category": "assertion failed"
-      }, {
-        "file": "verification/verus/system_time/laws.rs",
-        "function": "a_stalled_clock_advances_one_tick",
-        "category": "assertion failed"
-      }, {
-        "file": "verification/verus/system_time/laws.rs",
-        "function": "the_maximum_cannot_be_advanced",
-        "category": "assertion failed"
-      }, {
-        "file": "verification/verus/system_time/laws.rs",
-        "function": "nonadvancing_explicit_times_are_refused",
-        "category": "assertion failed"
-      }],
-      "min_verified_functions": 4
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "        Some(last) => last < candidate,\n        None => true,\n    }\n}",
+          "replace": "        Some(last) => last <= candidate,\n        None => true,\n    }\n}"
+        },
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "        Some(last) => last < candidate,\n        None => true,\n    },",
+          "replace": "        Some(last) => last <= candidate,\n        None => true,\n    },"
+        },
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "Some(last) if candidate <= last =>",
+          "replace": "Some(last) if candidate < last =>"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "every_automatic_assignment_advances",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "a_stalled_clock_advances_one_tick",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "the_maximum_cannot_be_advanced",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "nonadvancing_explicit_times_are_refused",
+          "category": "assertion failed"
+        },
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "admits_client_time",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "admit_a_future_time": {
+      "defect": "A client may name a system time later than the log's append time.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    advances(previous, candidate) && candidate <= log_time\n",
+          "replace": "    advances(previous, candidate)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "admits_client_time",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "admit_a_future_time_with_weakened_contract": {
+      "defect": "Both the runtime and its contract admit a client time ahead of the log.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    advances(previous, candidate) && candidate <= log_time\n",
+          "replace": "    advances(previous, candidate)\n"
+        },
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    } && candidate <= log_time),\n",
+          "replace": "    }),\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "an_admitted_client_time_never_leads_the_log",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/system_time/laws.rs",
+          "function": "an_admitted_client_time_leaves_a_following_chronon",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 9
     }
   }
 }

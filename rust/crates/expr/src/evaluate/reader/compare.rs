@@ -99,7 +99,7 @@ mod tests {
     async fn strict_set_reader_aliases_compare_by_identity_without_reading_children() {
         let schema = Schema::default();
         let context = EvalContext::default();
-        let frame = EvaluationFrame { schema: &schema, row: &[], context: &context, asynchronous: false, replacements: None };
+        let frame = EvaluationFrame { schema: &schema, row: ExpressionRow::Values(&[]), context: &context, asynchronous: false, replacements: None };
         let set = make_list(Kind::Set, ListReader::Values(vec![Value::Transit(vec![0xff])]), &frame).unwrap();
         let alias = clone_value(&set, &frame).unwrap();
         assert_eq!(equal(set, alias, true, &frame).unwrap().await.unwrap(), Some(true));

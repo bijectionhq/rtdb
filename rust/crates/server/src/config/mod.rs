@@ -24,9 +24,12 @@ pub struct KeyStoreSettings { pub path: PathBuf, pub password: Secret }
 pub struct FlightSettings {
     pub host: String, pub port: i32, pub transaction_idle_timeout: Duration, pub prepared_statement_idle_timeout: Duration,
     pub session_idle_timeout: Duration, pub session_unclaimed_timeout: Duration,
+    pub owned_native_actions: bool,
+    pub hosted_controls: Option<rtdb_flight_sql::HostedControlConfig>,
+    pub audience: Option<(std::net::SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>,
 }
 impl Default for FlightSettings {
-    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60) } }
+    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, hosted_controls: None, audience: None } }
 }
 #[derive(Clone, Debug)]
 pub struct HealthSettings { pub host: String, pub port: i32 }
@@ -41,9 +44,9 @@ pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub ro
 pub struct CompactorSettings { pub threads: usize, pub run_end_encoded_iids: bool, pub within_file_recency_branching: bool }
 /// Full-text search's index lane; with it off, `MATCH` is still answered, by scanning.
 #[derive(Clone, Debug)]
-pub struct SearchSettings { pub enabled: bool, pub threads: usize }
+pub struct SearchSettings { pub enabled: bool, pub threads: usize, pub write_format: rtdb_node::SearchFileFormat }
 #[derive(Clone, Debug)]
-pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration }
+pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration, pub reader_lease: Duration, pub reader_lease_margin: Duration }
 #[derive(Clone, Debug)]
 pub struct TracingSettings { pub enabled: bool, pub endpoint: String, pub service_name: String, pub query_tracing: bool, pub transaction_tracing: bool }
 #[derive(Clone, Debug)]
@@ -70,6 +73,7 @@ pub struct NodeConfiguration {
     pub tracing: TracingSettings,
     pub modules: Vec<ModuleSettings>,
     pub read_only_databases: bool,
+    pub ordered_index_arrow_references: bool,
     pub skipped_databases: BTreeSet<String>,
     pub node_id: String,
     pub local_log_uses_clock: bool,
@@ -119,6 +123,7 @@ impl NodeConfiguration {
         let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
         let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD").as_deref().and_then(join_threshold).unwrap_or(100_000);
         let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
+        let ordered_index_arrow_references = fields.boolean("orderedIndexArrowReferences")?.unwrap_or(false);
         let configuration = if ingest {
             let fixed_databases = match fields.take("databases") {
                 Some(value) => YamlFields::new(value, "databases")?.into_entries().into_iter().map(|(name, value)| Ok((name, decode_database_value(value)?))).collect::<Result<_>>()?,
@@ -126,7 +131,7 @@ impl NodeConfiguration {
             };
             Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, ordered_index_arrow_references, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -142,7 +147,7 @@ impl NodeConfiguration {
                 Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
                 None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
             };
-            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, ordered_index_arrow_references, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)
@@ -173,9 +178,17 @@ fn pgwire(value: Yaml) -> Result<PgwireSettings> {
 }
 fn flight(value: Yaml) -> Result<FlightSettings> {
     let mut fields = YamlFields::new(value, "flightSql")?;
+    let hosted_controls = fields.take("hostedControls").map(|value| {
+        let mut controls = YamlFields::new(value, "flightSql.hostedControls")?;
+        let owner = controls.required_string("owner")?;
+        let relations = controls.sequence("relations")?.unwrap_or_default().iter()
+            .map(|value| scalar_string(value, "hosted control relation")).collect::<Result<BTreeSet<_>>>()?;
+        controls.finish()?;
+        Ok::<_, Anomaly>(rtdb_flight_sql::HostedControlConfig { owner, relations })
+    }).transpose()?;
     let config = FlightSettings { host: fields.string("host")?.unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
         transaction_idle_timeout: duration(&mut fields, "transactionIdleTimeout", 1800)?, prepared_statement_idle_timeout: duration(&mut fields, "preparedStatementIdleTimeout", 1800)?,
-        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)? };
+        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), hosted_controls, audience: None };
     fields.finish()?;
     Ok(config)
 }
@@ -225,13 +238,22 @@ fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>)
 }
 fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;
-    let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(fields.integer("blocksToKeep")?.unwrap_or(10) as i64, "blocksToKeep")?, garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)? };
+    let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(fields.integer("blocksToKeep")?.unwrap_or(10) as i64, "blocksToKeep")?, garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)?,
+        reader_lease: duration(&mut fields, "readerLease", 3600)?, reader_lease_margin: duration(&mut fields, "readerLeaseMargin", 60)? };
     fields.finish()?;
     Ok(result)
 }
 fn search(value: Option<Yaml>) -> Result<SearchSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "search")?;
-    let result = SearchSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), threads: positive(fields.integer("threads")?.unwrap_or(1) as i64, "threads")? };
+    let write_format = match fields.integer("writeFormat")?.unwrap_or(11) {
+        11 => rtdb_node::SearchFileFormat::Tantivy,
+        12 => rtdb_node::SearchFileFormat::Arrow,
+        13 => rtdb_node::SearchFileFormat::Paged,
+        14 => rtdb_node::SearchFileFormat::Tree,
+        _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.config/search-format", "search.writeFormat must be 11, 12, 13, or 14")),
+    };
+    let result = SearchSettings { enabled: fields.boolean("enabled")?.unwrap_or(true),
+        threads: positive(fields.integer("threads")?.unwrap_or(1) as i64, "threads")?, write_format };
     fields.finish()?;
     Ok(result)
 }

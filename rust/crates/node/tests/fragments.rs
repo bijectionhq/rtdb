@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rtdb_columnar::read_value;
+use rtdb_format::database::proto::DatabaseConfig;
 use rtdb_maintenance::CollectionObserver;
 use rtdb_node::*;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers};
@@ -34,6 +35,29 @@ impl CatalogUsers for CatalogFixtures {
 impl CatalogMetrics for CatalogFixtures { fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> { Ok(CatalogRows::new(Vec::new(), Arc::new(()))) } }
 struct TickClock(AtomicI64);
 impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) } }
+
+struct LoopbackResources(NativeResources);
+const DATABASE: &str = "shop";
+
+#[async_trait]
+impl ResourceFactory for LoopbackResources {
+    fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
+        self.0.validate(name, configuration)
+    }
+
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> {
+        let mut storage = self.0.open_storage(name, configuration).await?;
+        storage.fragment_storage = Some(Arc::from("loopback-store"));
+        Ok(storage)
+    }
+
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess,
+        cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        self.0.open_logs(name, configuration, access, cancellation, storage).await
+    }
+
+    async fn close(&self) -> Result<()> { self.0.close().await }
+}
 
 /// Reads every fragment through the node's own `scan_fragment`, as the node a fragment belongs to would, except those under `failing`.
 #[derive(Default)]
@@ -62,6 +86,7 @@ impl ScanFragmenter for Loopback {
 
 async fn start() -> (Node, tokio::task::JoinHandle<Result<()>>, Arc<Loopback>) {
     let mut options = NodeOptions::default();
+    options.membership = Membership::Placed;
     options.replication.assertion_interval = Duration::from_millis(1);
     options.replication.election_seed = 1;
     options.replication.flush_timeout = Duration::from_secs(3600);
@@ -71,11 +96,14 @@ async fn start() -> (Node, tokio::task::JoinHandle<Result<()>>, Arc<Loopback>) {
     options.trie = rtdb_trie::TrieConfig::new(16, 32).unwrap();
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
     let fragmenter = Arc::new(Loopback::default());
-    let services = NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, scan_fragmenter: Some(fragmenter.clone()),
+    let resources = LoopbackResources(NativeResources::default().with_local_log_clock(clock.clone(), false));
+    let services = NodeServices { resources: Arc::new(resources), clock, scan_fragmenter: Some(fragmenter.clone()),
         ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) };
     let (node, driver) = Node::open(options, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    node.database_or_attach(DATABASE.into(), DatabaseConfig::default()).await.unwrap().unwrap();
     let _ = fragmenter.node.set(node.clone());
-    (node, tokio::spawn(driver.run()), fragmenter)
+    (node, driver, fragmenter)
 }
 
 fn order(id: i64) -> StructFields<Value> {
@@ -105,7 +133,7 @@ async fn populate(node: &Node, session: &mut NativeSession) {
     execute(session, TxOp::Sql { sql: "DELETE FROM orders WHERE _id < 20".into(), args: None }).await;
     execute(session, TxOp::Sql { sql: "UPDATE orders SET total = 0 WHERE _id BETWEEN 100 AND 130".into(), args: None }).await;
     execute(session, TxOp::Sql { sql: "UPDATE orders SET total = total + 0.5 WHERE _id % 7 = 0".into(), args: None }).await;
-    let database = node.catalog().database("xtdb").unwrap();
+    let database = node.catalog().database(DATABASE).unwrap();
     database.flush().await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async { while database.status().adopted_block.is_none() { tokio::time::sleep(Duration::from_millis(5)).await; } }).await.unwrap();
     execute(session, put(node, "orders", (600..700).map(order).collect())).await;
@@ -150,7 +178,7 @@ async fn stop(node: &Node, driver: tokio::task::JoinHandle<Result<()>>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_scan_read_as_fragments_returns_the_rows_of_a_whole_scan() {
     let (node, driver, fragmenter) = start().await;
-    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut session = node.session(DATABASE, Arc::new(Authority)).unwrap();
     populate(&node, &mut session).await;
     let whole = answers(&mut session).await;
     assert_eq!(fragmenter.read.load(Ordering::Relaxed), 0, "a disabled fragmenter splits nothing");
@@ -166,7 +194,7 @@ async fn a_scan_read_as_fragments_returns_the_rows_of_a_whole_scan() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fragment_whose_node_fails_is_read_by_the_coordinator() {
     let (node, driver, fragmenter) = start().await;
-    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut session = node.session(DATABASE, Arc::new(Authority)).unwrap();
     populate(&node, &mut session).await;
     let whole = answers(&mut session).await;
     fragmenter.enabled.store(true, Ordering::Relaxed);
@@ -178,21 +206,18 @@ async fn a_fragment_whose_node_fails_is_read_by_the_coordinator() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fragment_reads_as_of_its_basis_on_a_node_at_or_past_it() {
+async fn a_fragment_requires_the_captured_residence_and_exact_transaction_head() {
     let (node, driver, fragmenter) = start().await;
-    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut session = node.session(DATABASE, Arc::new(Authority)).unwrap();
     populate(&node, &mut session).await;
     fragmenter.enabled.store(true, Ordering::Relaxed);
     let _ = answers(&mut session).await;
     let fragment = fragmenter.last.lock().clone().unwrap();
-    let at_basis = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
-    let slices: Vec<_> = (0..4u8).flat_map(|first| (0..4u8).map(move |second| rtdb_query::TriePrefix::new(vec![first, second]).unwrap())).map(|prefix| {
-        let mut slice = fragment.clone();
-        slice.prefix = prefix;
-        slice
-    }).collect();
-    let mut before = Vec::new();
-    for slice in &slices { before.push(node.scan_fragment(slice, Duration::ZERO, &CancellationToken::new()).await.unwrap()); }
+    node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
+    let mut other_store = fragment.clone();
+    other_store.residence.as_mut().unwrap().storage = Arc::from("other-store");
+    let error = node.scan_fragment(&other_store, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.node/fragment-residence");
 
     let mut ahead = fragment.clone();
     ahead.basis.tx_id = rtdb_types::TxId(fragment.basis.tx_id.0 + 1);
@@ -207,17 +232,15 @@ async fn a_fragment_reads_as_of_its_basis_on_a_node_at_or_past_it() {
     execute(&mut session, TxOp::Sql { sql: "DELETE FROM users".into(), args: None }).await;
     execute(&mut session, put(&node, "users", vec![StructFields::from([("_id".to_owned(), Value::I64(1000)), ("name".to_owned(), Value::Utf8("later".into()))])])).await;
     let _ = rows(session.query_sql("SELECT name FROM users WHERE _id = 1000", vec![]).await.unwrap()).await;
-    assert_eq!(node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap(), at_basis, "a node past the basis reads the fragment as of the basis");
-    for (slice, before) in slices.iter().zip(&before) {
-        assert_eq!(&node.scan_fragment(slice, Duration::ZERO, &CancellationToken::new()).await.unwrap(), before, "slice {} reads as of the basis", slice.prefix);
-    }
+    let error = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.query/fragment-basis");
     stop(&node, driver).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fragment_carries_the_predicates_its_reader_evaluates_alike_and_no_others() {
     let (node, driver, fragmenter) = start().await;
-    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut session = node.session(DATABASE, Arc::new(Authority)).unwrap();
     populate(&node, &mut session).await;
     fragmenter.enabled.store(true, Ordering::Relaxed);
     let _ = rows(session.query_sql("SELECT _id FROM orders WHERE _id > 500", vec![]).await.unwrap()).await;

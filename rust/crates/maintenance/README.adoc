@@ -5,7 +5,11 @@ Selection covers L0 plus partial L1C, historical L1 size tiering with partial L2
 Only live inputs participate, and every recorded output shard contributes its high-water mark, including a nascent output awaiting its siblings.
 
 `SegmentCompactor` is a passive capability executing one immutable `CompactionJob` on the caller's task.
-It downloads immutable input files into an owned temporary directory, merges IID/system-time ordered pages, resolves L0 same-transaction overlap, partitions historical output by recency, and writes data and metadata files.
+It downloads immutable input files into an owned temporary directory, merges pages by IID and descending system position, resolves L0 same-transaction overlap, partitions historical output by recency, and writes data and metadata files.
+The system position pairs the commit time with the assertion's position inside a hosted Proposal landing.
+Governed pages store the position in `_commit_position`.
+Compaction retains the full valid interval and image of each positioned assertion until it crosses an erasure.
+A positioned assertion's recency is at least its commit time, including when a later assertion in the same commit covers its entire extent.
 Recency partitioning uses `CivilDate` for the complete signed 64-bit microsecond input range, including dates beyond Chrono's calendar range.
 Weekly, monthly, quarterly and yearly partitions include their UTC midnight ceiling.
 Persisted partition metadata and scan ceilings check the separate signed 64-bit microsecond bound when converting a trie date back to midnight.
@@ -52,7 +56,10 @@ Operation context accepts lowercase ASCII identifiers and object-key context pas
 
 `TrieCollector` and `BlockCollector` are passive cycle capabilities.
 Trie collection uses one immutable snapshot, bounded table/delete concurrency, and chunks containing at most 1024 trie keys.
-It removes data before metadata, drains started deletes, then publishes one deletion record per completed chunk.
+An uncoordinated sweep removes data before metadata, drains started deletes, and publishes one deletion record per completed chunk.
+Coordinated sweeps use a durable intent, an installed replica receipt and a catalog floor that waits for earlier readers.
+Compactor reset stages its superseded compacted pairs in the same retirement journal, with a required successor checkpoint block and naming epoch.
+Collection can resume those intents after restart even when the age policy selects no new garbage.
 L0 recovery files are excluded.
 Block collection removes expired catalog, table-block, and oversized-message objects without replica publication.
 Per-table failures are reported through `CollectionObserver` and isolated from other tables.

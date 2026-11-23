@@ -1,5 +1,6 @@
 //! Assembling the cell's processes: a node (server, agent, lease, control listener) and a logkeeper (server and lease).
 
+mod owned_worlds;
 pub(crate) mod standalone;
 
 pub use standalone::{STANDALONE_PROTOCOL, StandaloneSettings, initialize_standalone, serve_standalone};
@@ -11,6 +12,7 @@ use std::time::Duration;
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{Directory, MemberId, MemberRole};
+use rtdb_node::NodeOptions;
 use rtdb_server::{PlacedOptions, ServerDriver, ServerHandle, config::NodeConfiguration};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::net::TcpListener;
@@ -64,6 +66,15 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    let audience = settings.configuration.flight_sql.as_ref().and_then(|flight| flight.audience);
+    if audience.is_some() != settings.agent.audience_journal_port.is_some() || settings.agent.audience_journal_port == Some(0) {
+        return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
+            "An audience Flight listener and its read-only journal port must be installed together"));
+    }
+    if audience.is_some() { directory.require_audience_reads()?; }
+    if let Some(archive) = &settings.agent.world_archive {
+        crate::archive::require_independent_world_archive(&settings.agent.storage, archive)?;
+    }
     let engine_version = settings.engine_version.take().unwrap_or_else(|| ENGINE_VERSION.into());
     crate::admin::validate_engine_version(&engine_version)?;
     let scoped_writes = match (&settings.agent.s3_write_role, &settings.agent.storage) {
@@ -93,27 +104,56 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let memory = MemoryBudget::new(options.execution_memory_bytes);
     let writers: crate::logs::Writers = Default::default();
     let fence = Arc::new(FenceSlot::default());
-    let recorder = Arc::new(crate::logs::DirectoryRecorder { directory: Arc::clone(&directory) });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
-    let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
+    let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), storage_namespaces.objects, &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
     let storage_regions = TaskTracker::new();
     let local_witnesses = matches!(&settings.agent.storage, crate::deployment::CellStorage::Local { .. })
         .then(|| crate::store::LocalWitnessPool::new(Arc::clone(&settings.keys), &storage_regions));
+    let holds = Arc::new(crate::recovery_holds::RecoveryHolds {
+        directory: Arc::clone(&directory),
+        keys: Arc::clone(&settings.keys),
+        custody: if local_witnesses.is_some() { rtdb_directory::ReplayCustody::Local }
+            else { rtdb_directory::ReplayCustody::Hosted { owner: settings.hosted_task.clone() } },
+        tasks: storage_regions.clone(),
+    });
+    let owned_archive = crate::archive::WorldArchive {
+        directory: Arc::clone(&directory),
+        storage: settings.agent.world_archive.clone().unwrap_or_else(|| settings.agent.storage.clone()),
+        keys: Arc::clone(&settings.keys),
+        hosted_task: settings.hosted_task.clone(),
+        options: NodeOptions { owned_relations: true, ..options.clone() },
+    };
+    let flight_owned_worlds = settings.configuration.flight_sql.as_ref()
+        .filter(|flight| flight.port >= 0 && flight.owned_native_actions)
+        .map(|_| {
+            Arc::new(owned_worlds::PlacedWorldHost {
+                directory: Arc::clone(&directory),
+                agent: Arc::clone(&fence),
+                capture_source: settings.agent.world_archive.as_ref().map(|_| settings.agent.storage.clone()),
+                archive: owned_archive.storage.clone(),
+                keys: Arc::clone(&settings.keys),
+                hosted_task: settings.hosted_task.clone(),
+                options: owned_archive.options.clone(),
+            }) as Arc<dyn rtdb_flight_sql::OwnedWorldHost>
+        });
     let storage = Arc::new(crate::store::CellStoreFactory {
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
         storage_namespaces,
         scoped_writes: scoped_writes.clone(),
         hosted_task: settings.hosted_task,
+        audience_source: audience.map(|profile| profile.source()),
         storage_regions: storage_regions.clone(),
         local_witnesses,
     });
     let placed = PlacedOptions {
-        log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
+        log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&writers), holds))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
         claim_wait: settings.claim_wait,
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         flight_peer: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_flight_sql::FlightPeerVerifier>),
+        flight_owned_worlds,
+        world_constraints: Some(Arc::new(owned_archive)),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         scan_fragmenter: Some(fragmenter.clone() as Arc<dyn rtdb_query::ScanFragmenter>),
         compaction_relay: match (settings.pool == rtdb_directory::MemberPool::Compaction, &settings.capabilities) {
@@ -122,19 +162,26 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             (false, _) => None,
         },
     };
+    let relay_limit = settings.configuration.server.as_ref()
+        .filter(|_| settings.capabilities.is_some() && !settings.configuration.auth.uses_remote_address())
+        .map(|server| server.connections);
     let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
-    let pgwire_address = server.addresses().pgwire.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
+    let pgwire = server.primary_pgwire().ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
+    let pgwire_address = pgwire.address();
     let control = TcpListener::bind(settings.control).await.map_err(io)?;
     let control_address = control.local_addr().map_err(io)?;
     let pgwire_endpoint = advertised(pgwire_address, settings.advertise_host.as_deref())?;
     let control_endpoint = advertised(control_address, settings.advertise_host.as_deref())?;
-    let flight_endpoint = server.addresses().flight_sql.map(|address| advertised(address, settings.advertise_host.as_deref())).transpose()?;
+    let flight_endpoints = crate::agent::FlightEndpoints {
+        ordinary: server.addresses().flight_sql.map(|address| advertised(address, settings.advertise_host.as_deref())).transpose()?,
+        audience: server.addresses().audience_flight.map(|address| advertised(address, settings.advertise_host.as_deref())).transpose()?,
+    };
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
         role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool, engine_version, storage_namespaces: Some(storage_namespaces),
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoints, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
@@ -142,7 +189,10 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     tasks.spawn(driver.run());
     { let lease = Arc::clone(&lease); let cancellation = lease_cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     { let agent = Arc::clone(&agent); let cancellation = cancellation.clone(); tasks.spawn(async move { agent.run(cancellation).await; Ok(()) }); }
-    tasks.spawn(crate::control::serve(control, agent.clone(), crate::control::ControlKey(settings.capabilities.clone()), cancellation.clone()));
+    tasks.spawn(crate::control::serve_with_pgwire(
+        control, agent.clone(), crate::control::ControlKey(settings.capabilities.clone()),
+        cancellation.clone(), pgwire_address, relay_limit, pgwire.watch_status(),
+    ));
     Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, storage_regions, tasks })
 }
 
@@ -206,6 +256,11 @@ impl rtdb_node::ReadFence for FenceSlot {
         let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
         agent.confirm_hosted_read(database).await
     }
+
+    async fn confirm_audience(&self, database: &rtdb_node::Database, require_quorum: bool) -> Result<String> {
+        let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
+        agent.confirm_audience_read(database, require_quorum).await
+    }
 }
 
 fn stopped_agent() -> Anomaly {
@@ -214,6 +269,7 @@ fn stopped_agent() -> Anomaly {
 
 pub struct LogkeeperSettings {
     pub listen: SocketAddr,
+    pub authority: Option<(SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>,
     /// Stable DNS name of the disk, so ensembles can still reach it after a process restart.
     pub advertise_host: Option<String>,
     pub data_dir: PathBuf,
@@ -234,6 +290,13 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
     let endpoint = advertised(address, settings.advertise_host.as_deref())?;
+    let authority = if let Some((listen, profile)) = settings.authority {
+        if !settings.fsync {
+            return Err(Anomaly::incorrect("rtdb.multi/audience-authority", "The audience journal requires fsync"));
+        }
+        let socket = TcpListener::bind(listen).await.map_err(io)?;
+        Some(rtdb_logkeeper::AuthorityListener { socket, source: profile.source(), connections: profile.permits() })
+    } else { None };
     let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(rtdb_logkeeper::ServerOptions {
         data_dir: settings.data_dir,
         fsync: settings.fsync,
@@ -248,7 +311,7 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     }, MemberId(identity), settings.advertise_host.is_some(), settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    tasks.spawn(journal.serve(listener, cancellation.clone()));
+    tasks.spawn(journal.serve_with_authority(listener, authority, cancellation.clone()));
     { let lease = Arc::clone(&lease); let cancellation = cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     Ok(RunningLogkeeper { address, lease, cancellation, tasks })
 }
@@ -308,6 +371,7 @@ mod tests {
         let directory = rtdb_directory::MemoryDirectory::new();
         let data = tempfile::tempdir().unwrap();
         let settings = || LogkeeperSettings {
+            authority: None,
             listen: "127.0.0.1:0".parse().unwrap(),
             advertise_host: None,
             data_dir: data.path().to_owned(),
@@ -338,6 +402,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let empty = tempfile::tempdir().unwrap();
         let settings = |path: &std::path::Path, listen| LogkeeperSettings {
+            authority: None,
             listen,
             advertise_host: Some("keeper.test.internal".into()),
             data_dir: path.to_owned(),

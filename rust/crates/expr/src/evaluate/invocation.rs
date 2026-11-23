@@ -1,4 +1,4 @@
-use super::{EvalContext,Schema,Expr,Value,Result,Anomaly,expression_type,reader,overflow,validate_projection_value};
+use super::{EvalContext,ExpressionRow,Schema,Expr,Value,Result,Anomaly,expression_type,reader,overflow,validate_projection_value};
 use rtdb_types::{LogicalType,ScalarType};
 use crate::string::pattern::{CompiledReplacement,compile_replacement_pattern};
 mod host;
@@ -59,6 +59,7 @@ impl<'expr> ExpressionInvocation<'expr> {
 
     /// Returns an owned result under the row context's allocation scope.
     pub fn evaluate(&self,row: &[Value],context: &EvalContext<'_>) -> Result<Value> {
+        let row = ExpressionRow::Values(row);
         let mut value = if reader::required(self.expression) { reader::execute_sync_prepared(self.expression,self.schema,row,context,&self.replacements)? }
             else { super::evaluate_inner(self.expression,self.schema,row,context)? };
         value.admit_expression_dates()?;
@@ -67,6 +68,10 @@ impl<'expr> ExpressionInvocation<'expr> {
 
     /// Uses caller-owned suspension and cancellation; dropping the future retains no pending row work.
     pub async fn evaluate_async(&self,row: &[Value],context: &EvalContext<'_>) -> Result<Value> {
+        self.evaluate_row_async(ExpressionRow::Values(row), context).await
+    }
+
+    async fn evaluate_row_async(&self,row: ExpressionRow<'_>,context: &EvalContext<'_>) -> Result<Value> {
         let mut value = if reader::required(self.expression) { reader::execute_async_prepared(self.expression,self.schema,row,context,&self.replacements).await? }
             else { super::evaluate_async_inner(self.expression,self.schema,row,context).await? };
         value.admit_expression_dates()?;
@@ -82,13 +87,21 @@ impl<'expr> ExpressionInvocation<'expr> {
 
     /// Applies projection validation with the same caller-owned future as `evaluate_async`.
     pub async fn evaluate_projection_async(&self,row: &[Value],context: &EvalContext<'_>) -> Result<Value> {
-        let value = self.evaluate_async(row,context).await?;
+        self.evaluate_projection_row_async(ExpressionRow::Values(row), context).await
+    }
+
+    pub async fn evaluate_projection_row_async(&self, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<Value> {
+        let value = self.evaluate_row_async(row, context).await?;
         self.validate(&value)?;
         Ok(value)
     }
 
     /// Retains generated list descriptors under the same scope contract as `evaluate_list_async`.
     pub async fn evaluate_list_async(&self,row: &[Value],context: &EvalContext<'_>) -> Result<super::EvaluatedList> {
+        self.evaluate_list_row_async(ExpressionRow::Values(row), context).await
+    }
+
+    pub async fn evaluate_list_row_async(&self, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<super::EvaluatedList> {
         reader::execute_list_async(self.expression,self.schema,row,context,Some(&self.replacements)).await
     }
 

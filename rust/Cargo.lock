@@ -4626,6 +4626,7 @@ dependencies = [
  "rtdb-plan",
  "rtdb-query",
  "rtdb-sql",
+ "rtdb-storage",
  "rtdb-tx",
  "rtdb-types",
  "serde",
@@ -4667,6 +4668,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "uuid",
  "zstd",
@@ -4779,6 +4781,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -4836,6 +4839,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
+ "aws-sdk-s3",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -4856,6 +4860,7 @@ dependencies = [
  "rtdb-logkeeper",
  "rtdb-node",
  "rtdb-pgwire",
+ "rtdb-plan",
  "rtdb-query",
  "rtdb-replication",
  "rtdb-s3",
@@ -4919,6 +4924,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -4942,6 +4948,8 @@ dependencies = [
 name = "rtdb-pg-source"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "bigdecimal",
  "bytes",
@@ -4962,6 +4970,7 @@ dependencies = [
  "rtdb-tx",
  "rtdb-types",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls 0.26.6",
  "tokio-util",
@@ -4996,6 +5005,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.6",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -5014,17 +5024,20 @@ name = "rtdb-query"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
  "async-stream",
  "async-trait",
+ "bytes",
  "chrono",
  "datafusion-common",
  "datafusion-expr",
  "datafusion-functions",
  "datafusion-physical-expr",
  "futures",
+ "libc",
  "parking_lot",
  "rtdb-columnar",
  "rtdb-expr",
@@ -5052,6 +5065,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "fs2",
  "futures",
  "parking_lot",
  "rtdb-columnar",
@@ -5062,6 +5076,7 @@ dependencies = [
  "rtdb-tx",
  "rtdb-types",
  "serde",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -5077,8 +5092,10 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "aws-sdk-sts",
+ "base64 0.22.1",
  "bytes",
  "object_store",
+ "ring",
  "rtdb-format",
  "rtdb-storage",
  "rtdb-types",
@@ -5093,12 +5110,17 @@ dependencies = [
 name = "rtdb-search"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
  "async-trait",
  "bytes",
+ "futures",
  "memmap2",
  "parking_lot",
  "rtdb-columnar",
- "rtdb-expr",
  "rtdb-format",
  "rtdb-index",
  "rtdb-maintenance",
@@ -5182,6 +5204,7 @@ dependencies = [
  "rtdb-logkeeper",
  "rtdb-multi",
  "rtdb-node",
+ "rtdb-pgwire",
  "rtdb-storage",
  "rtdb-types",
  "tokio",
@@ -5219,10 +5242,12 @@ dependencies = [
  "fs2",
  "futures",
  "libc",
+ "memmap2",
  "object_store",
  "parking_lot",
  "percent-encoding",
  "rtdb-columnar",
+ "rtdb-format",
  "rtdb-types",
  "serde_json",
  "tempfile",
@@ -5243,6 +5268,9 @@ dependencies = [
 [[package]]
 name = "rtdb-text"
 version = "0.1.0"
+dependencies = [
+ "arrow-array",
+]
 
 [[package]]
 name = "rtdb-tls"
@@ -5294,6 +5322,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

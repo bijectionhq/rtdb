@@ -42,6 +42,20 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
     if let Some(result) = crate::series::signature(&name, arguments) { return result; }
     if let Some(result) = crate::temporal_functions::signature(&name, arguments) { return result; }
     if let Some(result) = crate::interval_constructor::signature(&name, arguments) { return result; }
+    if name == "epoch_nanos_be" {
+        let [timestamp] = arguments else {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "EPOCH_NANOS_BE takes one timestamp"));
+        };
+        let mut output = LogicalType::Nothing;
+        for leg in timestamp.legs() {
+            output = output.join(&match leg {
+                LogicalType::Null => LogicalType::Null,
+                LogicalType::Scalar(S::Timestamp { timezone: Some(_), .. }) => LogicalType::Scalar(S::Binary),
+                other => return Err(rtdb_types::function_type_mismatch(&name, [&other])),
+            });
+        }
+        return Ok(output);
+    }
     if name == "_meta_double" {
         if arguments.len() != 1 { return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "_meta_double requires one argument")); }
         if arguments[0].legs().contains(&LogicalType::Scalar(S::F16)) { return Err(Anomaly::unsupported("rtdb/jvm-half-float", "The pinned JVM vector factory rejects half-precision floats")); }

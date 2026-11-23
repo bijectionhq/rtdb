@@ -147,9 +147,9 @@ fn untyped_parameters_defer_option_checks_until_runtime_source_selection() {
     let expression = &expressions[0].expr;
     assert_eq!(expression.data_type(),T::Null);
     for value in [V::Null,V::Duration { value: 123,unit: U::Nanosecond }] {
-        assert_eq!(evaluate(expression,input.schema(),&[],&EvalContext { parameters: &[value.clone()],..Default::default() }).unwrap(),value);
+        assert_eq!(evaluate(expression,input.schema(),&[],&EvalContext { parameters: rtdb_expr::Parameters::Values(&[value.clone()]),..Default::default() }).unwrap(),value);
     }
-    assert!(evaluate(expression,input.schema(),&[],&EvalContext { parameters: &[V::Utf8("PT1S".into())],..Default::default() }).is_err());
+    assert!(evaluate(expression,input.schema(),&[],&EvalContext { parameters: rtdb_expr::Parameters::Values(&[V::Utf8("PT1S".into())]),..Default::default() }).is_err());
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn source_family_and_precision_errors_follow_codegen_consumption_order() {
         assert_eq!((planned.category, planned.code.as_str()), (category, code), "{expression}");
         let Statement::Query(relation) = compile(&source, &EmptyCatalog, &CompileOptions::default()).unwrap().statement else { panic!() };
         let RelationNode::Project { input, expressions } = relation.node() else { panic!() };
-        let evaluated = evaluate(&expressions[0].expr, input.schema(), &[], &EvalContext { parameters: &[value], ..Default::default() }).unwrap_err();
+        let evaluated = evaluate(&expressions[0].expr, input.schema(), &[], &EvalContext { parameters: rtdb_expr::Parameters::Values(&[value]), ..Default::default() }).unwrap_err();
         assert_eq!((evaluated.category, evaluated.code.as_str()), (category, code), "{expression}");
     }
 }
@@ -252,7 +252,7 @@ fn unchecked_parameter_types_validate_encoded_identity_targets_at_evaluation() {
     let RelationNode::Project { input, expressions } = relation.node() else { panic!("Expected projection") };
     let expression = &expressions[0].expr;
     for (value, expected) in [(V::I64(1), Some(V::Bool(true))), (V::Null, Some(V::Null)), (V::Bool(true), None)] {
-        let result = evaluate(expression, input.schema(), &[], &EvalContext { parameters: &[value], ..Default::default() });
+        let result = evaluate(expression, input.schema(), &[], &EvalContext { parameters: rtdb_expr::Parameters::Values(&[value]), ..Default::default() });
         match expected { Some(expected) => assert_eq!(result.unwrap(), expected), None => assert_eq!(result.unwrap_err().code, "xtdb.expression/cast-error") }
     }
 }

@@ -642,3 +642,30 @@ async fn a_local_file_of_a_cached_object_is_pinned_while_held() {
     assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 0);
     assert!(matches!(store.local_file(&ObjectKey::new("tables/docs/absent").unwrap()).await, Err(Error::MissingObject(_))));
 }
+
+#[tokio::test]
+async fn a_cold_scan_range_does_not_fill_the_disk_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(8 << 20);
+    let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+    let remote = Arc::new(ObservedStore::new(false));
+    let key = ObjectKey::new("tables/docs/data/file.arrow").unwrap();
+    let mut bytes = vec![0; 2 << 20];
+    bytes[123..127].copy_from_slice(b"page");
+    remote.put(&key, bytes.into()).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    let pool = BufferPool::new(Arc::clone(&store), 1 << 20);
+
+    let page = pool.scan_range(&key, 123..127, &memory).await.unwrap();
+    assert_eq!(page.as_slice(), b"page");
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 0);
+
+    drop(store.local_file(&key).await.unwrap());
+    let previously_read = remote.reads.load(Ordering::SeqCst);
+    let page = pool.scan_range(&key, 123..127, &memory).await.unwrap();
+    assert_eq!(remote.reads.load(Ordering::SeqCst), previously_read);
+    assert_eq!(cache.stats().pinned_bytes, 2 << 20);
+    store.forget(&key).await.unwrap();
+    assert_eq!(page.as_slice(), b"page");
+}

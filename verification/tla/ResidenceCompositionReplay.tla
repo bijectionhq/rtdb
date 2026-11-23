@@ -1,0 +1,62 @@
+--------------------------- MODULE ResidenceCompositionReplay ---------------------------
+EXTENDS ResidenceComposition, ResidenceCompositionEvents, Sequences
+
+VARIABLE cursor
+
+traceVars == <<vars, cursor>>
+TraceInit ==
+    /\ cursor = 0
+    /\ IF DisposalEffectsOnly
+        THEN /\ head = 0 /\ checkpoint = 0 /\ floor = 0
+             /\ query = None /\ providerRead = None /\ recovery = None /\ firstRecord = 1
+             /\ phase = "disposing" /\ source = Needs(0) /\ forkCopy = {}
+             /\ prepared = None /\ fork = 0 /\ stalePublication = FALSE
+        ELSE Init
+
+\* A replay projects observed cuts, provider publications and directory phases
+\* into the bounded model rather than choosing them nondeterministically.
+ObservedStep(event) ==
+    LET kind == event[1]
+        cut == event[2]
+        publication == event[3]
+    IN
+    CASE kind = "open-query" -> OpenQuery /\ query' = cut
+      [] kind = "begin-provider-read" -> BeginProviderRead /\ providerRead' = cut
+      [] kind = "close-query" -> CloseQuery /\ query = cut
+      [] kind = "drain-provider-read" -> DrainProviderRead /\ providerRead = cut
+      [] kind = "install" -> Install /\ head' = cut
+      [] kind = "publish-checkpoint" -> PublishCheckpoint /\ checkpoint' = cut
+      [] kind = "admit-recovery" -> AdmitRecovery /\ recovery' = cut
+      [] kind = "finish-recovery" -> FinishRecovery /\ recovery = cut
+      [] kind = "advance-floor" -> AdvanceFloor /\ floor' = cut
+      [] kind = "authorize-version" -> AuthorizeVersion /\ publication = "old"
+      [] kind = "remove-version" ->
+            ApplyVersionRemoval /\ source \ source' = {publication}
+      [] kind = "settle-version" -> SettleVersion /\ publication = "old"
+      [] kind = "trim" -> Trim /\ firstRecord' = cut
+      [] kind = "prepare-fork" -> PrepareFork /\ prepared' = cut
+      [] kind = "publish-fork" -> PublishFork /\ fork' = cut
+      [] kind = "authorize-disposal" -> AuthorizeDisposal
+      [] kind = "copy-fork" -> CopyForkPublication(publication) /\ fork = cut
+      [] kind = "erase-residence" -> EraseResidencePublication(publication)
+      [] kind = "settle-disposal" -> SettleDisposal
+      [] OTHER -> FALSE
+
+Advance ==
+    /\ cursor < Len(Events)
+    /\ ObservedStep(Events[cursor + 1])
+    /\ Next
+    /\ cursor' = cursor + 1
+
+Complete ==
+    /\ cursor = Len(Events)
+    /\ source = {} /\ forkCopy = Needs(fork)
+    /\ IF DisposalEffectsOnly
+        THEN phase = "disposing" /\ fork = 0
+        ELSE phase = "disposed" /\ firstRecord = 2 /\ fork = 1
+
+Accept == Complete /\ UNCHANGED traceVars
+TraceNext == Advance \/ Accept
+TraceSpec == TraceInit /\ [][TraceNext]_traceVars /\ WF_traceVars(Advance)
+ReplayTerminates == <>Complete
+=============================================================================

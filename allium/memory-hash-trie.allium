@@ -19,6 +19,7 @@
 --     This holds across a transaction boundary as well as within one — a trie derived for a transaction
 --     that is never applied leaves the trie it came from as it was, and the entries it added are free to
 --     be reused by the next transaction.
+--   - Two tries derived from the same earlier trie each retain their own pending rows.
 --
 -- Critical invariants:
 --   - The trie stores INTEGER INDICES, not actual row data
@@ -155,12 +156,11 @@ rule AddIndex {
 rule AddToLeaf {
     when: Leaf.add(leaf, trie, new_idx)
 
-    -- Append to log (O(1) operation, no sorting)
     let new_log_count = leaf.log_count + 1
     let new_leaf = Leaf.created(
         path: leaf.path,
         data: leaf.data,
-        log: leaf.log.with(leaf.log_count, new_idx),
+        log: append_pending_rows(leaf.log, leaf.log_count, [new_idx]),
         log_count: new_log_count
     )
 
@@ -393,6 +393,7 @@ rule MergeSort {
 
     -- Returns fully sorted indices (data + log merged)
     -- Caches result in sorted_data_cache
+    -- A failed IID lookup aborts a cache fill before the result is installed.
 
     ensures:
         if leaf.log_count = 0:
@@ -422,20 +423,25 @@ rule Compare {
 
     let left_iid = trie.iid_reader.get(left_idx)
     let right_iid = trie.iid_reader.get(right_idx)
-    let iid_cmp = left_iid.compare_to(right_iid)
+    let iid_cmp = compare_unsigned_bytes(left_iid, right_iid)
 
     ensures:
         if iid_cmp != 0:
             iid_cmp   -- different IIDs: order by IID
         else:
-            right_idx - left_idx   -- same IID: higher index (newer) comes first
+            compare_row_indices(right_idx, left_idx)
 }
 
 ------------------------------------------------------------
 -- Serialization
 --
 -- When serializing to protobuf, logs are compacted first.
--- Only the sorted `data` arrays are persisted.
+-- The wire preserves each leaf's sorted row indices.
+-- The wire root carries the trie root path when it is nonempty.
+-- An absent root path decodes as the empty path.
+-- A decoded child's path is its parent's path extended by the child's bucket position.
+-- Decoding preserves each leaf's row indices in their stored order.
+-- The native importer admits a leaf only when every stored row belongs to its decoded path and the stored run is ordered.
 -- Log entries would be lost if not compacted before serialization.
 ------------------------------------------------------------
 
@@ -445,7 +451,7 @@ rule ToProto {
     -- MUST compact logs before serialization
     -- Logs are ephemeral and not persisted
 
-    ensures: trie.compact_logs().root_node.as_proto()
+    ensures: encode_trie(trie.root_node.path, trie.compact_logs().root_node)
 }
 
 ------------------------------------------------------------
@@ -507,11 +513,14 @@ rule AddIfNotPresent {
 -- 3. Ordering within leaves: after merge_sort, indices are always ordered by
 --    (IID ascending, row index descending)
 --    This ensures newest rows for same IID appear first in iteration.
+--    Sorting and merging preserve each occurrence of a row index, including repeated indices.
+--    Every successful lookup of a retained row returns the same IID across trie versions that share the row.
 
 -- 4. Log batching: up to log_limit writes are batched before sorting overhead
 
 -- 5. Splitting: leaves split into branches when exceeding page_limit,
 --    EXCEPT at max depth where leaves can grow unbounded
+--    Each child receives its matching subsequence of the parent run, preserving its order and repeated indices.
 
 -- 6. Max depth overflow: at MAX_LEVEL depth, a leaf CANNOT split further.
 --    It accumulates all indices for that IID prefix regardless of page_limit.

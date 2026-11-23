@@ -2,9 +2,9 @@
 
 use super::journal::{Captured, Journal, Recovered, Work, Write};
 use super::payload::{Item, Source, Stored};
-use super::state::{Decision, StreamState, Window};
+use super::state::{Decision, StreamState, Window, WriterAuthority};
 use crate::history::RetainedChain;
-use crate::protocol::{DigestPage, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, RequestBody, ResponseBody};
+use crate::protocol::{AuthorityConfirmed, DigestPage, LogletCheck, Refused, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, RequestBody, ResponseBody};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -26,13 +26,51 @@ pub(crate) struct Slot {
     pub id: u64,
     pub name: String,
     pub state: Mutex<StreamState<Stored>>,
+    authority: Arc<Mutex<AuthorityProjection>>,
     /// Woken when the commit lsn or trim point moves, or the stream is dropped.
     pub progressed: Notify,
+}
+
+impl Slot {
+    pub fn new(id: u64, name: String, state: StreamState<Stored>) -> Self {
+        let authority = Arc::new(Mutex::new(AuthorityProjection {
+            accepted: state.writer_authority(), revision: Some(0), durable_revision: 0,
+        }));
+        Self { id, name, state: Mutex::new(state), authority, progressed: Notify::new() }
+    }
+
+    pub fn publish_authority_revision(&self, revision: u64) {
+        self.authority.lock().durable_revision = revision;
+    }
+}
+
+struct AuthorityProjection {
+    accepted: WriterAuthority,
+    revision: Option<u64>,
+    durable_revision: u64,
+}
+
+impl AuthorityProjection {
+    fn record(&mut self, authority: WriterAuthority) -> Option<u64> {
+        self.accepted = authority;
+        self.revision = self.revision.and_then(|revision| revision.checked_add(1));
+        self.revision
+    }
+
+    fn confirm(&self, epoch: u64, ensemble: [u8; 32]) -> ResponseBody {
+        if self.revision == Some(self.durable_revision) && self.accepted.confirms(epoch, ensemble) {
+            ResponseBody::AuthorityConfirmed(AuthorityConfirmed {})
+        } else {
+            // A pending higher promise also fences the earlier writer.
+            ResponseBody::Refused(Refused { promised: self.accepted.promised, last_lsn: -1 })
+        }
+    }
 }
 
 pub(crate) struct Store {
     journal: Arc<Journal>,
     streams: Mutex<HashMap<String, Arc<Slot>>>,
+    authorities: Mutex<HashMap<String, Arc<Mutex<AuthorityProjection>>>>,
     queue: mpsc::UnboundedSender<Work>,
     pending_writes: Arc<Semaphore>,
     digest_pages: Semaphore,
@@ -48,17 +86,19 @@ type Compaction = oneshot::Receiver<Result<(), String>>;
 
 impl Store {
     pub fn new(journal: Arc<Journal>, recovered: Vec<Recovered>, queue: mpsc::UnboundedSender<Work>) -> Self {
-        let streams = recovered.into_iter().map(|stream| {
-            let slot = Slot { id: stream.id, name: stream.name.clone(), state: Mutex::new(stream.state), progressed: Notify::new() };
+        let streams: HashMap<_, _> = recovered.into_iter().map(|stream| {
+            let slot = Slot::new(stream.id, stream.name.clone(), stream.state);
             (stream.name, Arc::new(slot))
         }).collect();
-        Self { journal, streams: Mutex::new(streams), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)), digest_pages: Semaphore::new(CONCURRENT_DIGEST_PAGES) }
+        let authorities = streams.iter().map(|(name, slot)| (name.clone(), Arc::clone(&slot.authority))).collect();
+        Self { journal, streams: Mutex::new(streams), authorities: Mutex::new(authorities), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)), digest_pages: Semaphore::new(CONCURRENT_DIGEST_PAGES) }
     }
 
     fn slot(&self, name: &str) -> Arc<Slot> {
         let mut streams = self.streams.lock();
         if let Some(slot) = streams.get(name) { return Arc::clone(slot); }
-        let slot = Arc::new(Slot { id: self.journal.allocate_id(), name: name.to_owned(), state: Mutex::new(StreamState::default()), progressed: Notify::new() });
+        let slot = Arc::new(Slot::new(self.journal.allocate_id(), name.to_owned(), StreamState::default()));
+        self.authorities.lock().insert(name.to_owned(), Arc::clone(&slot.authority));
         streams.insert(name.to_owned(), Arc::clone(&slot));
         slot
     }
@@ -75,20 +115,44 @@ impl Store {
         if self.queue.is_closed() { return Outcome::Now(failed("the journal has stopped")); }
         let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
             RequestBody::Append(append) => (append.stream, Box::new(move |state| state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn))),
-            RequestBody::Overwrite(overwrite) => (overwrite.stream, Box::new(move |state| state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn))),
+            RequestBody::Overwrite(overwrite) if overwrite.activate_ensemble.is_empty() => (overwrite.stream, Box::new(move |state| {
+                state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn)
+            })),
+            RequestBody::Overwrite(overwrite) => {
+                let Ok(ensemble) = overwrite.activate_ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
+                if !overwrite.complete { return Outcome::Now(failed("activation requires a complete overwrite")); }
+                (overwrite.stream, Box::new(move |state| state.repair(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.commit_lsn, ensemble)))
+            }
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
-            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) => return Outcome::Now(failed("not a direct mutation")),
+            RequestBody::CheckSynced(check) => return self.check_after_durability(&check.stream, admission, |state| state.check_synced(check.epoch)),
+            RequestBody::ActivateLoglet(check) => {
+                let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
+                (check.stream, Box::new(move |state| state.activate(check.epoch, ensemble)))
+            }
+            RequestBody::ReadIndex(check) => {
+                if !self.journal.is_durable() { return Outcome::Now(failed("read indexes require a durable journal")); }
+                let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
+                return self.check_after_durability(&check.stream, admission, |state| state.read_index(check.epoch, ensemble));
+            }
+            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) | RequestBody::Identify(_) | RequestBody::ConfirmAuthority(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
         let mut state = slot.state.lock();
         let before = (state.commit, state.trim, state.dropped);
+        let previous_authority = state.writer_authority();
         let decision = decide(&mut state);
         if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
+        let authority = state.writer_authority();
+        let authority_revision = if authority == previous_authority {
+            None
+        } else {
+            slot.authority.lock().record(authority)
+        };
         let (done, durable) = oneshot::channel();
-        if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done, _admission: Some(admission) }).is_err() {
+        if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done, _admission: Some(admission), authority_revision }).is_err() {
             return Outcome::Now(failed("the journal has stopped"));
         }
         if (state.commit, state.trim, state.dropped) != before { slot.progressed.notify_waiters(); }
@@ -112,7 +176,7 @@ impl Store {
         let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
         let captured = locked.iter().map(|(slot, state)| Captured { slot: Arc::clone(slot), state: (**state).clone() }).collect();
         let (done, finished) = oneshot::channel();
-        if self.queue.send(Work { write: Write::Compact(captured), done, _admission: None }).is_err() {
+        if self.queue.send(Work { write: Write::Compact(captured), done, _admission: None, authority_revision: None }).is_err() {
             self.journal.release_compaction();
             return Err("the journal has stopped".into());
         }
@@ -151,6 +215,32 @@ impl Store {
 
     pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {
         match self.existing(stream) { Some(slot) => slot.state.lock().check(epoch), None => StreamState::<Stored>::default().check(epoch) }
+    }
+
+    pub fn confirm_authority(&self, check: LogletCheck) -> ResponseBody {
+        if !self.journal.is_durable() || self.queue.is_closed() { return failed("durable writer authority is unavailable"); }
+        let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return failed("invalid ensemble digest"); };
+        let authority = self.authorities.lock().get(&check.stream).cloned();
+        let Some(authority) = authority else { return failed("the authority stream was not found"); };
+        let reply = authority.lock().confirm(check.epoch, ensemble);
+        reply
+    }
+
+    fn check_after_durability(
+        &self, stream: &str, admission: tokio::sync::OwnedSemaphorePermit, check: impl FnOnce(&StreamState<Stored>) -> ResponseBody,
+    ) -> Outcome {
+        let Some(slot) = self.existing(stream) else {
+            return Outcome::Now(check(&StreamState::default()));
+        };
+        let state = slot.state.lock();
+        let reply = check(&state);
+        if !matches!(reply, ResponseBody::Accepted(_)) { return Outcome::Now(reply); }
+
+        // The reply's position includes accepted mutations that the journal may still be syncing.
+        let (done, durable) = oneshot::channel();
+        let barrier = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: Some(admission), authority_revision: None };
+        if self.queue.send(barrier).is_err() { return Outcome::Now(failed("the journal has stopped")); }
+        Outcome::Durable(durable, reply)
     }
 
     /// Selects entries in `[from, to]` and where to find each payload, under the stream's lock.
@@ -200,7 +290,7 @@ impl Store {
             let window = self.select(&state, page.from_lsn, page.through_lsn, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
             let (done, durable) = oneshot::channel();
             // A selected commit can still be queued for fsync. The barrier is ordered after that commit.
-            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None }).is_err() {
+            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, authority_revision: None }).is_err() {
                 return failed("the journal has stopped");
             }
             (window, durable)
@@ -274,7 +364,8 @@ pub(crate) fn failed(message: impl Into<String>) -> ResponseBody { ResponseBody:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{DropStream, Overwrite};
+    use crate::protocol::{Check, DropStream, Overwrite};
+    use crate::server::state::Event;
     use bytes::Bytes;
 
     #[tokio::test]
@@ -284,7 +375,7 @@ mod tests {
         let (queue, mut work) = mpsc::unbounded_channel();
         let store = Store::new(Arc::new(journal), recovered, queue);
         let overwrite = |stream: &str| RequestBody::Overwrite(Overwrite {
-            stream: stream.into(), epoch: 1, from_lsn: 0, entries: Vec::new(), complete: true, commit_lsn: -1,
+            stream: stream.into(), epoch: 1, from_lsn: 0, entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(),
         });
         assert!(matches!(store.mutate(overwrite("first"), MAXIMUM_FRAME_BYTES).await, Outcome::Durable(_, _)));
         let mut second = Box::pin(store.mutate(overwrite("second"), 32));
@@ -295,6 +386,61 @@ mod tests {
         drop(pending);
         assert!(matches!(second.await, Outcome::Durable(_, _)));
         assert!(store.existing("second").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_synced_check_waits_for_a_queued_epoch_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let (queue, mut work) = mpsc::unbounded_channel();
+        let store = Store::new(Arc::new(journal), recovered, queue);
+        let check = || RequestBody::CheckSynced(Check { stream: "pending-sync".into(), epoch: 2 });
+
+        assert!(matches!(store.mutate(check(), 32).await, Outcome::Now(ResponseBody::Refused(_))));
+        let incoming = RequestBody::Overwrite(Overwrite {
+            stream: "pending-sync".into(), epoch: 2, from_lsn: 0,
+            entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(),
+        });
+        let Outcome::Durable(installed, ResponseBody::Accepted(_)) = store.mutate(incoming, 32).await else {
+            panic!("the complete overwrite must wait for the journal");
+        };
+        let Outcome::Durable(mut confirmed, ResponseBody::Accepted(_)) = store.mutate(check(), 32).await else {
+            panic!("the check must wait behind the overwrite");
+        };
+        assert!(futures::poll!(&mut confirmed).is_pending());
+        let install = work.recv().await.unwrap();
+        assert!(matches!(&install.write, Write::Events(_, events) if events.contains(&Event::Synced(Some(2)))));
+        install.done.send(Ok(())).unwrap();
+        installed.await.unwrap().unwrap();
+        let barrier = work.recv().await.unwrap();
+        assert!(matches!(&barrier.write, Write::Events(_, events) if events.is_empty()));
+        barrier.done.send(Ok(())).unwrap();
+        confirmed.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authority_confirms_only_a_durable_epoch_without_admitting_an_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let journal = Arc::new(journal);
+        let (queue, work) = mpsc::unbounded_channel();
+        let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
+        let check = |ensemble| LogletCheck { stream: "authority".into(), epoch: 2, ensemble };
+        let ensemble = Bytes::from_static(&[7; 32]);
+        let Outcome::Durable(installed, _) = store.mutate(RequestBody::Overwrite(Overwrite {
+            stream: "authority".into(), epoch: 2, from_lsn: 0, entries: Vec::new(),
+            complete: true, commit_lsn: -1, activate_ensemble: ensemble.clone(),
+        }), 32).await else { panic!("the ensemble needs a journal write"); };
+        assert!(matches!(store.confirm_authority(check(ensemble.clone())), ResponseBody::Refused(_)));
+
+        let driver = tokio::spawn(crate::server::journal::run(journal, Arc::downgrade(&store), work));
+        installed.await.unwrap().unwrap();
+        let all_writes = store.pending_writes.clone().acquire_many_owned(PENDING_WRITE_BYTES as u32).await.unwrap();
+        assert!(matches!(store.confirm_authority(check(ensemble)), ResponseBody::AuthorityConfirmed(_)));
+        assert!(matches!(store.confirm_authority(check(Bytes::from_static(&[8; 32]))), ResponseBody::Refused(_)));
+        drop(all_writes);
+        drop(store);
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -310,12 +456,12 @@ mod tests {
             from_lsn: 0,
             entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, payload: Bytes::from(vec![1; 2 << 20]) }],
             complete: true,
-            commit_lsn: 0,
+            commit_lsn: 0, activate_ensemble: Bytes::new(),
         }), 2 << 20).await, Outcome::Durable(_, _)));
         let slot = store.existing("drop-me").unwrap();
         let capture = Captured { slot: Arc::clone(&slot), state: slot.state.lock().clone() };
         assert!(journal.claim_compaction());
-        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0, _admission: None };
+        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0, _admission: None, authority_revision: None };
         assert!(store.queue.send(first_compaction).is_ok());
         let Outcome::Durable(dropped, _) = store.mutate(RequestBody::DropStream(DropStream { stream: "drop-me".into(), epoch: 2 }), 32).await else {
             panic!("the drop was refused");

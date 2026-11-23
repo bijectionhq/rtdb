@@ -13,10 +13,12 @@ path = "src/main.rs"
 
 [features]
 dynamodb = ["rtdb-directory/dynamodb", "dep:aws-config", "dep:aws-sdk-dynamodb"]
+s3-key-vault = ["dep:aws-config", "dep:aws-sdk-s3"]
 
 [dependencies]
 aws-config = { version = "=1.13.0", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
 rtdb-affinity.workspace = true
 rtdb-columnar.workspace = true
 rtdb-directory = { workspace = true, features = ["network"] }
@@ -24,6 +26,7 @@ rtdb-format.workspace = true
 rtdb-flight-sql.workspace = true
 rtdb-logkeeper.workspace = true
 rtdb-node.workspace = true
+rtdb-plan.workspace = true
 rtdb-query.workspace = true
 rtdb-pgwire.workspace = true
 rtdb-replication.workspace = true

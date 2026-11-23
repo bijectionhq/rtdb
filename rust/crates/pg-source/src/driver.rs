@@ -5,7 +5,7 @@ use rtdb_replication::{DriverStatus, ExternalReceipt, TermHandle};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use crate::{ConfirmationState, DirectMirror, Lsn, PgIndexer, PgTransaction, Remote, ResumeToken, SourceConfig, config::DIRECT_MIRROR_TYPE, indexer::ImportWriter, snapshot::{SnapshotReader, publication_exists}, stream::ChangeStream};
+use crate::{ArrowPgTransaction, ConfirmationState, DirectMirror, Lsn, PgIndexer, Remote, ResumeToken, SourceConfig, config::DIRECT_MIRROR_TYPE, indexer::ImportWriter, snapshot::{SnapshotReader, publication_exists}, stream::ChangeStream};
 
 #[derive(Clone, Debug)]
 pub struct ReconnectPolicy { pub initial_delay: Duration, pub maximum_delay: Duration, pub jitter: f64, pub reset_after: Duration }
@@ -77,7 +77,7 @@ impl SourceDriver {
             memory: Arc::clone(&self.memory), assignment: self.sampling.clone(), _reservation: reservation })))
     }
     /// The caller owns this future and must cancel and join it before assigning the source to another term.
-    /// `after` is applied progress; the block watch supplies the independently durable confirmation bound.
+    /// `after` supplies applied progress to resume from. Confirmation uses checkpoint or replay evidence.
     pub async fn run(self, term: TermHandle, after: Option<Arc<[u8]>>, mut blocks: watch::Receiver<DriverStatus>, cancellation: CancellationToken) -> Result<()> {
         let _sampling_region = self.sampling.clone().drop_guard();
         let _metrics_region = self.metrics.as_ref().map(|metrics| metrics.assigned(self.observer()?)).transpose()?;
@@ -90,10 +90,10 @@ impl SourceDriver {
         let resume = match after { Some(token) => ResumeToken::decode(&token)?.require_complete()?, None => self.snapshot(term).await? };
         self.stream(term, resume, blocks).await
     }
-    async fn submit(&self, term: &TermHandle, transaction: PgTransaction, completed: bool) -> Result<BoxFuture<'static, Result<Applied>>> {
-        let events = transaction.operations.len(); let commit_time = transaction.commit_time;
+    async fn submit(&self, term: &TermHandle, transaction: ArrowPgTransaction, completed: bool) -> Result<BoxFuture<'static, Result<Applied>>> {
+        let events = transaction.row_count(); let commit_time = transaction.commit_time;
         let token = ResumeToken::new(transaction.lsn, completed).encode();
-        let receipt = term.submit_external(Box::new(ImportWriter { transaction, indexer: Arc::clone(&self.indexer) }), commit_time, Some(token)).await?;
+        let receipt = term.submit_external(Box::new(ImportWriter { transaction, indexer: Arc::clone(&self.indexer), memory: Arc::clone(&self.memory) }), commit_time, Some(token)).await?;
         Ok(applied(receipt, events, commit_time))
     }
     async fn snapshot(&self, term: &TermHandle) -> Result<Lsn> {
@@ -105,13 +105,14 @@ impl SourceDriver {
             pending.push_back(self.submit(term, transaction, false).await?);
         }
         let lsn = snapshot.lsn;
-        pending.push_back(self.submit(term, PgTransaction::empty(lsn), true).await?);
+        pending.push_back(self.submit(term, ArrowPgTransaction::empty(lsn), true).await?);
         while let Some(result) = pending.next().await { result?; }
         snapshot.finish().await?;
         Ok(lsn)
     }
     async fn stream(&self, term: &TermHandle, resume: Lsn, blocks: &mut watch::Receiver<DriverStatus>) -> Result<()> {
         let mut confirmation = ConfirmationState::new(resume, durable(blocks)?);
+        recoverable_token(term, &mut confirmation)?;
         let mut pending = Pending::new(); let mut failures = 0u32; let mut random = uuid::Uuid::new_v4().as_u128() as u64;
         loop {
             self.status.send_modify(|status| status.phase = SourcePhase::Connecting);
@@ -123,8 +124,14 @@ impl SourceDriver {
             let result = loop {
                 tokio::select! {
                     result = &mut open => break result,
-                    result = pending.next(), if !pending.is_empty() => if let Some(result) = result { self.record_applied(result?); },
-                    change = blocks.changed() => { change.map_err(|_| stopped())?; confirmation.adopted(durable(blocks)?); }
+                    result = pending.next(), if !pending.is_empty() => if let Some(result) = result {
+                        self.record_applied(result?);
+                        recoverable_token(term, &mut confirmation)?;
+                    },
+                    change = blocks.changed() => {
+                        change.map_err(|_| stopped())?;
+                        confirmation.adopted(durable(blocks)?);
+                    }
                 }
             };
             let mut stream = match result { Ok(stream) => stream, Err(error) if retryable(&error) => { failures = failures.saturating_add(1); continue; }, Err(error) => return Err(error) };
@@ -161,7 +168,11 @@ impl SourceDriver {
                         update.reply_requested
                     }
                     Event::Read(Err(error)) => break error,
-                    Event::Applied(Some(result)) => { self.record_applied(result?); false },
+                    Event::Applied(Some(result)) => {
+                        self.record_applied(result?);
+                        recoverable_token(term, &mut confirmation)?;
+                        false
+                    },
                     Event::Applied(None) => false,
                     Event::Durable(change) => { change.map_err(|_| stopped())?; confirmation.adopted(durable(blocks)?); false },
                     Event::Tick => true,
@@ -191,7 +202,18 @@ fn applied(receipt: ExternalReceipt, events: usize, commit_time: Option<Timestam
     Box::pin(async move { receipt.applied().await?; Ok(Applied { events, commit_time }) })
 }
 fn durable(blocks: &mut watch::Receiver<DriverStatus>) -> Result<Option<Lsn>> {
-    blocks.borrow_and_update().adopted_block.as_ref().and_then(|block| block.external_source_token()).map(ResumeToken::decode).transpose().map(|token| token.map(|token| token.lsn))
+    let token = blocks.borrow_and_update().adopted_block.as_ref()
+        .and_then(|block| block.external_source_token()).map(ResumeToken::decode).transpose()?;
+    Ok(token.filter(|token| token.snapshot_completed).map(|token| token.lsn))
+}
+fn recoverable_token(term: &TermHandle, confirmation: &mut ConfirmationState) -> Result<()> {
+    if let Some(bytes) = term.recoverable_external_token() {
+        let token = ResumeToken::decode(&bytes)?;
+        if token.snapshot_completed {
+            confirmation.recovered_by_replay(token.lsn);
+        }
+    }
+    Ok(())
 }
 fn retryable(error: &Anomaly) -> bool { error.category == AnomalyCategory::Unavailable && error.code.starts_with("xtdb.postgres/") }
 fn stopped() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb.postgres/assignment-ended", "PostgreSQL source assignment ended") }

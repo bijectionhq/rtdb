@@ -20,6 +20,183 @@ fn tx(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64, system: i64) 
 fn timestamp(value: i64) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 
 #[tokio::test]
+async fn delegated_scan_refuses_a_later_erase_horizon_and_falls_back() {
+    use rtdb_query::{FragmentDepth, ScanFragment, ScanFragmenter, evaluate_fragment};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Replica {
+        context: Arc<QueryContext>,
+        refusals: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ScanFragmenter for Replica {
+        fn depth(&self, _: &str, _: &TableRef, _: u64) -> Option<FragmentDepth> { FragmentDepth::new(1).ok() }
+
+        async fn dispatch(&self, fragment: &ScanFragment) -> Result<Option<Vec<u8>>> {
+            match evaluate_fragment(Arc::clone(&self.context), fragment).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) => {
+                    if error.code == "rtdb.query/fragment-basis" { self.refusals.fetch_add(1, Ordering::Relaxed); }
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut put = tx(&state, &memory, 0, 10);
+    put.put(table(), document(1, Value::Utf8("captured".into())), Interval::ALL).unwrap();
+    state.apply(&put.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+    let captured = state.snapshot();
+
+    let mut erase = tx(&state, &memory, 1, 20);
+    erase.erase(table(), &EntityId::Integer(1)).unwrap();
+    state.apply(&erase.stage().unwrap()).unwrap();
+    let later = query_context(state.snapshot(), Arc::clone(&store), false);
+    let later_scan = scan(&later, &["v"], TemporalFilter::All, at(10), None);
+    assert!(collect(later_scan, Arc::clone(&later)).await.unwrap().is_empty());
+    let replica = Arc::new(Replica { context: later, refusals: AtomicUsize::new(0) });
+
+    let database = DatabaseSnapshot { partitions: vec![captured], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap()
+        .with_fragmenter(Some(replica.clone()), None);
+    let coordinator = QueryContext::new(catalog, memory, Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+    let relation = scan(&coordinator, &["v"], TemporalFilter::All, at(10), None);
+    assert_eq!(collect(relation, coordinator).await.unwrap(), vec![vec![Value::Utf8("captured".into())]],
+        "local fallback must preserve the coordinator's captured row");
+    assert_eq!(replica.refusals.load(Ordering::Relaxed), 4);
+}
+
+#[tokio::test]
+async fn a_cold_fragment_sends_selected_fixed_lists_as_arrow() {
+    use arrow_array::{Array, cast::AsArray};
+    use arrow_schema::DataType;
+    use rtdb_query::{ScanFragment, TriePrefix, evaluate_fragment};
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let width = 1 << 16;
+    let selected = Value::FixedSizeList(vec![Value::I64(7)].into());
+    let skipped = Value::FixedSizeList(vec![Value::FixedSizeBinary(vec![13; width])].into());
+    let mut write = tx(&state, &budget, 0, 10);
+    write.put(table(), document(1, selected.clone()), Interval::ALL).unwrap();
+    write.put(table(), document(2, skipped), Interval::ALL).unwrap();
+    state.apply(&write.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+    let snapshot = state.snapshot();
+    let basis = snapshot.tx_basis().unwrap();
+    let context = query_context(snapshot, store, true);
+    let relation = scan(&context, &["_id", "v"], TemporalFilter::All, at(10), None);
+    let rtdb_plan::RelationNode::Scan(scan) = relation.node() else { unreachable!() };
+    let mut scan = scan.clone();
+    scan.predicates.push(Expr::binary(BinaryOp::NotEq, scan.columns[0].expression(), Expr::Literal(Value::I64(2))));
+    let fragment = ScanFragment {
+        scan,
+        prefix: TriePrefix::new(Vec::new()).unwrap(),
+        basis,
+        residence: None,
+        bounds: rtdb_types::TemporalBounds { valid_time: Interval::ALL, system_time: Interval::from_micros(10, 11).unwrap() },
+        timezone: "UTC".into(),
+    };
+
+    let wire = evaluate_fragment(context, &fragment).await.unwrap();
+
+    let (length, bytes) = wire.split_first_chunk::<8>().unwrap();
+    assert_eq!(u64::from_be_bytes(*length) as usize, bytes.len());
+    assert!(bytes.len() < width);
+    let mut reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(reader.next().is_none());
+    let schema = batch.schema();
+    let field = schema.field(1);
+    assert_eq!(field.metadata()["rtdb.fragment.column"], "arrow");
+    assert!(matches!(field.data_type(), DataType::FixedSizeList(_, 1)));
+    let list = batch.column(1).as_fixed_size_list();
+    let storage_union = list.values().as_union();
+    let DataType::Union(legs, _) = storage_union.data_type() else { unreachable!() };
+    let wide = legs.iter().find(|(_, field)| field.data_type() == &DataType::FixedSizeBinary(width as i32)).unwrap().0;
+    assert!(storage_union.child(wide).is_empty());
+    assert_eq!(read_value(field, list, 0).unwrap(), selected);
+}
+
+#[tokio::test]
+async fn delegated_scan_keeps_its_snapshot_until_cancelled_provider_reads_drain() {
+    use rtdb_query::{ScanFragment, TriePrefix, evaluate_fragment};
+    use rtdb_storage::{IoRegion, StoredObject};
+    use std::{ops::Range, path::Path, sync::{Mutex, mpsc}, time::Duration};
+    use tokio::sync::oneshot;
+
+    struct ReadGate { started: oneshot::Sender<()>, finish: mpsc::Receiver<()> }
+    struct PausedStore { inner: MemoryStore, io: Arc<IoRegion>, gate: Mutex<Option<ReadGate>> }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PausedStore {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<bytes::Bytes> { self.inner.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<bytes::Bytes> {
+            let bytes = self.inner.get_range(key, range).await?;
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                return self.io.run_blocking(move || {
+                    let _ = gate.started.send(());
+                    let _ = gate.finish.recv();
+                    Ok(bytes)
+                }).await;
+            }
+            Ok(bytes)
+        }
+        async fn put(&self, key: &ObjectKey, bytes: bytes::Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    let inner = MemoryStore::default();
+    let mut put = tx(&state, &memory, 0, 10);
+    put.put(table(), document(1, Value::Utf8("captured".into())), Interval::ALL).unwrap();
+    state.apply(&put.stage().unwrap()).unwrap();
+    persist(&state, &inner).await;
+    let snapshot = state.snapshot();
+    let basis = snapshot.tx_basis().unwrap();
+    let io = IoRegion::new();
+    let (started, reading) = oneshot::channel();
+    let (resume, finish) = mpsc::channel();
+    let store = Arc::new(PausedStore { inner, io: Arc::clone(&io), gate: Mutex::new(Some(ReadGate { started, finish })) });
+    let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    let cancellation = CancellationToken::new();
+    let context = QueryContext::new(catalog, memory, Timestamp(50), "UTC", QueryOptions::default(), &cancellation).unwrap();
+    let relation = scan(&context, &["v"], TemporalFilter::All, at(10), None);
+    let rtdb_plan::RelationNode::Scan(scan) = relation.node() else { unreachable!() };
+    let fragment = ScanFragment {
+        scan: scan.clone(),
+        prefix: TriePrefix::new(Vec::new()).unwrap(),
+        basis,
+        residence: None,
+        bounds: rtdb_types::TemporalBounds { valid_time: Interval::ALL, system_time: Interval::from_micros(10, 11).unwrap() },
+        timezone: "UTC".into(),
+    };
+    let lifetime = Arc::downgrade(&context);
+    let request = tokio::spawn(async move { evaluate_fragment(context, &fragment).await });
+    tokio::time::timeout(Duration::from_secs(5), reading).await.unwrap().unwrap();
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap().unwrap_err();
+    assert_eq!(error.code, "xtdb/query-cancelled");
+    assert!(lifetime.upgrade().is_some(), "the admitted provider read must retain the fragment snapshot");
+    resume.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), io.close_and_wait()).await.unwrap();
+    assert!(lifetime.upgrade().is_none());
+}
+
+#[tokio::test]
 async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_storage() {
     let budget = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();

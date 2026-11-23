@@ -1,6 +1,6 @@
 //! A deterministic simulation of a cell's storage lifecycle: deployments writing through their real store stacks, releasing, forking (now and at a past block), being reaped, deleted and moved between cells.
 //!
-//! Driven for real, against `rtdb_storage::MemoryStore` buckets: `store::open_deployment_store` (prefixed, referencing when forked, packing, garbage), `reference::fork`, `reference::written_at_ms`, `store::reaper_pass`, `reference::erase_deployment` and `reference::materialize`.
+//! Driven for real, against `rtdb_storage::MemoryStore` buckets: `store::open_deployment_store` (prefixed, referencing when forked, packing, garbage), `reference::fork`, `reference::written_at_ms`, `store::reaper_pass`, `reference::simulate_erase_deployment` and `reference::materialize`.
 //! Modelled: what each deployment should read, and the admin sequences around the real calls (a fork flushes its parent first; a fork at a past block is refused once the block is as old as the reaper's grace; a move fences the holder, losing what it held back).
 //! Time is a simulated clock, which the stores stamp releases and packs from through the real `store::stamps`, so a run is a pure function of its seed.
 
@@ -16,7 +16,7 @@ use bytes::Bytes;
 use rtdb_directory::{Checkpoint, DeploymentRecord, Lifecycle};
 use rtdb_format::keys::{TrieKey, block_key, lex_hex};
 use rtdb_multi::packing::PackDiscovery;
-use rtdb_multi::reference::{self, Bucket, References};
+use rtdb_multi::reference;
 use rtdb_multi::store::{self, Clock, GarbageStore};
 use rtdb_storage::{Error as StoreError, MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::BlockIndex;
@@ -162,7 +162,7 @@ struct World {
     step: usize,
     now: Arc<AtomicI64>,
     clock: Clock,
-    cells: Vec<Bucket>,
+    cells: Vec<Arc<MemoryStore>>,
     deployments: Vec<Deployment>,
     trace: VecDeque<String>,
     summary: Summary,
@@ -175,7 +175,7 @@ impl World {
         let now = Arc::new(AtomicI64::new(1_000));
         let ticks = Arc::clone(&now);
         let clock: Clock = store::stamps(move || ticks.load(Ordering::SeqCst));
-        let cells = (0..CELLS).map(|_| Arc::new(MemoryStore::default()) as Bucket).collect();
+        let cells = (0..CELLS).map(|_| Arc::new(MemoryStore::default())).collect();
         let summary = Summary { seed: config.seed, ..Summary::default() };
         Self { rng: Rng::new(config.seed), config, step: 0, now, clock, cells, deployments: Vec::new(), trace: VecDeque::new(), summary, dirty: BTreeSet::new() }
     }
@@ -260,7 +260,7 @@ impl World {
     async fn open(&self, index: usize) -> Result<Arc<GarbageStore>, String> {
         let deployment = &self.deployments[index];
         let discovery = match deployment.record.checkpoint { Some(checkpoint) => PackDiscovery::From(checkpoint.block), None => PackDiscovery::List };
-        store::open_deployment_store(Arc::clone(&self.cells[deployment.cell]), &deployment.store(), discovery, Arc::clone(&self.clock)).await
+        store::open_deployment_store(self.cells[deployment.cell].clone(), &deployment.store(), discovery, Arc::clone(&self.clock)).await
             .map_err(|error| format!("d{index}'s store does not open: {error}"))
     }
 
@@ -330,7 +330,7 @@ impl World {
         self.summary.flushes += 1;
         // The holder publishes the block as its checkpoint, unless the directory is out of its reach for now.
         let published = self.rng.chance(70);
-        if published { self.deployments[index].record.checkpoint = Some(Checkpoint { block: block as i64, boundary: 0, source: 0, system_time: 0 }); }
+        if published { self.deployments[index].record.checkpoint = Some(Checkpoint { block: block as i64, boundary: 0, source: 0, system_time: 0, root_sha256: None }); }
         self.note(format!("d{index} flushes block {block}, packing {} objects{}", names.len(), if published { ", and publishes it" } else { "" }));
         Ok(())
     }
@@ -466,7 +466,9 @@ impl World {
         let outcomes = match self.config.bug {
             Some(Bug::ReaperSkipsCopy) => {
                 let mut outcomes = Vec::new();
-                for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { outcomes.push(store::reap_as_of(bucket.as_ref(), record, self.now(), grace, &References::default()).await); }
+                for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) {
+                    outcomes.push(store::simulate_reap_without_references(bucket.as_ref(), record, self.now(), grace).await);
+                }
                 outcomes
             }
             _ => {
@@ -491,7 +493,7 @@ impl World {
                         self.check().await?;
                     }
                 }
-                store::reaper_pass(bucket.as_ref(), &records, self.now(), grace).await.map_err(|error| format!("the reaper's scan of cell {cell} failed: {error}"))?
+                store::simulate_reap_cell(bucket.as_ref(), &records, self.now(), grace).await.map_err(|error| format!("the reaper's scan of cell {cell} failed: {error}"))?
             }
         };
         let mut erased = 0;
@@ -503,7 +505,7 @@ impl World {
         for record in records.iter().filter(|record| record.moved_at_ms.is_some_and(|moved| moved + GRACE_MS <= now)) {
             let prefix = object(&record.storage_prefix())?;
             if !bucket.list(Some(&prefix)).await.map_err(|error| error.to_string())?.is_empty() {
-                if !reference::erase_deployment(bucket.as_ref(), prefix.as_str(), &others).await.map_err(|error| error.to_string())? {
+                if !reference::simulate_erase_deployment(bucket.as_ref(), prefix.as_str(), &others).await.map_err(|error| error.to_string())? {
                     return Err(format!("cell {cell} still holds {} after its move grace", record.name));
                 }
                 self.summary.cleaned_moves += 1;
@@ -521,7 +523,7 @@ impl World {
         deployment.pending.clear();
         deployment.state = State::Deleted;
         let prefix = deployment.record.storage_prefix();
-        let empty = reference::erase_deployment(self.cells[cell].as_ref(), &prefix, &others).await.map_err(|error| format!("deleting d{index}: {error}"))?;
+        let empty = reference::simulate_erase_deployment(self.cells[cell].as_ref(), &prefix, &others).await.map_err(|error| format!("deleting d{index}: {error}"))?;
         if !empty { return Err(format!("deleting d{index} did not prove its prefix empty")); }
         self.summary.deletions += 1;
         self.note(format!("delete d{index}"));

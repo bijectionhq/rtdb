@@ -21,6 +21,8 @@ rtdb-expr.workspace = true
 rtdb-text.workspace = true
 parking_lot.workspace = true
 arrow-array.workspace = true
+arrow-buffer.workspace = true
+bytes.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 arrow-ipc.workspace = true
@@ -37,7 +39,11 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+bytes.workspace = true
 rtdb-metrics.workspace = true
 
 [lints]

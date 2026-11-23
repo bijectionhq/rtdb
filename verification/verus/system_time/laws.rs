@@ -1,4 +1,4 @@
-use crate::production::{advances, automatic_time};
+use crate::production::{admits_client_time, advances, automatic_time};
 use vstd::prelude::*;
 
 verus! {
@@ -45,6 +45,25 @@ pub fn nonadvancing_explicit_times_are_refused(previous: i64, candidate: i64)
 {
     let admissible = advances(Some(previous), candidate);
     assert(!admissible);
+}
+
+// LAW TIME-SYSTEM-BOUNDED-BY-LOG.
+pub fn an_admitted_client_time_never_leads_the_log(previous: Option<i64>, candidate: i64, log_time: i64) {
+    let admitted = admits_client_time(previous, candidate, log_time);
+    if admitted {
+        assert(candidate <= log_time);
+    }
+}
+
+// LAW TIME-SYSTEM-NO-EXHAUSTION.
+pub fn an_admitted_client_time_leaves_a_following_chronon(previous: Option<i64>, candidate: i64, log_time: i64, next_log: i64)
+    requires log_time < i64::MAX,
+{
+    let admitted = admits_client_time(previous, candidate, log_time);
+    if admitted {
+        let next = automatic_time(Some(candidate), next_log);
+        assert(next.is_some());
+    }
 }
 
 }

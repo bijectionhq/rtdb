@@ -4,6 +4,7 @@ import com.google.protobuf.ByteString
 import xtdb.api.tx.ExternalSourceToken
 import xtdb.database.Database
 import xtdb.types.MessageId
+import xtdb.log.proto.AcceptanceStage
 import xtdb.log.proto.ReplicaLogMessage
 import xtdb.log.proto.TrieDetails
 import xtdb.log.proto.attachDatabase
@@ -79,6 +80,8 @@ sealed interface ReplicaMessage {
                                 it.externalSourceToken.takeIf { _ -> it.hasExternalSourceToken() }?.toByteArray(),
                                 if (it.hasSrcMsgId()) it.srcMsgId else null,
                                 termId = msg.termId, termSeq = termSeq,
+                                placedAttempt = it.placedAttempt.takeIf { _ -> it.hasPlacedAttempt() },
+                                acceptanceStage = it.acceptanceStage.takeIf { _ -> it.hasAcceptanceStage() },
                             )
                         }
 
@@ -130,7 +133,7 @@ sealed interface ReplicaMessage {
                 .toHeaderedBytes(PROTOBUF_HEADER)
     }
 
-    data class ResolvedTx(
+    data class ResolvedTx @JvmOverloads constructor(
         val txId: MessageId,
         val systemTime: Instant,
         val committed: Boolean,
@@ -145,6 +148,8 @@ sealed interface ReplicaMessage {
         val srcMsgId: MessageId? = null,
         override val termId: Long,
         override val termSeq: Long? = null,
+        val placedAttempt: ByteString? = null,
+        val acceptanceStage: AcceptanceStage? = null,
     ) : ProtobufMessage() {
         override fun withTermSeq(termSeq: Long) = copy(termSeq = termSeq)
 
@@ -169,6 +174,8 @@ sealed interface ReplicaMessage {
                 }
                 this@ResolvedTx.externalSourceToken?.let { externalSourceToken = ByteString.copyFrom(it) }
                 this@ResolvedTx.srcMsgId?.let { srcMsgId = it }
+                this@ResolvedTx.placedAttempt?.let { placedAttempt = it }
+                this@ResolvedTx.acceptanceStage?.let { acceptanceStage = it }
             }
         }
     }

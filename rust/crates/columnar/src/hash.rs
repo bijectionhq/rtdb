@@ -1,6 +1,6 @@
-use arrow_array::{Array, FixedSizeListArray, ListArray, MapArray, RunArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
-use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_types::{Anomaly, DecimalValue, Result, Value};
+use arrow_array::{Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, ListArray, MapArray, PrimitiveArray, RunArray, StringArray, StructArray, UnionArray, types::*};
+use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
+use rtdb_types::{Anomaly, DecimalValue, Result, UriParts, Value};
 
 use crate::{EXTENSION_NAME_KEY, read_value};
 
@@ -123,7 +123,102 @@ fn decimal_double(value: &DecimalValue) -> Result<f64> {
         256 => arrow_buffer::i256::from_be_bytes(value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?).to_string(),
         _ => return Err(decimal_width()),
     };
-    format!("{coefficient}e{}", -i64::from(value.scale)).parse().map_err(|_| Anomaly::incorrect("rtdb/decimal-double", "Decimal could not be represented as a floating-point statistic"))
+    scaled_double(&coefficient, value.scale)
+}
+
+fn scaled_double(coefficient: &str, scale: i32) -> Result<f64> {
+    format!("{coefficient}e{}", -i64::from(scale)).parse().map_err(|_| Anomaly::incorrect("rtdb/decimal-double", "Decimal could not be represented as a floating-point statistic"))
+}
+
+pub fn decimal_cell_as_f64(field: &Field, array: &dyn Array, row: usize) -> Result<f64> {
+    if row >= array.len() || array.data_type() != field.data_type() { return Err(layout_error()); }
+    let scale = crate::decimal_field_parameters(field)?.ok_or_else(decimal_width)?.scale;
+    let coefficient = match field.data_type() {
+        DataType::Decimal32(..) => downcast::<PrimitiveArray<Decimal32Type>>(array)?.value(row).to_string(),
+        DataType::Decimal64(..) => downcast::<PrimitiveArray<Decimal64Type>>(array)?.value(row).to_string(),
+        DataType::Decimal128(..) => downcast::<PrimitiveArray<Decimal128Type>>(array)?.value(row).to_string(),
+        DataType::Decimal256(..) => downcast::<PrimitiveArray<Decimal256Type>>(array)?.value(row).to_string(),
+        _ => return Err(decimal_width()),
+    };
+    scaled_double(&coefficient, scale)
+}
+
+fn scalar_hash(field: &Field, array: &dyn Array, row: usize, seed: u32) -> Result<Option<i32>> {
+    let extension = field.metadata().get(EXTENSION_NAME_KEY).map(String::as_str);
+    if !field.metadata().is_empty() {
+        crate::decimal_field_parameters(field)?;
+        match (field.data_type(), extension) {
+            (_, None)
+            | (DataType::Int32, Some("xt/oid" | "xt/regclass" | "xt/regproc"))
+            | (DataType::Utf8, Some("xt/clj-keyword" | "uri"))
+            | (DataType::Binary, Some("xt/transit+msgpack"))
+            | (DataType::FixedSizeBinary(16), Some("uuid"))
+            | (DataType::Interval(IntervalUnit::MonthDayNano), Some("xt/intervalDMMType")) => {}
+            _ => return Ok(None),
+        }
+    }
+    let bytes = |bytes: &[u8]| xxhash32(bytes, seed) as i32;
+    let double = |value: f64| bytes(&value.to_bits().to_be_bytes());
+    macro_rules! cell {
+        ($ty:ty) => { downcast::<PrimitiveArray<$ty>>(array)?.value(row) };
+    }
+    Ok(Some(match field.data_type() {
+        DataType::Boolean => if downcast::<BooleanArray>(array)?.value(row) { 17 } else { 19 },
+        DataType::Int8 => double(f64::from(cell!(Int8Type))),
+        DataType::Int16 => double(f64::from(cell!(Int16Type))),
+        DataType::Int32 => double(f64::from(cell!(Int32Type))),
+        DataType::Int64 => double(cell!(Int64Type) as f64),
+        DataType::UInt8 => double(f64::from(cell!(UInt8Type) as i8)),
+        DataType::UInt16 => double(f64::from(cell!(UInt16Type) as i16)),
+        DataType::UInt32 => double(f64::from(cell!(UInt32Type) as i32)),
+        DataType::UInt64 => double((cell!(UInt64Type) as i64) as f64),
+        DataType::Float32 => double(f64::from(cell!(Float32Type))),
+        DataType::Float64 => double(cell!(Float64Type)),
+        DataType::Date32 => double(i64::from(cell!(Date32Type)).wrapping_mul(86_400) as f64),
+        DataType::Date64 => double((cell!(Date64Type) / 86_400_000).wrapping_mul(86_400) as f64),
+        DataType::Time32(TimeUnit::Second) => bytes(&cell!(Time32SecondType).to_le_bytes()),
+        DataType::Time32(TimeUnit::Millisecond) => bytes(&cell!(Time32MillisecondType).to_le_bytes()),
+        DataType::Time64(TimeUnit::Microsecond) => bytes(&cell!(Time64MicrosecondType).to_le_bytes()),
+        DataType::Time64(TimeUnit::Nanosecond) => bytes(&cell!(Time64NanosecondType).to_le_bytes()),
+        DataType::Duration(unit) => double(match unit {
+            TimeUnit::Second => cell!(DurationSecondType) as f64,
+            TimeUnit::Millisecond => cell!(DurationMillisecondType) as f64 / 1e3,
+            TimeUnit::Microsecond => cell!(DurationMicrosecondType) as f64 / 1e6,
+            TimeUnit::Nanosecond => cell!(DurationNanosecondType) as f64 / 1e9,
+        }),
+        DataType::Timestamp(unit, _) => double(match unit {
+            TimeUnit::Second => cell!(TimestampSecondType) as f64,
+            TimeUnit::Millisecond => cell!(TimestampMillisecondType) as f64 / 1e3,
+            TimeUnit::Microsecond => cell!(TimestampMicrosecondType) as f64 / 1e6,
+            TimeUnit::Nanosecond => cell!(TimestampNanosecondType) as f64 / 1e9,
+        }),
+        DataType::Interval(IntervalUnit::YearMonth) => bytes(&cell!(IntervalYearMonthType).to_le_bytes()),
+        DataType::Interval(IntervalUnit::DayTime) => {
+            let value = cell!(IntervalDayTimeType);
+            let mut buffer = [0; 8];
+            buffer[..4].copy_from_slice(&value.days.to_le_bytes());
+            buffer[4..].copy_from_slice(&value.milliseconds.to_le_bytes());
+            bytes(&buffer)
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let value = cell!(IntervalMonthDayNanoType);
+            let mut buffer = [0; 16];
+            buffer[..4].copy_from_slice(&value.months.to_le_bytes());
+            buffer[4..8].copy_from_slice(&value.days.to_le_bytes());
+            buffer[8..].copy_from_slice(&value.nanoseconds.to_le_bytes());
+            bytes(&buffer)
+        }
+        DataType::Utf8 => {
+            let value = downcast::<StringArray>(array)?.value(row);
+            if extension == Some("uri") { UriParts::parse(value)?; }
+            bytes(value.as_bytes())
+        }
+        DataType::Binary => bytes(downcast::<BinaryArray>(array)?.value(row)),
+        DataType::FixedSizeBinary(_) => bytes(downcast::<FixedSizeBinaryArray>(array)?.value(row)),
+        DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) =>
+            double(decimal_cell_as_f64(field, array, row)?),
+        _ => return Ok(None),
+    }))
 }
 
 /// Hashes in physical schema order, matching vector hashes used in JVM HLL metadata.
@@ -166,7 +261,10 @@ pub fn hash_cell(field: &Field, array: &dyn Array, row: usize, seed: u32) -> Res
             let values = downcast::<MapArray>(array)?.value(row);
             (0..values.len()).try_fold(0, |hash, index| Ok::<i32, Anomaly>(combine(hash, hash_cell(child, &values, index, seed)?)))
         }
-        _ => hash_value(&read_value(field, array, row)?, seed),
+        _ => match scalar_hash(field, array, row, seed)? {
+            Some(hash) => Ok(hash),
+            None => hash_value(&read_value(field, array, row)?, seed),
+        },
     }
 }
 

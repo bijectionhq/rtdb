@@ -15,13 +15,120 @@ impl TransactionAuthorization for Denied {
     fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
 }
 fn context() -> ResolveContext {
-    ResolveContext { database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
+    ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn document(value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
 fn request(ops: Vec<TxOp>, context: &ResolveContext) -> SourceTransaction { SourceTransaction::new(ops, SubmitOptions::default(), &context.memory).unwrap() }
 fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp::PutDocs { table: table(), documents: Documents::new(vec![document(value)], &context.memory).unwrap(), valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)) } }
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
+
+#[tokio::test]
+async fn sql_source_replay_keeps_unreached_parameter_cells_in_arrow() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+    use rtdb_format::envelope::SourceMessage;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("payload", DataType::Utf8, false)]));
+    let text = "x".repeat(1 << 21);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(StringArray::from(vec![text.as_str(), text.as_str()]))]).unwrap();
+    let arguments = SqlArguments::from_arrow(OwnedBatch::new(batch, &context.memory).unwrap(), &context.memory).unwrap();
+    let source = request(vec![TxOp::Sql {
+        sql: "INSERT INTO docs (_id, v) SELECT $1, CASE WHEN $1 < 0 THEN CAST(CHAR_LENGTH($2) AS BIGINT) ELSE $1 END".into(),
+        args: Some(arguments),
+    }], &context);
+    let encoded = source.encode().unwrap();
+    let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+    let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+    drop((source, encoded, message));
+    let headroom = 1 << 20;
+    let _pressure = context.memory.reserve(context.memory.limit_bytes() - context.memory.used_bytes() - headroom).unwrap();
+
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+    assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+    let writes = resolved.writes().tables();
+    let docs = writes.get(&table()).unwrap().batch().unwrap().view();
+    let values = (0..docs.len()).map(|row| {
+        let event = docs.read_event(row).unwrap();
+        let StoredOperation::Put(document) = event.operation else { panic!("Expected a put"); };
+        document["v"].clone()
+    }).collect::<Vec<_>>();
+    assert_eq!(values, [Value::I64(1), Value::I64(2)]);
+}
+
+#[tokio::test]
+async fn sql_source_replay_validates_an_unreached_uri_before_evaluation() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::{OwnedBatch, to_field};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let fields = vec![Field::new("id", DataType::Int64, false), to_field("payload", &LogicalType::Scalar(ScalarType::Uri)).unwrap()];
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![Arc::new(Int64Array::from(vec![1])), Arc::new(StringArray::from(vec!["http://["]))]).unwrap();
+    let arguments = SqlArguments::from_arrow(OwnedBatch::new(batch, &context.memory).unwrap(), &context.memory).unwrap();
+    let source = request(vec![TxOp::Sql {
+        sql: "INSERT INTO docs (_id, v) SELECT $1, CASE WHEN $1 < 0 THEN $2 IS NOT NULL ELSE TRUE END".into(),
+        args: Some(arguments),
+    }], &context);
+    let encoded = source.encode().unwrap();
+    let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+    let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+
+    let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+    let error = result.result().error().unwrap();
+    assert_eq!(error.code, "xtdb/invalid-uri");
+    assert!(error.context.get("arg-idx").is_none());
+}
+
+#[tokio::test]
+async fn old_resolvers_abort_a_fenced_source_record_before_a_replay_can_commit() {
+    use rtdb_format::envelope::{SourceBody, SourceMessage};
+
+    let context = context();
+    let key = "00112233445566778899aabbccddeeff/0";
+    let permit = ReplaySubmission::admit(key, Timestamp(100), Timestamp(400)).unwrap();
+    let encoded = request(vec![put(&context, 7, 0, i64::MAX)], &context)
+        .with_replay_submission(permit).encode().unwrap();
+    let Some(SourceMessage::Protobuf(SourceBody::Tx(command))) = SourceMessage::decode(encoded.as_slice()).unwrap() else {
+        panic!("expected structured source transaction");
+    };
+
+    for legacy_understands_permits in [false, true] {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+        let mut legacy_command = command.clone();
+        if legacy_understands_permits {
+            legacy_command.replay_submission.as_mut().unwrap().abort_on_legacy_resolver = None;
+        } else {
+            legacy_command.replay_submission = None;
+        }
+        let mut resolve = async |position, command| {
+            let request = SourceTransaction::decode(&SourceMessage::Protobuf(SourceBody::Tx(command)), &context.memory).unwrap();
+            let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(100 + position), request, &context).await.unwrap();
+            state.apply(resolver.take_head().unwrap().writes()).unwrap();
+            resolved
+        };
+        let old = resolve(0, legacy_command.clone()).await;
+        assert_eq!(old.result().error().unwrap().code, "xtdb/assert-failed");
+        assert_eq!(old.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+
+        let first = resolve(1, command.clone()).await;
+        assert!(first.result().committed());
+        assert!(first.writes().tables().contains_key(&table()));
+        let old_after_commit = resolve(2, legacy_command).await;
+        assert!(!old_after_commit.writes().tables().contains_key(&table()));
+        let duplicate = resolve(3, command.clone()).await;
+        assert_eq!(private_replay_original(duplicate.result().error().unwrap()).unwrap(), Some(first.result().tx_key()));
+        assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    }
+}
 
 #[tokio::test]
 async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
@@ -47,6 +154,8 @@ async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
             assert_eq!(self.0.used_bytes(), baseline);
 
             transaction.append(table(), rtdb_format::data::StoredEvent {
+                commit_position: 0,
+                entity_key: None,
                 iid: Value::I64(1).entity_id()?.iid(), system_from: transaction.tx_key().system_time,
                 valid_time: Interval::ALL, operation: StoredOperation::Put(document(7)), recency: None,
             })?;
@@ -115,7 +224,7 @@ async fn replayed_unsigned_argument_payloads_bind_signed_and_keep_source_bytes()
     assert_eq!(document["v"], Value::I64(1));
     let body = resolved.to_replica_body(&context.memory).unwrap();
     let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
-    let (replica, _) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+    let ReplayedTransaction { writes: replica, .. } = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
     assert_eq!(replica.tables()[&table()].batch().unwrap().view().read_event(0).unwrap().operation, StoredOperation::Put(document));
 }
 
@@ -129,7 +238,7 @@ async fn transaction_trace_contains_one_sql_span_per_operation_and_skipped_zero_
     let arguments = SqlArguments::from_rows(vec![vec![Value::Bool(true)], vec![Value::Bool(true)]], &context.memory).unwrap();
     let request = request(vec![TxOp::Sql { sql: "ASSERT ?".into(), args: Some(arguments) }], &context);
     assert!(resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request, &context).await.unwrap().result().committed());
-    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), &context).unwrap();
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).unwrap();
     tracer.close();
     let mut spans = Vec::new(); while let Some(span) = receiver.next().await { spans.push(span); }
     assert_eq!(spans.len(), 3);
@@ -153,7 +262,7 @@ async fn ingestion_metrics_count_abort_and_invalid_time_but_exclude_skipped_tran
     let metrics = Arc::new(Metrics::default()); let mut context = context(); context.execution_observer = Some(metrics.clone());
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql("ASSERT FALSE")], &context), &context).await.unwrap();
-    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), &context).unwrap();
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).unwrap();
     let request = SourceTransaction::new(vec![], SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() }, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(102), request, &context).await.unwrap();
     assert_eq!(metrics.0.load(std::sync::atomic::Ordering::Relaxed), 2);
@@ -191,7 +300,7 @@ async fn skipped_transaction_stages_only_its_aborted_row_and_smooths_time() {
     let context = context();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 9, 0, i64::MAX)], &context), &context).await.unwrap();
-    let skipped = resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(50), &context).unwrap();
+    let skipped = resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(50), None, &context).unwrap();
     assert_eq!(skipped.result().error().unwrap().code, "xtdb/skipped-tx");
     assert_eq!(skipped.result().tx_key().system_time, Timestamp(101));
     assert_eq!(skipped.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
@@ -221,6 +330,220 @@ async fn staged_txs_read_your_writes_across_a_batch_and_each_argument_row() {
     assert_eq!(resolver.take_head().unwrap().result().tx_key(), first.result().tx_key());
     state.apply(first.writes()).unwrap();
     assert_eq!(resolver.resolving_snapshot(state.value().snapshot()).unwrap().tx_basis(), Some(second.result().tx_key()));
+}
+
+#[tokio::test]
+async fn create_only_insert_checks_staged_intervals_and_replays_atomic_outcomes() {
+    use rtdb_format::envelope::{ReplicaBody, SourceMessage};
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let insert = |id, from, to| TxOp::InsertDocs {
+        table: table(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id)),
+            ("_valid_from".into(), Value::Null),
+        ])], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(from)),
+        valid_to: Some(Timestamp(to)),
+    };
+    let logged = |operations| {
+        let bytes = request(operations, &context).encode().unwrap();
+        let message = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+
+    let first = resolver.resolve_source(
+        state.snapshot(), SourcePosition(0), Timestamp(100), logged(vec![insert(1, 10, 20)]), &context,
+    ).await.unwrap();
+    assert!(first.result().committed());
+    let adjacent = resolver.resolve_source(
+        state.snapshot(), SourcePosition(1), Timestamp(101), logged(vec![insert(1, 20, 30)]), &context,
+    ).await.unwrap();
+    assert!(adjacent.result().committed());
+    let overlapping = resolver.resolve_source(
+        state.snapshot(), SourcePosition(2), Timestamp(102), logged(vec![insert(2, 10, 20), insert(1, 19, 21)]), &context,
+    ).await.unwrap();
+    assert_eq!(overlapping.result().error().unwrap().code, "rtdb.tx/exists");
+    assert!(!overlapping.writes().tables().contains_key(&table()));
+
+    let intra_transaction = resolver.resolve_source(
+        state.snapshot(), SourcePosition(3), Timestamp(103), logged(vec![insert(3, 10, 20), insert(3, 11, 12)]), &context,
+    ).await.unwrap();
+    assert_eq!(intra_transaction.result().error().unwrap().code, "rtdb.tx/exists");
+    assert!(!intra_transaction.writes().tables().contains_key(&table()));
+
+    let same_operation = TxOp::InsertDocs {
+        table: table(),
+        documents: Documents::new(vec![document(4), document(4)], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(10)),
+        valid_to: Some(Timestamp(20)),
+    };
+    let intra_batch = resolver.resolve_source(
+        state.snapshot(), SourcePosition(4), Timestamp(104), logged(vec![same_operation]), &context,
+    ).await.unwrap();
+    assert_eq!(intra_batch.result().error().unwrap().code, "rtdb.tx/exists");
+    assert!(!intra_batch.writes().tables().contains_key(&table()));
+
+    let follower = PartitionState::empty(Default::default()).unwrap();
+    for resolved in [first, adjacent, overlapping, intra_transaction, intra_batch] {
+        let body = resolved.to_replica_body(&context.memory).unwrap();
+        let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("expected resolved payload"); };
+        let snapshot = follower.snapshot();
+        let replayed = decode_replica(body, snapshot.tx_basis(), snapshot.block_index(), &context.memory).unwrap();
+        assert_eq!(&replayed.result, resolved.result());
+        follower.apply(&replayed.writes).unwrap();
+    }
+    let snapshot = follower.snapshot();
+    let events = snapshot.segments(&table()).iter().flat_map(|segment| segment.batches()).map(|batch| batch.len()).sum::<usize>();
+    assert_eq!(events, 2);
+}
+
+#[tokio::test]
+async fn owned_insert_owner_and_policy_survive_source_and_replica_decoding() {
+    use rtdb_format::envelope::{ReplicaBody, SourceMessage};
+    use rtdb_types::OwnedRelation;
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let relation = OwnedRelation::new("orders").unwrap();
+    let operation = TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![document(7)], &context.memory).unwrap(),
+        valid_from: None,
+        valid_to: None,
+    };
+    let source = SourceTransaction::new(
+        vec![operation],
+        SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() },
+        &context.memory,
+    ).unwrap();
+    let bytes = source.encode().unwrap();
+    let message = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap();
+    let request = SourceTransaction::decode(&message, &context.memory).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let snapshot = state.snapshot();
+    let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(0), Timestamp(100), request, &context).await.unwrap();
+    assert!(resolved.result().committed());
+    let physical = relation.table("owner");
+    assert!(resolved.writes().tables().contains_key(&physical));
+    assert!(!resolved.writes().tables().contains_key(&relation.table("another-owner")));
+
+    let encoded = resolved.to_replica_body(&context.memory).unwrap();
+    let ReplicaBody::ResolvedTx(body) = encoded.body() else { panic!("expected resolved payload"); };
+    let decoded = decode_replica(body, None, snapshot.block_index(), &context.memory).unwrap();
+    assert!(decoded.writes.tables().contains_key(&physical));
+    let mut unknown = body.clone();
+    let data = unknown.table_data.remove(&physical.schema_and_table()).unwrap();
+    unknown.table_data.insert(format!("rtdb_owned_v2/{}", physical.table), data);
+    let error = decode_replica(&unknown, None, snapshot.block_index(), &context.memory).err().unwrap();
+    assert_eq!(error.code, "rtdb.tx/invalid-replica-transaction");
+}
+
+#[tokio::test]
+async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let relation = OwnedRelation::new("commits").unwrap();
+    let id = EntityId::Integer(1);
+    let documents = || Documents::new(vec![document(7)], &context.memory).unwrap();
+    let source = |operations| {
+        let source = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let bytes = source.encode().unwrap();
+        let message = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let create = TxOp::OwnedInsertDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
+    let replace = || TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
+    let delete = || TxOp::OwnedDelete { relation: relation.clone(), id: id.clone(), valid_from: Some(Timestamp(0)), valid_to: None };
+    let check = |id, expected| TxOp::OwnedCheck { relation: relation.clone(), id, valid_at: Timestamp(10), expected };
+    let first = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![create]), &context).await.unwrap();
+    assert!(first.result().committed());
+    let first_revision = first.result().tx_key().system_time;
+
+    let expired = resolver.resolve_source(
+        state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![replace(), TxOp::owned_deadline(Timestamp(101))]), &context,
+    ).await.unwrap();
+    assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/expired");
+
+    let replaced = resolver.resolve_source(
+        state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![replace(), check(id.clone(), Some(first_revision)), TxOp::owned_deadline(Timestamp(110))]), &context,
+    ).await.unwrap();
+    assert!(replaced.result().committed());
+    let replacement_revision = replaced.result().tx_key().system_time;
+
+    let stale = resolver.resolve_source(
+        state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![delete(), check(id.clone(), Some(first_revision))]), &context,
+    ).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-point");
+    assert!(!stale.writes().tables().contains_key(&relation.table("owner")));
+
+    let alias = EntityId::Uuid(id.iid().0);
+    let mut alias_document = document(8);
+    alias_document.insert("_id".into(), alias.as_value());
+    let insert_alias = TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![alias_document], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(0)), valid_to: None,
+    };
+    let collision = resolver.resolve_source(
+        state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![check(alias.clone(), None), insert_alias]), &context,
+    ).await.unwrap();
+    assert!(collision.result().committed(), "the exact absence admits a distinct key at the same IID");
+    let alias_revision = collision.result().tx_key().system_time;
+
+    let deleted = resolver.resolve_source(
+        state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![delete(), check(id.clone(), Some(replacement_revision))]), &context,
+    ).await.unwrap();
+    assert!(deleted.result().committed());
+    let absent = resolver.resolve_source(
+        state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![check(id, None), check(alias, Some(alias_revision))]), &context,
+    ).await.unwrap();
+    assert!(absent.result().committed());
+}
+
+#[tokio::test]
+async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let captured = state.value().snapshot();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(captured.clone(), SourcePosition(0), Timestamp(100),
+        request(vec![put(&context, 10, 0, i64::MAX)], &context), &context).await.unwrap();
+    let second = resolver.resolve_source(captured.clone(), SourcePosition(1), Timestamp(101),
+        request(vec![put(&context, 20, 0, i64::MAX)], &context), &context).await.unwrap();
+
+    let reversed = [Arc::clone(second.writes()), Arc::clone(first.writes())];
+    assert!(matches!(captured.with_staged(&reversed), Err(error) if error.code == "rtdb.index/overlay-order"));
+    let wrong_block = rtdb_types::BlockIndex(captured.block_index().0 + 1);
+    let wrong = rtdb_index::StagedWrite::new(first.result().tx_key(), None, wrong_block, first.writes().tables().clone()).unwrap();
+    assert!(matches!(captured.with_staged(&[Arc::new(wrong)]), Err(error) if error.code == "rtdb.index/overlay-order"));
+
+    let before_apply = resolver.resolving_snapshot(captured.clone()).unwrap();
+    assert_eq!(before_apply.tx_basis(), Some(second.result().tx_key()));
+    assert_eq!(before_apply.iter_segments(&table()).count(), 2);
+    assert_eq!(captured.tx_basis(), None);
+    assert!(!captured.contains_table(&table()));
+
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let after_apply = resolver.resolving_snapshot(state.value().snapshot()).unwrap();
+    assert_eq!(after_apply.tx_basis(), before_apply.tx_basis());
+    assert_eq!(after_apply.iter_segments(&table()).count(), 2);
+    assert_eq!(state.value().snapshot().tx_basis(), Some(first.result().tx_key()));
+    assert!(!captured.contains_table(&table()));
 }
 
 #[tokio::test]
@@ -273,7 +596,7 @@ async fn staged_empty_create_table_visible_across_a_batch_5507() {
     assert!(!next.writes().tables().contains_key(&TableRef::new("public", "untouched")));
     let body = declared.to_replica_body(&context.memory).unwrap();
     let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
-    let (decoded, result) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+    let ReplayedTransaction { writes: decoded, result, .. } = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
     assert_eq!(&result, declared.result());
     assert_eq!(decoded.tables()[&empty].column_types(), declared.writes().tables()[&empty].column_types());
 }
@@ -331,7 +654,7 @@ async fn raw_decimal_cells_survive_source_replay_resolution_sum_and_replica_stag
         assert_eq!(document["v"], Value::Decimal(DecimalValue::new(36i128.to_be_bytes().to_vec(), precision, 129, 128).unwrap()));
         let body = resolved.to_replica_body(&context.memory).unwrap();
         let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
-        let (replica, result) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+        let ReplayedTransaction { writes: replica, result, .. } = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
         assert_eq!(&result, resolved.result());
         for table in [table(), sums] {
             let expected = resolved.writes().tables()[&table].batch().unwrap();
@@ -379,4 +702,416 @@ async fn resolved_series_dml_uses_the_resolving_nodes_endpoint_policy() {
         let StoredOperation::Put(document) = batch.view().read_event(0).unwrap().operation else { panic!("put") };
         assert_eq!(document["v"],Value::list((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
     }
+}
+
+#[tokio::test]
+async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_clock() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let at = |time| SourceTransaction::new(vec![put(&context, 3, 0, i64::MAX)], SubmitOptions { system_time: Some(Timestamp(time)), ..Default::default() }, &context.memory).unwrap();
+
+    for (position, requested) in [(0, 101), (1, i64::MAX)] {
+        let refused = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(100), at(requested), &context).await.unwrap();
+        assert_eq!(refused.result().error().unwrap().code, "rtdb/future-system-time");
+        assert!(refused.result().tx_key().system_time.0 <= 101, "a refused time never becomes the head");
+        assert_eq!(refused.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    }
+    let at_log = resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(200), at(200), &context).await.unwrap();
+    assert!(at_log.result().committed());
+    assert_eq!(at_log.result().tx_key().system_time, Timestamp(200));
+    let next = resolver.resolve_source(state.value().snapshot(), SourcePosition(3), Timestamp(300), request(vec![], &context), &context).await.unwrap();
+    assert_eq!(next.result().tx_key().system_time, Timestamp(300), "automatic time follows the log once no client time leads it");
+}
+
+#[tokio::test]
+async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_window() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let keyed = |user: &str, id: i64| {
+        let metadata = UserMetadata::new(Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8("order-1".into()))])), &context.memory).unwrap();
+        SourceTransaction::new(vec![put(&context, id, 0, i64::MAX)], SubmitOptions { user: Some(user.into()), user_metadata: Some(metadata), ..Default::default() }, &context.memory).unwrap()
+    };
+    let mut position = 0;
+    let mut resolve = async |request: SourceTransaction, log_time: i64| {
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(log_time), request, &context).await.unwrap();
+        position += 1;
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+        resolved
+    };
+
+    assert!(resolve(request(vec![], &context), 100).await.result().committed());
+    let original = resolve(keyed("alice", 1), 100).await;
+    assert!(original.result().committed());
+    assert_eq!(original.result().tx_key().system_time, Timestamp(101));
+    let duplicate = resolve(keyed("alice", 1), 100).await;
+    let error = duplicate.result().error().unwrap();
+    assert_eq!(error.code, "rtdb/idempotency-duplicate");
+    assert_eq!(error.context["original-tx-id"], original.result().tx_key().tx_id.0);
+    assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")], "a duplicate writes nothing but its own outcome");
+    let conflict = resolve(keyed("alice", 2), 300).await;
+    assert_eq!(conflict.result().error().unwrap().code, "rtdb/idempotency-conflict");
+    assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
+    let regressed = resolve(keyed("alice", 1), 99).await;
+    assert_eq!(regressed.result().error().unwrap().code, "rtdb/idempotency-duplicate");
+    let after = resolve(keyed("alice", 3), 100 + RECEIPT_WINDOW_MICROS).await;
+    assert!(after.result().committed(), "the identity is free again once the window has passed");
+    let retried_after_regression = resolve(keyed("alice", 3), 99).await;
+    let error = retried_after_regression.result().error().unwrap();
+    assert_eq!(error.code, "rtdb/idempotency-duplicate");
+    assert_eq!(error.context["original-tx-id"], after.result().tx_key().tx_id.0);
+}
+
+#[tokio::test]
+async fn external_event_writer_cannot_erase_private_replay_markers() {
+    struct ExternalWriter;
+
+    #[async_trait::async_trait]
+    impl TransactionWriter for ExternalWriter {
+        async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+            let error = transaction.append(TableRef::new("xt", "rtdb_replay_keys"), rtdb_format::data::StoredEvent {
+                commit_position: 0,
+                entity_key: None,
+                iid: Value::Utf8("00112233445566778899aabbccddeeff/0".into()).entity_id()?.iid(),
+                system_from: transaction.tx_key().system_time,
+                valid_time: Interval::ALL,
+                operation: StoredOperation::Erase,
+                recency: None,
+            }).unwrap_err();
+            Ok(WriterResult::Aborted { error, user_metadata: None })
+        }
+    }
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let resolved = resolver.resolve_external(state.value().snapshot(), Timestamp(100), None, None, &mut ExternalWriter, &context).await.unwrap();
+    assert_eq!(resolved.result().error().unwrap().code, "xtdb/forbidden-table");
+    assert!(!resolved.writes().tables().contains_key(&TableRef::new("xt", "rtdb_replay_keys")));
+}
+
+#[tokio::test]
+async fn declared_owned_schema_distinguishes_omission_and_null_after_source_decode() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{OwnedRelation, OwnedSchema};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let relation = OwnedRelation::new("typed-orders").unwrap();
+    let schema = OwnedSchema::from_json(br#"{"fields":[
+        {"name":"amount","type":{"kind":"i64"},"optional":true,"nullable":false}
+    ]}"#).unwrap();
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let documents = |value| {
+        let mut row = StructFields::from([("_id".into(), Value::I64(1))]);
+        if let Some(value) = value { row.insert("amount".into(), value); }
+        Documents::new(vec![row], &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let declare = TxOp::OwnedDeclareRelation { relation: relation.clone(), schema };
+    let declared = resolver.resolve_source(
+        state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![declare]), &context,
+    ).await.unwrap();
+    assert!(declared.result().committed());
+    assert!(declared.writes().tables().contains_key(&OwnedRelation::relation_catalog("owner")));
+
+    let create = TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: documents(None), valid_from: None, valid_to: None,
+    };
+    let created = resolver.resolve_source(
+        state.snapshot(), SourcePosition(1), Timestamp(101), source(vec![create]), &context,
+    ).await.unwrap();
+    assert!(created.result().committed());
+
+    let replace = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: documents(Some(Value::Null)), valid_from: None, valid_to: None,
+    };
+    let refused = resolver.resolve_source(
+        state.snapshot(), SourcePosition(2), Timestamp(102), source(vec![replace]), &context,
+    ).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/nonconforming");
+    assert!(!refused.writes().tables().contains_key(&relation.table("owner")));
+}
+
+#[tokio::test]
+async fn world_mutations_refuse_source_operations_without_held_admission() {
+    use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, TransactionKey, TxId, WorldSchemas, WorldShadow};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let world = OwnedWorld {
+        ancestor: None,
+        id: Iid([8; 16]), pin: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
+        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) },
+        parent_publication: None, mode: rtdb_types::WorldClockMode::Held { start: Timestamp(10) },
+        until: Timestamp(200), schemas: WorldSchemas::new(Default::default()).unwrap(), dropped: false,
+    };
+    let catalog = OwnedRelation::world_catalog();
+    let overlay = OwnedRelation::new("orders").unwrap().in_world(world.id).unwrap();
+    let root = TxOp::OwnedInsertDocs {
+        relation: catalog, documents: Documents::new(vec![world.record()], &context.memory).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let write = TxOp::OwnedReplaceDocs {
+        relation: overlay, documents: Documents::new(
+            vec![WorldShadow::Deleted.record(&EntityId::Integer(1)).unwrap()], &context.memory,
+        ).unwrap(),
+        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    for (position, operation) in [root, write].into_iter().enumerate() {
+        let source = SourceTransaction::new(
+            vec![operation], SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let refused = resolver.resolve_source(
+            state.snapshot(), SourcePosition(position as i64), Timestamp(100 + position as i64), source, &context,
+        ).await.unwrap();
+        assert_eq!(refused.result().error().unwrap().code, "rtdb.world/unavailable");
+    }
+}
+
+#[tokio::test]
+async fn owned_range_witness_checks_only_its_relation_before_mutation() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{OwnedRelation, PlacedAttemptScope};
+
+    let mut context = context();
+    let scope = PlacedAttemptScope::new("installed-replica", 1).unwrap();
+    context.owned_witness_scope = Some(scope);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let watched = OwnedRelation::new("watched").unwrap();
+    let other = OwnedRelation::new("other").unwrap();
+    let put = |relation: &OwnedRelation| TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: Documents::new(vec![document(7)], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(400)), valid_to: Some(Timestamp(500)),
+    };
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap().with_placed_seed(Some(scope.issue()));
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(vec![put(&watched)]), &context).await.unwrap();
+    assert!(initial.result().committed());
+    let check = |witness_scope, until| TxOp::OwnedCheckRange {
+        relation: watched.clone(), basis: initial.result().tx_key(), scope: witness_scope, frontier: 1, until: Timestamp(until),
+        fixed: None,
+    };
+    let unrelated = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![put(&other)]), &context).await.unwrap();
+    assert!(unrelated.result().committed());
+    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![put(&other), check(scope, 200)]), &context).await.unwrap();
+    assert!(accepted.result().committed());
+
+    let wrong_scope = PlacedAttemptScope::new("another-replica", 1).unwrap();
+    let moved = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![check(wrong_scope, 200)]), &context).await.unwrap();
+    assert_eq!(moved.result().error().unwrap().code, "rtdb.owned/range-witness-unavailable");
+    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![check(scope, 104)]), &context).await.unwrap();
+    assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/range-witness-unavailable");
+
+    let correction = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![put(&watched)]), &context).await.unwrap();
+    assert!(correction.result().committed());
+    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![put(&other), check(scope, 200)]), &context).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-range");
+    assert!(!stale.writes().tables().contains_key(&other.table("owner")));
+}
+
+#[tokio::test]
+async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{FixedRangeEvidence, FixedRangeKey, FixedRangeRule, OwnedRelation, OwnedSchema, PlacedAttemptScope};
+
+    let mut context = context();
+    let scope = PlacedAttemptScope::new("installed-replica", 1).unwrap();
+    context.owned_witness_scope = Some(scope);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let relation = OwnedRelation::new("fixed").unwrap();
+    let rule = FixedRangeRule { path: "by-key".into(), column: "key".into(), valid_at: Timestamp(450) };
+    let schema = OwnedSchema::from_json(br#"{"fields":[{"name":"key","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#).unwrap();
+    let put = |id: &str, key, from, to| TxOp::OwnedReplaceDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::Utf8(id.into())), ("key".into(), Value::Binary(vec![key])),
+        ])], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)),
+    };
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap().with_placed_seed(Some(scope.issue()));
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![
+        TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
+        TxOp::OwnedDeclareFixedRange { relation: relation.clone(), rule: rule.clone() },
+        put("middle", 5, 400, 500),
+    ]), &context).await.unwrap();
+    assert!(initial.result().committed(), "{:?}", initial.result().error());
+
+    let lower = FixedRangeKey::from_bound(&StructFields::from([
+        ("key".into(), Value::Binary(vec![5])), ("_id".into(), Value::Utf8("a".into())),
+    ]), "key").unwrap();
+    let upper = FixedRangeKey::from_bound(&StructFields::from([
+        ("key".into(), Value::Binary(vec![5])), ("_id".into(), Value::Utf8("z".into())),
+    ]), "key").unwrap();
+    let check = |basis, frontier, revision| TxOp::OwnedCheckRange {
+        relation: relation.clone(), basis, scope, frontier, until: Timestamp(200),
+        fixed: Some(Arc::new(FixedRangeEvidence { rule: rule.clone(), revision, lower: Some(lower.clone()), upper: Some(upper.clone()) })),
+    };
+    let other = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![put("zz", 5, 400, 500), put("middle", 8, 500, 550)]), &context).await.unwrap();
+    assert!(other.result().committed());
+    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![check(initial.result().tx_key(), 1, 1)]), &context).await.unwrap();
+    assert!(accepted.result().committed(), "{:?}", accepted.result().error());
+
+    let leave = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![TxOp::OwnedDelete {
+            relation: relation.clone(), id: rtdb_types::EntityId::String("middle".into()),
+            valid_from: Some(Timestamp(425)), valid_to: Some(Timestamp(475)),
+        }]), &context).await.unwrap();
+    assert!(leave.result().committed());
+    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![check(initial.result().tx_key(), 1, 1)]), &context).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-range");
+
+    let enter = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![put("new", 5, 400, 500)]), &context).await.unwrap();
+    assert!(enter.result().committed());
+    let stale_empty = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![check(leave.result().tx_key(), 4, 3)]), &context).await.unwrap();
+    assert_eq!(stale_empty.result().error().unwrap().code, "rtdb.owned/stale-range");
+}
+
+#[tokio::test]
+async fn hosted_control_replacement_and_owned_facts_abort_together() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{OwnedRelation, PlacedAttemptScope};
+
+    let mut context = context();
+    let scope = PlacedAttemptScope::new("installed-replica", 1).unwrap();
+    context.owned_witness_scope = Some(scope);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let facts = OwnedRelation::new("facts").unwrap();
+    let control = OwnedRelation::new("bj_control").unwrap();
+    let table = rtdb_types::TableRef::new("public", control.name());
+    let control_row = |n| StructFields::from([
+        ("_id".into(), Value::Utf8("head".into())), ("n".into(), Value::I64(n)),
+    ]);
+    let native_fact = || TxOp::OwnedInsertDocs {
+        relation: facts.clone(), documents: Documents::new(vec![document(7)], &context.memory).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let replacement = |expected, n| TxOp::HostedControl(rtdb_tx::HostedControlWrite::new(
+        control.clone(), scope, Some(Timestamp(expected)), control_row(n),
+    ).unwrap());
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap().with_placed_seed(Some(scope.issue()));
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(vec![TxOp::PutDocs {
+            table: table.clone(), documents: Documents::new(vec![control_row(1)], &context.memory).unwrap(),
+            valid_from: Some(Timestamp(0)), valid_to: None,
+        }]), &context).await.unwrap();
+    assert!(initial.result().committed());
+    let deadline = || TxOp::owned_deadline(Timestamp(200));
+    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![deadline(), replacement(99, 2), native_fact()]), &context).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.hosted/stale-control");
+    assert!(!stale.writes().tables().contains_key(&facts.table("owner")));
+
+    let check = |expected| TxOp::HostedControl(rtdb_tx::HostedControlWrite::check(
+        control.clone(), scope, Some(Timestamp(expected)),
+        StructFields::from([("_id".into(), Value::Utf8("head".into()))]),
+    ).unwrap());
+    let verified = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![deadline(), check(100)]), &context).await.unwrap();
+    assert!(verified.result().committed(), "{:?}", verified.result().error());
+    assert!(!verified.writes().tables().contains_key(&table));
+    let changed = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![deadline(), check(101), native_fact()]), &context).await.unwrap();
+    assert_eq!(changed.result().error().unwrap().code, "rtdb.hosted/stale-control");
+    assert!(!changed.writes().tables().contains_key(&facts.table("owner")));
+
+    let staging_deadline = || TxOp::OwnedDeadline { until: Timestamp(200), recheck_at_staging: true };
+    let apply_staged = |resolver: &mut TxResolver| {
+        while let Some(staged) = resolver.take_head() { state.apply(staged.writes()).unwrap(); }
+    };
+    apply_staged(&mut resolver);
+    let expired = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        Some(WriterPublication { clock: &|| Timestamp(199), maximum_inline_bytes: Some(1 << 20) }),
+    ).await.unwrap();
+    assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/expired");
+    assert!(expired.placed_attempt().is_some());
+    assert!(!expired.writes().tables().contains_key(&table));
+    assert!(!expired.writes().tables().contains_key(&facts.table("owner")));
+
+    apply_staged(&mut resolver);
+    let oversized = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(100) }),
+    ).await.unwrap();
+    assert_eq!(oversized.result().error().unwrap().code, "rtdb.owned/replica-inline-bound");
+    assert!(oversized.placed_attempt().is_some());
+    assert!(!oversized.writes().tables().contains_key(&table));
+    assert!(!oversized.writes().tables().contains_key(&facts.table("owner")));
+
+    apply_staged(&mut resolver);
+    let accepted = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(1 << 20) }),
+    ).await.unwrap();
+    assert!(accepted.result().committed(), "{:?}", accepted.result().error());
+    assert!(accepted.writes().tables().contains_key(&table));
+    assert!(accepted.writes().tables().contains_key(&facts.table("owner")));
+    assert_eq!(accepted.staging_clock_upper(), Some(Timestamp(199)));
+    let Some(rtdb_format::envelope::ReplicaBody::ResolvedTx(message)) = accepted.inline_replica_body() else { panic!("expected an inline replica transaction"); };
+    let stage = message.checked_acceptance_stage().unwrap().unwrap();
+    assert_eq!(stage.clock_upper, Timestamp(199));
+    assert_eq!(stage.cutoff, Timestamp(200));
+    let replayed = rtdb_tx::decode_replica(message, Some(oversized.result().tx_key()), accepted.writes().block_index(), &context.memory).unwrap();
+    assert!(replayed.writes.tables().contains_key(&table));
+    assert!(replayed.writes.tables().contains_key(&facts.table("owner")));
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
+        source(vec![deadline(), replacement(106, 3), native_fact()]), &context).await.unwrap();
+    assert!(!refused.result().committed());
+    assert!(!refused.writes().tables().contains_key(&table));
+
+    let malformed = resolver.resolve_source(state.snapshot(), SourcePosition(8), Timestamp(108),
+        source(vec![TxOp::PutDocs {
+            table: table.clone(), documents: Documents::new(vec![control_row(4)], &context.memory).unwrap(),
+            valid_from: Some(Timestamp(12)), valid_to: None,
+        }]), &context).await.unwrap();
+    assert!(malformed.result().committed());
+    let refused_slice = resolver.resolve_source(state.snapshot(), SourcePosition(9), Timestamp(109),
+        source(vec![deadline(), check(108)]), &context).await.unwrap();
+    assert_eq!(refused_slice.result().error().unwrap().code, "rtdb.hosted/control-scope");
+    assert!(!refused_slice.writes().tables().contains_key(&table));
 }

@@ -3,9 +3,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, LogicalType, Result, TableRef, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, Result, TableRef, Timestamp, TransactionKey};
 
 use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
+
+#[derive(Clone)]
+struct CatalogRead { _permit: Arc<dyn Send + Sync> }
+
+impl std::fmt::Debug for CatalogRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CatalogRead").finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -15,11 +24,29 @@ pub struct Snapshot {
     layered: BTreeMap<TableRef, Vec<Arc<LiveTable>>>,
     basis: Option<TransactionKey>,
     system_time_cap: Option<Timestamp>,
+    catalog_cut: Option<CatalogCut>,
+    catalog_read: Option<CatalogRead>,
 }
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
-        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new() }
+        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None }
+    }
+    pub(crate) fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
+        self.catalog_cut = catalog_cut;
+        self
+    }
+    /// Returns the conservative installed prefix captured with this physical catalog.
+    /// Callers must also bind the opened database and residence before comparing cuts across nodes.
+    pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
+    /// Transfers the store's captured catalog registration into this snapshot and its clones.
+    pub fn with_catalog_read(mut self, permit: Arc<dyn Send + Sync>) -> Self {
+        self.catalog_read = Some(CatalogRead { _permit: permit });
+        self
+    }
+    /// Clones the storage registration that was attached when the catalog was captured.
+    pub fn catalog_read_permit(&self) -> Option<Arc<dyn Send + Sync>> {
+        self.catalog_read.as_ref().map(|read| Arc::clone(&read._permit))
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
     /// Whether a transaction's own uncommitted writes are layered over this snapshot.
@@ -84,6 +111,18 @@ impl Snapshot {
         let applied = self.durable.tables().get(table)
             .filter(|segment| segment.block_index() > self.trie_catalog.l0_max_block_index(table));
         overlays.chain(applied)
+    }
+
+    /// Counts all events admitted for this relation, including live and staged
+    /// events. A flush transfers those events into the catalog's cumulative count.
+    pub fn relation_event_frontier(&self, table: &TableRef) -> Result<i64> {
+        let durable = self.table_catalog.metadata(table).map_or(0, |metadata| metadata.row_count);
+        if durable < 0 { return Err(Anomaly::fault("rtdb.index/relation-frontier", "Invalid durable relation event frontier")); }
+        self.iter_segments(table).try_fold(durable, |count, segment| {
+            count.checked_add(i64::from(segment.row_count())).ok_or_else(|| {
+                Anomaly::fault("rtdb.index/relation-frontier", "Relation event frontier overflow")
+            })
+        })
     }
 
     /// Newer delta segments precede older ones, preserving operation order at equal system times.

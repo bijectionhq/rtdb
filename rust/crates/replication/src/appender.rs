@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -11,15 +11,21 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, ReplicaMetadata, ReplicationClock, progress::term_ended};
+use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
 pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>), Message(ReplicaBody) }
 #[derive(Clone, Debug)]
-pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Replica(ReplicaPosition) }
+pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Control, TrieRemoval(ReplicaPosition) }
+
+pub(crate) struct AppendStamp {
+    pub sequence: TermSequence,
+    pub fingerprint: Option<ReplicaFingerprint>,
+}
 
 pub(crate) struct PendingWrite {
     pub body: WriteBody,
     pub block: BlockIndex,
-    sequence: AtomicI64,
+    append: OnceLock<AppendStamp>,
     completion: Mutex<Option<oneshot::Sender<Result<Applied>>>>,
     _reservation: Arc<MemoryReservation>,
 }
@@ -37,9 +43,15 @@ impl PendingWrite {
             .ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))
     }
     fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
-        Arc::new(Self { body, block, sequence: AtomicI64::new(-1), completion: Mutex::new(completion), _reservation: reservation })
+        Arc::new(Self { body, block, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
     }
-    pub fn sequence(&self) -> Option<TermSequence> { let value = self.sequence.load(Ordering::Acquire); (value >= 0).then_some(TermSequence(value)) }
+    pub fn append_stamp(&self) -> Option<&AppendStamp> { self.append.get() }
+    pub fn sequence(&self) -> Option<TermSequence> { self.append_stamp().map(|stamp| stamp.sequence) }
+    fn stamp_append(&self, sequence: TermSequence, frame: &[u8]) -> Result<()> {
+        let fingerprint = matches!(&self.body, WriteBody::Resolved(_)).then(|| fingerprint(frame));
+        self.append.set(AppendStamp { sequence, fingerprint })
+            .map_err(|_| Anomaly::fault("rtdb.replication/invalid-transition", "Pending replica write was submitted twice"))
+    }
     pub fn finish(&self, result: Result<Applied>) { if let Some(completion) = self.completion.lock().take() { let _ = completion.send(result); } }
 }
 impl Drop for PendingWrite { fn drop(&mut self) { if let Some(completion) = self.completion.get_mut().take() { let _ = completion.send(Err(term_ended())); } } }
@@ -63,13 +75,60 @@ pub(crate) struct ReplicaAppender {
     logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, sequence: TermSequence,
     queue: mpsc::UnboundedReceiver<AppendRequest>, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock,
     heartbeat: bool,
+    durable_commit_observer: Option<DurableCommitObserver>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitLagBasis { Ordered, Staged }
+
+type DurableCommitObserver = Arc<dyn Fn(CommitLagBasis, Option<Duration>) + Send + Sync>;
+
+struct DurableCommitObservation {
+    ordered_at: Timestamp,
+    staging_clock_upper: Option<Timestamp>,
+    clock: ReplicationClock,
+    observer: DurableCommitObserver,
+}
+
+impl DurableCommitObservation {
+    fn record(self) {
+        let observed = (self.clock)();
+        let observed_upper = observed.0.checked_add(1);
+        let lag_since = |start: Timestamp| observed_upper
+            .and_then(|upper| upper.checked_sub(start.0))
+            .filter(|micros| *micros >= 0)
+            .and_then(|micros| micros.checked_mul(1_000))
+            .map(|nanos| Duration::from_nanos(nanos as u64));
+        // An ordered timestamp can lead this wall clock. The stage sample already
+        // includes rounding, so it can equal the observation's upper tick.
+        let ordered = if observed < self.ordered_at { None } else { lag_since(self.ordered_at) };
+        (self.observer)(CommitLagBasis::Ordered, ordered);
+        if let Some(staged) = self.staging_clock_upper {
+            (self.observer)(CommitLagBasis::Staged, lag_since(staged));
+        }
+    }
+}
+
 impl ReplicaAppender {
     pub fn new(logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock) -> (AppenderHandle, Self) {
         let (sender, queue) = mpsc::unbounded_channel();
-        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true })
+        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true, durable_commit_observer: None })
     }
     pub fn with_heartbeat(mut self, heartbeat: bool) -> Self { self.heartbeat = heartbeat; self }
+    pub fn with_durable_commit_observer(mut self, observer: impl Fn(CommitLagBasis, Option<Duration>) + Send + Sync + 'static) -> Self {
+        self.durable_commit_observer = Some(Arc::new(observer));
+        self
+    }
+    fn durable_commit_observation(&self, body: &WriteBody) -> Option<DurableCommitObservation> {
+        let observer = self.durable_commit_observer.as_ref()?;
+        let WriteBody::Resolved(tx) = body else { return None; };
+        (tx.result().committed() && tx.placed_attempt().is_some()).then(|| DurableCommitObservation {
+            ordered_at: tx.result().tx_key().system_time,
+            staging_clock_upper: tx.staging_clock_upper(),
+            clock: Arc::clone(&self.clock),
+            observer: Arc::clone(observer),
+        })
+    }
     pub async fn run(mut self, mut first: Option<Arc<PendingWrite>>) -> Result<()> {
         let mut timer = tokio::time::interval(self.assertion_interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -89,7 +148,7 @@ impl ReplicaAppender {
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
                     match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), (self.clock)()), &self.cancellation, &mut receipts).await {
-                        Ok(Some(receipt)) => receipts.push(track_receipt(receipt, None, None)),
+                        Ok(Some(receipt)) => receipts.push(track_receipt(receipt, None, None, None)),
                         Ok(None) => break Ok(()),
                         Err(error) => break Err(error),
                     }
@@ -103,17 +162,25 @@ impl ReplicaAppender {
                     let Some(request) = request else { break Ok(()); };
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
-                    request.write.sequence.store(sequence.0, Ordering::Release);
                     let resolved;
-                    let body = match &request.write.body {
-                        WriteBody::Resolved(tx) => match tx.to_replica_body(&self.memory) { Ok(body) => { resolved = body; resolved.body() }, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } },
-                        WriteBody::Message(body) => body,
+                    let (body, allow_offload) = match &request.write.body {
+                        WriteBody::Resolved(tx) => match tx.inline_replica_body() {
+                            Some(body) => (body, false),
+                            None => match tx.to_replica_body(&self.memory) {
+                                Ok(body) => { resolved = body; (resolved.body(), true) }
+                                Err(error) => { request.write.finish(Err(error.clone())); break Err(error); }
+                            },
+                        },
+                        WriteBody::Message(body) => (body, true),
                     };
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
-                    match observe_enqueue(self.logs.enqueue_replica(&envelope, request.write.block, (self.clock)()), &self.cancellation, &mut receipts).await {
-                        Ok(Some(receipt)) => { receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable)); timer.reset(); }
+                    let observation = self.durable_commit_observation(&request.write.body);
+                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, (self.clock)(), allow_offload,
+                        |frame| request.write.stamp_append(sequence, frame));
+                    match observe_enqueue(enqueue, &self.cancellation, &mut receipts).await {
+                        Ok(Some(receipt)) => { receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable, observation)); timer.reset(); }
                         Ok(None) => { request.write.finish(Err(term_ended())); if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); } break Ok(()); }
                         Err(error) => { request.write.finish(Err(error.clone())); if let Some(sender) = request.durable { let _ = sender.send(Err(error.clone())); } break Err(error); }
                     }
@@ -147,9 +214,10 @@ async fn observe_enqueue(
     }
 }
 
-fn track_receipt(receipt: crate::ReplicaReceipt, write: Option<Arc<PendingWrite>>, durable: Option<oneshot::Sender<Result<ReplicaMetadata>>>) -> futures::future::BoxFuture<'static, Result<()>> {
+fn track_receipt(receipt: crate::ReplicaReceipt, write: Option<Arc<PendingWrite>>, durable: Option<oneshot::Sender<Result<ReplicaMetadata>>>, observation: Option<DurableCommitObservation>) -> futures::future::BoxFuture<'static, Result<()>> {
     Box::pin(async move {
         let outcome = receipt.durable().await;
+        if outcome.is_ok() && let Some(observation) = observation { observation.record(); }
         if let Some(sender) = durable { let _ = sender.send(outcome.clone()); }
         if let Err(error) = &outcome { if let Some(write) = write { write.finish(Err(error.clone())); } }
         outcome.map(|_| ())
@@ -167,6 +235,7 @@ pub(crate) fn join_error(error: tokio::task::JoinError) -> Anomaly { Anomaly::fa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use async_trait::async_trait;
     use bytes::Bytes;
     use rtdb_storage::{MemoryStore, cache::BufferPool, log::{AppendReceipt, Log, LogOffset, LogRecord, LogTail, MemoryLog}};
@@ -210,6 +279,37 @@ mod tests {
         let (_handle, appender, _) = pump(Duration::from_millis(1));
         let error = tokio::time::timeout(Duration::from_secs(1), appender.run(None)).await.unwrap().unwrap_err();
         assert!(error.message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
+    }
+
+    #[tokio::test]
+    async fn durability_measurement_uses_the_ordered_stamp_and_excludes_failed_acknowledgements() {
+        let (_handle, appender, _) = pump(Duration::from_secs(60));
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        let receipt = appender.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(110)).await.unwrap();
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let observer: DurableCommitObserver = {
+            let samples = Arc::clone(&samples);
+            Arc::new(move |basis, lag| samples.lock().push((basis, lag)))
+        };
+        let observation = |ordered, staged: Option<i64>, observed| DurableCommitObservation {
+            ordered_at: Timestamp(ordered), staging_clock_upper: staged.map(Timestamp),
+            clock: Arc::new(move || Timestamp(observed)), observer: Arc::clone(&observer),
+        };
+        assert!(track_receipt(receipt, None, None, Some(observation(100, Some(115), 120))).await.is_err());
+        assert!(samples.lock().is_empty());
+        observation(100, Some(115), 120).record();
+        observation(100, Some(121), 120).record();
+        observation(100, Some(101), 99).record();
+        observation(100, None, 120).record();
+        assert_eq!(samples.lock().as_slice(), [
+            (CommitLagBasis::Ordered, Some(Duration::from_micros(21))),
+            (CommitLagBasis::Staged, Some(Duration::from_micros(6))),
+            (CommitLagBasis::Ordered, Some(Duration::from_micros(21))),
+            (CommitLagBasis::Staged, Some(Duration::ZERO)),
+            (CommitLagBasis::Ordered, None),
+            (CommitLagBasis::Staged, None),
+            (CommitLagBasis::Ordered, Some(Duration::from_micros(21))),
+        ]);
     }
 
     #[tokio::test]

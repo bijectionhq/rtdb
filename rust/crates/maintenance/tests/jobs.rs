@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use rtdb_format::keys::TrieKey;
 use rtdb_index::{CatalogTrie, TrieCatalog, TrieState};
 use rtdb_maintenance::{available_jobs, RecencyMode};
@@ -7,7 +8,7 @@ fn catalog(keys: &[(&str, i64)]) -> TrieCatalog {
     let table = TableRef::new("public", "foo");
     let mut catalog = TrieCatalog::new(16).unwrap();
     for (key, size) in keys {
-        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: *size, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(100)).unwrap();
+        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: *size, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(100)).unwrap();
     }
     catalog
 }
@@ -41,4 +42,17 @@ fn historical_leveling_fills_a_partial_or_waits_for_four_inputs() {
     let jobs = available_jobs(&catalog(&keys)).unwrap();
     assert_eq!(jobs[0].output.to_string(), "l02-r20200101-b02");
     assert_eq!(jobs[0].inputs, ["l02-r20200101-b01".parse::<TrieKey>().unwrap(), "l01-r20200101-b02".parse().unwrap()]);
+}
+
+#[test]
+fn outputs_are_named_in_the_catalogs_epoch_so_a_reset_never_reuses_a_name() {
+    let before = catalog(&[("l00-rc-b00", 10), ("l00-rc-b01", 10)]);
+    let table = TableRef::new("public", "foo");
+    let after = before.reset_to_l0(BTreeMap::from([(table.clone(), before.current_tries(&table).into_iter().cloned().collect())])).unwrap();
+    let planned = |catalog: &TrieCatalog| available_jobs(catalog).unwrap().into_iter().map(|job| job.output).collect::<Vec<_>>();
+    let (old, new) = (planned(&before), planned(&after));
+    assert!(!old.is_empty());
+    assert!(old.iter().all(|key| key.epoch() == 0) && new.iter().all(|key| key.epoch() == 1));
+    assert!(new.iter().all(|key| !old.contains(key)), "{new:?} reuses a name planned before the reset");
+    assert_eq!(new.iter().map(|key| key.clone().with_epoch(0)).collect::<Vec<_>>(), old, "only the epoch differs");
 }

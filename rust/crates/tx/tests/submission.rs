@@ -134,7 +134,7 @@ fn nullable_abort_messages_preserve_error_presence_and_release_all_retained_char
         assert_eq!(outcome.error().unwrap().message, message);
         let wire = outcome.encoded_error().unwrap().unwrap();
         let encoded = rtdb_format::log::proto::ResolvedTx { tx_id: Some(1), system_time_micros: Some(2), committed: Some(false), error: Some(wire.as_slice().to_vec()), ..Default::default() };
-        let (staged, decoded) = decode_replica(&encoded, None, BlockIndex(0), &memory).unwrap();
+        let ReplayedTransaction { writes: staged, result: decoded, .. } = decode_replica(&encoded, None, BlockIndex(0), &memory).unwrap();
         assert_eq!(decoded, outcome);
         let clone = decoded.clone();
         drop(decoded); drop(outcome); drop(staged); drop(wire);
@@ -172,7 +172,7 @@ fn coalescing_argument_batches_preserves_old_clones_and_joined_types() {
     let clone = args.clone();
     assert_eq!(memory.used_bytes(), used);
     args.append(SqlArguments::from_rows(vec![vec![Value::Utf8("two".into())]], &memory).unwrap()).unwrap();
-    assert_eq!(original.rows().collect::<Vec<_>>(), [vec![Value::I64(1)].as_slice()]);
+    assert_eq!(original.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [vec![Value::I64(1)]]);
     assert_eq!(args.row_count(), 2);
     assert_eq!(args.types()[0], LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8)));
     drop(args); drop(original); drop(clone);
@@ -245,4 +245,52 @@ fn separate_puts_of_heterogeneous_documents_mark_absent_union_columns_nullable()
     let transaction = prepare_submission(operations, SubmitOptions::default(), "xtdb", &memory).unwrap();
     let message = SourceMessage::decode(transaction.encode().unwrap().as_slice()).unwrap().unwrap();
     SourceTransaction::decode(&message, &memory).unwrap();
+}
+
+#[test]
+fn replay_submission_wire_checks_presence_before_resolving() {
+    use rtdb_format::{envelope::SourceBody, log::proto::IdempotencyGuard};
+    use rtdb_types::Timestamp;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let key = "00112233445566778899aabbccddeeff/0";
+    let replay = ReplaySubmission::admit(key, Timestamp(0), Timestamp(1)).unwrap();
+    let transaction = SourceTransaction::new(
+        vec![TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None }],
+        SubmitOptions::default(),
+        &memory,
+    ).unwrap().with_replay_submission(replay);
+    let encoded = transaction.encode().unwrap();
+    let Some(SourceMessage::Protobuf(SourceBody::Tx(tx))) = SourceMessage::decode(encoded.as_slice()).unwrap() else {
+        panic!("expected structured source transaction");
+    };
+    let metadata = tx.replay_submission.as_ref().unwrap();
+    assert_eq!(metadata.key.as_deref(), Some(key));
+    assert_eq!(metadata.submitted_at_micros, Some(0));
+    assert_eq!(metadata.not_after_micros, Some(1));
+    assert_eq!(metadata.abort_on_legacy_resolver, Some(true));
+    let decoded = SourceTransaction::decode(&SourceMessage::Protobuf(SourceBody::Tx(tx.clone())), &memory).unwrap();
+    assert_eq!(decoded.encode().unwrap().as_slice(), encoded.as_slice());
+
+    let mut missing_cutoff = tx.clone();
+    missing_cutoff.replay_submission.as_mut().unwrap().not_after_micros = None;
+    let mut expired = tx.clone();
+    expired.replay_submission.as_mut().unwrap().not_after_micros = Some(0);
+    let mut missing_assertion = tx.clone();
+    let unguarded = SourceTransaction::new(
+        vec![TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None }],
+        SubmitOptions::default(), &memory,
+    ).unwrap().encode().unwrap();
+    let Some(SourceMessage::Protobuf(SourceBody::Tx(unguarded))) = SourceMessage::decode(unguarded.as_slice()).unwrap() else {
+        panic!("expected structured source transaction");
+    };
+    missing_assertion.tx_ops = unguarded.tx_ops;
+    let mut disabled_assertion = tx.clone();
+    disabled_assertion.replay_submission.as_mut().unwrap().abort_on_legacy_resolver = Some(false);
+    let mut ambiguous = tx;
+    ambiguous.idempotency_guard = Some(IdempotencyGuard { submitted_at_micros: Some(0), after_bootstrap: Some(false) });
+    for invalid in [missing_cutoff, expired, missing_assertion, disabled_assertion, ambiguous] {
+        let message = SourceMessage::Protobuf(SourceBody::Tx(invalid));
+        assert_eq!(SourceTransaction::decode(&message, &memory).err().unwrap().code, "rtdb.tx/invalid-source-transaction");
+    }
 }

@@ -1,0 +1,33 @@
+{
+  "summary": "A leader's own read-back must have the exact assigned pending-append sequence.",
+  "flags": ["--no-external-by-default", "--verify-module", "readback"],
+  "min_verified_functions": 1,
+  "controls": {
+    "accept_absence_as_zero": {
+      "mutate": [{
+        "file": "rust/crates/replication/src/readback_identity.rs",
+        "find": "None => false",
+        "replace": "None => expected == 0"
+      }],
+      "expect": [{
+        "file": "rust/crates/replication/src/readback_identity.rs",
+        "function": "matching_present_integer",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 0
+    },
+    "admit_later_sequence": {
+      "mutate": [{
+        "file": "rust/crates/replication/src/readback_identity.rs",
+        "find": "Some(observed) => observed == expected",
+        "replace": "Some(observed) => observed >= expected"
+      }],
+      "expect": [{
+        "file": "rust/crates/replication/src/readback_identity.rs",
+        "function": "matching_present_integer",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 0
+    }
+  }
+}

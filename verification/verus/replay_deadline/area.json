@@ -1,0 +1,54 @@
+{
+  "summary": "Replacement writers inherit the deadline of the pending command.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 2,
+  "controls": {
+    "reissue_the_deadline": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/replay_deadline.rs",
+          "find": "Some(original) => original",
+          "replace": "Some(_) => proposed"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/replay_deadline.rs",
+          "function": "replay_cutoff",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1,
+      "defect": "A replacement opens a new recovery window."
+    },
+    "reissue_with_weakened_contract": {
+      "defect": "A renewed window satisfies the weakened function contract and violates the composed cutoff law.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/replay_deadline.rs",
+          "find": "Some(original) => original",
+          "replace": "Some(_) => proposed"
+        },
+        {
+          "file": "rust/crates/multi/src/replay_deadline.rs",
+          "find": "previous.is_some() ==> out == previous.unwrap(),",
+          "replace": "previous.is_some() ==> out == proposed,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replay_deadline/laws.rs",
+          "function": "two_later_writers_share_the_first_cutoff",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    }
+  }
+}

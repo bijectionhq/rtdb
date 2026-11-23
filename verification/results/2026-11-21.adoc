@@ -937,6 +937,58 @@ All five tests in the maintenance `gc` suite passed with that follow-up.
 This deployment boundary covers one installed partition authority and its trie collector.
 Coordination between nodes, other physical deletion paths, and checkpoint and log retention during recovery remain open.
 
+== Reader leases across nodes
+
+The previous boundary left readers on other nodes unprotected, because their catalogs never reach the writer's collector.
+Every node now gives each query snapshot a bounded read lease.
+A node reads its monotonic clock, then the replica log tip, and anchors the lease once its catalog has applied that tip.
+A snapshot captured afterwards may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`, one hour and one minute by default.
+The storage I/O region checks the lease as it admits each provider request and refuses a late one with `rtdb.storage/read-lease-expired`.
+A node that cannot confirm its catalog waits up to the margin for its log processor and then holds an expired lease.
+The trie collector deletes an eligible trie only after a whole lease has passed on its own monotonic clock since it first observed the trie as eligible.
+In Multi, that deletion records a release that the cell reaper erases only after its grace.
+A collector starts with no observations after restart or failover.
+A node that reads a scan fragment for another node's query captures its own snapshot and holds its own lease.
+
+The link:../verus/read_lease/laws.rs[read lease area] verifies the three production decisions and two laws.
+The composed law relates each node's monotonic readings to real time: over one lease, measured and real elapsed time differ by at most `drift`.
+It assumes the anchor precedes the collector's first observation in real time and a request takes at most `io_bound`.
+Under `2 * drift + io_bound <= margin`, an admitted request finishes before any deletion the collector permits.
+No clock synchronization between nodes is assumed; the default one-minute margin over a one-hour lease tolerates up to 30 seconds of drift per lease, less half the request allowance.
+Admitting a request at the deadline fails the original contract, and fails both laws when the contract is weakened with it.
+Dropping the margin or the collector's wait, together with its contract, fails the composed law.
+The runner reported 5 verified functions for the baseline and the expected diagnostics for all four controls.
+
+Two conformance tests run a writer and a read-only follower over one shared log and store.
+The follower opens a cursor on a trie that compaction then supersedes.
+Within the lease, the writer's automatic collector keeps both files through three further blocks and the follower reads its admitted row.
+After the clock passes the lease, the writer deletes the data and metadata, and the follower cursor fails with `rtdb.storage/read-lease-expired` before its first provider request.
+Removing the request-time lease check makes the same cursor fail with `rtdb.storage/missing-object` on the trie's metadata, which reproduces the cross-node stranding.
+Removing the collector's wait makes the writer delete the data file while the follower lease is valid.
+An earlier version of the replay warmed the follower's buffer pool with a full query, and its cursor then succeeded from memory after deletion; the tests now open the cursor cold.
+The maintenance suite adds a collector test for the lease boundary and a configuration test for the lease and margin.
+Run them with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-storage -p rtdb-maintenance -p rtdb-node -p rtdb-conformance`.
+The storage, maintenance, index, query, node, replication and conformance suites ran 851 tests, of which 850 passed.
+The `sorted_and_unsorted_limits_open_their_inputs_before_resolving_bounds` statement test failed on the base commit `e05aac74f` as well; `d070d54c4` restored the open order of sorted limits.
+The first suite run found that a database whose log worker had failed before its first query could no longer read its adopted state.
+The maintenance supervisor now confirms the lease anchor on each status change, so a node that was current keeps its lease after its worker stops.
+After rebasing onto `17ad591d6`, the same suites plus `rtdb-multi` ran 991 tests.
+The Multi idempotency test overflowed a worker stack because the lease scope stored a second copy of each cursor future; the scope now returns the work or its scoped future directly, and that test passes.
+Two node search tests timed out awaiting indexed progress under machine load and passed on rerun.
+The maintenance `two_databases_share_a_slot_until_cancelled_uploads_finish` test hung because it awaited a completion without polling the driver whose jobs now run on blocking threads; `7be683f6b` and `441f0b297` fixed the fixture.
+
+Objects are immutable, so a request that outlives `io_bound` can only fail; the I/O region classifies a missing object reported after the deadline as `rtdb.storage/read-lease-expired`.
+A missing object within the lease remains `rtdb.storage/missing-object`, which marks a violated drift or retirement premise.
+Storage tests check admission at the deadline, the overrun classification and lease narrowing.
+The `garbageCollector` configuration accepts `readerLease` and `readerLeaseMargin` as ISO-8601 durations.
+Nodes with log processing disabled hold no lease, because they have no confirmed catalog; the native follower path always processes the log.
+
+The combined formal runner passed with the Rust boundary and native replay options on the lease commits before rebasing onto `8a84b69bb`, including 131 Verus obligations across the baseline areas, 74 Verus controls, and the Lean, TLC, Apalache, Alloy, Maude, mCRL2, AutoHyper and SMT studies.
+Its native checkpoint replay now requires both follower lease tests.
+The runner builds each cargo case with `--no-run` under its own one-hour limit before the five-minute run limit, because a fresh source copy rebuilds the workspace; an earlier attempt spent 4 minutes 42 seconds of the run limit compiling.
+Its input manifest SHA-256 is `ba25a8a301174849e3f69742c51d6d58a661f213803d85658c0c5bf601e3b2ef`.
+Transaction resolution on the leader remains protected by the partition registry and holds no lease.
+
 == Trie dependencies of the installed checkpoint
 
 Commit `2f1019b68` records the exact live and nascent trie identities of the installed checkpoint.
@@ -1020,3 +1072,1796 @@ It recorded 115 Verus obligations, 63 source controls, and 21 TLC baseline confi
 Its input manifest SHA-256 is `d92c0b97b24a6b19719564c7eea6816d9b6aff16c6ae59439d79a52d2a2a4e67`.
 The native replay and Rust boundary flags were omitted from this invocation.
 Distributed reader and recovery retention, hosted provider settlement, and the replica log suffix remain outside the local runtime guarantee.
+
+=== Prepared replica cursor during checkpoint recovery
+
+The ordinary recovery path asks a supporting replica log to admit a cursor before installing a checkpoint.
+It retries a strictly newer checkpoint only when the error identifies the first requested offset as part of a discarded prefix.
+The driver takes the admitted cursor with its original log and boundary identity.
+Exact and restored-archive recovery retain their existing anchors.
+Local file logs and providers that defer admission still open the cursor when the driver runs and retain their optional earlier floor check.
+
+TLC checked 171 reachable states of link:../tla/PreparedReplay.tla[PreparedReplay].
+The controls reject installation without admission, refusal without refresh, and use of a different cursor by the driver.
+Two additional traces witness successful recovery on a newer checkpoint and trimming after admission.
+The latter remains possible because cursor admission carries no retention entitlement on a remote log.
+
+The native suites passed 433 tests on `773adfde9`, including the Multi and logkeeper cold-start path after trimming.
+The gated native case checks the selected block before the consumer starts, the recovered SQL result, two recovery admissions, and zero independent tail opens by the driver.
+The source control run at `1740907ed` rejected leaving admission out of startup and discarding the admitted cursor.
+Use `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked --no-fail-fast -p rtdb-node -p rtdb-storage -p rtdb-replication -p rtdb-logkeeper -p rtdb-multi -p rtdb-conformance --lib --test native --test contract --test node_faults --test cell -- --test-threads=4`.
+The combined formal runner passed at `773adfde9` with input manifest SHA-256 `9198b230b9f18f27d4280e3ff32da536919f4bd4085e9bd55d0df6e66ce55b7e`.
+The combined run used the formal flags and the separate native run exercised the actual cursor handoff.
+
+=== Shared authorization for replay retention
+
+Link:../tla/ReplicaTrimAdmission.tla[ReplicaTrimAdmission] studies the next protocol with two simultaneous recovery handles, three candidate offsets and delayed physical trimming.
+A trim authorization advances a durable floor, which new recovery admissions consult even while the physical trim is pending.
+Authorization must preserve the smallest position required by every active recovery.
+TLC checked all 75 reachable states and caught both weakened rules.
+The reachability witness admits a new reader after an actual trim.
+
+Link:../lean/ReplicaTrimAdmission.lean[The Lean model] proves that no authorized physical trim removes an active recovery's starting position, for arbitrary finite histories and any reader type with decidable equality.
+The three audited theorems use only `propext` and `Quot.sound`.
+Both admission-control mutations fail the invariant-preservation theorem.
+This model assumes one stream with one durable authority, atomic registration and trim authorization, and a provider that completes only authorized trims.
+The proposed shared authority and recovery holds are still open production work.
+
+The combined formal runner passed on `17ad591d6` with 23 TLC baseline configurations and the new Lean and TLC controls.
+Its input manifest SHA-256 is `eb714e7df2ca08815f25ccd5c8c84491cb06e43486a56c36dae22498ea185a4a`.
+The Kafka adapter passed `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo check --offline --locked --manifest-path rust/Cargo.toml -p rtdb-kafka --lib` with the pinned CMake 4.5.1 on `PATH`.
+This adapter check did not connect to a broker.
+
+=== Multi recovery admission against an authorized trim
+
+Commit `e0192fdfd` makes the serving Multi log read the directory's certified replica prefix when admitting an ordinary recovery cursor.
+An outdated start reports the first required offset and the first offset outside the authorized prefix, allowing the checkpoint-discovery loop to seek a strictly newer root.
+The decision is scoped to the physical replica stream and log epoch, and the writer epoch may change without resetting the boundary.
+The provider still validates its own cursor.
+
+Verus checks three obligations on the actual offset decision in `rust/crates/multi/src/replica_retention.rs`.
+The controls exclude the first retained record, weaken the specification to match that behavior, and jointly drop the authorization rule and its contract.
+Each control reports its declared failure.
+The native test witnesses the directory refusing an outdated start while the backing log still has the requested record and accepts a start at the first retained record.
+The backing provider for that test is `MemoryLog`.
+The separate `cell` suite exercises real local logkeepers and cold recovery after their physical trim.
+`1dd4b2a42` passed 96 Multi library tests and 75 cell tests.
+
+[source,sh]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_TARGET_DIR=../target \
+  CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 cargo test --offline --locked -p rtdb-multi --lib --test cell
+----
+
+The `verify_multi_trim_admission` case in the formal runner's `--native-replay` lane reruns the focused test and a source control that omits the directory check.
+The focused baseline and expected assertion failure were both observed at `1dd4b2a42`.
+The native control's original `logs.rs` SHA-256 is `9e29de26443852521f5fc1a494b368884738950c1cdf6391a9037071e179a56e`.
+
+=== Recovery hold closure and owner loss
+
+TLC explored 22,494 reachable states with two hold identities, three offsets, a delayed directory admission, and independently delayed physical trim.
+The safety checks cover closure after a drain or confirmed stop, retention through an active or draining read, and the inability of a delayed admission to recreate a released hold.
+The three controls reject premature closure on cancellation, treating timeout as stop evidence, and skipping the closing CAS when no hold is visible.
+A fourth case reaches a physical trim after an owner's stop is confirmed and the hold is removed. link:../tla/ReplicaHoldLifecycle.tla[Lifecycle model]
+
+Lean proves `close_consumes_only_its_hold`, `close_fences_prior_admissions`, and `a_missing_hold_still_fences_its_ambiguous_admission` for arbitrary reader identities with decidable equality.
+The proofs use `propext` and `Quot.sound` and assume a monotone directory revision and a successful atomic close.
+The controls keep the revision unchanged and drop another reader's hold. link:../lean/ReplicaHoldClose.lean[Close and fencing laws]
+
+The admission check covers trims authorized before the directory read.
+A later trim is still possible because the production cursor does not register a durable hold.
+The models leave provider drain and conclusive owner death as refinement premises, and they abstract the release schedule and provider protocol.
+
+The combined formal runner passed at `1dd4b2a42` with Lean, Verus, Z3, TLC, Apalache, Alloy, Maude, mCRL2, and AutoHyper.
+It checked 24 TLC baseline configurations and the registered controls and witnesses.
+The native replay and Rust boundary flags were omitted in this combined run.
+Its input manifest SHA-256 is `9db36db755083ddc52a18203d897c48d7771710baef0854202f4a7311affd4f1`.
+See the link:../README.adoc#_run_the_studies[runner command and tool versions].
+
+=== Durable holds for Multi's ordinary catch-up
+
+Commit `e298879a0` stores each nonempty catch-up window as a recovery hold on the same deployment record as the authorized replica trim.
+The serving cursor captures the observed committed tip and registers its first required position before opening the provider cursor.
+The holder certifies a trim strictly below both the published checkpoint boundary and the least position in any recovery hold.
+The directory CAS validates both observations before physical trim can begin.
+The hold ends when the cursor has delivered its captured tip or when the cursor and its pending read have been dropped.
+The serving-region drain keeps whole-residence disposal behind outstanding holds.
+
+The release worker survives cancellation of its opener and uses the storage-region close CAS to fence an ambiguous admission.
+The reaper can act on a drained local witness or a confirmed stop of the exact hosted task.
+A missing stop witness leaves the hold in place.
+The local reaper test clears a discharged witness while preserving another live hold at the same offset.
+The local cell test blocks the reply to a successful hold registration, publishes a newer checkpoint, observes a real logkeeper trim that retains the first required record, then checks the subscriber's SQL rows and later trim progress.
+
+The native run at `a456fd6c5` passed 98 library tests and 76 cell tests.
+The rebase to `e298879a0` changed independent ordered-index proof files and preserved the tested Rust, Allium, and Verus sources byte for byte.
+
+[source,sh]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_TARGET_DIR=../target \
+  CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 cargo test --offline --locked -p rtdb-multi --lib --test cell
+----
+
+Verus verifies six obligations in the production replica-trim area.
+The additional single control drops the earliest hold from the cap.
+The joint control changes the contract along with the implementation, and the explicit retention law still fails.
+The Lean and TLC models cover closed and ambiguous holds under their stated authority and provider premises.
+The Rust arithmetic proof assumes its supplied minimum reflects the directory record, and runtime evidence for that adapter comes from the local cell case.
+
+The focused `verify_recovery_hold_replay` and `verify_multi_trim_admission` runner cases both passed on the landed Rust source.
+The first control omits holds from the trim input and fails the physical-retention assertion in the real cell test.
+The second omits the authorized-prefix check and fails the pending-trim admission assertion.
+Both expected failures ran with one selected test apiece.
+The originals have SHA-256 `0872a179d04164527539ef1af82ef1bfa40b11a7934f59e494c2a2bfabebb53e` for `agent.rs` and `e1e941202be4c3a5662c48ec9ffa506b89fc54c01b2776907ed13883b3841d29` for `recovery_holds.rs`.
+Both cases can be selected through the runner's `--native-replay` lane.
+
+The production hold covers an ordinary Multi startup's captured replica suffix.
+Checkpoint-object reachability across authorities, the live tail after catch-up, provider-side proof of hosted stop and drain, and retained-history reads for separate exact restore paths have different lifetime obligations.
+
+The combined formal runner passed at `a456fd6c5` with Lean, Verus, Z3, TLC, Apalache, Alloy, Maude, mCRL2, and AutoHyper.
+It exercised 24 TLC baseline configurations and the registered controls and witnesses.
+The native replay and Rust boundary flags were omitted from the combined run, and the focused native results are recorded above.
+The input manifest SHA-256 is `1b8ebc14ef98cfa0ce628c009e7d3607635e40aec0364a702d410a788071bf21`. link:../README.adoc#_run_the_studies[Runner command and tool versions]
+
+=== Checkpoint metadata reaping across authorities
+
+At `ae0957678`, the metadata model covers publication, admission, release, preparation of a deletion, and the provider's later removal of the object.
+Its scope is one immutable physical residence and checkpoint metadata ordered by block.
+It assumes authoritative versioned admission, a forward published block, and no reuse of the released object's identity.
+The model abstracts the clock threshold, provider transport, and ancestry references.
+
+TLC explored 79 reachable states with two readers and three blocks.
+It rejected stale admissions, overlooking existing holds, and backward publication at the named safety properties.
+The reachability witness removes both old blocks and retains the latest one with a live startup reader.
+Use `java -cp tla2tools.jar tlc2.TLC -config verification/tla/CheckpointMetadataRetention.cfg verification/tla/CheckpointMetadataRetention.tla` from the repository root.
+
+Lean checked `plans_survive_interleavings`, `reachable_plans_are_safe`, and `admitted_metadata_cannot_be_deleted` for finite histories with arbitrary reader identities and block indices.
+The axiom audit reports `propext` and `Quot.sound` only.
+Replay the positive proof with `lean verification/lean/CheckpointMetadataRetention.lean` on Lean 4.36.0.
+The standard local Lean run reached its wall-clock timeout during host contention.
+A focused rerun with `lean -j 1` and the default proof budgets verified the same baseline and rejected all three controls at `plans_survive_interleavings`.
+The registered runner cases specify the bounded witnesses, mutations, and expected failure sites. link:../lean/CheckpointMetadataRetention.lean[Lean laws] · link:../tla/CheckpointMetadataRetention.tla[TLA+ model]
+
+=== Cross-node serving snapshot retention
+
+The model compares a minimum held catalog cut and exact dependency tracking using the same provider and reader transitions.
+It models one physical residence, two readers, three successive catalog cuts and four immutable objects, including one shared across cuts and one created after startup.
+It allows time between the sweep's directory observation, discovery of a published release, authorization, and deletion.
+Closure and provider completion advance independently.
+
+TLC 2026.11.19 exhausted 7,622 reachable states with the cutoff and 8,278 with exact dependency tracking.
+Serving and open or draining reader dependencies remained present in both.
+Stale admission, omitted holds, ignored drain, and a release certified after the captured sweep each violated `ReaderReadable` in both variants.
+The late-release control for exact tracking has a seven-transition counterexample.
+A reaper captures cut 0, a later object enters at cut 1, a reader holds cut 1, and the object is retired at cut 2.
+The weakened reaper deletes it because its capture predates both the object and the reader.
+This model result requires a retirement certificate at or before the captured head even when the captured dependency inventory is exact.
+
+The common progress witness deletes both former dependencies while a current reader remains admitted.
+The exact policy also deletes an object introduced at cut 1 and retired at cut 2 while a reader still holds cut 0.
+The cutoff variant cannot take the second deletion in any reachable state of this configuration.
+These witnesses exercise possible reclamation under the two policies.
+
+Lean 4.36.0 checked four formal statements with an arbitrary dependency predicate over catalog cuts.
+The two safety laws require a retirement certificate and a premise that an active reader was either included in the capture or admitted at or above the captured head.
+The comparison laws prove that exact tracking permits all cutoff deletions under the certificate and exhibit strict inclusion.
+Three declarations use no axioms and the concrete witness uses `propext` and `Quot.sound`.
+The runner rejected five proof controls at their declared theorems, covering the hold premises, retirement order, certificate, and concrete witness.
+
+This is design evidence for one residence.
+The current Rust garbage record has an object key and a release time.
+A production connection needs an authoritative catalog-cut encoding, a certified release, cross-node reader admission with a drain boundary, and proof that the provider applies the authorization to the intended physical identity.
+The model takes final retirement as a premise and leaves reference transfers, exact historical admission, and capacity under long readers to separate studies.
+
+The focused run used `lean -j 1` and the registered TLC cases.
+The full runner can replay both configurations and their controls.
+The completed input SHA-256 values are `2c319c0f45ffaeb5655deb8fe1f8c266e2379042ca52e321be4bc64febcfa6a7` for the TLA+ model and `3b7275266258436aaff94d6a7d95dd05efe74e38358c17ffdf9b85130956243f` for the Lean model. link:../README.adoc#_run_the_studies[Runner and pinned tools] · link:../tla/ResidenceReaderRetention.tla[TLA+ model] · link:../lean/ResidenceReaderRetention.lean[Lean laws]
+
+=== Independent and shared-reference fork publication
+
+TLC 2026.11.19 compared a fork with a durable independent checkpoint and a fork with coordinated shared references.
+The model has one source and one child, a two-object checkpoint, one captured reaper inventory, and one outstanding physical deletion.
+It separates preparation from publication and includes a refusal after source collection removes the remaining prerequisites.
+The reference policy explored 27 reachable states and the copy policy explored 38.
+Every published child remained readable.
+Apalache 0.63.0 independently checked both baselines through eight transitions and rejected the stale-inventory control.
+
+Four controls violated `PublishedChildReadable`.
+They omit validation of the captured referrers, allow a new shared dependency during a pending deletion, delete before transferring the shared objects, or publish a partial independent copy.
+The stale-inventory control has a five-transition counterexample.
+Both baseline policies admit a child that stays readable after source collection and allow refusal after an incomplete preparation loses its inputs.
+
+The shared-reference baseline assumes that authorization and publication use common lineage authority.
+The ordinary Rust reference reaper captures a deployment inventory and later copies for observed referrers before the delete.
+The local maintenance lock serializes those operations on local storage.
+The hosted case needs separate evidence that its inventory and provider operation refine the modeled authority.
+The independent checkpoint case abstracts physical copy completion, decryption, tail replay, ambiguous outcomes and multiple ancestors.
+This study establishes finite model properties only.
+
+The registered TLC runner executes both policies, all four controls, and four reachability witnesses.
+The checked model SHA-256 is `d43053e0b4f22e095d3ae1d3c7a544d80077023a0ae950ae8e53d1925f6e4eb7`. link:../tla/ForkPublication.tla[Fork model] · link:../README.adoc#_run_the_studies[Runner]
+
+=== Production checkpoint metadata admission and collection
+
+The storage factory uses one versioned directory update to admit the recovery store, choose its metadata floor and record the hold.
+The storage-opening reads and database assembly run with that hold attached to admitted I/O.
+Ordinary discovery may advance or refresh from a published floor.
+An exact serving snapshot retries admission at a newer published checkpoint when its requested one has advanced.
+The reaper requires every released metadata block to be below both the published block and every active hold.
+
+The Verus checkpoint metadata area checked five obligations in the predicate included from production source.
+The ordinary control and the matching weakened contract each have one expected diagnostic.
+The direct Rust replay used the memory directory and local object provider on the merged candidate at `31ff21299`.
+It preserved a root pack, a spilled table block, a loose table block and the hold through cancellation of an admitted provider read.
+The reaper later collected the old metadata once that read drained.
+Removing the earliest hold failed exactly the packed-root assertion.
+The clean `store.rs` SHA-256 was `8a1adf7b37ec84c2995915fe127509b35ed6abbfc5b2f3247d3edaaad9354254`.
+The runner includes both cases when invoked with `--native-replay`. link:../verus/checkpoint_metadata/proof.rs[Exact production predicate] · link:../README.adoc#_run_the_studies[Runner]
+
+The combined formal run on the earlier integrated candidate `da7367925` completed Lean, TLC, Verus, Z3, Apalache, Alloy, Maude, mCRL2 and AutoHyper.
+It covered 126 baseline Verus obligations in 17 areas, 70 Verus controls, and 28 TLC baseline cases with the registered controls and reachability witnesses.
+Lean ran with one worker and its default proof budgets.
+This invocation omitted both Rust options.
+The disposition of the later fork study is recorded separately above.
+Its input manifest SHA-256 is `d4bb2ef583c091d331b37828437534901076516771a6e024fa737567c425f0d4`.
+
+=== Multi follow-up integration
+
+The `rtdb-multi` tip `ef5a4ee14` adds load-aware placement, writer confirmation after route changes, read-width cleanup and independent checkpoint copies for cross-organisation forks.
+The merged Rust candidate first exposed a default-stack overflow during the native idempotent transaction retry.
+One crash report identified recursive column pruning.
+A second run after guarding pruning reached a separate stack limit during nested page-cursor construction.
+The fixes apply stack growth to recursive pruning and to polls that build nested page cursors.
+
+The selected Rust suites passed 330 tests at `4ffa2cf02` with the default stack and four test threads.
+The run included 78 local cell tests, including the idempotent retry, checkpoint retention, load-aware rebalancing and cross-organisation fork after source erasure.
+The DynamoDB feature and live S3 qualification were outside the selected tests.
+From `rust/`, run `BIJECTION_LOCAL_EXECUTION=owner-authorized RUST_TEST_THREADS=4 cargo test --offline --locked -p rtdb-multi -p rtdb-replication -p rtdb-node --lib --test cell --test resources --test native`.
+
+=== Combined formal and Multi runs on the consolidated sources
+
+The combined formal runner completed with Lean, TLC, Verus, Z3, Apalache, Alloy, Maude, mCRL2 and AutoHyper.
+The run started from `5a04755e1`.
+All 258 tracked proof and adapter inputs in its manifest match the bytes on `706be8093`.
+The run covered 126 baseline Verus obligations in 17 areas, 70 Verus controls, and 30 TLC baseline cases with their registered controls and witnesses.
+Apalache additionally checked both fork policies through eight transitions and rejected the stale-inventory control.
+The input manifest SHA-256 is `594fb9a0ba992a4d71f33802cf8ca36248210d1993287778a5fb164a3b7ed87c`.
+This formal invocation omitted the Rust boundary and native replay options.
+The merged Rust suite and the targeted checkpoint metadata control are recorded above.
+
+The separate `verification/multi/check.sh` run checked 15 Lean modules and 14 TLC configurations, including all expected refusals and counterexamples.
+Each TLC case now keeps its copied source, generated trace and state database in its own ignored run directory.
+The clean-checkout pass replayed every Multi configuration with that layout.
+Use `BIJECTION_LOCAL_EXECUTION=owner-authorized TLA2TOOLS_JAR=/path/to/tla2tools.jar LEAN=/path/to/lean bash verification/multi/check.sh` with the pinned Java on the path. link:../multi/check.sh[Multi runner] · link:../README.adoc#_run_the_studies[Combined runner]
+
+=== Ordered index, replica boundary and hosted feature checks
+
+The ordered-index rerun checked eight Lean files on Lean 4.35.0, including the audit of 23 theorem declarations.
+The domain, seek and scope harnesses checked 32 Verus obligations from the included production sources.
+TLC completed all 12 configured cases, including five expected counterexamples and both retirement liveness cases.
+Its largest checkpoint baseline reached 8,812,741 distinct states through depth 21.
+All of this is evidence for the checked laws, production functions and finite models at their stated boundaries.
+The input manifest SHA-256 is `6d18b661012e0d8075e62bd3aba5fa7934dc5c3011dc15a511f9214cbf7f1d84`. link:../ordered-index/README.md#execution[Ordered-index runner instructions]
+
+The production replica admission boundary compiled on `9137e04f2`.
+The compiler rejected a caller forging the admission token with `E0423` and a caller passing an unadmitted record with `E0308`, both in the expected driver source.
+The clean driver SHA-256 is `5c41bafacc1f05e14cd6c053041d95ad3f0e5e2ae1c901937a2983bc1711f273`.
+This is the same boundary case as the combined runner's `--rust-boundary` option.
+
+The 21 supplemental query scan tests passed.
+The consolidated code also passed a local compile check of the Multi binary with its DynamoDB feature enabled.
+From `rust/`, run `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo check --offline --locked -p rtdb-multi --features dynamodb --bin rtdb-multi`.
+S3 provider behavior, full query-snapshot retention across serving nodes and hosted reference publication retain their separate evidence obligations.
+
+=== Delegated scan admission and provider drain
+
+At `2c89ffb51`, the delegated executor checks that the actual captured transaction key matches the coordinator's and that its view has no private overlays.
+The coordinator retains its own capture and uses it for a refused fragment.
+The executor attaches its query context to admitted provider work so the context survives caller cancellation until the worker and any undelivered result are gone.
+
+Lean 4.36.0 proved that a successful fragment agrees with the captured reference point and that selecting the reply or falling back preserves that observation for an arbitrary shared committed history.
+It checked a concrete later-erase witness.
+The three declarations use `propext` only.
+Allowing a later head, admitting a private overlay and removing the advance in the erase witness each failed at the registered theorem.
+
+TLC explored 59 reachable states of one coordinator and one worker across three transaction heads.
+It rejected admitting a later head, trusting the preliminary worker observation in place of the actual capture, and releasing the worker hold on cancellation.
+The witnesses exercised a matching response, local fallback after a later erase, and collection after drain.
+The model abstracts the worker's provider under one partition authority and uses a separately retained coordinator capture.
+
+The selected Rust suites passed 563 tests, including the 78 local Multi cell tests.
+The first new scan test dispatches to a later snapshot that has erased a row, then observes the earlier coordinator's row through local fallback.
+The second runs the delegated evaluator against a paused provider worker, cancels the caller, and observes the query context held until that worker drains.
+The two Rust source controls independently restore later-head admission and omit I/O retention.
+Each failed its named regression assertion.
+The clean `fragment.rs` SHA-256 was `daa8f4818572d306c8b0ee7e7ef293bff73873479b8def500f19d1a310156a47`.
+
+The proofs model the same database history on both nodes.
+Physical collection by another authority and transport checks that bind both captures to the same residence remain separate obligations.
+From `rust/`, the selected command is `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked -p rtdb-query -p rtdb-multi -p rtdb-node -p rtdb-replication --lib --test scan --test cell --test resources --test native`.
+The combined runner executes the registered Lean and TLC cases and adds both source controls with `--native-replay`. link:../lean/DelegatedScan.lean[Lean laws] · link:../tla/DelegatedScan.tla[TLA+ protocol] · link:../README.adoc#_run_the_studies[Runner]
+
+=== Catalog cut at cross-node reader admission
+
+TLC explored 126 reachable states of a replica, a snapshot and an independently advancing retirement floor.
+Using the installed cut captured with its catalog preserved the dependencies of every admitted reader in this configuration.
+Three controls used the received replica position, a later sample of the installed position and the logical transaction head.
+Each violated `Readable`.
+The received-position counterexample takes six transitions from initialization to deletion.
+The two witnesses reach a refusal for an older capture and a replacement reader after physical collection.
+
+Apalache 0.63.0 independently checked the baseline through eight transitions and rejected the received-position control.
+The checked model SHA-256 is `e8a9bc8601faff7c96713c0e208872f4fe3dcbf21863a24f2a6a5068889d6a2d`.
+Both tools run these cases through the combined runner.
+The finite study assumes the directory's retirement floor already has a valid producer.
+The Rust driver facts used in the refinement brief are its separate receive and apply boundaries and its independently published status watch.
+The storage receipt and reader admission adapter still need an installed catalog cut in production. link:../tla/CatalogCutPublication.tla[Comparison and controls]
+
+=== Delegated scan storage and journal identity
+
+At `65b86e478`, a Multi fragment carries the namespace and prefix of the coordinator's opened store and the epoch of its opened replica journal.
+The router compares that receipt with the current directory record.
+The receiver compares the receipt again against the immutable database handle used to capture the worker's snapshot.
+The wire tag distinguishes the scoped operation so an older worker cannot accept it through the earlier operation.
+
+TLC explored 26 reachable states and found that the accepted worker response always belongs to the captured history in the model.
+It rejected binding a request to the latest route, trusting the routing check at the worker, and ignoring the replica epoch.
+The witnesses covered a matching read and a worker-side refusal after replacement.
+The model uses distinct namespace, prefix and epoch values for distinct histories.
+Storage and log providers remain responsible for that identity premise.
+
+The selected Rust suites passed 564 tests, including 79 Multi cell tests and 23 query scan tests.
+The new cell case exercises a matching request, a different storage residence, a different epoch, a missing scope and decoding of the earlier wire tag.
+The two source controls independently ignore the namespace-qualified storage receipt and the epoch in the production worker comparison.
+They failed at the expected assertions.
+The clean `node.rs` SHA-256 is `8e94e7e29f59a8554ac4f6904b5e78e2759a11f6bc5b796cf769dfc48aa6fed0`.
+The new controls run with `--native-replay`. link:../tla/FragmentResidence.tla[Residence transition model]
+
+The combined local formal run completed at `65b86e478` across Lean, TLC, Verus, Z3, Apalache, Alloy, Maude, mCRL2 and AutoHyper.
+It checked 126 baseline Verus obligations in 17 areas, 70 source controls, and 32 TLC baselines with their registered controls and witnesses.
+Its input manifest SHA-256 is `151cabbfbf2f462ba907c45f4243bfeafedd1024bf734418ba1a5228d09bb76f`.
+The 270 source and model inputs apart from the runner are identical at `d21e9e199`.
+The intervening runner additions register the catalog-cut study, which was run separately as recorded above.
+The DynamoDB-enabled Multi binary also passed a local compile check against `d21e9e199`.
+The delegated scan and residence native controls were run as the focused cases above.
+
+=== Installed catalog cuts and consolidated branch evidence
+
+Commit `8be6d62f7` records a conservative installed replica prefix beside the immutable physical catalog.
+Each reader captures the two together, including when it reuses a cached live index.
+The driver waits for a pending block and deferred apply records to drain before it publishes the prefix.
+An unrecognized record freezes advancement, and a direct reset with no replica position suspends publication for the open partition.
+The current adapter derives its position from the admitted replay cursor and assumes the provider retains the correct journal suffix.
+Catalog cuts still need residence-qualified admission and a directory-backed retirement rule before a collector can use them.
+
+Verus checks `completed_prefix` byte for byte with the production source.
+The baseline has five obligations.
+The three direct controls remove the block, deferred-apply, or supported-history guard.
+The three joint controls weaken the function and its contract together and fail the corresponding law.
+Native tests exercise an actual block adoption with a held trie notification, a leader's deferred application, an unrecognized record, and a compactor reset.
+Re-run these tests with `cargo test --locked --manifest-path rust/Cargo.toml -p rtdb-replication --lib`.
+The Verus area runs in the combined runner. link:../verus/catalog_cut/area.json[Catalog-cut laws and controls]
+
+The consolidation includes the hosted ordered-index branch at `49bd0c804`, the core verification branch at `b1e41f938`, and the trie verification branch at `5d40ed129`.
+It includes the prior recovery properties, standalone authority, full-text-search and group-artefact tips.
+The earlier ordered-index branch had already been applied under a different commit identity.
+The ancestry merge records that branch with the same tree as its first parent.
+
+The JVM trie tests passed 12 cases under Temurin 25.0.5.1, including independent sibling versions and nonempty protobuf root paths.
+The separate temporal and recovery runner checked nine Lean files and 14 TLC configurations with their declared results.
+The independent SQL history oracle passed across live, flushed, compacted and reopened states, including the bypass of temporal pruning.
+The merged ordered-index query tests cover both seek directions, covered scans without the primary data object, offsets, and errors raised while opening sorted and unsorted limit inputs.
+The prior combined native run at `d070d54c4` passed 728 cases before the newer Arrow integration merge. link:../../dev/check-rtdb-proof-models.sh[Temporal and recovery reproduction]
+
+The combined formal runner finished at `e2b4f5d11`.
+It checked 34 Lean baselines, 160 baseline Verus obligations in 20 areas, 89 Verus negative controls and 33 bounded TLC baselines with their declared controls.
+The same run completed the Z3, Alloy, Apalache, Maude, mCRL2 and AutoHyper lanes. link:../README.adoc[Combined runner and toolchain]
+
+The expanded native run at `196f6d2b3` passed 1,154 cases and exposed one fixture that incorrectly required a particular delegated prefix to contain rows.
+Commit `5df92a93e` checks successful evaluation of that prefix and retains the required refusals for a different residence and a later captured head.
+All four delegation cases passed on the follow-up revision.
+
+The Multi update at `6082148e8` is included through `8527f7e00`.
+The conflict resolution keeps the checkpoint-refresh loop, opened fragment scope and per-handle session accounting together.
+The DynamoDB-enabled Rust run passed 106 library cases and 80 local cell cases.
+The provider-specific DynamoDB destruction case requires a local DynamoDB endpoint and was ignored.
+Re-run these suites with `cargo test --locked --manifest-path rust/Cargo.toml -p rtdb-multi --features dynamodb --lib --test cell`.
+
+The expanded Rust run on `bd4434246` passed all 1,232 cases across replication, index, trie, temporal, maintenance, query, node, columnar, format, storage, transactions, Flight SQL and PgWire.
+The isolated provider case also passed against an ephemeral DynamoDB Local 2.6.1 container.
+It verifies that the vault refuses the destroyed deployment key on reopening, while a different deployment remains usable.
+
+The verification branch advanced to `4fea3fad1` with the JVM snapshot-ownership model and a block-adoption regression.
+Lean 4.36.0 checked seven theorems and rejected all three ownership mutations.
+The model covers local reference ownership and final release, with the locking and Arrow lifetime refinement listed in the engine ledger. link:../lean/SnapshotOwnership.lean[JVM snapshot ownership]
+All 25 JVM live-index cases passed, including reads through a retained snapshot after block adoption.
+The JVM pinning-cache fixture also passed after replacing its assumption about the identity of the evicted entry with checks of the retained pins and the weight limit.
+
+The JVM core suite passed 742 cases and the Gradle property-test tasks passed 3,348 cases.
+The JVM binding suite passed 398 cases with a separately built `rtdb-ffi` library supplied through `xtdb.native.library`.
+The 20-case compactor class passed when rerun after the workspace run hit the one-second recency case timeout.
+The final workspace `test` run succeeded with the native library configured and one Gradle worker, with 3,195 passing cases across the reported test suites.
+
+=== Hosted catalog readers and installed lease progress
+
+The Rust query context, delegated scan, membership scan and transaction resolver register captures through the serving store.
+The directory admission binds the capture to an open storage region, residence and journal epoch.
+An opaque registration represents a captured catalog whose installed cut is unavailable.
+The same registration stays live through admitted provider work after its waiter is cancelled.
+The directory reaper still uses the existing collection policy for ordinary tries and their artefacts.
+
+The follower lease confirms a journal tip from installed progress.
+Native driver tests distinguish that progress from received progress while a block or transaction resolution holds effects.
+The integrated run includes both follower cursor lease cases and the hosted tests for advancing the live catalog while holding an older capture, rejecting an obsolete owner or journal, and keeping provider work registered through cancellation.
+
+Verus verifies six functions in `catalog_reader_admission` against the production predicate.
+The eight controls remove each guard separately or also weaken its contract, and fail at the expected postcondition or law.
+This evidence covers the pure directory admission decision under its inputs.
+The async update, cancellation handling and storage handoff have native test evidence.
+
+TLC explores 21 states in `RetirementPublication` over one reader, three cuts and two incarnations.
+It rejects the three weakened variants and reaches collection followed by a readable replacement.
+The production collector still needs a durable retirement-intent and certificate protocol, and provider deletion must target the certified physical identity. link:../../dev/doc/rtdb-formal-verification-design.adoc[Protocol and scope]
+
+At `b82dd238c`, 476 scoped Rust tests passed and the credentialed DynamoDB test was ignored.
+The run also includes the merged leaf-order contracts and the bounded object-read integration tests.
+The focused JVM `xtdb.trie.MemoryHashTrieTest` suite at that revision passed all 13 cases.
+The preceding run at `da662a25a` passed 334 scoped tests.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb --lib --test cell \
+  -p rtdb-node --test fragments --test native -p rtdb-replication \
+  -p rtdb-maintenance --test gc -p rtdb-conformance --test node_faults \
+  -p rtdb-trie --test contracts -p rtdb-storage --test remote --no-fail-fast
+----
+
+The machine-local command logs and proof artifacts are under
+`/private/tmp/rtdb-formal.QMjPSJsX/catalog-reader-and-leaf-b82dd238c-native.log` and
+`/private/tmp/rtdb-formal.QMjPSJsX/combined-b82dd238c/`.
+The combined run records the checked revision, tool hashes, input hashes and command outputs.
+The combined run at `b82dd238c` finished successfully with 452 recorded commands, including 134 Lean cases, 147 TLC cases and 125 Verus cases.
+Z3, Alloy, Apalache, Maude, mCRL2 and AutoHyper also met their declared baseline and control outcomes.
+The combined run used the formal tools only.
+The separate scoped native and JVM runs above supply the runtime observations for this change.
+
+=== Hosted S3 key vault and ordered cursor integration
+
+The S3 key vault carries the conditional custody path from the hosted Protocol 15 branch into the consolidated runtime.
+It keeps the configured local and DynamoDB providers and stores the S3 namespace and deletion signer separately from deployment keys.
+The hosted binary and image inputs identify the vault-enabled artifact as Protocol 14.
+This increment does not publish an image or change any cell configuration.
+
+At `1b8bab5af`, the scoped Rust run passed 387 tests across Multi, node, Flight SQL and conformance.
+One credentialed DynamoDB test was ignored.
+The six S3 vault tests include native AWS SDK requests against a mock endpoint.
+The covered ordered-cursor regression checks the first batch comes from the index and a later provider read surfaces the missing-page error.
+The native role-membership query passed with a lease from the primary database.
+All 16 release-selection tests passed, and the compiled Multi binary reported hosted protocol 14.
+
+TLC explored 18 states in the one-key custody model.
+It found the expected counterexamples for all three controls and reached confirmed withdrawal of an installed key.
+The provider's atomic conditional write and never-versioned storage are premises.
+Native mock-S3 evidence covers the adapter's requests and responses.
+Hosted AWS, complete deployment erasure and the remaining Protocol 15 branch changes are outside this increment's evidence.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb,s3-key-vault --lib --test cell \
+  -p rtdb-node --test native --test fragments -p rtdb-flight-sql \
+  -p rtdb-conformance --test node_faults --no-fail-fast
+----
+
+The command logs are under
+`/private/tmp/rtdb-formal.QMjPSJsX/protocol15-vault-1b8bab5af-native.log`
+and `/private/tmp/rtdb-formal.QMjPSJsX/s3-key-custody-focused/`.
+The combined formal run at `1b8bab5af` completed successfully with 457 recorded commands.
+It includes the five S3 custody cases and the other registered baseline, control and reachability checks.
+The vault's production network behavior remains covered by the scoped native tests above.
+
+=== Serving key enrollment and gateway replay
+
+A serving store uses the existing key when custody provides one.
+An absent key reaches enrollment only after a fresh directory check confirms the current writer of the original residence and no durable history.
+The direct store test observes refusal for a reader, a retired writer epoch and a writer whose journal inventory already exists.
+The separate Rust run at `e2b5204a6` passed 196 Multi cases, with one credentialed test ignored.
+Verus checks the production enrollment predicate with five verified functions.
+The single and joint controls for each of its three inputs report the expected failures.
+This proof treats the directory lookup, journal reservation order and conditional provider provisioning as premises.
+
+The latest Multi branch supplies protected gateway command keys and retains the initial deadline across replacement writers.
+The Multi proof runner preserves isolated TLC work directories and checks the branch's gateway replay model with its controls.
+TLC visits 358 reachable baseline states and rejects all three changed variants.
+The Lean laws cover key selection and preservation of deadlines across an arbitrary finite sequence of replacements.
+The same-model controls cover a session reset, malformed metadata and a renewed recovery window.
+Verus checks the production deadline decision and the composed cutoff law, and the jointly weakened contract fails at the composed law.
+The runtime contract still depends on durable duplicate detection using the same effective transaction key within its retention window.
+The Multi proof script passed all 16 Lean files and 18 TLC configurations at `124570088`.
+The integrated native run at `a997308e7` passed 447 cases across Multi, node, PgWire and conformance.
+One credentialed DynamoDB case was ignored.
+The PgWire, socket and Multi cases exercised retained command keys through session reset, rejection of older replacement writers, the fixed deadline across two replacements and availability after the isolation placement closed.
+The simulation library compiled in this run and its scenario integration tests are a separate invocation.
+The directory fixtures now retry or wait for the precise asynchronous operation they depend on, and parser-only fixtures run with replication disabled.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb,s3-key-vault --lib --test cell \
+  -p rtdb-node --test native --test fragments -p rtdb-pgwire --test protocol \
+  -p rtdb-conformance --test node_faults -p rtdb-simulation --no-fail-fast
+----
+
+The machine-local evidence is under
+`/private/tmp/rtdb-formal.QMjPSJsX/gateway-and-key-a997308e7-native.log`,
+`/private/tmp/rtdb-formal.QMjPSJsX/multi-124570088-proofs.log`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/combined-124570088/`.
+
+The combined suite at `124570088` completed successfully with 471 recorded commands.
+Its Lean and Verus cases include the gateway replay laws and controls and the production key enrollment predicate.
+The separate seeded native simulation run passed 13 cases across sessions, storage and the replicated writer.
+Four opt-in simulation cases were ignored.
+The default gateway and storage sweeps each ran 300 seeds with 200 steps per seed.
+The default replicated-writer sweep ran 2,000 seeds with 2,000 steps per seed.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb,s3-key-vault -p rtdb-simulation \
+  --test sessions --test storage --test simulation --no-fail-fast
+----
+
+Command output is in `/private/tmp/rtdb-formal.QMjPSJsX/gateway-simulation-a997308e7.log`.
+
+=== Trie leaf sort and merge through the pinned sort contract
+
+The integrated trie branch adopts Rust's `Ord` interface for the keyed rows so the proof can use the pinned Verus standard-library specification of `sort_unstable`.
+Verus checks total ordering against the same IID and ordinal rank used by the merge.
+The proof delegates the sort implementation's permutation and ordering behavior to that standard-library contract.
+At `cc77b3550`, Verus checked 35 functions and all 14 mutations produced the declared failures.
+The scoped native suites passed 516 tests across trie, format, index and query.
+Those tests include read failure and retry, duplicate preservation and the unchanged contents of the original trie after a failed insertion.
+The runtime system proof of leaf publication remains open. link:../../dev/doc/rtdb-engine-proof-evidence.md[Engine proof evidence]
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query --no-fail-fast
+----
+
+The machine-local command logs and controls are under
+`/private/tmp/rtdb-formal.QMjPSJsX/leaf-refinement-cc77b3550-native.log`
+and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-refinement-cc77b3550-verus/`.
+
+=== Persisted trie leaf order, Java merge, and Arrow slices
+
+The verification branch is integrated through `09fecb74a`.
+At merge `dfbeb7e0d`, the nine audited Lean run-end theorems checked the position of the first exclusive end for covered rows, the preservation of a nonzero slice origin, and the signed cast under its range premise.
+The five negative controls failed at the declared theorems.
+This argument assumes the hit and miss contract of Arrow's binary search.
+
+The persisted-leaf validator is the source called by native import after per-row path validation.
+With stable IID reads, successful validation establishes the all-pairs rank order and a reported inversion follows an ordered prefix.
+The read error result remains tied to one of the supplied row lookups.
+The separate Verus area at `4bcc56278` checked three functions on the pinned release and rejected all four controls at the declared sites. link:../verus/trie_leaf_load/area.json[Persisted-leaf proof]
+
+The focused JVM trie suite at `dfbeb7e0d` passed 15 tests.
+They cover repeated ordinals across runs and retry after an IID lookup error.
+OpenJML 21.0.29 with Z3 5.1.0 checked the production Java merge with the control-flow split annotations in `77027b899`.
+For the solver proof, the ordered inputs and Kotlin comparator contract are premises.
+The first local mutation rerun hit its time limit.
+The revised runner checked the general baseline again and rejected three mutations at the declared obligations: selecting the larger head, dropping an unread suffix, and replacing a right-side value.
+The controls use singleton or empty runs to witness the failure, and the head-selection case follows the affected branch through its order assertion.
+The release archive used in the local check was `openjml-macos-arm64-21.0.29.zip`, SHA-256 `9378a3abb3bb81e0e59edd1241b47da101cb3a14751c38cbcbc86c12b465950d`. https://github.com/OpenJML/OpenJML/releases/tag/21.0.29[OpenJML release]
+
+The native trie, format, index, query and columnar run at `dfbeb7e0d` recorded 590 passes and one failure.
+The failing columnar case measured 88.07 seconds against its 60-second limit while round-tripping nested unions.
+No assertion about a row value or a trie result failed in that run.
+The overall suite therefore did not pass.
+The same test binary recorded 72.70 seconds in the first isolated retry and passed in 49.83 seconds in a second isolated retry.
+The isolated result leaves the original suite result unchanged.
+
+Run the formal cases with the pinned tools described in link:../README.adoc#run-the-studies[the verification runner instructions], and the runtime cases with the commands below.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized ./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked -p rtdb-trie -p rtdb-format \
+  -p rtdb-index -p rtdb-query -p rtdb-columnar --no-fail-fast
+----
+
+Raw formal output is under `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-proofs/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/leaf-load-separated-verus/`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-openjml-final/`.
+The native logs are `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-native.log`,
+`/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-focused.log`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-sampled.log`.
+
+=== Installed trie removal receipts and residence retirement composition
+
+At `a8e16de4f`, the native replica driver binds a trie-removal receipt to its own matching read-back record.
+The driver completes the receipt only after its installed prefix reaches the record and one immutable partition value excludes the requested trie keys from both the current trie catalog and its checkpoint dependencies.
+Pending receipts stay with the owning term and fail on demotion.
+The receipt establishes logical exclusion at a replica position.
+Physical reclamation still requires durable intent tracking, the directory floor and grant, and a provider operation targeted to the certified physical identity.
+
+Verus 0.2026.11.20.9da409b checked five functions in the production decision area and rejected eight single and joint controls at their declared sites.
+The native read-back control sent the reply before prefix publication and failed at the test's pending-receipt assertion.
+The matching baseline and targeted control both ran after rebasing onto the current Arrow and transaction changes.
+The focused Rust suites passed 163 tests across replication, maintenance, and index, including the late reply, remaining live trie, and different read-back cases. link:../verus/trie_removal_receipt/area.json[Receipt proof and controls]
+
+The composed residence model checks one serving view, one admitted provider operation, one installed checkpoint, one recovery cursor, and one fork, over three catalog generations.
+It abstracts provider contents to physical identities, keeps one file shared across adjacent generations, and permits two versions of one logical key.
+TLC exhausts 3,081 reachable states of the baseline and rejects ten deliberate weakenings.
+Loss of an accepted intent before installation and loss after installation fail separately.
+The earliest reply control fails on the third trace state, and loss of an installed intent appears on the fourth.
+Ignoring the installed checkpoint fails on the seventh state. Omitting the fork hold and omitting admitted provider work each fail on the eleventh.
+The reachability check reaches successful collection with the replacement intact on the fourteenth state.
+Apalache 0.63.0 checks the composed safety predicates through ten transitions and independently rejects removal of the checkpoint hold in that bound.
+These are bounded design results. They assume that crash releases local holds only after their operations have stopped. link:../tla/ResidenceRetirement.tla[Composed residence model]
+
+The runner in link:../README.adoc#run-the-studies[the verification instructions] repeats the baseline and controls with the pinned tools.
+Use `--native-replay` to include the early-reply control.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked \
+  -p rtdb-replication -p rtdb-maintenance -p rtdb-index --no-fail-fast
+----
+
+Local command outputs are in `/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-prefix-verus/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-native-control-a8e16de4f/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-prefix-a8e16de4f-native.log`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/residence-retirement-composed-final/`.
+
+=== Durable native trie retirement intents
+
+At `ab9d86162` the collector stages an immutable intent in the opened storage root for each trie batch selected at an installed catalog cut.
+It stages the intents for the table before releasing its files or submitting any removal commands.
+Each receipt preserves the exact serialized intent with the replica position that confirms its removal.
+The collector releases the pending marker only after the installed receipt is durable.
+On reopen, ordinary collection reevaluates a still-present batch, and an already-absent batch can obtain a fresh installed receipt from the successor.
+The lookup validates the intent address and the receipt's embedded bytes.
+A read or validation error prevents effects in that cycle and allows another cycle to retry.
+The intent and its receipt stay in the source residence across forks and cell materialization.
+
+The disk-backed maintenance test reopens the store after stops on either side of installation, confirms that the receipt preserves the exact accepted intent, and replays an already-completed marker without issuing another removal.
+It also checks retry after a failed journal scan.
+The two native mutations fail at the declared assertions when staging is skipped and when replay is disabled.
+The focused Rust suite passed 396 tests across maintenance, replication, Multi and query, including the fork and transfer isolation case.
+Verus checked four functions and rejected four controls on the production receipt predicate, covering journal equality and strict progress past the selected cut. link:../verus/trie_retirement_intent/area.json[Receipt proof and mutations]
+
+The combined formal run at `a8e16de4f` separately completed 503 commands with the pinned toolchain, including the installed trie receipt area and the OpenJML checks.
+That run predates the durable intent area and the composed retirement model.
+The durable intent and composed model results are recorded in their focused runs.
+The default combined run excluded the optional native replay and compile-fail boundary suites.
+
+The retirement journal proves logical removal in storage roots with an installed catalog cut.
+The production reaper still needs certificates that bind exact physical identities and the atomically installed admission floor.
+The legacy timed release records do not supply that authority.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked \
+  -p rtdb-maintenance -p rtdb-replication -p rtdb-multi -p rtdb-query \
+  --lib --test gc --no-fail-fast
+----
+
+The native mutation tests also run with `--native-replay` in link:../README.adoc#run-the-studies[the pinned verification runner].
+The local evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/durable-trie-intent-ab9d86162-native.log`,
+`/private/tmp/rtdb-formal.QMjPSJsX/durable-trie-intent-ab9d86162-controls/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/durable-trie-intent-verus/`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/combined-a8e16de4f/`.
+
+
+== Client system time bounded by the source log
+
+A client-supplied system time must advance the head and must not exceed the source log's append time for its record; otherwise the transaction aborts with `rtdb/future-system-time` at the automatic time.
+History time therefore never leads the log clock, which removes the far-future pinning of later automatic times and the `xtdb/time-overflow` refusal after a write at the maximum timestamp.
+An external source's commit time is clamped to the node clock before smoothing.
+The link:../verus/system_time/laws.rs[system-time area] verifies the admission decision with two new laws: an admitted client time never leads the log, and it always leaves a following chronon when the log time is below the maximum.
+Dropping the log bound fails the decision's contract, and fails both laws when the contract is weakened with it; the runner reported 11 verified functions and the expected diagnostics for all six controls.
+A resolution test refuses a time one microsecond ahead of the log and the maximum timestamp, then commits at the log time and follows the log with the next automatic time.
+The affected tx, node, conformance, Multi, server, pgwire and Flight SQL suites passed after two fixtures that relied on future times were rewritten: the catalog-time test now reaches a head above the log clock by stepping that clock back, and the synthetic simulation tape's external commit times no longer lead its node clock.
+
+== Engine-owned retry receipts
+
+The resolver now decides retries from engine-owned receipts in `xt.idempotency_receipts`, which SQL cannot write.
+A receipt is keyed by the authenticated principal and the idempotency key and records a SHA-256 digest of the operations, timezone, explicit system time and the rest of the metadata.
+It is valid for one hour of system time from its transaction, so every replica decides identically from the logged record.
+A retry with the same body aborts with `rtdb/idempotency-duplicate`, which the node answers with the original's committed outcome; a different body aborts with `rtdb/idempotency-conflict`.
+The public `rtdb_idempotency_keys` table, its sentinel row and the SQL assertion guard are removed.
+A resolver test covers the duplicate, the conflict, another principal's independent identity and expiry at the end of the window.
+The node, Multi and gateway resend tests now resend the same bodies and check that a changed body is refused.
+The affected suites passed 817 of 818 tests; `copy_to_arrow_stream_uses_the_original_read_transaction` times out on the base commit `c165a2a9d` without this change.
+Expired receipts remain in bitemporal history until the metadata-retention increment removes them physically.
+
+
+=== Exact file observations in trie retirement
+
+Production revision `966570ab5` records each retirement batch's logical file plan in the durable intent and installed receipt.
+It records an observed S3 provider namespace, physical key and version for each owned loose file where the backing store supplies a usable version.
+It includes a shared artefact with the final batch retiring members of its group.
+Packed, inherited and archive-backed entries and entries without a usable provider version carry their logical keys only.
+Legacy intents can still be read with no file plan.
+
+The selected Rust suites reported 131 passing cases in maintenance, Multi and S3.
+The native group test recorded its synthetic provider observation exactly once, in the final member batch, and the crash-and-reopen test preserved the file plan.
+The loopback HTTP fixture exercised the production S3 adapter across five HEAD responses.
+It checked the actual encoded request path and the identity returned for an opaque version.
+It observed no version evidence for a missing object or header, an empty version or S3's `null` sentinel.
+The two opt-in S3 integration cases returned at their environment guard.
+A local MinIO binary was unavailable, and no real provider was contacted.
+The isolated native mutation rerun was stopped when available disk space dropped below 4 GiB.
+The new native controls remain registered with the pinned runner. link:../run.py[Native mutation runner]
+
+Verus checked four functions in the exact production classifier and its laws.
+Dropping the empty or null check failed the production postcondition.
+Dropping either check and weakening its contract together failed the matching independent law. link:../verus/s3_object_version/area.json[Verus area and control declarations]
+
+Lean revision `29a5e51da` checked seven theorems with the standard axiom audit.
+Exact selection matching fixes the authorized publication, and exact provider deletion preserves every other identity.
+The witnesses show that logical keys and content digests can repeat across publications and that local keys and version identifiers can repeat across provider namespaces.
+In the alternative naming model, differing naming epochs and differing input digests give distinct names.
+Four controlled weakenings fail at their declared theorems.
+The model assumes that identity encoding is injective over the fields that matter and that the provider implements exact deletion.
+It covers the identity relation for arbitrary lists of publications.
+Reader and recovery coverage and concurrent admission are separate obligations. link:../lean/RetirementIdentity.lean[Lean reference]
+
+The runtime record attests to a provider observation at staging time.
+It does not yet establish that the selected catalog was published with that physical identity.
+The reaper still needs catalog-to-publication binding, reference exclusion, and one atomic installation of the certificate and admission floor.
+Physical erasure still follows the legacy release path.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked \
+  -p rtdb-maintenance -p rtdb-multi -p rtdb-s3 --features rtdb-s3/versioning \
+  --lib --test gc --no-fail-fast
+----
+
+The retained Rust log is `/private/tmp/rtdb-formal.QMjPSJsX/version-observations-native-final2.log`, SHA-256 `d3840d34a8b33f5fbda2932d62c9cec810f71825b474b4d4784117bd8eb03598`.
+Raw proof evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/version-proof-862r1737/` and `/private/tmp/rtdb-formal.QMjPSJsX/identity-lean-geifh20n/`.
+The Lean source SHA-256 is `d3f14c0458d51852f015ecf34481b1da45b2b2de86b811e2eecb1f8301c98c4a`.
+The production Verus input SHA-256 is `9d29767a4279f9d4e022a7e88e7c1a8400dc4349a5c65c44c138bc7f9478a825`.
+
+== Naming epochs for compaction outputs
+
+A compactor reset rewinds the catalog to its L0 tries, after which compaction plans the same positional names again.
+A deletion authorized before the reset, or a file left behind by an interrupted reset, could then meet a newer file under the same name.
+The trie catalog now carries a naming epoch that each reset increments; every compaction output, including the historical outputs of an L0 job, is named in it, as `l02-rc-p0-b00-e01`, and each block persists it for recovery.
+The reset no longer waits for running collection, since a deletion authorized before it cannot reach an output planned after it.
+The native reset test now restarts with compaction enabled, recompacts, and checks that every new compacted file is named in epoch 1 and none reuses a name published before the reset.
+A planning test checks that outputs differ from the pre-reset plan only by epoch, and format tests cover round trips, partition groups and non-canonical epochs.
+The format, index, maintenance, replication, node, conformance, Multi and server suites passed apart from that test before the historical-output fix, and the reset and maintenance suites passed after it.
+
+
+=== Hosted catalog floors and compaction naming epochs
+
+The current Multi writer advances the catalog admission floor from an installed retirement receipt.
+The floor, reader registrations and writer fence use the same versioned directory record.
+An open registration for an older or opaque capture in that storage root and replica journal blocks advancement.
+A new capture at or above the installed floor is admissible, while earlier or untracked captures fail with retryable `rtdb.node/catalog-not-current`.
+The blocked writer retains the pending intent, and a successor can retry from its durable receipt after the captured provider work drains.
+The floor is scoped by residence, root, object namespace and journal, and survives DynamoDB parking.
+Recovery and fork dependencies and physical erasure still use their existing mechanisms.
+
+TLC exhausted 2,112 distinct states to graph depth 15 with one reader, three catalog cuts, one writer replacement and at most six updates of the directory version.
+It rejected four controls that admit an older capture, ignore an opaque hold, skip the reader CAS or skip the floor CAS.
+A separate reachable state witnesses admission of a current reader after the floor advances and the writer changes.
+Apalache independently checked the same safety laws through eight transitions and found the stale-floor-write counterexample.
+The model assumes a linearizable directory CAS and a receipt from an installed replica prefix. link:../tla/CatalogAdmissionFloor.tla[Catalog admission model]
+
+Lean checked four theorems over arbitrary finite lists of registered readers and finite histories of atomic changes.
+Three negative controls removed registration validation, removed held-reader validation, or permitted a rewind.
+Verus checked eleven functions in the exact Rust reader admission module and its laws.
+Fourteen controls failed at their expected proof sites, including six that change the floor boundary or admit an opaque capture. link:../lean/CatalogAdmissionFloor.lean[Ledger invariants] · link:../verus/catalog_reader_admission/area.json[Rust admission contracts]
+
+The epoch-qualified compaction branch on main made physical names distinct across resets.
+The trie catalog now checks a publication against the current naming epoch and requires full trie identity when removing a garbage entry.
+A follower installs the checkpoint's exact catalog and naming epoch together when they differ from its local epoch.
+The Rust tests replay delayed publication and removal across a reset and independently exercise follower checkpoint adoption.
+
+The floor supplies an admission constraint.
+A deletion grant still needs an atomic certificate that binds the selected publication to an exact provider identity and accounts for recovery and fork references.
+Mixed engine versions and live provider qualification remain open.
+
+Raw TLC and Apalache evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-model-uud2967g/`.
+Lean and Verus evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-lean-qqi8n_d2/` and `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-verus-lbknwrrt/`.
+The TLA+ source SHA-256 is `492bf139feb3f65c30b02c1565f1d12e39d8e555113e0d51250e61237d2b94fd`.
+The Lean source SHA-256 is `dc5e01868b1a741791774b336c454c3035ed3d159857c88718f92aef5df79054`.
+The Verus production source SHA-256 is `71d6bc201f6650bec3e3229dd8f26160f37eb1708f2b9acd482cc04e93e837d6`.
+
+The selected Rust suites passed 257 tests with one ignored on production revision `b4798f6a2`.
+They cover the in-memory directory CAS, parked record encoding, intent retry, delayed trie notices and reset checkpoint adoption.
+The local suite used the DynamoDB build configuration without contacting a hosted directory.
+The retained suite log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-admission-floor-and-naming-epochs-b4798f6a2.log`, SHA-256 `a747e3e942b33e4c2d8dba7fd1778815507d366a9c4a2bbf71a82a2258cc9b3d`.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --locked --offline \
+  -p rtdb-index -p rtdb-maintenance -p rtdb-multi -p rtdb-directory -p rtdb-replication \
+  --features rtdb-multi/dynamodb --lib --test gc --test catalogs --test jobs --no-fail-fast
+----
+
+The first isolated floor replay built its test executable and then timed out waiting for Cargo's build lock.
+The built executable passed the exact baseline when run directly.
+The runner now uses Cargo's structured build output to run an exact replay directly when it builds one test executable.
+The pending mutation replay records its commands and outputs in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-replay-final-9o0olj0u/`.
+
+The full Gradle invocation first stopped during root Clojure compilation because Testcontainers could not connect to Docker.
+After starting the installed local Docker Desktop daemon, the full run reached the root tests.
+It recorded 2,802 passes and 396 failures.
+Of those failures, 395 bindings tests had no `xtdb.native.library` configured and the single remaining root failure was an SSL connection setup error in `cross-db-refs-in-dml-5831`.
+A focused rerun supplies the installed local library and repeats the affected root namespace.
+The retained full Gradle logs are `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-before-docker.log` and `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-after-docker.log`.
+
+The exact runner selected the executable from Cargo's artifact report and ran it in the package directory.
+The archived naming-epoch replay passed.
+Re-enabling old-epoch publication and removing the physical identity check each failed at its declared assertion.
+The two controls and exact commands are in the replay evidence directory above.
+
+The focused Gradle retry exited zero with 415 passes using a previously built native library.
+It included all 398 binding tests and all 17 tests in the filtered multi-database namespace, including the earlier SSL setup failure.
+The focused log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-focused.log`.
+A new native-library build from the published source and a full Gradle run using that library are in progress.
+
+=== Direct check of the integrated Multi verification lane
+
+On `b1ee6c84d`, the Multi runner completed all 18 Lean files and 30 TLC configurations, including the expected failures and reachability witness.
+This is model evidence for the merged designs.
+The output is in `/private/tmp/rtdb-formal.QMjPSJsX/merged-main-b1ee6c84d-multi.log`. link:../multi/check.sh[Multi runner]
+
+The earlier full JVM retry compiled an FFI library from `5a891cf09` and ran on `e941898bb`, whose only change between those revisions is the evidence ledger.
+With JDK 25, Docker and that native library, 3,189 of 3,197 cases passed.
+The eight failures were two bindings queries, one coroutine limit in the Roaring serializer test, a PgWire timeout, three compaction waits, and one EDGAR synchronization fixture wait.
+The fresh library run cleared the earlier FFI load and PostgreSQL SSL setup failures.
+The failed suite is recorded in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-with-fresh-ffi.log` and the failure causes remain open.
+
+=== Residence ledger certificates and renewable holds
+
+Lean 4.35.0 checked six theorems for a single retirement in one residence over arbitrary finite histories.
+Issuing a certificate binds the selected provider identity and advances the floor in the ledger revision checked by the proposal.
+Any intervening hold admission, release or head publication invalidates the proposal.
+The proof covers reader, recovery-root and fork holds as well as admissions after issuance.
+Exact deletion preserves every publication required by a live hold if the authenticated retirement has established that all cuts at or after the retirement are independent of the selected identity.
+An eligible unheld retirement can issue a certificate in two transitions.
+Four controls fail at the preservation theorem when a proposal ignores holds or its revision, compares only the physical key, or admits a new hold below the floor.
+Lean audited the six theorems with standard axioms only.
+The evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/lean-retirement-certificate-evidence-3hq1aesf`. link:../lean/RetirementCertificate.lean[Ledger proof and acceptance program]
+
+TLC exhausted 9,074 states for one hold, four possible renewal starts, an abstract clock bounded after all valid deadlines, and at most one outstanding I/O request.
+The model separates renewal submission, ledger publication and acknowledgement.
+It checks reader entitlement and eventual collection after abandonment under fair time, observation, expiry and collection steps.
+The witness reaches collection after an acknowledged renewal.
+Five safety controls reject early expiry, stale observations, a deadline anchored to the reply, a missing I/O fence, and I/O beyond the assumed bound.
+Removing expiry fairness invalidates the progress property.
+TLC output is in `/private/tmp/rtdb-formal.QMjPSJsX/renewed-residence-hold-evidence-disvgsg1`. link:../tla/RenewedResidenceHold.tla[Renewal model]
+
+Z3 excludes expiry overlapping an admitted provider operation when the margin is at least twice the fractional clock drift times the timeout plus the maximum real duration of provider use.
+The formula allows separate monotonic clocks with different rates, requires the first observation to follow renewal start, and bounds each rate relative to physical time.
+Dropping either term yields a satisfiable overlap.
+The deployed clock-drift and provider-duration bounds, complete recovery-root manifests, the production certificate path and the collector's typestate enforcement are still open. link:../smt/residence-clock-margin.smt2[Margin constraints and controls]
+
+=== Binding hosted compaction retirement to an exact publication
+
+The Rust compactor requests a publication version for each output data and metadata file.
+The remote adapter takes a new version from the conditional write response.
+It takes the version of identical existing bytes from the same GET response that it read and compared.
+For uncertain multipart completion it accepts a version only when the read-back metadata identifies that upload attempt.
+The S3 adapter extracts the version from the multipart completion response. link:https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html#API_CompleteMultipartUpload_ResponseElements[S3 completion response] · link:https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_ResponseElements[S3 object read response]
+
+The trie notification and checkpoint catalog carry the exact provider namespace, physical key and version for each witnessed file.
+The fields survive transition to garbage.
+A retirement intent marks an observation as a publication match only if all of that identity equals the selected catalog record.
+Files inherited or restored from another residence, packed entries, and older trie records can lack publication evidence.
+Shared artefacts still need their own publication binding and reference proof.
+The new evidence applies to GC-1 and GC-2 at the publication boundary.
+Certificate issuance, recovery and fork reachability, and version-selective physical erasure remain open.
+
+TLC exhausted 50 distinct states with three possible provider versions, one write attempt, one later replacement, and one retirement observation.
+The model reaches both a lost-reply confirmation and a retry of identical bytes with a different version.
+Four controls fail at their named invariants.
+They substitute a later HEAD result for the write acknowledgement or for the verified read, omit the attempt check, or match retirement by key.
+Apalache independently checked the baseline through six transitions and found the later-HEAD counterexample.
+The model assumes authenticated provider responses and distinct non-null version IDs at one physical key. link:../tla/PublicationVersion.tla[Model and controls]
+
+The model evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/publication-version-model-ayvhb1fb/`.
+
+The scoped Rust suite on pre-rebase commit `af106a821` passed all 233 cases across storage, S3, maintenance, replication, and Multi.
+It included the publication acknowledgement, verified existing-object read, lost multipart acknowledgement, and catalog retirement fixtures.
+The JVM `:xtdb-core:testClasses` task on the same commit regenerated Protobuf sources and compiled Java and Kotlin production and test code.
+These runs are recorded in `catalog-publication-versions-af106a821-native.log` and `publication-version-jvm-schema.log` under the evidence directory's parent.
+The MinIO image could not be pulled, so the optional versioned-provider fixture did not run against a server.
+The final rebased commit `4e53c43e2` passed 237 scoped Rust cases.
+The exact-source native runner replayed both new fixtures and rejected the two controls at their expected assertions.
+Those controls substitute a later HEAD version for the version from the verified GET, or treat any observed version as equivalent to the catalog receipt.
+The final logs are `catalog-publication-versions-4e53c43e2-native.log` and `native-publication-version-4e53c43e2-q760kna8/` in the evidence directory's parent.
+The rebased JVM schema run at `92aa7a7d7` also compiled all Core Java and Kotlin sources and test classes with the new Protobuf definitions.
+The final rebase left those JVM and Protobuf inputs byte-for-byte unchanged.
+The full JVM behavior result from the preceding section remains separate.
+
+The archived naming-epoch, admission-floor and durable-intent fixtures also completed at the prior integration boundary.
+Both naming controls, both floor controls and all four durable-intent controls failed at the declared assertions.
+The archived command records are in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-replay-final-9o0olj0u/`.
+
+=== Document ownership in a shared search file
+
+A shared file's member directory stores cumulative document starts.
+An empty member can share the next member's starting ordinal.
+Lean 4.36.0 audited four theorems comparing a lookup in this directory with a linear walk over the member counts.
+Every document ordinal in the file has a member, and the directory chooses that same one.
+Two controls reject an exclusive lower bound and collapsing empty members before assigning member ordinals. link:../lean/SearchMemberBounds.lean[Offset proof]
+
+Verus checks the exact Rust search used by the sidecar for nondecreasing starts beginning at zero.
+It proves index bounds and selection of the last start at or before the queried ordinal.
+The first control fails the binary search's invariant after an inclusive comparison becomes exclusive.
+The joint control picks the first eligible member and weakens the function's contract to allow that answer.
+The law still requires the member that contains the offset and fails at its postcondition.
+The sidecar parser validates the zero start and adjacent ordering before the search is reachable.
+The model takes the writer's member counts and the posting's ordinal as inputs.
+Proof of the entire sidecar codec and the shared-file ranking frontier remains open.
+The command records are in `/private/tmp/rtdb-formal.QMjPSJsX/search-member-proof-evidence-xa4nofps/`. link:../verus/search_member/area.json[Production proof and controls]
+The scoped native suite passed 66 cases, including all 19 node search tests and both the shared-file member fixture and the selected-member ranking and corpus fixture.
+The native output is in `/private/tmp/rtdb-formal.QMjPSJsX/search-member-ownership-native.log`.
+
+[source,sh]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --locked --offline -p rtdb-search -p rtdb-node \
+  --lib --test search --no-fail-fast
+----
+
+=== When a collector can release an abandoned reader's files
+
+Lean 4.36.0 checked five theorems for a collector whose decisions depend on its observations up to a sweep.
+If for each finite sweep an admissible execution still using the bytes has exactly the observations of the abandoned execution, any safe decision leaves the files allocated in the abandoned execution.
+Two acceptance programs meet both obligations under different premises.
+A timed policy collects at a verified upper bound on outstanding use.
+A drain policy collects once it observes a sound confirmation that the last outstanding use ended.
+Two controls reject advancing the timed bound and accepting an unconfirmed drain.
+These are theorems about the observation contract and its premises.
+Provider duration and drain evidence still need to be established for each production collector.
+The command records and diagnostics are in `/private/tmp/rtdb-formal.QMjPSJsX/lean-reader-reclamation-minimality-nknjb4oi/`. link:../lean/ReaderReclamationMinimality.lean[Reclamation proof and acceptance programs]
+
+=== Integrated verifier and simulation reruns
+
+On `7174d3295`, the combined runner completed 176 Lean and 178 TLC cases, including baselines, reachability witnesses and expected failures.
+Verus then reported three assertions for the deliberately swapped trie children, while the manifest listed two.
+The additional diagnostic was the row-accounting assertion in the same function.
+The production baseline passed.
+The scoped IID area rerun confirmed the three diagnostics and all its other expectations before the manifest correction landed in `134b5be71`.
+The full Verus lane on that revision completed 205 cases across 34 areas, including the new shared-search area.
+The mCRL2 and AutoHyper checkpoint checks on the same sources also completed their baselines and controls.
+Their command records are under the `merged-main-134b5be71-verus-and-process-*` evidence directory.
+
+On `f29b333e6`, the OpenJML, Z3, Alloy, Apalache and Maude lanes completed their baselines and controls, including the exact-version and clock-margin studies.
+A scoped launcher used incomplete arguments for mCRL2 after the Maude step.
+The successful separate process run supplied the three executable paths explicitly.
+The independent lanes retain their output under `merged-main-f29b333e6-independent-models-*`.
+These results span several revisions and leave the final single-tree verification gate open. link:../PROGRAMME.md[Workstream evidence and exit gates]
+
+The Gradle property and simulation run used the worktree for `63bfb280c`, JDK 25 and the reused native library from `5a891cf09`.
+All 3,348 recorded cases passed.
+They comprise 27 root tests, 3,315 core tests and simulations, and six PostgreSQL source properties and simulations.
+The core reports include 33 simulation methods with 100 iterations each.
+The Gradle log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-publication-and-search-property-test.log`.
+The prior full JVM suite's eight failures remain open.
+
+=== Publication identity for shared artefacts
+
+The native search builder records the provider response's exact identity when a publication supplies it.
+The artefact record travels through the existing log and checkpoint catalog.
+The trie collector binds an individual artefact to its recorded version.
+For a group file it also requires every remaining record for that same file to carry the same identity.
+An idempotent upload can return a successful binding.
+A replacement, a mixed group, a record without publication evidence, or a file without any retained record stays unbound.
+The binding adds evidence for the retirement intent.
+The effect certificate, fork coverage and definition-lane retirement remain open.
+
+Lean 4.36.0 audited five theorems about agreement over arbitrary lists of held records.
+Two controls reject accepting a group with no witness and trusting any one member.
+The native group fixture supersedes one sibling, then the other three.
+The group files survive the first collection and enter the last batch's receipt only once.
+The fixture checks provider observations for groups whose records agree, disagree or lack a version.
+The 132-case scoped Rust run passed, and the JVM Core schema build regenerated Protobuf classes and compiled the production and test sources.
+The logs are `group-artefacts-publication-native.log` and `group-artefacts-publication-jvm-schema.log` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+The Lean evidence is under `group-publication-lean-evidence-b8nfzkav/` in the same directory. link:../lean/GroupPublication.lean[Group binding laws]
+The selected native replay ran the two trie publication checks and the shared artefact fixture against an isolated source copy, then rejected all three controls at their named assertions.
+The shared-file control trusts the first member despite conflicting retained records.
+The command records are under `native-group-publication-controls-qy2o5ni5/` in the same evidence directory.
+
+=== Combined model and production-decision run
+
+The combined local runner exited zero on the pinned main revision `90e8a2401`.
+The run includes Lean, TLC, Verus, OpenJML, Z3, Alloy, Apalache, Maude, mCRL2 and AutoHyper.
+It retained 632 command records, the exact revision and tool hashes in `run.json`, and input hashes in `inputs.json`.
+Its evidence directory is `/private/tmp/rtdb-formal.QMjPSJsX/merged-main-90e8a2401-models/`.
+This invocation covers the formal and model lanes.
+The separate native and JVM results above cover their stated paths and revisions.
+
+The subsequent `3409d499d` stage adds shared-artefact publication evidence.
+Its Lean, native and JVM schema results are recorded in the preceding section.
+Six files in the combined run's recorded inputs changed in that stage, including the schema, collector, fixtures and runner.
+The runner now also hashes the search file reader and search artefact builder.
+The final product-wide refinement and native qualification remain open.
+
+The optional versioned-provider fixture remains pending.
+The Docker image pulls and the direct attempt to obtain the published MinIO checksums failed.
+The official checksum requests returned HTTP 410. link:https://dl.min.io/server/minio/release/darwin-arm64/archive/[MinIO archive]
+
+=== Hosted trie release handoff
+
+The hosted trie collector stages the file plan, waits for the replica removal to install, persists a matching receipt, and advances or observes the catalog admission floor before it queues file releases.
+A blocked floor leaves the plan pending.
+If a release fails, the next collector can read the same plan and receipt, confirm floor coverage and retry the handoff.
+Artefacts and data precede metadata within a batch.
+Classic stores still use the existing collection path.
+
+TLC explored all 19 distinct states for one retirement, two files, one older reader and an interrupted release.
+It rejected four weakened rules at their named invariants, and found a trace that finishes the interrupted release and removes the pending plan.
+Apalache checked the safety conjunction through nine transitions and rejected discarding the plan after releasing only one file.
+The run records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-models-a6o8twnq/`. link:../tla/HostedTrieRelease.tla[Handoff model]
+
+Lean 4.36.0 audited four theorems covering release authority, retention of unfinished plans and file accounting for arbitrary lists and finite histories.
+Each corresponding step law rejected its control, which queues before the floor, discards an unfinished plan, or silently loses an unreleased file.
+The Lean model takes the installed receipt and floor as abstract transitions. It does not prove the hosted floor implementation or provider actions.
+The run records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-lean-1kfnxzyx/`. link:../lean/HostedTrieRelease.lean[Unbounded handoff laws]
+
+The Rust storage, maintenance and Multi suite selections passed 252 cases on parent `5f41a7d13` with this change.
+They include the local restart replay, classic GC tests, and hosted directory and cell tests.
+One optional test was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/hosted-retirement-release-5f41-rust.log`.
+The exact restart replay passed on parent `f71c07a0c` with this change.
+Seven mutations failed at their declared assertions, including queueing before installation and losing the plan on partial release.
+The per-case native build and test records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-native-en304von/`.
+The Verus lane completed all 35 area baselines and 173 controls against the sources in `dadbcaecf`.
+It includes the exact production receipt, catalog admission and cutoff decisions.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-current-verus-ya6bug80/`.
+
+The combined JVM test and property run used the JVM sources from parent `5f41a7d13` and the native library from `5a891cf09`.
+It recorded 6,503 passes and nine failures.
+All 3,315 core property and simulation cases passed.
+Six PostgreSQL source property cases failed in Docker fixture setup, and the root authentication fixture could not download its Keycloak image.
+The root property task also failed during Docker-dependent test discovery before recording any cases.
+Two read-only node tests timed out while waiting for source progress.
+The source-progress failures were observed with the reused native library.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/hosted-retirement-release-5f41-jvm-test-and-property.log`.
+
+The local FFI library was rebuilt from `818a6dfd5`. Its SHA-256 is `1e9c14a9f944260fd10cd1f4edb76240e92921e412b0c9c4f2d16822f2c3f004`.
+All six read-only node tests passed in a focused rerun with that library, including the two cases that timed out in the combined invocation.
+The build and test logs are `hosted-retirement-release-dadb-ffi-build.log` and `hosted-release-fresh-ffi-read-only.log` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+With Docker Desktop available, the focused fixture run passed eight authentication tests, 27 root property tests and all six PostgreSQL source properties and simulations.
+The fixture run used the same rebuilt library and recorded no skips.
+The log is `hosted-release-fresh-ffi-docker-fixtures.log` in the same directory.
+The combined invocation remains recorded with its original failure status.
+
+The handoff controls new release markers from the hosted trie collector.
+The downstream reaper still acts on logical keys and its grace period.
+An exact deletion certificate still needs recovery and fork dependency coverage and enforcement at the provider effect.
+
+== Structural review follow-through
+
+The native score path now evaluates two-argument `SEARCH_SCORE` from the document and query, with unit weights and length normalization.
+Five-argument BM25 consumes caller-provided statistics.
+The native search suite passed 19 cases, including ranking across partitions, alternate MATCH plans, dropping the index, unrelated rows, historical visibility and explicit statistics.
+The Z3 rank-arithmetic check passed all five baseline obligations and found the expected counterexamples for missing padding and incorrect minimum length.
+The affected Rust crate suites passed 1,889 tests with one ignored.
+The serial Gradle suite passed all 3,198 tests using the locally rebuilt Rust FFI library from the scoring change on parent `5adef2c18`.
+
+TLC checked the new bounded design models below.
+They specify target protocols and leave native refinement open.
+
+[cols="1,1,3",options="header"]
+|===
+|Model |Distinct states |Controls and reachability
+
+|PlacedServingAuthority
+|181,080
+|Reusing the intake slot and issuing a basis before commit each violates the intended identity invariant.
+A sealed loglet, a missing quorum read, or a missing apply wait each admits a stale reply.
+A reachability check finds a completed write and fresh read during a directory outage.
+The model assumes a correct committed prefix and active-loglet check and bounds the state space to two epochs, two intake slots per epoch and one read.
+
+|ErasureCustody
+|136
+|Skipping the successor, retaining a copied key, sharing an export key, accepting an unresolved copy, and suppressing deadline progress each violates its safety or progress property.
+A reachability check finds expiry with a resolved copy, both kinds of fork and a held old view.
+The model has one source domain, one detached key, one provider copy and an abstract two-tick grant expiry with weak fairness.
+Provider timing, backup inventory, cache fences and production transitions remain open.
+
+|KeyLineageEnrollment
+|39
+|Trusting missing directory history permits re-enrollment over orphaned ciphertext.
+Installing a different attempt or forgetting a withdrawal violates the anchor binding or terminal withdrawal invariant.
+A reachability check opens an existing key after directory history is lost.
+The model assumes an independent durable anchor for one lineage and two possible enrollment attempts.
+|===
+
+The existing fixed-ensemble recovery model passed all 342,407 reachable states under its declared bounds.
+It covers promises, acknowledged writes, partial repair and checkpoint-authorized trim.
+The remaining composition must cover loglet moves, the read index and production effects.
+
+The main runner includes the three new baselines and their controls.
+See link:../redesign/authority-boundaries.md[Authority boundaries] and link:../redesign/R7-eraser.md[History collection and privacy erasure].
+
+=== Hosted checkpoint identity through recovery retries
+
+The directory admission now passes the published block number and replica boundary to ordinary hosted recovery and exact hosted snapshot opens.
+The loader checks the stored root before reading its table metadata.
+The admitted block must carry the same boundary. A successor must advance both coordinates in the admitted replica epoch.
+The replay retry retains its last accepted checkpoint as the next bound, and refuses a configured log from a different epoch.
+Archive restore retains its explicit checkpoint and replay cutoff.
+
+The Verus checkpoint-discovery area verified nine functions and rejected eight single and joint controls at their declared sites.
+The checked Rust function operates on boundary offsets normalized to the admitted journal by the loader.
+The Verus run is under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-verus-gvrwmrr9/`. link:../verus/checkpoint_discovery/proof.rs[Production inclusion]
+TLC explored 21 distinct states with one published checkpoint, six candidate observations, two journal epochs and one replay restart.
+Four controls failed at the expected safety properties, and the reachability witness opened a later boundary after a prefix gap.
+Apalache checked five transitions and independently caught a retry that discarded its last accepted boundary.
+The model records are under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-models-08wq7qne/`. link:../tla/PublishedCheckpoint.tla[Model and controls]
+Lean 4.36.0 audited five theorems about exact matches, forward movement, same-journal selection, composition and arbitrary finite retry histories.
+All five rule mutations failed at their named laws.
+The run is under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-lean-7r6lkbg4/`. link:../lean/PublishedCheckpoint.lean[Transition and history laws]
+
+The replication and Multi selections passed 268 native cases on parent `d78a8fce2` with this change, including the hosted cell suite.
+One optional test was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-d78-rust.log`.
+The two exact startup replays passed.
+Four mutations failed at their named assertions, including dropping the admitted coordinate on a replay retry and opening a different log epoch.
+The command records are under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-native-qjh0b8pb/`.
+The five conformance tests selected by `node_faults recovery` also passed on the same parent, including restart, root and table collection overlap, and tiered publication.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-d78-conformance.log`.
+The standard JVM test run executed nine test tasks and passed 3,198 cases with no failures or skips.
+It used the JVM inputs at parent `d78a8fce2` and the native library from `818a6dfd5`.
+Both previously timed-out read-only cases and all authentication tests ran successfully.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-d78-jvm.log`.
+After rebasing onto `7f9bc1573`, the replication crate rebuilt and both new hosted checkpoint replays passed again.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-7f9-rust.log`.
+
+This establishes the hosted recovery coordinate under the existing deployment-to-log configuration binding.
+The root's full dependency manifest, protection of that manifest across reaping and fork creation, and archive-specific refinement remain open.
+
+=== Logkeeper confirmation uses synced journal votes
+
+A positive holder confirmation now requires the server's promised and synced epochs to match the request.
+The explicit check waits behind already-queued journal writes and emits no journal event.
+The request has a distinct wire tag from the legacy seal-only check.
+
+The native logkeeper suite passed 61 cases and left one throughput benchmark ignored.
+The regression replaced two journals with blank journals at the same addresses and required the holder's check to fail.
+Switching the client back to the seal-only check let that blank quorum confirm and failed the regression.
+A journal-queue test checked that the confirmation waits behind the epoch installation.
+All 85 native Multi cell tests and all 3,198 tests in the serial full Gradle run passed on the rebased tree.
+The separate requirements for subscriber read indexes remain in link:../redesign/authority-boundaries.md[Authority boundaries].
+
+=== Active loglet read-index model
+
+TLC explored 74,981 reachable states with two overlapping three-journal ensembles, two positions, one move and one read.
+Replacing exact activation with predecessor sync, or using only the published commit watermark, each admitted a read bound below an already acknowledged write.
+Reachability checks found a read served after the move and a speculative bound that must wait for progress.
+The model treats sealing and activation as atomic stages.
+Native subscriber integration and the production refinement for those stages were tracked separately. link:../tla/ActiveLogletReadIndex.tla[Active loglet model]
+
+=== Native active loglet read indexes
+
+The writer activates its exact ensemble after recovery and installs the same activation on repaired journals.
+An activation survives journal replay and compaction and is revoked by a higher epoch promise.
+A read index uses an intersecting quorum of matching durable activations and returns the largest held position.
+The native logkeeper suite passed 63 tests with one throughput benchmark ignored.
+The tests cover two overlapping ensembles, a completed append with unpublished commit watermarks and activation replay across compaction.
+The predecessor test fails when a synced replica can vote without matching the activated ensemble.
+The unpublished append test fails when a vote reports the published commit watermark as its bound.
+The default native simulation suite passed 13 tests with four longer sweeps ignored.
+The logkeeper suite passed again after the rebase and all 85 native Multi cell tests passed.
+The serial Gradle run executed nine test tasks and passed all 3,198 tests without failures or skips.
+Gradle property testing passed all 3,348 cases without failures or skips.
+This increment supplied the bounds later used by subscriber reads.
+
+=== Linearizable subscriber basis capture
+
+The attached replica log supplies a read index for implicit bases on deployments with linearizable reads enabled.
+The subscriber waits for its installed replica prefix before capturing the time basis.
+Within an explicit read transaction the pinned basis is retained.
+The gateway recognizes a freshness refusal before a response and retries it on the holder when ReadyForQuery reports idle.
+
+The native Node and Multi suites passed 358 cases, including the installed-prefix wait, refusal after sealing, and holder fallback with an idle backend.
+After rebasing over `182eb4cdf`, the Node, Multi and Flight SQL selections passed 465 cases.
+The basis test also checks an explicit historical basis and a pinned read transaction.
+The fallback test checks that an open read transaction receives the freshness refusal.
+The native basis test failed both when it captured an older basis before logkeeper confirmation and when it treated an unapplied bound as ready.
+The extended TLC model explored 100,508 reachable states.
+Skipping the apply wait and capturing the basis before confirmation each violated the served-prefix invariant.
+The previous activation and watermark controls still failed at their named bounds, and both reachability probes still found witnesses. link:../tla/ActiveLogletReadIndex.tla[Active loglet model]
+The full Gradle suite ran against the JNI library rebuilt on parent `f536956ed` and passed all 3,198 cases.
+
+=== Scoped placed attempt outcome witnesses
+
+Placed intake encodes the current replica history, writer epoch and a fresh nonce.
+Resolution combines that seed with the record's source position and authenticated principal.
+Every resolved placed result carries its attempt identity and its indexed outcome witness in the same delta.
+The witness uses the intake timestamp for its one-hour logical validity window.
+Copied fork tails omit the parent's attempt identity and witness.
+
+The native Multi replay checks a committed transaction and an abort, reads their identities from the sealed journal, and verifies their outcome witnesses after the checkpoint's prefix is trimmed and the deployment reopens.
+The skipped-transaction test archives a malformed operation stream and retains its scoped abort outcome.
+The selected Rust suites passed 628 cases.
+On parent `ab41896bc`, the expanded Rust run passed 737 cases, including Flight SQL and statement tests.
+Removing the outcome witness from the resolver failed the native test at its replica-frame assertion.
+The small TLC model covered 1,505 states and found a restored witness.
+It rejected an early witness, a witness lost at recovery, and lookups that disregard history, writer epoch or principal. link:../tla/PlacedAttemptOutcome.tla[Placed attempt outcome model]
+The model assumes distinct encoded identities and atomic resolved-delta application.
+The existing placed serving model checked 181,080 states and rejected the control that identifies two attempts by their reused intake slot.
+The combined Gradle run against the rebuilt JNI library on parent `d9eb3a115` passed 3,198 standard tests and 3,348 property cases.
+Public receipt issuance, redemption and physical expiry remain open.
+
+=== Table metadata bindings in checkpoint roots
+
+The Rust block producer now writes an OID-keyed SHA-256 manifest in each new checkpoint root.
+It hashes the exact encoded bytes passed to the table metadata write and publishes the root after all those writes complete.
+The Rust loader requires exactly the registered OIDs and validates each table block before decoding it.
+It checks the logical bytes returned by storage, including after decryption or unpacking.
+Older roots without a manifest retain the existing read path.
+
+Lean 4.36.0 audited four theorems about exact registry coverage, acceptance of the written metadata, equality of an accepted table block under the stated pairwise digest premise, and preservation of any dependencies derived from those bytes.
+The two mutations admit unregistered tables or accept any block at the expected path and fail at their declared laws. link:../lean/CheckpointTableManifest.lean[Table binding laws]
+TLC explored all 17 states for two tables, each with a write, confirmation and possible wrong-byte observation.
+It rejected premature root publication and accepting valid metadata under the wrong registered path, and reached an open complete checkpoint.
+Apalache checked eight transitions and independently rejected the path-only acceptance rule.
+The model and Lean records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-models-mlaewjgq/`. link:../tla/CheckpointTableManifest.tla[Publication and recovery model]
+
+The Rust format and replication selections passed 85 cases on parent `81585e972` with this change.
+The two exact native replays passed, and three mutations failed at their named assertions for OID coverage, writer binding and reader verification.
+The suite log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-81585-rust.log`, and the per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-native-6ek4vi0w/`.
+The nine existing checkpoint recovery conformance cases passed with the new manifest.
+Publishing the root before the table writes and refusing to refresh discovery still triggered the expected failures.
+The conformance records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-manifest-recovery-warm-d71ns30n/`.
+The JVM build regenerated core Protobuf and recompiled Kotlin and Java with the new field.
+All 3,198 standard JVM cases passed with the reused native library from `818a6dfd5`.
+The Rust replay exercises the new writer and verifier.
+The JVM log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-81585-jvm.log`.
+
+The manifest validates table metadata relative to trusted root bytes.
+The root's exact provider identity, payload and artefact publication bindings, and joint root-and-suffix retention still need evidence and enforcement.
+
+=== Fresh storage evidence for packed recovery
+
+A fresh metadata or byte read through Multi resolves a packed entry through its backing storage object.
+The metadata read checks that the observed containing object can cover the requested entry.
+Index admission checks every entry against the payload boundary, and an encrypted retry of an interrupted pack write must reach storage before returning success.
+A new confirmation of the recovered current checkpoint checks the root, registered table metadata and newly written level-zero objects, matching the preparation already used for historical candidates.
+
+Verus checked the production extent predicate and three laws for all representable offsets, lengths and payload limits.
+Four single and joint controls failed at their declared diagnostics.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-extent-verus-b749266v/`. link:../verus/pack_extent/proof.rs[Production inclusion]
+TLC explored 16 reachable states for one checkpoint pack and verified storage presence at observation.
+The staged-data and cached-index controls violated this property.
+The separate requirement for presence at submission failed when collection could occur between a valid observation and submission.
+With a hold through submission, TLC checked all 12 reachable states and reached a successful submission.
+Apalache independently checked both passing invariants through seven transitions and found the submission counterexample in the comparison without a hold.
+The model records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-models-8h89mb9v/`. link:../tla/CheckpointPackEvidence.tla[Model and controls]
+The combined Verus rerun checked all 36 area baselines and 181 controls after rebasing onto `5f4843201`.
+The packed-checkpoint and active-loglet TLC cases and all three packed-checkpoint Apalache cases also completed on this tree.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-current-verus-uxjzx6rt/` and `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-current-models-y4zsqpe7/`.
+
+The Multi and replication selections passed 273 native cases on parent `385264ff6` with this change, including 85 cell integration cases.
+One optional case was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/durable-packed-checkpoint-385-rust-final.log`.
+Four exact Rust replays passed after the retry test's assertion order was finalized.
+Five mutations failed at their declared assertions for staged evidence, cached evidence, index bounds, freshness forwarding and missing-root confirmation.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-native-p21jyckl/`.
+All 273 affected Rust cases passed again after rebasing onto `5f4843201`, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-5f484-rust.log`.
+After rebasing onto `eab2ad468`, the seven packing tests and the exact promotion replay passed again.
+Their logs are `checkpoint-pack-evidence-eab-packing.log` and `checkpoint-pack-evidence-eab-promotion.log` in the same evidence directory.
+The standard JVM suite on the `eab2ad468` tree with this change ran nine test tasks and passed all 3,198 cases.
+It used the FFI library built with the checkpoint change on parent `5f4843201`, SHA-256 `693454cc67b75c923d33b0f63cf1b9243eeda61ac7e97bd7b2be4dd567ed68d1`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-eab-jvm.log`.
+
+The checked production behaviour establishes backing-object presence at the read under the store's immutable-object contract.
+Exact provider publication identity, complete transitive checkpoint coverage and a joint hold through confirmation and replay remain open.
+
+=== Physical publication identity in packed reads
+
+The versioned S3 adapter returns each HEAD or range result with the physical identity from that response.
+The packing adapter matches those identities across the header, trailer, index and requested member range.
+Its write path records the version returned by the conditional pack publication.
+On a publication conflict it admits an existing pack only after comparing the prepared bytes with ranges from one verified physical version.
+A loaded index cannot be reused for a different version at the same path.
+A fork whose reference moves to an owned copy checks that copy's index and binds the returned bytes to its version.
+
+TLC checked all 44 states with one pack, a cold or cached index, and one change to absence, another version at the same path, or a fork copy.
+It rejected five weakened rules and reached both a cold read and a checked read of the copy.
+Apalache checked coherence through six transitions and independently found the mixed-member and stale-copy-index counterexamples.
+The model records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-models-2xow2f23/`. link:../tla/PackPublicationObservation.tla[Model and controls]
+Lean 4.36.0 proved one-step preservation and preservation over arbitrary finite schedules in the abstract versioned read, over an arbitrary provider identity type.
+Three controls fail at the preservation law when the trailer, index or member check is dropped.
+The Lean records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-lean-n1ba_r4j/`. link:../lean/PackPublicationObservation.lean[Schedule laws]
+The combined Verus run passed all 36 area baselines and matched all 181 controls on the rebased tree, including the production pack extent predicate.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-verus-n2_qzwf9/`.
+
+The affected Rust selections passed 310 cases on parent `b55c2e013` with this change, including 85 Multi cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-b55-rust-retry.log`.
+The provider replay checks the S3 HTTP adapter against a local endpoint with distinct metadata and range version identifiers.
+After rebasing onto `f536956ed`, nine exact Rust replays passed and all eleven mutations failed at their declared assertions.
+The new controls cover trailer, index and payload identity, a changed version at one path, index reuse after a fork transfer, and missing version evidence from the ranged response.
+The native records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-native-bi498ewy/`.
+The four affected crate suites and Multi cell integration passed 319 cases on that parent, including 93 cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-f536-rust.log`.
+The same 319 tests passed after rebasing onto `182eb4cdf`, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-182-rust.log`.
+Five native checkpoint recovery cases passed on the same tree, covering interrupted publication, replay and collection overlap.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-182-recovery-conformance.log`.
+The standard JVM suite on parent `f536956ed` with this change passed 3,198 cases across nine tasks, with no skips.
+It used the library rebuilt from that tree, SHA-256 `8ac402c381aff7ba99fddb46a727d34f9a4382bc09470c22fa523d2297665765`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-f536-jvm.log`.
+After the subscriber-freshness rebase onto `ea5265f16`, the affected Rust selections passed 321 cases, including 95 Multi cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-ea-rust.log`.
+
+The checked property covers coherence within a versioned pack observation and across use of a cached pack index.
+For a transferred fork reference it assumes the reference and copy path preserves the logical data.
+Stores without a provider identity rely on the immutable-object contract.
+Cold directory admission still needs a durable receipt for the exact selected publication, its dependency closure and the joint checkpoint-and-suffix hold.
+
+=== Directory root receipts and the startup replay hold
+
+The directory now records the SHA-256 digest carried by the adopted block, alongside its block and journal coordinates.
+The producer binds the bytes it writes, and adoption or publication retry reads the current stored root.
+Receipt-bearing cold opens read the exact admitted block and verify its fresh logical bytes before following any table pointers.
+A newer stored root requires its own directory admission, including after an unexpected replay gap.
+Current archive capture and fork copies check the logical root binding when one is present.
+
+Ordinary hosted startup installs the metadata hold and its first required replica offset in one directory compare-and-replace.
+The admission checks previously authorized trim before registering, and the trimmer accounts for both startup regions and active replay cursors.
+The startup registration is cleared after cursor admission and after its owned provider effects drain.
+
+TLC explored all 222 states for two successively published roots, one startup, one replay cursor and a delayed retirement plan.
+It rejected five weakened rules and reached successful recovery followed by collection and trim.
+Apalache checked ten transitions and found counterexamples for an omitted startup suffix hold and a gap before cursor admission.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-models-d47w9gbf/`. link:../tla/ReceiptedCheckpointStartup.tla[Model and controls]
+Lean 4.36.0 proved preservation in one abstract effect and over arbitrary finite schedules and natural offsets, under the declared collection and trim guards.
+The two controls drop one guard each and fail at the preservation law.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-lean-87lflwhx/`. link:../lean/ReceiptedCheckpointStartup.lean[Schedule laws]
+The combined Verus pass checked 36 areas and matched all 181 controls, including the production decisions for the first retained range and trimming below holds.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-verus-mrrzcuy4/`.
+
+The initial affected crate, cell and conformance run passed 413 cases on parent `d9eb3a115` after accounting for the new receipt's encoding size, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-d9-rust-retry.log`.
+After rebasing onto `ab41896bc`, six exact receipt replays passed and eight mutations failed at their named assertions.
+The native controls cover receipt publication, changed bytes, warm cache bypass, admitted root selection, retry after a gap, prior trim, and acquisition and release of the startup suffix hold.
+The existing metadata and replica-retention replays also passed, with both collection controls failing as expected.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-native-t5oxiq9x/`.
+The affected Rust suites also passed all 413 cases on `ab41896bc` with the final sources, including 95 hosted cell cases and eight node-fault cases.
+One optional case was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-ab4-rust.log`.
+The storage and gateway-session simulations passed eight cases with three optional cases ignored after adapting the simulation router to the holder-routing contract.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-ab4-simulation-fixed.log`.
+The standard JVM run passed 3,198 cases on `ab41896bc` with the receipt change and rebuilt FFI library, SHA-256 `e3645927398efe1c5ff3e30c6c71f49b55df2becadb3432fbf03a20a6cfcd643`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-ab4-jvm.log`.
+The affected Rust selections passed 414 cases after rebasing onto `4095189a7`, including 96 hosted cell cases and the scoped attempt outcome replay.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-409-rust.log`.
+The storage and session simulations also passed all eight selected cases on that tree, with three optional sweeps ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-409-simulation.log`.
+The standard JVM run on `4095189a7` regenerated the updated log Protobuf classes, recompiled core Kotlin and Java, and passed all 3,198 cases.
+Its FFI library SHA-256 is `265f0176da3562253dc8924ab3662d5e853f6ca13e579c5fbbc088a085d8f27b`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-409-jvm.log`.
+The combined TLC rerun on that tree checked the existing scoped attempt outcome model and the new startup model with their declared controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-models-ymmurzsx/`.
+After the Arrow and ranked-search rebase onto `1a45f529b`, all 23 focused checkpoint tests passed, including nine hosted cell cases.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-1a45-rust.log`.
+The compact directory test preserves the existing under-300-byte bound for the old shape and separately checks the exact 34-byte cost of a SHA-256 receipt in its fixtures.
+The fixture with journal custody is 306 bytes with its receipt.
+
+The receipt authenticates logical bytes under the SHA-256 premise and assumes directory writers preserve the receipt and startup hold fields.
+The startup guarantee covers the metadata root and existing replay suffix for ordinary receipt-bearing opens.
+Complete physical dependency closure, exact provider deletion authorization and the corresponding holds for legacy and archived recovery remain open.
+
+=== Replay dependency closure for archives and independent forks
+
+The copy path derives its inventory from the decoded checkpoint root and its registered table blocks.
+When the root carries table digests, the copy verifies them before interpreting any table dependency.
+It also checks that the fresh root and table bytes it copies are the bytes it used during discovery.
+The independent fork keeps the verified root bytes it already read.
+New receipts include live and nascent trie payloads, retained level-zero payloads and recorded usable artefacts.
+The inventory coalesces paths, so a search file shared by group members is copied once.
+Archive and stage readers retain the original primary inventory semantics for older receipts.
+The archive verifies the copied contents before publishing its receipt, and an independent fork writes its root after the members.
+
+TLC revision `bc1b506` explored all 264 states for one root, two possible table observations, five payload paths and one source artefact disappearance.
+Five weakened transitions violated the declared invariant.
+The reachability witness copied the artefact before its disappearance and still published a complete destination.
+Apalache 0.63.0 confirmed the bounded baseline through ten transitions and found counterexamples for changed copied metadata and an omitted artefact.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-models-fdmx96rb/`. link:../tla/CheckpointReplayClosure.tla[State machine]
+Lean 4.36.0 checked four theorems about the required inventory over arbitrary finite lists of normalized trie entries.
+Removing retained input or artefact inclusion failed at the corresponding membership law.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-lean-vcxsi_kl/`. link:../lean/CheckpointReplayClosure.lean[Membership theorems]
+
+On parent `4ff84793f` with these changes, the affected Rust selections passed 317 cases, including 96 hosted cell cases.
+One optional test was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-4ff-rust-retry.log`.
+Four focused Rust replays passed. Five controls failed at the named assertions for retained input, shared artefact inclusion, table binding, archive inventory and fork publication order.
+Both existing table-manifest replays also passed after sharing the matching predicate, with three controls failing at their named assertions.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-native-gl2av9h8/`.
+The combined run passed all 36 existing Verus area baselines and matched all 181 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-verus-z7szj0bt/`.
+The standard JVM suite passed 3,198 cases across nine tasks on the same tree, with no failures or skips.
+It used the rebuilt FFI library, SHA-256 `b96405a211f4ec36097ae0ef6d517da721697db110884a45b9e5323353bdad84`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-4ff-jvm.log`.
+
+This checks completeness of a successful copy against the logical catalog.
+Payload bytes rely on the immutable-object contract. Source availability through retries still needs the exact publication holds in R5.
+The existing archive byte limit now applies to the larger replay inventory, so a checkpoint can exceed the limit when retained inputs accumulate.
+
+=== Source metadata admission and physical handoff
+
+Archive capture registers source metadata protection in the same directory compare-and-replace that selects or reopens its capture point.
+The current checkpoint is protected by the published head.
+An older checkpoint can inherit protection from a still-open region that covers its block.
+A retry can also reopen a completed archive in independent custody without using the serving store.
+The source admission remains registered through its provider effects. Closed or independently reconciled regions release their own obligation.
+
+The production guard was verified in the existing Verus checkpoint-metadata area with ten verified functions and six source and contract controls.
+The full 36-area run matched all 185 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-verus-z9v7apwk/`. link:../verus/checkpoint_metadata/proof.rs[Exact production guard]
+Lean 4.36.0 checked four theorems about metadata admission, overlap, plan preservation and deletion over arbitrary finite histories.
+Three controls fail when admission accepts an unheld past root, the collector ignores existing holds, or publication moves backwards.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-lean-hij5fje6/`. link:../lean/CheckpointMetadataRetention.lean[Metadata proof]
+A second Lean model checked four theorems for arbitrary exact physical dependency sets and finite schedules.
+It establishes that an outstanding read retains its required publications and that an unrelated publication can be authorized.
+Three controls remove the check for pending removal, the protection of held dependencies or the drain witness.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-physical-handoff-lean-8731pdzz/`. link:../lean/CheckpointSourceHandoff.lean[Exact dependency model]
+
+TLC revision `bc1b506` explored 765 exact-hold and 423 residence-hold states for two checkpoint roots, one copy and six physical publications.
+Both preserved the safety invariant. Only the exact design reached collection of the unrelated publication during an admitted provider read.
+The exact run also reached a published copy and a canceled read that drained before release.
+The six safety controls fail, and under weak fairness for the five copy and drain steps the completion property holds.
+Disabling handoff violates that temporal property.
+Apalache 0.63.0 cross-checked safety through eleven transitions and found both the inherited-pack and staged-publication counterexamples.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-models-6_4r60ue/`. link:../tla/CheckpointSourceHandoff.tla[Comparison and progress model]
+
+On parent `3c0868e23` with these changes, the affected Rust selections passed 227 cases, including all 96 cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-3c-rust.log`.
+The focused capture replay passed and four mutations failed at their declared assertions for prior protection, transfer, directory registration and release.
+It also reopened the completed archive after the last source hold ended.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-native-rj9jvxwf/`.
+The standard JVM run passed 3,198 tests across nine tasks with no failures or skips.
+It reused the verified FFI library from the parent because this change only touches the hosted Multi crate and verification files.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-3c-jvm.log`.
+
+The native guard covers checkpoint roots and table metadata in hosted archive capture.
+Its proof assumes monotone publication within a residence, a directory observation for each authorization, and region release only after provider drain.
+The exact physical model still needs production publication identities and joint authorization across the collectors that can erase them, including inherited objects used by forks.
+
+=== Placed receipt issuance and causal redemption
+
+The native submit response and PostgreSQL transaction controls issue the same authenticated provisional receipt for an asynchronous placed attempt.
+The holder waits for its installed source and replica positions together, then confirms the exact attempt from applied progress or the indexed witness.
+A successor can classify an absent attempt as unresolved after it has installed the recovered replica prefix.
+A verified outcome issues an authenticated causal token for an installed replica position.
+Classic source logs retain their position-based await protocol.
+
+The Multi cell replay seals a writer before its pending attempt can append, terminates it, and commits a different attempt at the same source position on the successor.
+It rejects the sealed writer's receipt, a numeric token for the reused position, a forged token, a different principal, and a different installation serving the same database name.
+It accepts the successor's receipt and advances its connection's causal token.
+A second replay trims the original records after checkpoint publication and redeems the original provisional receipt on the new writer.
+The retained resolver outcome records include successful and aborted transactions.
+
+TLC explored 163,544 serving states and 1,505 witness states.
+It detected a reused-slot answer, issuing a basis at intake or before apply, and declaring absence before replaying the sealed prefix.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/placed-receipt-model-bfax30d_/`. link:../tla/PlacedServingAuthority.tla[Serving model and controls]
+
+The 796 selected Rust tests passed on parent `4ff84793f`, including 97 whole-cell tests.
+The log is `/private/tmp/rtdb-placed-receipt-cargo.log`.
+The native control substituted the latest numeric position for the exact installed attempt.
+The sealed writer's token then returned the successor's row, and the replay failed at the rejection assertion.
+The control and baseline source digest are under `/private/tmp/rtdb-formal.QMjPSJsX/placed-receipt-native.PdUmW9/`.
+The repository verification runner repeated both exact baselines and its named reused-position control.
+The runner evidence is under `/private/tmp/rtdb-formal.QMjPSJsX/placed-receipt-runner-e1egms_s/`.
+All 53 PgWire protocol tests passed after the COPY fixture requested its buffered ParseComplete and BindComplete messages.
+The original fixture also timed out on clean parent `4ff84793f`.
+The logs are `/private/tmp/rtdb-placed-receipt-pgwire-verified.log` and `/private/tmp/rtdb-placed-receipt-pgwire-parent.log`.
+The explicit JVM rerun on the `4ff84793f` tree passed 3,198 standard and 3,348 property cases with the native receipt implementation.
+The log is `/private/tmp/rtdb-placed-receipt-jvm-and-property.log`.
+After rebasing onto `3c0868e23`, the default Rust workspace type check passed and all 884 selected native cases passed, including 97 cell cases and 53 PgWire protocol cases.
+The logs are `/private/tmp/rtdb-placed-receipt-rebased-workspace.log` and `/private/tmp/rtdb-placed-receipt-rebased-cargo.log`.
+The native conformance library, history replay and node fault suites passed a further 63 cases on the rebased tree.
+The log is `/private/tmp/rtdb-placed-receipt-conformance.log`.
+The rebased JVM tests use the native library SHA-256 `5c6f28d1dc0804bba0ae74f856f403d80cbce645fa17ca5421110f2f2156bba6`.
+TLC reproduced the placed attempt and serving results on the rebased tree and checked all 264 states of the archive replay-closure model.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/rebased-placed-receipt-model-1ml5u9wx/`.
+The follow-up rebase onto `a6cf6d730` changed only native Multi archive and storage sources in the execution graph.
+The workspace type check and 227 Multi tests passed on that tree, including 97 cell cases.
+The JVM sources and native-library dependency closure retained the same inputs and library digest.
+The native logs are `/private/tmp/rtdb-placed-receipt-final-workspace.log` and `/private/tmp/rtdb-placed-receipt-final-multi.log`.
+The final Gradle invocation ran the standard, property and integration tasks in 22 minutes.
+It recorded 3,198 standard, 3,348 property and 5,630 integration cases.
+All three suites reported zero failures and errors.
+The PostgreSQL source integration case `slot recreation silently drops changes()` was skipped, with no reason in its XML.
+There were no reflection or boxed math warnings.
+The log is `/private/tmp/rtdb-placed-receipt-final-gradle.log`.
+
+=== Physical source evidence for checkpoint copying
+
+Each archive and independent-fork member now binds a logical key, size and optional physical version in its copy plan.
+A successful read checks its body observation and length against that binding, then checks the root or table metadata digest where present.
+The body observation comes from the response that supplied the bytes.
+An inherited packed member carries the containing pack's version and physical key.
+A repair-backed member carries the physical identity of the verified archive ciphertext.
+Reading that member still authenticates the archive digest and reseals it with the serving key.
+The source preparation preflights the entire archive byte budget before writing copied members.
+
+TLC revision `bc1b506` explored all 150 states for one planned member, up to one change and five evidence identities including absence.
+Four controls fail on dropped evidence, comparing only a version token, inferring the body identity from the plan, or accepting changed metadata.
+The bounded model reached publication for an inherited object, a repair archive object and an unversioned source that meets the logical contract.
+Apalache 0.63.0 cross-checked the invariant through five transitions and reproduced the token-only and inferred-identity counterexamples.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-models-12acffo7/`. link:../tla/CheckpointCopyEvidence.tla[Copy evidence model]
+Lean 4.36.0 checked four theorems for arbitrary finite copy plans and lists of byte costs.
+Three controls reject weakened version agreement, unchecked digests and failure to charge the budget.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-lean-4zjypry9/`. link:../lean/CheckpointCopyEvidence.lean[Inventory and budget laws]
+Verus checked the exact production debit and two laws over every representable ciphertext component and remaining budget.
+Four single and joint controls detect dropping encryption overhead and refusing an exact fit.
+The combined pass checked 37 areas and matched all 189 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-verus-797y2ybv/`. link:../verus/checkpoint_copy_budget/proof.rs[Production budget proof]
+
+A second TLC comparison checked all 98 separate-admission states and 81 atomic-admission states for one copy across two physical owners.
+It reached successful publication, partial admission and cleanup after the second owner refused.
+Three controls admit a read after only one owner agrees, skip a prior removal authorization, or release before provider drain.
+Apalache cross-checked separate admission through ten transitions and reproduced the one-owner read counterexample.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-physical-owners-model-1omsk52p/`. link:../tla/CheckpointPhysicalOwners.tla[Physical owner comparison]
+
+On parent `a6cf6d730` with these changes, the affected Rust selections passed 332 tests, including 96 hosted cell tests, with one optional test ignored.
+The native cases check the actual wrapped storage paths for inherited packs, loose files and archived repair as well as a loopback S3 full-object response.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-rust-final.log`.
+Four new source replays passed with four mutation failures at their declared assertions.
+The four existing replay-closure cases also passed with all five controls, including moving the independent fork root ahead of its dependencies.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-native-nn5a3rcs/`.
+The same tree passed five native recovery cases and eight storage and session simulation cases, with three optional simulation cases ignored.
+The logs are `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-recovery.log` and `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-simulation.log`.
+The standard JVM run on that tree passed 3,198 tests across nine tasks without failures or skips.
+Its rebuilt FFI library had SHA-256 `4a092a267e941f2603e90fa428a799e7a384f8113cc67669bbc4f5f08d44f2b7`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-jvm.log`.
+After rebasing onto `c7fdae115`, all 333 affected Rust tests passed, including 97 hosted cell cases, with one optional test ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-c7f-rust.log`.
+The rebased tree also passed all 37 Verus areas with 189 controls.
+TLC reran both new copy models and the peer's 163,544-state scoped receipt model with their controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-c7f-formal-prctoag4/`.
+The standard JVM suite passed 3,198 tests on the rebased tree without failures or skips.
+It used the rebuilt FFI library with SHA-256 `035e56094dd9ef9e97df62293c089ed4b6b50688c02f711e1087202f2e4b6664`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-c7f-jvm.log`.
+
+The plan carries physical evidence when the provider supplies it.
+Unversioned stores rely on immutable object names and the declared integrity checks.
+Holding these identities until I/O drains still requires admission against durable removal authority in every physical custody domain.
+
+=== Await receipts on a frozen checkpoint
+
+A frozen attachment derives its authority from the exact block, journal position and root digest admitted during startup.
+A causal token is usable within that journal and installed cut.
+A provisional receipt requires the exact checkpointed outcome and yields a causal token at the cut.
+Absence on a frozen attachment yields a retryable refusal.
+
+The cell replay obtains two sets of tokens, publishes a checkpoint containing the first outcome and advances the writer epoch.
+It opens a snapshot connection at that checkpoint, publishes a newer directory checkpoint covering the second outcome and stops all logkeepers.
+The snapshot connection confirms both covered token forms from object storage and refuses both forms for the second outcome.
+The native runner passed three receipt replays and rejected three controls, including acceptance beyond the frozen cut and a definitive negative outcome for an absent witness.
+Its records are under `/private/tmp/rtdb-formal.QMjPSJsX/frozen-receipt-pinned-native-2cp9d8uz/`.
+
+TLC checked nine states and exercised four weakened decisions and a positive confirmation witness.
+Its records are under `/private/tmp/rtdb-formal.QMjPSJsX/frozen-receipt-model-u6d7ppsi/`. link:../tla/FrozenReceiptCut.tla[Frozen receipt model and controls]
+The workspace type check and 686 selected native tests passed, including 98 cell tests.
+The logs are `/private/tmp/rtdb-frozen-receipt-workspace.log` and `/private/tmp/rtdb-frozen-receipt-final-cargo.log`.
+The initial standard JVM run passed 3,198 tests using the native library with SHA-256 `034a3c925604ece09bb815ce0048d1b0fa916835e7927b46bec7d7fa40d84ed9`.
+The archive copy change landed on `6e55bc6c5` and changed a native storage dependency.
+TLC reproduced the frozen receipt result together with the checkpoint copy and physical owner models on the rebased tree.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/frozen-receipt-rebased-model-18_9jf3_/`.
+The rebased workspace type check and all 722 selected native tests passed, including 98 cell cases and the storage and S3 unit suites.
+The logs are `/private/tmp/rtdb-frozen-receipt-rebased-workspace.log` and `/private/tmp/rtdb-frozen-receipt-rebased-cargo.log`.
+The rebased Gradle run uses the native library with SHA-256 `98eec17478b17b4d4e98e290311bfc329d680b46dd4385a9f51b38141d695be3`.
+The final Gradle run recorded 3,198 standard cases and 5,630 integration cases with zero failures and errors.
+The PostgreSQL slot-recreation case was already disabled in its source.
+No reflection or boxed-math warnings appeared.
+The log is `/private/tmp/rtdb-frozen-receipt-rebased-gradle.log`.
+
+=== Repair archive custody and local source drain
+
+The storage region now records the copy destination and the repair source independently on both local and remote media.
+Archive retirement considers both slots. A closed region can still retain custody while provider mutations settle.
+Serving-store open and recapture select the repair in their directory admission.
+A transfer that materializes a repair takes temporary read admission in the original custody and writes through the separately admitted destination.
+Opening repair bytes requires a region that admits the exact archive.
+Local archive sources and fork buckets pass the existing maintenance witness to their I/O regions, so an admitted read retains it after caller cancellation.
+
+TLC revision `bc1b506` explored all 162 states of one copy region, two independently held archives and one unrelated archive.
+Five controls fail for omitted repair custody, erasing under the destination rule alone, late admission, a read started from a closed region and release before drain.
+The model reached repair reads, closure with provider work awaiting settlement, unrelated retirement and retirement after release.
+Apalache 0.63.0 checked the invariant through twelve transitions and independently rejected ignoring the repair slot or admitting after retirement.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-models-svm4jv3y/`. link:../tla/RepairArchiveCustody.tla[Bounded custody model]
+Lean 4.36.0 checked four theorems for arbitrary archive identities, regions and finite schedules.
+Its controls remove repair membership, admission against closure, protection from erasure or the drain condition.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-lean-uuv1paid/`. link:../lean/RepairArchiveCustody.lean[Archive custody laws]
+Verus checked six functions and four single and joint controls in the production archive custody area.
+The combined run passed 38 areas and matched all 193 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-verus-zx_aovdi/`. link:../verus/repair_archive_custody/proof.rs[Production membership and admission guard]
+
+The bounded retirement-settlement comparison checks one key, two immutable provider versions and one outstanding removal.
+TLC explored all 44 states of exact-version removal and all 24 states of serialized path removal.
+Both preserve source and replacement availability under their respective rules.
+Only the exact design reaches completion of the old removal after its task stops while a reader holds the replacement.
+Both designs reach settlement and admission of the replacement.
+The controls fail when exact removal resolves the current name or task stop stands in for provider settlement.
+Apalache checked the exact policy through nine transitions and reproduced the path-only counterexample.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/source-retirement-settlement-models-79vqjde3/`. link:../tla/SourceRetirementSettlement.tla[Provider settlement comparison]
+
+On parent `6e55bc6c5` the affected Rust suites passed 272 tests, including 97 hosted cell cases, with one optional test ignored.
+The repaired-cell case reopens and recaptures the source, transfers it to another cell and checks the retained ordered history.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-6e5-rust-complete.log`.
+Four focused native replays passed, with six controls failing at their declared assertions for archive membership, closed-region reads, recapture, transfer, maintenance authority and canceled provider work.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-native-p3rdpdq3/`.
+The standard JVM suite on that parent passed 3,198 tests with no failures or skips.
+It reused the unaffected FFI library, with SHA-256 `035e56094dd9ef9e97df62293c089ed4b6b50688c02f711e1087202f2e4b6664`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-6e5-jvm.log`.
+
+After rebasing onto `f740a4080`, the affected Rust suites passed 273 cases, including 98 hosted cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-rust.log`.
+The four repair-source replays and six controls matched on that tree, as did the checkpoint metadata replay and its four controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-f740-native-lb2i79ko/`.
+The combined run passed all 38 Verus areas and matched all 193 controls. TLC reran both new studies and the frozen-receipt model with its controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-formal-p4ie01jr/`.
+The standard JVM suite passed 3,198 tests with no failures, errors or skips.
+It used the rebuilt FFI library with SHA-256 `1682a5e0ad49022072a1d1bbc18ce6ee65a8546f2f6259186704c1240d5377ab`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-jvm.log`.
+The JVM property suite passed 3,348 cases with no failures, errors or skips, including 100 iterations each for 33 core simulation methods.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-property.log`.
+
+The archive argument depends on retirement actors honoring both custody slots.
+Local serving-object collection shares the maintenance witness.
+The ordinary remote serving collector still needs durable per-version authorization and a provider settlement rule across all physical owners.
+
+=== Exact S3 retirement and provider settlement
+
+The adapter validates the namespace and the physical key against its own configuration before forming a version-qualified removal.
+Empty or replaceable `null` identifiers cannot authorize this provider operation.
+The adapter reads a fresh inventory for that exact key and version before returning success.
+A listing that still contains the version, has malformed continuation evidence, or fails to establish absence leaves the operation pending for retry.
+The provider premise is that qualified deletion names only the addressed immutable version and that a complete inventory includes the addressed version while present.
+This premise excludes reuse of immutable version identifiers.
+
+TLC revision `bc1b506` explored all 152 states for two removal submissions and up to two replacements.
+The path-only, reply-only, and incomplete-inventory controls violated their declared invariants.
+The reachability check found a redundant removal completing after settlement with a replacement already present.
+Apalache 0.63.0 checked safety through ten transitions and reproduced the partial-inventory counterexample.
+Lean 4.36.0 checked four theorems for arbitrary keys and version identities, including idempotence and preservation of other versions.
+Removing the version clause or weakening the inventory premise broke its declared theorem.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/exact-retirement-formal-_0xdtvxt/`. link:../tla/ExactRetirementRetry.tla[Retry model] link:../lean/ExactRetirementRetry.lean[Exact retirement laws]
+
+The native loopback test passed with the SDK request and listing response, and all four removal controls failed at their declared assertions.
+The existing observation replay also passed and rejected its invalid-identifier control.
+Their records are under `/private/tmp/rtdb-formal.QMjPSJsX/s3-exact-retirement-native-4srsf8gd/`.
+The combined Verus run passed all 38 areas and matched all 193 controls, including the shared immutable-version check.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/exact-retirement-verus-t82dvaho/`.
+The S3 and storage Rust suites passed 132 exercised cases. Two environment-gated cases returned before their MinIO exchanges because no endpoint was configured.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/s3-exact-retirement-rust.log`.
+The combined JVM command passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+The property run recorded 100 iterations each for 33 core simulation methods.
+Both suites used the rebuilt FFI library with SHA-256 `70e40dcaa6a140da5215d9d9fc82ca7c6d33d10213ff48c73efa5cb52d4feca2`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/s3-exact-retirement-jvm.log`.
+
+The ordinary remote collector still needs durable per-version authorization, physical-owner admission and integration of the provider settlement operation.
+The closed-prefix purge retains its existing authority and settlement rules.
+
+=== Shared reference publication and the retirement generation
+
+Shared forks publish their child record, name and an advanced cell-local lineage revision in one transaction.
+The revision persists with the in-process directory snapshot or in a reserved item in the DynamoDB names table.
+A descendant advances the same revision. An independent publication or a refused transaction leaves it unchanged.
+The revision does not require the original lineage root to reside in the same cell as the fork.
+The DynamoDB implementation relies on same-region atomic writes and serializable point reads. A scan may observe several committed states across its pages. link:https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html[DynamoDB transaction isolation]
+
+TLC revision `bc1b506` explored all 68 states of the publication and inventory model.
+The four controls weaken descendant tracking, authorization against the observed revision, or accounting for independent and refused publications.
+The model reached both an inventory overtaken by a descendant and a complete inventory accepted with that descendant included.
+Apalache 0.63.0 checked safety through nine transitions and reproduced the descendant counterexample for parent-only tracking.
+Lean 4.36.0 proved four laws over arbitrary finite publication histories. Both controls failed the declared laws.
+Verus checked six functions in the new directory area. Its eight production and joint controls matched their declared diagnostics.
+All 39 Verus areas passed and matched 201 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-formal-v7i5_30v/`. link:../tla/SharedReferenceRevision.tla[Publication and inventory model] link:../lean/SharedReferenceRevision.lean[Shared revision laws]
+
+The separate authority model checks one immutable source version, one direct reader, and one shared fork through preparation, transfer, removal and settlement.
+TLC explored all 19 states and rejected four controls.
+The model reached transfer and settlement with an existing child and refusal of stale preparation after settlement.
+Apalache checked the model through ten transitions and rejected checking the open gate alone at fork publication.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/lineage-fence-formal-2jknc1br/`. link:../tla/LineageRetirementAdmission.tla[Retirement admission model]
+
+The directory, Multi and simulation suites passed 297 cases with 11 opt-in cases ignored.
+The MemoryDirectory replay rejected publishing without advancing the revision.
+The DynamoDB replay verified that a stale revision prevents publication of both the child and the name. Removing the provider condition failed the declared control.
+The primary suite also exercised the directory contract over TCP and against DynamoDB Local 3.3.2 with a loopback client and an in-memory instance.
+The downloaded server archive matched AWS's published SHA-256 `7a94eb65f81aee270738751a4e5e3e6a7ad02a5d25194f55b83e08ec2ba6342b`. link:https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.DownloadingAndRunning.html[DynamoDB Local distribution]
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-native-d7t145hl/`.
+
+On parent `ad130398c`, the complete Lean runner and all 334 TLC cases passed.
+The Alloy, Maude, mCRL2, AutoHyper and Apalache suites also passed with their declared control outcomes.
+The model-suite records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-combined-models-6o9liroe/` and `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-other-engines-8tx40gw2/`.
+The combined JVM run on that parent passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+The property suite recorded 100 iterations each for 33 core simulation methods.
+The unchanged FFI artifact had SHA-256 `70e40dcaa6a140da5215d9d9fc82ca7c6d33d10213ff48c73efa5cb52d4feca2`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-jvm.log`.
+
+The combined tree on `65d0a3d9f` passed 366 exercised Rust cases across directory, Multi, logkeeper and simulation with 12 ignored cases.
+The two native fork controls matched on that tree with DynamoDB Local running, then the local instance was stopped.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-native-5ib3r6u6/`.
+The complete Lean runner, all 338 TLC cases, all 39 Verus areas and 201 Verus controls, and the Alloy, Maude, mCRL2, AutoHyper and Apalache suites passed on that tree.
+The journal-quorum model explored all 4,500 states, rejected both controls and reached the rebound witness.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-formal-u4e6qzn7/`.
+OpenJML 21.0.29 checked the existing JVM leaf-merge contract and matched its three controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-openjml-vfpb3hdv/`.
+The rebased JVM run passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+It recorded 100 iterations each for 33 core simulation methods, using the rebuilt FFI library with SHA-256 `61b0e492d985e6e49ca28a8dccb8220e77e4c3fef7afc633df54b701b7ce6cdc`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-jvm.log`.
+
+The live reaper still needs a durable authorization that checks the revision and prevents stale fork preparation from publishing after retirement.
+The retirement admission model checks the proposed authority in isolation. Composition with the running reaper remains open.
+
+=== Monotone fork reference manifests
+
+Only initialization of a fresh fork adds reference edges.
+Later collection edits withdraw the exact observed name and owner from the current manifest.
+The edit writes the next immutable slot of the snapshot it read and confirms its withdrawal from the published head before continuing.
+Lookups confirm the head after loading its bytes, and cleanup prunes only below that confirmed head.
+These decisions assume authoritative listing, immutable conditional writes and a monotone head while the residence remains open.
+
+The reaper withdraws shadowed fallback references before deleting its own object or release record.
+An interrupted physical removal leaves the release record available for a later pass.
+These changes preserve fresh manifest observations. The retained-manifest and physical-owner admission contracts remain separate obligations.
+
+TLC revision `bc1b506` explored all 244 states for three edges, competing withdrawals, one delayed write and one overlapping lookup.
+Four negative controls cover a stale whole-manifest overwrite, accepting the write reply, accepting a backfilled read and removing a local copy before withdrawing its fallback.
+Both reachability checks found the expected completed operations.
+Apalache 0.63.0 checked safety through eleven transitions and reproduced the stale-overwrite counterexample.
+Lean 4.36.0 proved seven laws over arbitrary name-owner relations and natural-number slot sequences.
+Removing withdrawal or allowing the head to be pruned failed the declared laws.
+Verus checked four functions in the new manifest area and matched all four of its production and joint controls.
+The full run passed 40 Verus areas and matched 205 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-formal-n7ifp186/`. link:../tla/MonotoneReferenceManifest.tla[Manifest model] link:../lean/MonotoneReferenceManifest.lean[Withdrawal and cleanup laws]
+
+Four production replays passed with five controls failing at their declared assertions.
+The delayed writer replay covers a conflicting immutable slot and a slot that was pruned and then accepted a late write.
+The lookup replay rejects a body from a backfilled slot.
+The collection replay observes the current manifest at the physical delete and confirms that an interrupted removal can retry.
+The affected Multi and simulation suites passed 262 cases, including 98 hosted cell cases, with 11 ignored cases.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-native-gmqeucr8/`.
+
+The complete Lean runner, all 345 TLC cases, and the Alloy, Maude, mCRL2, AutoHyper and Apalache suites matched their expected outcomes on parent `555fe7ec6`.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-combined-108vhzvw/`.
+The JVM run passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+The property suite recorded 100 iterations each for 33 core simulation methods.
+Both suites used the unchanged FFI artifact with SHA-256 `61b0e492d985e6e49ca28a8dccb8220e77e4c3fef7afc633df54b701b7ce6cdc`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-jvm.log`.
+
+The combined tree on `4f29a957d` also exercises the installed catalog receipt against a physically owned trie with an inherited fallback.
+A foreign scope leaves the owned object and its fallback intact.
+An accepted receipt allows the local withdrawal and removal while leaving the ancestor's physical copy in place.
+The four manifest replays and all five native controls matched after rebasing.
+The affected format, storage, maintenance, Multi and simulation suites passed 584 cases, with 11 ignored cases.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-4f29-native-ofki4pkd/`.
+The full Lean runner, all 350 TLC cases, all 40 Verus areas and 205 controls, and the Alloy, Maude, mCRL2, AutoHyper and Apalache suites matched on the combined tree.
+The hosted trie release model explored all 324 states, rejected the three controls and reached collection in the presence of an unrelated hold.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-4f29-formal-2r57kjab/`.
+On the combined tree the JVM run passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+It recorded 100 iterations each for 33 core simulation methods, using the rebuilt FFI library with SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-4f29-jvm.log`.

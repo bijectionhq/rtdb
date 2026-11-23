@@ -36,6 +36,120 @@ impl LeafColumns {
         }
     }
 }
+/// A leaf's column statistics borrowed by the scan.
+pub struct LeafStatistics<'a>(StatisticsSource<'a>);
+enum StatisticsSource<'a> {
+    Values(std::borrow::Cow<'a, [Value]>),
+    Arrow { records: &'a StructArray, rows: std::ops::Range<usize> },
+}
+
+#[derive(Clone, Copy)]
+enum StatisticCell<'a> { Value(&'a Value), Arrow(&'a dyn Array, usize) }
+
+#[derive(Clone, Copy)]
+pub struct ColumnStatistics<'a>(StatisticCell<'a>);
+
+impl LeafColumns {
+    pub fn statistics(&self) -> Result<LeafStatistics<'_>> {
+        fn plain(field: &Field) -> bool {
+            field.metadata().is_empty() && match field.data_type() {
+                DataType::Null | DataType::Boolean | DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Binary => true,
+                DataType::List(child) => plain(child),
+                DataType::Struct(fields) => fields.iter().all(|child| plain(child)),
+                _ => false,
+            }
+        }
+        if let LeafSource::Stored { field, columns, offset } = self.0.as_ref()
+            && plain(field)
+            && let Some(list) = columns.as_any().downcast_ref::<ListArray>()
+            && list.is_valid(*offset)
+            && let Some(records) = list.values().as_any().downcast_ref::<StructArray>() {
+            let offsets = list.value_offsets();
+            let rows = offsets[*offset] as usize..offsets[*offset + 1] as usize;
+            return Ok(LeafStatistics(StatisticsSource::Arrow { records, rows }));
+        }
+        self.values().map(|values| LeafStatistics(StatisticsSource::Values(values)))
+    }
+}
+
+impl LeafStatistics<'_> {
+    fn columns(&self) -> impl Iterator<Item = ColumnStatistics<'_>> {
+        let len = match &self.0 { StatisticsSource::Arrow { rows, .. } => rows.len(), StatisticsSource::Values(values) => values.len() };
+        (0..len).map(|position| ColumnStatistics(match &self.0 {
+            StatisticsSource::Arrow { records, rows } => StatisticCell::Arrow(*records, rows.start + position),
+            StatisticsSource::Values(values) => StatisticCell::Value(&values[position]),
+        }))
+    }
+
+    pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = ColumnStatistics<'a>> {
+        self.columns().filter(move |column| column.name() == Some(name))
+    }
+
+    pub fn root_column(&self, name: &str) -> Option<ColumnStatistics<'_>> {
+        self.columns().find(|column| column.name() == Some(name) && column.flag("root-col?") == Some(true))
+    }
+}
+
+impl<'a> StatisticCell<'a> {
+    fn field(self, name: &str) -> Option<Self> {
+        match self {
+            Self::Value(value) => value.field(name).map(Self::Value),
+            Self::Arrow(array, row) if array.is_valid(row) => {
+                let records = array.as_any().downcast_ref::<StructArray>()?;
+                Some(Self::Arrow(records.column_by_name(name)?.as_ref(), row))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'a> ColumnStatistics<'a> {
+    fn name(self) -> Option<&'a str> {
+        match self.0.field("col-name")? {
+            StatisticCell::Value(Value::Utf8(name)) => Some(name),
+            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
+                array.as_any().downcast_ref::<arrow_array::StringArray>().map(|values| values.value(row)),
+            _ => None,
+        }
+    }
+
+    pub fn flag(self, field: &str) -> Option<bool> {
+        match self.0.field(field)? {
+            StatisticCell::Value(Value::Bool(value)) => Some(*value),
+            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
+                array.as_any().downcast_ref::<arrow_array::BooleanArray>().map(|values| values.value(row)),
+            _ => None,
+        }
+    }
+
+    pub fn count(self) -> Option<i64> {
+        match self.0.field("count")? {
+            StatisticCell::Value(Value::I64(value)) => Some(*value),
+            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
+                array.as_any().downcast_ref::<arrow_array::Int64Array>().map(|values| values.value(row)),
+            _ => None,
+        }
+    }
+
+    pub fn bound(self, flavour: &str, key: &str) -> Option<f64> {
+        match self.0.field(flavour)?.field(key)? {
+            StatisticCell::Value(Value::F64(value)) => Some(*value),
+            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
+                array.as_any().downcast_ref::<arrow_array::Float64Array>().map(|values| values.value(row)),
+            _ => None,
+        }
+    }
+
+    pub fn bloom(self) -> Option<&'a [u8]> {
+        match self.0.field("bytes")?.field("bloom")? {
+            StatisticCell::Value(Value::Binary(value)) => Some(value),
+            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
+                array.as_any().downcast_ref::<arrow_array::BinaryArray>().map(|values| values.value(row)),
+            _ => None,
+        }
+    }
+}
+
 impl PartialEq for LeafColumns {
     fn eq(&self, other: &Self) -> bool { matches!((self.values(), other.values()), (Ok(left), Ok(right)) if *left == *right) }
 }

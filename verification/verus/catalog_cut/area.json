@@ -1,0 +1,130 @@
+{
+  "summary": "An installed replica cut can be published only after the supported history has no held effects.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "cross_pending_block": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "if tracking && !block_pending && !apply_deferred {",
+          "replace": "if tracking && !apply_deferred {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "function": "completed_prefix",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "cross_pending_block_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "if tracking && !block_pending && !apply_deferred {",
+          "replace": "if tracking && !apply_deferred {"
+        },
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "tracking && !block_pending && !apply_deferred,",
+          "replace": "tracking && !apply_deferred,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/catalog_cut/laws.rs",
+          "function": "a_pending_boundary_blocks_publication",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "cross_deferred_readback": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "if tracking && !block_pending && !apply_deferred {",
+          "replace": "if tracking && !block_pending {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "function": "completed_prefix",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "cross_deferred_readback_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "if tracking && !block_pending && !apply_deferred {",
+          "replace": "if tracking && !block_pending {"
+        },
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "tracking && !block_pending && !apply_deferred,",
+          "replace": "tracking && !block_pending,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/catalog_cut/laws.rs",
+          "function": "an_undrained_resolution_blocks_publication",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "publish_untracked_history": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "if tracking && !block_pending && !apply_deferred {",
+          "replace": "if !block_pending && !apply_deferred {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "function": "completed_prefix",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "publish_untracked_history_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "if tracking && !block_pending && !apply_deferred {",
+          "replace": "if !block_pending && !apply_deferred {"
+        },
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "tracking && !block_pending && !apply_deferred,",
+          "replace": "!block_pending && !apply_deferred,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/catalog_cut/laws.rs",
+          "function": "an_untracked_history_cannot_publish",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

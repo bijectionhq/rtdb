@@ -6,14 +6,16 @@ use zeroize::Zeroizing;
 
 use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, PgwireSettings, FlightSettings};
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
 #[derive(Clone, Debug)]
 pub struct StartOptions { pub mode: NodeMode, pub file: Option<PathBuf>, pub allocation_limit_bytes: usize, pub pgwire_port: i32, pub flight_sql_port: i32, pub object_sort: rtdb_types::ObjectSort }
 #[derive(Clone, Debug)]
-pub enum Command { Help, Version, BuildInfo, Start(StartOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool }, HashPassword { bcrypt: bool, password: Option<Secret> } }
+pub enum Command { Help, Version, BuildInfo, Start(StartOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize },
+    RepairRetainedCheckpoint { request: rtdb_node::RetainedLocalRepair, memory_bytes: usize },
+    RetainRepairBase { request: rtdb_node::RetainRepairBase, memory_bytes: usize }, HashPassword { bcrypt: bool, password: Option<Secret> } }
 
 pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(&str) -> Option<String>) -> Result<Command> {
     let mut arguments = arguments.into_iter().peekable();
@@ -27,6 +29,53 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         arguments.next();
         if arguments.next().is_some() { return Err(invalid("--build-info accepts no arguments")); }
         return Ok(Command::BuildInfo);
+    }
+    if matches!(arguments.peek().map(String::as_str), Some("repair-checkpoint" | "retain-repair-base")) {
+        let command = arguments.next().expect("peeked repair command");
+        let retaining = command == "retain-repair-base";
+        if matches!(arguments.peek().map(String::as_str), Some("-h" | "--help")) { return Ok(Command::Help); }
+        let mut positional = Vec::new();
+        let mut base_storage = None;
+        let mut retained_base = false;
+        let mut memory_bytes = environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024);
+        while let Some(argument) = arguments.next() {
+            if argument == "--memory-limit" {
+                memory_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?;
+            } else if argument == "--retained-base" && !retaining {
+                retained_base = true;
+            } else if argument == "--base-storage" && !retaining {
+                base_storage = Some(PathBuf::from(arguments.next().ok_or_else(|| invalid("--base-storage requires a path"))?));
+            } else if argument.starts_with('-') {
+                return Err(invalid(format!("Unknown repair option '{argument}'")));
+            } else {
+                positional.push(argument);
+            }
+        }
+        if retaining {
+            let [source, replica, exported, base]: [String; 4] = positional.try_into()
+                .map_err(|_| invalid("retain-repair-base requires storage, a replica log, an exported store, and one checkpoint receipt"))?;
+            let request = rtdb_node::RetainRepairBase {
+                source_storage: source.into(), replica_log: replica.into(), base_storage: exported.into(), base: repair_checkpoint(&base)?,
+            };
+            return Ok(Command::RetainRepairBase { request, memory_bytes });
+        }
+        if retained_base {
+            let [source, replica, output, through]: [String; 4] = positional.try_into()
+                .map_err(|_| invalid("Repair from the retained base requires storage, a replica log, an output parent, and one target receipt"))?;
+            let request = rtdb_node::RetainedLocalRepair {
+                source_storage: source.into(), replica_log: replica.into(), output_parent: output.into(),
+                base_storage: base_storage.ok_or_else(|| invalid("--retained-base requires --base-storage"))?,
+                through: repair_checkpoint(&through)?,
+            };
+            return Ok(Command::RepairRetainedCheckpoint { request, memory_bytes });
+        }
+        let [source, replica, output, base, through]: [String; 5] = positional.try_into()
+            .map_err(|_| invalid("repair-checkpoint requires storage, a replica log, an output parent, and two checkpoint receipts"))?;
+        let request = rtdb_node::LocalRepair {
+            source_storage: source.into(), base_storage, replica_log: replica.into(), output_parent: output.into(),
+            base: repair_checkpoint(&base)?, through: repair_checkpoint(&through)?,
+        };
+        return Ok(Command::RepairCheckpoint { request, memory_bytes });
     }
     let inspection = match arguments.peek().map(String::as_str) {
         Some("read-arrow-file") => Some(crate::inspect::FileKind::ArrowFile),
@@ -55,19 +104,25 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         let mut options = StartOptions { mode: NodeMode::Node, file: None, allocation_limit_bytes: environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024), pgwire_port: 5432, flight_sql_port: 3000, object_sort };
         let mut database = None;
         let mut dry_run = false;
+        let mut retained_base = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "-h" | "--help" => return Ok(Command::Help),
                 "-f" | "--file" => options.file = Some(PathBuf::from(arguments.next().ok_or_else(|| invalid("--file requires a path"))?)),
                 "--memory-limit" => options.allocation_limit_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?,
                 "--dry-run" => dry_run = true,
+                "--retained-base" if command == "reset-compactor" && retained_base.is_none() => {
+                    let path = arguments.next().filter(|path| !path.starts_with('-'))
+                        .ok_or_else(|| invalid("--retained-base requires the detached export path"))?;
+                    retained_base = Some(PathBuf::from(path));
+                }
                 name if name.starts_with("-D") => options.object_sort = crate::config::properties::command_property(name)?,
                 name if !name.starts_with('-') && database.is_none() => database = Some(argument),
-                _ => return Err(invalid(format!("{command} accepts one database name, --file, --dry-run and --memory-limit"))),
+                _ => return Err(invalid(format!("{command} received an unknown or repeated option"))),
             }
         }
         let database = database.ok_or_else(|| invalid(format!("{command} requires a database name")))?;
-        return Ok(if command == "export-snapshot" { Command::SnapshotExport { options, database, dry_run } } else { Command::CompactorReset { options, database, dry_run } });
+        return Ok(if command == "export-snapshot" { Command::SnapshotExport { options, database, dry_run } } else { Command::CompactorReset { options, database, dry_run, retained_base } });
     }
     if arguments.peek().is_some_and(|argument| argument == "hash-password") {
         arguments.next();
@@ -113,6 +168,19 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         }
     }
     Ok(Command::Start(options))
+}
+
+fn repair_checkpoint(value: &str) -> Result<rtdb_node::RepairCheckpoint> {
+    let (index, sha256) = value.split_once('@').ok_or_else(|| invalid("A repair checkpoint has the form BLOCK@SHA256"))?;
+    let block = index.parse::<i64>().ok().filter(|index| *index >= 0).ok_or_else(|| invalid("Checkpoint block must be nonnegative"))?;
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("Checkpoint SHA-256 must have 64 hexadecimal digits"));
+    }
+    let mut digest = [0; 32];
+    for (offset, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&sha256[2 * offset..2 * offset + 2], 16).map_err(|_| invalid("Invalid checkpoint SHA-256"))?;
+    }
+    Ok(rtdb_node::RepairCheckpoint { block: rtdb_types::BlockIndex(block), sha256: digest })
 }
 
 impl StartOptions {

@@ -1,7 +1,7 @@
 //! Page metadata tests for a scan's comparisons between a column and a constant, after the reference's metadata selector.
 //! A test that returns false proves that no row of the page satisfies the scan predicates.
 
-use rtdb_format::bloom::BloomFilter;
+use rtdb_format::{bloom::BloomFilter, metadata::LeafStatistics};
 use rtdb_plan::{BinaryOp, Expr, Scan, Schema};
 use rtdb_types::{Result, Value};
 use crate::context::Execution;
@@ -79,27 +79,26 @@ impl PageTest {
     }
 
     /// `columns` is a page's column metadata; a column the page doesn't hold satisfies no test.
-    pub(crate) fn matches(&self, columns: &[Value]) -> Result<bool> {
-        let column = |name: &str| columns.iter().find(|column| matches!(column.field("col-name"), Some(Value::Utf8(column)) if column == name) && column.field("root-col?") == Some(&Value::Bool(true)));
+    pub(crate) fn matches(&self, columns: &LeafStatistics<'_>) -> Result<bool> {
         Ok(match self {
             Self::Always => true,
             Self::All(tests) => { for test in tests { if !test.matches(columns)? { return Ok(false); } } true }
             Self::Any(tests) => { for test in tests { if test.matches(columns)? { return Ok(true); } } false }
             Self::Bound { column: name, flavour, extremum, op, value } => {
                 let key = match extremum { Extremum::Min => "min", Extremum::Max => "max" };
-                match column(name).and_then(|column| column.field(flavour)).and_then(|bounds| bounds.field(key)) {
-                    Some(Value::F64(bound)) => match op { BinaryOp::Lt => bound < value, BinaryOp::LtEq => bound <= value, BinaryOp::Gt => bound > value, _ => bound >= value },
+                match columns.root_column(name).and_then(|column| column.bound(flavour, key)) {
+                    Some(bound) => match op { BinaryOp::Lt => bound < *value, BinaryOp::LtEq => bound <= *value, BinaryOp::Gt => bound > *value, _ => bound >= *value },
                     _ => false,
                 }
             }
-            Self::Bloom { column: name, value } => match column(name) {
+            Self::Bloom { column: name, value } => match columns.root_column(name) {
                 None => false,
-                Some(column) => match column.field("bytes").and_then(|bytes| bytes.field("bloom")) {
-                    Some(Value::Binary(bytes)) => BloomFilter::from_bytes(bytes)?.contains_value(value)?,
+                Some(column) => match column.bloom() {
+                    Some(bytes) => BloomFilter::from_bytes(bytes)?.contains_value(value)?,
                     _ => true,
                 },
             },
-            Self::Presence { column: name, leg } => column(name).and_then(|column| column.field(leg)) == Some(&Value::Bool(true)),
+            Self::Presence { column: name, leg } => columns.root_column(name).and_then(|column| column.flag(leg)) == Some(true),
         })
     }
 }

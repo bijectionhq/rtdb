@@ -46,9 +46,9 @@ fn full_parameter_vector_types_determine_replacement_admission() {
     let values = [V::Null];
     let null = [L::Null];
     let nullable_text = [L::Scalar(S::Utf8).maybe()];
-    let context = EvalContext { parameters: &values,parameter_types: Some(&null),..Default::default() };
+    let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&values),parameter_types: Some(&null),..Default::default() };
     assert_eq!(evaluate(&expression,&Schema::default(),&[],&context).unwrap(),V::Null);
-    let context = EvalContext { parameters: &values,parameter_types: Some(&nullable_text),..Default::default() };
+    let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&values),parameter_types: Some(&nullable_text),..Default::default() };
     assert_eq!(evaluate(&expression,&Schema::default(),&[],&context).unwrap_err().code,"xtdb.expression/illegal-argument-exception");
 }
 

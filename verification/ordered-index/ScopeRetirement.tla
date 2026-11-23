@@ -30,7 +30,7 @@ TypeOK ==
 
 \* Admission and retirement use the same generation authority.
 AdmitUpload(writer, target) ==
-  /\ target = generation
+  /\ target >= generation
   /\ uploads[writer] = Idle
   /\ uploads' = [uploads EXCEPT ![writer] = target]
   /\ UNCHANGED <<generation, readers, copies, objects, dirty, published, acknowledged>>
@@ -45,8 +45,8 @@ SettleUpload(writer, committed) ==
   /\ UNCHANGED <<generation, readers, copies, published, acknowledged>>
 
 Publish ==
-  /\ generation \in objects \ published
-  /\ published' = published \cup {generation}
+  /\ 1 \in objects \ published
+  /\ published' = published \cup {1}
   /\ UNCHANGED <<generation, uploads, readers, copies, objects, dirty, acknowledged>>
 
 AdmitRead(reader) ==
@@ -70,6 +70,7 @@ ReleaseRead(reader) ==
 
 Retire ==
   /\ generation = 0
+  /\ 1 \in published
   /\ generation' = 1
   /\ UNCHANGED <<uploads, readers, copies, objects, dirty, published, acknowledged>>
 
@@ -77,6 +78,7 @@ EraseObjects ==
   /\ generation = 1
   /\ 0 \in objects
   /\ ~SettleUploads \/ (\A writer \in Writers : uploads[writer] # 0)
+  /\ ~DrainReaders \/ (\A reader \in Readers : readers[reader] # 0)
   /\ objects' = objects \ {0}
   /\ dirty' = dirty \ {0}
   /\ published' = published \ {0}
@@ -112,6 +114,7 @@ ReleaseSpec ==
   /\ WF_Vars(EraseObjects)
   /\ WF_Vars(Acknowledge)
 
-CompletesRetirement == <>acknowledged
+ReplacementPublished == <>(1 \in published)
+CompletesRetirement == ReplacementPublished => <>acknowledged
 
 =============================================================================

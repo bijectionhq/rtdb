@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
-use crate::{Error, Result};
+use crate::{Error, ReadLease, Result};
 
 tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
+    static READ_LEASE: Arc<ReadLease>;
+    static AUDIENCE_OBJECT_READ: ();
 }
 
 pub struct IoRegion {
@@ -18,11 +20,16 @@ pub struct IoRegion {
 pub(crate) struct IoAdmission {
     lifetimes: Vec<Arc<dyn Send + Sync>>,
     tokens: Vec<TaskTrackerToken>,
+    lease: Option<Arc<ReadLease>>,
 }
 impl IoAdmission {
     pub(crate) fn and(mut self, other: Self) -> Self {
         self.tokens.extend(other.tokens);
         self.lifetimes.extend(other.lifetimes);
+        self.lease = match (self.lease, other.lease) {
+            (Some(mine), Some(theirs)) => Some(mine.earlier(theirs)),
+            (mine, theirs) => mine.or(theirs),
+        };
         self
     }
 }
@@ -41,6 +48,25 @@ impl IoRegion {
         };
         RETAINED_OWNER.scope(owner, work).await
     }
+    /// Checks the lease when each provider operation is admitted while polling the work.
+    /// A nested lease narrows the one in scope where `leased` is called.
+    /// Returns the work itself or its scoped future, so a lease adds no copy of the work to the caller's future.
+    pub fn leased<F: std::future::Future>(lease: Option<Arc<ReadLease>>, work: F) -> impl std::future::Future<Output = F::Output> {
+        use tokio_util::either::Either;
+        let lease = match (lease, READ_LEASE.try_with(Arc::clone).ok()) {
+            (Some(lease), Some(parent)) => lease.earlier(parent),
+            (Some(lease), None) => lease,
+            (None, Some(parent)) => parent,
+            (None, None) => return Either::Right(work),
+        };
+        Either::Left(READ_LEASE.scope(lease, work))
+    }
+    /// Selects the dedicated provider read transport within an audience object read.
+    pub async fn audience_object_read<T>(work: impl std::future::Future<Output = T>) -> T {
+        AUDIENCE_OBJECT_READ.scope((), work).await
+    }
+    /// Whether this storage operation must use the audience object path.
+    pub fn requires_audience_transport() -> bool { AUDIENCE_OBJECT_READ.try_with(|_| ()).is_ok() }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
     /// Idle child handles do not delay any drain.
@@ -72,8 +98,10 @@ impl IoRegion {
     pub(crate) fn admit(&self) -> Result<IoAdmission> {
         let closed = self.closed.lock();
         if *closed { return Err(Error::Closed("I/O region is closed".into())); }
+        let lease = if self.parent.is_none() { READ_LEASE.try_with(Arc::clone).ok() } else { None };
+        if let Some(lease) = &lease { lease.check()?; }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
-            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect() });
+            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect(), lease });
         admission.tokens.push(self.tasks.token());
         admission.lifetimes.extend(self.lifetime.iter().cloned());
         Ok(admission)
@@ -95,6 +123,11 @@ impl IoRegion {
         Self::run_admitted(operation, work).await
     }
     pub(crate) async fn run_admitted<T: Send + 'static>(operation: IoAdmission, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+        let lease = operation.lease.clone();
+        let result = Self::run_admitted_unclassified(operation, work).await;
+        match lease { Some(lease) => lease.classify(result), None => result }
+    }
+    async fn run_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
             let operation = operation;
@@ -109,10 +142,20 @@ impl IoRegion {
     }
     #[cfg(any(feature = "remote", test))]
     pub(crate) async fn run_async_admitted<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
+        let lease = operation.lease.clone();
+        let result = Self::run_async_admitted_unclassified(operation, work).await;
+        match lease { Some(lease) => lease.classify(result), None => result }
+    }
+    #[cfg(any(feature = "remote", test))]
+    async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let audience = Self::requires_audience_transport();
+        let budget = crate::audience_work::current();
         tokio::spawn(async move {
             let operation = operation;
-            drop(sender.send(work.await));
+            let work = crate::audience_work::inherit(budget, work);
+            let result = if audience { Self::audience_object_read(work).await } else { work.await };
+            drop(sender.send(result));
             drop(operation);
         }).await.map_err(|error| Error::Task(error.to_string()))?;
         receiver.await.map_err(|error| Error::Task(error.to_string()))?

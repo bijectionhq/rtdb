@@ -3,7 +3,7 @@ mod interval;
 mod output;
 mod text;
 
-pub use output::{Format, SessionEnvironment, encode, encode_error, encode_value, to_transit};
+pub use output::{Format, SessionEnvironment, encode, encode_arrow, encode_error, encode_timestamp, encode_value, to_transit};
 pub use text::{from_transit, read_text};
 
 use std::{mem::size_of, sync::Arc};

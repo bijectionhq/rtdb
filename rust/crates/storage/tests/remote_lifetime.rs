@@ -5,9 +5,9 @@ use std::{fmt, future::{Future, poll_fn}, pin::Pin, sync::{Arc, atomic::{AtomicU
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
-use object_store::{CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
+use object_store::{CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
 use rtdb_columnar::MemoryBudget;
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, PublicationUploads, RemoteStore}};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, PublicationResult, PublicationUploads, RemoteStore}};
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]
@@ -30,6 +30,7 @@ struct Hooks {
     abort: Option<Arc<Gate>>,
     delete: Option<Arc<Gate>>,
     read: Option<Arc<Gate>>,
+    read_body: Option<Arc<Gate>>,
     fail_part: Option<usize>,
     fail_abort: bool,
     fail_delete: bool,
@@ -39,6 +40,12 @@ struct Hooks {
     forget_put_witness: bool,
     fail_first_publication_abort: bool,
     deny_list: bool,
+    put_version: Option<&'static str>,
+    read_version: Option<&'static str>,
+    head_version: Option<&'static str>,
+    put_etag: Option<&'static str>,
+    read_etag: Option<&'static str>,
+    head_etag: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -85,7 +92,9 @@ impl ProviderStore for ControlledStore {
         if self.hooks.forget_put_witness {
             options.attributes = Default::default();
         }
-        let result = self.inner.put_opts(location, payload, options).await?;
+        let mut result = self.inner.put_opts(location, payload, options).await?;
+        if let Some(version) = self.hooks.put_version { result.version = Some(version.into()); }
+        if let Some(etag) = self.hooks.put_etag { result.e_tag = Some(etag.into()); }
         if self.hooks.lose_put_reply {
             return Err(injected("lost publication reply"));
         }
@@ -100,7 +109,20 @@ impl ProviderStore for ControlledStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
         self.called();
         if !options.head { if let Some(gate) = &self.hooks.read { gate.enter().await; } }
-        self.inner.get_opts(location, options).await
+        let version = if options.head { self.hooks.head_version } else { self.hooks.read_version };
+        let etag = if options.head { self.hooks.head_etag } else { self.hooks.read_etag };
+        let gate = if options.head { None } else { self.hooks.read_body.clone() };
+        let mut result = self.inner.get_opts(location, options).await?;
+        if let Some(gate) = gate {
+            let GetResultPayload::Stream(body) = result.payload else { unreachable!("in-memory provider returns a stream") };
+            result.payload = GetResultPayload::Stream(futures::stream::once(async move {
+                gate.enter().await;
+                Ok::<_, object_store::Error>(body)
+            }).try_flatten().boxed());
+        }
+        if let Some(version) = version { result.meta.version = Some(version.into()); }
+        if let Some(etag) = etag { result.meta.e_tag = Some(etag.into()); }
+        Ok(result)
     }
     fn delete_stream(&self, locations: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
         let (inner, hooks, observed) = (Arc::clone(&self.inner), Arc::clone(&self.hooks), Arc::clone(&self.observed));
@@ -148,17 +170,17 @@ impl PublicationUploads for ControlledStore {
         Ok(upload)
     }
 
-    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<bool> {
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<PublicationResult> {
         let (owner, attempt) = self.uploads.lock().unwrap().get(upload).unwrap().clone();
         assert_eq!(owner, *path);
         let mut options = PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
         options.attributes.insert(object_store::Attribute::Metadata("rtdb-publication".into()), attempt.to_string().into());
         match self.put_opts(path, bytes.into(), options).await {
-            Ok(_) => {
+            Ok(written) => {
                 self.uploads.lock().unwrap().remove(upload);
-                Ok(true)
+                Ok(PublicationResult::Published { version: written.version, etag: written.e_tag })
             }
-            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(false),
+            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(PublicationResult::Conflict),
             Err(error) => Err(Error::Remote { key: path.to_string(), message: error.to_string() }),
         }
     }
@@ -236,6 +258,66 @@ fn journaled_region() -> (Arc<IoRegion>, Arc<PublicationInventory>) {
 }
 
 #[tokio::test]
+async fn publication_versions_come_from_the_acknowledgement_or_verified_existing_bytes() {
+    use rtdb_types::S3ObjectNamespace;
+
+    let path = ObjectKey::new("data.arrow").unwrap();
+    let contents = Bytes::from_static(b"sealed");
+    for managed in [false, true] {
+        let provider = ControlledStore::new(Hooks {
+            put_version: Some("write-version"),
+            read_version: Some("retried-version"),
+            head_version: Some("unbound-current-version"),
+            ..Default::default()
+        });
+        let prefix = ObjectKey::new("cell").unwrap();
+        let (io, journal) = journaled_region();
+        let store = if managed {
+            RemoteStore::new_managed(provider.clone(), prefix, io.clone(), provider)
+        } else {
+            RemoteStore::new_in(provider, Some(prefix), io.clone())
+        }.with_s3_versioning(S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None });
+
+        let written = store.put_with_publication(&path, contents.clone()).await.unwrap().unwrap().into_version().unwrap();
+        assert_eq!(written.key, "cell/data.arrow");
+        assert_eq!(written.version, "write-version", "the provider write acknowledgement supplies the version");
+        let retried = store.put_with_publication(&path, contents.clone()).await.unwrap().unwrap().into_version().unwrap();
+        assert_eq!(retried.version, "retried-version", "the same read must supply the body and version");
+        assert_eq!(retried.namespace, written.namespace);
+        assert_eq!(store.retirement_version(&path).await.unwrap().unwrap().version, "unbound-current-version");
+        assert!(matches!(store.put_with_publication(&path, Bytes::from_static(b"other")).await, Err(Error::ConflictingObject(_))));
+        io.close_and_wait().await;
+        assert!(journal.pending.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn terminal_publication_carries_the_tag_from_its_acknowledgement_or_confirmed_retry() {
+    let path = ObjectKey::new("data.arrow").unwrap();
+    let prefix = ObjectKey::new("terminal-root").unwrap();
+    let contents = Bytes::from_static(b"sealed");
+    let allocation = uuid::Uuid::new_v4();
+    let namespace = rtdb_types::S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None };
+    for lose_put_reply in [false, true] {
+        let (io, journal) = journaled_region();
+        let provider = ControlledStore::new(Hooks {
+            put_etag: Some("\"acknowledged\""), head_etag: Some("\"confirmed\""), read_etag: Some("\"retried\""),
+            lose_put_reply, ..Default::default()
+        });
+        let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider)
+            .with_s3_versioning(namespace.clone()).with_terminal_allocation(allocation);
+        let receipt = |etag: &str| Some(rtdb_types::PhysicalObjectPublication::Terminal(rtdb_types::TerminalObjectPublication {
+            namespace: namespace.clone(), key: "terminal-root/data.arrow".into(), allocation, etag: etag.into(),
+        }));
+        let committed = store.put_with_publication(&path, contents.clone()).await.unwrap();
+        assert_eq!(committed, receipt(if lose_put_reply { "\"confirmed\"" } else { "\"acknowledged\"" }));
+        assert_eq!(store.put_with_publication(&path, contents.clone()).await.unwrap(), receipt("\"retried\""));
+        io.close_and_wait().await;
+        assert!(journal.pending.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn managed_completion_recovers_exact_bytes_or_retires_the_upload() {
     let key = ObjectKey::new("data.arrow").unwrap();
     let contents = Bytes::from_static(b"sealed");
@@ -252,9 +334,11 @@ async fn managed_completion_recovers_exact_bytes_or_retires_the_upload() {
     assert!(journal.pending.lock().unwrap().is_empty());
 
     let (io, journal) = journaled_region();
-    let provider = ControlledStore::new(Hooks { lose_put_reply: true, ..Default::default() });
-    let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone());
-    store.put(&key, contents.clone()).await.unwrap();
+    let provider = ControlledStore::new(Hooks { lose_put_reply: true, head_version: Some("confirmed-attempt-version"), ..Default::default() });
+    let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone())
+        .with_s3_versioning(rtdb_types::S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None });
+    let recovered = store.put_with_publication(&key, contents.clone()).await.unwrap().unwrap().into_version().unwrap();
+    assert_eq!(recovered.version, "confirmed-attempt-version");
     io.close_and_wait().await;
     assert!(journal.pending.lock().unwrap().is_empty());
     assert_eq!(paths(&provider.inner).await, ["cell/data.arrow"]);
@@ -496,6 +580,31 @@ async fn cancelled_reserved_range_keeps_its_charge_until_the_provider_finishes()
     assert_pending(close.as_mut()).await; assert_eq!(memory.used_bytes(), 4);
     gate.release(); bounded(close).await;
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn cancelled_remote_body_keeps_its_catalog_owner_until_the_provider_drains() {
+    let gate = Gate::new();
+    let provider = ControlledStore::new(Hooks { read_body: Some(Arc::clone(&gate)), ..Default::default() });
+    provider.inner.put(&Path::from("data.arrow"), Bytes::from_static(b"catalog data").into()).await.unwrap();
+    let root = IoRegion::new();
+    let store = RemoteStore::new_in(provider, None, root.child());
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let owner = Arc::new(());
+    let held = Arc::downgrade(&owner);
+    let mut request = Box::pin(IoRegion::retaining(owner, store.get_fresh_exact(&key, 12)));
+    assert_pending(request.as_mut()).await;
+    gate.arrived().await;
+
+    drop(request);
+    let mut drain = Box::pin(root.close_and_wait());
+    assert_pending(drain.as_mut()).await;
+    assert!(held.upgrade().is_some(), "the response body still needs the catalog owner");
+    assert!(matches!(store.head(&key).await, Err(Error::Closed(_))));
+
+    gate.release();
+    bounded(drain).await;
+    assert!(held.upgrade().is_none(), "provider completion must release the last catalog owner");
 }
 
 #[tokio::test]

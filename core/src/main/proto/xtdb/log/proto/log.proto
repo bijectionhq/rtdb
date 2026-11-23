@@ -30,6 +30,22 @@ message Tx {
     string user = 4;
     bytes user_metadata = 5;
     bytes external_source_token = 6;
+    IdempotencyGuard idempotency_guard = 7;
+    ReplaySubmission replay_submission = 8;
+    // The intake position comes from the log record's metadata.
+    bytes placed_attempt_seed = 9;
+}
+
+message IdempotencyGuard {
+    int64 submitted_at_micros = 1;
+    bool after_bootstrap = 2;
+}
+
+message ReplaySubmission {
+    string key = 1;
+    int64 submitted_at_micros = 2;
+    int64 not_after_micros = 3;
+    bool abort_on_legacy_resolver = 4;
 }
 
 message BlockUploaded {
@@ -83,6 +99,27 @@ message TrieDetails {
     TrieState trie_state = 5;
     int64 garbage_as_of = 6;
     repeated ArtefactRecord artefacts = 7;
+    TrieFileVersions published_files = 8;
+}
+
+// Physical identities returned when the immutable files were published.
+message TrieFileVersions {
+    PublishedObjectVersion data = 1;
+    PublishedObjectVersion metadata = 2;
+}
+
+message PublishedObjectVersion {
+    string bucket = 1;
+    string endpoint = 2;
+    string region = 3;
+    string key = 4;
+    string version = 5;
+    TerminalPublication terminal = 6;
+}
+
+message TerminalPublication {
+    bytes allocation = 1;
+    string etag = 2;
 }
 
 // A file derived from a trie's data file (e.g. a search index), recorded on the trie's catalog entry and deleted with it.
@@ -94,6 +131,9 @@ message ArtefactRecord {
     // Opaque to the core: the artefact kind owns its encoding.
     bytes stats = 4;
     ArtefactScope scope = 5;
+    // Size of the published object, including its headers and auxiliary sections.
+    int64 file_size = 6;
+    PublishedObjectVersion published_version = 7;
 }
 
 // The data files one artefact is derived from.

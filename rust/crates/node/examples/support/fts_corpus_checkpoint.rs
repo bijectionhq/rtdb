@@ -3,17 +3,19 @@ use std::ops::Bound::{Excluded, Included};
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray,
+    builder::{ListBuilder, StringBuilder, UInt32Builder}, cast::AsArray, types::{Int64Type, UInt32Type}};
+use arrow_schema::Schema;
 use rtdb_node::{NativeSession, Node};
 use rtdb_text::{Corpus, Query, bm25, stored_length, tokens};
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{StructFields, TableRef, Timestamp, Value};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{Identity, TickClock, bench_options, bench_services, commit, flush, query, sql, where_ids};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Contribution {
     length: u32,
     terms: BTreeSet<String>,
@@ -46,11 +48,57 @@ impl Contribution {
     }
 }
 
-#[derive(Deserialize, Serialize)]
 struct CorpusDelta {
     from: Timestamp,
     through: Timestamp,
     replacements: BTreeMap<i64, Option<Contribution>>,
+}
+
+fn write_contributions<'a>(from: Option<Timestamp>, through: Timestamp, rows: impl Iterator<Item = (i64, Option<&'a Contribution>)>) -> Vec<u8> {
+    let mut ids = Vec::new();
+    let mut lengths = UInt32Builder::new();
+    let mut terms = ListBuilder::new(StringBuilder::new());
+    for (id, row) in rows {
+        ids.push(id);
+        lengths.append_option(row.map(|row| row.length));
+        if let Some(row) = row {
+            for term in &row.terms { terms.values().append_value(term); }
+        }
+        terms.append(row.is_some());
+    }
+    let batch = RecordBatch::try_from_iter([
+        ("_id", Arc::new(Int64Array::from(ids)) as ArrayRef),
+        ("length", Arc::new(lengths.finish()) as ArrayRef),
+        ("terms", Arc::new(terms.finish()) as ArrayRef),
+    ]).unwrap();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("through_micros".into(), through.0.to_string());
+    if let Some(from) = from { metadata.insert("from_micros".into(), from.0.to_string()); }
+    let schema = Arc::new(Schema::new_with_metadata(batch.schema().fields().clone(), metadata));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
+    rtdb_format::ipc::write_arrow_stream(&schema, &[batch], arrow_ipc::writer::IpcWriteOptions::default()).unwrap()
+}
+
+fn read_contributions(bytes: &[u8]) -> (Option<Timestamp>, Timestamp, BTreeMap<i64, Option<Contribution>>) {
+    let mut stream = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+    let schema = stream.schema();
+    let from = schema.metadata().get("from_micros").map(|time| Timestamp(time.parse().unwrap()));
+    let through = Timestamp(schema.metadata()["through_micros"].parse().unwrap());
+    let batch = stream.next().unwrap().unwrap();
+    assert!(stream.next().is_none());
+    let ids = batch.column(0).as_primitive::<Int64Type>();
+    let lengths = batch.column(1).as_primitive::<UInt32Type>();
+    let terms = batch.column(2).as_list::<i32>();
+    let words = terms.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let offsets = terms.value_offsets();
+    let rows = (0..batch.num_rows()).map(|row| {
+        let contribution = lengths.is_valid(row).then(|| Contribution {
+            length: lengths.value(row),
+            terms: (offsets[row]..offsets[row + 1]).map(|index| words.value(index as usize).to_owned()).collect(),
+        });
+        (ids.value(row), contribution)
+    }).collect();
+    (from, through, rows)
 }
 
 struct CorpusCheckpoint {
@@ -76,7 +124,9 @@ impl CorpusCheckpoint {
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        let (basis, visible): (_, BTreeMap<i64, Contribution>) = serde_json::from_slice(bytes).unwrap();
+        let (from, basis, rows) = read_contributions(bytes);
+        assert!(from.is_none());
+        let visible: BTreeMap<_, _> = rows.into_iter().map(|(id, row)| (id, row.unwrap())).collect();
         let mut totals = Corpus::default();
         for contribution in visible.values() { contribution.add(&mut totals); }
         Self { basis, totals, visible }
@@ -151,6 +201,14 @@ pub(super) fn exhaustive_corpus(rows: &[Vec<Value>]) -> Corpus {
     corpus
 }
 
+pub(super) fn corpus_score_sql(query: &str, corpus: &Corpus) -> String {
+    let frequencies = Query::parse(query).terms().iter()
+        .map(|term| corpus.frequencies.get(term).copied().unwrap_or(0).to_string())
+        .collect::<Vec<_>>().join(", ");
+    let query = query.replace('\'', "''");
+    format!("SEARCH_SCORE(body, '{query}', {}, {}, ARRAY[{frequencies}])", corpus.documents, corpus.tokens)
+}
+
 async fn verify_ranking(
     session: &mut NativeSession, checkpoint: &CorpusCheckpoint, valid: Timestamp, system: Timestamp,
 ) {
@@ -166,10 +224,8 @@ async fn verify_ranking(
     });
     let expected: Vec<_> = expected.into_iter().take(20)
         .map(|(id, score)| vec![Value::I64(id), Value::F64(score)]).collect();
-    let ranked = format!(
-        "SELECT _id, SEARCH_SCORE(body, 'alpha beta') AS score FROM docs {} WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 20",
-        as_of(valid, system),
-    );
+    let score = corpus_score_sql("alpha beta", &checkpoint.totals);
+    let ranked = format!("SELECT _id, {score} AS score FROM docs {} WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 20", as_of(valid, system));
     assert_eq!(query(session, &ranked).await, expected, "{ranked} at checkpoint {:?}", checkpoint.basis);
 }
 
@@ -186,8 +242,9 @@ async fn observe(
     let start = Instant::now();
     let delta = checkpoint.advance(session, basis, touched, boundaries).await;
     let delta_us = start.elapsed().as_secs_f64() * 1e6;
-    let encoded = serde_json::to_vec(&delta).unwrap();
-    let decoded = serde_json::from_slice(&encoded).unwrap();
+    let encoded = write_contributions(Some(delta.from), delta.through, delta.replacements.iter().map(|(&id, row)| (id, row.as_ref())));
+    let (from, through, replacements) = read_contributions(&encoded);
+    let decoded = CorpusDelta { from: from.unwrap(), through, replacements };
     replay.apply(&decoded);
     assert_eq!(replay.totals, checkpoint.totals, "{label} replayed totals");
     assert_eq!(replay.visible, checkpoint.visible, "{label} replayed contributions");
@@ -202,7 +259,7 @@ async fn observe(
     json!({
         "transition": label,
         "affected_iids": delta.replacements.len(),
-        "delta_json_bytes": encoded.len(),
+        "delta_arrow_bytes": encoded.len(),
         "delta_us": delta_us,
         "exhaustive_us": exhaustive_us,
         "visible_documents": checkpoint.totals.documents,
@@ -250,9 +307,7 @@ pub(super) async fn run(background_documents: i64) {
     let mut checkpoint = CorpusCheckpoint::capture(&mut session, past).await;
     let checkpoint_us = start.elapsed().as_secs_f64() * 1e6;
     assert_eq!(checkpoint.totals.documents, background_documents as u64 + 3);
-    let checkpoint_file = tempfile::NamedTempFile::new().unwrap();
-    serde_json::to_writer(checkpoint_file.as_file(), &(checkpoint.basis, &checkpoint.visible)).unwrap();
-    let bytes = std::fs::read(checkpoint_file.path()).unwrap();
+    let bytes = write_contributions(None, checkpoint.basis, checkpoint.visible.iter().map(|(&id, row)| (id, Some(row))));
     let mut replay = CorpusCheckpoint::from_bytes(&bytes);
     assert_eq!(replay.totals, checkpoint.totals);
     assert_eq!(replay.visible, checkpoint.visible);
@@ -299,7 +354,7 @@ pub(super) async fn run(background_documents: i64) {
             &boundaries, past, &mut replay).await);
     }
     println!("{}", json!({
-        "checkpoint_json_bytes": bytes.len(),
+        "checkpoint_arrow_bytes": bytes.len(),
         "churn": churn,
         "background_documents": background_documents,
         "initial_checkpoint_us": checkpoint_us,

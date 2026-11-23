@@ -18,3 +18,20 @@ pub(crate) fn newer_checkpoint(attempted: i64, listed: Option<i64>) -> Option<i6
         _ => None,
     }
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out <==> published_boundary >= 0 && match loaded_boundary {
+        Some(boundary) => (loaded_block == published_block && boundary == published_boundary)
+            || (loaded_block > published_block && boundary > published_boundary),
+        None => false,
+    },
+))]
+pub(crate) fn accepts_published_checkpoint(
+    published_block: i64, published_boundary: i64, loaded_block: i64, loaded_boundary: Option<i64>,
+) -> bool {
+    published_boundary >= 0 && match loaded_boundary {
+        Some(boundary) if loaded_block == published_block => boundary == published_boundary,
+        Some(boundary) => loaded_block > published_block && boundary > published_boundary,
+        None => false,
+    }
+}

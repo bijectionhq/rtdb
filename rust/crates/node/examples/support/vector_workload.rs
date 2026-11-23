@@ -24,7 +24,7 @@ const TOP: usize = 10;
 
 type Rows = Vec<(i64, f64)>;
 
-fn documents<'a>(node: &Node, rows: impl IntoIterator<Item = (i64, &'a [f32], u32, u32)>, dimensions: usize) -> ArrowDocuments {
+fn documents<'a>(node: &Node, rows: impl IntoIterator<Item = (i64, &'a [f32], u32, u32)>, dimensions: usize, valid_from: Timestamp, valid_to: Option<Timestamp>) -> ArrowDocuments {
     let item = Arc::new(Field::new("item", DataType::Float32, false));
     let width = i32::try_from(dimensions).unwrap();
     let schema = Arc::new(Schema::new(vec![
@@ -32,6 +32,8 @@ fn documents<'a>(node: &Node, rows: impl IntoIterator<Item = (i64, &'a [f32], u3
         Field::new("embedding", DataType::FixedSizeList(Arc::clone(&item), width), false),
         Field::new("random_group", DataType::Int64, false),
         Field::new("cluster_group", DataType::Int64, false),
+        Field::new("_valid_from", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), false),
+        Field::new("_valid_to", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), true),
     ]));
     let rows = rows.into_iter();
     let count = rows.size_hint().0;
@@ -47,14 +49,20 @@ fn documents<'a>(node: &Node, rows: impl IntoIterator<Item = (i64, &'a [f32], u3
         cluster.push(i64::from(cluster_group));
     }
     let embeddings = FixedSizeListArray::try_new(item, width, Arc::new(Float32Array::from(components)), None).unwrap();
-    let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids)), Arc::new(embeddings),
-        Arc::new(Int64Array::from(random)), Arc::new(Int64Array::from(cluster))];
+    let count = ids.len();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(ids)), Arc::new(embeddings),
+        Arc::new(Int64Array::from(random)), Arc::new(Int64Array::from(cluster)),
+        Arc::new(TimestampMicrosecondArray::from(vec![valid_from.0; count]).with_timezone("UTC")),
+        Arc::new(TimestampMicrosecondArray::from(vec![valid_to.map(|to| to.0); count]).with_timezone("UTC")),
+    ];
     let input = RecordBatch::try_new(schema, columns).unwrap();
-    ArrowDocuments::try_new(&input, node.memory()).unwrap().unwrap()
+    let input = rtdb_columnar::OwnedBatch::new(input, node.memory()).unwrap();
+    ArrowDocuments::from_ingest_batch(&input, node.memory()).unwrap().unwrap()
 }
 
-async fn put(session: &mut NativeSession, table: &TableRef, documents: ArrowDocuments, start: Timestamp, end: Option<Timestamp>) {
-    commit(session, vec![TxOp::PutArrowDocs { table: table.clone(), documents, valid_from: Some(start), valid_to: end }]).await;
+async fn put(session: &mut NativeSession, table: &TableRef, documents: ArrowDocuments) {
+    commit(session, vec![TxOp::PutArrowDocs { table: table.clone(), documents }]).await;
 }
 
 fn scope_scan(relation: &Arc<Relation>, iids: &BTreeSet<Iid>) -> Arc<Relation> {
@@ -103,8 +111,9 @@ async fn search_with_scorer(context: &Arc<QueryContext>, query: &[f32], valid: T
     if scalar { args.push(Arc::new(BooleanArray::from(vec![true]))); }
     let fields = args.iter().enumerate().map(|(index, array)| Field::new(format!("?{index}"), array.data_type().clone(), false)).collect::<Vec<_>>();
     let args = rtdb_columnar::OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), args).unwrap(), &context.memory).unwrap();
+    let types = args.batch().schema_ref().fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
     let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory).unwrap()
-        .execute_arrow(Arc::clone(context), args, None, &Default::default()).await.unwrap();
+        .execute_arrow_columns(Arc::clone(context), args, 0, &types, None).await.unwrap();
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().await.unwrap() {
         let batch = batch.batch();
@@ -250,11 +259,11 @@ async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedInde
     let filter = Filter::RandomBelow(10);
     assert!(search(&initial, query, VALID_AT, filter, Some(&reassigned_only)).await.is_empty());
 
-    let documents = documents(node, [(reassigned as i64, data.vector(reassigned), 0, 0), (fresh, query, 0, 0)], data.dimensions);
+    let documents = documents(node, [(reassigned as i64, data.vector(reassigned), 0, 0), (fresh, query, 0, 0)], data.dimensions, VALID_AT, None);
     let operations = vec![
         TxOp::DeleteDocs { table: captured.table.clone(), ids: entity_ids(&deleted), valid_from: Some(VALID_AT), valid_to: None },
         TxOp::EraseDocs { table: captured.table.clone(), ids: entity_ids(&erased) },
-        TxOp::PutArrowDocs { table: captured.table.clone(), documents, valid_from: Some(VALID_AT), valid_to: None },
+        TxOp::PutArrowDocs { table: captured.table.clone(), documents },
     ];
     let write = async {
         let started = Instant::now();
@@ -319,7 +328,7 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
             let (random, cluster) = index::groups(id, data.clusters.value(id) as usize);
             (id as i64, data.vector(id), random, cluster)
         });
-        put(&mut session, &table, documents(&node, rows, data.dimensions), VALID_AT, None).await;
+        put(&mut session, &table, documents(&node, rows, data.dimensions, VALID_AT, None)).await;
         if (offset + batch) % 20_000 == 0 { flush(&node).await; }
     }
     flush(&node).await;
@@ -344,7 +353,7 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     let query = &data.queries.values()[..data.dimensions];
     let before = search(&active, query, VALID_AT, Filter::All, None).await;
     let update_started = Instant::now();
-    put(&mut session, &table, documents(&node, [(count as i64, query, 0, 0)], data.dimensions), VALID_AT, None).await;
+    put(&mut session, &table, documents(&node, [(count as i64, query, 0, 0)], data.dimensions, VALID_AT, None)).await;
     let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
     let newer = session.query_context().await.unwrap();
     let expected = search(&newer, query, VALID_AT, Filter::All, None).await;
@@ -358,8 +367,8 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     let affected = before[0].0;
     let previous = data.vector(affected as usize);
     let reversed: Vec<_> = previous.iter().map(|value| -*value).collect();
-    put(&mut session, &table, documents(&node, [(affected, reversed.as_slice(), 999, 999)], data.dimensions), VALID_AT, Some(Timestamp(1))).await;
-    put(&mut session, &table, documents(&node, [(-1, query, 0, 0)], data.dimensions), Timestamp(1), None).await;
+    put(&mut session, &table, documents(&node, [(affected, reversed.as_slice(), 999, 999)], data.dimensions, VALID_AT, Some(Timestamp(1)))).await;
+    put(&mut session, &table, documents(&node, [(-1, query, 0, 0)], data.dimensions, Timestamp(1), None)).await;
     let erased = EntityIds::new(vec![EntityId::Integer(count as i64)], node.memory()).unwrap();
     commit(&mut session, vec![TxOp::EraseDocs { table: table.clone(), ids: erased }]).await;
 

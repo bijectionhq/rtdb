@@ -8,7 +8,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::{EventBatch, PageEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
 use rtdb_types::{Iid, LogicalType, Result, RunEndWidth, Timestamp};
 use tokio_util::sync::CancellationToken;
-use super::{MergeConfig, MergeFile, OutputSchema, check_disk, create_file, disk_remaining, event_reservation, limit_writer, open_input, read_page, row_bytes};
+use super::{MergeConfig, MergeFile, OutputSchema, check_disk, create_file, disk_remaining, limit_writer, open_input, read_page, row_bytes};
 use super::planner::bucket;
 
 #[derive(Clone, Debug)]
@@ -49,20 +49,15 @@ struct FinalWriter<'a> {
 impl FinalWriter<'_> {
     fn leaf(&mut self, events: &[PageEvent]) -> Result<usize> {
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
-        let _batch = event_reservation(self.memory, events, 8)?;
-        let batch = self.schema.batch(events)?;
-        let (leaf, metadata_charge) = self.metadata.write_leaf_reserved(&batch, self.memory)?;
-        limit_writer(&mut self.data, self.directory, self.disk_limit)?;
-        self.data.write(&batch)?;
-        self.metadata_charges.push(metadata_charge);
-        Ok(leaf)
+        let batch = self.schema.batch(events, self.memory)?;
+        self.page(batch.batch())
     }
 
     fn page(&mut self, batch: &arrow_array::RecordBatch) -> Result<usize> {
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         let (leaf, metadata_charge) = self.metadata.write_leaf_reserved(batch, self.memory)?;
         limit_writer(&mut self.data, self.directory, self.disk_limit)?;
-        self.data.write(batch)?;
+        self.data.write_event_page(batch, self.memory)?;
         self.metadata_charges.push(metadata_charge);
         Ok(leaf)
     }
@@ -232,7 +227,7 @@ impl StreamingTrie {
 pub(super) fn normalize(input: &MergeFile, put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>,
     data_path: &Path, meta_path: &Path, cancellation: &CancellationToken) -> Result<(u64, rtdb_format::log::proto::TrieMetadata)> {
     let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
-    let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency };
+    let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency, keyed: input.keyed };
     let directory = data_path.parent().ok_or_else(|| crate::invalid("Output path has no parent"))?;
     let arrow_schema = schema.schema()?;
     let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, &arrow_schema, disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, arrow_schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };

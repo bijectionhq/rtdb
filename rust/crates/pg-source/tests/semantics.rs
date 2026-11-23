@@ -17,9 +17,17 @@ fn confirmation_waits_for_adopted_blocks_then_crosses_unpublished_wal_gaps() {
     assert_eq!(state.confirmable(), Lsn(250));
 }
 #[test]
-fn no_durable_extent_permits_slot_progress_before_the_first_block() {
+fn first_block_or_replay_evidence_is_required_for_confirmation() {
     let mut state = ConfirmationState::new(Lsn(100), None);
     state.submitted(Lsn(200)); state.received_through(Lsn(250));
+    assert_eq!(state.confirmable(), Lsn(0));
+    state.recovered_by_replay(Lsn(100));
+    assert_eq!(state.confirmable(), Lsn(100));
+    state.recovered_by_replay(Lsn(250));
+    assert_eq!(state.confirmable(), Lsn(100));
+    state.recovered_by_replay(Lsn(200));
+    assert_eq!(state.confirmable(), Lsn(200));
+    state.adopted(Some(Lsn(200)));
     assert_eq!(state.confirmable(), Lsn(250));
 }
 #[test]

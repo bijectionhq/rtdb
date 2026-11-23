@@ -12,7 +12,7 @@ use rtdb_index::TransactionBuffer;
 use rtdb_storage::{MemoryStore, ObjectStore, cache::BufferPool, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_trie::TrieConfig;
 use rtdb_tx::{Documents, ResolveContext, SourceTransaction, SubmitOptions, TransactionAuthorization, TxOp};
-use rtdb_types::{Anomaly, BlockIndex, Interval, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, BlockIndex, Interval, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError::Empty;
 use tokio_util::sync::CancellationToken;
@@ -38,16 +38,21 @@ async fn fixture(config: ReplicationConfig, replica_message_limit: usize) -> Fix
 }
 
 async fn fixture_with_clock(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>) -> Fixture {
+    fixture_with_replica(config, replica_message_limit, clock, |replica| replica).await
+}
+
+async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
+    wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>) -> Fixture {
     let memory = MemoryBudget::new(1 << 30);
     let source = Arc::new(MemoryLog::new(1 << 28));
     let replica = Arc::new(MemoryLog::new(replica_message_limit));
     let store = Arc::new(MemoryStore::default());
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 27));
-    let logs = PartitionLogs::new(source.clone(), replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
+    let logs = PartitionLogs::new(source.clone(), wrap_replica(replica.clone()), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
+    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
     let effects = Arc::new(NoEffects);
     let cancellation = CancellationToken::new();
     let (handle, driver) = match clock {
@@ -259,8 +264,10 @@ async fn admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applie
 #[tokio::test]
 async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
     let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
+    let seed = rtdb_types::PlacedAttemptScope::new("deployment/1/replica", 7).unwrap().issue();
     let message = rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(proto::Tx {
-        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100), ..Default::default()
+        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100),
+        user: Some("alice".into()), placed_attempt_seed: Some(seed.encode().to_vec()), ..Default::default()
     }));
     let expected = message.encode().unwrap();
     let handle = fixture.handle.clone();
@@ -271,6 +278,15 @@ async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
     assert_eq!(result.error().unwrap().code, "xtdb/skipped-tx");
     assert_eq!(result.tx_key().system_time, Timestamp(100));
     assert_eq!(fixture.store.get(&rtdb_storage::ObjectKey::new("skipped-txs/00").unwrap()).await.unwrap().as_ref(), expected.as_slice());
+    let latest = fixture.replica.latest().unwrap().0;
+    let installed = fixture.replica.read_range(LogOffset(0), LogOffset(latest + 1)).await.unwrap().into_iter()
+        .find_map(|raw| match ReplicaEnvelope::decode(&raw.payload).unwrap().unwrap().message {
+            ReplicaBody::ResolvedTx(resolved) => Some(resolved),
+            _ => None,
+        }).unwrap();
+    let attempt = rtdb_types::PlacedAttempt::decode(installed.placed_attempt.as_deref().unwrap()).unwrap();
+    assert_eq!(attempt, seed.identify(position, Some("alice")).unwrap());
+    assert!(installed.table_data.contains_key("xt/placed_attempt_outcomes"));
     handle.shutdown();
     driver.await.unwrap().unwrap();
 }
@@ -309,6 +325,150 @@ async fn held_records_replay_below_the_fence_after_a_higher_term_upload() {
 }
 
 #[tokio::test]
+async fn catalog_cut_tracks_the_captured_catalog_after_a_pending_block_drains() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    let partition = Arc::clone(&fixture.driver.partition);
+    let table = TableRef::new("public", "docs");
+    assert_eq!(partition.open_snapshot(None).catalog_cut(), None);
+    assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), None);
+    fixture.driver.consume(raw(0, 1, 0, resolved(0, 0))).await.unwrap();
+    let before = partition.open_snapshot(None);
+    assert_eq!(before.catalog_cut().unwrap().through, ReplicaPosition(0));
+    fixture.driver.consume(raw(1, 1, 1, boundary(0, 0))).await.unwrap();
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let added = ReplicaBody::TriesAdded(proto::TriesAdded {
+        storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), source_msg_id: Some(1),
+        tries: vec![proto::TrieDetails {
+            table_name: Some(table.schema_and_table()), trie_key: Some("l00-rc-b00".into()), data_file_size: Some(1),
+            ..Default::default()
+        }],
+    });
+    fixture.driver.consume(raw(2, 1, 2, added)).await.unwrap();
+    let held = partition.open_snapshot(None);
+    assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(2));
+    assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), Some(ReplicaPosition(0)));
+    assert_eq!(held.catalog_cut(), before.catalog_cut());
+    assert!(held.trie_entries(&table).is_empty());
+
+    fixture.driver.consume(raw(3, 1, 3, upload(0, 0))).await.unwrap();
+    let installed = partition.open_snapshot(None);
+    assert_eq!(installed.catalog_cut().unwrap().through, ReplicaPosition(3));
+    assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), Some(ReplicaPosition(3)));
+    assert_eq!(installed.trie_entries(&table).len(), 1);
+    assert_eq!(held.catalog_cut().unwrap().through, ReplicaPosition(0));
+    assert!(held.trie_entries(&table).is_empty());
+}
+
+#[tokio::test]
+async fn catalog_cut_cannot_cross_an_unrecognized_replica_body() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    let partition = Arc::clone(&fixture.driver.partition);
+    fixture.driver.consume(raw(0, 1, 0, resolved(0, 0))).await.unwrap();
+    let mut unknown = raw(1, 1, 1, resolved(1, 1));
+    unknown.payload = unknown.payload.slice(..1);
+    fixture.driver.consume(unknown).await.unwrap();
+    fixture.driver.consume(raw(2, 1, 1, resolved(2, 2))).await.unwrap();
+
+    assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(2));
+    assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), Some(ReplicaPosition(0)));
+    assert_eq!(partition.snapshot().tx_basis().unwrap().tx_id, TxId(2));
+    assert_eq!(partition.snapshot().catalog_cut().unwrap().through, ReplicaPosition(0));
+}
+
+#[tokio::test]
+async fn catalog_cut_advances_when_resolution_releases_deferred_records() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, external_source: true, ..Default::default() }, 1 << 27).await;
+    let partition = Arc::clone(&fixture.driver.partition);
+    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+    let receipt = fixture.handle.term().unwrap()
+        .submit_external(Box::new(CommitExternal), Some(Timestamp(100)), None).await.unwrap();
+    let command = fixture.driver.commands.try_recv().unwrap();
+    fixture.driver.command(command).await.unwrap();
+    let table = TableRef::new("public", "docs");
+    let deleted = ReplicaBody::TriesDeleted(proto::TriesDeleted {
+        table_name: Some(table.schema_and_table()), trie_keys: vec!["l00-rc-b00".into()],
+    });
+    fixture.driver.consume(raw(1, 1, 1, deleted)).await.unwrap();
+    assert_eq!(fixture.driver.leader.as_ref().unwrap().held.len(), 1);
+    assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(1));
+    assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), Some(ReplicaPosition(0)));
+    assert_eq!(partition.open_snapshot(None).catalog_cut().unwrap().through, ReplicaPosition(0));
+
+    let resolution = &mut fixture.driver.leader.as_mut().unwrap().resolution;
+    let (resolver, result) = super::pending_resolution(resolution).await;
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    assert_eq!(fixture.handle.status().installed.map(|prefix| prefix.replica), Some(ReplicaPosition(1)));
+    assert_eq!(partition.open_snapshot(None).catalog_cut().unwrap().through, ReplicaPosition(1));
+    fixture.driver.demote().await.unwrap();
+    drop(receipt);
+}
+
+async fn queued_trie_removal(key: &str) -> (Fixture, TableRef, rtdb_format::keys::TrieKey, oneshot::Receiver<Result<Applied>>, LogRecord) {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }));
+    fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    fixture.driver.consume(opening).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+    let table = TableRef::new("public", "docs");
+    fixture.driver.partition.add_tries(&BTreeMap::from([(table.clone(), ["l01-rc-b00", "l01-rc-b01"].into_iter().map(|key| {
+        rtdb_index::CatalogTrie::notification(key.parse().unwrap(), 1, None).unwrap()
+    }).collect())]), Timestamp(100)).unwrap();
+    let key: rtdb_format::keys::TrieKey = key.parse().unwrap();
+    let (completion, receiver) = oneshot::channel();
+    fixture.driver.command(super::Command::Delete {
+        term: Term(1), table: table.clone(), keys: vec![key.clone()], completion,
+    }).await.unwrap();
+    let mut tail = fixture.replica.tail(LogOffset(0)).await.unwrap();
+    let mut records = tail.poll(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(records.len(), 1);
+    (fixture, table, key, receiver, records.pop().unwrap())
+}
+
+#[tokio::test]
+async fn trie_removal_receipt_waits_for_the_installed_catalog_cut() {
+    let (mut fixture, table, key, mut receipt, readback) = queued_trie_removal("l01-rc-b00").await;
+    let record = fixture.logs.decode_replica(readback).unwrap().unwrap();
+    let position = record.metadata.position;
+    let (_, admitted) = fixture.driver.fence.admit_record(record).unwrap();
+    fixture.driver.apply_admitted(admitted.unwrap()).await.unwrap();
+
+    let view = fixture.driver.partition.value();
+    assert!(!view.retains_trie(&table, &key));
+    assert_eq!(view.snapshot().catalog_cut().unwrap().through, ReplicaPosition(0));
+    assert!(matches!(receipt.try_recv(), Err(Empty)), "trie removal replied before the installed prefix");
+
+    fixture.driver.read_position = position;
+    fixture.driver.update_installed_prefix().unwrap();
+    assert!(matches!(receipt.try_recv().unwrap().unwrap(), Applied::TrieRemoval(through) if through == position));
+    assert_eq!(fixture.driver.partition.value().snapshot().catalog_cut().unwrap().through, position);
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn trie_removal_receipt_refuses_a_remaining_live_trie() {
+    let (mut fixture, table, key, receipt, readback) = queued_trie_removal("l01-rc-b01").await;
+    fixture.driver.consume(readback).await.unwrap();
+    assert_eq!(receipt.await.unwrap().unwrap_err().code, "rtdb.replication/trie-removal-unconfirmed");
+    assert!(fixture.driver.partition.value().retains_trie(&table, &key));
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn trie_removal_receipt_refuses_a_different_readback() {
+    let (mut fixture, table, key, receipt, mut readback) = queued_trie_removal("l01-rc-b00").await;
+    let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+    let ReplicaBody::TriesDeleted(message) = &mut envelope.message else { panic!("expected a trie removal"); };
+    message.trie_keys = vec!["l01-rc-b09".into()];
+    readback.payload = envelope.encode().into();
+    fixture.driver.consume(readback).await.unwrap();
+    assert_eq!(receipt.await.unwrap().unwrap_err().code, "rtdb.replication/trie-removal-unconfirmed");
+    assert!(fixture.driver.partition.value().retains_trie(&table, &key));
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
 async fn wrong_epoch_upload_is_held_and_record_overflow_stops_apply() {
     let config = ReplicationConfig { may_lead: false, pending_block_records: 1, ..Default::default() };
     let mut fixture = fixture(config, 1 << 27).await;
@@ -343,7 +503,7 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     let table = TableRef::new("public", "docs");
     for id in 0..8 { write.put(table.clone(), StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id))]), Interval::ALL).unwrap(); }
     state.apply(&write.stage().unwrap()).unwrap();
-    fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key })), None).unwrap();
+    fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key }).into()), None).unwrap();
     fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
     let pending = fixture.driver.pending_block.as_ref().unwrap();
     let first = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
@@ -356,14 +516,172 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     fixture.driver.consume(raw(1, 1, 1, ReplicaBody::BlockUploaded(uploaded))).await.unwrap();
     assert_eq!(fixture.driver.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     assert_eq!(fixture.driver.partition.value().live().block_row_count(), 0);
-    use crate::BlockDiscovery::{From, List};
-    for discovery in [List, From(BlockIndex(0)), From(BlockIndex(5)), crate::BlockDiscovery::At(BlockIndex(0))] {
+    use crate::BlockDiscovery::{At, From, FromPublished, List};
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(0), root_sha256: None };
+    for discovery in [List, From(BlockIndex(0)), From(BlockIndex(5)), FromPublished(published), At(BlockIndex(0))] {
         let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), discovery).await.unwrap();
         assert_eq!(recovered.block.as_ref().map(|block| block.block_index()), Some(BlockIndex(0)), "{discovery:?} finds the latest block");
         assert_eq!(recovered.progress.tx_key, Some(key));
         assert_eq!(recovered.fence.position(), TermPosition::Expecting(TermSequence(1)));
         assert_eq!(recovered.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     }
+    let missing = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000),
+        FromPublished(PublishedCheckpoint { block: BlockIndex(5), boundary: ReplicaPosition(5), root_sha256: None }))
+        .await.err().expect("an admitted published bound cannot fall back to an older block");
+    assert_eq!(missing.code, "rtdb.replication/block-gone");
+}
+
+#[tokio::test]
+async fn hosted_checkpoint_recovery_preserves_its_admitted_journal_boundary() {
+    use rtdb_format::{block::proto::Block, catalog::BlockCatalog, keys::block_key};
+    use rtdb_storage::ObjectKey;
+
+    let fixture = produced_memory_checkpoint(true).await;
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1), root_sha256: None };
+    let snapshot = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::AtPublished(published)).await.unwrap();
+    assert_eq!(snapshot.block.as_ref().unwrap().boundary_replica_position(), Some(published.boundary));
+    let another_log = PartitionLogs::new(fixture.source.clone(), fixture.replica.clone(),
+        StorageEpoch(0), StorageEpoch(1), CURRENT_STORAGE_VERSION, StorageEpoch(0), fixture.store.clone(),
+        Arc::new(BufferPool::new(fixture.store.clone(), 1 << 20)), fixture.memory.clone()).unwrap();
+    let wrong_log = fixture.blocks.recover_for_replay(snapshot, &another_log, TrieConfig::default(),
+        Timestamp(0), &CancellationToken::new()).await;
+    assert_eq!(wrong_log.err().map(|error| error.code), Some("rtdb.replication/invalid-block".into()),
+        "the admitted snapshot cannot be installed against a different replica journal");
+    let wrong = PublishedCheckpoint { boundary: ReplicaPosition(0), ..published };
+    let attempt = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), BlockDiscovery::AtPublished(wrong)).await;
+    assert_eq!(attempt.err().map(|error| error.code), Some("rtdb.replication/invalid-block".into()),
+        "the exact snapshot must match the boundary the directory admitted");
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::FromPublished(published)).await.unwrap();
+
+    // The first recovered checkpoint loses its log suffix while its replacement becomes visible.
+    for sequence in [2, 3] {
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)),
+            message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
+    }
+    fixture.replica.truncate_before(LogOffset(3)).unwrap();
+    assert!(matches!(fixture.logs.recovery_tail(published.boundary).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })));
+    let foreign = ReplicaPosition::from_epoch_offset(StorageEpoch(1), 3).unwrap();
+    let later = BlockCatalog::from_proto(Block {
+        block_index: Some(1), boundary_replica_msg_id: Some(foreign.0), ..Default::default()
+    }).unwrap();
+    fixture.store.put(&ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap(), later.encode().into()).await.unwrap();
+    let retry = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(),
+        Timestamp(0), &CancellationToken::new()).await;
+    assert_eq!(retry.err().map(|error| error.code), Some("rtdb.replication/invalid-block".into()),
+        "a replay retry must reject a successor from a different journal");
+}
+
+#[tokio::test]
+async fn a_receipted_checkpoint_checks_the_exact_root_bytes_before_opening() {
+    use rtdb_format::{catalog::{BlockCatalog, publication_digest}, keys::block_key};
+    use rtdb_storage::{ObjectKey, ObjectStore};
+
+    let fixture = produced_memory_checkpoint(true).await;
+    let block = BlockIndex(0);
+    let key = ObjectKey::new(block_key(block).unwrap()).unwrap();
+    let bytes = fixture.store.get(&key).await.unwrap();
+    let cached = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), BlockDiscovery::List).await.unwrap();
+    let catalog = cached.block.unwrap();
+    let admitted = BlockDiscovery::AtPublished(PublishedCheckpoint {
+        block,
+        boundary: ReplicaPosition(1),
+        root_sha256: Some(publication_digest(&bytes)),
+    });
+    assert_eq!(catalog.publication_sha256(), Some(publication_digest(&bytes)));
+    fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted).await.unwrap();
+
+    let mut different = bytes.to_vec();
+    different.extend_from_slice(&[0xa0, 0x06, 0x01]);
+    assert_eq!(BlockCatalog::decode(&different).unwrap(), catalog);
+    fixture.store.delete(&key).await.unwrap();
+    fixture.store.put(&key, different.into()).await.unwrap();
+    let error = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted)
+        .await.err().expect("receipt validation must read the current root bytes");
+    assert_eq!(error.message.as_deref(), Some("The stored checkpoint root does not match the directory receipt"));
+}
+
+#[tokio::test]
+async fn a_receipted_checkpoint_accepts_only_a_directory_admitted_successor() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (catalog, _) = fixture.blocks.load(BlockIndex(0)).await.unwrap();
+    let admitted = BlockDiscovery::FromPublished(PublishedCheckpoint {
+        block: BlockIndex(0), boundary: ReplicaPosition(1), root_sha256: catalog.publication_sha256(),
+    });
+    let mut writer = produce_newer_memory_checkpoint(&fixture).await;
+    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    let (later, _) = fixture.blocks.load(BlockIndex(1)).await.unwrap();
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted)
+        .await.expect("an unadmitted stored successor cannot replace the receipt");
+    assert_eq!(recovered.block.as_ref().unwrap().block_index(), BlockIndex(0));
+    fixture.replica.truncate_before(LogOffset(4)).unwrap();
+    let error = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &CancellationToken::new())
+        .await.err().expect("a suffix gap requires fresh directory admission");
+    assert_eq!(error.code, "rtdb.storage/log-range-unavailable", "the selected receipt must survive a replay gap");
+
+    let admitted = BlockDiscovery::FromPublished(PublishedCheckpoint {
+        block: later.block_index(), boundary: later.boundary_replica_position().unwrap(), root_sha256: later.publication_sha256(),
+    });
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted).await.unwrap();
+    let recovered = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &CancellationToken::new()).await.unwrap();
+    assert_eq!(recovered.block.unwrap().block_index(), BlockIndex(1));
+}
+
+#[tokio::test]
+async fn hosted_checkpoint_recovery_can_use_a_later_boundary_after_prefix_collection() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1), root_sha256: None };
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::FromPublished(published)).await.unwrap();
+    let mut writer = produce_newer_memory_checkpoint(&fixture).await;
+    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    fixture.replica.truncate_before(LogOffset(4)).unwrap();
+    let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(),
+        Timestamp(0), &CancellationToken::new()).await.unwrap();
+    assert_eq!(selected.block.unwrap().boundary_replica_position(), Some(ReplicaPosition(3)));
+}
+
+#[tokio::test]
+async fn a_checkpoint_manifest_refuses_a_different_tables_valid_metadata() {
+    use rtdb_storage::ObjectKey;
+    use sha2::{Digest, Sha256};
+
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 20).await;
+    let partition = &fixture.driver.partition;
+    let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+    let mut write = TransactionBuffer::new(partition.value().snapshot(), key, Arc::clone(&fixture.memory)).unwrap();
+    for (name, rows) in [("left_table", 1), ("right_table", 2)] {
+        for id in 0..rows {
+            write.put(TableRef::new("public", name), StructFields::from([("_id".into(), Value::I64(id))]), Interval::ALL).unwrap();
+        }
+    }
+    partition.apply(&write.stage().unwrap()).unwrap();
+    fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    let produced = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let entries = produced.catalog.table_entries().unwrap();
+    let left = entries.iter().find(|entry| entry.table.table == "left_table").unwrap();
+    let right = entries.iter().find(|entry| entry.table.table == "right_table").unwrap();
+    let key_for = |entry: &rtdb_format::catalog::TableEntry| ObjectKey::new(entry.slug.block_key(BlockIndex(0)).unwrap()).unwrap();
+    let left_key = key_for(left);
+    let left_bytes = fixture.store.get(&left_key).await.unwrap();
+    let right_bytes = fixture.store.get(&key_for(right)).await.unwrap();
+    assert_ne!(left_bytes, right_bytes);
+    let expected: [u8; 32] = Sha256::digest(&left_bytes).into();
+    assert_eq!(produced.catalog.table_block_digest(left.oid), Some(expected.as_slice()),
+        "a newly published root commits to the bytes written for each table OID");
+    fixture.blocks.load(BlockIndex(0)).await.unwrap();
+
+    fixture.store.delete(&left_key).await.unwrap();
+    fixture.store.put(&left_key, right_bytes).await.unwrap();
+    let cache = Arc::new(BufferPool::new(fixture.store.clone(), 1 << 20));
+    let reopened = BlockStore::new(fixture.store.clone(), cache, fixture.memory.clone(), 100_000_000).unwrap();
+    let recovered = reopened.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), BlockDiscovery::List).await;
+    let Err(error) = recovered else { panic!("recovery must refuse mismatched table metadata even when it decodes"); };
+    assert_eq!(error.code, "rtdb.replication/invalid-block");
+    assert!(error.message.unwrap().contains("does not match its checkpoint manifest"));
 }
 
 #[tokio::test]
@@ -375,7 +693,7 @@ async fn applying_a_deletion_drops_this_nodes_cached_copies_of_the_collected_fil
     let table = TableRef::new("public", "docs");
     write.put(table.clone(), StructFields::from([("_id".into(), Value::I64(1))]), Interval::ALL).unwrap();
     state.apply(&write.stage().unwrap()).unwrap();
-    fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key })), None).unwrap();
+    fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key }).into()), None).unwrap();
     fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
     let pending = fixture.driver.pending_block.as_ref().unwrap();
     let produced = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
@@ -418,6 +736,10 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };
+    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), Timestamp(100), false, |_| Ok(())).await
+        else { panic!("an inline-only append must fail before emitting an oversized proxy"); };
+    assert_eq!(error.code, "rtdb.storage/message-too-large");
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
     fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
     let record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
     assert!(matches!(ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message, ReplicaBody::OversizedMessage(_)));
@@ -427,6 +749,90 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
     let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()) });
     fixture.driver.consume(raw(2, 1, 1, missing)).await.unwrap();
     assert_eq!(fixture.driver.read_position, rtdb_types::ReplicaPosition(2));
+}
+
+#[tokio::test]
+async fn retained_replay_requires_the_offload_even_when_readback_cached_it() {
+    let fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
+    let envelope = ReplicaEnvelope {
+        term: Term(1), term_sequence: Some(TermSequence(0)),
+        message: ReplicaBody::TriesDeleted(proto::TriesDeleted {
+            table_name: Some("public/docs".into()),
+            trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect(),
+        }),
+    };
+    fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
+    let record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
+    let record = fixture.logs.decode_replica(record).unwrap().unwrap();
+    let stored = record.envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().unwrap();
+    let cached = fixture.logs.resolve_oversized(record.clone()).await.unwrap();
+    assert!(matches!(cached.envelope.message, ReplicaBody::TriesDeleted(_)));
+    fixture.store.delete(&rtdb_storage::ObjectKey::new(stored).unwrap()).await.unwrap();
+    assert!(fixture.logs.resolve_oversized(record.clone()).await.is_ok());
+    assert_eq!(fixture.logs.resolve_oversized_fresh(record).await.unwrap_err().code, "rtdb.storage/missing-object");
+}
+
+#[tokio::test]
+async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefixes() {
+    let config = ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() };
+    let mut leader = fixture(config.clone(), 1 << 27).await;
+    let mut follower = fixture(config, 1 << 27).await;
+    let claim = ReplicaEnvelope {
+        term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }),
+    };
+    leader.logs.enqueue_replica(&claim, BlockIndex(0), Timestamp(99)).await.unwrap().durable().await.unwrap();
+    let mut tail = leader.logs.replica_tail(leader.driver.read_position).await.unwrap();
+    let claim = tail.poll(Duration::from_secs(5)).await.unwrap().pop().unwrap();
+    leader.driver.consume(claim.clone()).await.unwrap();
+    follower.driver.consume(claim).await.unwrap();
+    leader.driver.promote().await.unwrap();
+
+    let transactions: [(&[&str], bool); 5] = [
+        (&["CREATE TABLE empty_docs (_id, v)"], true),
+        (&["INSERT INTO docs (_id, v) VALUES (1, 7), (2, 8)", "INSERT INTO other_docs (_id, v) VALUES (1, 10)"], true),
+        (&["INSERT INTO docs (_id, v) VALUES (3, 11)", "ASSERT FALSE"], false),
+        (&["UPDATE docs SET v = 9 WHERE _id = 1"], true),
+        (&["DELETE FROM docs WHERE _id = 2"], true),
+    ];
+    for (index, (statements, committed)) in transactions.into_iter().enumerate() {
+        let position = SourcePosition(index as i64);
+        let clock = Timestamp(100 + position.0);
+        let context = Arc::clone(&leader.driver.resolve);
+        let operations = statements.iter().map(|sql| TxOp::Sql { sql: (*sql).into(), args: None }).collect();
+        let transaction = SourceTransaction::new(operations, SubmitOptions::default(), &leader.memory).unwrap();
+        let snapshot = leader.driver.partition.value().snapshot();
+        let resolved = leader.driver.leader.as_mut().unwrap().resolver_mut().unwrap()
+            .resolve_source(snapshot, position, clock, transaction, &context).await.unwrap();
+        assert_eq!(resolved.result().committed(), committed, "{statements:?}: {:?}", resolved.result());
+        leader.driver.enqueue_resolved(resolved, None).await.unwrap();
+        let records = tail.poll(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(records.len(), 1);
+        let record = records.into_iter().next().unwrap();
+
+        leader.driver.consume(record.clone()).await.unwrap();
+        follower.driver.consume(record).await.unwrap();
+
+        let expected = leader.driver.partition.value();
+        let actual = follower.driver.partition.value();
+        assert_eq!(expected.live().latest_completed_tx(), actual.live().latest_completed_tx(), "{statements:?}");
+        assert_eq!(expected.snapshot().tables(), actual.snapshot().tables(), "{statements:?}");
+        for (name, staged) in expected.live().tables() {
+            let decoded = &actual.live().tables()[name];
+            assert_eq!(staged.column_types(), decoded.column_types(), "{statements:?}, {name:?}");
+            let events = |table: &rtdb_index::LiveTable| {
+                table.batches().flat_map(|batch| (0..batch.len()).map(move |row| batch.view().read_event(row).unwrap()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(events(staged), events(decoded), "{statements:?}, {name:?}");
+        }
+        let expected = leader.handle.progress().current();
+        let actual = follower.handle.progress().current();
+        assert_eq!(expected.source_position, position);
+        assert_eq!(actual.source_position, position);
+        assert_eq!(actual.tx_key, expected.tx_key);
+        assert_eq!(actual.latest_result, expected.latest_result, "{statements:?}");
+    }
+    leader.driver.demote().await.unwrap();
 }
 
 #[tokio::test]
@@ -466,7 +872,7 @@ async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_ent
     let value = partition.value();
     let live = value.trie_catalog().current_tries(&table)[0].key.clone();
     let slug = value.table_catalog().entry(&table).unwrap().slug.clone();
-    let record = |id: &str| proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None, scope: None };
+    let record = |id: &str| proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None, scope: None, file_size: None, published_version: None };
     let unknown: rtdb_format::keys::TrieKey = "l01-rc-b07".parse().unwrap();
     let file = |key: &rtdb_format::keys::TrieKey, id: &str| rtdb_storage::ObjectKey::new(slug.artefact_key(key, "search", id, 1).unwrap()).unwrap();
     for key in [file(&live, "body"), file(&unknown, "body"), file(&live, "title")] { store.put(&key, Bytes::from_static(b"artefact")).await.unwrap(); }
@@ -506,7 +912,7 @@ async fn local_recovery_driver(
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
+    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
         scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
@@ -753,6 +1159,26 @@ async fn reopen_memory_checkpoint_with_config(fixture: &Fixture, config: Replica
 }
 
 #[tokio::test]
+async fn promotion_requires_the_recovered_checkpoint_to_still_be_stored() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (handle, mut restarted) = reopen_memory_checkpoint(&fixture).await;
+    let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap();
+    let root = fixture.store.get(&key).await.unwrap();
+    fixture.store.delete(&key).await.unwrap();
+    restarted.fence.admit(Term(2), Some(TermSequence(0))).unwrap();
+    restarted.try_promote().await.unwrap();
+    assert!(restarted.leader.is_none(), "a missing recovered root cannot be submitted for confirmation");
+    assert_eq!(handle.status().promotion_failure.unwrap().code, "rtdb.storage/missing-object");
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(1));
+
+    fixture.store.put(&key, root).await.unwrap();
+    restarted.fence.admit(Term(3), Some(TermSequence(0))).unwrap();
+    restarted.try_promote().await.unwrap();
+    assert!(restarted.leader.as_ref().unwrap().recovery_write.is_some(), "the restored root can be confirmed");
+    restarted.demote().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_recovered_checkpoint_uses_only_matching_admitted_confirmation_and_accepts_legacy_epoch_zero() {
     for sequenced in [false, true] {
         let fixture = produced_memory_checkpoint(sequenced).await;
@@ -777,7 +1203,11 @@ async fn a_recovered_checkpoint_uses_only_matching_admitted_confirmation_and_acc
             assert_eq!(restarted.recovered_confirmation.is_some(), index < 7);
         }
         assert!(restarted.recovered_confirmation.is_none());
-        assert!(Arc::ptr_eq(&restarted.partition.value(), &before));
+        let current = restarted.partition.value();
+        assert!(Arc::ptr_eq(current.trie_catalog(), before.trie_catalog()));
+        assert!(Arc::ptr_eq(current.table_catalog(), before.table_catalog()));
+        assert!(Arc::ptr_eq(current.live(), before.live()));
+        assert_eq!(current.snapshot().catalog_cut().unwrap().through, ReplicaPosition(7));
         assert_eq!(handle.progress().current().source_position, SourcePosition(-1));
         assert!(handle.progress().current().tx_key.is_none());
 
@@ -1179,7 +1609,7 @@ async fn demotion_fails_queued_gc_publication_without_failing_the_progress_monit
     fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
     fixture.driver.promote().await.unwrap();
     let (completion, result) = tokio::sync::oneshot::channel();
-    fixture.driver.command(super::Command::Delete { term: Term(1), table: TableRef::new("public", "docs"), keys: vec![rtdb_format::keys::TrieKey::l0(BlockIndex(0)).unwrap()], completion }).await.unwrap();
+    fixture.driver.command(super::Command::Delete { term: Term(1), table: TableRef::new("public", "docs"), keys: vec!["l01-rc-b00".parse().unwrap()], completion }).await.unwrap();
     fixture.driver.consume(raw(0, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
     assert_eq!(result.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());
@@ -1191,17 +1621,22 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
     fixture.logs.append_source(&rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::FlushBlock(Default::default())), Timestamp(1)).await.unwrap();
     fixture.driver.consume(raw(0, 1, 0, resolved(1, 0))).await.unwrap();
     fixture.driver.promote().await.unwrap();
+    let old_snapshot = fixture.driver.partition.snapshot();
+    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(0));
     let value = fixture.driver.partition.value();
     let (completion, mut receipt) = tokio::sync::oneshot::channel();
     fixture.driver.command(super::Command::ResetCompactor {
         term: Term(1), expected: Arc::clone(value.trie_catalog()), expected_block: value.live().block_index(),
-        replacements: BTreeMap::new(), reservations: vec![fixture.memory.reserve(8192).unwrap()].into(), completion,
+        replacement: super::Replacement::L0(BTreeMap::new()), reservations: vec![fixture.memory.reserve(8192).unwrap()].into(), completion,
     }).await.unwrap();
     assert!(matches!(receipt.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
     assert!(fixture.driver.leader.as_ref().unwrap().compactor_reset.is_some());
+    assert_eq!(fixture.driver.partition.open_snapshot(None).catalog_cut(), None);
     fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
     assert_eq!(receipt.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());
+    assert_eq!(fixture.driver.partition.snapshot().catalog_cut(), None);
+    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(0));
 }
 
 #[tokio::test]
@@ -1274,7 +1709,7 @@ impl DatabaseEffects for HeldDatabaseEffect {
     fn secondary_databases(&self) -> Result<BTreeMap<String, DatabaseConfig>> { Ok(BTreeMap::new()) }
 }
 
-async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp) -> (TransactionKey, oneshot::Receiver<Result<Applied>>, LogRecord) {
+async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp, position: SourcePosition) -> (TransactionKey, oneshot::Receiver<Result<Applied>>, LogRecord) {
     fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
     fixture.driver.promote().await.unwrap();
 
@@ -1283,7 +1718,7 @@ async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp) -> (Tra
     let effects = Arc::clone(&fixture.driver.effects);
     let resolver = fixture.driver.leader.as_mut().unwrap().resolver_mut().unwrap();
     let verdict = super::check_db_op(effects.as_ref(), resolver, operation);
-    let staged = resolver.resolve_db_op(snapshot, SourcePosition(1), Timestamp(100), operation.clone(), verdict, &resolve).unwrap();
+    let staged = resolver.resolve_db_op(snapshot, position, Timestamp(100), operation.clone(), verdict, &resolve).unwrap();
     let key = staged.result().tx_key();
     let (completion, receipt) = oneshot::channel();
     fixture.driver.enqueue_resolved(staged, Some(completion)).await.unwrap();
@@ -1292,29 +1727,143 @@ async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp) -> (Tra
     let mut records = tail.poll(Duration::from_secs(5)).await.unwrap();
     assert_eq!(records.len(), 1);
     let readback = records.pop().unwrap();
-    let envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
-    assert!(matches!(envelope.message, ReplicaBody::ResolvedTx(message)
-        if message.tx_id == Some(key.tx_id.0) && message.committed == Some(true) && message.db_op.as_ref() == Some(operation)));
     (key, receipt, readback)
 }
 
-async fn attach_readback_fixture() -> (Fixture, DbOp, oneshot::Receiver<DbOp>, oneshot::Sender<Result<()>>) {
+#[tokio::test]
+async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies() {
+    let wall = Arc::new(AtomicI64::new(110));
+    let clock: ReplicationClock = {
+        let wall = Arc::clone(&wall);
+        Arc::new(move || Timestamp(wall.load(Ordering::Relaxed)))
+    };
+    let config = ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() };
+    let mut fixture = fixture_with_clock(config, 1 << 16, Some(clock)).await;
+    let scope = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap();
+    Arc::get_mut(&mut fixture.driver.resolve).unwrap().owned_witness_scope = Some(scope);
+    let operation = DbOp::AttachDatabase(proto::AttachDatabase {
+        db_name: Some("a".repeat(1 << 17)), config: Some(DatabaseConfig::default()),
+    });
+    let (_, prior_applied, prior_record) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    assert!(matches!(ReplicaEnvelope::decode(&prior_record.payload).unwrap().unwrap().message, ReplicaBody::OversizedMessage(_)));
+
+    let strict = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true }],
+        SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory,
+    ).unwrap().with_placed_seed(Some(scope.issue()));
+    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord {
+        metadata: LogMetadata { offset: LogOffset(1), timestamp: Timestamp(101) },
+        payload: strict.encode().unwrap().into_bytes(),
+    });
+    fixture.driver.resolve_next_source().await.unwrap();
+    let leader = fixture.driver.leader.as_ref().unwrap();
+    assert!(leader.resolution.is_none());
+    assert!(!leader.ready_source());
+    assert!(!leader.accepting_commands());
+
+    wall.store(200, Ordering::Relaxed);
+    fixture.driver.consume(prior_record).await.unwrap();
+    assert!(matches!(prior_applied.await.unwrap().unwrap(), Applied::Transaction(_)));
+    assert!(fixture.driver.leader.as_ref().unwrap().ready_source());
+    fixture.driver.resolve_next_source().await.unwrap();
+    let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
+    assert_eq!(result.as_ref().unwrap().result().error().unwrap().code, "rtdb.owned/expired");
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    fixture.driver.demote().await.unwrap();
+}
+
+async fn attach_readback_fixture(replica_message_limit: usize) -> (Fixture, DbOp, oneshot::Receiver<DbOp>, oneshot::Sender<Result<()>>) {
     let mut fixture = fixture(ReplicationConfig {
         may_lead: false, assertion_interval: Duration::from_secs(3600), ..Default::default()
-    }, 1 << 27).await;
+    }, replica_message_limit).await;
+    let (operation, called, finish) = hold_catalog_effect(&mut fixture);
+    (fixture, operation, called, finish)
+}
+
+fn hold_catalog_effect(fixture: &mut Fixture) -> (DbOp, oneshot::Receiver<DbOp>, oneshot::Sender<Result<()>>) {
     let (entered, called) = oneshot::channel();
     let (finish, release) = oneshot::channel();
     fixture.driver.effects = Arc::new(HeldDatabaseEffect { called: Mutex::new(Some(entered)), release: Mutex::new(Some(release)) });
     let operation = DbOp::AttachDatabase(proto::AttachDatabase {
         db_name: Some("secondary".into()), config: Some(DatabaseConfig::default()),
     });
-    (fixture, operation, called, finish)
+    (operation, called, finish)
+}
+
+struct EnqueueReturnGate {
+    log: Arc<MemoryLog>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Log for EnqueueReturnGate {
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<rtdb_storage::log::AppendReceipt> {
+        let receipt = self.log.enqueue(payload, timestamp).await?;
+        self.release.notified().await;
+        Ok(receipt)
+    }
+
+    fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
+    async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogTail>> { self.log.tail(after).await }
+    async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogRange>> { self.log.range(from, to).await }
+    async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
+}
+
+#[tokio::test]
+async fn own_transaction_can_apply_before_the_provider_returns_its_append_receipt() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut fixture = fixture_with_replica(ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() },
+        1 << 27, None, |log| Arc::new(EnqueueReturnGate { log, release: Arc::clone(&release) })).await;
+    let (operation, mut called, finish) = hold_catalog_effect(&mut fixture);
+    let (key, mut receipt, record) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    finish.send(Ok(())).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), fixture.driver.consume(record)).await.unwrap().unwrap();
+    assert_eq!(called.try_recv().unwrap(), operation);
+    assert!(matches!(receipt.try_recv().unwrap().unwrap(), Applied::Transaction(result) if result.tx_key() == key));
+    assert_eq!(fixture.handle.progress().current().tx_key, Some(key));
+    release.notify_one();
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn mismatched_readback_faults_before_buffering_during_resolution() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, idle_heartbeat: false, external_source: true, ..Default::default() }, 1 << 27).await;
+    let (operation, mut called, _finish) = hold_catalog_effect(&mut fixture);
+    let (_, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    let before = fixture.driver.partition.value();
+    let (completion, mut waiting) = oneshot::channel();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    fixture.driver.command(super::Command::External {
+        term: Term(1), writer: Box::new(WaitingWriter { started: None, dropped: Arc::clone(&dropped) }),
+        system_time: None, token: None, completion,
+    }).await.unwrap();
+    {
+        let leader = fixture.driver.leader.as_mut().unwrap();
+        assert!(leader.resolver.is_none());
+        let resolution = super::pending_resolution(&mut leader.resolution);
+        tokio::pin!(resolution);
+        assert!(futures::poll!(&mut resolution).is_pending());
+    }
+    let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+    let ReplicaBody::ResolvedTx(message) = &mut envelope.message else { panic!("expected transaction"); };
+    message.db_op = None;
+    readback.payload = envelope.encode().into();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), fixture.driver.consume(readback)).await.unwrap().unwrap_err();
+    assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch");
+    assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+    assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+    assert!(matches!(called.try_recv(), Err(Empty)));
+    assert!(fixture.handle.progress().current().tx_key.is_none());
+    assert!(fixture.driver.demote().await.unwrap().is_empty());
+    assert!(dropped.load(Ordering::Acquire));
+    assert_eq!(waiting.try_recv().unwrap().unwrap_err().code, "xtdb/leader-term-ended");
 }
 
 #[tokio::test]
 async fn own_attach_readback_mismatch_leaves_partition_catalog_and_progress_unchanged() {
-    let (mut fixture, operation, mut called, _finish) = attach_readback_fixture().await;
-    let (key, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation).await;
+    let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
+    let (key, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(1)).await;
     let before = fixture.driver.partition.value();
     let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
     let ReplicaBody::ResolvedTx(message) = &mut envelope.message else { panic!("expected an attach readback"); };
@@ -1343,10 +1892,180 @@ async fn own_attach_readback_mismatch_leaves_partition_catalog_and_progress_unch
 }
 
 #[tokio::test]
+async fn own_readback_requires_the_frame_written_for_the_staged_head() {
+    let mutations: [(&str, fn(&mut proto::ResolvedTx)); 7] = [
+        ("absent zero id", |message| message.tx_id = None),
+        ("absent system time", |message| message.system_time_micros = None),
+        ("changed commit status", |message| message.committed = Some(false)),
+        ("changed source position", |message| message.src_msg_id = Some(17)),
+        ("unwritten external token", |message| message.external_source_token = Some(vec![17])),
+        ("missing catalog operation", |message| message.db_op = None),
+        ("unwritten error bytes", |message| message.error = Some(vec![17])),
+    ];
+    for (field, mutate) in mutations {
+        let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
+        let (key, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+        assert_eq!(key.tx_id, TxId(0));
+        let before = fixture.driver.partition.value();
+        let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+        let ReplicaBody::ResolvedTx(message) = &mut envelope.message else { panic!("expected an attach readback"); };
+        mutate(message);
+        readback.payload = envelope.encode().into();
+
+        let error = {
+            let consumed = fixture.driver.consume(readback);
+            tokio::pin!(consumed);
+            let std::task::Poll::Ready(Err(error)) = futures::poll!(&mut consumed) else {
+                panic!("{field} did not fail before partition apply");
+            };
+            error
+        };
+        assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch", "{field}");
+        assert!(matches!(called.try_recv(), Err(Empty)), "{field}");
+        assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before), "{field}");
+        assert!(fixture.handle.progress().current().tx_key.is_none(), "{field}");
+        assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error, "{field}");
+        fixture.driver.demote().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn control_readback_cannot_replace_a_pending_transaction() {
+    for src_msg_id in [None, Some(17)] {
+        let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
+        let (_, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+        let before = fixture.driver.partition.value();
+        let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+        envelope.message = ReplicaBody::NoOp(proto::NoOp { src_msg_id });
+        readback.payload = envelope.encode().into();
+
+        let error = fixture.driver.consume(readback).await.unwrap_err();
+        assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch");
+        assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+        assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+        assert!(matches!(called.try_recv(), Err(Empty)));
+        assert_eq!(fixture.handle.progress().current().source_position, SourcePosition(-1));
+        fixture.driver.demote().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn own_transaction_requires_a_pending_append_for_its_sequence() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
+    fixture.driver.promote().await.unwrap();
+    let before = fixture.driver.partition.value();
+
+    let error = fixture.driver.consume(raw(0, 1, 1, resolved(0, 0))).await.unwrap_err();
+    assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch");
+    assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+    assert!(fixture.handle.progress().current().tx_key.is_none());
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn unrecognized_readback_only_faults_an_admitted_pending_transaction() {
+    for unknown_field in [false, true] {
+        let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
+        let (_, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+        let before = fixture.driver.partition.value();
+        let frame = |term, sequence| {
+            let mut frame = vec![rtdb_format::PROTOBUF_LOG_HEADER, 7 << 3, term, 9 << 3, sequence];
+            if unknown_field { frame.extend([12 << 3 | 2, 0]); }
+            Bytes::from(frame)
+        };
+        let mut discarded = readback.clone();
+        discarded.payload = frame(1, 0);
+        fixture.driver.consume(discarded).await.unwrap();
+        let mut foreign = readback.clone();
+        foreign.metadata.offset = LogOffset(readback.metadata.offset.0 + 1);
+        foreign.payload = frame(2, 1);
+        fixture.driver.consume(foreign).await.unwrap();
+        let advanced = fixture.driver.read_position;
+        assert!(matches!(receipt.try_recv(), Err(Empty)));
+
+        let mut own = readback;
+        own.metadata.offset = LogOffset(own.metadata.offset.0 + 2);
+        own.payload = frame(1, 1);
+        let error = fixture.driver.consume(own).await.unwrap_err();
+        assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch");
+        assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+        assert!(matches!(called.try_recv(), Err(Empty)));
+        assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+        assert!(fixture.handle.progress().current().tx_key.is_none());
+        assert_eq!(fixture.driver.read_position, advanced);
+        fixture.driver.demote().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn confirmed_append_cannot_publish_without_its_staged_head() {
+    let (mut fixture, operation, mut called, _finish) = attach_readback_fixture(1 << 27).await;
+    let (_, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    fixture.driver.leader.as_mut().unwrap().resolver_mut().unwrap().take_head().unwrap();
+    let before = fixture.driver.partition.value();
+
+    let error = fixture.driver.consume(readback).await.unwrap_err();
+    assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch");
+    assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+    assert!(matches!(called.try_recv(), Err(Empty)));
+    assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+    assert!(fixture.handle.progress().current().tx_key.is_none());
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn own_oversized_readback_checks_the_stored_transaction_bytes() {
+    let substitutions: [Option<(&str, fn(&mut ReplicaEnvelope))>; 3] = [
+        None,
+        Some(("xtdb.indexer/leader-read-back-mismatch", |frame| {
+            let ReplicaBody::ResolvedTx(message) = &mut frame.message else { panic!("expected a stored transaction"); };
+            message.table_data.insert("public/forged".into(), vec![1, 2, 3]);
+        })),
+        Some(("rtdb.format/oversized-term-mismatch", |frame| {
+            frame.term_sequence = Some(frame.term_sequence.unwrap().next().unwrap());
+        })),
+    ];
+    for substitution in substitutions {
+        let (mut fixture, mut operation, mut called, finish) = attach_readback_fixture(256).await;
+        let DbOp::AttachDatabase(attach) = &mut operation else { panic!("expected an attach"); };
+        attach.db_name = Some("a".repeat(384));
+        let (key, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+        let proxy = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+        let payload_key = proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().unwrap();
+        let before = fixture.driver.partition.value();
+        if let Some((_, substitute)) = substitution {
+            let payload_key = rtdb_storage::ObjectKey::new(payload_key).unwrap();
+            let mut inner = proxy.unwrap_payload(&fixture.store.get(&payload_key).await.unwrap()).unwrap();
+            substitute(&mut inner);
+            fixture.store.delete(&payload_key).await.unwrap();
+            fixture.store.put(&payload_key, inner.encode().into()).await.unwrap();
+        }
+        finish.send(Ok(())).unwrap();
+
+        let result = fixture.driver.consume(readback).await;
+        if let Some((code, _)) = substitution {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+            assert!(matches!(called.try_recv(), Err(Empty)));
+            assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+            assert!(fixture.handle.progress().current().tx_key.is_none());
+        } else {
+            result.unwrap();
+            assert_eq!(called.try_recv().unwrap(), operation);
+            assert!(matches!(receipt.try_recv().unwrap().unwrap(), Applied::Transaction(result) if result.tx_key() == key));
+            assert_eq!(fixture.handle.progress().current().tx_key, Some(key));
+        }
+        fixture.driver.demote().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn own_attach_readback_applies_before_the_effect_and_awaits_it_before_progress_and_receipt() {
     for effect in [Ok(()), Err(Anomaly::incorrect("test/attach-failed", "Applying the database attach failed"))] {
-        let (mut fixture, operation, mut called, finish) = attach_readback_fixture().await;
-        let (key, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation).await;
+        let (mut fixture, operation, mut called, finish) = attach_readback_fixture(1 << 27).await;
+        let (key, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(1)).await;
         let partition = Arc::clone(&fixture.driver.partition);
         let progress = Arc::clone(fixture.handle.progress());
 
@@ -1623,7 +2342,7 @@ async fn placed_driver(replica: Arc<MemoryLog>, config: ReplicationConfig) -> (R
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
+    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
     ReplicationDriver::new(config, logs, blocks, recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap()
@@ -1657,7 +2376,7 @@ fn a_group_objects_file_is_deleted_or_dropped_from_caches_only_with_the_groups_l
     let mut catalog = rtdb_index::TrieCatalog::new(16).unwrap();
     for bucket in 0..4 { catalog = add(catalog, &format!("l02-rc-p{bucket}-b00")); }
     for bucket in 0..4 { catalog = add(catalog, &format!("l03-rc-p0{bucket}-b01")); }
-    let record = proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some("body".into()), definition_version: Some(1), stats: None, scope: Some(proto::ArtefactScope::PartGroup as i32) };
+    let record = proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some("body".into()), definition_version: Some(1), stats: None, scope: Some(proto::ArtefactScope::PartGroup as i32), file_size: None, published_version: None };
     let value = rtdb_index::PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap();
     let group = |key: &str| key.parse::<TrieKey>().unwrap().part_group().unwrap();
     let object = |key: &str| rtdb_storage::ObjectKey::new(slug.owner_artefact_key(&ArtefactOwner::Group(group(key)), "search", "body", 1).unwrap()).unwrap();
@@ -1735,7 +2454,7 @@ async fn exact_and_restored_recovery_require_the_selected_checkpoint() {
     fixture.store.delete(&old).await.unwrap();
     let restored = fixture.blocks.recover(
         TrieConfig::default(), SourcePosition(-1), Timestamp(1000),
-        BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: ReplicaPosition(0) },
+        BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: ReplicaPosition(0), root_sha256: None },
     ).await.err().unwrap();
     assert_eq!(restored.code, "rtdb.replication/block-gone");
 }
@@ -1755,13 +2474,13 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
     fixture.store.delete(&rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(1)).unwrap()).unwrap()).await.unwrap();
     fixture.replica.truncate_before(LogOffset(5)).unwrap();
     let boundary = rtdb_types::ReplicaPosition(1);
-    assert!(matches!(fixture.logs.observed_replica_gap(boundary).await.unwrap(),
-        Some(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 5 })));
+    assert!(matches!(fixture.logs.recovery_tail(boundary).await,
+        Err(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 5 })));
 
     let cancellation = CancellationToken::new();
     for (discovery, cutoff) in [
         (BlockDiscovery::At(BlockIndex(0)), None),
-        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary }, Some(boundary)),
+        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary, root_sha256: None }, Some(boundary)),
     ] {
         let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), discovery).await.unwrap();
         let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &cancellation).await.unwrap();

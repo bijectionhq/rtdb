@@ -1,0 +1,74 @@
+{
+  "summary": "Recovered compacted pairs use a separate encodable namespace and different activation blocks have distinct epochs.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "reuse_compaction_names": {
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/replayed_reset_epochs.rs",
+          "find": "{ Some(RECOVERY_BASE + block as u64) }",
+          "replace": "{ Some(block as u64) }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/replayed_reset_epochs.rs",
+          "function": "recovery_file_epoch",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "reuse_compaction_names_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/replayed_reset_epochs.rs",
+          "find": "{ Some(RECOVERY_BASE + block as u64) }",
+          "replace": "{ Some(block as u64) }"
+        },
+        {
+          "file": "rust/crates/index/src/replayed_reset_epochs.rs",
+          "find": "out.unwrap() as int == RECOVERY_BASE as int + block as int",
+          "replace": "out.unwrap() as int == block as int"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replayed_reset/laws.rs",
+          "function": "recovered_pairs_never_use_a_compactor_output_epoch",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "merge_activation_blocks": {
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/replayed_reset_epochs.rs",
+          "find": "{ Some(RECOVERY_BASE + block as u64) }",
+          "replace": "{ Some(RECOVERY_BASE) }"
+        },
+        {
+          "file": "rust/crates/index/src/replayed_reset_epochs.rs",
+          "find": "out.unwrap() as int == RECOVERY_BASE as int + block as int",
+          "replace": "out.unwrap() as int == RECOVERY_BASE as int"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replayed_reset/laws.rs",
+          "function": "different_installation_blocks_do_not_share_recovery_names",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

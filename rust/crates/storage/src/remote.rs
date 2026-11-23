@@ -1,10 +1,17 @@
-use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
+use crate::{audience_work, Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{Attribute, GetOptions, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use object_store::{Attribute, GetOptions, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNamespace, TerminalObjectPublication};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+#[path = "remote_version_step.rs"]
+mod version_step;
+pub use version_step::valid_object_version;
+
+pub const S3_RETIREMENT_ATTRIBUTE: &str = "rtdb-retirement";
 
 /// A provider may still be copying when its completion can no longer be established.
 #[derive(Debug, thiserror::Error)]
@@ -28,13 +35,20 @@ pub trait PublicationJournal: Send + Sync {
     async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str, submitted: bool) -> Result<()>;
 }
 
+/// The result of this specific conditional publication.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublicationResult {
+    Published { version: Option<String>, etag: Option<String> },
+    Conflict,
+}
+
 /// A provider with a durable, independently abortable upload capability.
 #[async_trait]
 pub trait PublicationUploads: Send + Sync {
     /// Reserves an empty upload for a provider-encoded key.
     async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> Result<String>;
     /// Makes the upload visible only if no object already holds that key.
-    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> Result<bool>;
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> Result<PublicationResult>;
     /// Cancels this upload and confirms that it retains no parts.
     async fn abort(&self, path: &Path, upload: &str) -> Result<()>;
 }
@@ -43,7 +57,9 @@ pub trait PublicationUploads: Send + Sync {
 pub struct RemoteStore {
     objects: Arc<RemoteObjects>,
     io: Arc<IoRegion>,
-    single_put: bool,
+    cell: bool,
+    version_namespace: Option<Arc<S3ObjectNamespace>>,
+    terminal_allocation: Option<uuid::Uuid>,
 }
 
 impl RemoteStore {
@@ -56,13 +72,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None }), io, single_put: false }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None, terminal_allocation: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None }), io, single_put: true }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None, terminal_allocation: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -72,8 +88,27 @@ impl RemoteStore {
         io: Arc<IoRegion>,
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
-        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads) });
-        Self { objects, io, single_put: true }
+        let objects = Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
+        Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None }
+    }
+
+    /// Uses a separate read client for the same provider namespace and credentials.
+    pub fn with_audience_reader(mut self, reader: Arc<dyn ProviderStore>) -> Self {
+        Arc::make_mut(&mut self.objects).audience_reader = Some(reader);
+        self
+    }
+
+    /// Enables version observations for a store backed by the specified S3 namespace.
+    pub fn with_s3_versioning(mut self, namespace: S3ObjectNamespace) -> Self {
+        self.version_namespace = Some(Arc::new(namespace));
+        self
+    }
+
+    pub fn s3_namespace(&self) -> Option<&S3ObjectNamespace> { self.version_namespace.as_deref() }
+
+    pub fn with_terminal_allocation(mut self, allocation: uuid::Uuid) -> Self {
+        self.terminal_allocation = Some(allocation);
+        self
     }
 
     /// Rejects new requests and waits for admitted operations, including requests whose callers were cancelled.
@@ -93,11 +128,11 @@ impl RemoteStore {
         }
         let admission = self.io.admit()?.and(destination.io.admit()?);
         let (objects, destination_objects, source, key) = (Arc::clone(&self.objects), Arc::clone(&destination.objects), source.clone(), key.clone());
-        if destination.single_put {
+        if destination.cell {
             let io = destination.io.clone();
             return IoRegion::run_async_admitted(admission, async move {
                 let bytes = objects.get(&source).await?;
-                destination_objects.put(&key, bytes, Some(&io)).await
+                destination_objects.put(&key, bytes, Some(&io)).await.map(drop)
             }).await;
         }
         IoRegion::run_async_admitted(admission, async move { objects.copy_to(&source, &destination_objects, &key).await }).await
@@ -110,13 +145,81 @@ impl ObjectStore for RemoteStore {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.head(&key).await }).await
     }
+    async fn observe_head(&self, key: &ObjectKey) -> Result<ObjectObservation<StoredObject>> {
+        let (objects, key, namespace) = (self.objects.clone(), key.clone(), self.version_namespace.clone());
+        self.io.run_async(async move {
+            let path = objects.path(&key);
+            let metadata = objects.metadata(&key).await?;
+            Ok(ObjectObservation {
+                version: physical_version(namespace.as_deref(), &path, metadata.version),
+                value: StoredObject { key, size: metadata.size },
+            })
+        }).await
+    }
+    async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<PhysicalObjectVersion>> {
+        let Some(namespace) = self.version_namespace.clone() else { return Ok(None); };
+        let objects = self.objects.clone();
+        let key = key.clone();
+        self.io.run_async(async move {
+            let path = objects.path(&key);
+            let metadata = match objects.metadata(&key).await {
+                Ok(metadata) => metadata,
+                Err(Error::MissingObject(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            Ok(physical_version(Some(namespace.as_ref()), &path, metadata.version))
+        }).await
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.get(&key).await }).await
     }
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        Ok(self.observe_fresh_exact(key, length).await?.value)
+    }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<ObjectObservation<Bytes>> {
+        let (objects, key, namespace) = (self.objects.clone(), key.clone(), self.version_namespace.clone());
+        self.io.run_async(async move { objects.observe_exact(&key, length, namespace.as_deref()).await }).await
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.get_range(&key, range).await }).await
+    }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<ObjectObservation<Bytes>> {
+        let Some(namespace) = self.version_namespace.clone() else {
+            return Ok(ObjectObservation { value: self.get_range(key, range).await?, version: None });
+        };
+        if range.start >= range.end {
+            let observed = self.observe_head(key).await?;
+            if range.start == range.end && range.end <= observed.value.size {
+                return Ok(ObjectObservation { value: Bytes::new(), version: observed.version });
+            }
+            return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: observed.value.size });
+        }
+        let (objects, key) = (self.objects.clone(), key.clone());
+        self.io.run_async(async move {
+            let path = objects.path(&key);
+            let length = usize::try_from(range.end - range.start)
+                .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
+            let response = match objects.read(&key, GetOptions::new().with_range(Some(range.clone())), Some(length)).await {
+                Ok(response) => response,
+                Err(error @ Error::MissingObject(_)) => return Err(error),
+                Err(error) => {
+                    if objects.hide_tombstones && matches!(objects.metadata(&key).await, Err(Error::MissingObject(_))) {
+                        return Err(Error::MissingObject(key.to_string()));
+                    }
+                    return Err(error);
+                }
+            };
+            if response.range != range || response.meta.size < range.end {
+                return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
+            }
+            let version = physical_version(Some(&namespace), &path, response.meta.version.clone());
+            let value = collect_exact_body(response, &key, length, || Error::Remote {
+                key: key.to_string(), message: "provider returned a different byte range length".into(),
+            }).await?;
+            Ok(ObjectObservation { value, version })
+        }).await
     }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
@@ -124,13 +227,34 @@ impl ObjectStore for RemoteStore {
         self.io.run_async(async move { reservation.finish(objects.get_range(&key, range).await?) }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+        self.put_with_publication(key, bytes).await.map(drop)
+    }
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<PhysicalObjectPublication>> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         let io = self.io.clone();
-        let single_put = self.single_put;
-        self.io.run_async(async move { objects.put(&key, bytes, single_put.then_some(io.as_ref())).await }).await
+        let cell = self.cell;
+        let namespace = self.version_namespace.clone();
+        let terminal_allocation = self.terminal_allocation;
+        self.io.run_async(async move {
+            let published = objects.put(&key, bytes, cell.then_some(io.as_ref())).await?;
+            let path = objects.path(&key);
+            let Some(namespace) = namespace.as_deref() else { return Ok(None); };
+            if let Some(allocation) = terminal_allocation {
+                if published.version.as_deref().is_some_and(|version| version != "null") {
+                    return Err(Error::Remote { key: key.to_string(), message: "A terminal publication returned a provider version".into() });
+                }
+                let etag = published.etag.filter(|etag| strong_entity_tag(etag)).ok_or_else(|| Error::Remote {
+                    key: key.to_string(), message: "A terminal publication requires a strong entity tag".into(),
+                })?;
+                return Ok(Some(PhysicalObjectPublication::Terminal(TerminalObjectPublication {
+                    namespace: namespace.clone(), key: path.to_string(), allocation, etag,
+                })));
+            }
+            Ok(physical_version(Some(namespace), &path, published.version).map(PhysicalObjectPublication::Version))
+        }).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
-        if self.single_put {
+        if self.cell {
             return Err(Error::Remote { key: key.to_string(), message: "Cell writes must supply the final sealed bytes".into() });
         }
         let admission = self.io.admit()?;
@@ -144,15 +268,21 @@ impl ObjectStore for RemoteStore {
         self.io.run_async(async move { objects.list(directory.as_ref()).await }).await
     }
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
+        if self.cell {
+            return Err(Error::Remote { key: key.to_string(), message: "Cell storage requires provider retirement authority".into() });
+        }
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.delete(&key).await }).await
     }
 }
 
+#[derive(Clone)]
 struct RemoteObjects {
     client: Arc<dyn ProviderStore>,
+    audience_reader: Option<Arc<dyn ProviderStore>>,
     prefix: Option<ObjectKey>,
     uploads: Option<Arc<dyn PublicationUploads>>,
+    hide_tombstones: bool,
 }
 
 impl RemoteObjects {
@@ -205,7 +335,25 @@ impl RemoteObjects {
     }
 }
 
+fn physical_version(namespace: Option<&S3ObjectNamespace>, path: &Path, version: Option<String>) -> Option<PhysicalObjectVersion> {
+    let namespace = namespace?;
+    let version = version.filter(|version| valid_object_version(version.as_bytes()))?;
+    Some(PhysicalObjectVersion { namespace: namespace.clone(), key: path.to_string(), version })
+}
+
 fn publication_attribute() -> Attribute { Attribute::Metadata("rtdb-publication".into()) }
+
+pub fn strong_entity_tag(tag: &str) -> bool {
+    tag.strip_prefix('"').and_then(|tag| tag.strip_suffix('"')).is_some_and(|value| {
+        !value.is_empty() && value != "*"
+            && value.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\' | b','))
+    })
+}
+
+struct ProviderPublication {
+    version: Option<String>,
+    etag: Option<String>,
+}
 
 fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
     match error {
@@ -215,15 +363,84 @@ fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
     }
 }
 
+/// Reject an oversized response before copying it into the reserved body buffer.
+async fn collect_exact_body(object: GetResult, key: &ObjectKey, length: usize, wrong_size: impl Fn() -> Error) -> Result<Bytes> {
+    let mut stream = object.into_stream();
+    let first = stream.try_next().await.map_err(|error| provider_error(key, error))?.unwrap_or_default();
+    if first.len() > length { return Err(wrong_size()); }
+    if first.len() == length {
+        while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
+            if !chunk.is_empty() { return Err(wrong_size()); }
+        }
+        return Ok(first);
+    }
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(&first);
+    drop(first);
+    while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
+        if chunk.len() > length - bytes.len() { return Err(wrong_size()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != length { return Err(wrong_size()); }
+    Ok(bytes.into())
+}
+
 impl RemoteObjects {
+    fn reader(&self) -> Result<&dyn ProviderStore> {
+        if IoRegion::requires_audience_transport() {
+            return self.audience_reader.as_deref().ok_or_else(|| Error::Closed("The provider has no dedicated audience read transport".into()));
+        }
+        if audience_work::is_bounded() {
+            return Err(Error::Closed("The audience action requires its dedicated object transport".into()));
+        }
+        Ok(self.client.as_ref())
+    }
+
+    async fn read(&self, key: &ObjectKey, options: GetOptions, body_bytes: Option<usize>) -> Result<GetResult> {
+        if audience_work::is_bounded() {
+            let bytes = body_bytes.ok_or_else(|| Error::Closed("An audience provider read requires an exact body length".into()))?;
+            audience_work::provider_read(bytes)?;
+        }
+        let response = self.reader()?.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
+        if self.is_tombstone(&response) {
+            return Err(Error::MissingObject(key.to_string()));
+        }
+        Ok(response)
+    }
+
+    fn is_tombstone(&self, response: &GetResult) -> bool {
+        self.hide_tombstones && response.meta.size == 0
+            && response.attributes.get(&Attribute::Metadata(S3_RETIREMENT_ATTRIBUTE.into()))
+                .and_then(|value| uuid::Uuid::parse_str(value.as_ref()).ok()).is_some_and(|token| !token.is_nil())
+    }
+
+    async fn metadata(&self, key: &ObjectKey) -> Result<ObjectMeta> {
+        if self.hide_tombstones {
+            return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }, Some(0)).await?.meta);
+        }
+        audience_work::provider_read(0)?;
+        self.reader()?.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
+    }
+
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
-        let metadata = self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
+        let metadata = self.metadata(key).await?;
         Ok(StoredObject { key: key.clone(), size: metadata.size })
     }
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
-        self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?
-            .bytes().await.map_err(|error| provider_error(key, error))
+        self.read(key, GetOptions::default(), None).await?.bytes().await.map_err(|error| provider_error(key, error))
+    }
+
+    async fn observe_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
+        let path = self.path(key);
+        let object = self.read(key, GetOptions::default(), Some(length)).await?;
+        let wrong_size = || crate::object_store::wrong_size(key, length);
+        if object.meta.size != length as u64 || object.range != (0..length as u64) {
+            return Err(wrong_size());
+        }
+        let version = physical_version(namespace, &path, object.meta.version.clone());
+        let value = collect_exact_body(object, key, length, wrong_size).await?;
+        Ok(ObjectObservation { value, version })
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
@@ -232,20 +449,22 @@ impl RemoteObjects {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
         }
         if range.is_empty() { return Ok(Bytes::new()); }
-        let bytes = self.client.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
+        let requested = usize::try_from(range.end - range.start).map_err(|_| Error::AudienceWorkLimit)?;
+        audience_work::provider_read(requested)?;
+        let bytes = self.reader()?.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
         if bytes.len() as u64 != range.end - range.start {
             return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
         }
         Ok(bytes)
     }
 
-    async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<()> {
+    async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<ProviderPublication> {
         if let Some(journal) = authority.and_then(IoRegion::publication_journal) {
             return self.put_journaled(key, bytes, journal).await;
         }
         let options = PutOptions { mode: PutMode::Create, ..Default::default() };
         match self.client.put_opts(&self.path(key), bytes.clone().into(), options).await {
-            Ok(_) => Ok(()),
+            Ok(written) => Ok(ProviderPublication { version: written.version, etag: written.e_tag }),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 self.compare_existing(key, bytes).await
             }
@@ -253,7 +472,7 @@ impl RemoteObjects {
         }
     }
 
-    async fn put_journaled(&self, key: &ObjectKey, bytes: Bytes, journal: &dyn PublicationJournal) -> Result<()> {
+    async fn put_journaled(&self, key: &ObjectKey, bytes: Bytes, journal: &dyn PublicationJournal) -> Result<ProviderPublication> {
         let uploads = self.uploads.as_ref().ok_or_else(|| Error::Remote {
             key: key.to_string(), message: "The cell store has no abortable publication capability".into(),
         })?;
@@ -267,37 +486,47 @@ impl RemoteObjects {
         }
 
         let result = uploads.complete(&path, &upload, bytes.clone()).await;
-        if !matches!(&result, Ok(true)) {
+        if !matches!(&result, Ok(PublicationResult::Published { .. })) {
             // A conflict leaves uploaded parts behind. An uncertain
             // completion must also be fenced before clearing the admission.
             uploads.abort(&path, &upload).await?;
         }
         journal.settle(key, attempt, &upload, true).await?;
         match result {
-            Ok(true) => Ok(()),
-            Ok(false) => self.compare_existing(key, bytes).await,
+            Ok(PublicationResult::Published { version, etag }) => Ok(ProviderPublication { version, etag }),
+            Ok(PublicationResult::Conflict) => self.compare_existing(key, bytes).await,
             Err(error) => {
-                if matches!(self.publication_confirmed(key, attempt).await, Ok(true)) {
-                    Ok(())
-                } else {
-                    Err(error)
+                match self.publication_confirmed(key, attempt).await {
+                    Ok(PublicationResult::Published { version, etag }) => Ok(ProviderPublication { version, etag }),
+                    _ => Err(error),
                 }
             }
         }
     }
 
-    async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
-        if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) }
+    async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<ProviderPublication> {
+        let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
+        let version = object.meta.version.clone();
+        let etag = object.meta.e_tag.clone();
+        if self.is_tombstone(&object) || object.bytes().await.map_err(|error| provider_error(key, error))? != bytes {
+            return Err(Error::ConflictingObject(key.to_string()));
+        }
+        Ok(ProviderPublication { version, etag })
     }
 
-    async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<bool> {
+    async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<PublicationResult> {
         match self.client.get_opts(&self.path(key), GetOptions::new().with_head(true)).await {
             Ok(object) => {
                 let expected = attempt.to_string();
-                Ok(object.attributes.get(&publication_attribute())
-                    .is_some_and(|receipt| receipt.as_ref() == expected.as_str()))
+                if object.attributes.get(&publication_attribute())
+                    .is_some_and(|receipt| receipt.as_ref() == expected.as_str())
+                {
+                    Ok(PublicationResult::Published { version: object.meta.version, etag: object.meta.e_tag })
+                } else {
+                    Ok(PublicationResult::Conflict)
+                }
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(object_store::Error::NotFound { .. }) => Ok(PublicationResult::Conflict),
             Err(error) => Err(provider_error(key, error)),
         }
     }
@@ -309,7 +538,7 @@ impl RemoteObjects {
             Err(Error::MissingObject(_)) => (),
             Err(error) => return Err(error),
         }
-        if length == 0 { return self.put(key, Bytes::new(), None).await; }
+        if length == 0 { return self.put(key, Bytes::new(), None).await.map(drop); }
         let temporary = format!(".tmp/upload-{}", uuid::Uuid::new_v4());
         let temporary = Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{temporary}"), None => temporary });
         let mut upload = self.client.put_multipart(&temporary).await.map_err(|error| provider_error(key, error))?;
@@ -343,10 +572,13 @@ impl RemoteObjects {
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
+        if audience_work::is_bounded() {
+            return Err(Error::Closed("An audience action cannot list provider objects".into()));
+        }
         let namespace = self.prefix.as_ref().map(|key| Path::from(key.as_str()));
         let path = directory.map(|key| self.path(key)).or_else(|| namespace.clone());
         let prefix = namespace.map(|path| format!("{path}/"));
-        let mut stream = self.client.list(path.as_ref());
+        let mut stream = self.reader()?.list(path.as_ref());
         let mut result = Vec::new();
         while let Some(metadata) = stream.try_next().await.map_err(|error| {
             let key = directory.map(ToString::to_string).unwrap_or_default();
@@ -364,9 +596,18 @@ impl RemoteObjects {
             };
             if relative.split('/').any(|part| part == ".tmp") { continue; }
             let key = Self::key(relative)?;
-            if directory.is_none_or(|directory| key.is_under(directory)) {
-                result.push(StoredObject { key, size: metadata.size });
+            if directory.is_some_and(|directory| !key.is_under(directory)) { continue; }
+            if self.hide_tombstones && metadata.size == 0 {
+                match self.metadata(&key).await {
+                    Err(Error::MissingObject(_)) => continue,
+                    Err(error) => return Err(error),
+                    Ok(current) => {
+                        result.push(StoredObject { key, size: current.size });
+                        continue;
+                    }
+                }
             }
+            result.push(StoredObject { key, size: metadata.size });
         }
         result.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(result)
@@ -410,6 +651,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_audience_read_uses_its_own_client_or_refuses() {
+        use object_store::memory::InMemory;
+
+        let regular = Arc::new(InMemory::new());
+        let audience = Arc::new(InMemory::new());
+        let key = ObjectKey::new("receipt").unwrap();
+        regular.put(&Path::from("cell/receipt"), Bytes::from_static(b"regular").into()).await.unwrap();
+        audience.put(&Path::from("cell/receipt"), Bytes::from_static(b"audience").into()).await.unwrap();
+        let store = RemoteStore::new_single_put(regular, ObjectKey::new("cell").unwrap(), IoRegion::new());
+
+        let refused = IoRegion::audience_object_read(store.get(&key)).await;
+        assert!(matches!(refused, Err(Error::Closed(_))));
+
+        let store = store.with_audience_reader(audience);
+        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"regular"));
+        assert_eq!(IoRegion::audience_object_read(store.head(&key)).await.unwrap().size, 8);
+        assert_eq!(IoRegion::audience_object_read(store.get_fresh_exact(&key, 8)).await.unwrap(), Bytes::from_static(b"audience"));
+        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"regular"));
+    }
+
+    #[tokio::test]
     async fn a_listed_key_is_the_key_that_was_put_whatever_the_provider_encodes() {
         let store = RemoteStore::new_in(Arc::new(object_store::memory::InMemory::new()), Some(ObjectKey::new("cell").unwrap()), crate::IoRegion::new());
         for name in ["~packs/b00.pack", "tables/public$orders/data/l00-rc-b00.arrow", "notes/50%/a b"] {
@@ -420,4 +682,44 @@ mod tests {
         for name in &listed { store.get(&ObjectKey::new(name.clone()).unwrap()).await.unwrap(); }
         assert_eq!(store.list(Some(&ObjectKey::new("~packs").unwrap())).await.unwrap().len(), 1, "and a listing under one finds it");
     }
+    #[tokio::test]
+    async fn a_cell_store_refuses_path_deletion() {
+        let provider = Arc::new(object_store::memory::InMemory::new());
+        let root = ObjectKey::new("cell").unwrap();
+        let cell = RemoteStore::new_single_put(provider.clone(), root.clone(), IoRegion::new());
+        let ordinary = RemoteStore::new(provider, Some(root));
+        let key = ObjectKey::new("data/retained").unwrap();
+        cell.put(&key, Bytes::from_static(b"owned")).await.unwrap();
+
+        assert!(matches!(cell.delete(&key).await, Err(Error::Remote { .. })));
+        assert_eq!(ordinary.get(&key).await.unwrap(), Bytes::from_static(b"owned"));
+        ordinary.delete(&key).await.unwrap();
+        assert!(matches!(cell.head(&key).await, Err(Error::MissingObject(_))));
+    }
+
+    #[tokio::test]
+    async fn only_serving_reads_hide_retirement_tombstones() {
+        let provider = Arc::new(object_store::memory::InMemory::new());
+        let root = ObjectKey::new("cell").unwrap();
+        let serving = RemoteStore::new_single_put(provider.clone(), root.clone(), IoRegion::new())
+            .with_s3_versioning(S3ObjectNamespace { bucket: "bucket".into(), endpoint: None, region: None });
+        let ordinary = RemoteStore::new(provider.clone(), Some(root));
+        let retired = ObjectKey::new("~packs/b01.pack").unwrap();
+        let empty = ObjectKey::new("data/empty").unwrap();
+        let mut attrs = object_store::Attributes::new();
+        attrs.insert(Attribute::Metadata(S3_RETIREMENT_ATTRIBUTE.into()), uuid::Uuid::new_v4().simple().to_string().into());
+        provider.put_opts(&Path::from(format!("cell/{retired}")), Bytes::new().into(),
+            PutOptions { attributes: attrs, ..PutOptions::default() }).await.unwrap();
+        serving.put(&empty, Bytes::new()).await.unwrap();
+        assert!(matches!(serving.head(&retired).await, Err(Error::MissingObject(_))));
+        assert!(matches!(serving.get(&retired).await, Err(Error::MissingObject(_))));
+        assert!(matches!(serving.get_fresh_exact(&retired, 0).await, Err(Error::MissingObject(_))));
+        assert!(matches!(serving.observe_range(&retired, 0..1).await, Err(Error::MissingObject(_))));
+        assert_eq!(serving.list(None).await.unwrap(), [StoredObject { key: empty, size: 0 }]);
+        assert_eq!(ordinary.head(&retired).await.unwrap().size, 0);
+        for bytes in [Bytes::from_static(b"late write"), Bytes::new()] {
+            assert!(matches!(serving.put(&retired, bytes).await, Err(Error::ConflictingObject(_))));
+        }
+    }
+
 }

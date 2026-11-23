@@ -1,12 +1,17 @@
 //! Typed requests to the servers of one stream's ensemble.
 
-use super::connection::{Connection, connection, remote};
-use super::StreamConfig;
-use crate::protocol::{Accepted, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, Overwrite, PageDigest, Read, Refused, RequestBody, ResponseBody, Retire, Seal, Sealed, Trim};
-use bytes::Bytes;
+use super::connection::{Binding, Callback, Connection, connection, remote};
+use super::{JournalEndpoint, StreamConfig};
+use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
+use bytes::{Bytes, BytesMut};
+use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+
+const AUTHORITY_IDLE: Duration = Duration::from_secs(120);
 
 pub(crate) const MAXIMUM_BATCH_ENTRIES: u32 = 1024;
 pub(crate) const MAXIMUM_BATCH_BYTES: u64 = 16 * 1024 * 1024;
@@ -19,13 +24,60 @@ pub(crate) enum Ack {
 
 pub(crate) struct Ensemble {
     pub config: StreamConfig,
-    pub links: Vec<Arc<Connection>>,
+    pub links: Vec<Peer>,
+    identity: Bytes,
+}
+
+pub(crate) struct Peer {
+    connection: Arc<Connection>,
+    binding: Binding,
+    authority: tokio::sync::Mutex<Option<AuthoritySession>>,
+}
+
+struct AuthoritySession {
+    port: u16,
+    socket: TcpStream,
+    last_used: Instant,
+}
+
+impl Peer {
+    fn address(&self) -> &str { self.connection.address() }
+
+    pub fn send(&self, body: RequestBody, callback: Callback) {
+        self.connection.send(self.binding.clone(), body, callback)
+    }
+
+    async fn call(&self, body: RequestBody) -> Result<ResponseBody> {
+        self.connection.call(self.binding.clone(), body).await
+    }
 }
 
 impl Ensemble {
     pub fn new(config: StreamConfig) -> Self {
-        let links = config.servers.iter().map(|address| connection(address)).collect();
-        Self { config, links }
+        let journals = Arc::new(Mutex::new(config.servers.iter().map(|server| server.journal().map(Arc::from)).collect()));
+        let links = config.servers.iter().enumerate().map(|(slot, server)| Peer {
+            connection: connection(server.address()),
+            authority: tokio::sync::Mutex::new(None),
+            binding: match server.journal() {
+                Some(expected) => Binding::Expected(Arc::from(expected)),
+                None => Binding::Discover { slot, journals: Arc::clone(&journals) },
+            },
+        }).collect();
+        let mut journals: Vec<_> = config.servers.iter().filter_map(JournalEndpoint::journal).collect();
+        let mut identity = Sha256::new();
+        if journals.len() == config.servers.len() {
+            identity.update(b"rtdb.logkeeper/ensemble/v2");
+        } else {
+            identity.update(b"rtdb.logkeeper/ensemble/v1");
+            journals = config.servers.iter().map(JournalEndpoint::address).collect();
+        }
+        journals.sort_unstable();
+        identity.update((config.write_quorum as u64).to_be_bytes());
+        for journal in journals {
+            identity.update((journal.len() as u64).to_be_bytes());
+            identity.update(journal.as_bytes());
+        }
+        Self { config, links, identity: Bytes::copy_from_slice(&identity.finalize()) }
     }
 
     pub fn len(&self) -> usize { self.links.len() }
@@ -82,14 +134,69 @@ impl Ensemble {
         self.ack(server, reply)
     }
 
-    pub fn check_request(&self, epoch: u64) -> RequestBody { RequestBody::Check(Check { stream: self.stream(), epoch }) }
+    pub fn check_synced_request(&self, epoch: u64) -> RequestBody { RequestBody::CheckSynced(Check { stream: self.stream(), epoch }) }
 
-    pub fn overwrite_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> RequestBody {
-        RequestBody::Overwrite(Overwrite { stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: commit })
+    fn loglet_check(&self, epoch: u64) -> LogletCheck {
+        LogletCheck { stream: self.stream(), epoch, ensemble: self.identity.clone() }
+    }
+
+    pub async fn confirm_authority(&self, server: usize, epoch: u64, port: u16) -> Result<Option<u64>> {
+        let endpoint = &self.config.servers[server];
+        let journal = endpoint.journal().ok_or_else(|| remote(endpoint.address(), "writer authority requires an installed journal identity"))?;
+        let (host, _) = endpoint.address().rsplit_once(':')
+            .ok_or_else(|| remote(endpoint.address(), "invalid journal authority route"))?;
+        let address = format!("{host}:{port}");
+        let mut peer = self.links[server].authority.lock().await;
+
+        // A cancelled call drops its socket, so a delayed reply cannot answer another round.
+        let mut socket = match peer.take() {
+            Some(session) if session.port == port && session.last_used.elapsed() < AUTHORITY_IDLE => session.socket,
+            _ => {
+                let socket = TcpStream::connect(&address).await.map_err(|error| remote(&address, error.to_string()))?;
+                socket.set_nodelay(true).map_err(|error| remote(&address, error.to_string()))?;
+                socket
+            }
+        };
+        let request = Request {
+            id: 1,
+            body: Some(RequestBody::ConfirmAuthority(self.loglet_check(epoch))),
+            target_journal: journal.to_owned(),
+        };
+        let mut frame = BytesMut::new();
+        encode_frame(&request, &mut frame);
+        socket.write_all(&frame).await.map_err(|error| remote(&address, error.to_string()))?;
+        let response = read_bounded_frame::<Response>(&mut socket, AUTHORITY_FRAME_BYTES).await
+            .map_err(|error| remote(&address, error.to_string()))?;
+        let outcome = match response {
+            Some((Response { id: 1, body: Some(ResponseBody::AuthorityConfirmed(_)) }, _)) => None,
+            Some((Response { id: 1, body: Some(ResponseBody::Refused(refusal)) }, _)) => Some(refusal.promised),
+            _ => return Err(remote(&address, "the journal did not confirm writer authority")),
+        };
+        *peer = Some(AuthoritySession { port, socket, last_used: Instant::now() });
+        Ok(outcome)
+    }
+
+    pub async fn activate(&self, server: usize, epoch: u64) -> Result<Ack> {
+        let reply = self.links[server].call(RequestBody::ActivateLoglet(self.loglet_check(epoch))).await;
+        self.ack(server, reply)
+    }
+
+    pub async fn read_index(&self, server: usize, epoch: u64) -> Result<Ack> {
+        let reply = self.links[server].call(RequestBody::ReadIndex(self.loglet_check(epoch))).await;
+        self.ack(server, reply)
+    }
+
+    pub fn repair_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64) -> RequestBody {
+        RequestBody::Overwrite(Overwrite {
+            stream: self.stream(), epoch, from_lsn: from, entries, complete: true, commit_lsn: commit, activate_ensemble: self.identity.clone(),
+        })
     }
 
     pub async fn overwrite(&self, server: usize, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool) -> Result<Ack> {
-        let reply = self.links[server].call(self.overwrite_request(epoch, from, entries, complete, -1)).await;
+        let body = RequestBody::Overwrite(Overwrite {
+            stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: -1, activate_ensemble: Bytes::new(),
+        });
+        let reply = self.links[server].call(body).await;
         self.ack(server, reply)
     }
 

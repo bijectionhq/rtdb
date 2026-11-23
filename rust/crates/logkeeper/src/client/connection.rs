@@ -2,10 +2,11 @@
 //! Sending never waits: a request joins the session's outbox in call order, and its reply is handed to a callback or a future.
 //! A failed session fails every outstanding request, and the next request opens a new one.
 
-use crate::protocol::{Request, RequestBody, Response, ResponseBody, encode_frame, read_frame};
+use crate::protocol::{Identify, Request, RequestBody, Response, ResponseBody, encode_frame, read_frame};
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
+use rtdb_types::valid_journal_identity;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
@@ -27,8 +28,35 @@ pub(crate) struct Connection {
 }
 
 struct Session {
-    outbox: mpsc::UnboundedSender<Request>,
+    outbox: mpsc::UnboundedSender<QueuedRequest>,
     waiters: Arc<Waiters>,
+}
+
+#[derive(Clone)]
+pub(crate) enum Binding {
+    Expected(Arc<str>),
+    Discover { slot: usize, journals: Arc<Mutex<Vec<Option<Arc<str>>>>> },
+}
+
+impl Binding {
+    fn admits(&self, observed: &Arc<str>) -> bool {
+        match self {
+            Self::Expected(expected) => expected == observed,
+            Self::Discover { slot, journals } => {
+                let mut journals = journals.lock();
+                if let Some(expected) = &journals[*slot] { return expected == observed; }
+                if journals.contains(&Some(Arc::clone(observed))) { return false; }
+                journals[*slot] = Some(Arc::clone(observed));
+                true
+            }
+        }
+    }
+}
+
+struct QueuedRequest {
+    id: u64,
+    body: RequestBody,
+    binding: Binding,
 }
 
 enum Waiting {
@@ -70,7 +98,7 @@ impl Connection {
     pub fn address(&self) -> &str { &self.address }
 
     /// The callback runs on the connection's own task, or on a task of its own when the session has already failed, never on the caller's: callers send while holding locks their callbacks take.
-    pub fn send(&self, body: RequestBody, callback: Callback) {
+    pub fn send(&self, binding: Binding, body: RequestBody, callback: Callback) {
         let (outbox, waiters) = {
             let mut session = self.session.lock();
             if session.as_ref().is_none_or(|session| session.waiters.failed() || session.outbox.is_closed()) {
@@ -89,16 +117,16 @@ impl Connection {
             tokio::spawn(async move { callback(Err(error)) });
             return;
         }
-        if outbox.send(Request { id, body: Some(body) }).is_err()
+        if outbox.send(QueuedRequest { id, body, binding }).is_err()
             && let Some(callback) = waiters.take(id) {
             let error = remote(&self.address, "the connection closed");
             tokio::spawn(async move { callback(Err(error)) });
         }
     }
 
-    pub async fn call(&self, body: RequestBody) -> Result<ResponseBody> {
+    pub async fn call(&self, binding: Binding, body: RequestBody) -> Result<ResponseBody> {
         let (sender, receiver) = oneshot::channel();
-        self.send(body, Box::new(move |result| { let _ = sender.send(result); }));
+        self.send(binding, body, Box::new(move |result| { let _ = sender.send(result); }));
         match tokio::time::timeout(CALL_TIMEOUT, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(remote(&self.address, "the connection dropped a request")),
@@ -121,7 +149,7 @@ impl Session {
 }
 
 /// Ends when the connection fails or every sender of the outbox is gone.
-async fn run(address: String, requests: mpsc::UnboundedReceiver<Request>, waiters: Arc<Waiters>) {
+async fn run(address: String, requests: mpsc::UnboundedReceiver<QueuedRequest>, waiters: Arc<Waiters>) {
     if crate::local::is_local(&address) {
         match tokio::time::timeout(CONNECT_TIMEOUT, crate::local::connect(&address)).await {
             Ok(Ok(socket)) => {
@@ -148,14 +176,35 @@ async fn run_session(
     mut reader: impl AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin,
     address: String,
-    mut requests: mpsc::UnboundedReceiver<Request>,
+    mut requests: mpsc::UnboundedReceiver<QueuedRequest>,
     waiters: Arc<Waiters>,
 ) {
+    let identified = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut frame = BytesMut::new();
+        encode_frame(&Request { id: 0, body: Some(RequestBody::Identify(Identify {})), target_journal: String::new() }, &mut frame);
+        writer.write_all(&frame).await?;
+        read_frame::<Response>(&mut reader).await
+    }).await;
+    let identity: Arc<str> = match identified {
+        Ok(Ok(Some(Response { id: 0, body: Some(ResponseBody::JournalIdentity(identity)) })))
+            if valid_journal_identity(&identity.journal) => identity.journal.into(),
+        Ok(Err(error)) => return waiters.fail(format!("could not identify the journal: {error}")),
+        Err(_) => return waiters.fail("timed out identifying the journal".to_owned()),
+        _ => return waiters.fail("the server did not advertise a journal identity".to_owned()),
+    };
     let writing = async {
         let mut buffer = BytesMut::new();
-        while let Some(request) = requests.recv().await {
-            encode_frame(&request, &mut buffer);
-            while let Ok(request) = requests.try_recv() { encode_frame(&request, &mut buffer); }
+        let encode = |queued: QueuedRequest, buffer: &mut BytesMut| {
+            if queued.binding.admits(&identity) {
+                encode_frame(&Request { id: queued.id, body: Some(queued.body), target_journal: identity.to_string() }, buffer);
+            } else if let Some(callback) = waiters.take(queued.id) {
+                callback(Err(remote(&address, format!("journal {identity} does not own this ensemble slot"))));
+            }
+        };
+        while let Some(queued) = requests.recv().await {
+            encode(queued, &mut buffer);
+            while let Ok(queued) = requests.try_recv() { encode(queued, &mut buffer); }
+            if buffer.is_empty() { continue; }
             writer.write_all(&buffer).await.map_err(|error| error.to_string())?;
             buffer.clear();
         }

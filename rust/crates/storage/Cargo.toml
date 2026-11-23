@@ -13,9 +13,11 @@ remote = ["dep:object_store", "dep:futures", "dep:percent-encoding"]
 percent-encoding = { version = "2.3", optional = true }
 rtdb-types.workspace = true
 rtdb-columnar.workspace = true
+rtdb-format.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 fs2.workspace = true
+memmap2.workspace = true
 futures = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
 parking_lot.workspace = true

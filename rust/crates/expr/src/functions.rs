@@ -167,6 +167,14 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         "lower" => Ok(Value::Utf8(text(&args[0])?.to_lowercase())),
         "upper" => Ok(Value::Utf8(text(&args[0])?.to_uppercase())),
         "length" => match &args[0] { Value::Utf8(text) => count(text.chars().count()), Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => count(bytes.len()), Value::List(items) => count(items.len()), value => Err(inapplicable(&name, &[value])) },
+        "epoch_nanos_be" => {
+            let Value::Timestamp { value, unit, timezone: Some(_) } = &args[0] else {
+                return Err(inapplicable("epoch_nanos_be", &[&args[0]]));
+            };
+            let nanos = i128::from(*value) * (1_000_000_000 / i128::from(unit.units_per_second()));
+            let nanos = u64::try_from(nanos).map_err(|_| overflow())?;
+            Ok(Value::Binary(nanos.to_be_bytes().to_vec()))
+        }
         "_iid" => Ok(Value::FixedSizeBinary(args[0].entity_id()?.iid().0.to_vec())),
         "keyword" => match &args[0] {
             Value::Utf8(text) => Ok(Value::Keyword(rtdb_types::Keyword::from_name(text))),

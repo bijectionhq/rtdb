@@ -120,6 +120,12 @@ fn trim<'a>(args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'
         let count = count.demand().await?;
         let count = integer(scalar_ref(&count)?).and_then(|count| i64::try_from(count).ok()).ok_or_else(|| invalid("trim_array"))?;
         let size = crate::collection::trim_size(size,count)?;
+        if let EvalValue::List(_, reader) = &input
+            && let ListReader::Stored(list) = reader.as_ref()
+            && let Some(slice) = list.slice_packed(0, crate::collection::view_size(size)?)
+        {
+            return make_list(Kind::List, ListReader::Stored(slice), frame);
+        }
         make_list(Kind::List,ListReader::Trim { input,size },frame)
     },frame)
 }

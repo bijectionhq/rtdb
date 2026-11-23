@@ -10,6 +10,19 @@ Prepared query execution admits unsigned arguments at their signed vector width.
 `PreparedSql::open_query_typed` retains supplied vector field types for typed nulls and empty containers; `open_query` infers fields from its values.
 Result-schema description preserves supplied physical parameter fields, while opening a query binds against the signed execution field view.
 
+`NativeSession::reserve_ordered_present` requires a database write grant and an idle native session in autocommit mode with read-write access.
+It submits an empty transaction without caller-supplied system time or an idempotency key and returns the transaction key after apply, advancing the connection's await token.
+Transactions in the same database history that resolve after the reservation take strictly greater system times.
+Each call can append a fresh reservation, including a retry after an unknown outcome.
+The reservation changes transaction bookkeeping only and marks its `xt.txs` metadata with `rtdb_present_reservation`.
+
+`NodeOptions::owned_relations` enables the native owner-scoped relation API.
+Enable this mode only on an installation where every serving and replay member supports the owned relation format.
+`TxOp::OwnedInsertDocs` resolves create-only writes in the authenticated principal's namespace.
+`NativeSession::open_owned_point` reads a single entity in that namespace at a store-reserved present.
+Normal SQL and ordinary native writes cannot access the reserved scope.
+Owned write transactions contain only owned operations.
+
 Session parameter entries, database and timezone strings, await/snapshot tokens, pinned transaction bases and buffered SQL carry execution-budget reservations for their retained lifetime.
 Rejected parameter updates retain the previous value.
 The failed-transaction marker stores only the state needed to reject subsequent commands; it does not retain the command's diagnostic payload.
@@ -48,14 +61,20 @@ Database names that cannot form a safe single path component use an injective he
 Production local-log writers sample the configured clock for source transactions and the system clock for other messages, unless `with_local_log_clock` enables the configured clock for all records.
 `with_log_clock` replaces that clock with a fallible host clock for in-memory and local source transactions, keeping the local log's policy for other messages.
 The clock is sampled during append, after queue admission.
-`Node::snapshot_export` requires indexing and compaction to be disabled and returns a passive, charged manifest for the loaded block.
-The plan copies through the existing object-store capability, accepts completed immutable copies on retry and checks cancellation between copies.
-`Node::prepare_compactor_reset` catches up through a block and captures surviving L0 pairs directly from storage, including files whose serving entries were removed by compaction.
-The passive `CompactorReset` plan retains its catalog generation, term capability, deletion list and memory reservations.
+`Node::snapshot_export` requires indexing and compaction to be disabled and loads the exact checkpoint root and its table manifests.
+The export includes table declarations without data files and derives the primary trie dependencies from the checkpoint's own table manifests.
+The plan copies through the existing object-store capability, accepts completed immutable copies on retry and publishes the checkpoint root after its dependencies.
+`Node::prepare_compactor_reset` catches up through a block and verifies the L0 data and metadata pairs named by the installed checkpoint.
+An incomplete inventory refuses the reset before installing a replacement catalog.
+`Node::prepare_compactor_reset_from_retained_base` rebuilds the catch-up checkpoint in a private local store from a detached anchor and the database's held replica journal.
+It synchronizes the replacement pairs before the term-owned reset request and preserves prior L0 source descriptors for ordered replay.
+The passive `CompactorReset` plan retains its catalog generation, term capability, retirement inventory and memory reservations.
 Its application requires an exclusive maintenance node with indexing enabled and compaction and automatic GC disabled.
 The active replication driver accepts the reset only against that catalog and block, owns the reset completion within its leader term, and acknowledges it after adopting the replacement block.
-The plan then deletes compacted metadata before data; cancellation and failed publication retain the files needed for recovery.
-Planning alone performs the initial catch-up flush but makes no reset or deletion.
+On coordinated stores, the plan stages the compacted pairs before publication and submits them for retirement through the installed replica receipt and catalog floor afterwards.
+Earlier readers can defer release, and collection resumes pending retirements after restart.
+On an uncoordinated store the exclusive plan deletes compacted metadata before data after adoption.
+Planning alone performs the initial catch-up flush and reports the prospective retirements.
 Feature-gated provider factories supply Kafka, S3, Azure, and GCS implementations.
 `PostgresSourceFactory` is a passive immutable registry of node-local remotes and native indexer factories.
 The database source retains its native indexer and metric registration across leader changes; each active assignment driver owns its PostgreSQL sockets and confirmation state until teardown.

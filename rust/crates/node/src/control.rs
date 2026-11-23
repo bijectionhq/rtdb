@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_expr::{EvalContext, EvaluationScope, evaluate_async};
-use rtdb_format::basis::decode_tx_basis;
 use rtdb_plan::{Binder, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Expr, Identifier, Schema, TransactionOptions};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::UserMetadata;
@@ -11,6 +10,12 @@ use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, ScalarType, Time
 use tokio_util::sync::CancellationToken;
 
 use crate::{AccessSettings, CommitMode, CommitResult, LastSubmittedTx, NativeSession, OptionUpdate, ReadOnlySettings, ReadWriteSettings, TransactionSettings, TransactionStatus};
+use crate::node::HostedSourceReceipt;
+
+enum SourceInspection {
+    Owner(String),
+    Barrier(HostedSourceReceipt),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ControlFrontend { #[default] Native, PostgreSql, Adbc, FlightSql }
@@ -38,7 +43,9 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
     let fields = match name.as_str() {
         "clock_time" => vec![(name.as_str(), instant)],
-        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier" | "rtdb_hosted_source_barrier" => vec![(name.as_str(), text)],
+        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier"
+        | "rtdb_hosted_source_owner" => vec![(name.as_str(), text)],
+        "rtdb_hosted_source_barrier" => vec![(name.as_str(), text), ("tx_id", integer), ("system_time", instant.maybe())],
         "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
         "latest_submitted_tx" => vec![("tx_id", integer), ("system_time", instant.maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.maybe())],
         "latest_completed_txs" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("tx_id", integer), ("system_time", instant.maybe())],
@@ -197,7 +204,7 @@ impl NativeSession {
                 allocation.reserve(rtdb_expr::text_allocation_bound(&value)?)?;
                 allocation.reserve(name.len().checked_mul(4).ok_or_else(|| invalid("SET name allocation overflow"))?)?;
                 let value = if matches!(value, Value::Null | Value::Undefined) { None } else {
-                    let eval = EvalContext { parameters: arguments, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(&allocation), catalog, corpora: None };
+                    let eval = EvalContext { parameters: rtdb_expr::Parameters::Values(arguments), parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(&allocation), catalog };
                     let Value::Utf8(value) = rtdb_expr::scalar_call("str", &[value], &eval)? else { return Err(invalid("Session parameter could not be formatted")); };
                     Some(value)
                 };
@@ -210,17 +217,20 @@ impl NativeSession {
                 Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
             }
             ControlStatement::Show { name } => {
-                let hosted_history = if matches!(name.as_str(), "rtdb_source_barrier" | "rtdb_hosted_source_barrier") {
+                let source = if name == "rtdb_hosted_source_owner" {
+                    let history = self.service.confirm_hosted_source_owner(self.state.database(), cancellation).await?;
+                    Some(SourceInspection::Owner(history))
+                } else if matches!(name.as_str(), "rtdb_source_barrier" | "rtdb_hosted_source_barrier") {
                     if self.state.status() != TransactionStatus::Idle && !options.implicit_transaction {
                         return Err(Anomaly::incorrect("rtdb/source-barrier-in-transaction", "Complete the transaction before awaiting a source barrier"));
                     }
                     self.service.await_durable_source(
                         self.state.database(), name == "rtdb_hosted_source_barrier", cancellation,
-                    ).await?
+                    ).await?.map(SourceInspection::Barrier)
                 } else {
                     None
                 };
-                self.show(name, statement.requires_read_transaction(), hosted_history, cancellation).await.map(ControlResult::Rows)
+                self.show(name, statement.requires_read_transaction(), source, cancellation).await.map(ControlResult::Rows)
             },
             ControlStatement::Prepare { name, source } => {
                 allocation.reserve(size(name.len(), source.len())?)?;
@@ -230,7 +240,7 @@ impl NativeSession {
                 let context = self.query_context_with(cancellation, false).await?;
                 let bound = arguments.iter().try_fold(8192usize, |bytes, value| size(bytes, value.retained_bytes()?))?;
                 let _scratch = context.memory.reserve(size(bound, expressions.len().checked_mul(8192).ok_or_else(|| invalid("EXECUTE allocation size overflow"))?)?)?;
-                let eval = EvalContext { parameters: arguments, parameter_types: None, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[], snapshot_token: context.snapshot_token(), allocation: Some(&allocation), catalog: Some(&context.catalog), corpora: None };
+                let eval = EvalContext { parameters: rtdb_expr::Parameters::Values(arguments), parameter_types: None, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[], snapshot_token: context.snapshot_token(), allocation: Some(&allocation), catalog: Some(&context.catalog) };
                 let mut arguments = Vec::with_capacity(expressions.len());
                 for expression in expressions { arguments.push(evaluate_async(expression, &Schema::default(), &[], &eval).await?); }
                 let actual = arguments.iter().try_fold(0usize, |bytes, value| size(bytes, value.retained_bytes()?))?;
@@ -238,6 +248,9 @@ impl NativeSession {
                 allocation.reserve(name.len())?;
                 Ok(ControlResult::Execute { name: name.clone(), arguments, reservation, allocation })
             }
+            ControlStatement::CopyOut { .. } => Err(Anomaly::unsupported(
+                "xtdb/copy-out-frontend", "COPY TO STDOUT uses the PgWire protocol",
+            )),
             ControlStatement::CopyIn { table, format } => {
                 allocation.reserve(table.iter().try_fold(256usize, |bytes, identifier| size(bytes, size(identifier.text.len(), 128)?))?)?;
                 Ok(ControlResult::CopyIn { table: table.clone(), format: *format, allocation })
@@ -262,7 +275,7 @@ impl NativeSession {
     }
 
     async fn control_value(&self, expression: &Expr, parameters: &[Value], allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<Value> {
-        evaluate_async(expression, &Schema::default(), &[], &EvalContext { parameters, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog, corpora: None }).await
+        evaluate_async(expression, &Schema::default(), &[], &EvalContext { parameters: rtdb_expr::Parameters::Values(parameters), parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }).await
     }
 
     fn check_database_control(&self, action: &str, name: &str, options: ControlExecutionOptions) -> Result<()> {
@@ -271,19 +284,19 @@ impl NativeSession {
         Ok(())
     }
 
-    async fn show(&mut self, name: &str, checked: bool, hosted_history: Option<String>, cancellation: &CancellationToken) -> Result<QueryCursor> {
+    async fn show(&mut self, name: &str, checked: bool, source: Option<SourceInspection>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let basis = if checked { self.state.read_basis().await? } else { self.state.inspection_basis()? };
         let context = self.service.query_context(self.state.database(), &basis, cancellation).await?
             .with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None);
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }
-        if let Some(token) = self.state.effective_await_token() { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
+        if let Some(token) = if name == "latest_submitted_tx" { self.state.last_submitted_await_token() } else { self.state.effective_await_token() } { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
         let snapshot_token = if name == "snapshot_token" { Some(basis.snapshot_token()) } else { None };
         if let Some(token) = &snapshot_token { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
         let error = match (name, self.state.last_submitted()) { ("latest_submitted_tx", Some(LastSubmittedTx::Executed(tx))) => tx.encoded_error()?, _ => None };
         if let Some(error) = &error { bound = size(bound, error.as_ref().len().checked_mul(4).ok_or_else(|| invalid("SHOW error size overflow"))?)?; }
         let databases = if ["latest_completed_txs", "latest_submitted_msg_ids", "latest_processed_msg_ids"].contains(&name) {
-            crate::SessionService::await_basis(self.service.as_ref(), self.state.effective_await_token().map(decode_tx_basis).transpose()?, Duration::from_secs(60), cancellation).await?;
+            crate::SessionService::await_client_token(self.service.as_ref(), self.state.effective_await_token(), Duration::from_secs(60), cancellation).await?;
             self.service.visible_databases()?
         } else { Default::default() };
         for name in databases.keys() { bound = size(bound, size(8192, name.len().checked_mul(4).ok_or_else(|| invalid("SHOW database name size overflow"))?)?)?; }
@@ -300,9 +313,21 @@ impl NativeSession {
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "rtdb_ordered_system_time" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
-            "rtdb_hosted_source_barrier" => {
-                let history = hosted_history.ok_or_else(|| Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source barrier has no history"))?;
+            "rtdb_hosted_source_owner" => {
+                let Some(SourceInspection::Owner(history)) = source else {
+                    return Err(Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source confirmation has no history"));
+                };
                 (vec![(name, text.clone())], vec![vec![Value::Utf8(history)]])
+            },
+            "rtdb_hosted_source_barrier" => {
+                let Some(SourceInspection::Barrier(receipt)) = source else {
+                    return Err(Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source barrier has no receipt"));
+                };
+                let fields = vec![(name, text.clone()), ("tx_id", integer.clone().maybe()), ("system_time", instant.clone().maybe())];
+                let (offset, time) = receipt.applied.map_or((Value::Null, Value::Null), |key| {
+                    (Value::I64(key.tx_id.0), timestamp(key.system_time))
+                });
+                (fields, vec![vec![Value::Utf8(receipt.history), offset, time]])
             },
             "transaction_isolation" => (vec![(name, text.clone())], vec![vec![Value::Utf8("read committed".into())]]),
             "await_token" => (vec![(name, text.clone().maybe())], vec![vec![self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]]),
@@ -311,7 +336,7 @@ impl NativeSession {
                 let fields = vec![("tx_id", integer.clone().maybe()), ("system_time", instant.clone().maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.clone().maybe())];
                 let rows = self.state.last_submitted().map(|tx| {
                     let (system_time, committed) = match tx { LastSubmittedTx::Submitted(_) => (Value::Null, Value::Null), LastSubmittedTx::Executed(tx) => (timestamp(tx.tx_key().system_time), Value::Bool(tx.committed())) };
-                    vec![Value::I64(tx.tx_id().0), system_time, committed, error.as_ref().map_or(Value::Null, |error| Value::Transit(error.as_ref().to_vec())), self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]
+                    vec![Value::I64(tx.tx_id().0), system_time, committed, error.as_ref().map_or(Value::Null, |error| Value::Transit(error.as_ref().to_vec())), self.state.last_submitted_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]
                 }).into_iter().collect();
                 (fields, rows)
             }
@@ -343,7 +368,7 @@ impl NativeSession {
 /// `catalog` must be the captured basis when an expression resolves relation names.
 /// Evaluation stays on the caller's future; dropping it cancels SLEEP without installing partial settings.
 pub async fn transaction_settings(options: &TransactionOptions, parameters: &[Value], timezone: &str, session_timezone: &str, current_time: impl Into<rtdb_types::Instant>, memory: &Arc<MemoryBudget>, allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<TransactionSettings> {
-    let initial = EvalContext { parameters, parameter_types: None, current_time: current_time.into(), timezone, outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog, corpora: None };
+    let initial = EvalContext { parameters: rtdb_expr::Parameters::Values(parameters), parameter_types: None, current_time: current_time.into(), timezone, outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog };
     let timezone_update = update(options.timezone.as_ref(), &initial, |value| string(value, "TIMEZONE")).await?;
     let timezone = match &timezone_update { OptionUpdate::Set(timezone) => rtdb_expr::normalize_timezone(timezone)?, OptionUpdate::Clear => session_timezone.to_owned(), OptionUpdate::Unchanged => timezone.to_owned() };
     let eval = EvalContext { timezone: &timezone, ..initial };

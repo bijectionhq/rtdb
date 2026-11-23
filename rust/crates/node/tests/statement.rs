@@ -19,6 +19,288 @@ fn context(state: Option<&PartitionState>, memory: &Arc<MemoryBudget>) -> Arc<Qu
 }
 
 #[tokio::test]
+async fn prepared_parameter_projection_keeps_the_bound_arrow_buffers() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("client-int", DataType::Int64, false), Field::new("client-text", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42])), Arc::new(StringArray::from(vec!["bound"]))]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)];
+    let pointer = bound.batch().column(0).as_primitive::<Int64Type>().values().as_ptr();
+    let query = PreparedSql::prepare("SELECT $2 AS label, $1 AS n", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let advertised = query.result_schema(&context, &types).unwrap();
+
+    let empty = PreparedSql::prepare("SELECT FROM (VALUES ($1, $2)) AS t(a, b)", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut empty = empty.try_open_parameter_projection(Arc::clone(&context), &bound, &types).await.unwrap().unwrap();
+    let empty_row = empty.next_batch().await.unwrap().unwrap();
+    assert_eq!((empty_row.batch().num_columns(), empty_row.batch().num_rows()), (0, 1));
+
+    let mut cursor = query.try_open_parameter_projection(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    let output = cursor.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(cursor.schema(), advertised.schema());
+    assert_eq!(output.batch().column(0).as_string::<i32>().value(0), "bound");
+    assert_eq!(output.batch().column(1).as_primitive::<Int64Type>().value(0), 42);
+    assert_eq!(output.batch().column(1).as_primitive::<Int64Type>().values().as_ptr(), pointer);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prepared_query_reads_an_arrow_parameter_only_when_reached() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let source = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false), Field::new("text", DataType::Utf8, false)]));
+    let text = "x".repeat(1 << 21);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![3])), Arc::new(StringArray::from(vec![text]))]).unwrap();
+    let bound = OwnedBatch::new(batch, &source).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare(
+        "SELECT CASE WHEN v < 0 THEN CAST(CHAR_LENGTH($2) AS BIGINT) ELSE v + $1 END AS n FROM (VALUES (10), (20)) AS t(v)",
+        &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic,
+    ).unwrap();
+    let mut cursor = query.try_open_query_arrow(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    assert!(source.used_bytes() > 0);
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_primitive::<Int64Type>().values().as_ref(), &[13, 23]);
+    drop(cursor);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn vector_query_does_not_decode_an_unreached_case_arm() {
+    use arrow_array::{RecordBatch, StringArray, cast::AsArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let source = MemoryBudget::new(1 << 24);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    write(&state, 1, Value::I64(10), &memory);
+    let context = context(Some(&state), &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("left", DataType::Utf8, false), Field::new("right", DataType::Utf8, false)]));
+    let text = "x".repeat(1 << 21);
+    let array = |values: Vec<&str>| Arc::new(StringArray::from(values));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array(vec!["small"]), array(vec![text.as_str()])]).unwrap();
+    let bound = OwnedBatch::new(batch, &source).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare(
+        "SELECT CASE WHEN v < 0 THEN $2 ELSE $1 END AS label FROM docs",
+        &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic,
+    ).unwrap();
+    let mut cursor = query.try_open_query_arrow(Arc::clone(&context), &bound, &types).await.unwrap().unwrap();
+    let before = memory.used_bytes();
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_string::<i32>().value(0), "small");
+    assert!(memory.used_bytes().saturating_sub(before) < 1 << 20);
+    drop((output, cursor, bound));
+    assert_eq!(source.used_bytes(), 0);
+
+    let batch = RecordBatch::try_new(schema, vec![array(vec!["first", text.as_str()]), array(vec!["other", text.as_str()])]).unwrap();
+    let bound = OwnedBatch::new(batch, &source).unwrap();
+    let mut cursor = query.try_open_query_arrow(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    assert!(source.used_bytes() < 1 << 16);
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_string::<i32>().value(0), "first");
+}
+
+#[tokio::test]
+async fn prepared_parameter_projection_canonicalizes_masked_and_boolean_buffers() {
+    use arrow_array::{Array, BooleanArray, Int64Array, NullArray, RecordBatch, cast::AsArray, types::Int64Type};
+    use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("client-int", DataType::Int64, true),
+        Field::new("client-bool", DataType::Boolean, false),
+        Field::new("client-null", DataType::Null, true),
+    ]));
+    let masked = Int64Array::new(ScalarBuffer::from(vec![99]), Some(NullBuffer::new_null(1)));
+    let padded = BooleanArray::new(BooleanBuffer::new(Buffer::from(vec![0xff]), 0, 1), None);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(masked), Arc::new(padded), Arc::new(NullArray::new(1))]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64).maybe(), LogicalType::Scalar(ScalarType::Bool), LogicalType::Null];
+    let query = PreparedSql::prepare("SELECT $2 AS b, $1 AS n, $3 AS empty", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut projected = query.try_open_parameter_projection(Arc::clone(&context), &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    let mut ordinary = query.open_query_columns_typed(context, vec![Value::Null, Value::Bool(true), Value::Null], &types).await.unwrap();
+    let output = projected.next_batch().await.unwrap().unwrap();
+    let expected = ordinary.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(projected.schema(), ordinary.schema());
+    assert_eq!(output.batch(), expected.batch());
+    assert_eq!(output.batch().column(0).as_boolean().values().values(), &[1]);
+    assert!(output.batch().column(1).is_null(0));
+    assert_eq!(output.batch().column(1).as_primitive::<Int64Type>().value(0), 0);
+    assert_eq!(output.batch().column(2).data_type(), &DataType::Null);
+}
+
+#[tokio::test]
+async fn prepared_parameter_projection_selects_the_first_row_and_releases_the_batch() {
+    use arrow_array::{RecordBatch, StringArray, cast::AsArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("input", DataType::Utf8, false)]));
+    let unused = "x".repeat(1 << 20);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["first", unused.as_str()]))]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let upload = Arc::downgrade(bound.reservation());
+    let types = [LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare("SELECT $1 AS label", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = query.try_open_parameter_projection(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+
+    assert!(upload.upgrade().is_none());
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("first")]);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn computed_parameter_projection_uses_arrow_arithmetic_and_preserves_nested_payloads() {
+    use arrow_array::{Array, Int64Array, RecordBatch, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let long = LogicalType::Scalar(ScalarType::I64);
+    let payload = Value::list(vec![Value::Struct([("label".into(), Value::Utf8("kept".into()))].into()), Value::I64(7)]);
+    let payload_type = payload.logical_type();
+    let types = [long.clone(), long.clone(), payload_type.clone()];
+    let fields = vec![Field::new("a", DataType::Int64, false), Field::new("b", DataType::Int64, false), to_field("payload", &payload_type).unwrap()];
+    let bound = |a| {
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), vec![
+            Arc::new(Int64Array::from(vec![a])),
+            Arc::new(Int64Array::from(vec![3])),
+            copy_array(&payload_type, std::slice::from_ref(&payload)).unwrap(),
+        ]).unwrap();
+        OwnedBatch::new(batch, &memory).unwrap()
+    };
+    let query = PreparedSql::prepare("SELECT ($1 + $2) * $2 AS total, $3 AS payload", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut projected = query.try_open_parameter_projection(Arc::clone(&context), &bound(11), &types).await.unwrap().unwrap();
+    let mut ordinary = query.open_query_columns_typed(Arc::clone(&context), vec![Value::I64(11), Value::I64(3), payload.clone()], &types).await.unwrap();
+    let actual = projected.next_batch().await.unwrap().unwrap();
+    let expected = ordinary.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(projected.schema(), ordinary.schema());
+    assert_eq!(actual.batch(), expected.batch());
+    assert_eq!(actual.batch().column(0).as_primitive::<Int64Type>().value(0), 42);
+    assert!(actual.batch().column(1).as_list::<i32>().is_valid(0));
+    assert!(query.try_open_parameter_projection(context, &bound(i64::MAX), &types).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prepared_vector_projection_reads_arrow_operands_for_division_comparison_and_text() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("left", DataType::Int64, false),
+        Field::new("right", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let bound = |divisor| {
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(Int64Array::from(vec![84])),
+            Arc::new(Int64Array::from(vec![divisor])),
+            Arc::new(StringArray::from(vec!["Straße"])),
+        ]).unwrap();
+        OwnedBatch::new(batch, &memory).unwrap()
+    };
+    let numeric = LogicalType::Scalar(ScalarType::I64);
+    let types = [numeric.clone(), numeric, LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare("SELECT $1 / $2 AS quotient, $1 > $2 AS larger, UPPER($3) AS label",
+        &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = query.try_open_parameter_projection(Arc::clone(&context), &bound(2), &types).await.unwrap().unwrap();
+    let output = cursor.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(output.batch().column(0).as_primitive::<Int64Type>().value(0), 42);
+    assert!(output.batch().column(1).as_boolean().value(0));
+    assert_eq!(output.batch().column(2).as_string::<i32>().value(0), "STRASSE");
+    assert!(query.try_open_parameter_projection(context, &bound(0), &types).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prepared_vector_projection_admits_the_masked_utf8_span_before_evaluation() {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("input", DataType::Utf8, true)]));
+    let bound = |masked_bytes| {
+        let strings = StringArray::try_new(
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, masked_bytes])),
+            Buffer::from_vec(vec![b'x'; masked_bytes as usize]),
+            Some(NullBuffer::new_null(1)),
+        ).unwrap();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(strings)]).unwrap();
+        OwnedBatch::new(batch, &memory).unwrap()
+    };
+    let types = [LogicalType::Scalar(ScalarType::Utf8).maybe()];
+    let query = PreparedSql::prepare("SELECT CHAR_LENGTH(UPPER($1)) AS size", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+
+    let mut small = query.try_open_parameter_projection(Arc::clone(&context), &bound(1), &types).await.unwrap().unwrap();
+    let page = small.next_batch().await.unwrap().unwrap();
+    assert_eq!(page.batch().column(0).null_count(), 1);
+    drop((small, page));
+    assert!(query.try_open_parameter_projection(Arc::clone(&context), &bound(1 << 19), &types).await.unwrap().is_none());
+    let mut cursor = query.open_query_columns_typed(context, vec![Value::Null], &types).await.unwrap();
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(read_value(output.batch().schema_ref().field(0), output.batch().column(0).as_ref(), 0).unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn prepared_parameter_projection_copies_only_the_first_fixed_size_list() {
+    use arrow_array::{RecordBatch, cast::AsArray};
+    use arrow_schema::Schema;
+    use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let first = Value::FixedSizeList(vec![Value::I64(20), Value::I64(22)].into());
+    let second = Value::FixedSizeList(vec![Value::I64(0), Value::I64(0)].into());
+    let ty = first.logical_type();
+    let schema = Arc::new(Schema::new(vec![to_field("input", &ty).unwrap()]));
+    let batch = RecordBatch::try_new(schema, vec![copy_array(&ty, &[first.clone(), second]).unwrap()]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let upload = Arc::downgrade(bound.reservation());
+    let query = PreparedSql::prepare("SELECT $1 AS fixed", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = query.try_open_parameter_projection(context, &bound, &[ty]).await.unwrap().unwrap();
+    drop(bound);
+    assert!(upload.upgrade().is_none());
+
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    let batch = page.batch();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_fixed_size_list().value_length(), 2);
+    assert_eq!(read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0).unwrap(), first);
+}
+
+#[tokio::test]
 async fn postgres_preparation_keeps_inline_xtql_source_and_result_fields() {
     let memory = MemoryBudget::new(1 << 26);
     let context = context(None, &memory);

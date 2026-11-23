@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{AccessSettings, CommitResult, NativeSession, Node, TransactionSettings, TransactionStatus};
 use rtdb_pg_codec::Format;
 use rtdb_plan::{CopyFormat, Identifier};
@@ -12,6 +12,53 @@ use rtdb_types::{Anomaly, Result, TableRef, Value};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use crate::error::{cancelled, protocol};
+
+/// Encodes each batch while its source buffers are in scope and releases
+/// them before waiting on the connection.
+pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
+    mut cursor: rtdb_query::QueryCursor, memory: &Arc<MemoryBudget>, wire: &mut crate::wire::Writer<W>,
+) -> Result<()> {
+    let schema = cursor.runtime_schema();
+    let bound = schema.fields().iter().try_fold(8192usize, |bytes, field| {
+        let field_bytes = field.data_type.retained_bytes()?.saturating_add(field.name.len());
+        bytes.checked_add(field_bytes.saturating_mul(64).saturating_add(4096))
+            .ok_or_else(|| protocol("COPY TO schema is too large"))
+    })?;
+    let _schema = memory.reserve(bound)?;
+    let fields = schema.fields().iter().map(|field| rtdb_columnar::to_field(&field.name, &field.data_type))
+        .collect::<Result<Vec<_>>>()?;
+    let schema = arrow_schema::Schema::new(fields);
+    let mut encoder = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), &schema).map_err(arrow_output_error)?;
+    wire.send(b'H', &[1, 0, 1, 0, 1]).await?;
+    wire.send(b'd', &std::mem::take(encoder.get_mut())).await?;
+    wire.flush().await?;
+    let mut count = 0u64;
+    loop {
+        let encoded = cursor.encode_next_batch(|batch| -> Result<_> {
+            let batch = rtdb_columnar::conform_batch(batch.clone(), &schema, memory)?;
+            let bytes = batch.batch().get_array_memory_size().checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(bound)).ok_or_else(|| protocol("COPY TO batch is too large"))?;
+            let reservation = memory.reserve(bytes)?;
+            encoder.write(batch.batch()).map_err(arrow_output_error)?;
+            Ok((batch.batch().num_rows() as u64, std::mem::take(encoder.get_mut()), reservation))
+        }).await?;
+        let Some(encoded) = encoded else { break };
+        let (rows, bytes, _reservation) = encoded.inspect_err(|_| cursor.record_consumer_error())?;
+        count = count.checked_add(rows).ok_or_else(|| protocol("COPY TO row count overflow"))?;
+        for chunk in bytes.chunks(64 * 1024) {
+            wire.send(b'd', chunk).await?;
+        }
+        wire.flush().await?;
+    }
+    encoder.finish().map_err(arrow_output_error)?;
+    wire.send(b'd', encoder.get_ref()).await?;
+    wire.empty(b'c').await?;
+    wire.string(b'C', &format!("COPY {count}")).await
+}
+
+fn arrow_output_error(error: arrow_schema::ArrowError) -> Anomaly {
+    Anomaly::incorrect("xtdb.pgwire/copy-output", error.to_string())
+}
 
 pub(crate) struct CopyInput { file: NamedTempFile, format: CopyFormat, table: TableRef, length: u64, limit: u64, _reservation: Arc<MemoryReservation> }
 impl CopyInput {
@@ -37,8 +84,7 @@ impl CopyInput {
                 let values = if self.format == CopyFormat::TransitJson { rtdb_format::transit::decode_json_sequence(&bytes)? } else { rtdb_format::transit::decode_msgpack_sequence(&bytes)? };
                 let rows = values.into_iter().map(|value| match rtdb_pg_codec::from_transit(value)? { Value::Struct(fields) => Ok(fields), _ => Err(protocol("COPY Transit values must be documents")) }).collect::<Result<Vec<_>>>()?;
                 let count = rows.len() as u64;
-                let operation = self.row_operation(rows, node.memory())?;
-                self.submit(operation, session, node, cancellation).await?;
+                self.submit(|| self.put_rows(rows, node.memory()), session, node, cancellation).await?;
                 Ok(count)
             }
             CopyFormat::ArrowFile | CopyFormat::ArrowStream => {
@@ -54,32 +100,25 @@ impl CopyInput {
                     if cancellation.is_cancelled() { return Err(cancelled()); }
                     let batch = batch?;
                     count = count.checked_add(batch.num_rows() as u64).ok_or_else(|| protocol("COPY row count overflow"))?;
-                    if let Some(documents) = ArrowDocuments::try_new(&batch, node.memory())? {
-                        let operation = TxOp::PutArrowDocs { table: self.table.clone(), documents, valid_from: None, valid_to: None };
-                        self.submit(operation, session, node, cancellation).await?;
-                        continue;
+                    // An explicit transaction can hold this batch after COPY releases its decoder reservation.
+                    let batch = OwnedBatch::new(batch, node.memory())?;
+                    if let Some(documents) = ArrowDocuments::from_ingest_batch(&batch, node.memory())? {
+                        let operation = TxOp::PutArrowDocs { table: self.table.clone(), documents };
+                        self.submit(|| Ok(operation), session, node, cancellation).await?;
                     }
-                    let schema = batch.schema();
-                    let mut bound = 8192usize;
-                    for row in 0..batch.num_rows() { for column in 0..batch.num_columns() { bound = bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.column(column).as_ref(), row)?).ok_or_else(|| protocol("COPY row allocation overflow"))?; } }
-                    let _values = node.memory().reserve(bound)?;
-                    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), rtdb_columnar::read_execution_value(field, batch.column(column).as_ref(), row)?))).collect::<Result<StructFields<_>>>()).collect::<Result<Vec<_>>>()?;
-                    let operation = self.row_operation(rows, node.memory())?;
-                    self.submit(operation, session, node, cancellation).await?;
                 }
                 Ok(count)
             }
         }
     }
-    fn row_operation(&self, rows: Vec<StructFields<Value>>, memory: &Arc<MemoryBudget>) -> Result<TxOp> {
+    fn put_rows(&self, rows: Vec<StructFields<Value>>, memory: &Arc<MemoryBudget>) -> Result<TxOp> {
         Ok(TxOp::PutDocs { table: self.table.clone(), documents: Documents::new(rows, memory)?, valid_from: None, valid_to: None })
     }
-
-    async fn submit(&self, operation: TxOp, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
+    async fn submit(&self, operation: impl FnOnce() -> Result<TxOp>, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
         let owns_transaction = session.state().status() == TransactionStatus::Idle;
         if owns_transaction { session.state_mut().begin_with(TransactionSettings { access: Some(AccessSettings::ReadWrite(Default::default())), ..Default::default() })?; }
         let work = async {
-            session.state_mut().execute_operation(operation).await?;
+            session.state_mut().execute_operation(operation()?).await?;
             if owns_transaction { let _sample = rtdb_plan::ExecutionSample::new(node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction); if let CommitResult::Executed(tx) = session.state_mut().commit_tx(None).await? { if let Some(error) = tx.error() { return Err(error.clone()); } } }
             Ok(())
         };

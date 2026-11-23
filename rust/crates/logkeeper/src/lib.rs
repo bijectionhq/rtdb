@@ -10,9 +10,11 @@ mod protocol;
 mod local;
 mod server;
 
-pub use client::{CopyFrom, Loglet, QuorumLog, RetainedAudit, StreamConfig, audit_retained, certify_committed_prefix, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
+pub use client::{CertifiedRangeReader, CopyFrom, Loglet, QuorumLog, RetainedAudit, StreamConfig, audit_retained, bootstrap_committed_page, certify_committed_prefix, certify_committed_range, copy_certified_range, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, seal_recover_committed, trim, verify_certified_range};
+pub use protocol::Entry as ArchivedReplicaEntry;
 pub use local::LocalListener;
-pub use server::{JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
+pub use rtdb_types::JournalEndpoint;
+pub use server::{AuthorityListener, JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
 
 /// The pure pieces `rtdb-simulation` drives directly: one stream's server state machine, the recovery planning rules, and the messages they exchange.
 /// Not API: they change with the protocol.

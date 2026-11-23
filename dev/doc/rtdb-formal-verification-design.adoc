@@ -114,7 +114,7 @@ Treat sentinel encodings as explicit conventions in the refinement map.
 
 Two snapshots of the same history may choose different admissible physical representations.
 Equivalent representations must agree on every observable read within their shared entitlement.
-For successful accelerated search, normalize the query arguments, analyzer and corpus at the same admitted basis before comparing outputs.
+Compare accelerated and exhaustive search with the same query arguments, analyzer and admitted basis.
 Correctness of cancellation and resource refusal is a separate observation from the rows of a successful result.
 
 === Abstraction and simulation relations
@@ -260,11 +260,11 @@ After interruption between physical deletion and its notice, retry converges on 
 |FTS-1
 |Accelerated MATCH yields the reference scan's qualifying rows at the same basis.
 Every narrowing decision retains every qualifying visible row.
-Required fallback preserves the predicate and score corpus when the underlying data is readable.
+Required fallback preserves the predicate and the scores computed from SQL arguments when the underlying data is readable.
 |Compare result bags and exposed temporal columns across indexed and scan-only runs, including shared files, erasures, history modes, missing files, and admission-budget fallback.
 
 |FTS-2
-|Ranked early termination preserves SQL's top results under the chosen corpus, numerical evaluation order, residual predicates, and tie rules.
+|Ranked early termination preserves SQL's top results under the two-argument scoring function, numerical evaluation order, residual predicates, and tie rules.
 |Compare top K with a fully evaluated sort for exact ties, floating-point boundaries, and multiple MATCH predicates.
 If SQL defines a total tie-break order, compare the exact ordered rows.
 Otherwise compare results using the orderings SQL permits.
@@ -656,13 +656,375 @@ A capability can carry the outcome of a decision.
 An authority or identity constraint must also preserve the outcome across any delay before effect.
 The collection study must cover trie data, trie metadata, shared artefacts, cached pathnames, checkpoint roots, table blocks, and log payloads with their own reachability rules.
 
+The versioned S3 adapter binds each removal to one immutable version in its configured namespace.
+It confirms absence with a complete fresh inventory for that key before accepting settlement.
+A redundant request can finish after settlement. Its effect is still limited to the original version.
+The retry study checks that interleaving, and the Lean model proves that exact removal preserves every other version.
+These results assume faithful exact removal and complete listing by the provider.
+The ordinary remote reaper still needs the durable authority that closes admission and orders collection across physical owners. link:../../verification/tla/ExactRetirementRetry.tla[Retirement retry model]
+
 The retained bounded study compared a validated lease and coordinated pin and exhibited age-only and stale-follower counterexamples.
 The first native cursor-and-collection diagnostic timed out waiting for a scheduled event.
 A later native diagnostic with an explicitly invoked eligible collector reproduced a missing required object in an open cursor.
 Rust now registers live query and transaction catalogs with their partition owner.
 The trie collector snapshots that registry with the current state and excludes dependencies of all retained reader catalogs.
 I/O regions keep those references through provider completion, and an in-progress collection prevents a compactor reset from reopening its key allocation.
-Runtime coordination across separate partition owners, recovery holds, and failover remains open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:gc.allium[Trie collection contract]
+Readers on other nodes hold a validated bounded lease, the alternative the bounded study admitted without a coordination channel from readers to the collector.
+A node anchors the lease at a monotonic clock reading taken before it reads the replica tip, once its catalog has applied that tip, and every provider request checks the deadline when it is admitted.
+The collector waits a whole lease on its own monotonic clock after first observing a trie as eligible.
+Both sides measure elapsed time, so the argument needs a bound on clock rate drift over one lease rather than synchronized clocks.
+Verus checks that a request the lease admits finishes before any such deletion, given that drift bound and a request-duration bound.
+Objects are immutable, so a request that overruns the duration bound can only fail, and it reports the expired lease.
+A native replay shows a follower cursor keeping its files within its lease and refused with a typed error after it.
+In Multi, the collector's deletion records a release that the cell reaper erases only after its grace, so the lease wait precedes it.
+Recovery holds across authorities remain open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:../../verification/verus/read_lease/laws.rs[Lease law] · link:gc.allium[Trie collection contract]
+
+=== Fork publication while the source is being collected
+
+A fork becomes available when the directory publishes the child.
+At that boundary the child must have a complete, readable checkpoint and the committed tail selected for the fork.
+A refused preparation may clean up its private state once it knows that publication did not take effect.
+An ambiguous publication must preserve that state until its outcome is known.
+
+The copy policy publishes an independent checkpoint only after all required children of its root are durable in the destination's physical residence.
+The directory still checks that the source may authorize the fork.
+Source data read before publication can become unavailable, in which case an incomplete copy yields a refusal.
+Once a complete copy is published, its liveness depends on its own data and provider authority.
+Tail durability, byte-level equivalence and the independent key under which a cross-organisation copy is sealed have separate evidence obligations.
+
+A shared-reference policy uses a common authority to make fork publication and reaper deletion authorization mutually consistent.
+A reaper snapshots the published referrers and validates that inventory at authorization.
+After authorization a new fork cannot depend on a location that the existing operation can remove.
+Before removal the reaper must copy the object into every referrer admitted by the authority and wait for completion.
+This can be implemented with a lineage-scoped fence, because a child's manifest can name an ancestor as the physical owner.
+
+Shared fork publication now advances a cell-local lineage revision in the directory transaction that creates the deployment and its name.
+That revision also advances when a fork of a fork inherits physical references from its ancestors.
+An independent copy or a refused publication preserves the revision.
+The bounded model rejects authorization of a scan overtaken by a descendant publication, and the Lean model proves that an unchanged revision preserves the reference inventory over a finite publication history.
+This evidence covers the publication mechanism. The reaper still needs to compare the revision in its authorization transaction and preserve the resulting obligations through settlement. link:../../verification/tla/SharedReferenceRevision.tla[Shared reference revision model]
+
+After a fork initializes its manifest, concurrent reaper edits can only withdraw the selected name-owner pairs.
+Each attempt reads a confirmed head, edits that snapshot at its immediate successor, and verifies the current head before acknowledging the withdrawal.
+A fresh read also verifies its head after fetching the manifest body, since a delayed write can repopulate a pruned slot.
+The reaper withdraws a shadowed fallback before removing the local copy and keeps its release evidence through a failed removal.
+The local replay checks the live reaper path. Readers retaining an older manifest and cross-owner provider effects still need the coordinated admission and settlement contract. link:../../verification/tla/MonotoneReferenceManifest.tla[Manifest withdrawal model]
+
+The Rust reference reaper scans the deployment inventory before reaching the provider delete.
+The existing local maintenance lock serializes local fork preparation with that sweep.
+On S3 the local lock helper returns without acquiring a distributed fence.
+A source revision check at child publication alone does not establish that a later provider deletion used a complete inventory.
+The shared-reference model therefore states the additional authorization premise explicitly.
+Its counterexamples concern the model, with hosted integration and provider-level evidence still open.
+
+The finite comparison models a root and one payload.
+Both policies admit a child that stays readable after source collection.
+Both allow refusal when collection removes inputs before the fork can establish its dependency contract. link:../../verification/tla/ForkPublication.tla[Fork publication model]
+
+=== Cross-node retention of serving snapshots
+
+The local partition can capture a query catalog consistently with its own collection decisions.
+A Multi deployment also has independent partition owners and a cell reaper that lists durable garbage records outside the directory transaction.
+The existing record carries an object key and a wall-clock release time.
+For this study its role is to submit an object for collection.
+The additional value needed by a reader-aware reaper is a certified retirement cut in the same order used for authoritative catalog admission.
+
+A catalog cut is distinct from the user's bitemporal query basis.
+Two equivalent physical catalogs can expose the same rows while carrying different object dependencies.
+Treat a cut as a residence-scoped catalog revision with a monotone order.
+Before choosing an encoding, demonstrate that every publication affecting a dependency changes the revision, including an accepted compaction result or artefact update that preserves the query basis.
+Checkpoint block numbers and wall-clock time alone do not provide that refinement.
+
+The common protocol has four decisions.
+
+. The directory admits and records a hold for the current catalog cut in one versioned update.
+  A reader with a different local cut must catch up or follow the product's refusal contract before opening storage.
+. Retirement certifies that the immutable object identity is absent from the named cut and from every later admissible cut.
+  The producer must distinguish the final retirement of the identity from the removal of one of several references.
+. A reaper captures a head and the outstanding reader obligations in one directory observation.
+  It compares release certificates against that captured observation, including releases discovered during a later listing.
+. The effect targets the exact physical identity authorized for removal.
+  Close or cancellation may stop new reads before already admitted provider operations are drained.
+
+Two candidates make the same safety decisions with different information.
+
+[cols="1,2,2",options="header"]
+|===
+|Policy |Delete admissibility from one sweep |Runtime cost to establish
+
+|Generation cutoff
+|The retirement cut is at or below the head and every outstanding reader cut.
+|Store one cut per hold and compute their minimum.
+An older reader can delay collection of objects it never referenced.
+
+|Exact dependencies
+|The retirement cut is at or below the captured head and no outstanding reader depends on the object.
+|Use immutable, complete dependency sets or a sound membership index.
+Inventory construction and retention must cover shared artefacts and all storage reads that outlive local cursor closure.
+|===
+
+The retirement cut in the exact policy still matters.
+An object may first become reachable after the captured sweep and be retired before the reaper lists its release.
+It is then absent from that sweep's inventory even though a reader subsequently admitted at the intermediate cut still needs it.
+The captured head must cover the certificate before that sweep can authorize deletion.
+
+TLC checks both policies with the same histories, two readers, three catalog cuts and four objects.
+Lean proves that either policy excludes every possible dependency at the time of the delete under the retained-catalog premise and the retirement certificate.
+It proves that exact tracking admits every deletion permitted by the generation cutoff, and gives an example where it permits more.
+These results concern candidate protocols in one residence.
+For production, identify the authoritative cut and receipt producers, connect storage admission and I/O draining for all query paths, and verify the garbage adapter and physical delete's identity.
+Exact historical admission, recovery dependencies, mixed-version deployments, and forks that share physical files require composition with their respective authorities. link:../../verification/tla/ResidenceReaderRetention.tla[Comparable model] · link:../../verification/lean/ResidenceReaderRetention.lean[General safety and comparison laws]
+
+=== The catalog cut used at reader admission
+
+The admitted cut must be a lower bound on the physical effects installed in the exact catalog captured by the reader.
+Store that relationship in the same immutable partition value as the catalog, or derive it from a witness that the partition publishes with that value.
+Signing a higher cut can admit a snapshot that still depends on an object the cell may collect.
+
+Replica delivery and application are separate in the Rust driver.
+The driver can retain admitted records while resolution is in flight or while a block awaits its matching upload.
+It can advance its transport position with those records still pending application.
+The status watch also publishes independently of query catalog capture, so a later status read can describe a different catalog from the one the query holds.
+The transaction head is a logical observation and a physical catalog publication can change dependencies while leaving that head unchanged.
+
+TLC compares those three observations with an atomic capture of the installed catalog and its revision.
+Using the received position, reading the installed position after capture, or reusing the transaction basis each admits a view with a dependency still needed at an older cut.
+The model's successful variant refuses the stale capture and admits a replacement after collection.
+That result assumes a monotone retirement floor certified at publication by the collector's authority.
+The Rust partition stores the storage version, storage epoch, journal epoch and conservative installed position beside the trie catalog.
+Captures with a cached live index use the cut of the same partition value that supplies their physical catalog.
+Ordinary startup seeds the cut at the empty journal prefix or a checkpoint boundary in the opened journal epoch, after the driver opens the replay tail.
+After a record or a completed resolution, the driver advances the cut only when the pending block and deferred application queues have drained.
+An unrecognized replica body freezes the last cut.
+Exact and restored startup, or an ordinary checkpoint without a matching journal boundary, leave the cut unavailable.
+A direct compactor reset suspends cuts for the open partition.
+The hosted Rust store registers a held capture against the open storage owner, physical residence and journal epoch in one versioned directory update.
+A capture without a cut registers an opaque dependency.
+The capture and its admitted provider operations share the lifetime of the registration.
+Owner teardown can discard the registration once storage has drained or process death is established.
+The reaper still needs a certified retirement cut and a directory floor before it can use these reader records.
+
+The bounded-lease path observes installed replica progress before taking a new snapshot.
+A system-role membership query takes its lease from the primary database whose snapshot it captures.
+It uses a separate status field that advances when deferred effects have applied.
+An unrecognized record freezes this progress even if the replica keeps receiving records.
+The cut embedded in a snapshot remains the authority for the exact captured catalog, including captures taken before the watch advanced. link:../../verification/tla/CatalogCutPublication.tla[Capture and publication model] · link:../../rust/crates/replication/src/driver.rs[Driver transitions] · link:../../rust/crates/multi/src/catalog_readers.rs[Hosted reader registration]
+
+=== Publication of retirement certificates
+
+A request to retire an object and an installed catalog that excludes it are distinct states.
+The certificate must follow installation of the final exclusion.
+Publishing the certificate advances the admission floor for that residence and journal in the same directory change.
+Readers already registered below that floor keep their holds until they drain.
+An opaque reader registered before the floor advances blocks generation-based authorization until it drains.
+After the floor advances, serving an opaque capture requires a separate retention authority.
+
+The bounded retirement-publication model checks one reader, three cuts and two physical incarnations of the same logical key.
+It separates the request, catalog installation, durable certificate, authorization and deletion.
+Its controls check premature certification, missing admission fencing and deletion by logical key.
+A successful sequence retires and erases the first incarnation and publishes a readable second incarnation.
+The model allows a provider to retry an already authorized deletion.
+Production must therefore either prevent key reuse in the certified namespace or support deletion conditional on the authorized physical identity.
+
+The hosted trie collector now queues releases after recording the installed removal receipt and observing an admission floor that covers it.
+The immutable file plan remains pending across a crash or partially successful release.
+Its replay queues derived artefacts, then data, then metadata, with the same release budget as ordinary collection.
+The reaper still uses timed garbage records.
+The complete production certificate must cover recovery roots and fork references, and the storage provider must consume the exact authorized identity. link:../../verification/tla/HostedTrieRelease.tla[Hosted release handoff model]
+Crash detection, provider copy and pack sharing remain separate implementation obligations. link:../../verification/tla/RetirementPublication.tla[Retirement publication model] · link:../../rust/crates/maintenance/src/gc.rs[Trie collection]
+
+The production certificate must bind the installation, storage namespace, root, journal epoch, terminal catalog cut and immutable physical identity.
+A content digest attests to bytes and can repeat across separate publications.
+A provider version must identify one publication, or publication must allocate an object name that the namespace cannot reuse.
+An adapter that lacks either capability cannot execute a certified deletion.
+
+Keep retirement intent durable before recording the catalog transition so a replacement writer can resume both before and after installation.
+The installed prefix proves which transition took effect.
+The post-transition catalog must exclude the same immutable identity, including every member reference to a shared artefact.
+The native collector now stages content-addressed intent metadata for each trie batch before its file releases and replica submission when it has an installed catalog cut.
+The metadata is scoped to the opened storage root and replica journal, separate from checkpoint packing and fork inheritance.
+After a writer stops, a successor can re-confirm a pending intent whose trie keys are absent from the installed catalog and checkpoint.
+If a key still appears, ordinary collection reevaluates its eligibility.
+An unreadable or invalid pending record stops that collection pass and is reported for retry on a later pass.
+The successor releases a hosted intent marker after the durable receipt and floor cover the removal and every planned file release succeeds.
+Hosted roots wait for a tracked catalog cut before selecting a retirement.
+Classic roots retain the file-first collection path.
+The intent digest binds the selection, trie keys, and recorded file plan.
+A shared artefact is recorded with the last batch retiring members of its group.
+For loose S3 objects owned by the serving residence, the collector observes the current provider version by issuing a HEAD through the store chain before recording the intent.
+Each observation carries the namespace, encoded physical key and exact version identifier.
+A missing object or header, an empty or `null` version, and an inherited, packed or archive-backed entry yield no version evidence.
+Historical intents remain readable with an empty file plan.
+A provider observation identifies one object version at observation time.
+For new hosted compaction outputs, the catalog now preserves the version returned by the immutable put that published each data or metadata file.
+An idempotent retry takes the version from the same provider response that returned the matching bytes.
+An uncertain multipart completion takes the version only from a provider response bearing that exact attempt's witness.
+The retirement journal records a publication match only for an observed version equal to the selected catalog's recorded version.
+The search builder preserves the exact provider version when its upload supplies one.
+A group artefact binds only if there is a retained catalog record for it and every retained record naming the same group file carries the observed identity.
+The Lean group law checks agreement for arbitrary lists of held records. link:../../verification/lean/GroupPublication.lean[Group publication proof]
+An inherited or packed file, a historical catalog without recorded versions, or a replacement at the same key carries no publication match.
+The publication model compares these bindings with separate HEAD requests and key-only retirement observations. link:../../verification/tla/PublicationVersion.tla[Publication version model]
+Certification still needs to exclude every relevant recovery and fork reference, including group membership, and authorize the exact provider effect.
+The Lean identity model checks that an accepted observation names the selected physical identity and that an exact erase preserves every other publication.
+A replacement can have the same logical key and content digest, and two provider namespaces can have the same local key and version.
+The model also checks the alternative of names qualified by epoch and input digest.
+The native trie catalog uses an epoch-qualified physical name after compactor reset.
+It admits replica compaction notices in the current naming epoch, adopts a changed epoch together with its persisted checkpoint catalog, and uses full trie identity to remove garbage.
+Those checks assume correct encoding and a provider that enforces immutable publication and erasure by exact identity. link:../../verification/lean/RetirementIdentity.lean[Physical identity model]
+The native driver now defers the trie-removal reply until the installed prefix covers its read-back position.
+It checks the requested trie keys against the current catalog and the installed checkpoint in one immutable partition value before returning a position.
+An unrecognized prefix or a removal skipped under the recovery cutoff cannot produce the reply.
+This reply is evidence of logical exclusion for the requested trie keys.
+The retirement protocol still needs to connect publication identities to the catalog and install the certificate and admission floor together. link:../../verification/verus/trie_removal_receipt/area.json[Native receipt proof and mutation controls] · link:../../verification/verus/trie_retirement_intent/area.json[Intent receipt proof and controls]
+Multi already coordinates its reader registrations with a monotone admission floor on the same directory version.
+The current writer proposes the installed cut from a durable receipt.
+Every older or opaque registration in that root and journal blocks the advance.
+If the floor cannot yet advance, the pending marker remains available so the next collector can retry from the receipt without re-submitting the removal.
+The floor persists through leader replacement and DynamoDB parking.
+A new capture that precedes the floor, or lacks a cut after a floor exists, fails with a retryable `rtdb.node/catalog-not-current`.
+A new read at the floor is admissible.
+These rules constrain reader admission while serving object erasure continues to use timed releases.
+Publishing the deletion certificate and its admission floor belongs in one directory CAS for that residence.
+The effect can be retried against the same certified identity after loss of a provider reply.
+A checkpoint can retain the intent or its completion through a journal trim only when the new recovery anchor supplies the same evidence.
+
+Recovery, inspection and fork readers also supply retention obligations.
+A currently installed serving catalog can exclude an object that a still-admissible checkpoint needs before replay.
+Retiring a packed entry must account for the other entries and for manifests that name the pack.
+An exact recovery or a shared-reference fork must establish its objects under its own authority before the source may remove them.
+The composed residence model checks one checkpoint, one recovery cursor, one fork, one serving reader, and one provider request that can outlive its reader.
+Its three generations retain a shared file through an intermediate catalog and distinguish two physical incarnations of one logical key.
+It checks that an accepted intent survives until certification even when the writer crashes after installation.
+A reachable execution collects the older objects while the replacement stays readable.
+Crash releases the local holds only in the model transition that establishes their work has stopped.
+Pack views, independent residences, and runtime traces at the directory and provider boundaries remain open. link:../../verification/tla/ResidenceRetirement.tla[Composed residence retirement model] · link:structural-redesign.adoc#mechanisms[Residence ledger contract]
+
+A migration activates certified collection only where every serving owner enforces the same admission floor.
+The collector retains uncertified releases in that namespace until they can be matched to authoritative retirement evidence.
+A mixed-version owner that cannot register its captured cut needs a separate hold before any deletion can proceed.
+The runtime replay must cover restart before and after publication, a reader that keeps provider work after cancellation, a fork using physical objects from the old residence, and a new incarnation after a delayed delete.
+
+
+=== Hosted key custody
+
+The vault installs one current key per deployment, checkpoint or stage identity.
+A serving residence opens with its existing key.
+A missing key can be enrolled only by the current writer of an original residence with no durable evidence of earlier storage or journal use.
+The writer checks the directory again after observing the missing key.
+Journal reservation precedes durable journal writes, so a writer arriving after that reservation cannot create a replacement key.
+A conditional creation may succeed only while the object is absent.
+Withdrawal replaces the current value with a tombstone conditional on the observed state.
+The vault confirms withdrawal from the tombstone and requires the bucket to have never enabled versioning.
+Key creation and withdrawal may race, and a conditional conflict does not establish the outcome.
+
+The bounded S3 key model checks one provider object, two possible key values, and a withdrawal that can race with provisioning.
+Its invariants require an acknowledged withdrawal to leave a terminal tombstone and no historical key in the vault.
+TLC reaches an acknowledged withdrawal of an installed key.
+Its controls allow success on a conflict, allow provisioning after a tombstone, or allow historical versions.
+The provider supplies conditional writes and a fresh read of the current object.
+The bucket's administrative policy preserves the no-versioning and tombstone premises.
+Deployment-wide erasure also depends on drainage, inventory, and withdrawal of all independent key copies. link:../../verification/tla/S3KeyCustody.tla[Key custody model]
+
+=== Delegated scans keep the coordinator's captured view
+
+A delegated prefix scan is an optimization of a query the coordinator already admitted.
+The worker must answer from a capture of the same transaction head, including the system timestamp, within the same database history.
+It checks the snapshot it actually captured after any catch-up wait.
+The coordinator evaluates the fragment against its own held snapshot if the worker cannot supply that capture.
+The request carries the storage namespace and deployment prefix from the coordinator's opened store, plus the epoch of its opened replica journal.
+The router consults the directory to place this capture and falls back if the directory now names a different residence or epoch.
+A worker validates the same receipt against the opened database handle it will query, independently of the routing observation.
+The scoped wire operation has its own tag so a worker without the scope check refuses the request and the coordinator can fall back.
+The namespace and journal epochs identify their storage histories under the directory and storage-provider identity contracts.
+A scan with private transaction overlays uses local execution.
+
+An earlier upper bound on system time does not recreate an earlier admission horizon.
+A worker with a later ERASE can return an empty answer where the coordinator's earlier capture still has a row.
+The fragment protocol distinguishes a refusal from a successful empty result so the coordinator can fall back.
+
+The delegated evaluator owns its query context across the whole fragment.
+The provider admission inherits this context, including its captured snapshot, until the read completes and any undelivered result is dropped.
+Local collection therefore accounts for a delegated snapshot even when the executor's caller has cancelled.
+Physical collection by other nodes still needs the shared residence authority described above.
+
+Lean proves that delegation plus local fallback preserves the reference point observation for a common committed history.
+TLC checks the timing between catching up, capturing, cancelling and draining.
+Native replays exercise the actual coordinator fallback and a cancelled read at the delegated storage boundary.
+A separate finite model checks scope identity while placement and worker opening change independently. link:../../verification/lean/DelegatedScan.lean[Observation laws] · link:../../verification/tla/DelegatedScan.tla[Interleaving model]
+
+=== Multi replica recovery holds
+
+An ordinary recovery selects a checkpoint in one physical residence and opens a cursor on that residence's replica stream.
+The directory's certified replica prefix advances before a physical trim request can remove records.
+Recovery can refresh to a strictly newer checkpoint if the authorized prefix already covers its first required record.
+A nonempty catch-up window requires a recovery hold before the provider cursor opens.
+
+The serving log registers each hold by a fresh identity on the same versioned deployment record that owns the certified prefix.
+The CAS serializes registering the first required offset and authorizing a conflicting trim.
+The hold is admitted only for the record's residence and log epoch, so a writer handoff leaves protection in place and a transferred record clears source custody.
+The holder caps its certified trim at both the published checkpoint and the earliest required replica record.
+The storage-region inventory makes retirement wait for outstanding holds.
+
+For an ambiguous registration, the closing operation needs a successful CAS even when the hold is absent in the latest observation.
+A delayed request issued against the old version then fails its precondition.
+Cancellation closes new admissions and preserves the hold until prior reads are drained.
+Confirmed owner death can substitute for a drain if the witness identifies the exact owner and recovery can no longer consume that owner's results.
+A local lock and a hosted task's recorded stop each need source and adapter evidence establishing that premise.
+Directory revision monotonicity, unique hold IDs, and writer fencing are explicit assumptions of the close model.
+
+The protected interval ends at the committed tip observed when recovery prepares to open the cursor.
+The cursor releases its hold after it has delivered the record at that tip or when it is dropped after its pending read is dropped.
+The live subscription then follows the ordinary live-tail contract.
+A task tracker joins the acquisition and release worker so a cancelled opener cannot abandon its own in-flight directory request.
+The local reaper checks the precise file lock, and the hosted reaper checks the registered task's confirmed stop record.
+Checkpoint object reclamation, ensemble movement, cell moves, and remote stop confirmation each need separate refinement evidence.
+All deployed versions permitted to authorize trims must use the same hold contract before it can protect a recovery.
+
+The bounded model distinguishes a delayed CAS, locally observed cancellation, drained I/O, confirmed owner death, and completed physical trim.
+Lean proves that closing one modeled hold leaves the others alone and that the resulting monotone revision fences older requests.
+The local cell regression pauses a real subscriber after registration, publishes a newer checkpoint, verifies that the physical trim retains the required record, and observes the subscriber's SQL state and trim progress after release. link:../../verification/tla/ReplicaHoldLifecycle.tla[Hold lifecycle] · link:../../verification/lean/ReplicaHoldClose.lean[Close and fencing laws]
+
+=== Hosted catalog reader batches
+
+The serving store serializes catalog reader mutations for its own storage region and batches operations that are already queued.
+It commits releases separately from admissions, so an admission that would grow the record cannot block a batch of releases.
+Every admitted reader still has a distinct directory identity and registered cut.
+Each batch checks the current residence, storage owner, and catalog admission floor before its directory CAS.
+A conflict retries against the returned current record.
+An ambiguous release still issues a CAS when the reader is absent, fencing a delayed admission against the older version.
+The reader remains held until its retained I/O drains.
+The batch is an optimization of the existing authority order and leaves the provider reclamation rules unchanged.
+
+=== Multi startup checkpoint metadata
+
+A packed store derives its discovery hint and startup metadata hold from the same successful storage admission CAS.
+The startup can then read root catalogs, their per-table block catalogs, and block-pack indices at or above that admitted block.
+If no block has been published, the hold begins at block zero.
+A frozen snapshot request is accepted at the directory's current checkpoint.
+If that checkpoint changes before admission, the node can retry the request at a strictly newer one.
+Ordinary startup can discover a later root and may refresh its listing, keeping the stored lower bound.
+
+A reaper plan may authorize released metadata only below the published block and every open metadata hold.
+A new hold begins at the observed published block or higher, so it cannot overlap metadata an earlier plan authorized when publication only moves forward within the residence.
+This applies to the checkpoint metadata objects in loose storage, named block packs, and spill packs.
+In the packed case, the pack remains if any of its entries has an outstanding metadata obligation.
+Completion still requires the usual release records, grace and reference handling for ordinary collection.
+
+The storage factory carries the startup hold through the opening reads and transfers it to the node.
+The node keeps it through checkpoint selection, metadata reads, and any ordinary recovery retry while assembling the database.
+Its I/O region propagates the hold into admitted provider and cache operations when the calling future is cancelled.
+Dropping the final reference clears the metadata field independently of the broader serving region.
+A crashed reader's metadata hold belongs to the serving region that the reaper reconciles after definitive evidence of owner loss.
+The protocol assumes every active reader and reaper uses the same metadata-hold rules.
+It also assumes monotone publication within an immutable physical residence and no resurrection of a released metadata identity.
+
+Lean proves that an authorized metadata deletion remains safe through subsequent admissions, forward publication, and hold releases, including when the actual provider deletion starts later.
+TLC checks independent authorization and deletion with overlapping readers.
+Verus checks the native comparison against both bounds.
+The native adapter replay exercises packed and loose metadata while a provider read outlives its cancelled caller.
+The protection is for startup metadata in one Multi residence.
+Serving trie pages, artefacts, shared lineage inventories, and the complete snapshot lifetime need their own refinement against the reaper and compaction transitions. link:../../verification/tla/CheckpointMetadataRetention.tla[Metadata retention model] · link:../../verification/lean/CheckpointMetadataRetention.lean[Interleaving proof]
 
 == Production boundary and responsibilities
 
@@ -734,7 +1096,7 @@ Prove identity-specific finalization if extracted and replay paused old loads wi
 |The builder and candidate decisions operate on derived evidence.
 The scan owns resolved row visibility and residual evaluation.
 |Audit group member selection, artefact version and fallback, row origins, page eligibility, score corpus and ranked candidate admission.
-Ensure each path to early termination consumes the same score and tie conditions. link:../../rust/crates/search/src/file.rs[Search file] · link:../../rust/crates/query/src/scan.rs[Scan] · link:fts.allium[Search contracts]
+Ensure each path to early termination uses the same document-local formula and tie conditions. link:../../rust/crates/search/src/file.rs[Search file] · link:../../rust/crates/query/src/scan.rs[Scan] · link:fts.allium[Search contracts]
 |===
 
 For each effect, record the production entry point, the checked decision, and what keeps the decision valid until the effect.
@@ -1047,6 +1409,34 @@ Compiler controls reject forging and raw use of the replica admission witness.
 Each of the two new storage and compaction areas includes production-only and joint contract mutations.
 |Extend coverage from these functions to their effect paths, concurrent publication, reader protection, and ranked pipeline decisions.
 
+|Reader lease and collector turnover
+|Verus checks the interval arithmetic against clock drift and bounded I/O.
+TLC checks that two collector terms with independent clock origins preserve admitted I/O and eventually collect once the successor's lease has elapsed, under weak fairness of collection.
+The native fixture replaces one collector with another sharing the catalog and observes both trie files retained before expiry and reclaimed at expiry.
+link:../../verification/results/2026-11-23.adoc[Collector turnover evidence]
+|Exercise a scheduled term handoff through the node with in-flight readers, establish the provider drain premise and cover staged and deferred releases.
+
+|Hosted catalog admission
+|The same directory CAS coordinates reader registration and an installed retirement floor.
+TLC explores stale reads and writes, opaque captures and writer replacement.
+Apalache cross-checks the bounded safety property and the stale floor write control.
+Lean proves preservation for arbitrary lists of readers over serialized ledger transitions.
+Verus checks the exact cutoff decision.
+|Bind the floor and exact physical grant at one linearization point, bring recovery roots under the same authority and emit refinement traces.
+
+|Hosted trie release handoff
+|The collector queues the staged files only after the installed receipt and admission floor cover the same catalog cut.
+TLC and Apalache check the handoff with an older reader and an interrupted release.
+Lean proves release authority, retention of unfinished plans and complete file accounting for arbitrary plans and finite model histories.
+|Carry one exact grant from the residence ledger to the physical reaper and cover recovery roots and fork references.
+
+|Physical retirement identity
+|The trie retirement intent and installed receipt preserve the observed logical file plan and exact version metadata where the serving store can supply it.
+Verus checks the shipped S3 version classifier, with production-only and joint contract mutations.
+A loopback S3 HEAD fixture checks provider key encoding and refusal of missing, empty and replaceable version IDs.
+Lean checks identity matching, exact erase and qualified names, with four controls against weaker operations.
+|Extend version binding to other storage representations and artefact retirement outside trie collection, and require a directory-installed certificate before a provider erase.
+
 |Concurrent design models
 |TLC covers bounded writer admission, query capture, resolution, recovery, cache, reader I/O, and compaction publication variants.
 The ledger gives per-model state counts and scopes, plus bounded Apalache, Alloy, and Maude results.
@@ -1059,6 +1449,8 @@ Verus checks that the production cutoff requires strict dominance of both the sc
 Lean proves that complete term-window summaries preserve all conjunctive matches.
 It also proves that retaining every local score tie preserves the global result, including the page after an offset.
 Verus checks production posting assignment, scan range and impact accumulation.
+Lean proves that cumulative member offsets locate the reference owner of each in-range document.
+Verus checks the Rust binary search used by the shared-file reader, including equal starts for empty members.
 The native score witness passes and the unpadded mutation fails.
 |Prove that the planner, visibility verification, and index supply a complete frontier for every qualifying row, and that each supplied maximum covers its whole source.
 Relate the native postings iterator and persisted sidecar to the modeled complete term-window summaries.
@@ -1068,9 +1460,59 @@ Relate the native postings iterator and persisted sidecar to the modeled complet
 A durable-node test verifies current and system-history SQL results before, during and after tiered publication, then recovers the partial checkpoint and replays the last notice.
 Production discovery now advances to a newer advertised root when collection removes the selected root or a table block during startup.
 Native runs verify both cases using the block collector, and Verus checks the strict progress decision.
-An observed replica prefix gap also triggers strictly newer checkpoint discovery before installing the state.
-Verus checks the exact first-required-offset rule. The native memory-provider run selects a later checkpoint and replays its retained suffix.
-A separate model distinguishes observation from retention through tail opening.
+For providers that support recovery cursor admission, the database admits the cursor before installing an ordinary checkpoint.
+A trimmed first required offset triggers strictly newer checkpoint discovery.
+The replication driver uses that same cursor after checking the log and checkpoint boundary.
+Ordinary hosted discovery validates the block and journal boundary captured in the directory admission.
+A retry following prefix collection checks the successor against the last accepted checkpoint.
+Verus checks the coordinate decision. Lean proves preservation across successive replacements, and native replays exercise refusal and successful recovery.
+New Rust roots commit to every table block by OID and SHA-256 of its stored bytes.
+The Rust loader checks those bindings before decoding. Lean proves preservation of metadata-derived dependencies under the digest premise.
+For packed Multi checkpoints, a fresh presence check reaches the containing storage object.
+The writer checks the recovered current checkpoint before submitting its confirmation.
+Verus verifies checked pack extents. The bounded model distinguishes evidence at the probe from a hold that keeps the pack through submission.
+For versioned S3 packs the packing adapter uses the provider identity from the same response as each observation.
+A cached index is scoped to that publication, and opening a relocated fork copy checks its own index.
+Lean proves preservation over finite observation schedules. TLC and Apalache check the bounded failure and copy transitions.
+New hosted directory checkpoints bind the exact adopted catalog bytes by SHA-256.
+Cold startup uses the admitted receipt for its root selection and validates a fresh read before loading table blocks.
+The same startup registration protects the catalog metadata and first required replica offset until the prepared cursor takes over.
+Lean checks preservation through finite schedules under the abstract effect guards, and the bounded model checks the joint admission and handoff.
+Verus checks the exact first-required-offset rule.
+New hosted archives and independent forks derive a replay inventory from the root's checked table metadata.
+It includes data and metadata for usable tries and retained level-zero replay inputs, plus the artefacts recorded by usable members.
+A shared artefact appears once under its group key.
+A copy checks the metadata again against the bytes used for discovery and publishes only after copying the required files.
+Archive receipts and staged inventories carry the scope used to derive them. Existing receipts preserve their original primary scope.
+Lean checks inventory membership over arbitrary finite catalogues. TLC and Apalache cover copy ordering, replaced metadata and source availability in the bounded model.
+The running-system cases check archive and independent-fork copies with retained level-zero files and a shared group artefact.
+Archive registration admits its source metadata hold with the selected checkpoint and keeps that hold through provider drain.
+A retry can inherit continuous protection for an older checkpoint or verify an already completed archive in its own storage.
+Verus checks admission at the current checkpoint and overlap with a predecessor's metadata floor.
+Lean proves safety for arbitrary finite histories of metadata authorization, handoff and collection, under monotone publication.
+The source-handoff model compares whole-residence and exact physical holds, including an inherited pack, cancellation with a read pending, and a durable destination.
+Both designs preserve the bounded safety invariant. The exact design admits collection of unrelated data while a copy is active.
+Lean proves source retention during an admitted read for arbitrary finite schedules over exact dependency sets.
+That result assumes the published dependency mapping is complete and collection authorization has a single order with admission.
+Archive and independent-fork copies now plan the exact logical member and the physical publication behind it when the provider exposes one.
+Packed members carry their containing pack's identity. A repair-backed member carries the identity of its accepted archive ciphertext.
+The exact read checks the body response against the planned namespace, physical key and version token, and separately checks the logical length and any bound metadata digest.
+The archive preflights its sealed byte budget before copying the body inventory.
+Verus checks the production debit step for every representable size, and Lean checks its composition over arbitrary lists of costs.
+TLC and Apalache check a changed physical source, including equal version tokens under different paths.
+Native selections use a read through the real storage layers and a loopback S3 response.
+A second bounded model compares a single atomic admission with separate acquisition from two physical owners.
+Both preserve the source obligation when reading requires every owner's hold, local admission accounts for earlier removal authorizations, and cancellation waits for provider drain.
+The separate acquisition model also reaches cleanup after a partial refusal.
+A repair-backed capture now retains the existing repair and the new destination in its storage region.
+Serving-store open and source-side transfer use the same repair read guard.
+Archive retirement considers both dependencies, and an admitted local copy retains the maintenance witness until its I/O finishes.
+Lean checks archive custody through arbitrary finite schedules.
+Verus checks exact archive membership and the closed-region read guard in production.
+The retirement-settlement model distinguishes a delayed provider effect from the lifetime of its submitting task.
+An exact-version removal can overlap admission of a different version, while a path-based removal needs exclusion of that path's replacement until settlement.
+The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
+TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
 mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.
 AutoHyper checks that startup with one transient collection interruption agrees with direct startup on the eventually admitted block when both observe the same stable replacement.
 TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.
@@ -1079,7 +1521,7 @@ The native trie collector protects live and nascent trie files from the latest i
 The reference comes from the persisted table blocks, and it changes atomically with local block adoption.
 Verus checks the selection decision independently of whether a query reader exists.
 TLC and Apalache check the installed-checkpoint rule separately from the current catalog, including nascent trie dependencies and delayed deletion.
-|Extend protection across checkpoint discovery, replacement, and multiple authorities.
+|Bind the admitted root to its provider identity and its exact trie and artefact publications, then extend protection across multiple authorities.
 Protect the required log suffix through replay and account for deletion entry points outside trie collection.
 Establish supported remote configurations and any eventual retry and staging cleanup guarantees.
 

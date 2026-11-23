@@ -29,7 +29,7 @@ async fn declared_set_pairs_reject_empty_lists_and_unselected_branches() {
     let empty = Expr::Parameter { index: 0,data_type: L::list(set_type()) };
     let expression = Expr::binary(B::Eq,empty.clone(),empty);
     let arguments = [V::list(vec![])];
-    let context = EvalContext { parameters: &arguments,..Default::default() };
+    let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&arguments),..Default::default() };
     assert!(CompiledExpr::compile(&expression,&Schema::default()).is_err());
     assert_eq!(evaluate(&expression,&Schema::default(),&[],&context).unwrap_err().code,"xtdb.expression/set-equality");
     assert!(evaluate_async(&expression,&Schema::default(),&[],&context).await.is_err());
@@ -37,7 +37,7 @@ async fn declared_set_pairs_reject_empty_lists_and_unselected_branches() {
     assert!(evaluate_async(&hidden,&Schema::default(),&[],&context).await.is_err());
     let union = set_type().join(&L::Scalar(S::I64));
     let expression = Expr::binary(B::Eq,Expr::Parameter { index: 0,data_type: union.clone() },Expr::Parameter { index: 0,data_type: union });
-    assert!(evaluate(&expression,&Schema::default(),&[],&EvalContext { parameters: &[V::I64(1)],..Default::default() }).is_err());
+    assert!(evaluate(&expression,&Schema::default(),&[],&EvalContext { parameters: rtdb_expr::Parameters::Values(&[V::I64(1)]),..Default::default() }).is_err());
 }
 
 #[tokio::test]

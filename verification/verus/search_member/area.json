@@ -1,0 +1,54 @@
+{
+  "summary": "A shared search document belongs to the last member that starts at or before its ordinal.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "exclude_the_starting_ordinal": {
+      "defect": "An exact boundary goes to a preceding member.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/member_bounds.rs",
+          "find": "        if starts[middle].doc <= doc {",
+          "replace": "        if starts[middle].doc < doc {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/search/src/member_bounds.rs",
+          "function": "document_member",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "select_first_member_with_weakened_contract": {
+      "defect": "The lookup and its contract accept an earlier eligible boundary even when another member owns the document.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/member_bounds.rs",
+          "find": "    let mut lower = 1;",
+          "replace": "    if starts[0].doc <= doc { return 0; }\n    let mut lower = 1;"
+        },
+        {
+          "file": "rust/crates/search/src/member_bounds.rs",
+          "find": "        forall |i: int| (owner as int) < i < starts@.len() ==> (#[trigger] starts@[i]).doc > doc,\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/search_member/laws.rs",
+          "function": "document_uses_the_member_covering_its_offset",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

@@ -85,6 +85,17 @@ impl GrantedAccess {
     }
 }
 
+impl AuthConfig {
+    pub fn uses_remote_address(&self) -> bool {
+        let rules = match self {
+            Self::SingleRootUser { .. } => return false,
+            Self::UserList { rules, .. } => rules,
+            Self::OpenIdConnect(config) => &config.rules,
+        };
+        rules.iter().any(|rule| rule.remote_address.is_some())
+    }
+}
+
 impl Default for AuthConfig {
     fn default() -> Self { Self::SingleRootUser { password: std::env::var("XTDB_PASSWORD").ok().map(Secret::new) } }
 }

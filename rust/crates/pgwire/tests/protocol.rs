@@ -96,6 +96,44 @@ fn rows(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<Vec<u8>>>> {
 }
 
 #[tokio::test]
+async fn copy_to_arrow_stream_uses_the_original_read_transaction() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut writer = Client::connect(&running.server, None).await;
+    let mut reader = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (1, X'6162')").await), b"CZ");
+    assert_eq!(tags(&reader.query("BEGIN READ ONLY").await), b"CZ");
+    let first = reader.query("SELECT COUNT(*) FROM payloads").await;
+    assert_eq!(rows(&first), [vec![Some(b"1".to_vec())]]);
+    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (2, X'6364')").await), b"CZ");
+
+    reader.parse("arrow", "COPY (SELECT val FROM (
+        SELECT 0::BIGINT AS probe, _id, val FROM payloads WHERE _id <= 1
+        UNION ALL
+        SELECT 1::BIGINT AS probe, _id, val FROM payloads WHERE _id > 1
+    ) AS probes ORDER BY probe, _id) TO STDOUT WITH (FORMAT 'arrow-stream')", &[]).await;
+    reader.send(b'H', &[]).await;
+    assert_eq!(reader.receive().await.0, b'1');
+    reader.bind("transfer", "arrow").await;
+    reader.send(b'H', &[]).await;
+    assert_eq!(reader.receive().await.0, b'2');
+    reader.execute("transfer", 0).await;
+    reader.send(b'S', &[]).await;
+    let frames = reader.through(b'Z').await;
+    assert_eq!(frames[0].0, b'H');
+    assert_eq!(&frames[frames.len() - 3..].iter().map(|frame| frame.0).collect::<Vec<_>>(), b"cCZ");
+    assert_eq!(frames[frames.len() - 2].1, b"COPY 1\0");
+    assert_eq!(frames.last().unwrap().1, b"T");
+    let ipc = frames.into_iter().filter(|frame| frame.0 == b'd').flat_map(|(_, bytes)| bytes).collect::<Vec<_>>();
+    let batches = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None).unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.len(), 1);
+    let array = batches[0].column(0).as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+    assert_eq!(array.value(0), b"ab");
+    assert_eq!(tags(&reader.query("COMMIT").await), b"CZ");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn duration_literal_overflow_occurs_only_when_query_output_demands_value() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
@@ -549,40 +587,7 @@ async fn arrow_copy_unsigned_ids_and_values_enter_signed_execution() {
 }
 
 #[tokio::test]
-async fn arrow_copy_vectors_rank_after_flush_for_both_ipc_formats() {
-    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
-    use arrow_schema::{DataType, Field};
-
-    let running = Running::start(ServerConfig::default(), None).await;
-    let mut client = Client::connect(&running.server, None).await;
-    let item = Arc::new(Field::new("item", DataType::Float32, false));
-    let embedding = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![0.0, 1.0, 1.0, 0.0])), None).unwrap();
-    let batch = RecordBatch::try_from_iter([
-        ("_id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
-        ("embedding", Arc::new(embedding) as ArrayRef),
-    ]).unwrap();
-    for (table, file) in [("stream_vectors", false), ("file_vectors", true)] {
-        let bytes = if file { rtdb_format::ipc::write_file(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() }
-            else { rtdb_format::ipc::write_stream(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() };
-        let format = if file { "arrow-file" } else { "arrow-stream" };
-        client.send(b'Q', &cstring(&format!("COPY {table} FROM STDIN WITH (FORMAT '{format}')"))).await;
-        assert_eq!(client.receive().await.0, b'G');
-        client.send(b'd', &bytes).await;
-        client.send(b'c', &[]).await;
-        assert_eq!(tags(&client.through(b'Z').await), b"CZ");
-        running.node.flush_all(std::time::Duration::from_secs(10)).await.unwrap();
-
-        let results = client.query(&format!(
-            "SELECT _id FROM {table} ORDER BY COSINE_DISTANCE(embedding, ARRAY[1,0]), _id LIMIT 2"
-        )).await;
-        assert_eq!(rows(&results), vec![vec![Some(b"2".to_vec())], vec![Some(b"1".to_vec())]]);
-    }
-    drop(client);
-    running.stop().await;
-}
-
-#[tokio::test]
-async fn arrow_copy_batches_autocommit_separately_and_explicit_rollback_discards_all_batches() {
+async fn arrow_copy_batches_autocommit_separately_and_share_an_explicit_transaction() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
     for (table, file) in [("stream_docs", false), ("file_docs", true)] {
@@ -601,6 +606,16 @@ async fn arrow_copy_batches_autocommit_separately_and_explicit_rollback_discards
     client.send(b'd', &arrow_copy_bytes(false, 2)).await; client.send(b'c', &[]).await;
     assert_eq!(tags(&client.through(b'Z').await), b"CZ"); assert_eq!(tags(&client.query("ROLLBACK").await), b"CZ");
     let frames = client.query("SELECT n FROM stream_docs ORDER BY _id").await; assert_eq!(tags(&frames), b"TDDCZ"); assert_eq!(rows(&frames).len(), 2);
+    assert_eq!(tags(&client.query("BEGIN READ WRITE").await), b"CZ");
+    client.send(b'Q', &cstring("COPY stream_docs FROM STDIN WITH (FORMAT 'arrow-stream')")).await;
+    assert_eq!(client.receive().await.0, b'G');
+    client.send(b'd', &arrow_copy_bytes(false, 2)).await;
+    client.send(b'c', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"CZ");
+    assert_eq!(tags(&client.query("COMMIT").await), b"CZ");
+    let times = rows(&client.query("SELECT _valid_from FROM stream_docs ORDER BY _id").await);
+    assert_eq!(times.len(), 4);
+    assert_eq!(times[2], times[3]);
     drop(client); running.stop().await;
 }
 
@@ -1539,6 +1554,39 @@ async fn ordered_index_ddl_and_keyset_queries_use_the_pgwire_entry_point() {
     assert_eq!(tags(&frames), b"12CZ");
     assert_eq!(frames[2].1, cstring("DROP INDEX"));
     assert!(rows(&client.query("SELECT _id FROM xt.ordered_indexes").await).is_empty());
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn arrow_copy_vectors_rank_after_flush_for_both_ipc_formats() {
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field};
+
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let embedding = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![0.0, 1.0, 1.0, 0.0])), None).unwrap();
+    let batch = RecordBatch::try_from_iter([
+        ("_id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+        ("embedding", Arc::new(embedding) as ArrayRef),
+    ]).unwrap();
+    for (table, file) in [("stream_vectors", false), ("file_vectors", true)] {
+        let bytes = if file { rtdb_format::ipc::write_file(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() }
+            else { rtdb_format::ipc::write_stream(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() };
+        let format = if file { "arrow-file" } else { "arrow-stream" };
+        client.send(b'Q', &cstring(&format!("COPY {table} FROM STDIN WITH (FORMAT '{format}')"))).await;
+        assert_eq!(client.receive().await.0, b'G');
+        client.send(b'd', &bytes).await;
+        client.send(b'c', &[]).await;
+        assert_eq!(tags(&client.through(b'Z').await), b"CZ");
+        running.node.flush_all(std::time::Duration::from_secs(10)).await.unwrap();
+
+        let results = client.query(&format!(
+            "SELECT _id FROM {table} ORDER BY COSINE_DISTANCE(embedding, ARRAY[1,0]), _id LIMIT 2"
+        )).await;
+        assert_eq!(rows(&results), vec![vec![Some(b"2".to_vec())], vec![Some(b"1".to_vec())]]);
+    }
     drop(client);
     running.stop().await;
 }

@@ -51,6 +51,7 @@ impl Log for ClockedLog {
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.delegate.latest() }
     async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.delegate.retained_floor().await }
+    async fn recovery_tail(&self, after: LogOffset) -> rtdb_storage::Result<Option<Box<dyn LogTail>>> { self.delegate.recovery_tail(after).await }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> { self.delegate.tail(after).await }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> { self.delegate.range(from, to).await }
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.delegate.read_range(from, to).await }

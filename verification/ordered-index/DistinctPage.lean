@@ -100,6 +100,59 @@ theorem global_prefix_survives_local_limit (stream global : List Nat)
         simp [List.take_succ_cons, head] at winner
         simp [head, ih uniqueTail count member winner]
 
+private theorem ordered_keys_eq (left right : List Nat)
+    (leftStrict : left.Pairwise (· < ·)) (rightStrict : right.Pairwise (· < ·))
+    (same : ∀ key, key ∈ left ↔ key ∈ right) : left = right := by
+  induction left generalizing right with
+  | nil =>
+    cases right with
+    | nil => rfl
+    | cons head tail =>
+      have impossible := (same head).mpr (by simp)
+      simp at impossible
+  | cons head tail ih =>
+    cases right with
+    | nil =>
+      have impossible := (same head).mp (by simp)
+      simp at impossible
+    | cons other rest =>
+      obtain ⟨beforeTail, strictTail⟩ := List.pairwise_cons.mp leftStrict
+      obtain ⟨beforeRest, strictRest⟩ := List.pairwise_cons.mp rightStrict
+      have inOthers := (same head).mp (by simp)
+      have inLeft := (same other).mpr (by simp)
+      have lower : other ≤ head := by
+        rcases List.mem_cons.mp inOthers with equal | later
+        · exact Nat.le_of_eq equal.symm
+        · exact Nat.le_of_lt (beforeRest head later)
+      have upper : head ≤ other := by
+        rcases List.mem_cons.mp inLeft with equal | later
+        · exact Nat.le_of_eq equal.symm
+        · exact Nat.le_of_lt (beforeTail other later)
+      have equal := Nat.le_antisymm upper lower
+      subst other
+      apply congrArg (List.cons head)
+      apply ih rest strictTail strictRest
+      intro key
+      by_cases first : key = head
+      · subst key
+        exact ⟨fun h => (Nat.lt_irrefl head (beforeTail head h)).elim,
+               fun h => (Nat.lt_irrefl head (beforeRest head h)).elim⟩
+      · simpa [first] using same key
+
+/-- Once clearance is applied, ordered postings with the same candidate
+keys give the same stream after eliminating duplicate runs. -/
+theorem distinct_runs_refine_membership (left right : List Nat)
+    (leftSorted : left.Pairwise (· ≤ ·)) (rightSorted : right.Pairwise (· ≤ ·))
+    (same : ∀ key, key ∈ left ↔ key ∈ right) :
+    distinctRuns none left = distinctRuns none right := by
+  have leftStrict := distinctRuns_strict none left leftSorted (by simp [orderedAfter])
+  have rightStrict := distinctRuns_strict none right rightSorted (by simp [orderedAfter])
+  apply ordered_keys_eq _ _ leftStrict rightStrict
+  intro key
+  rw [distinctRuns_mem none left key leftSorted (by simp [orderedAfter]),
+      distinctRuns_mem none right key rightSorted (by simp [orderedAfter])]
+  simpa using same key
+
 structure Posting where
   key : Nat
   label : Nat

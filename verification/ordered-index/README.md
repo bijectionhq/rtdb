@@ -4,15 +4,15 @@ The reference answer resolves the original captured event stream at the requeste
 The proof sources in this directory decompose that specification.
 The checker results and the remaining production obligations appear below.
 
-| Property | Proof source | Production refinement still required |
+| Property | Proof source | Production boundary |
 | --- | --- | --- |
-| Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition and for any left-to-right tiling. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
-| Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks production timestamp conversion, aligned bucket lookup and the maximal aligned step used by the bucket iterator. | Relate the iterator state and termination to the complete tiling in `Buckets.lean`. |
-| Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | Connect Arrow values and SQL comparisons to the order and filters, and the tree cursor and heap to the ordered streams. |
-| Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | The adopted L0 inventory supplies the flushed input identities and lengths. Connect live segment offsets and the immutable file bytes to the exact capture. |
-| Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
-| Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable cleanup obligation under a single fail-stop owner. `ErasureRelease.tla` checks the requirement for fenced writes and replica eviction. |
-| Bijection page witnesses | `OrderedRead.lean` proves how agreement over the consumed ordered prefix preserves the page. `DistinctPage.lean` proves the ordered distinct candidate prefix, clearance before deduplication, and the preservation of global prefix keys under each local limit. | Bind the per-world SQL results and protected custody streams to the candidate sets used at acquisition and revalidation. |
+| Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition and for any left-to-right tiling. | The projection uses the admitted temporal resolver. The composition uses exact tiling and checked timestamp and ceiling decisions. |
+| Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks production timestamp conversion, aligned bucket lookup and the maximal aligned step used by the bucket iterator. | The iterator supplies a complete aligned tiling. Each production step preserves the range and advances to the maximal aligned boundary. |
+| Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | The native path interprets Arrow comparisons and filters before limiting the merged streams. The paired run checks that path at labelled forward and reverse reads. |
+| Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | The adopted L0 inventory supplies flushed identities and lengths. Exact immutable bytes and the live segments must come from the captured snapshot. |
+| Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | The missing-root regression checks stable addresses through repair. The protocol uses immutable publication and tracked replica permits. |
+| Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Capture-based replay scrubs before publishing. `ErasureCleanup.tla` checks the cleanup obligation, and `ScopeRetirement.tla` checks the provider admission, replica permit, settlement, and reclamation protocol. |
+| Bijection page witnesses | `OrderedRead.lean` proves how agreement over the consumed ordered prefix preserves the page. `DistinctPage.lean` proves the ordered distinct candidate prefix, clearance before deduplication, and the preservation of global prefix keys under each local limit. | The paired fixture binds the per-world SQL results and custody streams to acquisition and revalidation. Complete SQL prefixes and authentic custody inputs are refinement premises. |
 
 `CheckpointCountOnly.cfg` should produce a wrong answer when a replay substitutes an event with a duplicate while preserving the count.
 `CheckpointEarlyPublish.cfg` should expose a reachable manifest that references a missing object.
@@ -101,7 +101,7 @@ The local Bijection PgWire fixture `registered_pages_agree_with_and_without_orde
 The `scan_ordered_seek` attribute was present on both labelled ascending and descending reads before the index was dropped, and absent from the corresponding scans after the drop.
 At one basis and observation, both paths returned the expected rows, continuation and authenticated consumed predicate, and both registrations revalidated.
 On the published Bijection source `96b534c7c49ed01d57a307ebee42fadb083ae601`, the paired fixture and the full RTDB WorldStore conformance fixture both passed against the local hosted engine.
-Hosted provider upload settlement and reader eviction remain production proof obligations.
+The hosted generation-retirement evidence below covers the later storage implementation.
 
 On the hosted integration source `671274af9f8e92b912a2958f1b8ea75a8a602a75`,
 Lean 4.35.0 checked seven law modules and audited 18 theorems through Rex on the M1.
@@ -131,16 +131,28 @@ It permits a provider upload admitted before closure to finish after closure.
 Erasure acknowledgement requires provider settlement and release of reader copies.
 A replacement generation carries replayed content only after the model's scrub condition is satisfied.
 
-With two publishers and two readers, TLC explored all 605 reachable states with the safety invariants holding.
-Setting `SettleUploads` to `FALSE` allowed a retired object to reappear after acknowledgement.
-Setting `DrainReaders` to `FALSE` allowed acknowledgement while an original reader still owned a copy.
-Setting `ScrubReplay` to `FALSE` allowed the replacement generation to carry erased content.
-`ScopeRetirementLiveness.cfg` checked eventual acknowledgement over the same 605 states under weak fairness for closing, settlement, reader release, deletion, and acknowledgement.
-Removing either upload settlement fairness or reader release fairness produced a liveness counterexample.
+TLC 2026.11.19.180144 explored all 540 reachable states with two publishers
+and two replica permits. The model allows an upload admitted before closure
+to finish afterward and requires the scrubbed replacement to be published
+before closing the earlier scope.
 
-The hosted implementation still needs a generation authority shared by read admission, the provider publication journal, and erasure completion.
-The authority must close the generation before inspecting the journal. It must settle each admitted upload by completion or confirmed abort, then verify deletion at the provider.
-Each replica must drain the old generation's operations and decoded pages before releasing its reader admission.
+| Control | First invariant violation |
+| --- | --- |
+| `SettleUploads = FALSE` | A retired object reappeared after acknowledgement. |
+| `DrainReaders = FALSE` | A retired scope was acknowledged while a replica still held a page. |
+| `ScrubReplay = FALSE` | The replacement scope carried erased content. |
+
+`ScopeRetirementLiveness.cfg` explored the same 540 states. After the
+replacement is published, acknowledgement eventually occurs under weak
+fairness for closing, settlement, reader release, deletion, and acknowledgement.
+
+Verus 0.2026.11.20.9da409b checked six obligations in `scope.rs`, which
+includes the production directory's generation decisions. The checks prove
+that the closure floor cannot move backward, a stale retirement preserves the
+open suffix, and the replacement remains admissible at the exact boundary.
+Changing the production admission from inclusive to strict failed its
+postcondition.
+
 Replay on consolidated RTDB discovers erase cuts from adopted L0 files before
 writing any replacement page. `Recovery.lean` checks
 `scrubbed_replay_preserves_points`: for one IID, filtering out strictly
@@ -156,13 +168,117 @@ scopes alone. Four ordered-index unit tests and eight native regressions
 passed on the consolidated engine. The regressions cover exact repair when
 an old dirty address cannot be reused, a same-revision erase and reinsertion,
 and preservation of an unpublished later scope. The PgWire declaration and
-keyset regression also passed. The hosted directory still needs to fence old
-admissions and record physical provider completion.
+keyset regression also passed.
+
+The hosted directory records replica permits and provider publications before
+page I/O. A watched replica shares its permit across concurrent operations
+and releases it after its decoded pages and provider I/O drain. The directory
+rejects new upload admissions immediately at closure. The reaper discovers old
+scope prefixes through the version and multipart inventories, settles exact
+journaled uploads, and purges all versions before removing the retirement
+obligation. The local regression retained a generation after a read caller
+was cancelled, then reclaimed it after I/O completed. It also exercised a
+preexisting unregistered prefix and an outstanding storage region from
+before index permits were tracked.
+
+The hosted PgWire regression exercised erase, replica permits, the production
+reaper, and the retained page against a version-enabled MinIO instance.
+A separate S3 runtime regression checked noncurrent versions, a delete marker,
+a prefix containing only a multipart upload, exact upload abort, and isolation
+from a neighboring generation. A provider fault regression also exercised the
+production journal with a superseded writer. The reaper kept the scope while
+its serving region was active, then confirmed abort and reclaimed its versions.
+An attempted completion with the original upload ID failed after reclamation.
+These tests cover the local provider
+implementation and the selected failure schedules. The model assumes the
+provider's confirmed abort and inventory contracts. Primary L0 files are a
+separate custody boundary.
+
+### Retiring dropped definitions
+
+The captured catalog retains the definition fence after the last physical
+scope is removed. The reaper discovers old definitions through provider
+version and multipart inventories, including definitions that were already
+dropped when generation tracking began. The hosted versioned-provider
+regression verifies both erase and drop. Its node queries use the direct
+catalog scan and passed with default Tokio stack sizing. The directory unit
+test reclaimed an unregistered dropped definition and rejected admission
+before and after reclamation.
+
+TLC explored 16 reachable states in both `CatalogRetirement.cfg` and
+`CatalogRetirementLiveness.cfg`. Ignoring previous versions left an old object
+after acknowledgement. Discarding the durable catalog fence allowed a stale
+capture to reopen the removed definition. The positive configurations
+preserved its replacement.
+
+## Temporal projection composition
+
+Lean 4.35.0 checked that coalescing adjacent spans with an equal tuple
+preserves every point. `bucket_postings_refine_table` composes exact bucket
+tiling with the temporal replay laws. At one captured basis and valid point,
+the postings for a single IID carry the authoritative value and contribute
+at most one matching tuple. The exact tiling hypothesis is supplied by the
+bucket laws, with Verus checking the signed timestamp mapping and maximal
+aligned production step.
+
+The core `History.lean` and `Ceiling.lean` checks also passed.
+Verus checked 18 obligations in the production ceiling harness covering its
+update, clipping window, and half-open cell geometry. The ordered projection
+opens the same admitted history resolver used by the engine's scan.
+
+## Page and read witness composition
+
+Lean 4.35.0 checked `distinct_runs_refine_membership` and
+`ordered_route_preserves_page_and_witness` with warnings promoted to errors.
+Given the same authorized candidate membership and the exact captured source,
+the ordered index and scan agree on the distinct stream, resolved rows,
+lookahead, and keys inspected for registration. The axiom audit reported
+only `propext`, `Classical.choice`, and `Quot.sound` across these laws.
+
+The paired test reran the published RTDB engine at `1a6eceb63` with the
+published Bijection integration at `96b534c7c49ed01d57a307ebee42fadb083ae601`.
+The trace recorded both native seek directions for labelled pages, then
+authoritative scans with the ordered index dropped. The fixture required equal
+rows, continuation, the authenticated consumed predicate, and successful
+revalidation at the same observation. It runs against a dedicated local
+RTDB endpoint. The theorem assumes exact candidate membership and replay
+coverage, whose production bindings are exercised by these runtime tests.
+
+On newer Bijection main source `ebaa9bbe2f49afbb3ad6f2838affbdcd007a38a2`,
+Verus checked 12 candidate-window and seven overlay-admission obligations
+from the production files. Lean checked `RtdbCandidatePrefixes` and
+`RtdbOverlayHistory`. Together these establish the retained first distinct
+union prefix and the effect of keeping the protected history and clear suffix
+through the newest clear reset. The proofs require authentic source prefixes,
+ancestry, and operation decoding.
+
+The newer paired runtime build used Bijection source `29cada504ef` with the
+mask projection alias fix published at `8585a3489207d430d443f54d9e8bb9746a5a3906`.
+The standalone RTDB binary was built from `d2d6945cf`. The local PgWire run
+observed `scan_ordered_seek` for both labelled directions before the drop,
+then the corresponding plain scans. Rows, continuation, and the authenticated
+read witness matched and both registrations revalidated. The alias fix keeps
+the positional mask decoder intact and gives each joined column a unique name.
+
+The focused paged-overlay regression passed on Bijection source
+`d00682f567c`, published as `c259639529869f6fb98ced7184fe7c896d4388d0`.
+It uses a parent with 146 candidate keys and a child with a long run of
+deletions and one inherited merge. The test checks the two remaining rows,
+continuation, and exhaustion in both directions. The disk-backed PgWire
+trace recorded native seeks while traversing the deleted candidates.
+
+The broader WorldStore conformance reruns on the newer Bijection source
+hit fixture lease deadlines. The last run used in-memory RTDB storage
+with tracing disabled. It reached the second label-order pass and stopped
+when the 300 ms lease in
+`a_dropped_or_lapsed_world_refuses_the_whole_commit` expired before its
+fixture fork committed. The focused registered-page and paged-overlay
+regressions passed against the disk-backed PgWire engine.
 
 ## Execution
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.
 Write generated proof products and TLC state under an ignored task target directory.
-Run each Lean module and compile `Temporal.lean` into the module search path before checking `Recovery.lean`, then run `Axioms.lean` against the compiled modules.
-Run Verus on `domain.rs` and `seek.rs` in this directory so the included paths resolve to the source used by RTDB.
+Compile `Temporal.lean`, `Buckets.lean`, `DistinctPage.lean`, and `OrderedRead.lean` into the module search path before checking `Recovery.lean`, then run `Axioms.lean` against the compiled modules.
+Run Verus on `domain.rs`, `seek.rs`, and `scope.rs` so the included paths resolve to the production sources used by RTDB.
 Run TLC against each configuration, retaining the source identity, tool version, and each diagnostic trace.

@@ -1,0 +1,56 @@
+# R6 · Seal durable units within a custody domain
+
+## Contract
+
+Every durable data unit is sealed under an independently destroyable data key.
+A custody domain is the authority that can enumerate and revoke every means of decrypting its units, including active grants, caches, recoverable key versions and backups.
+A storage copy within the domain retains that identity.
+An independent copy receives a fresh domain, new unit identities and new keys before publication.
+A same-domain fork holds references to the source's units and follows erasure of their shared history.
+A cross-organization export or an independent archive publishes re-encrypted data under its own authority.
+A move that preserves the same logical database transfers custody with the history and obtains a receipt retiring the predecessor's serving path.
+
+## Unit publication
+
+The passive unit identity binds domain, purpose, generation, unique publication and chunk number where applicable.
+Create an opaque key slot for that exact publication using conditional creation.
+A losing writer opens the winning publication or abandons its unpublished unit.
+This resolves concurrent job convergence at publication, so ciphertext from separate attempts may differ.
+Authenticate the unit label and chunk coordinates.
+Keep a single logical publication inside the root even when a provider retry created several physical versions.
+The residence ledger inventories all recoverable wraps and copies before a unit can appear in a root.
+
+Persisting a recoverable wrapped data key in an immutable backup would preserve decryption after ledger deletion.
+Use key slots with provider-backed revocation and an inventory of any recoverable wrapping versions.
+Decrypted pages need an authority-bound lease and invalidation tied to the slot.
+Persistent caches contain ciphertext.
+Log segments need their own slot and a manifest that describes the replacement root and replay interval.
+
+## Enrollment
+
+The provider must offer a permanent create-once lineage anchor or equivalent non-reusable storage identity.
+Opening existing encrypted storage requires its exact anchor and key identity.
+Provisioning is conditional on creating a new anchor and binding the key slot to it.
+An unknown create outcome is resolved against the same attempt identity.
+An existing or tombstoned anchor forbids enrollment, including after loss of directory metadata.
+`KeyLineageEnrollment.tla` checks binding an installed key to its claimed anchor, refusal of re-enrollment over surviving ciphertext, and terminal withdrawal.
+Its transitions assume durable conditional creation of the anchor.
+The provider tests must exercise an object surviving stale or missing directory data.
+The current Verus decision about boolean enrollment predicates remains applicable only after these premises have been established.
+
+## Object roles and implementation boundary
+
+The key service is a passive collaborator that exposes enrollment, opening and revocation for an exact slot.
+The residence authority owns atomic publication of roots and their key dependencies.
+The active eraser coordinates preparation and publication with that authority.
+The key-grant monitor owns the current grant generation and wakes revoked readers.
+Classic and Multi storage can share the sealing format and the custody contract.
+
+Multi currently encrypts under a deployment key and uses shared bytes in several copy paths.
+Classic deployments currently lack the corresponding sealing protocol.
+Per-unit custody is still a target.
+Before landing, qualify ranged reads and object naming on each supported provider, including lost create replies and redundant compaction jobs.
+Prove that an independent copy retains no decryption handle that can access the source ciphertext.
+Verify the cache fence and nonce uniqueness against shipped source.
+
+[Current cipher](../../rust/crates/multi/src/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

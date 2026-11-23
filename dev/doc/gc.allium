@@ -3,11 +3,13 @@
 --
 -- Garbage collection of superseded tries (data + meta files) for one database.
 --
--- Per-database, leader-only, signal-driven. The node that leads this database's
--- replica log also owns its trie GC; followers do not run trie GC at all. There
--- is no periodic timer: the leader signals at every block boundary (the only
--- moment new garbage can appear), and tx processing carries on without waiting
--- for the GC cycle.
+-- Per-database, leader-only, signal-driven.
+-- The node that leads this database's replica log owns its trie GC.
+-- The leader signals at block adoption and transaction processing continues without waiting for the cycle.
+-- In native Rust, the term supervisor also signals on term entry and periodically while automatic trie GC is enabled.
+-- The period is the configured reader lease clamped to 100 milliseconds through 60 seconds.
+-- A retry gives an eligible trie or pending receipt a fresh collection opportunity even if no new block arrives.
+-- The timer only schedules cycles. The collector still checks eligibility, elapsed reader leases and the catalog admission floor.
 --
 -- Tries transition to `garbage` during addTries (see trie-cat.allium); this
 -- spec covers physical cleanup: deleting object-store files and publishing
@@ -21,7 +23,57 @@
 -- Pending tries remain required because a retained replica notice can complete their compaction cohort after recovery.
 -- Query and transaction snapshots register at the partition owner's state boundary.
 -- An admitted provider operation retains that registration through completion, including after caller cancellation.
--- Compactor reset requires collection authorization to drain before it can reopen key allocation.
+-- Compactor reset starts a new naming epoch, so a deletion authorized before it can never reach an output planned after it.
+--
+-- Query snapshots on every node also hold a bounded read lease, because another node's collector cannot see them.
+-- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
+-- A snapshot captured after that confirmation may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`.
+-- Each provider request checks the lease when it is admitted; a request admitted in time runs to completion.
+-- Objects are immutable, so a request that overruns the deadline can only fail; a missing object it then reports is classified as the expired lease.
+-- A node reading a scan fragment for another node's query captures its own snapshot and holds its own lease.
+-- A later request fails with `rtdb.storage/read-lease-expired` rather than reading a file that may be gone.
+-- A node whose catalog cannot be confirmed current waits up to the margin for its log processor.
+-- A replicated query or delegated fragment without a current lease is refused at snapshot admission.
+-- An admitted snapshot still checks the lease before beginning each provider request.
+-- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
+-- In Multi, that deletion records a release, which the cell reaper erases only after its grace.
+-- Native nodes with a local journal and local storage share a catalog floor at the storage root.
+-- Catalog admission and floor advancement use the same filesystem lock.
+-- A reader's shared ticket lock retains its catalog until its last provider operation completes or its process exits.
+-- The collector persists the floor before releasing files from the installed receipt.
+-- A capture in the floor's journal must supply a cut at or above the durable floor.
+-- A successor journal can open from the latest durable checkpoint after offline replacement.
+-- Held catalogs from the predecessor and opaque captures delay the successor floor.
+-- Installing the successor floor fences earlier journals.
+-- An exclusive compactor reset resumes cut publication after it adopts its new naming epoch.
+-- The installed prefix covers the new catalog before the reset completes.
+-- A coordinated reset stages the compacted file identities with the successor block and naming epoch before adoption.
+-- Reset intents can publish retirement only after the adopted checkpoint covers those coordinates and the selected trie names have been withdrawn.
+-- Collection resumes pending reset and ordinary retirements before selecting new age-eligible garbage.
+-- The native leader acknowledges a trie removal after its known installed replica prefix covers the removal record.
+-- The immutable partition value at acknowledgement contains neither a requested key nor a checkpoint dependency on that key.
+-- A skipped replay record or an unrecognized prefix cannot supply this acknowledgement.
+-- When its partition has an installed catalog cut, the native collector persists an intent for each batch before releasing files or submitting the removal.
+-- It records a later receipt from that journal before releasing the intent marker.
+-- In Multi the serving writer proposes that installed cut as the admission floor for its storage root.
+-- If an older or opaque catalog is still held, the marker stays pending until a successor can install or observe the floor.
+-- A hosted trie batch queues its files only after the durable receipt and floor cover the same installed cut.
+-- The release operation loads the installed receipt by its exact plan digest.
+-- Its release records carry the residence, object namespace and installed cut.
+-- The cell reaper admits the release when its directory observation carries that residence and namespace and covers the installed cut in the same storage root and journal.
+-- The published recovery inventory must cover the installed removal.
+-- Older recovery and metadata admissions retain the released files until their provider work drains.
+-- Files in that plan release in artefact, data and metadata order.
+-- An interrupted release retains the plan so a successor can retry the files before releasing the intent marker.
+-- Hosted collection waits for an installed catalog cut before selecting a batch.
+-- The floor is a bound on future reader admission; physical erasure continues through the timed release path.
+-- An observed version of a loose data or metadata file matches the publication only when it equals the version the selected catalog recorded.
+-- A file without a matching publication remains eligible for collection through the existing timed path.
+-- A new collector checks pending intents in the same storage root and journal.
+-- Where the installed catalog and checkpoint already exclude the requested keys, it can re-confirm their removal through replication.
+-- Source-residence retirement metadata stays outside fork publication and cell materialization.
+-- A new collector, after restart or failover, observes afresh.
+-- Both sides measure elapsed time, so clocks need no synchronization; the margin covers twice the rate drift over one lease plus the longest provider request.
 --
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
 -- startup/catch-up, so they don't need replica-log coordination.
@@ -73,7 +125,7 @@ entity TrieGarbageCollector {
     --                    that *started* after their suspension).
     --
     -- See `TrieGarbageCollector.kt` for the loop body.
-    enabled: Boolean              -- gates the auto-signal from finishBlock; awaitNoGarbage is unaffected
+    enabled: Boolean              -- gates automatic signals; awaitNoGarbage is unaffected
     blocks_to_keep: Integer
     garbage_lifetime: Duration
 
@@ -192,7 +244,7 @@ rule LeaderClosesTrieGc {
 --                         drains its triggers after each cycle and runs again
 --                         if any are pending.
 --
--- The `enabled` config gates only the auto-`signal()` from finishBlock.
+-- The enabled flag gates signals from block adoption and the native term timer.
 -- Direct `awaitNoGarbage()` always runs a cycle, regardless of `enabled`.
 
 rule LeaderFinishBlockSignalsTrieGc {
@@ -320,6 +372,13 @@ rule GarbageCollectTable {
 }
 
 rule DeleteAndCommitChunkRule {
+    -- This order applies to classic stores, where the collector issues the file deletes itself.
+    -- In Multi, the recorded file plan instead releases to the reaper after receipt and floor installation as described above.
+    -- An installed plan that matches an immutable S3 publication releases its exact version to the hosted reaper.
+    -- A terminal plan carries the publication identity recorded by the file writer into its installed release.
+    -- The hosted reaper compares that identity inside the enrolled allocation before closing the owner's read admission for the file and release record.
+    -- Existing shared manifests and active physical owner reads retain that version until their dependencies are withdrawn or drained.
+    -- An older hosted marker can recover its immutable version from the authenticated installed receipt for the same cut and object.
     -- One atomic step in the per-table per-chunk ordering. The DELETEs run
     -- first, in parallel; only after every DELETE in the chunk has succeeded
     -- do we publish + commit.
@@ -335,6 +394,7 @@ rule DeleteAndCommitChunkRule {
     -- A trie's artefacts, such as its search files (fts.allium), go before its data file: they carry the data file's content, so they must not outlive it.
     -- They are found by listing the trie's artefact prefix rather than by reading its entry's records, which also catches an artefact whose record had not been applied when this cycle read its snapshot.
     -- A partition group's artefacts (trie-cat.allium: ArtefactScope) are derived from every member's data file, so they go once the cycle collects the last member the catalog holds, before any chunk.
+    -- A recorded shared file binds to an observed provider version only when at least one retained record names it and every retained record for that file witnesses that same publication.
     -- A member the catalog holds and this cycle does not collect, live or not yet past its garbage lifetime, keeps them.
     -- See: maintenance/src/gc.rs (collect_table, finished_groups)
     when: DeleteAndCommitChunk(table, chunk)
@@ -456,7 +516,7 @@ surface TrieGcAdmin {
 
     @guarantee BypassesEnabledFlag
         -- AdminAwaitsNoTrieGarbage runs a cycle regardless of config.enabled.
-        -- The flag gates only the auto-signal from finishBlock.
+        -- The flag gates automatic signals from block adoption and the native term timer.
 
     @guarantee CycleAwaiterFairness
         -- Every caller is resumed (or cancelled) by exactly one cycle whose

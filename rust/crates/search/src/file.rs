@@ -1,48 +1,59 @@
-//! A search file: one single-segment tantivy index over a trie or its partition group, bundled into one object.
-//! A document is a text run: every version of one entity whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible.
-//! Tokens come from `rtdb-text`, so the index and the residual `MATCH` agree.
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use rtdb_text::{Corpus, Query, RankScorer, Scorer};
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
-use tantivy::collector::DocSetCollector;
-use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
-use tantivy::directory::{FileHandle, FileSlice, OwnedBytes, RamDirectory, WatchCallback, WatchHandle, WritePtr};
-use tantivy::postings::SegmentPostings;
-use tantivy::query::{BooleanQuery, Occur, TermQuery};
-use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
-use tantivy::store::Compressor;
-use tantivy::tokenizer::{PreTokenizedString, Token};
-use tantivy::{Directory, HasLen, Index, IndexSettings, TantivyDocument, Term};
-
-use crate::rank_windows::{document_range, extend_impact, window_of};
-use crate::rectangle::merge_adjacent_valid_time;
+mod layout;
+mod legacy11;
+mod manifest;
+mod paged;
+mod postings;
+mod page_tree;
+pub(crate) use page_tree::{IoStats as TreeIoStats, observe_io as observe_tree_io};
+mod tree_file;
+mod tree_rank;
+mod rank_tree;
+mod write;
 
 #[cfg(feature = "experiments")]
 pub(crate) mod experiment;
 
-const MAGIC: &[u8; 8] = b"RTSRCH01";
-/// Identifies the bundle bytes produced by the builder, including visibility encoding.
-pub const FORMAT_VERSION: i32 = 7;
-const WRITER_MEMORY: usize = 32 << 20;
-/// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
-const SIDECAR: &str = "rtdb.sidecar";
-/// A term in at least this many documents has its window bounds stored; a rarer term's are computed from its postings when asked.
-const STORED_IMPACTS: u32 = 1024;
-/// A row's place in a column's runs where the row is visible nowhere, and where it is visible with the column null or absent.
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Write};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
+
+use arrow_array::{
+    Array, BooleanArray, Float64Array, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, Int64Array,
+    cast::AsArray, types::{Int64Type, UInt8Type},
+};
+use arrow_buffer::{BooleanBufferBuilder, Buffer};
+use arrow_schema::Schema;
+use rtdb_text::{Corpus, Query, RankScorer, Scorer, stored_length};
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
+use sha2::{Digest, Sha256};
+
+use crate::rank_windows::document_range;
+use layout::Reader;
+use manifest::{Manifest, Term, postings_table};
+use postings::{Impact, Matching, Postings, needs_positions};
+pub use layout::Source;
+pub(crate) use layout::FooterLocator;
+
+pub const FORMAT_VERSION: i32 = 13;
+pub(crate) const TREE_FORMAT_VERSION: i32 = 14;
+pub(crate) use page_tree::PageCache;
+pub(crate) use tree_file::{TreeFile, TreeLocator};
+pub(crate) use tree_rank::TreeRanked;
+pub(crate) fn encode_tantivy_stats(sections: &[Section]) -> Vec<u8> { legacy11::encode_catalog(sections) }
+pub(crate) const LEGACY_FORMAT_VERSION: i32 = 12;
+pub(crate) const TANTIVY_FORMAT_VERSION: i32 = 11;
+const STORED_IMPACTS: usize = 1024;
 const NO_DOC: u32 = u32::MAX;
 const NULL_DOC: u32 = u32::MAX - 1;
-/// A row's key in the sidecar: IID, system from, valid from, valid to, operation.
-const KEY_BYTES: usize = 16 + 8 + 8 + 8 + 1;
 
 /// One data-file row as the search file sees it: its key and the tokens of each indexed column.
 /// Rows arrive as the data file holds them: IID ascending, then system time descending.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchRow {
+    /// Full entity identity on every owned effect, including delete and erase.
+    pub identity: Option<EntityId>,
     pub iid: [u8; 16],
     pub system_from: i64,
     pub valid_from: i64,
@@ -50,6 +61,37 @@ pub struct SearchRow {
     pub op: EventOp,
     /// Parallel to the file's columns: `None` where the column is null or absent, and otherwise the tokens of its UTF-8 value, none for a value of another type.
     pub values: Vec<Option<Vec<String>>>,
+}
+
+pub(crate) struct IndexedRow<'a> {
+    pub header: EventHeader,
+    pub key: Option<Cow<'a, [u8]>>,
+    pub sql_id: Option<i64>,
+    pub values: Vec<Option<StringArray>>,
+}
+
+pub(crate) trait SearchPage {
+    fn len(&self) -> usize;
+    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>>;
+}
+
+impl SearchPage for Vec<SearchRow> {
+    fn len(&self) -> usize { Vec::len(self) }
+
+    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
+        let row = &self[row];
+        if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the definition's columns")); }
+        let header = EventHeader {
+            iid: Iid(row.iid), system_from: Timestamp(row.system_from), commit_position: 0,
+            valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op,
+        };
+        let values = row.values.iter().map(|tokens| tokens.as_ref().map(StringArray::from_iter_values)).collect();
+        let sql_id = match &row.identity {
+            Some(EntityId::Integer(id)) if EntityId::Integer(*id).iid() == header.iid => Some(*id),
+            _ => None,
+        };
+        Ok(IndexedRow { header, key: row.identity.as_ref().map(|id| Cow::Owned(id.handle_bytes())), sql_id, values })
+    }
 }
 
 /// Lifespans, in weeks, below which a document falls into each class but the last, which is unbounded.
@@ -81,27 +123,6 @@ impl Section {
 /// A trie's recency as an instant: no row of it is visible from then on.
 pub fn ceiling_of(recency: Option<rtdb_types::CivilDate>) -> Option<i64> { recency.map(|date| date.epoch_day().saturating_mul(86_400_000_000)) }
 
-/// Sections as an artefact record's stats hold them.
-pub fn encode_sections(sections: &[Section]) -> Vec<u8> {
-    let mut bytes = vec![sections.len() as u8];
-    for section in sections {
-        bytes.push(section.class);
-        for value in [section.valid_from, section.valid_to, section.system_from, section.system_to, section.birth, section.death] { bytes.extend_from_slice(&value.to_le_bytes()); }
-    }
-    bytes
-}
-
-/// The sections a record's stats hold, or `None` for stats in no form this version wrote.
-pub fn decode_sections(bytes: &[u8]) -> Option<Vec<Section>> {
-    let (count, rest) = bytes.split_first()?;
-    if rest.len() != *count as usize * 49 { return None; }
-    Some(rest.chunks_exact(49).map(|chunk| {
-        let at = |index: usize| i64::from_le_bytes(chunk[1 + index * 8..9 + index * 8].try_into().unwrap_or_default());
-        Section { class: chunk[0], valid_from: at(0), valid_to: at(1), system_from: at(2), system_to: at(3), birth: at(4), death: at(5) }
-    }).collect())
-}
-
-/// A document's lifespan class, from its rectangles clipped to the trie's ceiling.
 fn lifespan(rectangles: &[[i64; 4]], ceiling: i64) -> (u8, Section) {
     let mut bounds = Section::of(0, rectangles[0], ceiling);
     for rectangle in &rectangles[1..] { bounds.widen(&Section::of(0, *rectangle, ceiling)); }
@@ -118,11 +139,10 @@ pub struct DocMatch { pub doc: u32, pub iid: [u8; 16], pub member: u32 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyedEvent { pub system_from: i64, pub valid_from: i64, pub valid_to: i64, pub op: EventOp }
 
-fn schema(columns: &[String]) -> (Schema, Vec<Field>) {
-    let mut builder = Schema::builder();
-    let text = TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqsAndPositions).set_fieldnorms(true));
-    let fields = columns.iter().map(|column| builder.add_text_field(&format!("c_{column}"), text.clone())).collect();
-    (builder.build(), fields)
+impl From<rtdb_types::EventHeader> for KeyedEvent {
+    fn from(header: rtdb_types::EventHeader) -> Self {
+        Self { system_from: header.system_from.0, valid_from: header.valid_time.lower().0, valid_to: header.valid_time.upper().0, op: header.op }
+    }
 }
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()) }
@@ -131,735 +151,562 @@ fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file"
 fn op_code(op: EventOp) -> u8 { match op { EventOp::Put => 0, EventOp::Delete => 1, EventOp::Erase => 2 } }
 fn op_of(code: u8) -> Result<EventOp> { match code { 0 => Ok(EventOp::Put), 1 => Ok(EventOp::Delete), 2 => Ok(EventOp::Erase), _ => Err(corrupt("Search file key has no such operation")) } }
 
-/// Builds the bundled search file over rows in data-file order, as one page, in memory.
-pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str) -> Result<Vec<u8>> {
-    let mut bundle = Vec::new();
-    write_search_file(columns, [Ok(rows.to_vec())], identity, None, RamDirectory::create(), &mut bundle)?;
-    Ok(bundle)
-}
-
-/// A member's starting offsets in the shared page and document sequences.
-#[derive(Clone, Copy)]
-struct MemberStart { page: u32, doc: u32 }
-
-/// What the writer accumulates beside tantivy's segment, to become the sidecar.
-struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
-
-/// One entity's rows while they arrive: each row's position and header, and per column, its value as an index into the column's distinct values.
-#[derive(Default)]
-struct Entity { iid: Option<[u8; 16]>, rows: Vec<(u32, EventHeader)>, values: Vec<(Vec<Option<usize>>, Vec<Vec<String>>, std::collections::HashMap<Vec<String>, usize>)> }
-
-impl Entity {
-    fn new(columns: usize) -> Self { Self { values: (0..columns).map(|_| Default::default()).collect(), ..Self::default() } }
-    fn push(&mut self, ordinal: u32, row: SearchRow) -> Result<()> {
-        self.iid = Some(row.iid);
-        self.rows.push((ordinal, EventHeader { iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
-        for ((indices, distinct, seen), value) in self.values.iter_mut().zip(row.values) {
-            indices.push(value.map(|tokens| *seen.entry(tokens.clone()).or_insert_with(|| { distinct.push(tokens); distinct.len() - 1 })));
-        }
-        Ok(())
-    }
-}
-
-/// Builds the search file over a data file's pages of rows, in order, building its segment in `directory` and writing the bundle to `output`.
-/// The bytes are a function of the rows, their pages, the columns, `identity` and `ceiling` alone, wherever the segment is built, so every builder of one job writes the same object.
-pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(columns: &[String], pages: impl IntoIterator<Item = Result<Vec<SearchRow>>>, identity: &str, ceiling: Option<i64>, directory: D, output: W) -> Result<Vec<Section>> {
-    write_group_search_file(columns, [pages], identity, ceiling, directory, output)
-}
-
-/// Builds one search file over its members' data files in bucket order.
-/// Siblings share the same recency ceiling, and the returned sections bound the whole file.
-pub fn write_group_search_file<D, W, P>(columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, ceiling: Option<i64>, directory: D, output: W) -> Result<Vec<Section>>
-where
-    D: Directory + Clone + 'static,
-    W: std::io::Write,
-    P: IntoIterator<Item = Result<Vec<SearchRow>>>,
-{
-    let (schema, fields) = schema(columns);
-    let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
-    let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
-    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
-    let mut rows = 0u32;
-    let mut previous_member_iid = None;
-    for pages in members {
-        sidecar.member_starts.push(MemberStart {
-            page: u32::try_from(sidecar.page_starts.len()).map_err(fault)?,
-            doc: u32::try_from(sidecar.doc_iids.len()).map_err(fault)?,
-        });
-        let mut entity = Entity::new(columns.len());
-        for page in pages {
-            sidecar.page_starts.push(rows);
-            for row in page? {
-                if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
-                if entity.iid.is_none() && previous_member_iid.is_some_and(|iid| iid >= row.iid) {
-                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));
-                }
-                if entity.iid.is_some_and(|iid| iid > row.iid) { return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID order")); }
-                if entity.iid.is_some_and(|iid| iid != row.iid) { runs(&mut writer, &fields, &mut sidecar, std::mem::replace(&mut entity, Entity::new(columns.len())))?; }
-                if entity.rows.last().is_some_and(|(_, last)| last.system_from.0 < row.system_from) { return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order")); }
-                for docs in &mut sidecar.row_docs { docs.push(NO_DOC); }
-                sidecar.keys.extend_from_slice(&row.iid);
-                for value in [row.system_from, row.valid_from, row.valid_to] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }
-                sidecar.keys.push(op_code(row.op));
-                entity.push(rows, row)?;
-                rows = rows.checked_add(1).ok_or_else(|| fault("A search file holds at most u32::MAX rows"))?;
-            }
-        }
-        previous_member_iid = entity.iid.or(previous_member_iid);
-        runs(&mut writer, &fields, &mut sidecar, entity)?;
-    }
-    if sidecar.member_starts.is_empty() { return Err(fault("A search file holds at least one member")); }
-    writer.finalize().map_err(fault)?;
-    let bytes = encode(&Index::open(directory.clone()).map_err(fault)?, &fields, rows, &sidecar)?;
-    directory.atomic_write(Path::new(SIDECAR), &bytes).map_err(fault)?;
-    bundle(&directory, &segment_uuid(identity), output)?;
-    Ok(sidecar.sections.into_values().collect())
-}
-
-fn coalesce(mut rectangles: Vec<[i64; 4]>) -> Vec<[i64; 4]> {
-    rectangles.sort_unstable_by_key(|rectangle| (rectangle[2], rectangle[3], rectangle[0]));
-    let mut merged = Vec::with_capacity(rectangles.len());
-    for rectangle in rectangles {
-        if let Some(last) = merged.last_mut()
-            && let Some(joined) = merge_adjacent_valid_time(*last, rectangle)
-        {
-            *last = joined;
-        } else {
-            merged.push(rectangle);
-        }
-    }
-    merged.sort_unstable_by_key(|rectangle| (rectangle[2], rectangle[0]));
-    merged
-}
-
-/// One entity's rows become its text runs, per column: a document for each distinct value its visible versions hold there, with every rectangle where one of them is visible.
-/// A visible version whose column is null or absent belongs to no run of that column, and is marked as null.
-fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sidecar: &mut Accumulated, entity: Entity) -> Result<()> {
-    let Some(iid) = entity.iid else { return Ok(()) };
-    let mut visible: Vec<Vec<[i64; 4]>> = vec![Vec::new(); entity.rows.len()];
-    for (index, rectangle) in rtdb_temporal::visibility(entity.rows.iter().enumerate().map(|(index, (_, header))| (header, index)))? {
-        visible[index].push([rectangle.valid_time.lower().0, rectangle.valid_time.upper().0, rectangle.system_time.lower().0, rectangle.system_time.upper().0]);
-    }
-    for (column, ((indices, distinct, _), field)) in entity.values.into_iter().zip(fields).enumerate() {
-        let mut members: Vec<Vec<usize>> = vec![Vec::new(); distinct.len()];
-        for (index, value) in indices.iter().enumerate() {
-            if visible[index].is_empty() { continue; }
-            match value { Some(value) => members[*value].push(index), None => sidecar.row_docs[column][entity.rows[index].0 as usize] = NULL_DOC }
-        }
-        for (tokens, members) in distinct.into_iter().zip(members) {
-            if members.is_empty() { continue; }
-            let doc = u32::try_from(sidecar.doc_iids.len()).map_err(fault)?;
-            let mut document = TantivyDocument::new();
-            if !tokens.is_empty() {
-                let mut offset = 0;
-                let tokens = tokens.into_iter().enumerate().map(|(position, text)| {
-                    let token = Token { offset_from: offset, offset_to: offset + text.len(), position, text, position_length: 1 };
-                    offset = token.offset_to + 1;
-                    token
-                }).collect();
-                document.add_pre_tokenized_text(*field, PreTokenizedString { text: String::new(), tokens });
-            }
-            writer.add_document(document).map_err(fault)?;
-            let rectangles = coalesce(members.iter().flat_map(|index| visible[*index].iter().copied()).collect());
-            let (class, bounds) = lifespan(&rectangles, sidecar.ceiling);
-            sidecar.sections.entry(class).and_modify(|section| section.widen(&bounds)).or_insert(bounds);
-            sidecar.doc_classes.push(class);
-            sidecar.rectangles.extend(rectangles);
-            sidecar.rectangle_starts.push(u32::try_from(sidecar.rectangles.len()).map_err(fault)?);
-            sidecar.doc_iids.push(iid);
-            sidecar.column_docs[column] += 1;
-            for index in members { sidecar.row_docs[column][entity.rows[index].0 as usize] = doc; }
-        }
-    }
-    Ok(())
-}
-
-/// A term's documents within one window: the highest frequency among them, and the shortest stored length.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Impact { window: u32, frequency: u32, length: u32 }
-
-/// Every window holding the term, in order, from its postings.
-fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tantivy::fieldnorm::FieldNormReader) -> Vec<Impact> {
-    use tantivy::{DocSet, postings::Postings};
-    let mut impacts: Vec<Impact> = Vec::new();
-    let mut doc = postings.doc();
-    while doc != tantivy::TERMINATED {
-        let (window, frequency, length) = (window_of(doc), postings.term_freq(), lengths.fieldnorm(doc));
-        match impacts.last_mut() {
-            Some(last) if last.window == window => {
-                (last.frequency, last.length) = extend_impact(last.frequency, last.length, frequency, length);
-            }
-            _ => impacts.push(Impact { window, frequency, length }),
-        }
-        doc = postings.advance();
-    }
-    impacts
-}
-
-/// The sidecar, in order: row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID and lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
-fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let documents = sidecar.doc_iids.len() as u32;
-    for count in [rows, documents, sidecar.page_starts.len() as u32, u32::try_from(sidecar.member_starts.len()).map_err(fault)?] {
-        bytes.extend_from_slice(&count.to_le_bytes());
-    }
-    for member in &sidecar.member_starts {
-        bytes.extend_from_slice(&member.page.to_le_bytes());
-        bytes.extend_from_slice(&member.doc.to_le_bytes());
-    }
-    for value in sidecar.page_starts.iter().chain(&sidecar.column_docs).chain(sidecar.row_docs.iter().flatten()) { bytes.extend_from_slice(&value.to_le_bytes()); }
-    for iid in &sidecar.doc_iids { bytes.extend_from_slice(iid); }
-    bytes.extend_from_slice(&sidecar.doc_classes);
-    bytes.extend_from_slice(&encode_sections(&sidecar.sections.values().copied().collect::<Vec<_>>()));
-    for start in &sidecar.rectangle_starts { bytes.extend_from_slice(&start.to_le_bytes()); }
-    for rectangle in &sidecar.rectangles { for value in rectangle { bytes.extend_from_slice(&value.to_le_bytes()); } }
-    bytes.extend_from_slice(&sidecar.keys);
-    let reader = index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
-    let searcher = reader.searcher();
-    let mut entries = Vec::new();
-    for segment in searcher.segment_readers() {
-        for (column, field) in fields.iter().enumerate() {
-            let inverted = segment.inverted_index(*field).map_err(fault)?;
-            let lengths = segment.get_fieldnorms_reader(*field).map_err(fault)?;
-            let mut terms = inverted.terms().stream().map_err(fault)?;
-            while terms.advance() {
-                if terms.value().doc_freq < STORED_IMPACTS { continue; }
-                let mut postings = inverted.read_postings_from_terminfo(terms.value(), IndexRecordOption::WithFreqs).map_err(fault)?;
-                entries.push((column as u32, terms.key().to_vec(), impacts_of(&mut postings, &lengths)));
-            }
-        }
-    }
-    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (column, term, impacts) in entries {
-        bytes.extend_from_slice(&column.to_le_bytes());
-        bytes.extend_from_slice(&u16::try_from(term.len()).map_err(fault)?.to_le_bytes());
-        bytes.extend_from_slice(&term);
-        bytes.extend_from_slice(&(impacts.len() as u32).to_le_bytes());
-        for impact in impacts { for value in [impact.window, impact.frequency, impact.length] { bytes.extend_from_slice(&value.to_le_bytes()); } }
-    }
-    bytes.extend_from_slice(&checksum(&bytes));
-    Ok(bytes)
-}
-
-/// Tantivy checks its own files; the sidecar's bounds and nulls decide results, so it is checked too.
-fn checksum(bytes: &[u8]) -> [u8; 8] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)[..8].try_into().unwrap_or_default()
-}
-
-/// A uuid-shaped name derived from the job's identity, standing in for tantivy's random segment id.
-fn segment_uuid(identity: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(identity.as_bytes());
-    digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn bundle(directory: &dyn Directory, uuid: &str, mut output: impl std::io::Write) -> Result<()> {
-    let meta = String::from_utf8(directory.atomic_read(Path::new("meta.json")).map_err(fault)?).map_err(fault)?;
-    let parsed: serde_json::Value = serde_json::from_str(&meta).map_err(fault)?;
-    let segments = parsed.get("segments").and_then(serde_json::Value::as_array).ok_or_else(|| fault("Search index meta has no segments"))?;
-    let original = match segments.as_slice() {
-        [] => None,
-        [segment] => Some(segment.get("segment_id").and_then(serde_json::Value::as_str).ok_or_else(|| fault("Search segment has no id"))?.replace('-', "")),
-        _ => return Err(fault("A search file holds exactly one segment")),
-    };
-    let rename = |name: &str| original.as_ref().map_or(name.to_string(), |original| name.replace(original, uuid));
-    let meta = original.as_ref().map_or(meta.clone(), |original| {
-        let dashed = |id: &str| format!("{}-{}-{}-{}-{}", &id[..8], &id[8..12], &id[12..16], &id[16..20], &id[20..]);
-        meta.replace(&dashed(original), &dashed(uuid)).replace(original, uuid)
-    });
-    let mut files: BTreeMap<String, Option<PathBuf>> = BTreeMap::from([("meta.json".to_string(), None), (SIDECAR.to_string(), Some(PathBuf::from(SIDECAR)))]);
-    if let Some(original) = &original {
-        for extension in ["idx", "term", "fieldnorm", "fast", "store", "pos"] {
-            let path = PathBuf::from(format!("{original}.{extension}"));
-            if directory.exists(&path).map_err(fault)? { files.insert(rename(&path.to_string_lossy()), Some(path)); }
-        }
-    }
-    let write = |output: &mut dyn std::io::Write, bytes: &[u8]| output.write_all(bytes).map_err(fault);
-    write(&mut output, MAGIC)?;
-    let mut position = MAGIC.len() as u64;
-    let mut index = Vec::new();
-    for (name, source) in &files {
-        let length = match source {
-            None => { write(&mut output, meta.as_bytes())?; meta.len() }
-            Some(path) => {
-                let bytes = directory.open_read(path).map_err(fault)?.read_bytes().map_err(fault)?;
-                write(&mut output, bytes.as_slice())?;
-                bytes.len()
-            }
-        } as u64;
-        index.push((name.clone(), position, length));
-        position += length;
-    }
-    let mut footer = Vec::new();
-    footer.extend_from_slice(&(index.len() as u32).to_le_bytes());
-    for (name, offset, length) in index {
-        footer.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        footer.extend_from_slice(name.as_bytes());
-        footer.extend_from_slice(&offset.to_le_bytes());
-        footer.extend_from_slice(&length.to_le_bytes());
-    }
-    footer.extend_from_slice(&position.to_le_bytes());
-    footer.extend_from_slice(MAGIC);
-    write(&mut output, &footer)?;
-    output.flush().map_err(fault)
-}
-
-/// The bytes a search file is read from: the object as read, a lease on the buffer pool's copy of it, or this node's local file mapped into memory.
-pub enum Source { Bytes(bytes::Bytes), Lease(rtdb_storage::cache::CacheLease), Mapped(memmap2::Mmap, rtdb_storage::LocalFile) }
-impl From<bytes::Bytes> for Source { fn from(bytes: bytes::Bytes) -> Self { Self::Bytes(bytes) } }
-impl From<Vec<u8>> for Source { fn from(bytes: Vec<u8>) -> Self { Self::Bytes(bytes.into()) } }
-impl From<rtdb_storage::cache::CacheLease> for Source { fn from(lease: rtdb_storage::cache::CacheLease) -> Self { Self::Lease(lease) } }
-impl std::ops::Deref for Source {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] { match self { Self::Bytes(bytes) => bytes, Self::Lease(lease) => lease.as_slice(), Self::Mapped(map, _) => map } }
-}
-
-impl Source {
-    /// Maps a local file whose object is immutable.
-    pub fn mapped(local: rtdb_storage::LocalFile) -> Result<Self> {
-        // SAFETY: an object is never rewritten under its key, and the local file is held for as long as the map, so the mapped bytes do not change beneath it.
-        let map = unsafe { memmap2::Mmap::map(local.file()) }.map_err(fault)?;
-        Ok(Self::Mapped(map, local))
-    }
-}
-// SAFETY: every owner keeps its bytes at a fixed address for as long as it lives, wherever it moves: behind a reference count, or in a mapping.
-unsafe impl stable_deref_trait::StableDeref for Source {}
-
-/// A read-only directory over an immutable search bundle.
-#[derive(Clone)]
-struct BundleDirectory { bytes: FileSlice, files: Arc<BTreeMap<PathBuf, Range<usize>>> }
-
-impl std::fmt::Debug for BundleDirectory {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.debug_struct("BundleDirectory").field("files", &self.files.keys()).finish() }
-}
-
-impl BundleDirectory {
-    fn open(bytes: FileSlice) -> Result<Self> {
-        let len = bytes.len();
-        if len < 2 * MAGIC.len() + 8 { return Err(corrupt("Search file has no bundle magic")); }
-        let trailer = bytes.slice(len - 16..).read_bytes().map_err(fault)?;
-        let head = bytes.slice(..8).read_bytes().map_err(fault)?;
-        if head.as_slice() != MAGIC || trailer.len() != 16 || &trailer.as_slice()[8..] != MAGIC {
-            return Err(corrupt("Search file has no bundle magic"));
-        }
-        let footer = usize::try_from(u64::from_le_bytes(trailer.as_slice()[..8].try_into().map_err(fault)?)).map_err(fault)?;
-        if !(8..=len - 16).contains(&footer) { return Err(corrupt("Search file footer is out of range")); }
-        let footer_bytes = bytes.slice(footer..len - 16).read_bytes().map_err(fault)?;
-        let mut cursor = footer_bytes.as_slice();
-        let mut take = |count: usize| -> Result<&[u8]> {
-            if cursor.len() < count { return Err(corrupt("Search file footer is truncated")); }
-            let (head, tail) = cursor.split_at(count);
-            cursor = tail;
-            Ok(head)
-        };
-        let count = u32::from_le_bytes(take(4)?.try_into().map_err(fault)?);
-        let mut files = BTreeMap::new();
-        for _ in 0..count {
-            let length = u16::from_le_bytes(take(2)?.try_into().map_err(fault)?) as usize;
-            let name = std::str::from_utf8(take(length)?).map_err(fault)?.to_string();
-            let offset = usize::try_from(u64::from_le_bytes(take(8)?.try_into().map_err(fault)?)).map_err(fault)?;
-            let size = usize::try_from(u64::from_le_bytes(take(8)?.try_into().map_err(fault)?)).map_err(fault)?;
-            let end = offset.checked_add(size).filter(|end| *end <= footer).ok_or_else(|| corrupt("Search file entry is out of range"))?;
-            files.insert(PathBuf::from(name), offset..end);
-        }
-        Ok(Self { bytes, files: Arc::new(files) })
-    }
-    fn read_only(path: &Path) -> std::io::Error { std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("Search file is read-only: {}", path.display())) }
-}
-
-impl Directory for BundleDirectory {
-    fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
-        let range = self.files.get(path).ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))?;
-        Ok(Arc::new(self.bytes.slice(range.clone())))
-    }
-    fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> { Err(DeleteError::IoError { io_error: Arc::new(Self::read_only(path)), filepath: path.to_path_buf() }) }
-    fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> { Ok(self.files.contains_key(path)) }
-    fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> { Err(OpenWriteError::wrap_io_error(Self::read_only(path), path.to_path_buf())) }
-    fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> { Ok(self.get_file_handle(path)?.read_bytes(0..self.files[path].len()).map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?.as_slice().to_vec()) }
-    fn atomic_write(&self, path: &Path, _: &[u8]) -> std::io::Result<()> { Err(Self::read_only(path)) }
-    fn sync_directory(&self) -> std::io::Result<()> { Ok(()) }
-    fn acquire_lock(&self, _: &tantivy::directory::Lock) -> std::result::Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
-        Ok(tantivy::directory::DirectoryLock::from(Box::new(())))
-    }
-    fn watch(&self, _: WatchCallback) -> tantivy::Result<WatchHandle> { Ok(WatchHandle::empty()) }
-}
-
-/// What the sidecar holds, located within the bundle's bytes.
-struct Sidecar { bytes: OwnedBytes, rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
-
-impl Sidecar {
-    fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
-        let whole = bytes.as_slice();
-        let (data, sum) = whole.split_at_checked(whole.len().saturating_sub(8)).ok_or_else(|| corrupt("Search file sidecar is truncated"))?;
-        if sum.len() != 8 || checksum(data) != sum { return Err(corrupt("Search file sidecar fails its checksum")); }
-        let mut position = 0usize;
-        let mut take = |count: usize| -> Result<Range<usize>> {
-            let end = position.checked_add(count).filter(|end| *end <= data.len()).ok_or_else(|| corrupt("Search file sidecar is truncated"))?;
-            let range = position..end;
-            position = end;
-            Ok(range)
-        };
-        let u32_at = |range: Range<usize>| u32::from_le_bytes(data[range].try_into().unwrap_or_default());
-        let (rows, counted, pages) = (u32_at(take(4)?), u32_at(take(4)?), u32_at(take(4)?) as usize);
-        if counted != documents { return Err(corrupt("Search file sidecar counts other documents than its segment")); }
-        let members = u32_at(take(4)?) as usize;
-        let member_starts = (0..members).map(|_| {
-            Ok(MemberStart { page: u32_at(take(4)?), doc: u32_at(take(4)?) })
-        }).collect::<Result<Vec<_>>>()?;
-        if !member_starts.first().is_some_and(|first| first.page == 0 && first.doc == 0)
-            || member_starts.windows(2).any(|pair| pair[0].page > pair[1].page || pair[0].doc > pair[1].doc)
-            || member_starts.last().is_some_and(|last| last.page as usize > pages || last.doc > documents)
-        {
-            return Err(corrupt("Search file member starts are out of order"));
-        }
-        let page_starts = (0..pages).map(|_| take(4).map(u32_at)).collect::<Result<Vec<_>>>()?;
-        if page_starts.first().is_some_and(|first| *first != 0) || page_starts.windows(2).any(|pair| pair[0] > pair[1]) || page_starts.last().is_some_and(|last| *last > rows) {
-            return Err(corrupt("Search file page starts are out of order"));
-        }
-        let column_docs = (0..columns).map(|_| take(4).map(u32_at)).collect::<Result<Vec<_>>>()?;
-        if column_docs.iter().map(|count| u64::from(*count)).sum::<u64>() != u64::from(documents) { return Err(corrupt("Search file columns count other documents than it holds")); }
-        let row_docs = take(rows as usize * columns * 4)?;
-        if data[row_docs.clone()].chunks_exact(4).any(|chunk| { let doc = u32::from_le_bytes(chunk.try_into().unwrap_or_default()); doc != NO_DOC && doc != NULL_DOC && doc >= documents }) {
-            return Err(corrupt("Search file row names no document"));
-        }
-        let doc_iids = take(documents as usize * 16)?.start;
-        let doc_classes = take(documents as usize)?.start;
-        let counted = take(1)?;
-        let body = take(data[counted.start] as usize * 49)?;
-        let sections = decode_sections(&data[counted.start..body.end]).ok_or_else(|| corrupt("Search file sections are malformed"))?;
-        if data[doc_classes..doc_classes + documents as usize].iter().any(|class| !sections.iter().any(|section| section.class == *class)) { return Err(corrupt("Search file document has no section")); }
-        let starts = take((documents as usize + 1) * 4)?;
-        let rectangle_starts: Vec<u32> = data[starts.clone()].chunks_exact(4).map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap_or_default())).collect();
-        if rectangle_starts.first() != Some(&0) || rectangle_starts.windows(2).any(|pair| pair[0] > pair[1]) { return Err(corrupt("Search file rectangles are out of order")); }
-        let rectangles = take(*rectangle_starts.last().unwrap_or(&0) as usize * 32)?.start;
-        let keys = take(rows as usize * KEY_BYTES)?.start;
-        let entries = u32_at(take(4)?);
-        let mut impacts = BTreeMap::new();
-        for _ in 0..entries {
-            let column = u32_at(take(4)?);
-            let length = take(2)?;
-            let term = data[take(u16::from_le_bytes(data[length].try_into().unwrap_or_default()) as usize)?].to_vec();
-            let windows = u32_at(take(4)?) as usize;
-            let range = take(windows.checked_mul(12).ok_or_else(|| corrupt("Search file impacts overflow"))?)?;
-            let ascending = data[range.clone()].chunks_exact(12).map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])).collect::<Vec<_>>().windows(2).all(|pair| pair[0] < pair[1]);
-            if !ascending || column as usize >= columns { return Err(corrupt("Search file impacts are out of order")); }
-            impacts.insert((column, term), range);
-        }
-        if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
-        Ok(Self { bytes, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
-    }
-    fn data(&self) -> &[u8] { self.bytes.as_slice() }
-    fn u32_at(&self, offset: usize) -> u32 { u32::from_le_bytes(self.data()[offset..offset + 4].try_into().unwrap_or_default()) }
-    fn i64_at(&self, offset: usize) -> i64 { i64::from_le_bytes(self.data()[offset..offset + 8].try_into().unwrap_or_default()) }
-    fn impacts(&self, column: u32, term: &str) -> Option<Vec<Impact>> {
-        let range = self.impacts.get(&(column, term.as_bytes().to_vec()))?;
-        Some(self.data()[range.clone()].chunks_exact(12).map(|chunk| {
-            let at = |offset: usize| u32::from_le_bytes([chunk[offset], chunk[offset + 1], chunk[offset + 2], chunk[offset + 3]]);
-            Impact { window: at(0), frequency: at(4), length: at(8) }
-        }).collect())
-    }
-    /// A row's place among a column's runs.
-    fn row_doc(&self, column: usize, row: u32) -> RowDoc {
-        if row >= self.rows || column >= self.column_docs.len() { return RowDoc::Invisible; }
-        match self.u32_at(self.row_docs + (column * self.rows as usize + row as usize) * 4) { NO_DOC => RowDoc::Invisible, NULL_DOC => RowDoc::Null, doc => RowDoc::Run(doc) }
-    }
-    fn section(&self, doc: u32) -> Option<&Section> { let class = self.data()[self.doc_classes + doc as usize]; self.sections.iter().find(|section| section.class == class) }
-    fn member_pages(&self, member: u32) -> Result<Range<usize>> {
-        let member = member as usize;
-        let first = self.member_starts.get(member).ok_or_else(|| corrupt("Search file has no such member"))?.page as usize;
-        let end = self.member_starts.get(member + 1).map_or(self.page_starts.len(), |start| start.page as usize);
-        Ok(first..end)
-    }
-    fn doc_match(&self, doc: u32) -> DocMatch {
-        let member = self.member_starts.partition_point(|start| start.doc <= doc) - 1;
-        DocMatch { doc, iid: self.doc_iid(doc), member: member as u32 }
-    }
-    fn doc_iid(&self, doc: u32) -> [u8; 16] { self.data()[self.doc_iids + doc as usize * 16..][..16].try_into().unwrap_or_default() }
-    fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ {
-        let (start, end) = (self.u32_at(self.rectangle_starts + doc as usize * 4), self.u32_at(self.rectangle_starts + (doc as usize + 1) * 4));
-        (start..end).map(move |index| { let at = self.rectangles + index as usize * 32; [self.i64_at(at), self.i64_at(at + 8), self.i64_at(at + 16), self.i64_at(at + 24)] })
-    }
-    fn row_iid(&self, row: u32) -> &[u8] { &self.data()[self.keys + row as usize * KEY_BYTES..][..16] }
-    /// The rows of one entity's events, IID being the rows' order.
-    fn rows_of(&self, iid: &[u8; 16]) -> Range<u32> {
-        let (mut low, mut high) = (0u32, self.rows);
-        while low < high { let middle = low + (high - low) / 2; if self.row_iid(middle) < &iid[..] { low = middle + 1; } else { high = middle; } }
-        let start = low;
-        high = self.rows;
-        while low < high { let middle = low + (high - low) / 2; if self.row_iid(middle) <= &iid[..] { low = middle + 1; } else { high = middle; } }
-        start..low
-    }
-    fn key(&self, row: u32) -> Result<KeyedEvent> {
-        let at = self.keys + row as usize * KEY_BYTES + 16;
-        Ok(KeyedEvent { system_from: self.i64_at(at), valid_from: self.i64_at(at + 8), valid_to: self.i64_at(at + 16), op: op_of(self.data()[at + 24])? })
-    }
-}
-
-/// Where a row stands in one column: visible nowhere within the file, visible with the column null or absent, or visible in a run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RowDoc { Invisible, Null, Run(u32) }
-
 pub fn meets(rectangle: [i64; 4], bounds: TemporalBounds) -> bool {
     rectangle[0] < bounds.valid_time.upper().0 && bounds.valid_time.lower().0 < rectangle[1] && rectangle[2] < bounds.system_time.upper().0 && bounds.system_time.lower().0 < rectangle[3]
 }
 
-/// An opened search file.
-/// The searcher is made once: a search file never changes, so neither does its one segment's reader.
-pub struct SearchFile { searcher: tantivy::Searcher, columns: Vec<String>, sidecar: Sidecar }
+
+fn sections_array(sections: &[Section]) -> Result<StructArray> {
+    let instants = |instant: fn(&Section) -> i64| Arc::new(Int64Array::from_iter_values(sections.iter().map(instant)));
+    layout::Table::Sections.array(vec![
+        Arc::new(UInt8Array::from_iter_values(sections.iter().map(|section| section.class))),
+        instants(|section| section.valid_from),
+        instants(|section| section.valid_to),
+        instants(|section| section.system_from),
+        instants(|section| section.system_to),
+        instants(|section| section.birth),
+        instants(|section| section.death),
+    ])
+}
+
+fn sections_of(array: &StructArray) -> Result<Vec<Section>> {
+    let classes = array.column(0).as_primitive::<UInt8Type>();
+    if array.len() > LIFESPAN_WEEKS.len() + 1 || array.columns().iter().any(|column| column.null_count() != 0)
+        || classes.values().windows(2).any(|pair| pair[0] >= pair[1])
+        || classes.values().last().is_some_and(|&class| class as usize > LIFESPAN_WEEKS.len())
+    {
+        return Err(corrupt("Search file has invalid lifespan sections"));
+    }
+    let bounds: [_; 6] = std::array::from_fn(|index| array.column(index + 1).as_primitive::<Int64Type>());
+    Ok((0..array.len()).map(|row| {
+        let [valid_from, valid_to, system_from, system_to, birth, death] = bounds.map(|column| column.value(row));
+        Section { class: classes.value(row), valid_from, valid_to, system_from, system_to, birth, death }
+    }).collect())
+}
+
+pub fn encode_sections(sections: &[Section]) -> Result<Vec<u8>> {
+    encode_catalog_stats(sections, None)
+}
+
+const FOOTER_LOCATOR: &str = "rtdb.search.footer";
+const ROOT_LOCATOR: &str = "rtdb.search.root";
+
+pub(crate) fn encode_catalog_stats(sections: &[Section], footer: Option<&FooterLocator>) -> Result<Vec<u8>> {
+    let metadata = footer.map(|footer| (FOOTER_LOCATOR.to_string(), footer.encode())).into_iter().collect();
+    encode_sections_with(sections, metadata)
+}
+
+pub(crate) fn encode_tree_stats(sections: &[Section], locator: &TreeLocator) -> Result<Vec<u8>> {
+    encode_sections_with(sections, [(ROOT_LOCATOR.to_owned(), locator.encode())].into_iter().collect())
+}
+
+fn encode_sections_with(sections: &[Section], metadata: std::collections::HashMap<String, String>) -> Result<Vec<u8>> {
+    let sections = sections_array(sections)?;
+    let schema = Arc::new(Schema::new_with_metadata(layout::section_fields(), metadata));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), sections.columns().to_vec()).map_err(fault)?;
+    rtdb_format::ipc::write_arrow_stream(&schema, &[batch], arrow_ipc::writer::IpcWriteOptions::default())
+}
+
+pub(crate) fn decode_tree_locator(bytes: &[u8]) -> Option<TreeLocator> {
+    let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None).ok()?;
+    TreeLocator::decode(reader.schema().metadata().get(ROOT_LOCATOR)?)
+}
+
+pub(crate) fn decode_footer_locator(bytes: &[u8]) -> Option<FooterLocator> {
+    let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None).ok()?;
+    FooterLocator::decode(reader.schema().metadata().get(FOOTER_LOCATOR)?)
+}
+
+pub fn decode_sections(bytes: &[u8]) -> Option<Vec<Section>> {
+    let mut reader = match arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None) {
+        Ok(reader) => reader,
+        Err(_) => return legacy11::decode_sections(bytes).map(|sections| sections.into_iter().map(legacy11::Section::into_arrow).collect()),
+    };
+    if reader.schema().fields() != &layout::section_fields() { return None; }
+    let batch = reader.next()?.ok()?;
+    if reader.next().is_some() { return None; }
+    sections_of(&StructArray::from(batch)).ok()
+}
+
+pub(crate) fn artefact_identity(table_slug: &str, owner: &rtdb_format::keys::ArtefactOwner, id: &str, version: i64) -> String {
+    format!("{table_slug}/{owner}/{id}/v{version}")
+}
+
+struct ConversionOutput<'a, 'file> {
+    writer: &'a mut std::io::BufWriter<&'file std::fs::File>,
+    error: &'a mut Option<Anomaly>,
+}
+
+impl Write for ConversionOutput<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(bytes).inspect_err(|error| *self.error = Some(transcode_io(error)))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush().inspect_err(|error| *self.error = Some(transcode_io(error)))
+    }
+}
+
+fn transcode_io(error: impl std::fmt::Display) -> Anomaly {
+    Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.search/transcode-io", error.to_string())
+}
+
+fn artefact_digest(identity: &str) -> [u8; 32] { Sha256::digest(identity.as_bytes()).into() }
+
+pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_search_file(columns, [Ok(rows.to_vec())], identity, None, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Writes one Arrow search file over a trie's rows.
+pub fn write_search_file(columns: &[String], pages: impl IntoIterator<Item = Result<Vec<SearchRow>>>, identity: &str, ceiling: Option<i64>, output: impl Write) -> Result<Vec<Section>> {
+    write_group_search_file(columns, [pages], identity, ceiling, output)
+}
+
+pub(crate) fn write_query_pages<I: SearchPage>(
+    columns: &[String], pages: impl IntoIterator<Item = Result<I>>, ceiling: Option<i64>, output: impl Write,
+    reservation: Arc<rtdb_columnar::MemoryReservation>,
+) -> Result<Vec<Section>> {
+    write::write_group(columns, [pages], "built", None, ceiling, output, Some(reservation), FORMAT_VERSION)
+}
+
+/// Writes one Arrow search file over the members in bucket order with a shared recency ceiling.
+pub fn write_group_search_file<P>(columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, ceiling: Option<i64>, output: impl Write) -> Result<Vec<Section>>
+where P: IntoIterator<Item = Result<Vec<SearchRow>>>,
+{
+    write::write_group(columns, members, identity, None, ceiling, output, None, FORMAT_VERSION)
+}
+
+pub(crate) fn write_versioned_group<P, I>(
+    columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: i64,
+    ceiling: Option<i64>, output: impl Write, reservation: Option<Arc<rtdb_columnar::MemoryReservation>>, format: i32,
+) -> Result<Vec<Section>>
+where P: IntoIterator<Item = Result<I>>, I: SearchPage,
+{
+    write::write_group(columns, members, identity, Some(version), ceiling, output, reservation, format)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowDoc { Invisible, Null, Run(u32) }
+
+/// An immutable search artefact with independently checked Arrow batches.
+pub struct SearchFile {
+    reader: Reader,
+    columns: Vec<String>,
+    manifest: Manifest,
+    validated_postings: Box<[OnceLock<()>]>,
+    _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
+struct TranscodedSearchMap {
+    map: memmap2::Mmap,
+    _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
+impl AsRef<[u8]> for TranscodedSearchMap {
+    fn as_ref(&self) -> &[u8] { &self.map }
+}
 
 impl SearchFile {
     pub fn open(bytes: impl Into<Source>, columns: &[String]) -> Result<Self> {
-        Self::open_slice(FileSlice::from(bytes.into()), columns)
+        let source = bytes.into();
+        let source = if legacy11::is_bundle(source.as_ref()) {
+            legacy11::decode(bytes::Bytes::from_owner(source), columns)?.into()
+        } else { source };
+        Self::open_reader(Reader::from_source(source)?, columns)
     }
 
-    /// Opens a bundle through an immutable range reader.
-    pub fn open_with_ranges(reader: Arc<dyn FileHandle>, columns: &[String]) -> Result<Self> {
-        Self::open_slice(FileSlice::new(reader), columns)
+    pub(crate) fn with_reservation(mut self, reservation: Arc<rtdb_columnar::MemoryReservation>) -> Self {
+        self._reservation = Some(reservation);
+        self
     }
 
-    fn open_slice(bytes: FileSlice, columns: &[String]) -> Result<Self> {
-        let directory = BundleDirectory::open(bytes)?;
-        let sidecar = directory.get_file_handle(Path::new(SIDECAR)).map_err(|_| corrupt("Search file has no sidecar"))?;
-        let sidecar = sidecar.read_bytes(0..sidecar.len()).map_err(fault)?;
-        let index = Index::open(directory).map_err(fault)?;
-        let (expected, _) = schema(columns);
-        if index.schema() != expected { return Err(corrupt("Search file schema does not match its definition")); }
-        let segments = index.searchable_segment_metas().map_err(fault)?;
-        if segments.len() > 1 { return Err(corrupt("A search file holds at most one segment")); }
-        let documents = segments.iter().map(|segment| segment.max_doc()).sum();
-        let reader: tantivy::IndexReader = index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
-        Ok(Self { sidecar: Sidecar::parse(sidecar, columns.len(), documents)?, searcher: reader.searcher(), columns: columns.to_vec() })
+    pub(crate) async fn open_catalog(source: Source, columns: &[String], locator: Option<&FooterLocator>,
+        memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<(Self, Option<usize>)> {
+        if locator.is_some() || !legacy11::is_bundle(source.as_ref()) {
+            return Self::open_located(source, columns, locator).map(|file| (file, None));
+        }
+        let columns = columns.to_vec();
+        let memory = Arc::clone(memory);
+        tokio::task::spawn_blocking(move || {
+            let output = tempfile::tempfile().map_err(transcode_io)?;
+            let mut writer = std::io::BufWriter::new(&output);
+            let mut error = None;
+            let conversion = legacy11::decode_to(bytes::Bytes::from_owner(source), &columns,
+                ConversionOutput { writer: &mut writer, error: &mut error }, Some(&memory));
+            if let Some(error) = error { return Err(error); }
+            conversion?;
+            writer.flush().map_err(transcode_io)?;
+            drop(writer);
+            let bytes = usize::try_from(output.metadata().map_err(transcode_io)?.len()).map_err(transcode_io)?;
+            let reservation = memory.is_prepaid().then(|| memory.reserve(bytes)).transpose()?;
+            // SAFETY: the anonymous file has no other handle and all writes have finished.
+            let map = unsafe { memmap2::Mmap::map(&output) }.map_err(transcode_io)?;
+            let mapped = TranscodedSearchMap { map, _reservation: reservation };
+            Self::open_located(bytes::Bytes::from_owner(mapped).into(), &columns, None).map(|file| (file, Some(bytes)))
+        }).await.map_err(transcode_io)?
+    }
+
+    pub(crate) fn open_located(source: Source, columns: &[String], locator: Option<&FooterLocator>) -> Result<Self> {
+        if let Some(locator) = locator {
+            let bytes = source.as_ref();
+            locator.verify(bytes.get(locator.start..).ok_or_else(|| corrupt("Search file has no catalog footer"))?)?;
+        }
+        Self::open(source, columns)
+    }
+
+    pub(crate) async fn open_remote(storage: &Arc<rtdb_storage::cache::BufferPool>, key: &rtdb_storage::ObjectKey,
+        footer: &FooterLocator, columns: &[String]) -> Result<Self> {
+        Self::open_reader(Reader::remote(storage, key, footer).await?, columns)
+    }
+
+    pub(crate) fn metadata_bytes(&self) -> usize {
+        self.reader.metadata_bytes()
+    }
+
+    pub(crate) async fn prepare_terms(&self, column: &str, queries: &[&Query]) -> Result<()> {
+        let Some(column) = self.column(column) else { return Ok(()); };
+        let mut pages = Vec::new();
+        for text in queries.iter().flat_map(|query| query.terms()).collect::<BTreeSet<_>>() {
+            let Some(term) = self.manifest.term(column, text) else { continue; };
+            if let Some(blocks) = self.manifest.blocks(&term) {
+                let positions = queries.iter().any(|query| needs_positions(query, text));
+                for block in blocks {
+                    pages.push(block.page);
+                    if positions { pages.push(block.page + 1); }
+                }
+            } else {
+                pages.push(term.page);
+            }
+        }
+        self.reader.prefetch(pages).await
+    }
+
+    /// Opens a file backed by byte ranges within an immutable source of the given length.
+    pub fn open_with_ranges(
+        length: usize, read: impl Fn(Range<usize>) -> std::io::Result<Buffer> + Send + Sync + 'static, columns: &[String],
+    ) -> Result<Self> {
+        Self::open_reader(Reader::open(length, move |range| read(range).map_err(fault))?, columns)
+    }
+
+    fn open_reader(reader: Reader, columns: &[String]) -> Result<Self> {
+        let manifest = Manifest::read(&reader, columns)?;
+        let validated_postings = (0..manifest.terms().len()).map(|_| OnceLock::new()).collect();
+        Ok(Self { reader, columns: columns.to_vec(), manifest, validated_postings, _reservation: None })
     }
 
     fn column(&self, column: &str) -> Option<usize> { self.columns.iter().position(|candidate| candidate == column) }
-    fn field(&self, column: &str) -> Option<Field> { self.column(column).map(|index| Field::from_field_id(index as u32)) }
 
-    /// Whether the document is visible anywhere in `bounds` as far as this file's own events decide; events elsewhere can only cut it further.
     pub fn visible(&self, doc: u32, bounds: TemporalBounds) -> bool {
-        self.sidecar.section(doc).is_some_and(|section| section.meets(bounds)) && self.sidecar.rectangles(doc).any(|rectangle| meets(rectangle, bounds))
+        doc < self.manifest.documents
+            && self.sections().iter().find(|section| section.class == self.manifest.doc_class(doc)).is_some_and(|section| section.meets(bounds))
+            && self.rectangles(doc).any(|rectangle| meets(rectangle, bounds))
     }
 
-    /// The bounds of each lifespan class's documents.
-    pub fn sections(&self) -> &[Section] { &self.sidecar.sections }
+    pub fn sections(&self) -> &[Section] { &self.manifest.sections }
 
-    /// The rectangles where the document is visible as far as this file's own events decide, as valid from, valid to, system from, system to.
-    pub fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ { self.sidecar.rectangles(doc) }
+    pub fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ { self.manifest.rectangles(doc) }
 
-    /// Every event of one entity this file's data holds, system time descending.
-    pub fn events(&self, iid: &[u8; 16]) -> Result<Vec<KeyedEvent>> { self.sidecar.rows_of(iid).map(|row| self.sidecar.key(row)).collect() }
+    pub fn events(&self, iid: &[u8; 16]) -> Result<Vec<KeyedEvent>> {
+        self.manifest.rows_of(iid).map(|row| self.manifest.event(row)).collect()
+    }
 
-    /// Every event of one entity this file's data holds, with its row, system time descending.
-    pub fn rows_of(&self, iid: &[u8; 16]) -> Result<Vec<(u32, KeyedEvent)>> { self.sidecar.rows_of(iid).map(|row| Ok((row, self.sidecar.key(row)?))).collect() }
+    pub fn rows_of(&self, iid: &[u8; 16]) -> Result<Vec<(u32, KeyedEvent)>> {
+        self.manifest.rows_of(iid).map(|row| Ok((row, self.manifest.event(row)?))).collect()
+    }
 
-    /// A row's run in a column: `None` where the row is visible nowhere within the file, `Some(None)` where it is visible with the column null or absent.
     pub fn run_of(&self, column: &str, row: u32) -> Option<Option<u32>> {
-        match self.column(column).map(|index| self.sidecar.row_doc(index, row)) { Some(RowDoc::Run(doc)) => Some(Some(doc)), Some(RowDoc::Null) => Some(None), _ => None }
-    }
-
-    pub(crate) fn member_rows(&self, member: u32) -> Result<Range<u32>> {
-        let pages = self.sidecar.member_pages(member)?;
-        let start_row = |page| self.sidecar.page_starts.get(page).copied().unwrap_or(self.sidecar.rows);
-        Ok(start_row(pages.start)..start_row(pages.end))
-    }
-
-    pub(crate) fn member_iids(&self, rows: Range<u32>) -> impl Iterator<Item = [u8; 16]> + '_ {
-        rows.map(|row| <[u8; 16]>::try_from(self.sidecar.row_iid(row)).unwrap_or_default()).scan(None, |last, iid| { let fresh = *last != Some(iid); *last = Some(iid); Some(fresh.then_some(iid)) }).flatten()
-    }
-
-    pub(crate) fn latest_system_from(&self, rows: Range<u32>) -> Result<i64> {
-        rows.map(|row| self.sidecar.key(row).map(|key| key.system_from)).try_fold(i64::MIN, |latest, system| system.map(|system| latest.max(system)))
-    }
-
-    /// A document's length as the index stores it.
-    pub fn stored_length(&self, column: &str, doc: u32) -> Result<u32> {
-        let Some(field) = self.field(column) else { return Ok(0) };
-        let Some(segment) = self.searcher.segment_readers().first() else { return Ok(0) };
-        Ok(segment.get_fieldnorms_reader(field).map_err(fault)?.fieldnorm(doc))
-    }
-
-    /// The documents holding a term in a column, in order.
-    pub fn holding(&self, column: &str, term: &str) -> Result<Vec<u32>> {
-        use tantivy::DocSet;
-        let Some(mut postings) = self.postings(column, term)? else { return Ok(Vec::new()) };
-        let mut docs = Vec::new();
-        while postings.doc() != tantivy::TERMINATED {
-            docs.push(postings.doc());
-            postings.advance();
+        match self.manifest.row_doc(self.column(column)?, row) {
+            RowDoc::Invisible => None, RowDoc::Null => Some(None), RowDoc::Run(doc) => Some(Some(doc)),
         }
-        Ok(docs)
     }
 
-    pub(crate) fn postings(&self, column: &str, term: &str) -> Result<Option<SegmentPostings>> {
-        let (Some(field), Some(segment)) = (self.field(column), self.searcher.segment_readers().first()) else { return Ok(None) };
-        segment.inverted_index(field).map_err(fault)?.read_postings(&Term::from_field_text(field, term), IndexRecordOption::Basic).map_err(fault)
+    pub(crate) fn single_column_member_runs(&self, member: u32) -> Result<impl Iterator<Item = DocMatch> + '_> {
+        if self.columns.len() != 1 { return Err(corrupt("Owned search must cover exactly one column")); }
+        let member = member as usize;
+        let first = self.manifest.members.get(member).ok_or_else(|| corrupt("Search file has no such member"))?.doc;
+        let end = self.manifest.members.get(member + 1).map_or(self.manifest.documents, |start| start.doc);
+        Ok((first..end).map(|doc| self.manifest.doc_match(doc)))
+    }
+
+    pub(crate) fn matches_artefact(&self, identity: &str, version: i64) -> bool {
+        self.manifest.matches_artefact(identity, version)
+    }
+
+    pub(crate) fn has_full_event_keys(&self) -> bool { self.manifest.has_full_event_keys() }
+
+    pub(crate) fn rows_for_key<'a>(&'a self, iid: &[u8; 16], key: &'a [u8]) -> impl Iterator<Item = Result<(u32, KeyedEvent)>> + 'a {
+        self.manifest.rows_of(iid).filter(move |&row| self.manifest.event_key(row) == Some(key))
+            .map(|row| Ok((row, self.manifest.event(row)?)))
+    }
+
+    pub(crate) fn run_identity_bytes(&self, run: DocMatch) -> Result<&[u8]> { self.manifest.run_key(run.doc) }
+
+    pub(crate) fn run_identity_key(&self, run: DocMatch) -> Result<rtdb_columnar::EntityIdRef<'_>> {
+        rtdb_columnar::EntityIdRef::from_handle_bytes(self.run_identity_bytes(run)?)
+            .map_err(|_| corrupt("Search run has an invalid complete identity"))
+    }
+
+    pub(crate) fn integer_id(&self, run: DocMatch) -> Option<i64> {
+        match self.run_identity_key(run).ok()? {
+            rtdb_columnar::EntityIdRef::Integer(id) if EntityId::Integer(id).iid().0 == run.iid => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn token_length(&self, doc: u32) -> Result<u32> {
+        if doc >= self.manifest.documents { return Err(corrupt("Search file has no such run")); }
+        Ok(self.manifest.token_length(doc))
+    }
+
+    pub fn stored_length(&self, column: &str, doc: u32) -> Result<u32> {
+        if self.column(column).is_none() { return Ok(0); }
+        Ok(stored_length(self.token_length(doc)? as usize))
+    }
+
+    pub fn holding(&self, column: &str, term: &str) -> Result<Vec<u32>> {
+        Ok(self.postings(column, term)?.map_or_else(Vec::new, |postings| postings.documents().to_vec()))
+    }
+
+    pub(crate) fn postings(&self, column: &str, term: &str) -> Result<Option<Postings>> {
+        let Some(column) = self.column(column) else { return Ok(None) };
+        PostingPages::new(self, column).get(term, false)
     }
 
     pub(crate) fn document_frequency(&self, column: &str, term: &str) -> Result<u64> {
-        let (Some(field), Some(segment)) = (self.field(column), self.searcher.segment_readers().first()) else { return Ok(0) };
-        let inverted = segment.inverted_index(field).map_err(fault)?;
-        inverted.doc_freq(&Term::from_field_text(field, term)).map(u64::from).map_err(fault)
+        Ok(self.column(column).and_then(|column| self.manifest.term(column, term)).map_or(0, |term| term.frequency.into()))
     }
 
-    /// Every query term and phrase as one conjunction over the column.
-    fn conjunction(field: Field, query: &Query) -> BooleanQuery {
-        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = query.terms().iter().map(|term| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)).collect();
-        for phrase in query.phrases() {
-            clauses.push((Occur::Must, Box::new(tantivy::query::PhraseQuery::new(phrase.iter().map(|term| Term::from_field_text(field, term)).collect()))));
+    pub(crate) fn check_terms(&self, column: &str, queries: &[&Query]) -> Result<()> {
+        let Some(column) = self.column(column) else { return Ok(()); };
+        let mut pages = PostingPages::new(self, column);
+        for query in queries {
+            for term in query.terms() { pages.get(term, needs_positions(query, term))?; }
         }
-        BooleanQuery::new(clauses)
+        Ok(())
     }
 
-    /// The ids of every document holding all of the query's terms and phrases in the column, in order.
-    fn matching_docs(&self, column: &str, query: &Query) -> Result<Vec<u32>> {
-        let Some(field) = self.field(column) else { return Ok(Vec::new()) };
-        if query.terms().is_empty() { return Ok(Vec::new()); }
-        let found = self.searcher.search(&Self::conjunction(field, query), &DocSetCollector).map_err(fault)?;
-        let mut docs: Vec<u32> = found.into_iter().map(|address| address.doc_id).collect();
-        docs.sort_unstable();
-        Ok(docs)
+    pub(crate) fn verify(&self) -> Result<()> {
+        let mut pages = PostingPages::new(self, 0);
+        for term in self.manifest.terms() { pages.read(term, true)?; }
+        Ok(())
     }
 
-    /// Every document holding all of the query's terms and phrases in the column that is visible somewhere in `bounds`.
-    pub fn matches(&self, column: &str, query: &Query, bounds: TemporalBounds) -> Result<Vec<DocMatch>> {
-        Ok(self.matching_docs(column, query)?.into_iter().filter(|doc| self.visible(*doc, bounds)).map(|doc| self.sidecar.doc_match(doc)).collect())
-    }
-
-    /// The visible documents matching `matching`, with each one's score for `scoring`'s terms, from the postings' frequencies and the stored length.
-    /// It equals `rtdb_text::bm25` of the row's tokens, which is what SEARCH_SCORE computes on a resolved row.
-    pub fn scored(&self, column: &str, matching: &Query, scoring: &Query, corpus: Option<&Corpus>, bounds: TemporalBounds) -> Result<Vec<(DocMatch, f64)>> {
-        let Some(field) = self.field(column) else { return Ok(Vec::new()) };
-        let docs = self.matches(column, matching, bounds)?;
-        let Some(segment) = self.searcher.segment_readers().first() else { return Ok(Vec::new()) };
-        let mut scorer = ExactScorer::open(segment, field, Arc::new(Scorer::new(scoring.clone(), corpus)))?;
-        docs.into_iter().map(|doc| Ok((doc, scorer.score(doc.doc)))).collect()
-    }
-
-    /// The documents matching `matching` and visible in `bounds`, best possible score for `scoring` first, a window of documents at a time.
-    pub fn ranked(self: &Arc<Self>, column: &str, matching: &Query, scoring: &RankScorer, bounds: TemporalBounds) -> Result<Ranked> {
-        let (Some(column), Some(field)) = (self.column(column), self.field(column)) else { return Ok(Ranked(None)) };
-        let Some(segment) = self.searcher.segment_readers().first() else { return Ok(Ranked(None)) };
-        if matching.terms().is_empty() { return Ok(Ranked(None)); }
-        let inverted = segment.inverted_index(field).map_err(fault)?;
-        let lengths = segment.get_fieldnorms_reader(field).map_err(fault)?;
-        let impacts = |term: &str| -> Result<Vec<Impact>> {
-            if let Some(impacts) = self.sidecar.impacts(column as u32, term) { return Ok(impacts); }
-            Ok(match inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)? {
-                Some(mut postings) => impacts_of(&mut postings, &lengths),
-                None => Vec::new(),
-            })
+    pub(crate) fn matched_runs(&self, column: &str, query: &Query, bounds: TemporalBounds) -> Result<Matches<'_>> {
+        let matching = match self.column(column) {
+            Some(column) => {
+                let mut pages = PostingPages::new(self, column);
+                Matching::new(query, |term, positions| pages.get(term, positions))?
+            }
+            None => None,
         };
-        let mut windows: Option<Vec<u32>> = None;
-        for term in matching.terms() {
-            let held: Vec<u32> = impacts(term)?.into_iter().map(|impact| impact.window).collect();
-            windows = Some(match windows { None => held, Some(previous) => previous.into_iter().filter(|window| held.binary_search(window).is_ok()).collect() });
+        let documents = UInt32Array::from_iter_values(matching.iter().flat_map(|matching| {
+            matching.documents().iter().copied().filter(|&doc| matching.includes(doc) && self.visible(doc, bounds))
+        }));
+        Ok(Matches { file: self, documents })
+    }
+
+    pub fn matches(&self, column: &str, query: &Query, bounds: TemporalBounds) -> Result<Vec<DocMatch>> {
+        Ok(self.matched_runs(column, query, bounds)?.iter().collect())
+    }
+
+    pub fn scored(&self, column: &str, matching: &Query, scoring: &Query, corpus: Option<&Corpus>, bounds: TemporalBounds) -> Result<Vec<(DocMatch, f64)>> {
+        let Some(column) = self.column(column) else { return Ok(Vec::new()) };
+        let mut pages = PostingPages::new(self, column);
+        let Some(matching) = Matching::new(matching, |term, positions| pages.get(term, positions))? else { return Ok(Vec::new()) };
+        let mut scorer = ExactScorer::new(&mut pages, Arc::new(Scorer::new(scoring.clone(), corpus)))?;
+        Ok(matching.documents().iter().copied().filter(|&doc| matching.includes(doc) && self.visible(doc, bounds))
+            .map(|doc| (self.manifest.doc_match(doc), scorer.score(doc, self.manifest.token_length(doc)))).collect())
+    }
+
+    pub fn ranked(self: &Arc<Self>, column: &str, matching: &Query, scoring: &RankScorer, bounds: TemporalBounds) -> Result<Ranked> {
+        self.ranked_with_id(column, matching, scoring, bounds, false)
+    }
+
+    pub(crate) fn ranked_for_query(self: &Arc<Self>, column: &str, matching: &Query, scoring: &RankScorer, bounds: TemporalBounds,
+        ascending_id: bool) -> Result<RankedSource> {
+        if self.reader.format >= FORMAT_VERSION && let Some(column) = self.column(column) {
+            return Ok(RankedSource::Paged(paged::PagedRanked::new(Arc::clone(self), column, matching, scoring, bounds, ascending_id)));
         }
-        let mut ordered: Vec<(f64, u32)> = windows.unwrap_or_default().into_iter().map(|window| (0.0, window)).collect();
-        for (term_index, term) in scoring.scorer().query().terms().iter().enumerate() {
-            let impacts = impacts(term)?;
+        self.ranked_with_id(column, matching, scoring, bounds, ascending_id).map(RankedSource::Legacy)
+    }
+
+    pub(crate) fn needs_ranked_postings(&self) -> bool { self.reader.format == LEGACY_FORMAT_VERSION }
+
+    pub(crate) fn ranked_with_id(self: &Arc<Self>, column: &str, matching: &Query, scoring: &RankScorer, bounds: TemporalBounds, ascending_id: bool) -> Result<Ranked> {
+        let Some(column) = self.column(column) else { return Ok(Ranked(None)) };
+        let mut pages = PostingPages::new(self, column);
+        let Some(matching) = Matching::new(matching, |term, positions| pages.get(term, positions))? else { return Ok(Ranked(None)) };
+        let length = |doc| stored_length(self.manifest.token_length(doc) as usize);
+        let mut windows: Option<Vec<u32>> = None;
+        for posting in matching.terms() {
+            let holding: Vec<_> = posting.impacts(length).into_iter().map(|impact| impact.window).collect();
+            windows = Some(match windows {
+                None => holding,
+                Some(previous) => previous.into_iter().filter(|window| holding.binary_search(window).is_ok()).collect(),
+            });
+        }
+        let scorer = ExactScorer::new(&mut pages, Arc::clone(scoring.scorer()))?;
+        let mut ordered: Vec<_> = windows.unwrap_or_default().into_iter().map(|window| (0.0, window)).collect();
+        for (term, postings) in scorer.postings.iter().enumerate() {
+            let Some(postings) = postings else { continue };
+            let impacts = postings.impacts(length);
             for (bound, window) in &mut ordered {
                 if let Ok(index) = impacts.binary_search_by_key(window, |impact| impact.window) {
-                    *bound += scoring.term_bound(term_index, impacts[index].frequency, impacts[index].length);
+                    let Impact { frequency, length, same_frequency, same_length, .. } = impacts[index];
+                    let exact = same_frequency && (same_length || !scoring.scorer().uses_length_normalization());
+                    *bound += if ascending_id && exact { scoring.scorer().term_score(term, frequency, length) }
+                        else { scoring.term_bound(term, frequency, length) };
                 }
             }
         }
-        ordered.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
-        Ok(Ranked(Some(Windows { file: Arc::clone(self), field, matching: matching.clone(), scoring: Arc::clone(scoring.scorer()), bounds, windows: ordered, next: 0, batch: 4 })))
+        let tie = |window: u32| ascending_id.then(|| self.manifest.window_id(window)).flatten();
+        ordered.sort_unstable_by(|left, right| right.0.total_cmp(&left.0).then_with(|| tie(left.1).cmp(&tie(right.1)))
+            .then(left.1.cmp(&right.1)));
+        Ok(Ranked(Some(Windows { file: Arc::clone(self), matching, scorer, bounds, windows: ordered, next: 0, ascending_id })))
     }
 
-    /// Whether MATCH holds on each row, through the run it belongs to: `None` where the column is null or absent, as MATCH is on such a row.
     pub fn match_set(self: &Arc<Self>, column: &str, query: &Query) -> Result<MatchSet> {
-        let documents = self.sidecar.documents;
-        let mut matching = vec![0u64; documents.div_ceil(64) as usize];
-        for doc in self.matching_docs(column, query)? { matching[doc as usize / 64] |= 1 << (doc % 64); }
-        Ok(MatchSet { file: Arc::clone(self), column: self.column(column), matching: MatchingDocuments::All(matching) })
+        let column = self.column(column);
+        let mut bits = BooleanBufferBuilder::new(self.manifest.documents as usize);
+        bits.append_n(self.manifest.documents as usize, false);
+        if let Some(column) = column {
+            let mut pages = PostingPages::new(self, column);
+            if let Some(matching) = Matching::new(query, |term, positions| pages.get(term, positions))? {
+                for &doc in matching.documents() {
+                    if matching.includes(doc) { bits.set_bit(doc as usize, true); }
+                }
+            }
+        }
+        Ok(MatchSet { file: Arc::clone(self), column, matching: MatchingDocuments::All(BooleanArray::new(bits.finish(), None)) })
     }
 
     pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: &BTreeSet<Iid>) -> Result<MatchSet> {
-        use tantivy::{DocSet, query::Query as _};
-
-        let mut selected = BTreeMap::new();
         let column = self.column(column);
+        let mut documents = BTreeSet::new();
+        let mut bits = BooleanBufferBuilder::new(iids.len());
         if let Some(column) = column {
             for iid in iids {
-                for row in self.sidecar.rows_of(&iid.0) {
-                    if let RowDoc::Run(doc) = self.sidecar.row_doc(column, row) {
-                        selected.insert(doc, false);
-                        if selected.len() > 1024 { return self.match_set(&self.columns[column], query); }
+                for row in self.manifest.rows_of(&iid.0) {
+                    if let RowDoc::Run(doc) = self.manifest.row_doc(column, row) {
+                        documents.insert(doc);
+                        if documents.len() > 1024 { return self.match_set(&self.columns[column], query); }
                     }
                 }
             }
-            if !selected.is_empty() && !query.terms().is_empty() {
-                let segment = &self.searcher.segment_readers()[0];
-                let weight = Self::conjunction(Field::from_field_id(column as u32), query)
-                    .weight(tantivy::query::EnableScoring::disabled_from_searcher(&self.searcher)).map_err(fault)?;
-                let mut docs = weight.scorer(segment, 1.0).map_err(fault)?;
-                for (&doc, matched) in &mut selected {
-                    if docs.doc() < doc { docs.seek(doc); }
-                    *matched = docs.doc() == doc;
-                }
+            let mut pages = PostingPages::new(self, column);
+            let matching = if documents.is_empty() { None } else { Matching::new(query, |term, positions| pages.get(term, positions))? };
+            for &doc in &documents {
+                bits.append(matching.as_ref().is_some_and(|matching| matching.includes(doc)));
             }
         }
-        Ok(MatchSet { file: Arc::clone(self), column, matching: MatchingDocuments::Selected(selected) })
+        let matching = MatchingDocuments::Selected(UInt32Array::from_iter_values(documents), BooleanArray::new(bits.finish(), None));
+        Ok(MatchSet { file: Arc::clone(self), column, matching })
     }
 
-    /// The column's corpus statistics for the query's terms: its runs, their tokens, and each term's document frequency.
     pub fn corpus(&self, column: &str, query: &Query) -> Result<Corpus> {
-        let (Some(index), Some(field)) = (self.column(column), self.field(column)) else { return Ok(Corpus::default()) };
-        let mut corpus = Corpus { documents: u64::from(self.sidecar.column_docs[index]), ..Corpus::default() };
-        for segment in self.searcher.segment_readers() {
-            let inverted = segment.inverted_index(field).map_err(fault)?;
-            corpus.tokens += inverted.total_num_tokens();
-            for term in query.terms() {
-                *corpus.frequencies.entry(term.clone()).or_default() += u64::from(inverted.doc_freq(&Term::from_field_text(field, term)).map_err(fault)?);
-            }
+        let Some(index) = self.column(column) else { return Ok(Corpus::default()) };
+        let (documents, tokens) = self.manifest.column_totals(index);
+        let frequencies = query.terms().iter().map(|term| {
+            let frequency = self.manifest.term(index, term).map_or(0, |posting| posting.frequency.into());
+            (term.clone(), frequency)
+        }).collect();
+        Ok(Corpus { documents, tokens, frequencies })
+    }
+}
+
+pub(crate) struct Matches<'a> {
+    file: &'a SearchFile,
+    documents: UInt32Array,
+}
+
+impl Matches<'_> {
+    pub(crate) fn len(&self) -> usize { self.documents.len() }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = DocMatch> + '_ {
+        self.documents.values().iter().map(|&doc| self.file.manifest.doc_match(doc))
+    }
+}
+
+struct PostingPages<'a> {
+    file: &'a SearchFile,
+    column: usize,
+    pages: BTreeMap<usize, StructArray>,
+}
+
+impl<'a> PostingPages<'a> {
+    fn new(file: &'a SearchFile, column: usize) -> Self { Self { file, column, pages: BTreeMap::new() } }
+
+    fn get(&mut self, text: &str, positions: bool) -> Result<Option<Postings>> {
+        let Some(term) = self.file.manifest.term(self.column, text) else { return Ok(None) };
+        self.read(term, positions).map(Some)
+    }
+
+    fn read(&mut self, term: Term, positions: bool) -> Result<Postings> {
+        let postings = if let Some(blocks) = self.file.manifest.blocks(&term) {
+            paged::postings(&self.file.reader, &blocks, self.file.manifest.documents, positions)?
+        } else {
+            let page = match self.pages.entry(term.page) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(postings_table(&self.file.reader.page(term.page)?))
+                }
+            };
+            Postings::from_table(page, term.index)?
+        };
+        let validity = &self.file.validated_postings[term.ordinal];
+        if validity.get().is_none() {
+            postings.validate(term.frequency as usize, self.file.manifest.documents)?;
+            let _ = validity.set(());
         }
-        Ok(corpus)
+        Ok(postings)
     }
 }
 
 enum MatchingDocuments {
-    All(Vec<u64>),
-    Selected(BTreeMap<u32, bool>),
+    All(BooleanArray),
+    Selected(UInt32Array, BooleanArray),
 }
 
-/// MATCH of one query on rows of a search file, by page and row, through each row's run.
 pub struct MatchSet { file: Arc<SearchFile>, column: Option<usize>, matching: MatchingDocuments }
 
 impl MatchSet {
-    /// MATCH on the row at `row` of data page `page`: `None` where the column is null or absent; an error where the file has no such row, or the row is visible nowhere.
     pub fn value(&self, page: usize, row: usize) -> Result<Option<bool>> {
-        let sidecar = &self.file.sidecar;
-        let start = *sidecar.page_starts.get(page).ok_or_else(|| corrupt("Search file has no such page"))?;
-        let end = sidecar.page_starts.get(page + 1).copied().unwrap_or(sidecar.rows);
-        let row = u32::try_from(row).ok().and_then(|row| start.checked_add(row)).filter(|row| *row < end).ok_or_else(|| corrupt("Search file has no such row"))?;
+        let manifest = &self.file.manifest;
+        if page >= manifest.pages.len() { return Err(corrupt("Search file has no such page")); }
+        let start = manifest.pages.value(page);
+        let end = if page + 1 < manifest.pages.len() { manifest.pages.value(page + 1) } else { manifest.rows };
+        let row = u32::try_from(row).ok().and_then(|row| start.checked_add(row)).filter(|row| *row < end)
+            .ok_or_else(|| corrupt("Search file has no such row"))?;
         let Some(column) = self.column else { return Ok(None) };
-        match sidecar.row_doc(column, row) {
+        match manifest.row_doc(column, row) {
             RowDoc::Invisible => Err(corrupt("Search file row is visible nowhere")),
             RowDoc::Null => Ok(None),
             RowDoc::Run(doc) => match &self.matching {
-                MatchingDocuments::All(bits) => Ok(Some(bits.get(doc as usize / 64).is_some_and(|word| word & (1 << (doc % 64)) != 0))),
-                MatchingDocuments::Selected(docs) => docs.get(&doc).copied().map(Some)
-                    .ok_or_else(|| corrupt("Search file MATCH was not requested for this row")),
+                MatchingDocuments::All(bits) => Ok(Some(bits.value(doc as usize))),
+                MatchingDocuments::Selected(docs, bits) => docs.values().binary_search(&doc)
+                    .map(|row| Some(bits.value(row))).map_err(|_| corrupt("Search file MATCH was not requested for this row")),
             },
         }
     }
-    /// MATCH on one member's data file, by its own page and row.
+
     pub fn member(self: &Arc<Self>, member: u32) -> Result<MemberMatches> {
-        let pages = self.file.sidecar.member_pages(member)?;
-        Ok(MemberMatches { set: Arc::clone(self), first: pages.start, pages: pages.len() })
+        let member = member as usize;
+        let manifest = &self.file.manifest;
+        let first = manifest.members.get(member).ok_or_else(|| corrupt("Search file has no such member"))?.page as usize;
+        let end = manifest.members.get(member + 1).map_or(manifest.pages.len(), |start| start.page as usize);
+        Ok(MemberMatches { set: Arc::clone(self), first, pages: end - first })
     }
 
-    /// The bytes held, for a cache's weight.
     pub fn bytes(&self) -> usize {
         match &self.matching {
-            MatchingDocuments::All(bits) => bits.len() * 8,
-            MatchingDocuments::Selected(docs) => docs.len() * std::mem::size_of::<(u32, bool)>(),
+            MatchingDocuments::All(bits) => bits.get_buffer_memory_size(),
+            MatchingDocuments::Selected(docs, bits) => docs.get_buffer_memory_size() + bits.get_buffer_memory_size(),
         }
     }
 }
 
-/// MATCH on the rows of one member of a search file.
 pub struct MemberMatches { set: Arc<MatchSet>, first: usize, pages: usize }
 
 impl rtdb_query::FileMatches for MemberMatches {
@@ -873,73 +720,120 @@ impl rtdb_query::FileMatches for MatchSet {
     fn value(&self, page: usize, row: usize) -> Result<Option<bool>> { MatchSet::value(self, page, row) }
 }
 
-/// Scores documents in ascending order from the postings of the scoring terms.
-struct ExactScorer { postings: Vec<Option<tantivy::postings::SegmentPostings>>, lengths: tantivy::fieldnorm::FieldNormReader, scoring: Arc<Scorer> }
+struct ExactScorer {
+    scoring: Arc<Scorer>,
+    postings: Vec<Option<Postings>>,
+    frequencies: Vec<u32>,
+}
 
 impl ExactScorer {
-    fn open(segment: &tantivy::SegmentReader, field: Field, scoring: Arc<Scorer>) -> Result<Self> {
-        let inverted = segment.inverted_index(field).map_err(fault)?;
-        let postings = scoring.query().terms().iter().map(|term| inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)).collect::<Result<_>>()?;
-        Ok(Self { postings, lengths: segment.get_fieldnorms_reader(field).map_err(fault)?, scoring })
+    fn new(pages: &mut PostingPages<'_>, scoring: Arc<Scorer>) -> Result<Self> {
+        let postings = scoring.query().terms().iter().map(|term| pages.get(term, false)).collect::<Result<Vec<_>>>()?;
+        let frequencies = vec![0; postings.len()];
+        Ok(Self { scoring, postings, frequencies })
     }
-    fn score(&mut self, doc: u32) -> f64 {
-        use tantivy::{DocSet, postings::Postings};
-        let frequencies: Vec<u32> = self.postings.iter_mut().map(|postings| match postings {
-            Some(postings) => if postings.doc() <= doc && postings.seek(doc) == doc { postings.term_freq() } else { 0 },
-            None => 0,
-        }).collect();
-        self.scoring.score(&frequencies, self.lengths.fieldnorm(doc))
+
+    fn score(&mut self, doc: u32, length: u32) -> f64 {
+        for (frequency, postings) in self.frequencies.iter_mut().zip(&self.postings) {
+            *frequency = postings.as_ref().map_or(0, |postings| postings.frequency(doc));
+        }
+        self.scoring.score(&self.frequencies, stored_length(length as usize))
     }
 }
 
-/// A search file's matching visible documents, handed out a batch of windows at a time, best bound first; `None` where nothing in the file can match.
-/// No document left behind scores above `bound`.
+/// A file's ranked candidates, emitted in batches of windows ordered by score bound.
 pub struct Ranked(Option<Windows>);
 
-/// The windows holding every matching term, each with the best score a document in it can have, best first, and how far they have been handed out.
-struct Windows { file: Arc<SearchFile>, field: Field, matching: Query, scoring: Arc<Scorer>, bounds: TemporalBounds, windows: Vec<(f64, u32)>, next: usize, batch: usize }
+pub(crate) enum RankedSource {
+    Legacy(Ranked),
+    Paged(paged::PagedRanked),
+}
 
-impl Ranked {
-    /// The highest score any document not yet handed out can have, or `None` once all are.
-    pub fn bound(&self) -> Option<f64> { self.0.as_ref().and_then(|windows| windows.windows.get(windows.next).map(|(bound, _)| *bound)) }
-
-    /// The matching visible documents of the next windows, with their exact scores; twice as many windows as the time before.
-    pub fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> { self.expand_in(None, &mut 0) }
-
-    pub(crate) fn expand_in(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<Vec<(DocMatch, f64)>> {
-        self.0.as_mut().map_or(Ok(Vec::new()), |windows| windows.expand(scope, examined))
+impl RankedSource {
+    pub fn bound(&self) -> Option<crate::rank_cutoff::RankKey> {
+        match self {
+            Self::Legacy(rank) => rank.rank_bound(),
+            Self::Paged(rank) => rank.bound(),
+        }
     }
 
-    /// The file the documents belong to.
+    pub async fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<ScoredRuns> {
+        match self {
+            Self::Legacy(rank) => rank.expand_in(scope, examined).ok_or_else(|| corrupt("Ranked file has no remaining windows")),
+            Self::Paged(rank) => rank.expand(scope, examined).await,
+        }
+    }
+}
+
+struct Windows {
+    file: Arc<SearchFile>,
+    matching: Matching,
+    scorer: ExactScorer,
+    bounds: TemporalBounds,
+    windows: Vec<(f64, u32)>,
+    next: usize,
+    ascending_id: bool,
+}
+
+pub(crate) struct ScoredRuns {
+    file: Arc<SearchFile>,
+    documents: UInt32Array,
+    scores: Float64Array,
+}
+
+impl ScoredRuns {
+    pub(crate) fn len(&self) -> usize { self.documents.len() }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (DocMatch, f64)> + '_ {
+        self.documents.values().iter().zip(self.scores.values().iter())
+            .map(|(&doc, &score)| (self.file.manifest.doc_match(doc), score))
+    }
+}
+
+impl Ranked {
+    pub fn bound(&self) -> Option<f64> { self.0.as_ref().and_then(|windows| windows.windows.get(windows.next).map(|(bound, _)| *bound)) }
+
+    pub(crate) fn rank_bound(&self) -> Option<crate::rank_cutoff::RankKey> {
+        let windows = self.0.as_ref()?;
+        let &(score, window) = windows.windows.get(windows.next)?;
+        let id = windows.ascending_id.then(|| windows.file.manifest.window_id(window)).flatten();
+        Some(crate::rank_cutoff::RankKey { score, id })
+    }
+
+    pub fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> {
+        Ok(self.expand_in(None, &mut 0).map_or_else(Vec::new, |found| found.iter().collect()))
+    }
+
+    pub(crate) fn expand_in(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Option<ScoredRuns> {
+        self.0.as_mut().map(|windows| windows.expand(scope, examined))
+    }
+
     pub fn file(&self) -> Option<&Arc<SearchFile>> { self.0.as_ref().map(|windows| &windows.file) }
 }
 
 impl Windows {
-    fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<Vec<(DocMatch, f64)>> {
-        use tantivy::{DocSet, query::Query as _};
-        let end = self.next.saturating_add(self.batch).min(self.windows.len());
-        let mut windows: Vec<u32> = self.windows[self.next..end].iter().map(|(_, window)| *window).collect();
-        self.next = end;
-        self.batch = self.batch.saturating_mul(2);
-        windows.sort_unstable();
-        let searcher = &self.file.searcher;
-        let segment = &searcher.segment_readers()[0];
-        let weight = SearchFile::conjunction(self.field, &self.matching).weight(tantivy::query::EnableScoring::disabled_from_searcher(searcher)).map_err(fault)?;
-        let mut docs = weight.scorer(segment, 1.0).map_err(fault)?;
-        let mut scorer = ExactScorer::open(segment, self.field, Arc::clone(&self.scoring))?;
+    fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> ScoredRuns {
+        let end = self.next.saturating_add(4).min(self.windows.len());
         let mut found = Vec::new();
-        for window in windows {
-            let (start, stop) = document_range(window);
-            let mut doc = if docs.doc() < start { docs.seek(start) } else { docs.doc() };
-            while doc < stop && doc != tantivy::TERMINATED {
-                if cfg!(feature = "experiments") { *examined += 1; }
-                if scope.is_none_or(|scope| scope.contains(&Iid(self.file.sidecar.doc_iid(doc)))) && self.file.visible(doc, self.bounds) {
-                    found.push((self.file.sidecar.doc_match(doc), scorer.score(doc)));
+        let mut scores = Vec::new();
+        let documents = self.matching.documents();
+        for &(_, window) in &self.windows[self.next..end] {
+            let (start, end) = document_range(window);
+            let first = documents.partition_point(|&doc| doc < start);
+            let last = documents.partition_point(|&doc| doc < end);
+            for &doc in &documents[first..last] {
+                *examined += 1;
+                if self.matching.includes(doc)
+                    && scope.is_none_or(|scope| scope.contains(&Iid(self.file.manifest.doc_iid(doc))))
+                    && self.file.visible(doc, self.bounds)
+                {
+                    found.push(doc);
+                    scores.push(self.scorer.score(doc, self.file.manifest.token_length(doc)));
                 }
-                doc = docs.advance();
             }
         }
-        Ok(found)
+        self.next = end;
+        ScoredRuns { file: Arc::clone(&self.file), documents: UInt32Array::from(found), scores: Float64Array::from(scores) }
     }
 }
 
@@ -947,13 +841,15 @@ impl Windows {
 mod tests {
     use super::*;
     use rtdb_text::tokens;
+    use rtdb_types::Interval;
+    use crate::rank_windows::window_of;
 
     fn all() -> TemporalBounds { TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL } }
     fn at(valid: i64, system: i64) -> TemporalBounds {
         TemporalBounds { valid_time: Interval::from_micros(valid, valid + 1).unwrap(), system_time: Interval::from_micros(system, system + 1).unwrap() }
     }
     fn row(id: u8, system_from: i64, title: &str, body: &str) -> SearchRow {
-        SearchRow { iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens(title)), Some(tokens(body))] }
+        SearchRow { identity: None, iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens(title)), Some(tokens(body))] }
     }
     fn columns() -> Vec<String> { vec!["title".into(), "body".into()] }
     fn rows() -> Vec<SearchRow> {
@@ -961,39 +857,95 @@ mod tests {
     }
     fn open(rows: &[SearchRow]) -> Arc<SearchFile> { Arc::new(SearchFile::open(build_search_file(&columns(), rows, "job").unwrap(), &columns()).unwrap()) }
     /// A row's run, by the rows' order in the file.
-    fn run(file: &SearchFile, row: u32) -> Option<u32> { match file.sidecar.row_doc(1, row) { RowDoc::Run(doc) => Some(doc), _ => None } }
+    fn run(file: &SearchFile, row: u32) -> Option<u32> { match file.manifest.row_doc(1, row) { RowDoc::Run(doc) => Some(doc), _ => None } }
+
+    #[tokio::test]
+    async fn scoped_tantivy_conversion_keeps_its_arrow_map_charged_until_drop() -> Result<()> {
+        let columns = columns();
+        let mut bundle = Vec::new();
+        write_versioned_group(&columns, [[Ok(rows())]], "legacy", 1, None, &mut bundle, None, TANTIVY_FORMAT_VERSION)?;
+        let memory = rtdb_columnar::MemoryBudget::new(8 << 20).prepay(4 << 20)?;
+        let (file, converted) = SearchFile::open_catalog(bundle.into(), &columns, None, &memory).await?;
+        assert_eq!(memory.used_bytes(), converted.unwrap());
+        drop(file);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     #[test]
     fn range_reads_preserve_ranked_results_without_requesting_the_entire_bundle() {
-        #[derive(Debug)]
-        struct Tracked {
-            data: OwnedBytes,
-            reads: std::sync::Mutex<Vec<Range<usize>>>,
-        }
-
-        impl HasLen for Tracked {
-            fn len(&self) -> usize { self.data.len() }
-        }
-
-        #[async_trait::async_trait]
-        impl FileHandle for Tracked {
-            fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
-                self.reads.lock().unwrap().push(range.clone());
-                Ok(self.data.slice(range))
-            }
-        }
-
         let data = build_search_file(&columns(), &rows(), "ranges").unwrap();
         let full = SearchFile::open(data.clone(), &columns()).unwrap();
-        let tracked = Arc::new(Tracked { data: OwnedBytes::new(data), reads: Default::default() });
-        let ranged = SearchFile::open_with_ranges(tracked.clone(), &columns()).unwrap();
+        let data = Buffer::from(data);
+        let length = data.len();
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&reads);
+        let ranged = SearchFile::open_with_ranges(length, move |range| {
+            recorded.lock().unwrap().push(range.clone());
+            Ok(data.slice_with_length(range.start, range.len()))
+        }, &columns()).unwrap();
         let query = Query::parse("invoice");
         let score = |file: &SearchFile| file.scored("body", &query, &query, None, all())
             .unwrap().into_iter().map(|(hit, score)| (hit.iid, hit.doc, score)).collect::<Vec<_>>();
         assert_eq!(score(&ranged), score(&full));
-        let reads = tracked.reads.lock().unwrap();
-        assert!(reads.contains(&(tracked.len() - 16..tracked.len())));
-        assert!(reads.iter().all(|range| range.len() < tracked.len()));
+        let reads = reads.lock().unwrap();
+        assert!(reads.contains(&(length - 10..length)));
+        assert!(reads.iter().all(|range| range.len() < length));
+    }
+
+    #[test]
+    fn published_runs_keep_exact_lengths_and_definition_identity() {
+        let columns = vec!["body".to_string()];
+        let tokens = vec!["term".to_string(); 79];
+        let row = SearchRow { identity: None, iid: [1; 16], system_from: 1, valid_from: 1, valid_to: 10, op: EventOp::Put, values: vec![Some(tokens)] };
+        let mut bytes = Vec::new();
+        write_versioned_group(&columns, [[Ok(vec![row])]], "owned-file", 13, None, &mut bytes, None, FORMAT_VERSION).unwrap();
+        let file = SearchFile::open(bytes, &columns).unwrap();
+        assert!(file.matches_artefact("owned-file", 13));
+        assert!(!file.matches_artefact("other-file", 13));
+        assert!(!file.matches_artefact("owned-file", 14));
+        assert_eq!(file.token_length(0).unwrap(), 79);
+        assert_eq!(file.stored_length("body", 0).unwrap(), 76);
+        assert!(file.token_length(1).is_err());
+    }
+
+    #[test]
+    fn an_owned_run_round_trips_its_full_typed_identity() {
+        let columns = vec!["body".to_string()];
+        let id = EntityId::String("complete-id".into());
+        let row = SearchRow { identity: Some(id.clone()), iid: id.iid().0, system_from: 1, valid_from: 1, valid_to: 10,
+            op: EventOp::Put, values: vec![Some(tokens("invoice"))] };
+        let bytes = build_search_file(&columns, &[row], "owned-run").unwrap();
+        let file = SearchFile::open(bytes, &columns).unwrap();
+        let run = file.matches("body", &Query::parse("invoice"), at(2, 2)).unwrap()[0];
+        assert_eq!(file.run_identity_key(run).unwrap(), rtdb_columnar::EntityIdRef::from(&id));
+    }
+
+    #[test]
+    fn search_file_cuts_only_the_matching_identity_in_a_shared_iid() {
+        let columns = ["body".into()];
+        let text = EntityId::String("invoice".into());
+        let iid = text.iid().0;
+        let uuid = EntityId::Uuid(iid);
+        let event = |identity, system_from, op, values| SearchRow {
+            identity: Some(identity), iid, system_from, valid_from: 0, valid_to: i64::MAX,
+            op, values: vec![values],
+        };
+        let bytes = build_search_file(&columns, &[
+            event(text.clone(), 20, EventOp::Delete, None),
+            event(uuid.clone(), 10, EventOp::Put, Some(tokens("invoice"))),
+            event(text.clone(), 10, EventOp::Put, Some(tokens("invoice"))),
+        ], "shared-iid").unwrap();
+        let file = SearchFile::open(bytes, &columns).unwrap();
+        let earlier = file.matches("body", &Query::parse("invoice"), at(15, 15)).unwrap();
+        let later = file.matches("body", &Query::parse("invoice"), at(25, 25)).unwrap();
+        assert_eq!(earlier.len(), 2);
+        assert_eq!(later.len(), 1);
+        assert_eq!(file.run_identity_key(later[0]).unwrap(), rtdb_columnar::EntityIdRef::from(&uuid));
+        assert!(file.has_full_event_keys());
+        let text_key = text.handle_bytes();
+        let rows = file.rows_for_key(&iid, &text_key).collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(rows.iter().map(|(ordinal, _)| *ordinal).collect::<Vec<_>>(), [0, 2]);
     }
 
     #[test]
@@ -1004,11 +956,11 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_built_on_disk_bundles_to_the_same_bytes_as_one_built_in_memory() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut streamed = Vec::new();
-        write_search_file(&columns(), [Ok(rows())], "job", None, tantivy::directory::MmapDirectory::open(directory.path()).unwrap(), &mut streamed).unwrap();
-        assert_eq!(streamed, build_search_file(&columns(), &rows(), "job").unwrap());
+    fn a_search_file_streamed_to_disk_matches_one_built_in_memory() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let output = std::io::BufWriter::new(path.reopen().unwrap());
+        write_search_file(&columns(), [Ok(rows())], "job", None, output).unwrap();
+        assert_eq!(std::fs::read(path.path()).unwrap(), build_search_file(&columns(), &rows(), "job").unwrap());
     }
 
     #[test]
@@ -1016,7 +968,7 @@ mod tests {
         let file = open(&rows());
         let (first, second, third) = (run(&file, 0).unwrap(), run(&file, 1).unwrap(), run(&file, 2).unwrap());
         assert!(first == third && first != second, "the first and third versions share their text");
-        assert_eq!(file.sidecar.row_doc(0, 0), file.sidecar.row_doc(0, 1), "every version shares its title, so the title is one run");
+        assert_eq!(file.manifest.row_doc(0, 0), file.manifest.row_doc(0, 1), "every version shares its title, so the title is one run");
         let overdue: Vec<u32> = file.rectangles(first).map(|rectangle| rectangle[2]).map(|system| system as u32).collect();
         assert_eq!(overdue, [10, 30], "visible from system time 10 to 20, and from 30 on");
         let query = Query::parse("overdue");
@@ -1044,7 +996,7 @@ mod tests {
         assert_eq!(file.corpus("body", &Query::parse("same")).unwrap().documents, 1);
         assert_eq!(file.corpus("title", &Query::parse("title")).unwrap().documents, 50);
         assert_eq!(
-            coalesce(vec![[0, 5, 10, 20], [5, 9, 10, 20], [0, 5, 20, 30], [7, 8, 1, 2]]),
+            write::coalesce(vec![[0, 5, 10, 20], [5, 9, 10, 20], [0, 5, 20, 30], [7, 8, 1, 2]]),
             [[7, 8, 1, 2], [0, 9, 10, 20], [0, 5, 20, 30]],
         );
     }
@@ -1106,15 +1058,17 @@ mod tests {
         (0..count).map(|index| {
             let body: Vec<String> = (0..1 + next() % 12).map(|_| words[next() % words.len()].to_string()).collect();
             let value = match index % 17 { 0 => None, 1 => Some(Vec::new()), _ => Some(body) };
-            SearchRow { iid: [(index / 20) as u8; 16], system_from: 1_000_000 - index as i64, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![None, value] }
+            SearchRow { identity: None, iid: [(index / 20) as u8; 16], system_from: 1_000_000 - index as i64, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![None, value] }
         }).collect()
     }
 
     #[test]
     fn ranked_windows_bound_every_match_and_hand_each_out_once() {
         let rows = corpus_rows(5000, 7);
-        let file = open(&rows);
-        assert!(file.sidecar.impacts.keys().any(|(column, _)| *column == 1), "common terms have their impacts stored");
+        let mut legacy = Vec::new();
+        write_versioned_group(&columns(), [[Ok(rows)]], "legacy", 1, None, &mut legacy, None, LEGACY_FORMAT_VERSION).unwrap();
+        let file = Arc::new(SearchFile::open(legacy, &columns()).unwrap());
+        assert!(file.postings("body", "invoice").unwrap().unwrap().has_stored_impacts());
         for bounds in [all(), at(1, 999_000)] {
             for (matching, scoring) in [("invoice", "invoice overdue"), ("red blue", "red"), ("\"paid late\"", "paid late green"), ("absent", "absent")] {
                 let (matching, scoring) = (Query::parse(matching), Query::parse(scoring));
@@ -1149,7 +1103,7 @@ mod tests {
         let rows = corpus_rows(300, 3);
         let pages: Vec<Vec<SearchRow>> = rows.chunks(70).map(<[SearchRow]>::to_vec).collect();
         let mut bytes = Vec::new();
-        write_search_file(&columns(), pages.iter().cloned().map(Ok), "job", None, RamDirectory::create(), &mut bytes).unwrap();
+        write_search_file(&columns(), pages.iter().cloned().map(Ok), "job", None, &mut bytes).unwrap();
         let file = Arc::new(SearchFile::open(bytes, &columns()).unwrap());
         let query = Query::parse("invoice");
         let set = file.match_set("body", &query).unwrap();
@@ -1184,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn a_word_longer_than_tantivy_keeps_is_matched_and_scored_as_the_row_is() {
+    fn an_overlength_word_is_split_into_the_same_terms_for_indexing_and_scoring() {
         let long = format!("{} overdue", "x".repeat(70_000));
         let rows = vec![row(1, 0, "", &long), row(2, 0, "", "overdue")];
         let file = open(&rows);
@@ -1206,7 +1160,7 @@ mod tests {
         let third = vec![Ok(vec![row(128, 30, "", "overdue"),
                                  SearchRow { values: vec![None, None], ..row(129, 30, "", "") }])];
         let mut bytes = Vec::new();
-        write_group_search_file(&columns(), [first, Vec::new(), third], "group", None, RamDirectory::create(), &mut bytes).unwrap();
+        write_group_search_file(&columns(), [first, Vec::new(), third], "group", None, &mut bytes).unwrap();
         let file = Arc::new(SearchFile::open(bytes, &columns()).unwrap());
         let query = Query::parse("overdue");
         let selected = |bounds| file.matches("body", &query, bounds).unwrap().into_iter()
@@ -1235,10 +1189,204 @@ mod tests {
     }
 
     #[test]
-    fn a_sidecar_whose_bytes_changed_is_unreadable() {
+    fn posting_access_checks_only_the_arrow_batches_for_requested_terms() {
+        let indexed = [String::from("body")];
+        let row = SearchRow {
+            values: vec![Some((0..96).map(|term| format!("token{term:03}")).collect())],
+            ..row(1, 0, "", "")
+        };
+        let mut bytes = build_search_file(&indexed, &[row], "postings").unwrap();
+        let ipc = arrow_ipc::reader::FileReader::try_new(Cursor::new(bytes.as_slice()), None).unwrap();
+        assert_eq!(ipc.num_batches(), 8);
+        drop(ipc);
+        let reader = Reader::from_source(Source::from(bytes.clone())).unwrap();
+        let damaged = reader.page_range(6);
+        bytes[damaged.start + damaged.len() / 2] ^= 1;
+        let search = SearchFile::open(bytes, &indexed).unwrap();
+        assert_eq!(search.matches("body", &Query::parse("token002"), all()).unwrap().len(), 1);
+        assert!(search.matches("body", &Query::parse("token095"), all()).is_err());
+        assert!(search.verify().is_err());
+    }
+
+    #[tokio::test]
+    async fn paged_ranking_agrees_with_the_legacy_files_for_terms_and_phrases() {
+        let indexed = ["body".to_owned()];
+        let mut rows: Vec<_> = (-2500..2500).map(|id| {
+            let identity = EntityId::Integer(id);
+            let body = if id % 5 == 0 { "an overdue invoice overdue" } else { "invoice is paid" };
+            SearchRow { iid: identity.iid().0, identity: Some(identity), values: vec![Some(tokens(body))], ..row(0, 1, "", "") }
+        }).collect();
+        rows.sort_unstable_by_key(|row| row.iid);
+        let mut legacy = Vec::new();
+        write_versioned_group(&indexed, [[Ok(rows.clone())]], "old", 1, None, &mut legacy, None, LEGACY_FORMAT_VERSION).unwrap();
+        let legacy = SearchFile::open(legacy, &indexed).unwrap();
+        let pages = Arc::new(SearchFile::open(build_search_file(&indexed, &rows, "new").unwrap(), &indexed).unwrap());
+        for matching in ["invoice", "\"overdue invoice\"", "\"invoice overdue\"", "invoice missing"] {
+            let matching = Query::parse(matching);
+            let scoring = Arc::new(Scorer::new(Query::parse("paid overdue"), None)).for_ranking().unwrap();
+            let mut ranked = pages.ranked_for_query("body", &matching, &scoring, at(2, 2), true).unwrap();
+            let mut got = Vec::new();
+            while ranked.bound().is_some() {
+                let batches = ranked.expand(None, &mut 0).await.unwrap();
+                got.extend(batches.iter().map(|(doc, score)| (doc.doc, score.to_bits())));
+            }
+            got.sort_unstable();
+            let expected: Vec<_> = legacy.scored("body", &matching, scoring.scorer().query(), None, at(2, 2)).unwrap()
+                .into_iter().map(|(doc, score)| (doc.doc, score.to_bits())).collect();
+            assert_eq!(got, expected);
+        }
+    }
+
+    use rtdb_storage::{MemoryStore, ObjectStore, StoredObject};
+
+    #[derive(Default)]
+    struct Remote {
+        store: MemoryStore,
+        ranges: parking_lot::Mutex<Vec<Range<u64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Remote {
+        async fn head(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<StoredObject> { self.store.head(key).await }
+        async fn get(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<bytes::Bytes> { self.store.get(key).await }
+        async fn get_range(&self, key: &rtdb_storage::ObjectKey, range: Range<u64>) -> rtdb_storage::Result<bytes::Bytes> {
+            self.ranges.lock().push(range.clone());
+            self.store.get_range(key, range).await
+        }
+        async fn put(&self, key: &rtdb_storage::ObjectKey, bytes: bytes::Bytes) -> rtdb_storage::Result<()> { self.store.put(key, bytes).await }
+        async fn put_file(&self, key: &rtdb_storage::ObjectKey, source: &std::path::Path) -> rtdb_storage::Result<()> { self.store.put_file(key, source).await }
+        async fn list(&self, key: Option<&rtdb_storage::ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.store.list(key).await }
+        async fn delete(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<()> { self.store.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn a_cold_ranked_read_fetches_neither_phrase_positions_nor_unrelated_postings() {
+        use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
+
+        let columns = ["body".to_owned()];
+        let mut rows: Vec<_> = (0..8192).map(|id| {
+            let identity = EntityId::Integer(id);
+            SearchRow { iid: identity.iid().0, identity: Some(identity),
+                values: vec![Some(tokens(&format!("invoice document{id}")))], ..row(0, 1, "", "") }
+        }).collect();
+        rows.sort_unstable_by_key(|row| row.iid);
+        let bytes = build_search_file(&columns, &rows, "remote").unwrap();
+        let mut on_disk = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut on_disk, &bytes).unwrap();
+        let locator = FooterLocator::read(&mut on_disk).unwrap();
+        let stats = encode_catalog_stats(&[], Some(&locator)).unwrap();
+        assert_eq!(decode_footer_locator(&stats), Some(locator.clone()));
+        assert_eq!(decode_sections(&stats), Some(vec![]));
+        let source = Arc::new(Remote::default());
+        let key = ObjectKey::new("search/docs").unwrap();
+        source.put(&key, bytes.clone().into()).await.unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let disk = rtdb_storage::disk_cache::DiskCache::open(cache_dir.path(), 32 << 20, rtdb_columnar::MemoryBudget::new(32 << 20)).unwrap();
+        let store = disk.scope(ObjectKey::new("database").unwrap(), source.clone()).unwrap();
+        let pool = Arc::new(BufferPool::new(store, 16 << 20));
+        let runtime = crate::SearchRuntime::new(16 << 20);
+        let file = runtime.file_with_locator("db", &pool, &key, &columns, Some(&locator)).await.unwrap();
+        let matching = Query::parse("invoice");
+        let scorer = Arc::new(Scorer::new(matching.clone(), None)).for_ranking().unwrap();
+        let mut ranked = file.ranked_for_query("body", &matching, &scorer, at(2, 2), true).unwrap();
+        assert_eq!(ranked.bound().unwrap().id, Some(0));
+        let hits = ranked.expand(None, &mut 0).await.unwrap();
+        assert!(hits.iter().any(|(doc, _)| file.integer_id(doc) == Some(0)));
+
+        let reads = source.ranges.lock().clone();
+        let sent: u64 = reads.iter().map(|range| range.end - range.start).sum();
+        assert!(sent < bytes.len() as u64 / 2, "read {sent} of {} bytes", bytes.len());
+        let term = file.manifest.term(0, "invoice").unwrap();
+        for block in file.manifest.blocks(&term).unwrap() {
+            let position = file.reader.page_range(block.page + 1);
+            assert!(reads.iter().all(|range| range.start >= position.end as u64 || range.end <= position.start as u64));
+        }
+        assert!(pool.object_store().cached_local_file(&key).await.unwrap().is_none());
+        drop(file);
+        drop(runtime);
+        drop(pool);
+        disk.close_and_wait().await;
+    }
+
+
+    #[tokio::test]
+    async fn tree_rank_and_visibility_read_only_authenticated_ranges() {
+        use rtdb_storage::{ObjectKey, cache::BufferPool};
+        use tree_file::{DOCUMENT, POSTING, TERM, VISIBILITY, event_key, ordinal, term_key};
+
+        let columns = ["body".to_owned()];
+        let mut rows: Vec<_> = (0..16_384).map(|id| {
+            let identity = EntityId::Integer(id);
+            SearchRow { iid: identity.iid().0, identity: Some(identity),
+                values: vec![Some(tokens(&format!("invoice document{id}")))], ..row(0, 1, "", "") }
+        }).collect();
+        rows.sort_unstable_by_key(|row| row.iid);
+        let mut on_disk = tempfile::tempfile().unwrap();
+        write_versioned_group(&columns, [[Ok(rows.clone())]], "remote-v14", 42, None, &mut on_disk, None, TREE_FORMAT_VERSION).unwrap();
+        let locator = TreeLocator::read(&mut on_disk).unwrap();
+        use std::io::{Read, Seek};
+        on_disk.rewind().unwrap();
+        let mut bytes = Vec::new();
+        on_disk.read_to_end(&mut bytes).unwrap();
+
+        let store = Arc::new(Remote::default());
+        let key = ObjectKey::new("search/tree").unwrap();
+        store.put(&key, bytes.clone().into()).await.unwrap();
+        let pool = Arc::new(BufferPool::new(store.clone(), 16 << 20));
+        let cache = Arc::new(PageCache::new(4 << 20));
+        let tree = Arc::new(TreeFile::remote(pool.clone(), key.clone(), cache.clone(), &locator, &columns, "remote-v14", 42).await.unwrap());
+        let term = Query::parse("invoice");
+        let scoring = Arc::new(Scorer::new(term.clone(), None)).for_ranking().unwrap();
+        let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), true).await.unwrap();
+        assert_eq!(rank.bound().unwrap().id, Some(0));
+        assert!(rank.expand(None, &mut 0).await.unwrap().is_empty());
+        let mut hits = Vec::new();
+        while hits.is_empty() {
+            hits = rank.expand(None, &mut 0).await.unwrap();
+        }
+        assert!(hits.iter().any(|hit| hit.key.id == Some(0)));
+        assert_eq!(tree.events(rows[12_000].iid).await.unwrap().len(), 1);
+        let reads = store.ranges.lock().clone();
+        let sent: u64 = reads.iter().map(|range| range.end - range.start).sum();
+        assert!(sent < bytes.len() as u64 / 4, "sparse read fetched {sent} of {} bytes", bytes.len());
+
+        let term_ref = tree.page_reference_for_test(TERM, &term_key(0, "invoice")).await.unwrap().unwrap();
+        let position = tree.page_reference_for_test(POSTING, &ordinal(3)).await.unwrap().unwrap().range().unwrap();
+        let mut unused_document_pages = 0;
+        for first in (0..rows.len()).step_by(tree_file::DOCUMENT_ROWS) {
+            let range = tree.page_reference_for_test(DOCUMENT, &ordinal(first)).await.unwrap().unwrap().range().unwrap();
+            if reads.iter().all(|read| read.start >= range.end || read.end <= range.start) { unused_document_pages += 1; }
+        }
+        assert!(reads.iter().all(|range| range.start >= position.end || range.end <= position.start));
+        assert!(unused_document_pages > 0);
+        let row = 12_000;
+        let event = tree.page_reference_for_test(VISIBILITY, &event_key(&rows[row].iid, row as u32)).await.unwrap().unwrap().range().unwrap();
+        assert!(reads.iter().any(|range| range.start == event.start && range.end == event.end));
+        let holder = rtdb_columnar::MemoryBudget::new(32 << 20);
+        let scoped = Arc::new(BufferPool::with_metadata_budget(store.clone(),
+            rtdb_storage::cache::CacheBudget::with_memory(holder.prepay(16 << 20).unwrap()),
+            holder.prepay(1 << 20).unwrap()));
+        let runtime = crate::SearchRuntime::with_tree_files(16 << 20);
+        let scoped_first = runtime.tree_file(&scoped, &key, &locator, &columns, "remote-v14", 42, false).await.unwrap();
+        let scoped_second = runtime.tree_file(&scoped, &key, &locator, &columns, "remote-v14", 42, false).await.unwrap();
+        assert!(!Arc::ptr_eq(&scoped_first, &scoped_second));
+        assert!(scoped.pool_retained_bytes() > 0);
+        drop((scoped_first, scoped_second));
+        assert_eq!(scoped.pool_retained_bytes(), 0);
+
+        let mut damaged = bytes;
+        damaged[term_ref.offset as usize + term_ref.metadata as usize] ^= 1;
+        let bad_key = ObjectKey::new("search/bad-tree").unwrap();
+        store.put(&bad_key, damaged.into()).await.unwrap();
+        let bad = Arc::new(TreeFile::remote(pool.clone(), bad_key, cache, &locator, &columns, "remote-v14", 42).await.unwrap());
+        assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), true).await.is_err());
+    }
+
+    #[test]
+    fn a_manifest_whose_bytes_changed_is_unreadable() {
         let bytes = build_search_file(&columns(), &corpus_rows(2000, 1), "job").unwrap();
-        let directory = BundleDirectory::open(FileSlice::from(Source::from(bytes.clone()))).unwrap();
-        let range = directory.files[Path::new(SIDECAR)].clone();
+        let reader = Reader::from_source(Source::from(bytes.clone())).unwrap();
+        let range = reader.page_range(0);
         for offset in [range.start, range.start + range.len() / 2, range.end - 1] {
             let mut corrupted = bytes.clone();
             corrupted[offset] ^= 0x10;
@@ -1256,10 +1404,10 @@ mod tests {
             SearchRow { iid: [2; 16], system_from: 0, ..row(2, 0, "", "superseded after 400 days") },
         ];
         let mut bytes = Vec::new();
-        let sections = write_search_file(&columns(), [Ok(rows)], "job", Some(1000 * day), RamDirectory::create(), &mut bytes).unwrap();
+        let sections = write_search_file(&columns(), [Ok(rows)], "job", Some(1000 * day), &mut bytes).unwrap();
         let file = SearchFile::open(bytes, &columns()).unwrap();
         assert_eq!(file.sections(), sections.as_slice());
-        let class = |text: &str| sections.iter().find(|section| section.class == file.sidecar.data()[file.sidecar.doc_classes + file.matches("body", &Query::parse(text), all()).unwrap()[0].doc as usize]).copied().unwrap();
+        let class = |text: &str| sections.iter().find(|section| section.class == file.manifest.doc_class(file.matches("body", &Query::parse(text), all()).unwrap()[0].doc)).copied().unwrap();
         let (short, long, open) = (class("next day"), class("400 days"), class("long lived"));
         assert_eq!((short.class, long.class, open.class), (0, 3, 4), "four hundred days is under 64 weeks; the open run, clipped to the ceiling at 1000 days, under 256");
         assert_eq!((short.birth, short.death), (9 * day, 10 * day));
@@ -1268,7 +1416,7 @@ mod tests {
         let later_valid = TemporalBounds { valid_time: Interval::from_micros(500 * day, 500 * day + 1).unwrap(), system_time: Interval::from_micros(9 * day + day / 2, 9 * day + day / 2 + 1).unwrap() };
         assert!(short.meets(later_valid), "visible at a far later valid time, as known during its one day");
         assert!(!open.meets(at(1000 * day, 1000 * day)), "the ceiling ends every version");
-        assert_eq!(decode_sections(&encode_sections(&sections)), Some(sections.clone()));
+        assert_eq!(decode_sections(&encode_sections(&sections).unwrap()), Some(sections.clone()));
         assert_eq!(decode_sections(&[1, 2, 3]), None);
     }
 }

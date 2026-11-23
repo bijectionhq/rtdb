@@ -91,7 +91,7 @@ impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
     }
 }
 
-fn attachment_storage(attachment: &rtdb_node::Database) -> Result<crate::store::CellStoreConfig> {
+pub(crate) fn attachment_storage(attachment: &rtdb_node::Database) -> Result<crate::store::CellStoreConfig> {
     let Some(database_config::Storage::RemoteStorage(remote)) = &attachment.configuration().storage else {
         return Err(refused("The attachment has no cell storage identity"));
     };

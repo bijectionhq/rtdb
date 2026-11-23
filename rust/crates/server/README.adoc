@@ -73,8 +73,40 @@ The manifest contains one block catalog, its table blocks and the live/nascent t
 Copies preserve object bytes, and identical retries are accepted.
 `reset-compactor DATABASE` runs an exclusive maintenance node with compaction, automatic GC and listeners disabled.
 Every other node, client and upstream writer must remain stopped until it finishes.
-The command catches up, enumerates surviving L0 pairs, publishes their replacement catalog and waits for its block adoption before deleting compacted files.
-`--dry-run` reports the replacement tries and deletion list after the catch-up flush.
+The command catches up, verifies the L0 pairs named by the installed checkpoint and publishes their replacement catalog.
+On coordinated stores, it records the superseded compacted pairs before publication and submits them for retirement after adoption.
+Physical removal can wait for readers to release their catalog and resumes during subsequent collection, including after a restart.
+On uncoordinated stores, the command removes the compacted pairs after adoption.
+`--dry-run` reports the replacement tries and prospective retirements after the catch-up flush.
+`reset-compactor DATABASE --retained-base EXPORTED_STORAGE` rebuilds primary storage from the persisted repair anchor and the journal suffix through the maintenance node's catch-up checkpoint.
+Use the detached export installed by `retain-repair-base` for the same local database and journal.
+The reset reconstructs missing L0 pairs in that suffix, publishes rebuilt compacted pairs under fresh names, and retires old compacted files through the coordinated catalog floor.
+If an original L0 pair still exists, the synchronized copy accepts identical bytes and refuses a conflicting file.
+The replay mode applies to epoch-zero local storage for one database without an external source or owned lifetime replay.
+Its dry run stages the rebuild temporarily and reports the prospective retirement without publishing replacement files.
+`rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256` rebuilds a stopped single local database in a separate directory.
+Supply the original storage parent containing `v06`, the file named `REPLICA_LOG`, an existing output parent outside `v06`, and decimal block numbers with the SHA-256 digests of their exact published block files.
+Stop the original database and keep its journal and storage stable for the duration of the command.
+Select a known-good base whose bound table blocks and live and nascent primary trie files are intact.
+Use `--base-storage PATH` to open the base from a separately retained `export-snapshot` directory, even if its original files have been removed from the serving store.
+The target can have missing primary files if the original journal still contains the full interval from the base boundary through the target boundary, including any oversized payload objects referenced by the interval.
+The command trusts the original local journal and the base's immutable primary trie contents.
+This path applies to epoch-zero local storage with both checkpoints in the same replica journal and with all writes coming from RTDB.
+The command publishes a separate `repair-…/storage` directory and reports its checkpoint digest, last transaction and original replica epoch.
+Use that storage with a new empty local log configured at an epoch higher than the one reported.
+The rebuilt catalog contains primary data, so derived indexes can be rebuilt by their normal maintenance paths.
+`rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256` protects an independently exported repair base for epoch-zero local storage.
+Stop all users of the original store and move a trusted export of its current block outside the serving storage root before installing it.
+Supply the export's parent of `v06` as `EXPORTED_STORAGE` and use the original `REPLICA_LOG`.
+RTDB checks both checkpoint publications, the exported table blocks and primary file inventory, and the replica boundary.
+RTDB synchronizes the exported files and their directory entries before installing the bound.
+Keep the detached export and original local journal available.
+The native block collector preserves root catalogs, per-table block metadata, and offloaded replica payloads from the retained block onward, including after restart.
+Export and retain a newer current block in the same journal to advance the bound and allow collection of older files.
+An old target remains usable for `repair-checkpoint` while the active retention bound covers its interval.
+`rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage EXPORTED_STORAGE` selects the durable anchor from the original serving store.
+The command checks the detached export against the stored block, digest and replica boundary while holding the journal lock.
+The target remains explicit, so an operator can repair to any later retained cut in the same journal.
 `compactor` opens the database catalog, follows replica progress, performs deterministic compaction and publishes results through the source log.
 It opens no pgwire or Flight listeners and never claims leadership; the configured health listener remains available.
 A separate writer must apply its source-log notifications before jobs are acknowledged.

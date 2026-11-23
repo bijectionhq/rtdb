@@ -59,6 +59,8 @@ impl TransactionWriter for AuthoredWriter {
             for uuid in docs {
                 let id = *uuid.as_bytes();
                 tx.append(table.clone(), StoredEvent {
+                    commit_position: 0,
+                    entity_key: None,
                     iid: EntityId::Uuid(id).iid(),
                     system_from: actual.system_time,
                     valid_time,
@@ -118,6 +120,8 @@ impl Trial {
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let node_cancellation = cancellation.child_token();
             let context = Arc::new(ResolveContext {
+                owned_witness_scope: None,
+                world_constraints: None,
                 database: "test-db".into(), memory: memory.scope(), storage: cache,
                 query_options: Default::default(), scan_accelerators: Default::default(), cancellation: node_cancellation.clone(), default_tz: "UTC".into(),
                 authorization: Arc::new(DatabasePolicy), execution_observer: None, tracer: None,
@@ -337,7 +341,7 @@ async fn scenario(
         let progress = handle.progress().current();
         if reached.role != expected_role || reached.highest_term != Term(1) || reached.promotion_failure.is_some()
             || progress.tx_key != Some(last_tx) || progress.external_token.as_deref() != Some(token.as_slice())
-            || progress.latest_result.as_ref().is_none_or(|result| result.committed() != final_commit)
+            || progress.latest_result.as_ref().is_none_or(|completed| completed.result().committed() != final_commit)
             || handle.progress().fault().is_some()
         {
             return Err(format!("native actor {actor} did not converge at selected observation: {reached:?}, {progress:?}").into());
@@ -473,7 +477,7 @@ mod tests {
         let mut inputs = vec![Event { sequence: 1, event: Input::Flush { offset: 0, time: [100, 1_100] } }];
         for action in 0..30u32 {
             let committed = action != 29;
-            let time = [101, 1000 * (i64::from(action) + 1)];
+            let time = [99, 1000 * (i64::from(action) + 1)];
             let sequence = 11 + action as usize * 4;
             inputs.push(Event { sequence, event: Input::ExternalStart { action, token: tape::token(action),
                 tx_id: i64::from(action), time, documents: committed.then(|| vec![uuid::Uuid::from_u128(u128::from(action))]) } });

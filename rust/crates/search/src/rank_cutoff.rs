@@ -68,9 +68,42 @@ pub(crate) fn can_stop(kth: u64, pending: Option<u64>, unread: Option<u64>) -> b
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RankKey {
+    pub score: f64,
+    pub id: Option<i64>,
+}
+
+impl RankKey {
+    pub fn compare(self, other: Self) -> std::cmp::Ordering {
+        self.score_order(other).then_with(|| other.id.cmp(&self.id))
+    }
+
+    pub fn score_order(self, other: Self) -> std::cmp::Ordering {
+        let score = |score: f64| rank_key(score.to_bits()).unwrap_or(u64::MAX);
+        score(self.score).cmp(&score(other.score))
+    }
+
+    pub fn beats(self, bound: Self) -> bool {
+        let (Some(winner), Some(ceiling)) = (rank_key(self.score.to_bits()), rank_key(bound.score.to_bits())) else {
+            return false;
+        };
+        winner > ceiling || (winner == ceiling && self.id.zip(bound.id).is_some_and(|(id, best)| id < best))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::can_stop;
+    use super::{RankKey, can_stop};
+
+    #[test]
+    fn integer_tie_break_requires_a_strict_proof() {
+        let winner = RankKey { score: -0.0, id: Some(-1) };
+        assert!(winner.beats(RankKey { score: 0.0, id: Some(0) }));
+        assert!(!winner.beats(RankKey { score: 0.0, id: Some(-1) }));
+        assert!(!winner.beats(RankKey { score: 0.0, id: None }));
+        assert!(!winner.beats(RankKey { score: f64::NAN, id: Some(0) }));
+    }
 
     #[test]
     fn both_frontiers_can_block_the_cutoff() {

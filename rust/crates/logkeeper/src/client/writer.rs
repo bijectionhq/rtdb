@@ -231,27 +231,98 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
     Ok(synced)
 }
 
+fn sealed_history(replies: &[(usize, Sealed)]) -> (usize, Holding) {
+    let sealed: Vec<Sealed> = replies.iter().map(|(_, sealed)| sealed.clone()).collect();
+    let (source, winning) = &replies[winner(&sealed)];
+    (*source, Holding::from(winning))
+}
+
+async fn bootstrap_replica_page(
+    ensemble: &Ensemble, server: usize, sealed: &Sealed, epoch: u64,
+    checkpoint: i64, first: i64, entries: &[Entry], terminal: bool,
+) -> Result<()> {
+    let through = first + entries.len() as i64 - 1;
+    let conflict = || Error::ConflictingObject(ensemble.config.stream.clone());
+    let unavailable = || Error::Remote { key: ensemble.config.stream.clone(), message: "the replica is missing an earlier genesis page".into() };
+    if sealed.promised > epoch { return Err(Error::Deposed { epoch, promised: sealed.promised }); }
+    if sealed.promised != epoch || (terminal && sealed.last_lsn > through) {
+        return Err(conflict());
+    }
+    if sealed.trim_lsn != checkpoint {
+        if sealed.trim_lsn != -1 || sealed.last_lsn != -1 || sealed.commit_lsn != -1 {
+            return Err(conflict());
+        }
+        if first != checkpoint + 1 { return Err(unavailable()); }
+        deposed_by(epoch, ensemble.trim(server, checkpoint).await?)?;
+    } else if sealed.commit_lsn < first - 1 || sealed.last_lsn < first - 1 {
+        return Err(unavailable());
+    }
+
+    let overlap = sealed.last_lsn.min(through);
+    let mut next = first;
+    while next <= overlap {
+        let prefix = ensemble.fetch(server, next, overlap + 1, MAXIMUM_BATCH_ENTRIES).await?;
+        let begin = (next - first) as usize;
+        let end = begin.saturating_add(prefix.entries.len());
+        if prefix.trim_lsn != checkpoint || prefix.entries.is_empty()
+            || prefix.entries.last().is_some_and(|entry| entry.lsn > overlap)
+            || entries.get(begin..end) != Some(prefix.entries.as_slice())
+        {
+            return Err(conflict());
+        }
+        next += prefix.entries.len() as i64;
+    }
+
+    let missing = &entries[(next - first) as usize..];
+    if let Some(entry) = missing.first() {
+        // Each append also establishes the peer's sync at this epoch. An
+        // overlapping writer can only append next or fail and re-observe.
+        deposed_by(epoch, ensemble.overwrite(server, epoch, entry.lsn, missing.to_vec(), true).await?)?;
+    } else if sealed.synced != epoch {
+        if sealed.last_lsn > through { return Err(conflict()); }
+        deposed_by(epoch, ensemble.overwrite(server, epoch, through + 1, Vec::new(), true).await?)?;
+    }
+    let committed = deposed_by(epoch, ensemble.commit(server, epoch, through).await?)?;
+    if terminal {
+        let final_state = ensemble.seal(server, epoch).await?;
+        if final_state.promised > epoch { return Err(Error::Deposed { epoch, promised: final_state.promised }); }
+        if final_state.promised != epoch || final_state.synced != epoch || final_state.trim_lsn != checkpoint
+            || final_state.last_lsn != through || final_state.commit_lsn != through
+        {
+            return Err(conflict());
+        }
+    } else if committed.last_lsn < through || committed.commit_lsn < through {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+
 impl Writer {
     pub async fn open(ensemble: Arc<Ensemble>, epoch: u64) -> Result<Arc<Self>> {
         let replies = seal_quorum(&ensemble, epoch).await?;
-        let sealed: Vec<Sealed> = replies.iter().map(|(_, sealed)| sealed.clone()).collect();
-        let (source, winning) = &replies[winner(&sealed)];
-        let history = Holding::from(winning);
-        let recovered = Recovered { source: (&ensemble, *source), start: history.trim + 1, history };
+        let (source, history) = sealed_history(&replies);
+        let recovered = Recovered { source: (&ensemble, source), start: history.trim + 1, history };
         Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
+    }
+
+    pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<i64> {
+        let replies = seal_quorum(ensemble, epoch).await?;
+        let (source, history) = sealed_history(&replies);
+        let last = history.last;
+        let recovered = Recovered { source: (ensemble, source), start: history.trim + 1, history };
+        sync_quorum(ensemble, epoch, &replies, &recovered, last).await?;
+        Ok(last)
     }
 
     /// Recovers the same history used by a local ensemble move and by a
     /// copy to a different physical stream.
     async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
         let previous_replies = seal_quorum(previous, epoch).await?;
-        let sealed: Vec<Sealed> = previous_replies.iter().map(|(_, sealed)| sealed.clone()).collect();
-        let (source, winning) = &previous_replies[winner(&sealed)];
-        let history = Holding::from(winning);
+        let (source, history) = sealed_history(&previous_replies);
         let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
-        let in_place = Recovered { source: (previous, *source), start: history.trim + 1, history: history.clone() };
+        let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone() };
         sync_quorum(previous, epoch, &previous_replies, &in_place, start - 1).await?;
-        Ok(Recovered { source: (previous, *source), history, start })
+        Ok(Recovered { source: (previous, source), history, start })
     }
 
     /// Copies the recovered suffix into another ensemble and opens its writer.
@@ -270,10 +341,57 @@ impl Writer {
         Ok(())
     }
 
+    pub(super) async fn bootstrap_committed_page(
+        ensemble: &Ensemble, epoch: u64, checkpoint: i64, first: i64, entries: &[Entry], terminal: bool,
+    ) -> Result<()> {
+        let replies = seal_quorum(ensemble, epoch).await?;
+        let mut seeds = replies.into_iter().map(|(server, mut sealed)| async move {
+            // Lost replies or an identical concurrent bootstrap can race an
+            // overwrite. Re-read the peer before retrying any append.
+            for _ in 0..8 {
+                match bootstrap_replica_page(ensemble, server, &sealed, epoch, checkpoint, first, entries, terminal).await {
+                    Ok(()) => return Ok(()),
+                    Err(error @ (Error::Deposed { .. } | Error::ConflictingObject(_))) => return Err(error),
+                    Err(_) => sealed = ensemble.seal(server, epoch).await?,
+                }
+            }
+            Err(Error::Remote { key: ensemble.config.stream.clone(), message: "replica genesis page did not settle".into() })
+        }).collect::<FuturesUnordered<_>>();
+        let mut committed = 0;
+        while let Some(reply) = seeds.next().await {
+            match reply {
+                Ok(()) => committed += 1,
+                Err(error @ (Error::Deposed { .. } | Error::ConflictingObject(_))) => return Err(error),
+                Err(_) => (),
+            }
+        }
+        if committed < ensemble.config.write_quorum {
+            return Err(Error::Remote { key: ensemble.config.stream.clone(),
+                message: "a quorum did not commit the reserved replica genesis page".into() });
+        }
+        Ok(())
+    }
+
     /// Recovers a durable write quorum of `ensemble` before opening the pipeline.
     async fn establish(ensemble: Arc<Ensemble>, epoch: u64, replies: &[(usize, Sealed)], recovered: Recovered<'_>) -> Result<Arc<Self>> {
         let last = recovered.history.last;
         let synced = sync_quorum(&ensemble, epoch, replies, &recovered, last).await?;
+        // Predecessor recovery also syncs replicas at this epoch. Only the writer's own ensemble activates.
+        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| ensemble.activate(server, epoch)).collect();
+        let mut activated = 0;
+        while let Some(reply) = activating.next().await {
+            match reply {
+                Ok(Ack::Accepted(_)) => activated += 1,
+                Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
+                _ => (),
+            }
+            if activated >= ensemble.config.write_quorum { break; }
+        }
+        drop(activating);
+        if activated < ensemble.config.write_quorum {
+            return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!(
+                "activated {activated} journals, a write quorum is {}", ensemble.config.write_quorum) });
+        }
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
         let replicas = (0..ensemble.len()).map(|server| if synced.contains(&server) {
             Replica { acked: last, link: Link::Live }
@@ -336,12 +454,12 @@ impl Writer {
         let writer = Arc::downgrade(self);
         let ensemble = Arc::clone(&self.ensemble);
         let round = Arc::clone(round);
-        self.ensemble.links[server].send(self.ensemble.check_request(self.epoch), Box::new(move |reply| {
+        self.ensemble.links[server].send(self.ensemble.check_synced_request(self.epoch), Box::new(move |reply| {
             let Some(writer) = Weak::upgrade(&writer) else { return };
             let mut state = writer.state.lock();
             match ensemble.ack(server, reply) {
                 Ok(Ack::Refused(refused)) if refused.promised > writer.epoch => writer.depose(&mut state, refused.promised),
-                ack => if let State::Open(pipeline) = &mut *state { writer.mark(pipeline, &round, server, ack.is_ok()); },
+                ack => if let State::Open(pipeline) = &mut *state { writer.mark(pipeline, &round, server, matches!(ack, Ok(Ack::Accepted(_)))); },
             }
         }));
     }
@@ -350,7 +468,7 @@ impl Writer {
         let mut state = self.state.lock();
         if let Ok(Ack::Refused(refused)) = ack && refused.promised > self.epoch { return self.depose(&mut state, refused.promised); }
         let State::Open(pipeline) = &mut *state else { return };
-        if let Some(round) = &round { self.mark(pipeline, round, server, ack.is_ok()); }
+        if let Some(round) = &round { self.mark(pipeline, round, server, matches!(ack, Ok(Ack::Accepted(_)))); }
         match ack {
             Ok(Ack::Accepted(accepted)) => {
                 let replica = &mut pipeline.replicas[server];
@@ -450,7 +568,7 @@ impl Writer {
                 let pipeline = match &mut *state { State::Open(pipeline) => pipeline, State::Deposed { promised } => return Err(Error::Deposed { epoch, promised: *promised }) };
                 if from >= pipeline.buffer_first {
                     let entries = pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).map(|buffered| buffered.entry.clone()).collect();
-                    let body = ensemble.overwrite_request(epoch, from, entries, true, pipeline.commit);
+                    let body = ensemble.repair_request(epoch, from, entries, pipeline.commit);
                     pipeline.replicas[server].link = Link::Live;
                     self.send(pipeline, server, body);
                     return Ok(());
@@ -478,7 +596,7 @@ impl Writer {
         }
     }
 
-    /// Succeeds once a write quorum of servers has answered, in a round that started after this call, that the stream is not sealed beyond this writer's epoch.
+    /// Succeeds once a write quorum has confirmed its stream is synced to this writer's promised epoch in a round that started after this call.
     /// So no successor had committed anything when the call began: a successor commits only after sealing a write quorum, which meets the confirming one.
     /// Concurrent callers share a round, at most one is in flight, and callers arriving during it wait for the next.
     /// A busy writer's round is answered by the replies to its appends and commits sent after it started; an idle writer's sends each server a check.
@@ -496,6 +614,40 @@ impl Writer {
             Confirmation::Deposed { promised } => Err(Error::Deposed { epoch: self.epoch, promised }),
             Confirmation::Unavailable(message) => Err(Error::Remote { key: self.ensemble.config.stream.clone(), message }),
         }
+    }
+
+    /// Confirms the durable epoch on a fresh quorum without submitting disk or append work.
+    pub async fn confirm_authority(&self, port: u16) -> Result<()> {
+        let still_open = || match &*self.tip.borrow() {
+            Tip::Open(_) => Ok(()),
+            Tip::Deposed { promised } => Err(Error::Deposed { epoch: self.epoch, promised: *promised }),
+        };
+        still_open()?;
+        let quorum = self.ensemble.config.write_quorum;
+        if quorum <= self.ensemble.len() - quorum {
+            return Err(Error::Remote {
+                key: self.ensemble.config.stream.clone(),
+                message: "durable writer authority requires an intersecting write quorum".into(),
+            });
+        }
+        let mut replies: FuturesUnordered<_> = (0..self.ensemble.len())
+            .map(|server| self.ensemble.confirm_authority(server, self.epoch, port)).collect();
+        let mut confirmed = 0;
+        while let Some(reply) = replies.next().await {
+            match reply {
+                Ok(None) => {
+                    confirmed += 1;
+                    if confirmed == quorum { return still_open(); }
+                }
+                Ok(Some(promised)) if promised > self.epoch => {
+                    self.depose(&mut self.state.lock(), promised);
+                    return Err(Error::Deposed { epoch: self.epoch, promised });
+                }
+                _ => {}
+            }
+            if confirmed + replies.len() < quorum { break; }
+        }
+        Err(Error::Remote { key: self.ensemble.config.stream.clone(), message: "a write quorum did not confirm durable writer authority".into() })
     }
 
     fn join_confirmation(self: &Arc<Self>, pipeline: &mut Pipeline) -> watch::Receiver<Option<Confirmation>> {

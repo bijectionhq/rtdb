@@ -1,4 +1,4 @@
-use crate::{Error, ObjectKey, ObjectStore, Result, object_store::{ReadReservation, RetainedBytes}};
+use crate::{Error, ObjectKey, ObjectStore, Result, object_store::{ReadReservation, RetainedBytes, ObjectReadAllocation}};
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use std::any::Any;
@@ -138,7 +138,11 @@ pub struct CacheBudget {
 }
 
 impl CacheBudget {
-    pub fn new(limit: usize) -> Arc<Self> { Arc::new(Self { memory: MemoryBudget::new(limit), lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0) }) }
+    pub fn new(limit: usize) -> Arc<Self> { Self::with_memory(MemoryBudget::new(limit)) }
+    pub fn with_memory(memory: Arc<MemoryBudget>) -> Arc<Self> {
+        Arc::new(Self { memory, lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0) })
+    }
+    pub fn prepaid_by(&self, parent: &Arc<MemoryBudget>) -> bool { self.memory.prepaid_by(parent) }
     pub fn retained_bytes(&self) -> usize { self.memory.used_bytes() }
     pub fn limit_bytes(&self) -> usize { self.memory.limit_bytes() }
 
@@ -146,11 +150,11 @@ impl CacheBudget {
         Error::MemoryLimit { requested, limit: self.limit_bytes(), retained: self.retained_bytes() }
     }
 
-    fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+    fn reserve(&self, scope: &Arc<MemoryBudget>, bytes: usize) -> Result<Arc<MemoryReservation>> {
         // A request no eviction could make fit evicts nothing.
         if bytes > self.limit_bytes() { return Err(self.limit_error(bytes)); }
         loop {
-            if let Ok(reservation) = self.memory.reserve(bytes) { return Ok(reservation); }
+            if let Ok(reservation) = scope.reserve(bytes) { return Ok(reservation); }
             let evicted = self.lru.lock().evict(|entry| entry.value.idle());
             match evicted { Some(evicted) => drop(evicted), None => return Err(self.limit_error(bytes)) }
         }
@@ -169,6 +173,7 @@ impl AsRef<[u8]> for CacheLease {
 
 impl CacheLease {
     pub fn as_slice(&self) -> &[u8] { &self.allocation.as_slice()[self.range.clone()] }
+    pub fn is_partial_allocation(&self) -> bool { self.range.len() != self.allocation.len() }
 
     /// The slice retains the entire allocation and its byte reservation.
     pub fn slice(&self, range: Range<usize>) -> Result<Self> {
@@ -206,6 +211,12 @@ impl Drop for EmptyEntryCleanup<'_> {
     }
 }
 
+fn reserve_read(length: usize, allocation: ObjectReadAllocation, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<ReadReservation> {
+    let retained = reserve(allocation.retained_bytes)?;
+    let scratch = (allocation.scratch_bytes > 0).then(|| reserve(allocation.scratch_bytes)).transpose()?;
+    Ok(ReadReservation::funded(length, retained, scratch))
+}
+
 fn reserve_from(memory: &Arc<MemoryBudget>, bytes: usize) -> Result<Arc<MemoryReservation>> {
     memory.reserve(bytes).map_err(|_| Error::MemoryLimit { requested: bytes, limit: memory.limit_bytes(), retained: memory.used_bytes() })
 }
@@ -216,6 +227,7 @@ fn view_overhead(key: &ObjectKey) -> usize { key.as_str().len().saturating_mul(2
 pub struct BufferPool {
     store: Arc<dyn ObjectStore>,
     budget: Arc<CacheBudget>,
+    memory: Arc<MemoryBudget>,
     id: u64,
     metadata: Option<Arc<MemoryBudget>>,
 }
@@ -232,7 +244,8 @@ impl BufferPool {
 
     fn open(store: Arc<dyn ObjectStore>, budget: Arc<CacheBudget>, metadata: Option<Arc<MemoryBudget>>) -> Self {
         let id = budget.pools.fetch_add(1, Ordering::Relaxed);
-        Self { store, budget, id, metadata }
+        let memory = budget.memory.scope();
+        Self { store, budget, memory, id, metadata }
     }
 
     /// Charges the bookkeeping of retained objects to `metadata`, and their bytes and every view to `budget`.
@@ -242,8 +255,22 @@ impl BufferPool {
         Self::open(store, budget, Some(metadata))
     }
 
+    /// The reader's prepaid metadata allocation for a scoped cache.
+    pub fn prepaid_metadata_budget(&self) -> Option<&Arc<MemoryBudget>> {
+        self.metadata.as_ref().filter(|memory| memory.is_prepaid())
+    }
+
     pub fn retained_bytes(&self) -> usize { self.budget.retained_bytes() }
+    pub fn budget(&self) -> &Arc<CacheBudget> { &self.budget }
+
+    /// Bytes charged to this pool, including decoded views and outstanding read leases.
+    pub fn pool_retained_bytes(&self) -> usize { self.memory.used_bytes() }
+
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
+
+    fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        self.budget.reserve(&self.memory, bytes)
+    }
 
     /// Drops the object's bytes, decoded views and disk copy from this pool's caches. Outstanding leases keep their bytes.
     pub async fn invalidate(&self, key: &ObjectKey) -> Result<()> {
@@ -315,13 +342,45 @@ impl BufferPool {
     /// fetched and charged to the pool's budget for as long as the lease lives, but not kept.
     pub async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<CacheLease> {
         if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
-        self.fetch(key, range, |length| self.budget.reserve(length)).await
+        self.fetch(key, range, |length| self.reserve(length)).await
     }
 
     /// As `get_range`, charging the bytes to `fallback` where the pool's budget cannot hold them.
     pub async fn get_range_or(&self, key: &ObjectKey, range: Range<u64>, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
         if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
-        self.fetch(key, range, |length| self.budget.reserve(length).or_else(|_| reserve_from(fallback, length))).await
+        self.fetch(key, range, |length| self.reserve(length).or_else(|_| reserve_from(fallback, length))).await
+    }
+
+    pub async fn scan_length(&self, key: &ObjectKey) -> Result<u64> {
+        if let Some(entry) = self.held(key) {
+            if let Some(allocation) = entry.allocation.lock().await.as_ref() { return Ok(allocation.len() as u64); }
+        }
+        Ok(self.store.head(key).await?.size)
+    }
+
+    pub async fn scan_range(&self, key: &ObjectKey, range: Range<u64>, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        self.fetch_scan_range(key, range, |length| self.reserve(length).or_else(|_| reserve_from(fallback, length))).await
+    }
+
+    /// Fetches a range without populating the disk cache with the whole object and charges the shared pool.
+    pub async fn get_scan_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<CacheLease> {
+        self.fetch_scan_range(key, range, |length| self.reserve(length)).await
+    }
+
+    async fn fetch_scan_range(&self, key: &ObjectKey, range: Range<u64>, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<CacheLease> {
+        if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
+        let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| Error::Task("Scan range is inverted or exceeds addressable memory".into()))?;
+        let allocation = self.store.scan_range_allocation(key, length)?;
+        let reservation = reserve_read(length, allocation, reserve)?;
+        let allocation = Arc::new(self.store.get_reserved_scan_range(key, range, reservation).await?);
+        Ok(CacheLease { allocation, range: 0..length })
+    }
+
+    async fn fetch_whole(&self, key: &ObjectKey, length: usize, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<RetainedBytes>> {
+        let allocation = self.store.whole_object_allocation(key, length)?;
+        let reservation = reserve_read(length, allocation, reserve)?;
+        Ok(Arc::new(self.store.get_reserved_object(key, reservation).await?))
     }
 
     /// As `get`, except that an object the pool cannot admit is read whole under `fallback`, and not kept.
@@ -329,7 +388,9 @@ impl BufferPool {
         match self.get(key).await {
             Err(Error::MemoryLimit { .. }) => {
                 let size = self.store.head(key).await?.size;
-                self.fetch(key, 0..size, |length| reserve_from(fallback, length)).await
+                let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
+                let allocation = self.fetch_whole(key, size, |bytes| reserve_from(fallback, bytes)).await?;
+                Ok(CacheLease { allocation, range: 0..size })
             }
             fetched => fetched,
         }
@@ -356,8 +417,7 @@ impl BufferPool {
                 None => {
                     let size = self.store.head(key).await?.size;
                     let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
-                    let reservation = ReadReservation::new(size, self.budget.reserve(size)?);
-                    let allocation = Arc::new(self.store.get_reserved_range(key, 0..size as u64, reservation).await?);
+                    let allocation = self.fetch_whole(key, size, |bytes| self.reserve(bytes)).await?;
                     *slot = Some(allocation.clone());
                     allocation
                 }
@@ -372,12 +432,12 @@ impl BufferPool {
     /// None where the view would take more than an eighth of the budget, or does not fit once nothing idle is left.
     pub fn admit(&self, bytes: usize) -> Option<Arc<MemoryReservation>> {
         if bytes > self.budget.limit_bytes() / 8 { return None; }
-        self.budget.reserve(bytes).ok()
+        self.reserve(bytes).ok()
     }
 
     /// Holds `value` as `view` of the object in place of any it held; false, holding nothing, where its bookkeeping does not fit.
     pub fn insert_view<T: Cached>(&self, key: &ObjectKey, view: View, value: Arc<T>) -> bool {
-        let Ok(overhead) = self.budget.reserve(view_overhead(key)) else { return false };
+        let Ok(overhead) = self.reserve(view_overhead(key)) else { return false };
         let value = Value::View { value, in_use: in_use_of::<T>, _overhead: overhead };
         let replaced = self.budget.lru.lock().insert(self.id, key, Slot::View(view), value);
         drop(replaced);
@@ -434,6 +494,30 @@ mod fairness_tests {
         drop(first.get(&ObjectKey::new("a").unwrap()).await.unwrap());
         assert!(matches!(second.get(&ObjectKey::new("b").unwrap()).await, Err(Error::MemoryLimit { .. })));
         assert_eq!(budget.retained_bytes(), 50, "the other pool's entry survives");
+    }
+
+    #[tokio::test]
+    async fn a_prepaid_cache_admits_and_retains_objects_during_ordinary_pressure() {
+        let parent = MemoryBudget::new(200);
+        let prepaid = CacheBudget::with_memory(parent.prepay(100).unwrap());
+        assert!(prepaid.prepaid_by(&parent));
+        let store = Arc::new(MemoryStore::default());
+        let a = ObjectKey::new("a").unwrap();
+        let b = ObjectKey::new("b").unwrap();
+        store.put(&a, Bytes::from(vec![1; 60])).await.unwrap();
+        store.put(&b, Bytes::from(vec![2; 60])).await.unwrap();
+        let ordinary = BufferPool::with_budget(store.clone(), CacheBudget::with_memory(Arc::clone(&parent)));
+        let audience = BufferPool::with_budget(store, prepaid);
+        let held = ordinary.get(&a).await.unwrap();
+        let _pressure = parent.reserve(40).unwrap();
+        assert_eq!(parent.used_bytes(), parent.limit_bytes());
+        assert!(matches!(ordinary.get(&b).await, Err(Error::MemoryLimit { .. })));
+        assert!(!audience.holds(&a));
+        drop(audience.get(&a).await.unwrap());
+        drop(held);
+        drop(ordinary.get(&b).await.unwrap());
+        assert!(!ordinary.holds(&a));
+        assert!(audience.holds(&a));
     }
 }
 
@@ -521,12 +605,19 @@ mod view_tests {
         let first = pool_of(&budget, &[]).await;
         let second = pool_of(&budget, &[("big", 36_000)]).await;
         for page in 0..4 { assert!(cache_view(&first, "f", View::Page(page), 4_000)); }
-        assert!(budget.retained_bytes() > 16_000);
-        drop(second.get(&key("big")).await.unwrap());
+        assert!(first.pool_retained_bytes() > 16_000);
+        assert_eq!(second.pool_retained_bytes(), 0);
+        let lease = second.get(&key("big")).await.unwrap();
         let kept = (0..4).filter(|page| first.view::<Decoded>(&key("f"), View::Page(*page)).is_some()).count();
         assert!(kept < 4, "the other pool's fetch evicted some views");
         assert!(first.view::<Decoded>(&key("f"), View::Page(0)).is_none(), "the oldest first");
         assert!(second.view::<Decoded>(&key("f"), View::Page(3)).is_none(), "views belong to the pool that cached them");
+        assert_eq!(second.pool_retained_bytes(), 36_000);
+        assert_eq!(budget.retained_bytes(), first.pool_retained_bytes() + second.pool_retained_bytes());
         assert!(budget.retained_bytes() <= budget.limit_bytes());
+        second.invalidate(&key("big")).await.unwrap();
+        assert_eq!(second.pool_retained_bytes(), 36_000);
+        drop(lease);
+        assert_eq!(second.pool_retained_bytes(), 0);
     }
 }

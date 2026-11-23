@@ -146,7 +146,7 @@ impl PartitionSpool {
     }
 }
 
-fn partition_count(blocks: usize,minimum: usize) -> Result<usize> {
+pub(crate) fn partition_count(blocks: usize,minimum: usize) -> Result<usize> {
     if minimum == 0 || minimum > i32::MAX as usize || !minimum.is_power_of_two() { return Err(invalid("join-partitions","Minimum join partitions must be a positive signed power of two")); }
     let blocks = i32::try_from(blocks).map_err(|_|size_error())?;
     let count = if blocks == 0 { 0 } else { (1u32 << (31 - blocks.leading_zeros())).wrapping_shl(1) as i32 };

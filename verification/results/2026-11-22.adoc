@@ -1,0 +1,461 @@
+= RTDB kernel study results, 2026-11-22
+
+== W2 and R5 · Inherited serving reads and physical residence disposal
+
+Production change `586330acad`.
+An inherited serving read acquires a directory registration on the deployment and residence containing the provider path.
+The provider operation retains that registration through caller cancellation.
+Disposal closes that residence to new reads, drains its regions and transfers the observed fork references before removing the source.
+A fork can read an owned copy without depending on a retired owner.
+
+The native replay starts a fork fallback read, cancels its waiter while the provider operation is active, and confirms that disposal still waits for the physical owner.
+After the provider work releases its hold, disposal completes and the same open fork reads the copy.
+Two source controls fail at their named assertions when owner admission is skipped or a fenced owner admits new work.
+The local replay exercised `ReferencingStore`, the in-memory directory and local object store, the provider I/O lifetime boundary and the disposal API.
+It makes no claim about reproducing a failure of a query snapshot.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Lean 4.36.0
+|Three theorems cover the reference model for arbitrary reader types and reachable histories.
+The runner checked their axioms and rejected three weakened transition rules.
+The full Lean suite matched.
+
+|TLC
+|All 84 states of the two-reader disposal model were explored.
+Five deliberately weakened models failed and the reachability control observed disposal after cancellation and drain.
+All 357 repository cases matched their expected results.
+
+|Apalache 0.63.0
+|The disposal safety invariant held through ten transitions.
+The other symbolic checks matched their configured outcomes.
+
+|Verus
+|The admission predicate used by the serving path and its three laws verified.
+Three code controls and three paired code-and-contract controls failed at their declared sites.
+All 41 areas and 211 controls matched.
+
+|Native Rust
+|The disposal replay and its two controls matched.
+The storage, maintenance, directory, Multi, and simulation suites reported 480 successful cases and 11 ignored cases using DynamoDB-enabled compilation. Cases gated on an unconfigured provider endpoint can exit before exercising it.
+A separate pass against ephemeral DynamoDB Local 3.3.2 exercised all 12 DynamoDB directory cases.
+The S3-specific native endpoint cases had no configured endpoint.
+
+|JVM and storage integration
+|3,198 standard and 3,348 property cases passed with zero failures, errors or skips.
+Core ran 100 distinct iterations each for 33 simulation methods.
+The selected JVM S3 proxy integration also passed all 12 cases. It uses a local proxy and exercises the JVM storage adapter.
+All three Gradle tasks used the rebuilt FFI library with SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+
+|Other design checks
+|The existing Alloy, Maude, mCRL2 and AutoHyper suites matched their expected results. These checks did not gain new disposal cases.
+|===
+
+The Lean theorem and TLC and Apalache results are about their models.
+Verus checks the synchronous admission predicate. The native replay supplies evidence for the directory CAS, Rust lifetime and disposal composition on the exercised path.
+Ordinary remote collection, transitive fork publication during retirement, and administrative copy admission remain open.
+The per-inherited-read directory cost and hosted-provider behaviour are unmeasured.
+
+=== Reproduction
+
+The repo runner includes the model, program proofs and controls. With the pinned tools and local authorization, use the command in link:../README.adoc[the runner instructions].
+Local evidence under `/private/tmp/rtdb-formal.QMjPSJsX/` includes command arguments and solver logs.
+
+* `reference-read-native-axy173_w/` contains the native replay and its controls.
+* `reference-read-formal-s1ne3ojt/` contains Verus and the focused TLC and Apalache runs. `reference-read-combined-o_sv1ij8/` contains the full TLC, Apalache, Alloy, Maude, mCRL2 and AutoHyper runs.
+* `reference-read-full-lean-0_8mo993/` contains the full Lean run, including the three new controls.
+* `reference-read-final-rust.log`, `reference-read-dynamo.log`, `reference-read-jvm.log` and `reference-read-s3-integration.log` contain the suite logs.
+
+The production tree is `80a7f0f32943b1bc525e379a464263a42c20a1b0`.
+The two preceding merge commits consolidated branch history while retaining identical source trees.
+
+== W2 and R5 · Fork publication across whole-residence disposal
+
+Production change `4ac4d1716`, tree `925442dae362203bcb0b3a1150cf074c0bd8b8d4`.
+This increment uses the local reclamation lineage state introduced in `6e9d6182d`.
+Whole-residence disposal acquires a distinct, persistent phase against the version of the drained physical owner. The phase advances the preparation generation before the referrer inventory is read.
+An interrupted disposal can resume against the same physical scope. Its receipt and the reopening of that phase publish together.
+A remote fork observes the open generation before storage preparation. After disposal, a stale preparation is refused and a fresh one can use the surviving copy.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Lean
+|Three theorems cover generation monotonicity over arbitrary histories, rejection of preparations from before the close and exact residence settlement. Their axiom audit was empty. Three mutation controls matched. The full Lean runner passed after adjusting the monotonicity proof to accept both advancing and unchanged generations, so the close mutation is attributed to the stale-preparation law.
+
+|TLC and Apalache
+|TLC explored 42 states of the model with a source, existing child and prospective grandchild, including restart. Five safety controls failed as expected, and the reachability control found fresh publication after receipt. All 365 repository cases matched their expected outcomes.
+Apalache checked the same invariant through 11 transitions and completed the other configured symbolic checks.
+
+|Verus
+|The shared-reference area verified 11 functions and laws, including the production tests for an open current generation and exact disposal scope. Eight new code and paired code-and-contract controls matched.
+All 41 areas and 219 controls matched.
+
+|Native
+|493 cases passed and 11 were ignored across Directory, storage, S3, maintenance, Multi and simulation. The fixture ran the shared Directory contract in memory, over TCP and with in-memory DynamoDB Local 3.3.2.
+The disposal replay reopens a durable local directory after reserving the lineage, checks that disposal copies into the published child and rejects an old preparation, then publishes a fresh fork.
+The replay rejects three source controls covering a lost reservation, a receipt that leaves the reservation behind and publication with a stale generation.
+The two existing lineage publication controls and both inherited-read disposal controls also matched.
+
+|JVM
+|3,198 standard tests, 3,348 property cases and 12 focused S3 proxy integration tests passed with zero failures, errors or skips. The FFI artifact was rebuilt and retained SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`. The proxy tests exercise the JVM adapter on a local endpoint.
+
+|Other design checks
+|The existing Alloy, Maude, mCRL2 and AutoHyper suites matched.
+|===
+
+The execution evidence covers the local provider, TCP and DynamoDB Local. The remote directory transaction is exercised against DynamoDB Local. Live S3 disposal and ordinary remote garbage collection still need provider evidence and the ordinary reaper still needs version-bound authorization. Physical-owner admission for administrative copy and remote preparation I/O remains open.
+
+=== Reproduction
+
+The model cases, executable predicate proofs and mutations are included in link:../README.adoc[the repository runner].
+The native controls require a loopback DynamoDB Local endpoint to exercise the backend transaction.
+Commands and logs are retained under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+* `reference-disposal-final-native-sjixezbz/` has the scoped Rust run and the targeted native replays. The local fixture was started in memory with telemetry disabled and stopped after the run.
+* `reference-disposal-combined-h_5pk4lw/` has the TLC, Apalache, Verus, Alloy, Maude, mCRL2 and AutoHyper runs.
+* `reference-disposal-lean-final-dy6zlwij/` has the full Lean run and its controls.
+* `reference-disposal-jvm.log` and `reference-disposal-s3-integration.log` have the Gradle results.
+
+== W2 and R5 · Hosted release-marker settlement
+
+Production change `c0ff58899`, tree `bbe7886fd08cfa94dcaa66a00750525b66ca36d2`.
+This increment extends the hosted exact data retirement and preparation holds introduced by `84effc8e5`.
+A new loose-file retirement records the version returned with the release marker's body. Before authorizing erasure the reaper verifies that marker again and fences both physical keys.
+The provider confirms absence of the retired data and marker versions separately. The directory then clears the owner fence and reopens the lineage in one transaction.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|TLC and Apalache
+|TLC explored 20 states of the marker settlement model. Four safety mutations failed as expected, and the reachability check found a delayed marker effect after settlement with a replacement present. All 377 configured repository cases matched.
+Apalache checked the marker model through 11 transitions. The other configured symbolic checks matched.
+
+|Verus and Lean
+|The shared-reference area verified 13 functions and laws, including the new owner-settlement predicate. Four added code and code-and-contract controls matched.
+All 41 Verus areas and 223 controls matched. The full existing Lean suite passed.
+
+|Native
+|495 cases passed and 11 were ignored across Directory, storage, S3, maintenance, Multi and simulation.
+The directory contract ran in memory, over TCP and against DynamoDB Local 3.3.2.
+The application replay uses the S3 version adapter against a loopback HTTP fixture. The fixture keeps the data and marker visible after separate removal acknowledgements, and a durable directory restart retains the authorization. An eventual retry sends each original version identifier and confirms absence while the provider reports newer versions.
+Two source controls fail at their declared assertions when the marker is skipped or settlement leaves the owner fence behind.
+A separate inherited-read replay and its three controls check data admission, residence closure and the marker fence.
+
+|JVM
+|3,198 standard cases, 3,348 property cases and 12 focused S3 proxy adapter integration cases passed with zero failures, errors or skips. FFI SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+
+|Other design checks
+|The existing Alloy, Maude, mCRL2 and AutoHyper suites matched.
+|===
+
+The proofs cover the model and the synchronous predicate. The execution evidence covers the named local providers and fixture exchanges.
+Live S3 and mixed-version rollout remain unverified.
+An older authorized reservation without a marker version can settle its data and leave its marker for a later version-aware pass.
+Pack-level collection, unwitnessed legacy releases and unversioned providers still need a complete retirement protocol.
+
+=== Reproduction
+
+The repository runner includes the marker model, production predicate checks and native controls.
+Commands and logs are retained under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+* `exact-marker-native-32oftwkr/` has the scoped Rust suite and versioned provider replay.
+* `exact-marker-custody-rybqv9w3/` has the inherited-read replay and controls.
+* `exact-marker-combined-fd3fsewo/` has the complete formal runs and their tool command records.
+* `exact-marker-jvm.log` and `exact-marker-s3-integration.log` have the Gradle results.
+
+== W2, R5 and R9 · Hosted packs and the local removal boundary
+
+Production changes `9104176e6` and `6a1a4f6ee`. Publication-identity comparison `e22d6956d`.
+Hosted checkpoint metadata packs now stay in storage until a newer same-store checkpoint is published, the owner checks its recovery holds and references, and mature releases cover all members of the same provider version.
+After removing that version, the reaper can settle remaining markers by confirming the original version is absent.
+The local-volume path reaper is private to Multi's maintenance code. The public simulator control takes only an in-memory store.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|TLC and Apalache
+|The hosted pack model explored 616 states. Seven safety mutations produced counterexamples, and the reachability check found residual marker settlement with a replacement still present. Apalache independently checked eight transitions and found the incomplete-coverage counterexample.
+The publication-identity model explored 6 states for terminal keys and 18 for atomic publication identity. Both preserved the replacement property. The tag-only variant failed, and the reachability checks confirmed fresh-key publication and preservation across a same-key replacement.
+The combined run at `e22d6956d` passed all 406 TLC and 68 Apalache cases.
+
+|Lean and Verus
+|Lean checks the maximum-member bound for arbitrary blocks and holds. Its matching control fails at that theorem.
+Verus checks the production checkpoint retention predicate used at the physical-owner CAS. The area verified 13 functions and laws and rejected all eight controls, including the weakened code and contract together.
+The combined run passed 67 Lean proof cases, all 41 production Verus areas and 225 Verus controls.
+
+|Rust and compile-fail
+|The pack change passed 498 scoped tests with 11 ignored. The production replay exercised incomplete coverage, a held checkpoint, a stale release and an absent exact version with a replacement present. Three pack controls and both existing exact marker controls failed at their declared assertions.
+The local API change passed 272 scoped tests with 10 ignored. Both prohibited calls fail to compile and compile under their corresponding control.
+
+|JVM and adapter integration
+|On the pack change, all 3,198 standard cases, 3,348 property cases and 12 focused S3 proxy integration cases passed.
+The FFI SHA-256 was `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+
+|Other design checks
+|The combined run also passed the configured Alloy, Maude, mCRL2, AutoHyper, SMT and OpenJML cases.
+|===
+
+The pack replay uses an in-memory provider with immutable publication identities. The S3 adapter replay separately checks versioned request and settlement behavior through loopback HTTP.
+Live S3, mixed-content packs, legacy path-only pack releases, never-versioned serving adapters and the full composed residence contract remain open.
+
+=== Reproduction
+
+The repository runner includes the bounded models, exact Rust predicates, native replay and compile-fail controls.
+Local evidence under `/private/tmp/rtdb-formal.QMjPSJsX/`:
+
+* `publication-tag-combined-e22d6956d/` has the combined proof run, tool hashes and commands.
+* `pack-exact-native-cy326ms7/` has the scoped Rust, DynamoDB Local 3.3.2, native mutations and FFI builds.
+* `reaper-boundary-native-8qk_n5e5/` has the API boundary and scoped Rust results.
+* The Gradle logs are `build/test-run.log` and `build/pack-exact-s3-integration.log` in `/private/tmp/rtdb-publication-version.5mfxM4cf/`.
+
+== R5 · Terminal S3 enrollment
+
+The enrollment command authenticates the provisioning authority and provider root before admitting a never-versioned allocation.
+It requires clean object, version and multipart inventories and persists the qualification before activating the namespace.
+Terminal readers, scoped writers and inventory opens require the same qualification and allocation marker.
+
+TLC explored 46 states for enrollment.
+It rejected trusting bucket status alone, resuming over dirty inventory, permitting an early write after the inventory check and reopening under a legacy alias.
+The reachability run reopened an enrolled allocation after publication.
+TLC also matched the existing publication identity, hosted path release and tombstone disposal studies.
+link:../tla/TerminalNamespaceEnrollment.tla[Enrollment model]
+
+The scoped native run on `1db6dc564` passed 564 cases and five doctests, with 11 ignored cases.
+The loopback S3 suite exercised fresh and resumed enrollment, rejection of occupied and versioned scopes, an outstanding multipart upload and dirty bootstrap residue.
+The fixture normalized the emulator's bucket-versioning response to the AWS XML schema.
+The command-line replay exercised first activation, repeat activation and rejection in a different allocation.
+The bucket-level allocation test refuses nesting under a legacy residence.
+The existing fork and disposal replay passed against both bucket profiles.
+
+The JVM run against the rebuilt FFI at `4ac35e3d5` passed 3,198 standard, 3,348 property and 5,629 integration cases, with one PostgreSQL integration skip.
+The focused build on `bd79d69b6` plus the Flight SQL compilation fix passed 246 unit tests, with one ignored case.
+Allium 3.7.2 check and analysis added no diagnostics relative to the existing target spec.
+
+The provider-policy fence and irreversible key retirement need live qualification.
+The loopback emulator does not enforce the MinIO session-policy integration contract.
+New tombstone retirement requires a per-publication witness from the serving write path.
+
+The native, fixture and TLC evidence is under `/private/tmp/rtdb-terminal-enroll-native-rebased.log`, `/private/tmp/rtdb-terminal-enrollment-fixture.log` and `/private/tmp/rtdb-terminal-enrollment-3o3k6t8m/`.
+
+== R5 · Witnessed terminal loose-file retirement
+
+The write response supplies the provider identity for the catalog's file or artefact record.
+The hosted collector retains a terminal publication in its installed release, and the reaper compares both targets before authorizing the exact owning residence.
+The receipt survives open, interrupted and resumed retirement, and provider closure precedes settlement.
+
+On `9a304e94eb` the native suite passed 636 cases and five doctests, with eight ignored cases.
+The storage regression exercises a normal publication, lost reply and exact-byte retry.
+The reaper replay blocks on the published recovery cut, an older recovery admission and a physical-owner read.
+It retains and resumes the same release-marker upload after a directory restart.
+The loopback S3 fixture exercises the captured ETag and rejects a different allocation and tag.
+
+TLC explored 36 states for terminal retirement admission.
+Its six safety mutants omit enrollment, the installed release, write evidence, the owner hold, recovery coverage or upload closure.
+The reachability witness settles an eligible retirement.
+The publication identity, disposal and existing composed residence studies matched their controls.
+Allium 3.7.2 added no diagnostics to the edited specs relative to their baseline.
+link:../tla/TerminalRetirementAdmission.tla[Admission model]
+
+The replay abstracts provider policies and mixed packs.
+The runtime provider gate still needs qualification in the hosted environment.
+The native and TLC records are in `/private/tmp/rtdb-terminal-publication-native-final.log` and `/private/tmp/rtdb-terminal-retirement-final-ofwj4jrq/`.
+
+== R5 · Recovery coverage for versioned loose-file retirement
+
+Versioned loose trie releases and recovered legacy witnesses use the same checkpoint and replica-start guard as terminal releases.
+The owner revision rechecks the guard when establishing the exact retirement fence.
+The versioned replay verifies that an older directory checkpoint or an admitted recovery at the removal cut prevents provider effects.
+After both advance, the same replay exercises fork references, owner reads, a lost provider reply and exact version settlement.
+All six native exact retirement cases passed in `/private/tmp/rtdb-versioned-checkpoint-fence-final.log`.
+The reconciled native build on `54fd1569d5` passed 241 targeted tests, with one ignored case, after boxing the staged reader's serving future.
+The JVM suite on the terminal publication tree recorded 3,198 standard, 3,348 property and 5,629 integration passes, with one PostgreSQL slot-recreation skip.
+The root suite ran separately after a discovery failure, and the property and integration results came from the preceding full execution.
+The final combined Gradle invocation accepted all task results as current.
+
+== R5 · Serving recovery inventory and prefix authorization
+
+Hosted flush, park and idle suspension publish the replay inventory commitment with the checkpoint cut.
+The reaper requires that commitment before redeeming a trie release.
+A cold snapshot refuses a mismatched commitment before opening the block.
+The native copy fixture detects an absent retained L0 member, an absent shared artefact and a replacement provider version.
+The scoped native run passed 294 cases and five doctests, with six ignored cases.
+DynamoDB Local passed all 35 directory cases with the binary parked format enabled.
+The versioned loopback S3 tests recovered across worker loss and across an interrupted checkpoint restore.
+
+TLC explored 404 distinct states for the trim protocol.
+The controls reject publishing an incomplete inventory, authorizing a trim from a legacy checkpoint, ignoring older recovery holds and admitting against the physical floor after a stronger trim authorization.
+The reachability case opens a recovery after a trim.
+Allium check and analysis added no diagnostics to the edited specifications.
+link:../tla/ReplicaTrimAdmission.tla[Trim admission model]
+
+== R5 · PostgreSQL confirmation before block adoption
+
+Synced local source and replica journals and synced local checkpoint storage support an early confirmation from an applied transaction.
+The PostgreSQL 17 replay confirms a transaction at the upstream slot before the first block exists, reopens both journals, and resumes the same slot without losing either imported row.
+The other native PostgreSQL replays cover the checkpoint-only bound and concurrent snapshot import.
+The scoped replication, storage and PostgreSQL suites passed, and all three live PostgreSQL fixture tests passed.
+TLC explored 48 distinct states. Its controls reject volatile apply evidence, unconditional pre-block confirmation and received WAL beyond the recoverable token.
+The reachability case confirms before the first block using retained replay.
+link:../tla/ExternalConfirmation.tla[External confirmation model]
+
+== R9 · Native recovery and trim trace
+
+A native subscriber opened its replay cursor while the holder advanced the checkpoint and trimmed the journal.
+The trace recorded 26 committed directory revisions and two physical floor observations, at offsets 3 with a hold and 10 after drain.
+The validator accepted the live capture.
+Five controls reject a missing manifest, a trim overlapping a hold, a physical floor beyond its authorization, a different journal and a gap in directory revisions.
+link:../recovery_trace.py[Recovery trace validator]
+
+The combined JVM suites passed 3,198 standard, 3,348 property and 5,629 integration cases, with one PostgreSQL slot-recreation skip.
+The PostgreSQL failover test passed in its focused retry and in the full integration run.
+No reflection or boxed-math warnings were recorded.
+
+== R4 · Local catalog admission and installed retirement
+
+The native trie collector installed a removal and left its intent pending while a second local store held the earlier cut.
+After that hold closed, a reopened collector deleted the receipt's files without another publication and rejected admission at the earlier cut.
+The storage tests also cover an offline journal replacement with an outstanding older hold and an opaque checkpoint reader.
+The native node suite passed 116 cases, including journal replacement and compactor reset over an existing floor.
+The reset waits for the prefix covering its new naming epoch before returning.
+
+== R5 · Hosted suffix pins and shared pack observations
+
+Startup, live replay and suffix preparation read the same persisted journal anchor.
+The trim plan includes pending archive suffixes until publication or expiry, and the verified archive retains the archived copy independently.
+TLC explored 14 states and rejected dropping a pending pin and publishing an unverified archive.
+The reachability case removed the live suffix while the archive still held its capture.
+The existing trim admission model explored 404 states.
+
+The native recovery trace retained the subscriber's first required record at offset 3 and advanced the physical floor to offset 10 after drain.
+Its 26 directory revisions passed the trace validator, and five corrupted traces failed their expected checks.
+A provider-counting regression verifies two pack members with one pack observation and refuses a replacement of that physical key.
+The replay commitment keeps its existing encoding.
+link:../tla/ReplicaTrimArchive.tla[Archive handoff model] · link:../recovery_trace.py[Native trace validator]
+
+The combined Gradle rerun with the rebuilt native library passed 3,198 standard, 3,348 property and 5,629 integration cases.
+The PostgreSQL slot-recreation fixture was skipped.
+No reflection or boxed-math warnings were recorded.
+Allium check and analysis reported the original diagnostics for all three changed specifications.
+
+== R5 · Archive copy custody and reset inventory
+
+The archive regression admits a copy against its journal anchor and holds the first required record while an admitted provider operation remains open.
+The record stays protected after archive publication and pin expiry, and the directory releases it after provider drain.
+The model explored 19 states and rejected trim during an admitted copy, releasing a pending pin, and publication without archive verification.
+The progress witness reaches physical trim after the archive takes custody and provider work has drained.
+
+The native reset fixture temporarily removes a required L0 data object and verifies that preparation refuses and keeps the compacted files.
+An unlisted L0 pair is present when the retry succeeds, and the plan excludes it.
+The successful replacement remains readable after restart.
+The packed copy test observes one physical pack for two members, and exact body reads still refuse a changed version.
+The directory, Multi, and node suites passed 27, 163, and 117 cases respectively.
+The live cell trace exercised checkpoint admission and trim and rejected all five controls.
+The complete native cell suite passed 99 cases on the default worker stack after the short-query planning fix.
+The fix also passed its depleted-stack test.
+
+== R8 · Log-time application receipt expiry
+
+The resolver regression begins with two records at the same append timestamp and checks the retry boundary after the second record's system time advances.
+It regresses the source clock before and after reusing the expired key and confirms that retries still name the most recent committed receipt.
+All 33 resolver cases passed.
+
+The combined Gradle run passed 3,198 standard, 3,348 property and 5,629 integration cases.
+The PostgreSQL slot-recreation fixture was skipped.
+No reflection or boxed-math warnings were recorded.
+
+== W2 and R9 · Native local disposal trace
+
+Model and replay change `c376a8669e`.
+A local directory admits erasure of one source residence after the fork has published references to two objects.
+The test captures successful copy and removal effects from the local object store during the native disposal call.
+It checks the signed empty inventory and rereads both fork copies afterwards.
+The trace records physical paths. The replay checks the source and destination scopes before mapping paths to the bounded model.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Native
+|165 Multi library tests passed. The trace recorded four effects in order, copy then remove for each publication.
+The composed checker accepted all four effects and refused the trace control at its first step when a source removal moved ahead of the required copy.
+
+|TLC and Apalache
+|TLC explored 1,063 states in the per-publication composition.
+Nine unsafe changes failed, and the two reachability cases observed selective collection and whole-residence progress.
+The authored trace passed, and all five altered traces were rejected at their declared points.
+Apalache independently checked 11 transitions and found the missing replay-suffix guard in its negative control.
+
+|Combined evidence
+|On `c376a8669e`, 474 TLC cases, 70 Apalache cases, 67 Lean proof cases and 41 Verus areas with 225 controls matched.
+OpenJML, Alloy and SMT ran on the same revision. A missing Maude prelude interrupted the original aggregate run after those checks. The restored, hash-matched Maude distribution passed along with mCRL2 and AutoHyper in a separate invocation on the same revision.
+|===
+
+The native trace starts with a directory permit and an already-published fork. It ends at observed local source absence.
+The authored TLA+ trace goes through directory settlement and includes a query, an in-flight read and a recovery cursor.
+The native trace gives evidence for the local copy and removal effects. Hosted provider execution and the full composition across these entry points remain open.
+
+The reproduction runner is link:../run.py[verification/run.py].
+The native fixture and captured trace are in `per-publication-native-c376a8669e-56_ro90g/`.
+Recorded proof commands and tool identities are in `per-publication-combined-c376a8669e/` and `per-publication-combined-tail-c376a8669e-6voyi_ho/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+== W1 · Replica-tip currency for reader leases
+
+Production change `aa0c65dd19`.
+The foreground and maintenance paths still share one mutex-protected state.
+Both now use the verified Rust decisions for recording a pending tip and confirming its clock anchor.
+An observation at an equal or older tip keeps the pending sample.
+The sampled tip must be installed before confirmation, and the anchor keeps the greater clock reading.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Lean
+|Four audited theorems establish prefix coverage and monotonicity over arbitrary finite model histories.
+Three model controls fail at their declared theorem.
+
+|TLC
+|126,031 states for two observers, with bounded clock and replica positions.
+Four safety controls fail, and the reachability case sees one confirmation while a second observer is still active.
+
+|Verus
+|The two production functions and four laws verify for representable inputs.
+Three code mutations and three paired code-and-contract mutations fail at their declared sites.
+
+|Rust
+|All 22 Node library tests passed at `aa0c65dd19`.
+The three currency cases also passed in an isolated harness linked to the prebuilt Rust dependencies.
+|===
+
+The clock sample must precede the provider tip read. The installed frontier must advance monotonically within the same replica epoch.
+The proof covers the anchoring decision under those premises. The provider's response and drain timing, early query refusal and leadership turnover remain separate obligations.
+
+Proof logs and commands are in `read-currency-lean-ac4jaa85/`, `read-currency-tlc-a5iv5da7/`, `read-currency-verus-71qg5jbs/` and `read-currency-native-if_slre_/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+The package test log is `read-currency-full-node-aa0c65dd19.log`.
+The post-rebase TLC run reproduced the currency results at `aa0c65dd19` and passed the added recovery custody and repair-anchor model cases and their Lean controls.
+Its commands are in `currency-rebase-recovery-aa0c65dd19-gw4uu07w/`.
+
+The single combined formal run at `ef7ef49df1` passed 480 TLC cases, 70 Apalache cases, 68 Lean proof cases with 197 controls, and 42 Verus areas with 231 controls.
+It also completed Alloy, Maude, mCRL2, AutoHyper, SMT and OpenJML.
+The later runtime rebase changed neither currency proof source nor the production currency steps.
+The combined proof receipt under `read-currency-combined-ef7ef49df1/` names that exact source revision. The targeted runs above supply evidence for the later revision.
+
+== W1 · Query admission requires current catalog currency
+
+Production change `6465fb63ae`.
+Replicated query capture refuses an unconfirmed or expired catalog lease before handing its captured snapshot to the evaluator.
+Delegated fragments and membership queries use the same guard.
+Offline query capture continues to admit reads without a replica lease.
+Provider operations still check the lease at their own admission boundary.
+
+All 23 Node library tests and 121 native Node integration tests passed.
+The new native test exercises the actual query context call with an unusable replica lease and checks its unavailable outcome. The same fixture checks offline acceptance.
+The native control omits the query capture guard and fails at the snapshot-admission assertion.
+The Node suite log is `current-query-catalog-node.log` and the replay receipt and control outputs are in `current-query-catalog-control-khk9w37b/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+The full Gradle suite and live hosted-provider qualification were outside these runs.

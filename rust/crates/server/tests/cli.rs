@@ -106,12 +106,81 @@ fn snapshot_export_requires_database_and_preserves_dry_run_configuration() {
 
 #[test]
 fn compactor_reset_requires_database_and_preserves_dry_run_configuration() {
-    let Command::CompactorReset { options, database, dry_run } = parse(&["reset-compactor", "analytics", "--dry-run", "-f", "node.yaml"]) else { panic!("expected compactor reset") };
+    let Command::CompactorReset { options, database, dry_run, retained_base: None } = parse(&["reset-compactor", "analytics", "--dry-run", "-f", "node.yaml"]) else { panic!("expected compactor reset") };
     assert_eq!(database, "analytics");
     assert!(dry_run);
     assert_eq!(options.file.unwrap().to_str(), Some("node.yaml"));
     assert!(cli::parse(["reset-compactor".into()], &|_| None).is_err());
     assert!(cli::parse(["reset-compactor", "one", "two"].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
+fn reset_compactor_accepts_a_retained_export_only_for_reset() {
+    let Command::CompactorReset { retained_base: Some(export), dry_run: true, .. } =
+        parse(&["reset-compactor", "xtdb", "--retained-base", "export", "--dry-run"])
+    else { panic!("expected retained reset") };
+    assert_eq!(export.to_str(), Some("export"));
+    for arguments in [
+        &["reset-compactor", "xtdb", "--retained-base", "--dry-run"][..],
+        &["export-snapshot", "xtdb", "--retained-base", "export"][..],
+        &["reset-compactor", "xtdb", "--retained-base", "first", "--retained-base", "second"][..],
+    ] {
+        assert!(cli::parse(arguments.iter().map(|arg| (*arg).to_owned()), &|_| None).is_err());
+    }
+}
+
+#[test]
+fn retain_repair_base_requires_a_detached_store_and_checkpoint_receipt() {
+    let base = format!("9@{}", "a1".repeat(32));
+    let Command::RetainRepairBase { request, memory_bytes } = parse(&[
+        "retain-repair-base", "source", "logs/REPLICA_LOG", "export", &base, "--memory-limit", "104857600",
+    ]) else { panic!("expected repair base retention") };
+    assert_eq!(request.source_storage.to_str(), Some("source"));
+    assert_eq!(request.base_storage.to_str(), Some("export"));
+    assert_eq!(request.replica_log.to_str(), Some("logs/REPLICA_LOG"));
+    assert_eq!(request.base.block.0, 9);
+    assert_eq!(request.base.sha256, [0xa1; 32]);
+    assert_eq!(memory_bytes, 104857600);
+    assert!(cli::parse(["retain-repair-base", "source", "logs/REPLICA_LOG", &base].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
+fn a_retained_base_requires_the_detached_export_and_one_target_receipt() {
+    let through = format!("23@{}", "C4".repeat(32));
+    let Command::RepairRetainedCheckpoint { request, .. } = parse(&[
+        "repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through,
+        "--retained-base", "--base-storage", "export",
+    ]) else { panic!("expected repair from retained base") };
+    assert_eq!(request.base_storage.to_str(), Some("export"));
+    assert_eq!(request.through.block.0, 23);
+    let detached_required = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through, "--retained-base"];
+    assert!(cli::parse(detached_required.map(str::to_owned), &|_| None).is_err());
+    let only_one_receipt = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through, &through,
+        "--retained-base", "--base-storage", "export"];
+    assert!(cli::parse(only_one_receipt.map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
+fn checkpoint_repair_requires_exact_publication_receipts() {
+    let base = format!("9@{}", "a1".repeat(32));
+    let through = format!("23@{}", "C4".repeat(32));
+    let Command::RepairCheckpoint { request, memory_bytes } = parse(&[
+        "repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &base, &through,
+        "--base-storage", "known-good", "--memory-limit", "104857600",
+    ]) else { panic!("expected checkpoint repair") };
+    assert_eq!(request.source_storage.to_str(), Some("source"));
+    assert_eq!(request.base_storage.unwrap().to_str(), Some("known-good"));
+    assert_eq!(request.replica_log.to_str(), Some("logs/REPLICA_LOG"));
+    assert_eq!(request.output_parent.to_str(), Some("repairs"));
+    assert_eq!(request.base.block.0, 9);
+    assert_eq!(request.base.sha256, [0xa1; 32]);
+    assert_eq!(request.through.block.0, 23);
+    assert_eq!(request.through.sha256, [0xc4; 32]);
+    assert_eq!(memory_bytes, 104857600);
+    for invalid in ["9", "9@abcd", &format!("-9@{}", "ab".repeat(32)), &format!("9@{}", "zz".repeat(32))] {
+        let arguments = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", invalid, &through];
+        assert!(cli::parse(arguments.map(str::to_owned), &|_| None).is_err());
+    }
 }
 
 #[test]

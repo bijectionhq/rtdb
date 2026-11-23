@@ -375,6 +375,30 @@ impl ControlParser<'_> {
         }
         if self.eat("DETACH") { self.expect("DATABASE")?; return Ok(ControlStatement::DetachDatabase { name: self.identifier()?.normalized() }); }
         self.expect("COPY")?;
+        if self.token(Token::LParen) {
+            let start = self.index;
+            let mut depth = 1;
+            loop {
+                let Some(token) = self.tokens.get(self.index) else { return Err(self.error("Unclosed COPY query")); };
+                match token.token {
+                    Token::LParen => depth += 1,
+                    Token::RParen => { depth -= 1; if depth == 0 { break; } },
+                    _ => (),
+                }
+                self.index += 1;
+            }
+            let end = self.index;
+            self.index += 1;
+            if start == end { return Err(self.error("COPY requires a query")); }
+            self.expect("TO")?; self.expect("STDOUT")?; self.expect("WITH")?;
+            if !self.token(Token::LParen) { return Err(self.error("COPY requires WITH parentheses")); }
+            self.expect("FORMAT")?; self.token(Token::Eq);
+            if self.string()? != "arrow-stream" { return Err(self.error("COPY TO requires the arrow-stream format")); }
+            if !self.token(Token::RParen) { return Err(self.error("Expected closing COPY options parenthesis")); }
+            let source = StatementSource::tokens(self.source, &self.tokens[start], &self.tokens[end - 1]);
+            crate::parse::parse_statement_syntax(source, source.span(), &self.tokens[start..end])?;
+            return Ok(ControlStatement::CopyOut { query: source.text().into() });
+        }
         let mut table = vec![self.identifier()?];
         if self.token(Token::Period) { table.push(self.identifier()?); }
         self.expect("FROM")?; self.expect("STDIN")?; self.expect("WITH")?;

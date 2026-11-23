@@ -10,8 +10,136 @@ use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Lea
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V1, READ_HELD_HOSTED_CONTROL_V2};
         let work = async {
-            match action.r#type.as_str() {
+            let action_type = action.r#type.as_str();
+            if let Some(source) = call.session.audience_source() {
+                match action_type {
+                    // Catalog acquisition checks the placement and quorum at the captured cut.
+                    PREPARE_APPLIED_READ_V1 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_HISTORICAL_POINT_V1 | READ_HELD_HOSTED_CONTROL_V2 => {
+                        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+                        let attachment = attachment.ok_or_else(unsupported)?;
+                        self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
+                    }
+                    // These actions only relinquish resources under the authenticated local session.
+                    CLOSE_OWNED_READ_V1 | "CloseSession" => {}
+                    _ => return Err(Status::permission_denied("The reserved Flight session only admits audience observations")),
+                }
+            }
+            match action_type {
+                crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::DECLARE_OWNED_RELATION_V1 => Ok(vec![Ok(self.declare_owned_relation_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body).await?)]),
+                crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_COUNTED_V2 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V2 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_DECIDING_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_STAGED_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V3 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped, false).await?)]),
+                crate::owned_actions::COMMIT_ORDERED_V1 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Ordered, false).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V4 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped, true).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V7 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_SCOPED_READ_V1 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                PREPARE_APPLIED_READ_V1 => {
+                    self.prepare_applied_read_action(&call, &action.body).await?;
+                    Ok(Vec::new())
+                }
+                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
+                crate::owned_actions::SEARCH_HELD_WORLD_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
+                crate::owned_actions::SEARCH_HELD_WORLD_V2 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_RANGE_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRangeAt).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_COUNT_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCountAt).await?)]),
+                crate::owned_actions::HELD_WORLD_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange).await?)]),
+                crate::owned_actions::HELD_WORLD_COUNT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCount).await?)]),
+                crate::owned_actions::HELD_WORLD_MEASURE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentMeasure).await?)]),
+                crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRangeAt).await?)]),
+                crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRange).await?)]),
+                crate::owned_actions::HELD_OWNED_RANGE_V1 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading).await?)]),
+                crate::owned_actions::HELD_OWNED_RANGE_V2 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full).await?)]),
+                crate::owned_actions::HELD_OWNED_RANGE_V3 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid).await?)]),
+                crate::owned_actions::HELD_OWNED_RANGE_V4 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical).await?)]),
+                crate::owned_actions::HELD_OWNED_COUNT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, false).await?)]),
+                crate::owned_actions::HELD_OWNED_COUNT_V2 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, false).await?)]),
+                crate::owned_actions::HELD_OWNED_MEASURE_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, true).await?)]),
+                crate::owned_actions::HELD_OWNED_MEASURE_AT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, true).await?)]),
+                crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V1 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::READ_HELD_WORLD_CHANGES_V3 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 => Ok(vec![Ok(self.held_owned_storage_usage_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V1 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V3 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 => Ok(vec![Ok(self.held_expiry_candidates_action(&call, &action.body).await?)]),
+                crate::owned_actions::APPLY_HELD_EXPIRY_V1 => Ok(vec![Ok(self.apply_held_expiry_action(&call, &action.body).await?)]),
+                crate::owned_actions::NOMINATE_HELD_EXPIRY_V1 => Ok(vec![Ok(self.nominate_held_expiry_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_CHANGES_V3 => Ok(vec![Ok(self.held_owned_changes_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_HELD_UNIQUE_V1 => Ok(vec![Ok(self.held_owned_unique_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_OWNED_POINT_V2 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_VALID_AT_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::ParentAt).await?)]),
+                crate::owned_actions::HELD_WORLD_VALID_AT_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
+                crate::owned_actions::HELD_WORLD_VALID_V2 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current).await?)]),
+                crate::owned_actions::HELD_WORLD_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::EffectiveAt).await?)]),
+                crate::owned_actions::HELD_WORLD_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::Effective).await?)]),
+                crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::OverlayAt).await?)]),
+                crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::Overlay).await?)]),
+                crate::owned_actions::HELD_PROTECTED_COVERAGE_V1 => Ok(vec![Ok(self.held_protected_coverage_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 => Ok(vec![Ok(self.held_protected_carriers_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
+                crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
+                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V3 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
+                crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
+                crate::owned_actions::HELD_WORLD_VERSION_V2 => self.held_world_version_action(&call, &action.body).await,
+                crate::owned_actions::HELD_WORLD_TOUCH_IMAGES_V1 => self.held_world_path_touch_action(&call, &action.body, true).await,
+                crate::owned_actions::HELD_WORLD_PATH_TOUCH_V1 => self.held_world_path_touch_action(&call, &action.body, false).await,
+                crate::owned_actions::HELD_OWNED_PATH_TOUCH_V1 => self.held_owned_path_touch_action(&call, &action.body).await,
+                crate::owned_actions::HELD_OWNED_HISTORICAL_POINT_V1 => Ok(vec![Ok(self.held_owned_historical_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_POSITION_POINT_V1 => Ok(vec![Ok(self.held_owned_position_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_VALID_DURING_V2 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_OWNED_POSITION_VALID_DURING_V1 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::CLOSE_OWNED_READ_V1 => {
+                    self.close_owned_read_action(&call, &action.body)?;
+                    Ok(Vec::new())
+                }
+                crate::owned_actions::PREPARE_REPLAY_PARENT_V1 => Ok(vec![Ok(self.prepare_replay_parent_action(&call, &action.body).await?)]),
+                crate::owned_actions::FINISH_REPLAY_PARENTS_V1 => Ok(vec![Ok(self.finish_replay_parents_action(&call, &action.body).await?)]),
+                crate::owned_actions::RETAIN_REPLAYED_WORLD_V3 => Ok(vec![Ok(self.retain_replayed_world_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_WORLD_READ_V4 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::SELECT_HELD_WORLD_PARENT_AS_OF_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfParent).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_POINT_AT_V1 => Ok(vec![Ok(self.held_world_point_at_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::SELECT_HELD_WORLD_AS_OF_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfLocal).await?)]),
+                crate::owned_actions::HELD_WORLD_AT_PREFLIGHT_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::ExactLocal).await?)]),
+                crate::owned_actions::HELD_WORLD_POINT_AT_V1 => Ok(vec![Ok(self.held_world_point_at_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_WORLD_POINT_V2 => Ok(vec![Ok(self.held_world_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::CLOSE_WORLD_READ_V1 => {
+                    self.close_world_read_action(&call, &action.body)?;
+                    Ok(Vec::new())
+                }
+                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V2 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
+                crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::PUBLISH_WORLD_CUT_V2 => {
+                    Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
+                        action.r#type == crate::owned_actions::PUBLISH_WORLD_CUT_V2).await?)])
+                }
+                crate::owned_actions::COMMIT_WORLD_V4 => Ok(vec![Ok(self.validate_world_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HELD_WORLDS_V4 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;
                     let shared = self.connection(&call, &call.database).await?;
@@ -39,13 +167,14 @@ impl Service {
                     let mut results = Vec::new();
                     if let Some(last) = native.state().last_submitted() {
                         let error_bound = match last { LastSubmittedTx::Executed(tx) => tx.error().map(crate::error::allocation_bound).transpose()?.unwrap_or(0), _ => 0 };
-                        let bound = wire::add(error_bound, wire::add(8192, wire::mul(native.state().effective_await_token().map_or(0, str::len), 16)?)?)?;
+                        let await_token = native.state().last_submitted_await_token();
+                        let bound = wire::add(error_bound, wire::add(8192, wire::mul(await_token.map_or(0, str::len), 16)?)?)?;
                         let _scratch = self.memory().reserve(bound).map_err(status)?;
                         let (tx_id, time, committed, error) = match last {
                             LastSubmittedTx::Submitted(tx) => (tx.tx_id.0, None, None, None),
                             LastSubmittedTx::Executed(tx) => (tx.tx_key().tx_id.0, Some(ticket::timestamp(tx.tx_key().system_time)?), Some(tx.committed()), tx.error().map(crate::error::anomaly_json).transpose()?),
                         };
-                        let value = serde_json::json!({ "txId": tx_id, "systemTime": time, "committed": committed, "error": error, "awaitToken": native.state().effective_await_token() });
+                        let value = serde_json::json!({ "txId": tx_id, "systemTime": time, "committed": committed, "error": error, "awaitToken": await_token });
                         let bytes = serde_json::to_vec(&value).map_err(arrow)?;
                         let charge = self.memory().reserve(bytes.capacity()).map_err(status)?;
                         results.push(Ok(ActionResult { body: wire::retain(bytes, charge) }));
@@ -56,7 +185,7 @@ impl Service {
                 "CreatePreparedStatement" => {
                     let request: ActionCreatePreparedStatementRequest = unpack(&action.body)?;
                     let connection = self.tx_or_session(&call, request.transaction_id.as_ref()).await?;
-                    let shape = self.prepare_shape(connection, &request.query, None).await?;
+                    let shape = self.prepare_shape(connection, &request.query).await?;
                     let scope = request.transaction_id.map_or_else(|| PreparedScope::Session(call.database.clone()), PreparedScope::Transaction);
                     let charge = self.memory().reserve(wire::add(request.query.capacity(), wire::add(call.database.len(), 1024)?)?).map_err(status)?;
                     let prepared = Arc::new(Prepared::new(call.session.owner(), request.query, scope, charge));
@@ -86,8 +215,8 @@ impl Service {
                                 if matches!(value.value, Some(protocol::OptionValue::String(value)) if value.is_empty() || value == call.database) { None } else { Some(2) }
                             }
                             "catalog" => match value.value {
-                                Some(protocol::OptionValue::String(value)) if value.is_empty() => { call.session.select_catalog(None, &self.0.node)?; None }
-                                Some(protocol::OptionValue::String(value)) => { if self.admit_database(&value).await? { call.session.select_catalog(Some(value), &self.0.node)?; None } else { Some(2) } }
+                                Some(protocol::OptionValue::String(value)) if value.is_empty() => { call.session.select_catalog(None)?; None }
+                                Some(protocol::OptionValue::String(value)) => { if self.admit_database(&value).await? { call.session.select_catalog(Some(value))?; None } else { Some(2) } }
                                 _ => Some(2),
                             },
                             "schema" => if matches!(value.value, Some(protocol::OptionValue::String(value)) if value == "public") { None } else { Some(2) },
@@ -99,11 +228,21 @@ impl Service {
                 }
                 "CloseSession" => {
                     protocol::Empty::decode(action.body.as_ref()).map_err(arrow)?;
-                    if let Lookup::Found(session) = self.0.sessions.take(&call.session.id) { session.close(); }
+                    call.close_session();
                     if call.minted { return Err(Status::not_found("No session to close")); }
-                    Ok(vec![Ok(raw(&protocol::CloseResult { status: 1 }, self)?)])
+                    let result = protocol::CloseResult { status: 1 };
+                    let charge = call.reserve(wire::add(result.encoded_len(), 256)?)?;
+                    Ok(vec![Ok(ActionResult { body: wire::retain(result.encode_to_vec(), charge) })])
                 }
                 _ => Err(unsupported()),
+            }
+        };
+        let owner = call.audience_io_owner();
+        let work = async move {
+            match owner {
+                Some(owner) => rtdb_storage::IoRegion::retaining(owner,
+                    rtdb_storage::audience_work::within(Some(crate::config::AUDIENCE_READ_LIMITS), work)).await,
+                None => work.await,
             }
         };
         let results = call.cancellation.run_until_cancelled(work).await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;

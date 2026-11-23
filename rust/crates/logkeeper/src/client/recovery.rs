@@ -67,6 +67,10 @@ pub fn plan_repair(server: &Holding, history: &Holding) -> Result<RepairPlan, St
     Ok(RepairPlan { trim_through, from })
 }
 
+#[allow(unexpected_cfgs)]
+#[cfg(kani)]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

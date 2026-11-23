@@ -1,10 +1,11 @@
 use prost::Message;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, JournalEndpoint, Result, valid_journal_identity};
 use uuid::Uuid;
 
-use crate::{Checkpoint, DeploymentRecord, JournalAnchor, Lifecycle, MemberId, StorageNamespaces, Version};
+use crate::{CatalogAdmissionFloor, Checkpoint, DeploymentRecord, JournalAnchor, Lifecycle, MemberId, StorageNamespaces, Version};
 
 const WIRE_VERSION: u8 = 1;
+const BOUND_JOURNAL_VERSION: u8 = 2;
 
 #[derive(Clone, PartialEq, Message)]
 struct ParkedDeployment {
@@ -46,9 +47,39 @@ struct ParkedDeployment {
     compaction_replay_cutoff: Option<i64>,
     #[prost(message, optional, tag = "19")]
     replica_anchor: Option<PackedJournalAnchor>,
+    #[prost(message, repeated, tag = "20")]
+    catalog_admission_floors: Vec<PackedCatalogFloor>,
+    #[prost(message, repeated, tag = "21")]
+    bound_journals: Vec<PackedJournal>,
 }
 
-#[derive(Clone, Copy, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message)]
+struct PackedJournal {
+    #[prost(string, tag = "1")]
+    address: String,
+    #[prost(bytes = "vec", tag = "2")]
+    journal: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PackedCatalogFloor {
+    #[prost(string, tag = "1")]
+    root: String,
+    #[prost(string, tag = "2")]
+    residence: String,
+    #[prost(bytes = "vec", tag = "3")]
+    object_namespace: Vec<u8>,
+    #[prost(sint32, tag = "4")]
+    storage_version: i32,
+    #[prost(sint32, tag = "5")]
+    storage_epoch: i32,
+    #[prost(sint32, tag = "6")]
+    replica_epoch: i32,
+    #[prost(sint64, tag = "7")]
+    through: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct PackedCheckpoint {
     #[prost(sint64, tag = "1")]
     block: i64,
@@ -58,6 +89,10 @@ struct PackedCheckpoint {
     source: i64,
     #[prost(sint64, tag = "4")]
     system_time: i64,
+    #[prost(bytes = "vec", tag = "5")]
+    root_sha256: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    recovery_manifest_sha256: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -75,18 +110,20 @@ struct PackedJournalAnchor {
 pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, resident_idle: _, ensemble, created_at_ms, read_width,
-        activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, replica_anchor, storage_generation,
+        activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, recovery_manifest_sha256, replica_anchor, storage_generation,
         storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
-        source_cleanup, deletion_record, replica_journals, storage_regions, cell_transfer, disposal, checkpoint_recovery,
-        checkpoint_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_capture_retirements,
+        source_cleanup, deletion_record, replica_journals, storage_regions, catalog_readers, catalog_admission_floors, ordered_indexes, ordered_index_catalogs,
+        cell_transfer, disposal, checkpoint_recovery, serving_replay_capture,
+        checkpoint_stage, checkpoint_transfer_fence, checkpoint_transfer_terminal, checkpoint_transfer_bootstrap, checkpoint_transfer_replica, checkpoint_transfer_activation, hosted_fork_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_worlds, checkpoint_suffix_pins, checkpoint_capture_retirements,
         archive_retirement, compaction_replay_cutoff, retired_residences, version: _,
     } = record;
     if holder.is_some() || !matches!(lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
         || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_observation.is_some() || deletion_record.is_some() || !log_copy_servers.is_empty()
-        || !storage_regions.is_empty() || cell_transfer.is_some() || disposal.is_some() || checkpoint_recovery.is_some()
-        || checkpoint_stage.is_some() || !checkpoint_repair_receipts.is_empty() || !checkpoint_capture_retirements.is_empty()
-        || !retired_residences.is_empty() || !checkpoint_captures.is_empty() || archive_retirement.is_some()
+        || !storage_regions.is_empty() || !catalog_readers.is_empty() || cell_transfer.is_some() || disposal.is_some() || checkpoint_recovery.is_some() || serving_replay_capture.is_some()
+        || !ordered_indexes.is_empty() || !ordered_index_catalogs.is_empty()
+        || checkpoint_stage.is_some() || checkpoint_transfer_fence.is_some() || checkpoint_transfer_terminal.is_some() || checkpoint_transfer_bootstrap.is_some() || checkpoint_transfer_replica.is_some() || checkpoint_transfer_activation.is_some() || hosted_fork_stage.is_some() || !checkpoint_repair_receipts.is_empty() || !checkpoint_capture_retirements.is_empty()
+        || !retired_residences.is_empty() || !checkpoint_captures.is_empty() || !checkpoint_worlds.is_empty() || !checkpoint_suffix_pins.is_empty() || archive_retirement.is_some()
     {
         return None;
     }
@@ -103,6 +140,19 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         namespaces.extend_from_slice(keys);
     }
 
+    let mut unbound_journals = Vec::new();
+    let mut bound_journals = Vec::new();
+    for endpoint in replica_journals {
+        match endpoint {
+            JournalEndpoint::Member { address, journal } => {
+                if !valid_journal_identity(journal) { return None; }
+                let id = Uuid::try_parse(journal).ok()?;
+                bound_journals.push(PackedJournal { address: address.clone(), journal: id.as_bytes().to_vec() });
+            }
+            JournalEndpoint::Address(address) => unbound_journals.push(address.clone()),
+        }
+    }
+    let wire_version = if bound_journals.is_empty() { WIRE_VERSION } else { BOUND_JOURNAL_VERSION };
     let packed = ParkedDeployment {
         org: org.clone(),
         lineage: (lineage != id).then(|| lineage.clone()),
@@ -114,20 +164,33 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         log_epoch: *log_epoch,
         parent: parent.clone(),
         linearizable_reads: *linearizable_reads,
-        checkpoint: checkpoint.map(|Checkpoint { block, boundary, source, system_time }| PackedCheckpoint { block, boundary, source, system_time }),
+        checkpoint: checkpoint.map(|Checkpoint { block, boundary, source, system_time, root_sha256 }| PackedCheckpoint {
+            block, boundary, source, system_time, root_sha256: root_sha256.map_or_else(Vec::new, |bytes| bytes.to_vec()),
+            recovery_manifest_sha256: recovery_manifest_sha256.map_or_else(Vec::new, |bytes| bytes.to_vec()),
+        }),
         replica_anchor: replica_anchor.as_deref().map(|anchor| PackedJournalAnchor {
             root_incarnation: anchor.root_incarnation, first: anchor.interval[0], through: anchor.interval[1], digest: anchor.digest.to_vec(),
         }),
         storage_generation: storage_generation.map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
         storage_namespaces: namespaces,
+        catalog_admission_floors: catalog_admission_floors.iter().map(|(root, floor)| PackedCatalogFloor {
+            root: root.clone(),
+            residence: floor.residence.clone(),
+            object_namespace: floor.object_namespace.as_bytes().to_vec(),
+            storage_version: floor.cut.storage_version.0,
+            storage_epoch: floor.cut.storage_epoch.0,
+            replica_epoch: floor.cut.replica_epoch.0,
+            through: floor.cut.through.0,
+        }).collect(),
         quarantined: *lifecycle == Lifecycle::Quarantined,
-        replica_journals: replica_journals.iter().cloned().collect(),
+        replica_journals: unbound_journals,
+        bound_journals,
         compaction_replay_cutoff: *compaction_replay_cutoff,
         s3_write_lease_until_ms: *s3_write_lease_until_ms,
         engine_pin: engine_pin.clone(),
     };
     let mut encoded = Vec::with_capacity(1 + packed.encoded_len());
-    encoded.push(WIRE_VERSION);
+    encoded.push(wire_version);
     packed.encode(&mut encoded).expect("a sized in-memory buffer accepts the record");
     Some(encoded)
 }
@@ -137,8 +200,19 @@ fn invalid(message: impl Into<String>) -> Anomaly {
 }
 
 pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Version) -> Result<DeploymentRecord> {
-    let Some((&WIRE_VERSION, body)) = bytes.split_first() else { return Err(invalid("Unknown parked record version")); };
+    let Some((&wire_version @ (WIRE_VERSION | BOUND_JOURNAL_VERSION), body)) = bytes.split_first() else {
+        return Err(invalid("Unknown parked record version"));
+    };
     let packed = ParkedDeployment::decode(body).map_err(|error| invalid(error.to_string()))?;
+    if wire_version == WIRE_VERSION && !packed.bound_journals.is_empty() {
+        return Err(invalid("Bound journals require parked record version 2"));
+    }
+    let mut replica_journals: std::collections::BTreeSet<_> = packed.replica_journals.into_iter().map(JournalEndpoint::Address).collect();
+    for journal in packed.bound_journals {
+        let id = Uuid::from_slice(&journal.journal).map_err(|_| invalid("Invalid journal identifier"))?;
+        if id.is_nil() { return Err(invalid("A bound journal needs a nonzero identifier")); }
+        replica_journals.insert(JournalEndpoint::Member { address: journal.address, journal: id.to_string() });
+    }
     let (members, trailing) = packed.ensemble.as_chunks::<16>();
     if !trailing.is_empty() { return Err(invalid("The logkeeper list has a partial member identifier")); }
     let storage_generation = match packed.storage_generation.as_slice() {
@@ -162,6 +236,29 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         let digest = anchor.digest.try_into().map_err(|_| invalid("Invalid replica anchor digest"))?;
         Ok(Box::new(JournalAnchor { root_incarnation: anchor.root_incarnation, interval: [anchor.first, anchor.through], digest }))
     }).transpose()?;
+    let mut catalog_admission_floors = std::collections::BTreeMap::new();
+    for floor in packed.catalog_admission_floors {
+        let object_namespace = Uuid::from_slice(&floor.object_namespace).map_err(|_| invalid("Invalid catalog floor namespace"))?;
+        let cut = rtdb_types::CatalogCut {
+            storage_version: rtdb_types::StorageVersion(floor.storage_version),
+            storage_epoch: rtdb_types::StorageEpoch(floor.storage_epoch),
+            replica_epoch: rtdb_types::StorageEpoch(floor.replica_epoch),
+            through: rtdb_types::ReplicaPosition(floor.through),
+        };
+        let value = CatalogAdmissionFloor { residence: floor.residence, object_namespace, cut };
+        if catalog_admission_floors.insert(floor.root, value).is_some() {
+            return Err(invalid("A parked record contains multiple catalog floors for a storage root"));
+        }
+    }
+    let (checkpoint, recovery_manifest_sha256) = packed.checkpoint.map(|PackedCheckpoint { block, boundary, source, system_time, root_sha256, recovery_manifest_sha256 }| {
+        let root_sha256 = if root_sha256.is_empty() { None } else {
+            Some(root_sha256.try_into().map_err(|_| invalid("Invalid checkpoint root digest"))?)
+        };
+        let recovery_manifest_sha256 = if recovery_manifest_sha256.is_empty() { None } else {
+            Some(recovery_manifest_sha256.try_into().map_err(|_| invalid("Invalid recovery manifest digest"))?)
+        };
+        Ok::<_, Anomaly>((Some(Checkpoint { block, boundary, source, system_time, root_sha256 }), recovery_manifest_sha256))
+    }).transpose()?.unwrap_or_default();
     Ok(DeploymentRecord {
         id: id.to_owned(),
         name: name.to_owned(),
@@ -183,7 +280,8 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         move_from: None,
         log_copy_servers: Vec::new(),
         linearizable_reads: packed.linearizable_reads,
-        checkpoint: packed.checkpoint.map(|PackedCheckpoint { block, boundary, source, system_time }| Checkpoint { block, boundary, source, system_time }),
+        checkpoint,
+        recovery_manifest_sha256,
         replica_anchor,
         moved_at_ms: None,
         source_cleanup: None,
@@ -194,16 +292,29 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         deletion_observation: None,
         engine_pin: packed.engine_pin,
         deletion_record: None,
-        replica_journals: packed.replica_journals.into_iter().collect(),
+        replica_journals,
         storage_regions: Default::default(),
+        catalog_readers: Default::default(),
+        catalog_admission_floors,
+        ordered_indexes: Default::default(),
+        ordered_index_catalogs: Default::default(),
         cell_transfer: None,
         disposal: None,
         retired_residences: Default::default(),
         checkpoint_recovery: None,
+        serving_replay_capture: None,
         compaction_replay_cutoff: packed.compaction_replay_cutoff,
         checkpoint_stage: None,
+        checkpoint_transfer_fence: None,
+        checkpoint_transfer_terminal: None,
+        checkpoint_transfer_bootstrap: None,
+        checkpoint_transfer_replica: None,
+        checkpoint_transfer_activation: None,
+        hosted_fork_stage: None,
         checkpoint_repair_receipts: Default::default(),
         checkpoint_captures: Default::default(),
+        checkpoint_worlds: Default::default(),
+        checkpoint_suffix_pins: Default::default(),
         checkpoint_capture_retirements: Default::default(),
         archive_retirement: None,
         version,
@@ -232,6 +343,21 @@ mod tests {
         assert_eq!(read_back, record);
         assert_eq!(read_back.active_s3_write_lease(901_999), Some(902_000));
         assert_eq!(read_back.active_s3_write_lease(902_000), None);
+    }
+
+    #[test]
+    fn parking_preserves_catalog_admission_floors() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
+        let cut = rtdb_types::CatalogCut {
+            storage_version: rtdb_types::StorageVersion(6),
+            storage_epoch: rtdb_types::StorageEpoch(2),
+            replica_epoch: rtdb_types::StorageEpoch(0),
+            through: rtdb_types::ReplicaPosition(63),
+        };
+        let floor = CatalogAdmissionFloor { residence: record.storage_prefix(), object_namespace: Uuid::new_v4(), cut };
+        record.catalog_admission_floors.insert("v06_e02".into(), floor);
+        let bytes = encode(&record).unwrap();
+        assert_eq!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap(), record);
     }
 
     #[test]

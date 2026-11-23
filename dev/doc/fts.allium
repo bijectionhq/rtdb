@@ -10,6 +10,18 @@
 -- Which version of an entity is visible at the query's valid and system time is decided by the scan's bitemporal resolution, as it is for every other predicate, and MATCH is re-checked on the resolved row.
 -- So a search file that is missing costs a query time and never changes its result.
 --
+-- An owned clear-text declaration comes from the authenticated principal's protected search-path catalog.
+-- The artefact lane feeds its one explicitly declared UTF-8 column to the same search-file builder.
+-- Published files include the ordered definition version, artifact identity, and exact token length of each run.
+-- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
+-- Both ranking paths apply the same typed overlay shadows before computing corpus statistics.
+-- A declared optional text column with only null or absent values contributes an empty corpus.
+-- Owned runs carry their full typed identity. Ranked candidates verify that identity, their winning revision, and the declared text at the held cut.
+-- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
+-- Retained-world ranking checks for a placed world host before decoding the Flight request.
+-- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
+-- Public SQL search definitions remain scoped to the public catalog.
+--
 -- The core knows a search file only as an artefact of kind `search`: trie-cat.allium records artefacts on trie entries, db.allium carries ArtefactsAdded through the leader, and gc.allium deletes artefacts with their owner.
 -- This spec owns what an artefact of kind `search` holds, which definitions and jobs produce them, and how a query reads them.
 --
@@ -89,7 +101,9 @@ entity SearchJob {
 ------------------------------------------------------------
 
 config {
-    -- See: server config `search: {enabled, threads}`, NodeOptions.artefact_threads / scan_acceleration.
+    -- See: server config `search: {enabled, threads, writeFormat}` and NodeOptions.
+    -- The configured format determines which files new jobs write.
+    write_format: Integer = 11
     -- Off stops the lane and the accelerator together; MATCH is then answered by scanning.
     enabled: Boolean = true
     threads: Integer = 1
@@ -140,6 +154,8 @@ rule SearchJobRuns {
     -- The lane builds files compaction leaves out, files for new definitions or versions, and repairs.
     -- The lane downloads the owner's data files, in bucket order for a group.
     -- Both paths read one page at a time under that page's memory reservation.
+    -- They read event headers and borrow compatible indexed text cells from the page's Arrow vectors for tokenization.
+    -- An on-demand build reads its input directly from the retained data-file cache lease.
     -- Both reserve the segment's indexing heap up front in proportion to the input size, build the segment on disk, and stream the bundle to the object store.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     when: job: SearchJob.created
@@ -150,7 +166,8 @@ rule SearchJobRuns {
 }
 
 rule RetireSearchFiles {
-    -- A search file is retired once its definition leaves force: dropped, redefined, or superseded by a new analyzer or format version.
+    -- A search file is retired once its logical definition or analyzer version leaves force.
+    -- A reader retains files in every supported format for the same definition version.
     -- A retired definition is one neither in force nor made after the snapshot's basis, so a definition newer than the snapshot is never retired.
     -- The lane appends ArtefactsRemoved for the retired records on the table's live tries, and once it is applied deletes their objects.
     -- It deletes as well every unrecorded object of kind `search` under a live trie for a retired definition: one a builder uploaded and failed to record.
@@ -159,7 +176,6 @@ rule RetireSearchFiles {
     -- GC collects an artefact under a retired trie or under a group with no remaining members.
     -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
     -- A builder on another node may still record an object a retiring lane deleted; its own lane retires that record at its next look.
-    -- While nodes run different analyzer or format versions, a newer node retires an older version's files and an older node builds them again; the churn ends with the upgrade.
     when: DefinitionsInForceChanged(table)
 
     ensures:
@@ -187,8 +203,13 @@ rule RepairUnreadableSearchFile {
 
 -- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer, and every phrase of it (terms between double quotes) as consecutive tokens.
 -- The analyzer splits a word longer than the index's longest token (rtdb_text::MAX_TOKEN_BYTES) into tokens of at most that length, so the index holds every token the analyzer makes.
--- SEARCH_SCORE(column, query) is the BM25 of that value for the query's terms.
--- Search file construction and live postings derive tokens from the indexed fields of each put event.
+-- SEARCH_SCORE(column, query) sums BM25 term-frequency contributions with unit weights and unit length normalization.
+-- The five-argument form computes BM25 from its document count, total stored length and document frequencies.
+-- The frequency vector follows the distinct term order returned by SEARCH_TERMS.
+-- SEARCH_LENGTH gives the stored length of a UTF-8 document for aggregation over the admitted rows and null for any other input.
+-- SEARCH_CORPUS_FINGERPRINT hashes the ordered text id and body pairs passed as two arrays.
+-- Each id and body is prefixed with its byte length so the input has one spelling.
+-- Ranked pruning applies to the two-argument form.
 --
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
 --
@@ -201,7 +222,8 @@ rule RepairUnreadableSearchFile {
 --      A data file never changes, so a kept one serves every later query of the trie.
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
---      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
+--      A node publishes immutable postings for a prefix of the live batches under their table, column and snapshot lineage.
+--      A query uses whole pages within the prefix in its own snapshot and reads the remaining rows directly.
 --      A document is cut by the events of its entity in the partition's other selected tries and live segments, as CutByLaterEvents says, and contributes only if a rectangle it keeps meets the bounds.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
 --   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
@@ -209,53 +231,36 @@ rule RepairUnreadableSearchFile {
 -- Past max_candidates candidates, the scan runs unnarrowed instead.
 -- Past max_unindexed_bytes of tries the lane should have indexed but has not, the node builds none of them: the scan is neither narrowed nor ranked, and only rows of tries with a recorded file take MATCH from it.
 --
--- A query that evaluates SEARCH_SCORE registers CorpusAsOfTheSnapshot once per table and column a MATCH narrows, from every partition the query reads.
 -- When optional search construction cannot fit the query budget or the source page order is unsupported by the search format, the scan evaluates those rows from their data files.
--- A query text's score parameters are fixed at its first use, so pruning and every score in one query use the same binary64 weights and average length.
---
--- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
+-- The two-argument score uses the same term contributions and binary64 addition order in each partition and in SQL evaluation.
 --
 -- A scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, is ranked before it opens, in each partition it reads:
---
---   0. The column's corpus is registered before any partition is ranked, so a score is the same whichever partition fixes it first.
 --
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
 --      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
 --      Where an earlier selection supplies an IID scope, file and live events outside that scope are discarded before scoring.
---      The scope does not change the corpus or restrict the history used to resolve any selected IID.
---      A window adds the upper bounds for each term in scoring order. Each term uses the window's maximum frequency and minimum stored length with binary64 roundoff covered before addition.
+--      Resolution reads the full history of each selected IID.
+--      A window adds the upper bounds for each term in scoring order.
+--      A bound uses the maximum canonical unit score when available, or maximum frequency and minimum stored length with binary64 roundoff covered before addition.
+--      For ascending integer identity ties, a window may also carry the smallest possible identity at its score ceiling.
 --   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
 --      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
 --      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
---   3. Verification can stop early only when n verified rows score strictly above both sources: already-scored candidates and unread windows.
---      Either source can be empty. Equal bounds, including the two signed zeroes, keep verification going.
+--   3. Verification can stop early only when the n-th verified rank key is strictly ahead of every remaining bound.
+--      A remaining bound represents a scored candidate or unread work.
+--      A tie is ordered by identity only when both bounds prove its order.
+--      The two signed zeroes have the same score rank.
 --      An invalid score or bound supplied to this decision also keeps verification going.
---   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
+--   4. The scan hands on every verified row that may be in the first n.
+--      A ranked point scan may emit projected rows retained by its verifier at the same snapshot.
+--      If the gather exceeds available memory, the scan releases the retained payload and streams from the narrowed IID selection.
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
 -- A candidate-budget miss without an IID scope skips unranked narrowing if the ranked candidate union already contains more distinct IIDs than its limit.
 -- This union is a lower bound for the unranked candidate union and counts each IID once across its pending and handed-out events.
 -- Other declines use unranked narrowing, including an exhausted verification budget or a candidate-budget miss where there is no distinct-IID proof.
--- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every corpus the query registered; with none, each term's inverse document frequency is 1.
-
-rule CorpusAsOfTheSnapshot {
-    -- A column's corpus at a snapshot is its values in the rows a scan of the table sees at the snapshot's own instant, its latest transaction's system time, taken as valid time and system time both, across every partition and the live index.
-    -- A row whose column is null or absent is not in it; a value that is not text is, with no tokens.
-    -- Documents counts those rows, tokens sums their stored lengths, and a term's frequency counts the rows holding it.
-    -- The corpus is a function of the snapshot's data.
-    -- A node can build search files for any trie visible at the snapshot instant, or count the same corpus by scanning the resolved values when a build is refused.
-    -- Each file's runs that its own events leave visible at every instant from its latest event on are counted once per file and kept; those visible over a bounded valid interval are checked at the instant.
-    -- An entity with events in more than one file, or in the live index, is resolved across all of them as the scan resolves, live rows first at one instant, and its one visible row replaces what its runs counted file by file.
-    -- Within one live segment, a later appended event takes precedence over earlier rows at the same system time.
-    -- A shared file contributes only the runs and row keys of the members the snapshot selects.
-    -- A node keeps the corpus for those files, member selections and live segments.
-    when: ScoreAsked(column, snapshot)
-
-    ensures:
-        CorpusOfVisibleRows(column, snapshot)
-}
 
 rule CutByLaterEvents {
     -- A document's rectangles come from its own file's events; an event of the same entity elsewhere in the partition, in a selected trie or live segment, cuts them.
@@ -305,6 +310,18 @@ contract SearchFileLayout {
         -- A search file's bytes are a deterministic function of the owner's data files, its definition and the job's identity.
         -- Every node that runs the same job writes the same object.
 
+    @invariant BoundedArrowDirectory
+        -- The format 14 artefact record locates a bounded Arrow root by byte range and SHA-256 digest.
+        -- The root describes independently addressable term, posting, document and IID visibility trees.
+        -- A term directory records short rank summaries inline and refers to rank pages for larger postings.
+        -- Each rank branch bounds the scores of its descendant windows and may prove the first identity at its exact maximum.
+        -- Each directory edge authenticates its child byte range.
+        -- A negative discovery synopsis excludes term nominations; IID visibility can still read the same file.
+        -- Per-storage cache entries hold authenticated immutable pages and share concurrent reads.
+        -- Readers with prepaid cache allocations hold search range leases within those allocations.
+        -- Coalesced remote reads retain only the selected ranges in the decoded page cache.
+        -- A sparse query can read visibility for an IID in a source that did not nominate it.
+
     @invariant OneDocPerRun
         -- A search file has one document per text run of each column in each member's data file, so a version changing one column adds no posting to another.
         -- It records each row's run in each column, or that the row is visible with the column null or absent, or that it is visible nowhere within the file.
@@ -344,11 +361,12 @@ contract SearchCorrectness {
     -- What narrowing may and may not change about a query.
 
     @invariant RankedLimitKeepsTheFirstRows
-        -- Under a ranked LIMIT, the rows the scan hands on include every row among the first n by SEARCH_SCORE, ties at the n-th included.
+        -- Under a ranked LIMIT, the scan hands on every row among the first n by the SQL ordering.
+        -- A tie at the cutoff remains eligible until the optimizer can prove its position.
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.
-        -- SEARCH_SCORE's values are the same too, a function of the snapshot (ScoresFromTheSnapshot).
+        -- SEARCH_SCORE's value is a function of its arguments (ScoresFromArguments).
 
     @invariant CandidatesAreASuperset
         -- Every IID with a visible row satisfying MATCH at the query's valid and system time is in the candidate set.
@@ -362,6 +380,7 @@ contract SearchCorrectness {
         -- A node keeps recorded files by object key, and the files it builds by data-file key and columns, each naming immutable bytes, and uses one only while the database's storage is the one it was read through, so a kept file is never stale.
         -- A recorded file the object store holds on this node's disk, its local store or disk cache, is mapped from there rather than read into memory, so the files kept open are bounded by disk and only the pages a query reads are resident.
         -- A file read into memory holds its buffer-pool lease, so when the pool refuses a read for want of room, the node drops the files it keeps that way and reads again.
+    -- An Arrow map converted from a Tantivy bundle under a prepaid query budget retains its allocation charge until the map is released.
 }
 
 ------------------------------------------------------------
@@ -384,17 +403,15 @@ surface FullTextSearch {
     @guarantee MatchAtAnyTime
         -- MATCH answers at any valid time and system time the scan accepts, the default as-of-now included.
 
-    @guarantee ScoresFromTheSnapshot
-        -- A score is BM25 against CorpusAsOfTheSnapshot: the same snapshot scores the same whatever compaction and the lane have done.
-        -- A query at a past time is scored against its snapshot's corpus, not the past one.
-        -- A query narrowing several columns or tables sums their corpora.
+    @guarantee ScoresFromArguments
+        -- The same document, query text and optional statistics produce the same score across scan plans, joins, time coordinates and artefact states.
+        -- A caller may derive statistics by aggregating the rows of an explicitly selected corpus.
 }
 
 -- Black box helpers used in rule expressions:
 --   search_entries(job)                — the file's record on its trie or on every member of its group
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
 --   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the owner's artefact key
---   CorpusOfVisibleRows(column, snapshot) — CorpusAsOfTheSnapshot's counts (search/src/corpus.rs)
 --   EachCandidateCutByItsEntitysLaterEvents(scan) — CutByLaterEvents' subtraction, before narrowing and ranking
 --   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
 --   retired_records(table)               — the records RetireSearchFiles retires (maintenance/src/artefact.rs: retired_artefacts)

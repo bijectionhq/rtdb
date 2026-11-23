@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import xtdb.util.asIid
 import xtdb.util.closeAllOnCatch
 import xtdb.NodeBase
 import xtdb.NodeBase.Companion.openBase
@@ -605,7 +606,11 @@ class LiveIndexTest {
                 val t0 = Instant.parse("2020-01-01T00:00:00Z")
                 val t1 = Instant.parse("2020-01-02T00:00:00Z")
 
-                db.put(0, t0, table)
+                val firstId = UUID(0L, 1L)
+                db.openTx(0, t0).use { tx ->
+                    tx.put(table, firstId)
+                    db.commitTx(tx)
+                }
 
                 db.state.openSnapshot(t0).use { held ->
                     db.put(1, t1, table)
@@ -630,7 +635,12 @@ class LiveIndexTest {
                     }
 
                     assertNull(adoption)
-                    assertEquals(1, held.table(table).single().relation.rowCount)
+                    val retained = held.table(table).single()
+                    val trie = retained.trie.compactLogs()
+                    val row = trie.leaves.single().data.single()
+                    assertEquals(1, retained.relation.rowCount)
+                    assertEquals(0, row)
+                    assertEquals(ByteBuffer.wrap(firstId.asIid), trie.iidReader.getBytes(row))
                 }
             }
         } finally {

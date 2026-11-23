@@ -82,7 +82,7 @@ class ReleaseSelectionTests(unittest.TestCase):
         matrix = json.loads((HERE / "matrix.json").read_bytes())
         self.assertEqual(selected_features(matrix, "local", "linux/amd64"), [])
         self.assertIn("rtdb-server/all-backends", selected_features(matrix, "all-backends", "linux/arm64"))
-        self.assertEqual(selected_features(matrix, "multi", "linux/arm64"), ["rtdb-multi/dynamodb"])
+        self.assertEqual(selected_features(matrix, "multi", "linux/arm64"), ["rtdb-multi/dynamodb", "rtdb-multi/s3-key-vault"])
         for variant, platform in [("unknown", "linux/amd64"), ("local", "linux/mips")]:
             with self.assertRaises(ValueError):
                 selected_features(matrix, variant, platform)

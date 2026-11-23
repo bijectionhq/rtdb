@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
-use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
-    log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
+use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch_with_recency, owned_encoded_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
+    log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
-use rtdb_types::{EventOp, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
+use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{CompactionExecutor, CompactionJob, RecencyMode, SnapshotSource};
 
@@ -84,17 +84,25 @@ struct MergeFile {
     part: Vec<u8>,
     recency: Option<CivilDate>,
     carries_recency: bool,
+    keyed: bool,
     writer: Option<ArrowFileWriter>,
     leaves: Vec<layout::Leaf>,
 }
 
-struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
+struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, keyed: bool }
 
 impl OutputSchema {
-    fn batch(&self, events: &[PageEvent]) -> Result<arrow_array::RecordBatch> {
-        copy_encoded_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
+    fn batch(&self, events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+        owned_encoded_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency, memory)
     }
-    fn schema(&self) -> Result<SchemaRef> { Ok(self.batch(&[])?.schema()) }
+    fn schema(&self) -> Result<SchemaRef> {
+        let schema = copy_encoded_batch_with_recency::<PageEvent>(&[], self.put.clone(), self.iid_encoding, self.recency)?.schema();
+        if !self.keyed { return Ok(schema); }
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(rtdb_format::data::entity_key_field()));
+        fields.push(Arc::new(rtdb_format::data::commit_position_field()));
+        Ok(Arc::new(arrow_schema::Schema::new(fields)))
+    }
 }
 
 fn create_file(path: &Path) -> Result<File> {
@@ -103,7 +111,8 @@ fn create_file(path: &Path) -> Result<File> {
 
 /// What encoding an event may hold at once: its document's decoded cells, and the event itself.
 fn row_bytes(event: &PageEvent) -> Result<usize> {
-    event.document_bytes()?.checked_add(std::mem::size_of::<PageEvent>() + 128).ok_or_else(|| crate::invalid("Compaction row size overflow"))
+    event.document_bytes()?.checked_add(event.entity_key().map_or(0, |key| key.len()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PageEvent>() + 128)).ok_or_else(|| crate::invalid("Compaction row size overflow"))
 }
 
 fn event_reservation(memory: &Arc<MemoryBudget>, events: &[PageEvent], multiplier: usize) -> Result<Arc<MemoryReservation>> {
@@ -189,19 +198,68 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<Logi
     Ok(Some(fields))
 }
 
+/// Page and trie order use IID, then descending system time. Each complete
+/// key within the current physical bucket owns its temporal state.
+struct EntityStates<'a, State> {
+    bucket: Option<Iid>,
+    plain: Option<State>,
+    keyed: BTreeMap<&'a [u8], (State, Arc<MemoryReservation>)>,
+}
+
+impl<'a, State> EntityStates<'a, State> {
+    fn new() -> Self {
+        Self { bucket: None, plain: None, keyed: BTreeMap::new() }
+    }
+
+    fn get(
+        &mut self, event: &'a PageEvent, memory: &Arc<MemoryBudget>,
+        init: impl FnOnce() -> State,
+    ) -> Result<&mut State> {
+        if self.bucket != Some(event.iid) {
+            self.plain = None;
+            self.keyed.clear();
+            self.bucket = Some(event.iid);
+        }
+        let Some(key) = event.entity_key() else { return Ok(self.plain.get_or_insert_with(init)); };
+        match self.keyed.entry(key) {
+            std::collections::btree_map::Entry::Occupied(entry) => Ok(&mut entry.into_mut().0),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let charge = memory.reserve(std::mem::size_of::<State>() + 512)?;
+                Ok(&mut entry.insert((init(), charge)).0)
+            }
+        }
+    }
+}
+
+struct SameTimeState {
+    calculator: AdmittedPolygonCalculator,
+    system_from: Option<Timestamp>,
+    seen_erase: bool,
+    erased: bool,
+}
+
 fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Vec<Arc<MemoryReservation>>)> {
     let mut result = Vec::new();
     let mut charges = Vec::new();
-    let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(memory));
-    let mut previous = None;
-    let mut seen_erase = false;
-    let mut erased_iid = None;
+    let mut states = EntityStates::new();
     for event in events {
-        let group = (event.iid, event.system_from);
-        if previous != Some(group) { calculator.reset(); previous = Some(group); seen_erase = false; }
+        let state = states.get(event, memory, || SameTimeState {
+            calculator: AdmittedPolygonCalculator::new(None, Arc::clone(memory)),
+            system_from: None, seen_erase: false, erased: false,
+        })?;
+        if state.system_from != Some(event.system_from) {
+            state.calculator.reset();
+            state.system_from = Some(event.system_from);
+            state.seen_erase = false;
+        }
         let header = event.header();
-        let resolved = if erased_iid == Some(event.iid) { None } else {
-            calculator.visit(&header, |polygon| {
+        let resolved = if state.erased { None } else {
+            state.calculator.visit(&header, |polygon| {
+                if header.commit_position != 0 {
+                    charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+                    result.push(event.clone());
+                    return Ok(());
+                }
                 for (valid_from, valid_to, system_to) in polygon.ranges() {
                     if system_to > event.system_from {
                         charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
@@ -213,15 +271,15 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
                 Ok(())
             })?
         };
-        if header.op == EventOp::Erase { erased_iid = Some(event.iid); }
+        if header.op == EventOp::Erase { state.erased = true; }
         if resolved.is_none() {
-            if !seen_erase {
+            if !state.seen_erase {
                 charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
                 let mut event = event.clone();
                 event.valid_time = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
                 result.push(event);
             }
-            seen_erase = true;
+            state.seen_erase = true;
         }
     }
     Ok((result, charges))
@@ -259,12 +317,16 @@ impl CompactionExecutor for SegmentCompactor {
             let (reader, reservation) = open_input(data, &self.memory)?;
             inputs.push(InputSegment { key: key.clone(), metadata, reader, _reservations: vec![reservation, metadata_charge] });
         }
+        let keyed = job.table.is_owned_event_data();
+        if inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::ENTITY_KEY_FIELD).is_ok() != keyed) {
+            return Err(crate::invalid("Compaction input does not have the required entity-key layout"));
+        }
         let put = merged_put_schema(&inputs)?;
         let carry = self.config.within_file_recency_branching && job.output.recency().is_some() && inputs.iter().all(|input| input.reader.schema().index_of("_recency").is_ok());
         let tasks = planner::plan(&inputs, &job.part)?;
         let initial_recency = if job.recency_mode == RecencyMode::Partition { None } else { job.output.recency() };
         let initial_carry = job.recency_mode == RecencyMode::Preserve && carry;
-        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, &self.config, &self.memory)?];
+        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, keyed, &self.config, &self.memory)?];
         for task in tasks {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let mut rows = Vec::new();
@@ -285,18 +347,22 @@ impl CompactionExecutor for SegmentCompactor {
                 rows.push(events);
             }
             let mut heap = planner::RowHeap::new(&rows)?;
-            let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory));
+            let mut states = EntityStates::new();
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
             while let Some((stream, row)) = heap.next() {
                 let event = &rows[stream][row];
-                let Some(recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
+                let calculator = states.get(event, &self.memory, || AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory)))?;
+                let Some(mut recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
+                if event.commit_position != 0 {
+                    recency = recency.max(event.system_from);
+                }
                 let target = if job.recency_mode == RecencyMode::Partition && recency != Timestamp::MAX {
                     let date = recency_partition(recency, self.config.recency_partition)?;
                     if let Some(index) = outputs.iter().position(|output| output.recency == Some(date)) { index }
                     else {
                         let index = outputs.len();
-                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, &self.config, &self.memory)?);
+                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, keyed, &self.config, &self.memory)?);
                         index
                     }
                 } else { 0 };
@@ -305,10 +371,9 @@ impl CompactionExecutor for SegmentCompactor {
                 event.recency = if outputs[target].carries_recency { Some(if job.recency_mode == RecencyMode::Partition { recency } else { event.recency.ok_or_else(|| crate::invalid("Historical input lost recency"))? }) } else { None };
                 buckets.entry(target).or_default().push(event);
             }
-            drop(calculator);
+            drop(states);
             for (index, events) in buckets {
-                let _charge = event_reservation(&self.memory, &events, 8)?;
-                outputs[index].write(&events, task.path.clone(), &put, &self.config)?;
+                outputs[index].write(&events, task.path.clone(), &put, &self.config, &self.memory)?;
             }
             tokio::task::yield_now().await;
         }
@@ -319,38 +384,43 @@ impl CompactionExecutor for SegmentCompactor {
         for index in order {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let output = &outputs[index];
-            let key = TrieKey::new(job.output.level(), output.recency, job.output.part().to_vec(), job.output.block_index())?;
+            let key = TrieKey::new(job.output.level(), output.recency, job.output.part().to_vec(), job.output.block_index())?.with_epoch(job.output.epoch());
             let data_path = directory.path().join(format!("output-{index}.arrow"));
             let meta_path = directory.path().join(format!("output-{index}.meta.arrow"));
             let (size, metadata) = layout::normalize(output, &put, &self.config, &self.memory, &data_path, &meta_path, cancellation)?;
             check_disk(directory.path(), self.config.temporary_byte_limit, 0)?;
             let data_key = ObjectKey::new(entry.slug.data_key(&key)).map_err(crate::invalid)?;
-            self.store.put_file(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+            let data = self.store.put_file_with_publication(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", data_key.to_string().into()).with_context("operation", "put_file".into()))?;
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
-            self.store.put_file(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+            let meta = self.store.put_file_with_publication(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
             let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
-            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, ..Default::default() });
+            let published_files = if data.is_some() || meta.is_some() {
+                Some(TrieFileVersions { data: data.map(Into::into), metadata: meta.map(Into::into) })
+            } else { None };
+            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, published_files, ..Default::default() });
         }
         Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
     }
 }
 
 impl MergeFile {
-    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency };
+    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<StructFields<LogicalType>>, keyed: bool, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency, keyed };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
-        Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
+        Ok(Self { path, part: part.to_vec(), recency, carries_recency, keyed, writer: Some(writer), leaves: Vec::new() })
     }
-    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig) -> Result<()> {
+    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig,
+        memory: &Arc<MemoryBudget>) -> Result<()> {
         if events.is_empty() { return Ok(()); }
-        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency };
+        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency, keyed: self.keyed };
         let writer = self.writer.as_mut().ok_or_else(|| crate::invalid("Merge file already ended"))?;
         limit_writer(writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
-        writer.write(&schema.batch(events)?)?;
+        let batch = schema.batch(events, memory)?;
+        writer.write_event_page(batch.batch(), memory)?;
         self.leaves.push(layout::Leaf { page: self.leaves.len(), path, rows: events.len(), min_recency: events.iter().filter_map(|event| event.recency).min(), max_recency: events.iter().filter_map(|event| event.recency).max() });
         Ok(())
     }
@@ -372,6 +442,98 @@ mod tests {
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
 
     #[test]
+    fn normalization_retains_governed_event_keys_and_positions_in_the_output_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let spill = directory.path().join("merge.arrow");
+        let data = directory.path().join("data.arrow");
+        let metadata = directory.path().join("meta.arrow");
+        let memory = MemoryBudget::new(1 << 22);
+        let config = MergeConfig::default();
+        let events = [(b"world-a".as_slice(), 2), (b"world-b".as_slice(), 1)].map(|(key, commit_position)| StoredEvent {
+            commit_position,
+            entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
+            valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
+        });
+        let mut spill = MergeFile::new(spill, None, false, &[], &None, true, &config, &memory).unwrap();
+        spill.write(&page(&events), vec![], &None, &config, &memory).unwrap();
+        spill.finish(&config).unwrap();
+        layout::normalize(&spill, &None, &config, &memory, &data, &metadata, &CancellationToken::new()).unwrap();
+        let (mut reader, _reservation) = open_input(File::open(data).unwrap(), &memory).unwrap();
+        let batch = EventBatch::new(read_page(&mut reader, 0, &memory).unwrap().batch().clone()).unwrap();
+        assert_eq!(batch.entity_key(0).unwrap(), Some(b"world-a".as_slice()));
+        assert_eq!(batch.entity_key(1).unwrap(), Some(b"world-b".as_slice()));
+        assert_eq!(batch.header(0).unwrap().commit_position, 2);
+        assert_eq!(batch.header(1).unwrap().commit_position, 1);
+    }
+
+    #[test]
+    fn same_time_compaction_keeps_fully_superseded_landing_assertions_until_erasure() {
+        let memory = MemoryBudget::new(1 << 20);
+        let assertions = [2, 1].map(|commit_position| StoredEvent {
+            commit_position,
+            entity_key: Some(Arc::from(b"entity".as_slice())),
+            iid: Iid([1; 16]),
+            system_from: Timestamp(100),
+            valid_time: Interval::from_micros(10, 20).unwrap(),
+            operation: StoredOperation::Delete,
+            recency: None,
+        });
+        let (surviving, _charges) = resolve_same_time(&page(&assertions), &memory).unwrap();
+        assert_eq!(
+            surviving.iter().map(EncodedEvent::header).collect::<Vec<_>>(),
+            assertions.iter().map(StoredEvent::header).collect::<Vec<_>>(),
+        );
+        let erased = StoredEvent {
+            system_from: Timestamp(101),
+            commit_position: 0,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Erase,
+            ..assertions[0].clone()
+        };
+        let erased_header = erased.header();
+        let [later, earlier] = assertions;
+        let (surviving, _charges) = resolve_same_time(&page(&[erased, later, earlier]), &memory).unwrap();
+        assert_eq!(surviving.iter().map(EncodedEvent::header).collect::<Vec<_>>(), [erased_header]);
+    }
+
+    #[test]
+    fn same_time_compaction_keeps_temporal_state_separate_for_colliding_keys() {
+        let memory = MemoryBudget::new(1 << 20);
+        let events = [b"world-a".as_slice(), b"world-b".as_slice()].map(|key| StoredEvent {
+            commit_position: 0,
+            entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
+            valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
+        });
+        let input = page(&events);
+        let (rows, charges) = resolve_same_time(&input, &memory).unwrap();
+        assert_eq!(rows.iter().map(PageEvent::entity_key).collect::<Vec<_>>(), [Some(b"world-a".as_slice()), Some(b"world-b".as_slice())]);
+        drop((rows, charges));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn compaction_reserves_encoding_scratch_before_writing_a_page() {
+        let fields = StructFields::from([("payload".into(), LogicalType::Scalar(rtdb_types::ScalarType::Binary))]);
+        let input = build_event_batch(&[StoredEvent {
+            commit_position: 0,
+            entity_key: None,
+            iid: Iid([1; 16]), system_from: Timestamp(100), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("payload".into(), rtdb_types::Value::Binary(vec![7; 1 << 20]))])),
+        }], Some(fields), None).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let mut writer = ArrowFileWriter::new_reserved(file, input.schema_ref(), &memory).unwrap();
+        let position = writer.bytes_written();
+        let before = memory.used_bytes();
+
+        let error = writer.write_event_page(&input, &memory).unwrap_err();
+
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(writer.bytes_written(), position);
+        assert_eq!(memory.used_bytes(), before);
+    }
+
+    #[test]
     fn row_heap_matches_flatten_and_sort_without_losing_occurrences() {
         use std::cmp::Reverse;
 
@@ -380,7 +542,7 @@ mod tests {
             Iid([128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         ];
         let events: Vec<_> = iids.into_iter().flat_map(|iid| {
-            [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent {
+            [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent { commit_position: 0, entity_key: None,
                 iid,
                 system_from: Timestamp(system_from),
                 valid_time: Interval::from_micros(10, 20).unwrap(),
@@ -450,6 +612,8 @@ mod tests {
                         StoredOperation::Put(StructFields::from([("ordinal".into(), Value::I64(i64::from(ordinal)))]))
                     } else { StoredOperation::Delete };
                     StoredEvent {
+                        commit_position: 0,
+                        entity_key: None,
                         iid: Iid([1; 16]),
                         system_from: Timestamp(100),
                         valid_time: Interval::from_micros(lower, upper).unwrap(),
@@ -486,6 +650,8 @@ mod tests {
     #[test]
     fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
         let input = page(&[StoredEvent {
+            commit_position: 0,
+            entity_key: None,
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(10, 20).unwrap(),
@@ -510,6 +676,8 @@ mod tests {
     #[test]
     fn same_time_compaction_admits_the_ceiling_before_cloning_a_second_events_row() {
         let event = |lower, upper| StoredEvent {
+            commit_position: 0,
+            entity_key: None,
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(lower, upper).unwrap(),

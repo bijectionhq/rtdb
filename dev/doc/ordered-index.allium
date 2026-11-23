@@ -24,13 +24,36 @@ entity Checkpoint {
 -- A root contains each winning indexed row over disjoint valid-time spans at its system-time point.
 -- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
+-- A correction page serializes just the Arrow key rows for the validity spans it owns.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
--- A read or maintenance cycle owns decoded index pages for its own lifetime.
--- A point read merges bucket prefixes in key order and fetches payload at the same basis.
--- An ordered distinct page filters eligible rows before counting each distinct key once.
+-- A read or maintenance cycle owns index page buffers for its own lifetime.
+-- A point read merges bucket prefixes in key order.
+-- Every reader opens both JSON and Arrow IPC branch pages, revision directories, and checkpoint manifests within the current layout.
+-- Arrow reference publication starts after each reader in the installation can open both formats.
+-- A newly published page can keep a reference to a page originally written in JSON.
+-- Arrow references bind the measured subtree count, domain, and coefficient alongside the full key fences.
+-- Every immutable page reference binds its exact subtree entry count and full fences.
+-- A covered held count subtracts the full-key boundary ranks in each bucket containing the requested valid instant.
+-- The bucket cover makes the counts disjoint across the visible postings for that instant.
+-- Unsigned Arrow cells compare at their signed execution widths for bounds, seeks, and page order.
+-- Zoned microsecond timestamp keys compare by their instant for bounds, seeks, and page order.
+-- Floating-point ordering distinguishes signed zeros and ties every NaN last. Zero and NaN bounds are left to the row predicate, and NaNs match no indexed comparison.
+-- A covered point read streams typed batches of the requested columns from those postings after applying every predicate.
+-- A payload seek applies remaining predicates to batches resolved at the captured basis, then gathers the qualifying batch and row offsets in index order.
+-- Filtering and output use the same resolved payload batches.
+-- Gathering nested payloads preserves their source Arrow vectors and composes their selected positions in index order.
+-- A contiguous forward run of plain text or binary cells may share its selected value bytes.
+-- Hosted shared buffers retain the page permit through synchronous wire encoding and drop before transport waits.
+-- Hosted APIs returning Arrow arrays to callers use independent result buffers.
+-- An ordered distinct page filters eligible rows before counting each distinct sort prefix once.
+-- All participating equality classes must be adjacent in the index order.
+-- On the ordinary fallback plan, an input-opening error takes precedence over an OFFSET or FETCH error.
+-- After the input opens, OFFSET is checked before FETCH.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
 -- A checkpoint's page scope is zero before the first captured erase, and one past the last source block containing an erase afterward.
 -- Every page reachable from a checkpoint uses that checkpoint's scope. Page addresses within the scope retain their source block.
 -- After the replacement checkpoint is published, collection releases older scopes and preserves pages staged in newer scopes.
 -- Data compaction preserves input events and changes no ordered-index checkpoint.
+-- The layout version participates in every definition's derived address.
+-- Replacing a layout retires the former address with the same storage fences as a dropped definition.

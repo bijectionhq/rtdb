@@ -1,5 +1,6 @@
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{block::proto, catalog::{BlockCatalog, TableBlock}};
+use rtdb_format::{block::proto, catalog::{BlockCatalog, TableBlock, TableEntry}};
+use rtdb_types::TableRef;
 
 #[test]
 fn catalog_clones_share_the_graph_and_its_allocation_charge() {
@@ -30,4 +31,59 @@ fn table_block_clones_keep_the_decoded_schema_charged() {
     assert_eq!(memory.used_bytes(), 1024);
     drop(retained);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn a_table_block_manifest_covers_exactly_the_recorded_oids() {
+    let table = TableEntry::new(16_384, TableRef::new("public", "example")).unwrap();
+    let legacy = proto::Block { tables: vec![table.to_proto()], ..Default::default() };
+    assert_eq!(BlockCatalog::from_proto(legacy.clone()).unwrap().table_block_digest(table.oid), None);
+    let root = |entries: Vec<(u32, Vec<u8>)>| proto::Block {
+        table_block_manifest: Some(proto::TableBlockManifest { sha256_by_oid: entries.into_iter().collect() }),
+        ..legacy.clone()
+    };
+    let verified = BlockCatalog::from_proto(root(vec![(table.oid, vec![7; 32])])).unwrap();
+    assert_eq!(verified.table_block_digest(table.oid), Some([7; 32].as_slice()));
+    for malformed in [
+        vec![],
+        vec![(table.oid + 1, vec![7; 32])],
+        vec![(table.oid, vec![7; 31])],
+        vec![(table.oid, vec![7; 32]), (table.oid + 1, vec![9; 32])],
+    ] {
+        assert!(BlockCatalog::from_proto(root(malformed)).is_err(), "the manifest must cover exactly the table OIDs with SHA-256 digests");
+    }
+}
+
+#[test]
+fn replay_closure_preserves_l0_inputs_and_usable_artefacts() {
+    use std::collections::BTreeSet;
+    use prost::Message;
+    use rtdb_format::{catalog::CheckpointContents, keys::{TableSlug, TrieKey}, log::proto::{ArtefactRecord, ArtefactScope, TrieDetails, TrieState}};
+    use rtdb_types::BlockIndex;
+
+    let slug = TableSlug::recorded("public$example").unwrap();
+    let l0 = TrieKey::l0(BlockIndex(1)).unwrap();
+    let retired = TrieKey::new(1, None, Vec::new(), BlockIndex(2)).unwrap();
+    let live = TrieKey::new(2, None, vec![0], BlockIndex(3)).unwrap();
+    let nascent = TrieKey::new(2, None, vec![1], BlockIndex(3)).unwrap();
+    let group = ArtefactRecord { kind: Some("search".into()), definition_id: Some("group".into()), definition_version: Some(4), scope: Some(ArtefactScope::PartGroup as i32), ..Default::default() };
+    let own = ArtefactRecord { definition_id: Some("own".into()), scope: None, ..group.clone() };
+    let detail = |trie: &TrieKey, state: TrieState, artefacts| TrieDetails { trie_key: Some(trie.to_string()), trie_state: Some(state as i32), artefacts, ..Default::default() };
+    let block = TableBlock::decode(&proto::TableBlock {
+        tries: vec![detail(&retired, TrieState::Live, vec![own.clone()])],
+        partitions: vec![proto::Partition { tries: vec![
+            detail(&l0, TrieState::Garbage, vec![own.clone()]),
+            detail(&retired, TrieState::Garbage, vec![own.clone()]),
+            detail(&live, TrieState::Live, vec![group.clone(), own.clone()]),
+            detail(&nascent, TrieState::Nascent, vec![group.clone()]),
+        ], ..Default::default() }],
+        ..Default::default()
+    }.encode_to_vec()).unwrap();
+    let primary = [slug.data_key(&live), slug.metadata_key(&live), slug.data_key(&nascent), slug.metadata_key(&nascent)];
+    assert_eq!(block.checkpoint_trie_files(&slug, CheckpointContents::Primary).unwrap(), BTreeSet::from(primary.clone()));
+    let mut replay = BTreeSet::from(primary);
+    replay.extend([slug.data_key(&l0), slug.metadata_key(&l0), slug.recorded_artefact_key(&live, &own).unwrap(),
+        slug.recorded_artefact_key(&live, &group).unwrap()]);
+    assert_eq!(block.checkpoint_trie_files(&slug, CheckpointContents::Replay).unwrap(), replay,
+        "replay closure must include retained L0 and one copy per usable artefact");
 }

@@ -5,6 +5,19 @@ use rtdb_storage::{Error, ObjectKey, ObjectStore, remote::RemoteStore};
 use std::sync::Arc;
 
 #[tokio::test]
+async fn fresh_exact_reads_accept_only_a_complete_object_of_the_published_length() {
+    let provider = Arc::new(object_store::memory::InMemory::new());
+    let store = RemoteStore::new(provider, None);
+    let key = ObjectKey::new("ordered-index/page").unwrap();
+    store.put(&key, Bytes::from_static(b"page")).await.unwrap();
+    assert_eq!(store.get_fresh_exact(&key, 4).await.unwrap(), Bytes::from_static(b"page"));
+    assert!(store.get_fresh_exact(&key, 3).await.is_err());
+    assert!(store.get_fresh_exact(&key, 5).await.is_err());
+    store.delete(&key).await.unwrap();
+    assert!(matches!(store.get_fresh_exact(&key, 4).await, Err(Error::MissingObject(_))));
+}
+
+#[tokio::test]
 async fn remote_namespaces_share_a_provider_without_aliasing() {
     let provider = Arc::new(object_store::memory::InMemory::new());
     let first = RemoteStore::new(provider.clone(), Some(ObjectKey::new("db/parts/0/v06").unwrap()));

@@ -27,7 +27,30 @@ async fn run() -> Result<()> {
         Command::HashPassword { bcrypt, password } => { println!("{}", cli::hash_password(bcrypt, password, &mut std::io::stdin().lock())?); Ok(()) }
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
-        Command::CompactorReset { options, database, dry_run } => reset_compactor(options, database, dry_run).await,
+        Command::CompactorReset { options, database, dry_run, retained_base } => reset_compactor(options, database, dry_run, retained_base).await,
+        Command::RetainRepairBase { request, memory_bytes } => {
+            let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let installation = request.install(memory, &cancellation);
+            tokio::pin!(installation);
+            let boundary = tokio::select! {
+                result = &mut installation => result?,
+                _ = shutdown_signal() => { cancellation.cancel(); installation.await? }
+            };
+            write_report(std::io::stdout().lock(), |output| {
+                writeln!(output, "Retained repair base {} from replica boundary {}", request.base.block.0, boundary.0)
+            })
+        },
+        Command::RepairCheckpoint { request, memory_bytes } => {
+            let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            report_checkpoint_repair(request.rebuild(memory, &cancellation), &cancellation).await
+        },
+        Command::RepairRetainedCheckpoint { request, memory_bytes } => {
+            let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            report_checkpoint_repair(request.rebuild(memory, &cancellation), &cancellation).await
+        },
         Command::Start(options) => {
             let (config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
             let (handle, driver) = if options.mode == cli::NodeMode::Compactor {
@@ -40,6 +63,23 @@ async fn run() -> Result<()> {
     }
 }
 
+async fn report_checkpoint_repair(
+    repair: impl std::future::Future<Output = Result<rtdb_node::RepairedStore>>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    tokio::pin!(repair);
+    let store = tokio::select! {
+        result = &mut repair => result?,
+        _ = shutdown_signal() => { cancellation.cancel(); repair.await? }
+    };
+    write_report(std::io::stdout().lock(), |output| {
+        let digest: String = store.checkpoint.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
+        writeln!(output, "Rebuilt checkpoint {}@{digest} through transaction {}", store.checkpoint.block.0, store.latest_transaction.tx_id.0)?;
+        writeln!(output, "Storage: {}", store.path.display())?;
+        writeln!(output, "Source replica epoch: {}", store.source_replica_epoch.0)
+    })
+}
+
 async fn export_snapshot(options: cli::StartOptions, database: String, dry_run: bool) -> Result<()> {
     let (mut config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
     config.compactor.threads = 0;
@@ -49,7 +89,7 @@ async fn export_snapshot(options: cli::StartOptions, database: String, dry_run: 
     config.flight_sql = None;
     config.health = None;
     let (handle, driver) = ServerDriver::open_with_memory(config, options.allocation_limit_bytes, memory).await?;
-    let plan = match handle.node().snapshot_export(&database, handle.node().now()) {
+    let plan = match handle.node().snapshot_export(&database, handle.node().now()).await {
         Ok(Some(plan)) => plan,
         Ok(None) => {
             let reported = write_report(std::io::stderr().lock(), |output| writeln!(output, "No completed blocks found - aborting."));
@@ -72,7 +112,7 @@ async fn export_snapshot(options: cli::StartOptions, database: String, dry_run: 
     write_report(std::io::stderr().lock(), |output| writeln!(output, "Export complete: copied {} files to {}", plan.files().len(), plan.directory()))
 }
 
-async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: bool) -> Result<()> {
+async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: bool, retained_base: Option<std::path::PathBuf>) -> Result<()> {
     let (mut config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
     config.compactor.threads = 0;
     config.indexer.enabled = true;
@@ -85,16 +125,20 @@ async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: 
     let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "Compactor reset requires every other node, client and upstream writer to remain stopped until completion."));
     if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
     run_operation(&handle, driver, &cancellation, async {
-        let plan = handle.node().prepare_compactor_reset(&database, &cancellation).await?;
+        let plan = match retained_base.as_deref() {
+            Some(export) => handle.node().prepare_compactor_reset_from_retained_base(&database, export, &cancellation).await?,
+            None => handle.node().prepare_compactor_reset(&database, &cancellation).await?,
+        };
+        let kind = if retained_base.is_some() { "replayed primary" } else { "verified L0" };
         write_report(std::io::stdout().lock(), |output| {
-            for (table, tries) in plan.replacement_tries() { writeln!(output, "{}: {} surviving L0 tries", table.schema_and_table(), tries.len())?; }
-            for key in plan.files_to_delete() { writeln!(output, "{} {key}", if dry_run { "WOULD DELETE" } else { "DELETE AFTER PUBLICATION" })?; }
+            for (table, tries) in plan.replacement_tries() { writeln!(output, "{}: {} {kind} tries", table.schema_and_table(), tries.len())?; }
+            for key in plan.files_to_delete() { writeln!(output, "{} {key}", if dry_run { "WOULD RETIRE" } else { "RETIRE AFTER PUBLICATION" })?; }
             Ok(())
         })?;
         if dry_run { return Ok(()); }
         let block = tokio::time::timeout(Duration::from_secs(300), plan.apply(&cancellation)).await
             .map_err(|_| Anomaly::fault("rtdb.compactor-reset/timeout", "Compactor reset did not complete within five minutes"))??;
-        write_report(std::io::stderr().lock(), |output| writeln!(output, "Compactor reset completed at block {}; compacted files deleted.", block.0))
+        write_report(std::io::stderr().lock(), |output| writeln!(output, "Compactor reset completed at block {}. Compacted files submitted for retirement.", block.0))
     }).await
 }
 
@@ -242,7 +286,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let (handle, driver) = unopened(directory.path()).await;
             let error = if export_error {
-                handle.node().snapshot_export("missing-database", handle.node().now()).err().expect("missing database")
+                handle.node().snapshot_export("missing-database", handle.node().now()).await.err().expect("missing database")
             } else { write_report(BrokenOutput, |output| writeln!(output, "maintenance manifest")).unwrap_err() };
             let code = error.code.clone();
             assert_eq!(close_unstarted::<()>(driver, Err(error)).await.unwrap_err().code, code);

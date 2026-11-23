@@ -168,6 +168,31 @@ fn create_or_alter_table_and_role_membership_are_transaction_operations() {
     }
 }
 
+#[test]
+fn typed_declarations_bind_native_columns_and_allow_untyped_neighbors() {
+    let sql = r#"CREATE TABLE docs (_id TEXT, "ExactName" BIGINT, effective TIMESTAMPTZ, tags TEXT[], dynamic)"#;
+    let statement = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap().statement;
+    let Statement::Dml(rtdb_plan::Dml::CreateTable { columns, .. }) = statement else {
+        panic!("Expected a table declaration");
+    };
+    use rtdb_types::TimeUnit;
+    assert_eq!(columns, vec![
+        ("_id".into(), LogicalType::Scalar(ScalarType::Utf8).maybe()),
+        ("ExactName".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
+        ("effective".into(), LogicalType::Scalar(ScalarType::Timestamp { timezone: Some("UTC".into()), unit: TimeUnit::Microsecond }).maybe()),
+        ("tags".into(), LogicalType::list(LogicalType::Scalar(ScalarType::Utf8)).maybe()),
+        ("dynamic".into(), LogicalType::Nothing),
+    ]);
+    for sql in [
+        "CREATE TABLE docs (v BIGINT, V TEXT)",
+        "CREATE TABLE docs (_valid_from TIMESTAMPTZ)",
+        "CREATE TABLE docs (v TEXT NOT NULL)",
+        "CREATE TABLE docs (v imaginary_type)",
+    ] {
+        assert!(prepare(sql, &Fixture, &PrepareOptions::default()).is_err(), "{sql}");
+    }
+}
+
 impl Catalog for Fixture {
     fn default_database(&self) -> &str { "xtdb" }
     fn databases(&self) -> BTreeSet<String> { BTreeSet::from(["xtdb".into(), "archive".into()]) }

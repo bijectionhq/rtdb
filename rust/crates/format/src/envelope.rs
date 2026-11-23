@@ -1,5 +1,5 @@
 use prost::Message;
-use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, Term, TermSequence};
+use rtdb_types::{Anomaly, BlockIndex, PlacedAttempt, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::generated::xtdb::log::proto::{ReplicaLogMessage, SourceLogMessage};
 use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
@@ -118,23 +118,74 @@ pub struct ReplicaEnvelope {
     pub message: ReplicaBody,
 }
 
-impl ReplicaEnvelope {
-    pub fn encoded_len(&self) -> usize {
-        1 + self.message.encoded_len() + 1 + varint_length(self.term.0 as u64)
-            + self.term_sequence.map_or(0, |sequence| 1 + varint_length(sequence.0 as u64))
-    }
+pub struct ReplicaFrame {
+    pub term: Term,
+    pub term_sequence: Option<TermSequence>,
+    pub message: Option<ReplicaBody>,
+}
 
-    pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
+pub struct AcceptanceStageWitness {
+    pub source_position: SourcePosition,
+    pub ordered_at: Timestamp,
+    pub clock_upper: Timestamp,
+    pub cutoff: Timestamp,
+}
+
+impl crate::log::proto::ResolvedTx {
+    /// Coordinates retained with a strict committed transaction. The sample
+    /// is the writer's admission clock, before quorum durability.
+    pub fn checked_acceptance_stage(&self) -> Result<Option<AcceptanceStageWitness>> {
+        let Some(stage) = &self.acceptance_stage else { return Ok(None); };
+        let (Some(upper), Some(cutoff), Some(source), Some(ordered_at)) =
+            (stage.clock_upper_micros, stage.cutoff_micros, self.src_msg_id, self.system_time_micros)
+        else { return Err(invalid("Incomplete strict acceptance stage")); };
+        let attempt = self.placed_attempt.as_deref().ok_or_else(|| invalid("Strict acceptance stage has no placed attempt"))?;
+        if self.committed != Some(true) || self.tx_id != Some(source) || self.db_op.is_some()
+            || PlacedAttempt::decode(attempt)?.position() != SourcePosition(source)
+            || upper <= 0 || upper >= cutoff || ordered_at >= cutoff
+        {
+            return Err(invalid("Strict acceptance stage does not match a committed placed transaction"));
+        }
+        Ok(Some(AcceptanceStageWitness {
+            source_position: SourcePosition(source), ordered_at: Timestamp(ordered_at),
+            clock_upper: Timestamp(upper), cutoff: Timestamp(cutoff),
+        }))
+    }
+}
+
+impl ReplicaFrame {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
         if header != PROTOBUF_LOG_HEADER {
             return Err(invalid(format!("Unknown replica message header: {header}")));
         }
         let wire = ReplicaLogMessage::decode(payload).map_err(|error| invalid(error.to_string()))?;
-        Ok(wire.message.map(|message| Self {
-            term: Term(wire.term_id.unwrap_or_default()),
-            term_sequence: wire.term_seq.map(TermSequence),
-            message,
-        }))
+        if let Some(ReplicaBody::ResolvedTx(tx)) = &wire.message { tx.checked_acceptance_stage()?; }
+        Ok(Self { term: Term(wire.term_id.unwrap_or_default()), term_sequence: wire.term_seq.map(TermSequence), message: wire.message })
+    }
+
+    pub fn into_envelope(self) -> Option<ReplicaEnvelope> {
+        self.message.map(|message| ReplicaEnvelope { term: self.term, term_sequence: self.term_sequence, message })
+    }
+}
+
+impl ReplicaEnvelope {
+    /// Allows for both term fields at their largest wire widths, before the appender has assigned them.
+    pub fn maximum_encoded_len(message: &ReplicaBody) -> usize {
+        Self::framed_len(message, u64::MAX, Some(u64::MAX))
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        Self::framed_len(&self.message, self.term.0 as u64, self.term_sequence.map(|sequence| sequence.0 as u64))
+    }
+
+    fn framed_len(message: &ReplicaBody, term: u64, sequence: Option<u64>) -> usize {
+        1 + message.encoded_len() + 1 + varint_length(term)
+            + sequence.map_or(0, |sequence| 1 + varint_length(sequence))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
+        Ok(ReplicaFrame::decode(bytes)?.into_envelope())
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -179,6 +230,9 @@ impl ReplicaEnvelope {
         }
         if matches!(payload.message, ReplicaBody::OversizedMessage(_)) {
             return Err(invalid("Nested oversized replica messages are invalid"));
+        }
+        if matches!(&payload.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some()) {
+            return Err(invalid("Strict acceptance requires an inline replica record"));
         }
         Ok(payload)
     }

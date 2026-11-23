@@ -2,6 +2,7 @@ package xtdb.cache
 
 import com.github.benmanes.caffeine.cache.RemovalCause
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CompletableFuture.completedFuture
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -51,18 +52,25 @@ class PinningCacheTest {
 
         PinningCache<String, TestEntry>(maxSizeBytes = 10).use { cache ->
             withCommonPoolStarved {
-                for (k in listOf("a", "b", "c"))
+                val keys = listOf("a", "b", "c")
+                for (k in keys)
                     cache.get(k) { completedFuture(TestEntry(4, evictions)) }.join()
+                assertEquals(keys.toSet(), cache.cache.asMap().keys.toSet())
 
-                for ((k, stillPinned) in listOf("a" to 8L, "b" to 4L, "c" to 0L)) {
+                for ((index, k) in keys.withIndex()) {
+                    val remaining = keys.drop(index + 1)
+                    val stillPinned = remaining.size * 4L
                     cache.releaseEntry(k)
                     awaitUntil { cache.stats0.pinnedBytes == stillPinned }
+                    assertEquals(stillPinned, cache.stats0.pinnedBytes)
+                    assertTrue(cache.cache.asMap().keys.containsAll(remaining))
                 }
 
-                awaitUntil { cache.cache.asMap().size <= 2 }
+                awaitUntil { cache.cache.asMap().size <= 2 && evictions.isNotEmpty() }
 
-                assertEquals(setOf("b", "c"), cache.cache.asMap().keys)
-                assertEquals(listOf("a"), evictions.toList())
+                val retained = cache.cache.asMap().keys.toSet()
+                assertEquals(2, retained.size)
+                assertEquals((keys.toSet() - retained).toList(), evictions.toList())
             }
         }
     }

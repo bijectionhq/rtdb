@@ -4,6 +4,9 @@ use rtdb_types::CivilDate;
 use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{BRANCH_FACTOR, PartGroup, TrieKey}, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
+#[path = "replayed_reset_epochs.rs"]
+mod reset_epochs;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrieState { Nascent, Live, Garbage { as_of: Timestamp } }
 
@@ -15,13 +18,15 @@ pub struct CatalogTrie {
     pub state: TrieState,
     /// Files derived from this trie's data file, at most one per (kind, definition id, definition version).
     pub artefacts: Vec<log_pb::ArtefactRecord>,
+    /// The provider's version for each file at publication, retained when the trie becomes garbage.
+    pub published_files: Option<log_pb::TrieFileVersions>,
 }
 
 impl CatalogTrie {
     pub fn notification(key: TrieKey, data_file_size: i64, mut metadata: Option<log_pb::TrieMetadata>) -> Result<Self> {
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
         if let Some(metadata) = &mut metadata { metadata.iid_bloom = None; }
-        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent, artefacts: Vec::new() })
+        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent, artefacts: Vec::new(), published_files: None })
     }
 
     pub fn from_proto(value: &log_pb::TrieDetails) -> Result<Self> {
@@ -34,7 +39,7 @@ impl CatalogTrie {
         };
         let data_file_size = value.data_file_size.unwrap_or_default();
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
-        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state, artefacts: value.artefacts.clone() })
+        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state, artefacts: value.artefacts.clone(), published_files: value.published_files.clone() })
     }
 
     pub fn to_proto(&self, table: &TableRef) -> log_pb::TrieDetails {
@@ -45,7 +50,7 @@ impl CatalogTrie {
         log_pb::TrieDetails {
             table_name: Some(table.schema_and_table()), trie_key: Some(self.key.to_string()),
             data_file_size: Some(self.data_file_size), trie_metadata: self.metadata.clone(),
-            trie_state: Some(state), garbage_as_of, artefacts: self.artefacts.clone(),
+            trie_state: Some(state), garbage_as_of, artefacts: self.artefacts.clone(), published_files: self.published_files.clone(),
         }
     }
 
@@ -168,17 +173,20 @@ impl TableTries {
 }
 
 #[derive(Clone, Debug)]
-pub struct TrieCatalog { tables: BTreeMap<TableRef, TableTries>, file_size_target: i64 }
+pub struct TrieCatalog { tables: BTreeMap<TableRef, TableTries>, file_size_target: i64, naming_epoch: u64 }
 
-impl Default for TrieCatalog { fn default() -> Self { Self { tables: BTreeMap::new(), file_size_target: 100 * 1024 * 1024 } } }
+impl Default for TrieCatalog { fn default() -> Self { Self { tables: BTreeMap::new(), file_size_target: 100 * 1024 * 1024, naming_epoch: 0 } } }
 
 impl TrieCatalog {
     pub fn new(file_size_target: i64) -> Result<Self> {
         if file_size_target <= 0 { return Err(invalid("Trie file size target must be positive")); }
-        Ok(Self { tables: BTreeMap::new(), file_size_target })
+        Ok(Self { tables: BTreeMap::new(), file_size_target, naming_epoch: 0 })
     }
     pub fn tables(&self) -> impl Iterator<Item = &TableRef> { self.tables.keys() }
     pub fn file_size_target(&self) -> i64 { self.file_size_target }
+    /// The epoch compaction outputs planned from this catalog are named in.
+    pub fn naming_epoch(&self) -> u64 { self.naming_epoch }
+    pub fn with_naming_epoch(self, naming_epoch: u64) -> Self { Self { naming_epoch, ..self } }
     pub fn max_block_index(&self, table: &TableRef, shard: &Shard) -> BlockIndex {
         self.tables.get(table).and_then(|table| table.shards.get(shard)).map_or(BlockIndex(-1), |state| state.max_block_index)
     }
@@ -239,7 +247,7 @@ impl TrieCatalog {
             for key in keys {
                 if key.level() == 0 { continue; }
                 if let Some(shard) = table.shards.get_mut(&Shard::of(key)) {
-                    if shard.tries.get(&key.block_index()).is_some_and(|trie| matches!(trie.state, TrieState::Garbage { .. })) {
+                    if shard.tries.get(&key.block_index()).is_some_and(|trie| trie.key == *key && matches!(trie.state, TrieState::Garbage { .. })) {
                         shard.tries.remove(&key.block_index());
                     }
                 }
@@ -280,8 +288,10 @@ impl TrieCatalog {
         }
         next
     }
+    /// Rewinds every table to its surviving L0 tries and starts a new naming epoch, so outputs planned after the reset never reuse a name planned before it.
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<Self> {
         let mut next = self.clone();
+        next.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
         for (table, tries) in replacements {
             let mut state = TableTries::default();
             let mut shard = ShardValue::default();
@@ -294,6 +304,40 @@ impl TrieCatalog {
             next.tables.insert(table, state);
         }
         Ok(next)
+    }
+
+    /// Selects new physical names for the recovered compacted pairs and keeps the original L0 identities needed by ordered replay.
+    pub fn reset_from_primary(&self, mut primary: Self, block: BlockIndex, as_of: Timestamp) -> Result<(Self, u64)> {
+        let files_epoch = reset_epochs::recovery_file_epoch(block.0).ok_or_else(|| invalid("Recovery file epoch exhausted"))?;
+        primary.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
+        for table in primary.tables.values_mut() {
+            for (shard, value) in &mut table.shards {
+                for trie in value.tries.values_mut() {
+                    if matches!(trie.state, TrieState::Garbage { .. }) {
+                        return Err(invalid("Primary recovery contains a garbage trie"));
+                    }
+                    if shard.level > 0 {
+                        trie.key = trie.key.clone().with_epoch(files_epoch);
+                        trie.published_files = None;
+                    }
+                    trie.artefacts.clear();
+                }
+            }
+        }
+        for (table, old) in &self.tables {
+            for (shard, old) in old.shards.iter().filter(|(shard, _)| shard.level == 0) {
+                let new = primary.tables.entry(table.clone()).or_default().shards.entry(shard.clone()).or_default();
+                new.max_block_index = new.max_block_index.max(old.max_block_index);
+                for (block, previous) in &old.tries {
+                    new.tries.entry(*block).or_insert_with(|| {
+                        let mut source = previous.clone();
+                        source.garbage(as_of);
+                        source
+                    });
+                }
+            }
+        }
+        Ok((primary, files_epoch))
     }
     pub fn partitions(&self, table: &TableRef) -> Result<Vec<block_pb::Partition>> {
         self.tables.get(table).into_iter().flat_map(|table| table.shards.iter()).map(|(shard, state)| {

@@ -1,0 +1,30 @@
+#![allow(unexpected_cfgs)]
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out <==> serving && open_owner && same_residence && current_epoch == opened_epoch,
+))]
+pub(crate) fn admits(serving: bool, open_owner: bool, same_residence: bool, current_epoch: i32, opened_epoch: i32) -> bool {
+    serving && open_owner && same_residence && current_epoch == opened_epoch
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out <==> (match floor {
+        None => true,
+        Some(lower) => match captured {
+            None => false,
+            Some(position) => position >= lower,
+        },
+    }),
+))]
+pub(super) fn admits_after_floor(captured: Option<i64>, floor: Option<i64>) -> bool {
+    match floor {
+        None => true,
+        Some(lower) => match captured {
+            None => false,
+            Some(position) => position >= lower,
+        },
+    }
+}

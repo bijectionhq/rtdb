@@ -8,8 +8,9 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole};
 use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
+use rtdb_s3::CELL_STORAGE_NAMESPACE_MARKER as STORAGE_NAMESPACE_MARKER;
 use rtdb_storage::{Error as StoreError, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, JournalEndpoint, Result};
 use serde::{Deserialize, Serialize};
 
 /// The protobuf type name the logkeeper log factory is registered under.
@@ -46,10 +47,6 @@ pub enum CellStorage {
     S3 { config: rtdb_s3::S3Config },
 }
 
-/// The key under an S3 configuration's prefix that a cell's objects are kept below.
-pub(crate) const S3_CELL_ROOT: &str = "cell";
-const STORAGE_NAMESPACE_MARKER: &str = "~cell-namespace";
-
 pub(crate) fn s3_write_lease_horizon(at_ms: i64) -> i64 {
     let interval = rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE;
     at_ms.saturating_add(interval.as_millis() as i64)
@@ -63,7 +60,7 @@ impl CellStorage {
     }
 
     pub(crate) fn s3_root(config: &rtdb_s3::S3Config) -> Result<ObjectKey> {
-        config.object_prefix(&ObjectKey::new(S3_CELL_ROOT)?)
+        config.object_prefix(&config.cell_root()?)
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> rtdb_types::Result<bool> {
@@ -113,49 +110,27 @@ impl CellStorage {
 
     /// The cell's objects as one store, keyed relative to the cell's storage root.
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
-        match self {
-            CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
-            CellStorage::S3 { config } => Ok(Self::s3_bucket(config, io).await?),
-        }
+        self.open_bucket(io, false).await
     }
 
-    pub(crate) async fn s3_bucket(
-        config: &rtdb_s3::S3Config,
-        io: std::sync::Arc<rtdb_storage::IoRegion>,
-    ) -> rtdb_types::Result<std::sync::Arc<rtdb_storage::remote::RemoteStore>> {
-        let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
-        config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
+    pub(crate) async fn open_bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>, audience: bool) -> rtdb_types::Result<crate::reference::Bucket> {
+        match self {
+            CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
+            CellStorage::S3 { config } => {
+                let root = config.cell_root()?;
+                let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
+                if audience { Ok(config.open_audience_cell(&root, &remotes, io).await?) }
+                else { Ok(config.open_cell(&root, &remotes, io).await?) }
+            }
+        }
     }
 
     pub(crate) async fn s3_inventory(
         config: &rtdb_s3::S3Config,
     ) -> rtdb_types::Result<rtdb_s3::VersionedInventory> {
-        let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        let root = config.cell_root()?;
         let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
         config.versioned_inventory(&root, &remotes).await
-    }
-
-    pub(crate) async fn purge_serving_inventory(
-        &self,
-        deployment: &rtdb_storage::ObjectKey,
-    ) -> rtdb_types::Result<rtdb_directory::ServingInventory> {
-        match self {
-            Self::Local { .. } => Ok(rtdb_directory::ServingInventory::LocalDirectory),
-            Self::S3 { config } => {
-                Self::s3_inventory(config).await?.purge(deployment).await?;
-                Ok(rtdb_directory::ServingInventory::S3VersionsAndUploads)
-            }
-        }
-    }
-
-    pub(crate) async fn purge_inventory(&self, deployment: &ObjectKey) -> Result<rtdb_directory::DeletionInventory> {
-        match self {
-            Self::Local { .. } => Ok(rtdb_directory::DeletionInventory::CurrentObjects),
-            Self::S3 { config } => {
-                Self::s3_inventory(config).await?.purge(deployment).await?;
-                Ok(rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads)
-            }
-        }
     }
 
     pub(crate) fn cleanup_contains(&self, other: &Self, deployment: &ObjectKey) -> Result<bool> {
@@ -169,9 +144,8 @@ impl CellStorage {
                 Ok(canonical(other_root)?.starts_with(canonical(root)?.join(deployment.as_str())))
             }
             (Self::S3 { config }, Self::S3 { config: other_config }) if config.bucket == other_config.bucket => {
-                let cell = ObjectKey::new(S3_CELL_ROOT)?;
-                let root = config.object_prefix(&cell)?;
-                let other_root = other_config.object_prefix(&cell)?;
+                let root = Self::s3_root(config)?;
+                let other_root = Self::s3_root(other_config)?;
                 let Some(relative) = other_root.as_str().strip_prefix(&format!("{root}/")) else { return Ok(false) };
                 Ok(ObjectKey::new(relative)?.is_under(deployment))
             }
@@ -179,7 +153,6 @@ impl CellStorage {
         }
     }
 
-    /// The storage `spec` names: `s3://BUCKET[/PREFIX]`, with `endpoint`, `region` and `path_style` as query parameters, or a local directory.
     pub fn parse(spec: &str) -> rtdb_types::Result<Self> {
         let Some(location) = spec.strip_prefix("s3://") else { return Ok(CellStorage::Local { root: PathBuf::from(spec) }) };
         let (location, query) = location.split_once('?').unwrap_or((location, ""));
@@ -191,9 +164,18 @@ impl CellStorage {
                 Some(("endpoint", endpoint)) => config.endpoint = Some(endpoint.to_owned()),
                 Some(("region", region)) => config.region = Some(region.to_owned()),
                 Some(("path_style", on)) => config.path_style_access_enabled = on == "true",
+                Some(("terminal", scope)) if config.terminal_scope.is_none() => {
+                    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+                    let invalid = || Anomaly::incorrect("rtdb.multi/storage-spec", "Terminal storage requires an allocation UUID and a base64url Ed25519 public key");
+                    let (allocation, authority) = scope.split_once('.').ok_or_else(invalid)?;
+                    let allocation = uuid::Uuid::parse_str(allocation).map_err(|_| invalid())?;
+                    let authority = URL_SAFE_NO_PAD.decode(authority).ok().and_then(|bytes| bytes.try_into().ok()).ok_or_else(invalid)?;
+                    config.terminal_scope = Some(rtdb_s3::TerminalS3Scope { allocation, authority });
+                }
                 _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.multi/storage-spec", format!("Unknown S3 storage parameter {pair}"))),
             }
         }
+        config.cell_root()?;
         Ok(CellStorage::S3 { config })
     }
 }
@@ -250,25 +232,27 @@ pub enum Role {
 /// The logkeeper streams a deployment's database reads and writes, carried in its `DatabaseConfig`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogkeeperLogConfig {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub deployment: String,
     pub key_id: String,
     pub replica_stream: String,
     pub replica_seal_scope: String,
     /// The ensemble the stream moves from, when the holder opening it moves it to `servers`.
     #[serde(default)]
-    pub previous_servers: Option<Vec<String>>,
-    /// The members `servers` are, recorded as the deployment's ensemble once a move completes.
-    #[serde(default)]
-    pub ensemble: Vec<String>,
-    /// The writer epoch a holder opens its streams at; ignored by a subscriber.
+    pub previous_servers: Option<Vec<JournalEndpoint>>,
+    /// The writer epoch for opening a stream and for confirming a read index.
     pub epoch: u64,
+    #[serde(default)]
+    pub require_read_index: bool,
     /// A snapshot reader's checkpoint: its logs end there and never advance, so it reads no logkeeper.
     #[serde(default)]
     pub frozen_at: Option<rtdb_directory::Checkpoint>,
     /// The namespace of the deployment's log positions.
     #[serde(default)]
     pub log_epoch: i32,
+    /// Inclusive original intake position consumed before a transferred target may write.
+    #[serde(default)]
+    pub transferred_source_through: Option<i64>,
     pub write_quorum: usize,
 }
 
@@ -293,21 +277,41 @@ pub(crate) fn select_logkeepers<'a>(key: &str, width: usize, mut selected: Vec<&
     selected
 }
 
-pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<String>> {
+pub(crate) fn ranked_read_replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>, now: i64) -> Vec<&'a MemberRecord> {
+    let holder = rtdb_directory::effective_holder(record, members, now);
+    let nodes: Vec<_> = members.values().filter(|member| {
+        holder != Some(&member.id) && record.may_place_on(member, now) && member.control_address.is_some()
+            && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces))
+    }).collect();
+    rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied().collect()
+}
+
+pub(crate) fn read_replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>, now: i64) -> Vec<&'a MemberRecord> {
+    if record.read_width <= 1 { return Vec::new(); }
+    let mut ranks = ranked_read_replicas(record, members, now);
+    ranks.truncate(record.read_width.saturating_sub(1) as usize);
+    ranks
+}
+
+pub(crate) fn journal_endpoint(member: &MemberRecord) -> JournalEndpoint {
+    JournalEndpoint::Member { address: member.address.clone(), journal: member.id.0.clone() }
+}
+
+pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<JournalEndpoint>> {
     record.ensemble.iter().map(|id| {
-        members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(|member| member.address.clone())
+        members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(journal_endpoint)
             .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))
     }).collect()
 }
 
-/// The configuration a node opens `record` with, given its ensemble's addresses.
-pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage: &CellStorage, role: Role) -> DatabaseConfig {
+/// The configuration a node opens `record` with, given its ensemble's journals.
+pub fn database_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, storage: &CellStorage, role: Role) -> DatabaseConfig {
     moving_config(record, servers, None, storage, role)
 }
 
-/// The configuration a holder opens `record` with when it moves the stream from `previous` to `servers`, the ensemble `ensemble`.
-pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Option<(Vec<String>, Vec<rtdb_directory::MemberId>)>, storage: &CellStorage, role: Role) -> DatabaseConfig {
-    let mut log = LogkeeperLogConfig {
+/// The configuration a holder opens `record` with when it moves the stream from `previous_servers` to `servers`.
+pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, previous_servers: Option<Vec<JournalEndpoint>>, storage: &CellStorage, role: Role) -> DatabaseConfig {
+    let log = LogkeeperLogConfig {
         write_quorum: write_quorum(servers.len()),
         servers,
         deployment: record.id.clone(),
@@ -315,12 +319,15 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
         replica_stream: record.stream("replica"),
         replica_seal_scope: record.replica_seal_scope(),
         epoch: record.epoch,
+        require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
         log_epoch: record.log_epoch,
+        transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
+            let terminal = activation.replica.bootstrap.terminal.source_through;
+            record.checkpoint.map_or(terminal, |checkpoint| terminal.max(checkpoint.source))
+        }),
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
-        previous_servers: None,
-        ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect(),
+        previous_servers,
     };
-    if let Some((previous, ensemble)) = moving { log.previous_servers = Some(previous); log.ensemble = ensemble.into_iter().map(|id| id.0).collect(); }
     let store = crate::store::CellStoreConfig { storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
         writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor,
         snapshot_block: match role { Role::Snapshot(checkpoint) => Some(checkpoint.block), _ => None } };

@@ -28,6 +28,8 @@ pub enum Error {
     MessageTooLarge { size: usize, maximum: usize },
     #[error("cache requires {requested} bytes; limit is {limit} with {retained} retained")]
     MemoryLimit { requested: usize, limit: usize, retained: usize },
+    #[error("audience read work exceeded its installed allowance")]
+    AudienceWorkLimit,
     #[error("storage task failed: {0}")]
     Task(String),
     #[error("remote storage at {key}: {message}")]
@@ -36,6 +38,8 @@ pub enum Error {
     PermissionDenied { key: String, message: String },
     #[error("log writer at epoch {epoch} was deposed by a seal at epoch {promised}")]
     Deposed { epoch: u64, promised: u64 },
+    #[error("read lease expired at {deadline:?}; now {now}")]
+    ReadLeaseExpired { deadline: Option<i64>, now: i64 },
     #[error("{upload}; multipart abort also failed: {abort}")]
     MultipartAbort { #[source] upload: Box<Error>, abort: Box<Error> },
 }
@@ -64,10 +68,12 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::LogReadLimit { maximum_records, maximum_payload_bytes } => (Category::Busy, "rtdb.storage/log-read-limit", serde_json::json!({"maximum-records": maximum_records, "maximum-payload-bytes": maximum_payload_bytes})),
             Error::MessageTooLarge { size, maximum } => (Category::Incorrect, "rtdb.storage/message-too-large", serde_json::json!({"size": size, "maximum": maximum})),
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
+            Error::AudienceWorkLimit => (Category::Busy, "rtdb.storage/audience-work-limit", serde_json::json!({})),
             Error::Task(_) => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),
             Error::Deposed { epoch, promised } => (Category::Conflict, "rtdb.storage/deposed", serde_json::json!({"epoch": epoch, "promised": promised})),
             Error::PermissionDenied { key, .. } => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"key": key})),
+            Error::ReadLeaseExpired { deadline, now } => (Category::Unavailable, "rtdb.storage/read-lease-expired", serde_json::json!({"deadline": deadline, "now": now})),
             Error::MultipartAbort { upload, abort } => {
                 let mut anomaly = Anomaly::from(*upload);
                 anomaly.message = Some(message);

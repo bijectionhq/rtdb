@@ -1,7 +1,8 @@
-//! The control protocol between the cell and a node's agent: newline-delimited JSON, one request per connection.
+//! The control protocol between the cell and a node's agent: newline-delimited JSON with an optional Pgwire handoff.
 //! In a cell with a secret, every request carries a grant signed with it, and a node refuses one that does not.
 
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const NODE_UNDER_PRESSURE: &str = "rtdb.multi/node-under-pressure";
@@ -17,7 +19,14 @@ pub(crate) const NOT_CLAIMABLE: &str = "rtdb.multi/not-claimable";
 pub(crate) const CLAIM_CONTENDED: &str = "rtdb.multi/claim-contended";
 pub(crate) const ACTIVATION_RATE_LIMITED: &str = "rtdb.multi/activation-rate-limited";
 
-pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED | ACTIVATION_RATE_LIMITED) }
+pub(crate) const WRITER_PGWIRE_UNREACHABLE: &str = "rtdb.multi/writer-pgwire-unreachable";
+pub(crate) const WRITER_CONTROL_UNREACHABLE: &str = "rtdb.multi/writer-control-unreachable";
+const CONTROL_IO: &str = "rtdb.multi/control-io";
+const CONTROL_TIMEOUT: &str = "rtdb.multi/control-timeout";
+
+pub(crate) fn unreachable_control(code: &str) -> bool { matches!(code, CONTROL_IO | CONTROL_TIMEOUT) }
+
+pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED | ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE | WRITER_CONTROL_UNREACHABLE) }
 
 pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: Duration, mut attempt: impl FnMut() -> F) -> Result<T> {
     let latest_start = tokio::time::Instant::now() + window;
@@ -25,7 +34,7 @@ pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: D
         let result = attempt().await;
         let Err(error) = &result else { return result; };
         if !retryable_activation(&error.code) { return result; }
-        let delay = if error.code == ACTIVATION_RATE_LIMITED { Duration::from_millis(100) } else { Duration::from_millis(25) };
+        let delay = if matches!(error.code.as_ref(), ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE | WRITER_CONTROL_UNREACHABLE) { Duration::from_millis(100) } else { Duration::from_millis(25) };
         let retry_at = tokio::time::Instant::now() + delay;
         if retry_at >= latest_start { return result; }
         tokio::time::sleep_until(retry_at).await;
@@ -44,18 +53,33 @@ pub enum Request {
     ParkForMove { name: String, epoch: u64, ticket: MoveTicket },
     /// Answers Done while the agent is serving: the controller's liveness probe.
     Ping,
-    FlightEndpoint,
+    OpenPgwire,
+    FlightEndpoint { audience: bool },
+    HoldingLoads { #[serde(default)] measure_query_cpu: bool },
+    ReadLoads,
     /// A client is using the deployment through a gateway.
     Touch { name: String },
     /// Serve the deployment's reads from a log-fed replica on this node.
     Subscribe { name: String },
+    /// Serve a deployment using a read index before capturing an implicit basis.
+    SubscribeFresh { name: String },
     /// Serve the deployment's reads as of its checkpoint, from object storage alone.
     Snapshot { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
     Flush { name: String },
+    /// Pin the named captured checkpoint through this writer's exact installed basis.
+    PinCheckpointSuffix {
+        name: String,
+        deployment: uuid::Uuid,
+        lease: uuid::Uuid,
+        capture: uuid::Uuid,
+        basis: rtdb_types::TransactionKey,
+        expires_at_ms: i64,
+    },
     /// Publish a compaction a worker produced, as the deployment's holder; the notification is an encoded TriesAdded.
     PublishCompaction { name: String, notification: Vec<u8>, grant: String },
     /// Read a fragment of another node's scan of the deployment, at the fragment's basis (`RefineKeyForLargeDeployments`).
+    #[serde(rename = "scan_scoped_fragment")]
     ScanFragment { name: String, fragment: rtdb_query::ScanFragment, grant: String },
 }
 
@@ -75,8 +99,11 @@ pub enum Response {
     /// This member serves the deployment's reads from a replica; clients reach it at `address`.
     Subscribed { address: String },
     FlightEndpoint { address: String },
+    HoldingLoads { holdings: Vec<crate::load::HoldingLoad> },
+    ReadLoads { loads: Vec<crate::read_width::ReadLoad> },
     Done,
-    Flushed { block: i64 },
+    Flushed { checkpoint: rtdb_directory::Checkpoint },
+    CheckpointSuffixPinned { pin: rtdb_directory::CheckpointSuffixPin },
     Published { position: i64 },
     /// A fragment's rows: length-prefixed Arrow IPC streams, in base64.
     Fragment { batches: String },
@@ -117,6 +144,14 @@ struct Envelope {
     request: Request,
 }
 
+#[derive(Serialize, Deserialize)]
+struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_probe_overflows: Option<u64>,
+    #[serde(flatten)]
+    response: Response,
+}
+
 impl Response {
     pub fn refused(error: &Anomaly) -> Self { Self::Refused { code: error.code.to_string(), message: error.message.clone().unwrap_or_default() } }
 }
@@ -127,47 +162,121 @@ pub trait Handler: Send + Sync + 'static {
 }
 
 pub async fn serve(listener: TcpListener, handler: Arc<dyn Handler>, key: ControlKey, cancellation: CancellationToken) -> Result<()> {
+    serve_on(listener, handler, key, cancellation, None).await
+}
+
+#[derive(Clone)]
+struct PgwireEndpoint {
+    address: SocketAddr,
+    relay_slots: Option<Arc<Semaphore>>,
+    status: watch::Receiver<rtdb_pgwire::ServerStatus>,
+}
+
+pub async fn serve_with_pgwire(listener: TcpListener, handler: Arc<dyn Handler>, key: ControlKey, cancellation: CancellationToken,
+                               mut address: SocketAddr, relay_limit: Option<usize>, status: watch::Receiver<rtdb_pgwire::ServerStatus>) -> Result<()> {
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() { IpAddr::V4(Ipv4Addr::LOCALHOST) } else { IpAddr::V6(Ipv6Addr::LOCALHOST) });
+    }
+    let relay_slots = relay_limit.map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))));
+    serve_on(listener, handler, key, cancellation, Some(PgwireEndpoint { address, relay_slots, status })).await
+}
+
+async fn write_message(stream: &mut TcpStream, value: &impl Serialize) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(value).expect("a control message serializes");
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await
+}
+
+async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: ControlKey, cancellation: CancellationToken,
+                  pgwire: Option<PgwireEndpoint>) -> Result<()> {
     loop {
-        let (stream, _) = tokio::select! {
+        let (mut stream, _) = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
             accepted = listener.accept() => accepted.map_err(io)?,
         };
-        let (handler, key) = (Arc::clone(&handler), key.clone());
+        let (handler, key, pgwire) = (Arc::clone(&handler), key.clone(), pgwire.clone());
+        let stop = cancellation.clone();
         tokio::spawn(async move {
-            let (read, mut write) = stream.into_split();
             let mut line = String::new();
-            if BufReader::new(read.take(MAXIMUM_REQUEST_BYTES)).read_line(&mut line).await.is_err() { return; }
+            if BufReader::new((&mut stream).take(MAXIMUM_REQUEST_BYTES)).read_line(&mut line).await.is_err() { return; }
+            let mut startup_probe_overflows = None;
             let response = match serde_json::from_str::<Envelope>(&line) {
                 Ok(envelope) => match key.admit(envelope.control_grant.as_deref()) {
-                    Ok(()) => handler.handle(envelope.request).await,
+                    Ok(()) => match envelope.request {
+                        Request::OpenPgwire => {
+                            if let Some(PgwireEndpoint { address, relay_slots: Some(slots), .. }) = pgwire.filter(|_| key.0.is_some()) {
+                                if let Ok(_slot) = slots.try_acquire_owned() {
+                                    if let Ok(Ok(mut destination)) = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(address)).await {
+                                        let _ = stream.set_nodelay(true);
+                                        let _ = destination.set_nodelay(true);
+                                        if write_message(&mut stream, &Response::Done).await.is_ok() {
+                                            stop.run_until_cancelled(tokio::io::copy_bidirectional(&mut stream, &mut destination)).await;
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            Response::Refused { code: "rtdb.multi/pgwire-relay-unavailable".into(), message: "This control endpoint cannot open a Pgwire connection".into() }
+                        }
+                        request => {
+                            let reports_probe = matches!(request, Request::Ping | Request::Activate { .. } | Request::Subscribe { .. }
+                                | Request::SubscribeFresh { .. } | Request::Snapshot { .. });
+                            let response = handler.handle(request).await;
+                            if reports_probe {
+                                startup_probe_overflows = pgwire.as_ref().map(|endpoint| endpoint.status.borrow().startup_probe_overflows);
+                            }
+                            response
+                        }
+                    },
                     Err(error) => Response::refused(&error),
                 },
                 Err(error) => Response::Refused { code: "rtdb.multi/control-request".into(), message: error.to_string() },
             };
-            let mut bytes = serde_json::to_vec(&response).expect("a response serializes");
-            bytes.push(b'\n');
-            let _ = write.write_all(&bytes).await;
+            let _ = write_message(&mut stream, &Reply { startup_probe_overflows, response }).await;
         });
     }
 }
 
-pub async fn call(address: &str, request: &Request, timeout: Duration, key: &ControlKey) -> Result<Response> {
-    let exchange = async {
-        let stream = TcpStream::connect(address).await.map_err(io)?;
-        let (read, mut write) = stream.into_split();
-        let mut bytes = serde_json::to_vec(&Envelope { control_grant: key.grant(), request: request.clone() }).expect("a request serializes");
-        bytes.push(b'\n');
-        write.write_all(&bytes).await.map_err(io)?;
+async fn exchange(address: &str, request: Request, timeout: Duration, key: &ControlKey) -> Result<(TcpStream, Reply)> {
+    let transfer = async {
+        let mut stream = TcpStream::connect(address).await.map_err(io)?;
+        write_message(&mut stream, &Envelope { control_grant: key.grant(), request }).await.map_err(io)?;
         let mut line = String::new();
-        BufReader::new(read.take(MAXIMUM_RESPONSE_BYTES)).read_line(&mut line).await.map_err(io)?;
+        BufReader::new((&mut stream).take(MAXIMUM_RESPONSE_BYTES)).read_line(&mut line).await.map_err(io)?;
         if !line.ends_with('\n') { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/control-response-size", format!("{address} answered with more than the largest response a caller reads"))); }
-        serde_json::from_str::<Response>(&line).map_err(|error| Anomaly::fault("rtdb.multi/control-response", error.to_string()))
+        let response = serde_json::from_str::<Reply>(&line).map_err(|error| Anomaly::fault("rtdb.multi/control-response", error.to_string()))?;
+        Ok((stream, response))
     };
-    tokio::time::timeout(timeout, exchange).await
-        .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/control-timeout", format!("No answer from {address}")))?
+    tokio::time::timeout(timeout, transfer).await
+        .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, CONTROL_TIMEOUT, format!("No answer from {address}")))?
 }
 
-fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/control-io", error.to_string()) }
+pub async fn call(address: &str, request: &Request, timeout: Duration, key: &ControlKey) -> Result<Response> {
+    exchange(address, request.clone(), timeout, key).await.map(|(_, reply)| reply.response)
+}
+
+pub(crate) async fn call_with_pgwire_probe(address: &str, request: Request, timeout: Duration, key: &ControlKey) -> Result<(Response, Option<u64>)> {
+    exchange(address, request, timeout, key).await.map(|(_, reply)| (reply.response, reply.startup_probe_overflows))
+}
+
+pub(crate) async fn ping(address: &str, timeout: Duration, key: &ControlKey) -> Result<Option<u64>> {
+    let (response, overflows) = call_with_pgwire_probe(address, Request::Ping, timeout, key).await?;
+    if response == Response::Done { return Ok(overflows); }
+    Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/probe-refused", "The node's control endpoint did not answer its liveness probe"))
+}
+
+pub(crate) async fn open_pgwire(address: &str, timeout: Duration, key: &ControlKey) -> Result<TcpStream> {
+    if key.0.is_some() {
+        let (stream, response) = exchange(address, Request::OpenPgwire, timeout, key).await?;
+        if response.response == Response::Done {
+            stream.set_nodelay(true).map_err(io)?;
+            return Ok(stream);
+        }
+    }
+    Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/pgwire-relay-unavailable", "No signed Pgwire relay is available"))
+}
+
+fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, CONTROL_IO, error.to_string()) }
 
 #[cfg(test)]
 mod tests {

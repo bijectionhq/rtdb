@@ -1,0 +1,67 @@
+{
+  "summary": "Admits unsigned query row counts through signed long maximum and computes the capped ordered prefix.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "bounds"
+  ],
+  "min_verified_functions": 2,
+  "controls": {
+    "admit_negative_count": {
+      "mutate": [
+        {
+          "file": "rust/crates/query/src/limit_bounds.rs",
+          "find": "value < 0 || value > i64::MAX as i128",
+          "replace": "value > i64::MAX as i128"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/query/src/limit_bounds.rs",
+          "function": "checked_row_count",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/query/src/limit_bounds.rs",
+          "function": "checked_row_count",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "reject_maximum_count": {
+      "mutate": [
+        {
+          "file": "rust/crates/query/src/limit_bounds.rs",
+          "find": "value > i64::MAX as i128",
+          "replace": "value >= i64::MAX as i128"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/query/src/limit_bounds.rs",
+          "function": "checked_row_count",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "forget_offset_in_prefix": {
+      "mutate": [
+        {
+          "file": "rust/crates/query/src/limit_bounds.rs",
+          "find": "offset.saturating_add(fetch.unwrap_or(cap)).min(cap)",
+          "replace": "fetch.unwrap_or(cap).min(cap)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/query/src/limit_bounds.rs",
+          "function": "sort_prefix_len",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    }
+  }
+}

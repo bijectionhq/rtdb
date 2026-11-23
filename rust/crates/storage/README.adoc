@@ -38,6 +38,11 @@ An empty entry is removed when its last fetcher fails or is cancelled.
 Pools sharing a payload budget report its retained encoded bytes and in-flight read reservations.
 An evicted payload remains charged until its last lease or slice drops.
 
+A scan maps requested byte ranges on local object files and on existing disk-cache files.
+A cold remote range read can fetch those bytes directly.
+Whole-object transforms such as authenticated encryption load the object once before reading its selected pages.
+A retained mapping keeps any disk-cache lease alive until the last Arrow buffer referencing it is released.
+
 `DiskCache` is a shared monitor for immutable remote files, with per-entry load exclusion and passive leases that prevent eviction during reads.
 Downloads publish a complete temporary file atomically and charge each in-flight chunk and retained entry to the supplied allocation budget.
 Cancelled or failed loads release their temporary files and allow a later reader to retry.

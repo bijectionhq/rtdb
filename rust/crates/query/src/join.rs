@@ -14,19 +14,23 @@ enum Phase {
 pub(crate) struct JoinCursor {
     phase: Phase,plan: JoinPlan,
 }
-struct JoinPlan { layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution }
+struct JoinPlan { layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution,projected_build: bool }
 impl JoinCursor {
     pub fn new(build: BoxPageCursor,probe: DeferredInput,mut layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution) -> Result<Self> {
         if kind == JoinKind::Cross { return Err(invalid("join-kind","Cross join requires its page-pair cursor")); }
         if matches!(kind, JoinKind::Full | JoinKind::Single) || kind == JoinKind::Left && !build_left || kind == JoinKind::Right && build_left { layout.with_null_build(build_left)?; }
-        Ok(Self { phase: Phase::Build { input: build,probe },plan: JoinPlan { layout,build_left,kind,execution } })
+        Ok(Self { phase: Phase::Build { input: build,probe },plan: JoinPlan { layout,build_left,kind,execution,projected_build: false } })
+    }
+    pub fn with_projected_build(mut self, projected: bool) -> Self {
+        self.plan.projected_build = projected;
+        self
     }
 }
 impl JoinPlan {
     fn build_layout(&self) -> &JoinInput { if self.build_left { &self.layout.left } else { &self.layout.right } }
     fn probe_layout(&self) -> &JoinInput { if self.build_left { &self.layout.right } else { &self.layout.left } }
-    fn track_build(&self) -> bool { self.kind == JoinKind::Full || self.kind == JoinKind::Left && self.build_left || self.kind == JoinKind::Right && !self.build_left }
-    fn preserve_probe(&self) -> bool { matches!(self.kind, JoinKind::Full | JoinKind::Single) || self.kind == JoinKind::Left && !self.build_left || self.kind == JoinKind::Right && self.build_left }
+    fn track_build(&self) -> bool { tracks_build(self.kind, self.build_left) }
+    fn preserve_probe(&self) -> bool { preserves_probe(self.kind, self.build_left) }
     fn blooms(&self) -> bool { matches!(self.kind,JoinKind::Inner | JoinKind::Semi) || self.track_build() && self.kind != JoinKind::Full }
     fn joined(&self,build: &OwnedRow,probe: &OwnedRow) -> Result<OwnedRow> {
         let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
@@ -150,6 +154,15 @@ fn append(page: &mut PageBuilder,row: OwnedRow,execution: &Execution) -> Result<
 }
 fn size_error() -> rtdb_types::Anomaly { invalid("join-size","Join output or comparator metadata exceeds supported allocation bounds") }
 
+pub(crate) fn tracks_build(kind: JoinKind, build_left: bool) -> bool {
+    kind == JoinKind::Full || kind == JoinKind::Left && build_left || kind == JoinKind::Right && !build_left
+}
+
+pub(crate) fn preserves_probe(kind: JoinKind, build_left: bool) -> bool {
+    matches!(kind, JoinKind::Full | JoinKind::Single)
+        || kind == JoinKind::Left && !build_left || kind == JoinKind::Right && build_left
+}
+
 #[async_trait]
 impl PageCursor for JoinCursor {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
@@ -160,7 +173,8 @@ impl PageCursor for JoinCursor {
                 Phase::Build { mut input,probe } => {
                     let mut accumulator = BuildAccumulator::new(plan.execution.context.options.join_build_rows,Arc::clone(&plan.execution.context))?;
                     while let Some(page) = input.next_page().await? {
-                        accumulator.append(plan.build_layout().project_page(page,&plan.execution).await?)?;
+                        let page = if plan.projected_build { page } else { plan.build_layout().project_page(page,&plan.execution).await? };
+                        accumulator.append(page)?;
                     }
                     match accumulator.finish()? {
                         BuildInput::Memory(page) => {

@@ -40,7 +40,15 @@ pub struct Scan {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ScanTopK { pub column: ColumnId, pub query: Expr, pub limit: Expr }
+pub struct ScanTopK {
+    pub column: ColumnId,
+    pub query: Expr,
+    pub limit: Expr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<ColumnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascending_id: Option<ColumnId>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrderedTopK {

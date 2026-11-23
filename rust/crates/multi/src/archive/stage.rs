@@ -7,8 +7,10 @@ use rtdb_directory::{
     CellMedia, CheckpointStage, CheckpointStageIntent, DeploymentRecord, Directory,
     DisposalReceipt, HostedTask, Lifecycle,
 };
+use rtdb_format::catalog::CheckpointContents;
 use rtdb_storage::{Error, IoRegion, ObjectStore};
 use rtdb_types::Result;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
@@ -23,11 +25,27 @@ use crate::{
     reference::{PrefixedStore, key},
     store::{
         ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
-        track_checkpoint_stage_publications,
+        track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
     },
 };
 
 pub(super) const STAGED_MANIFEST: &str = "~checkpoint-stage";
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(super) enum StageInventory {
+    Primary(Vec<ArchivedObject>),
+    Replay { objects: Vec<ArchivedObject> },
+}
+
+impl StageInventory {
+    pub(super) fn into_contents(self) -> (CheckpointContents, Vec<ArchivedObject>) {
+        match self {
+            Self::Primary(objects) => (CheckpointContents::Primary, objects),
+            Self::Replay { objects } => (CheckpointContents::Replay, objects),
+        }
+    }
+}
 
 /// Close the exact scratch identity, even when cancellation wins the race
 /// with staging. Physical disposal stays with the cell's ordinary reaper.
@@ -59,6 +77,7 @@ pub(crate) async fn discard_checkpoint_stage(
                 source_log_epoch: point.log_epoch,
                 checkpoint: point.checkpoint,
                 media: media.clone(),
+                transfer_only: false,
                 staged_manifest_sha256: None,
             }));
             match directory.create_deployment(tombstone).await {
@@ -67,7 +86,7 @@ pub(crate) async fn discard_checkpoint_stage(
             }
         }
     };
-    staged(&record, &request, &media)?;
+    staged(&record, &request, &media, false)?;
     if record.incarnation != 1
         || record.holder.is_some()
         || record.checkpoint.is_some()
@@ -103,6 +122,18 @@ pub async fn stage_checkpoint(
     request: CheckpointStageIntent,
     hosted_task: Option<HostedTask>,
 ) -> Result<CheckpointStage> {
+    stage_checkpoint_for(directory, archive, storage, keys, request, hosted_task, false).await
+}
+
+pub(super) async fn stage_checkpoint_for(
+    directory: Arc<dyn Directory>,
+    archive: &CellStorage,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    request: CheckpointStageIntent,
+    hosted_task: Option<HostedTask>,
+    transfer_only: bool,
+) -> Result<CheckpointStage> {
     if request.source.is_nil()
         || request.capture.is_nil()
         || request.operation.is_nil()
@@ -121,7 +152,7 @@ pub async fn stage_checkpoint(
         keys: keys.custody_namespace()?,
     };
     if let Some(stored) = directory.deployment(&target_id).await? {
-        if let Some(complete) = staged(&stored, &request, &media)? {
+        if let Some(complete) = staged(&stored, &request, &media, transfer_only)? {
             return Ok(complete);
         }
     }
@@ -133,12 +164,21 @@ pub async fn stage_checkpoint(
         .filter(|(_, manifest)| manifest == &request.source_manifest_sha256)
         .ok_or_else(|| inconsistent("The source capture has another manifest"))?;
     require_capture_open(&source, request.capture)?;
+    if transfer_only && (source.writer_pool().is_none()
+        || !super::same_incarnation(&source, &point) || source.checkpoint != Some(point.checkpoint))
+    {
+        return Err(inconsistent("A terminal transfer requires the original current source checkpoint"));
+    }
+    super::admit_lifetime_restore(
+        directory.as_ref(), archive, keys, &point, &manifest, hosted_task.as_ref(), transfer_only,
+    ).await?;
     let intent = CheckpointStage {
         intent: request,
         source_incarnation: point.incarnation,
         source_log_epoch: point.log_epoch,
         checkpoint: point.checkpoint,
         media,
+        transfer_only,
         staged_manifest_sha256: None,
     };
     let bucket = storage.bucket(IoRegion::new()).await?;
@@ -153,7 +193,7 @@ pub async fn stage_checkpoint(
             Err(error) => directory.deployment(&target_id).await?.ok_or(error)?,
         },
     };
-    if let Some(complete) = staged(&retained, &intent.intent, &intent.media)? {
+    if let Some(complete) = staged(&retained, &intent.intent, &intent.media, transfer_only)? {
         return Ok(complete);
     }
     crate::deployment::require_storage_namespaces(&retained, namespaces)?;
@@ -172,7 +212,7 @@ pub async fn stage_checkpoint(
         &source_id,
         archive,
         hosted_task.as_ref(),
-        Some(point.operation),
+        Some((point.operation, None)),
         None,
         |current| {
             require_capture_open(current, point.operation)?;
@@ -183,9 +223,9 @@ pub async fn stage_checkpoint(
                     "The capture lost its retained archive admission",
                 ));
             }
-            Ok(())
+            Ok(None)
         },
-        |archive_io| {
+        |_, _, archive_io| {
             let (directory, target_id, intent) = (&directory, &target_id, &intent);
             let (retained, point, manifest, hosted_task) =
                 (&retained, &point, &manifest, hosted_task.as_ref());
@@ -197,7 +237,7 @@ pub async fn stage_checkpoint(
                     storage,
                     hosted_task,
                     None,
-                    Some((Arc::clone(directory), intent.intent.operation)),
+                    Some(RegionPublication::Stage(Arc::clone(directory), intent.intent.operation)),
                     |current| {
                         if current.lifecycle != Lifecycle::Restoring
                             || current.checkpoint_stage.as_deref() != Some(intent)
@@ -206,9 +246,9 @@ pub async fn stage_checkpoint(
                                 "The target no longer admits this checkpoint stage",
                             ));
                         }
-                        Ok(())
+                        Ok(None)
                     },
-                    |target_io| {
+                    |_, _, target_io| {
                         copy_checkpoint(
                             archive, storage, keys, retained, point, manifest, archive_io,
                             target_io,
@@ -221,7 +261,7 @@ pub async fn stage_checkpoint(
     )
     .await?;
     let result = update_installation(directory.as_ref(), &target_id, |current| {
-        if let Some(prior) = staged(current, &intent.intent, &intent.media)? {
+        if let Some(prior) = staged(current, &intent.intent, &intent.media, transfer_only)? {
             if prior.staged_manifest_sha256.as_deref() == Some(staged_digest.as_str()) {
                 return Ok(());
             }
@@ -245,7 +285,7 @@ pub async fn stage_checkpoint(
         Ok(())
     })
     .await?;
-    staged(&result, &intent.intent, &intent.media)?
+    staged(&result, &intent.intent, &intent.media, transfer_only)?
         .ok_or_else(|| inconsistent("The stage lost its positive receipt"))
 }
 
@@ -253,13 +293,17 @@ fn staged(
     record: &DeploymentRecord,
     request: &CheckpointStageIntent,
     media: &CellMedia,
+    transfer_only: bool,
 ) -> Result<Option<CheckpointStage>> {
     let retained = record
         .checkpoint_stage
         .as_deref()
+        .or_else(|| record.checkpoint_transfer_activation.as_deref()
+            .map(|activation| &activation.replica.bootstrap.terminal.fence.destination))
         .filter(|stage| {
             &stage.intent == request
                 && &stage.media == media
+                && stage.transfer_only == transfer_only
                 && record.name == request.name
                 && record.org == request.org
         })
@@ -274,57 +318,77 @@ fn staged(
 
 /// Keep the archive key or target upload under its original directory
 /// inventory until all asynchronous storage operations have drained.
+pub(super) enum RegionPublication {
+    Stage(Arc<dyn Directory>, Uuid),
+    CheckpointTransfer(Arc<dyn Directory>, Uuid),
+    Capture(Arc<dyn Directory>),
+}
+
 pub(super) async fn with_region<T, F, Fut>(
     directory: &dyn Directory,
     keys: &dyn KeyService,
     deployment: &str,
     media: &CellStorage,
     hosted_task: Option<&HostedTask>,
-    capture: Option<Uuid>,
-    publication: Option<(Arc<dyn Directory>, Uuid)>,
-    admit: impl Fn(&DeploymentRecord) -> Result<()>,
+    archive: Option<(Uuid, Option<Uuid>)>,
+    publication: Option<RegionPublication>,
+    admit: impl Fn(&DeploymentRecord) -> Result<Option<i64>>,
     run: F,
 ) -> Result<T>
 where
-    F: FnOnce(Arc<IoRegion>) -> Fut,
+    F: FnOnce(DeploymentRecord, Uuid, Arc<IoRegion>) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
     let region = Uuid::new_v4();
+    let (capture, checkpoint_suffix) = archive.map_or((None, None), |(capture, suffix)| (Some(capture), suffix));
     let (state, witness) = match media {
         CellStorage::Local { .. } => (
-            rtdb_directory::StorageRegion::Local { archive: capture },
+            rtdb_directory::StorageRegion::Local { archive: capture, checkpoint_suffix, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, },
             keys.hold_local_storage_region(region)?,
         ),
         CellStorage::S3 { .. } => {
             let owner = hosted_task.cloned().ok_or_else(|| {
                 inconsistent("Remote checkpoint staging requires its installed ECS task")
             })?;
-            (remote_storage_region(capture, Some(owner)), None)
+            let mut state = remote_storage_region(capture, Some(owner));
+            if let rtdb_directory::StorageRegion::Remote { checkpoint_suffix: held_suffix, .. } = &mut state {
+                *held_suffix = checkpoint_suffix;
+            }
+            (state, None)
         }
     };
     let witnessed = witness.is_some();
     let mut io =
         IoRegion::new().child_holding(witness.map(|lock| Arc::new(lock) as Arc<dyn Send + Sync>));
     if matches!(media, CellStorage::S3 { .. }) {
-        if let Some((owner, operation)) = publication {
-            track_checkpoint_stage_publications(
-                &mut io,
-                owner,
-                deployment.to_owned(),
-                region,
-                operation,
-            );
+        match publication {
+            Some(RegionPublication::Stage(owner, operation)) => {
+                track_checkpoint_stage_publications(&mut io, owner, deployment.to_owned(), region, operation);
+            }
+            Some(RegionPublication::CheckpointTransfer(owner, operation)) => {
+                track_checkpoint_transfer_publications(&mut io, owner, deployment.to_owned(), region, operation);
+            }
+            Some(RegionPublication::Capture(owner)) => {
+                track_publications(&mut io, owner, deployment.to_owned(), region, None);
+            }
+            None => (),
         }
     }
     let admitted = update_installation(directory, deployment, |record| {
-        admit(record)?;
-        record.storage_regions.insert(region, state.clone());
+        let first_required = admit(record)?;
+        let mut state = state.clone();
+        if let rtdb_directory::StorageRegion::Local { checkpoint_replay_from, .. }
+            | rtdb_directory::StorageRegion::Remote { checkpoint_replay_from, .. } = &mut state
+        {
+            *checkpoint_replay_from = first_required;
+        }
+        record.storage_regions.insert(region, state);
         Ok(())
     })
     .await;
     let uncertain = admitted.is_err();
     let result = match admitted {
-        Ok(_) => run(io.clone()).await,
+        Ok(record) => run(record, region, io.clone()).await,
         Err(error) => Err(error),
     };
     io.close_and_wait().await;
@@ -372,19 +436,19 @@ async fn copy_checkpoint(
     for object in &capture.objects {
         let name = key(&object.name)?;
         let ciphertext = read_object(&source, &name, object).await?;
-        let plaintext = source_cipher.open(name.as_str(), &ciphertext)?;
-        let resealed = target_cipher.seal_deterministic(name.as_str(), &plaintext)?;
-        let staged = ArchivedObject {
-            name: object.name.clone(),
-            bytes: resealed.len() as u64,
-            sha256: digest(&resealed),
-        };
+        let plaintext = source_cipher.open_object(&name, &ciphertext)?;
+        let resealed = target_cipher.seal_object(&name, &plaintext)?;
+        let staged = ArchivedObject::from_sealed(&name, &resealed)?;
         put_exact(&destination, &name, resealed).await?;
         expected.insert(name);
         objects.push(staged);
     }
     // The final stage receipt binds the exact inventory under this root.
-    let inventory = encode(&objects)?;
+    let inventory = match capture.format {
+        CheckpointContents::Primary => StageInventory::Primary(objects),
+        CheckpointContents::Replay => StageInventory::Replay { objects },
+    };
+    let inventory = encode(&inventory)?;
     let digest = digest(&inventory);
     put_exact(&destination, &manifest_name, inventory).await?;
     let observed = destination
@@ -401,7 +465,7 @@ async fn copy_checkpoint(
     Ok(digest)
 }
 
-async fn put_exact(
+pub(super) async fn put_exact(
     store: &dyn ObjectStore,
     name: &rtdb_storage::ObjectKey,
     bytes: Bytes,

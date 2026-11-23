@@ -23,7 +23,7 @@ fn retains_within_bound(logical: LogicalType, values: Vec<Value>) {
 
 #[test]
 fn an_arrow_batch_charges_shared_buffer_capacity_once() {
-    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_array::{Array, ArrayRef, Int64Array};
     use arrow_schema::{DataType, Field};
 
     let shared = Int64Array::from_iter_values(0..8192);
@@ -36,6 +36,9 @@ fn an_arrow_batch_charges_shared_buffer_capacity_once() {
     assert_eq!(error.code, "rtdb/undersized-reservation");
     let batch = OwnedBatch::with_reservation(batch, memory.reserve(1 << 17).unwrap()).unwrap();
     let column = Arc::clone(batch.batch().column(100));
+    let slice = column.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(slice.values().as_ptr(), shared.values()[100..].as_ptr());
+    assert_eq!(slice.get_buffer_memory_size(), 32 * std::mem::size_of::<i64>());
     drop(batch);
     assert_eq!(memory.used_bytes(), 1 << 17);
     assert_eq!(column.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 100);

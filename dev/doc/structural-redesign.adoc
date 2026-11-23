@@ -1,0 +1,168 @@
+= RTDB structural redesign
+
+Six guarantees could not be closed in the inherited architecture.
+Three independent designs converged on the replacement below.
+This document is the target contract for the redesign increments.
+The second review's Multi serving and custody boundaries extend that design.
+
+== Owner decisions
+
+* A client-supplied system time may not lead the source log's append time (tolerance zero).
+* A view admitted before an erasure keeps its answers until the erasure deadline; afterwards a read that needs destroyed key material fails with `rtdb/erased-under-view`.
+  SNAP-1 and DUR-1 are amended accordingly.
+* An erasure reaches forks that retain shared custody of that history.
+  An independent export or archive is re-encrypted and governed by its own custody authority.
+* Transaction user metadata is retained only for the retry-receipt window, and is erasable with its unit before then.
+* XTDB wire, configuration and storage compatibility is not a constraint.
+
+== Coordinates
+
+History uses transaction system time, bounded by the log clock, and drives no physical decision.
+Reclamation uses a monotone catalog generation recorded by the residence ledger.
+Node-local monotonic durations only expire the holds of readers that stop renewing them.
+Receipt expiry uses the record's log time.
+Erasure starts at publication of the erasing generation and uses the custody authority's bounded grant clock.
+
+== Mechanisms
+
+[cols="1,3,2",options="header"]
+|===
+|Tension |Replacement |Deleted
+
+|System time as a physical clock
+|A client time is admitted only when it advances the head and does not exceed the log append time.
+An external source's commit time is clamped to the node clock.
+|Unbounded future client times and the resulting overflow cliff.
+
+|History retention and privacy erasure
+|History collection retires data below a cut protected by the residence ledger.
+Privacy erasure prepares readable successors, then publishes them and arms bounded key revocation within the affected custody domain.
+Recovery and compactor reset start from held recovery roots.
+|Permanent L0 retention, `reset_to_l0`, live recovery data sharing a destruction deadline without a successor.
+
+|Shared bytes and independently erasable custody
+|A publication has a unique key slot and a conditionally installed identity.
+Dependent forks retain scoped key grants.
+Independent exports own fresh keys.
+|Convergence based on independently generated ciphertext, copied keys in independent custody.
+
+|Volatile intake positions and durable transaction identity
+|An intake receipt names an epoch-qualified attempt.
+A checkpointed replica outcome binds the attempt to an applied causal basis.
+Placed clients redeem opaque receipts scoped to the authenticated principal and deployment history.
+Closing an epoch establishes negative outcomes only after the successor installs the recovered prefix.
+|Public reuse of volatile source offsets.
+
+|Directory leases, idle cost and fresh reads
+|The installed loglet confirms its writer epoch and supplies an on-demand read index.
+A fresh reader waits for that prefix to apply.
+|Directory authority over log serving, periodic freshness writes.
+
+|Search relevance and optional acceleration
+|Two-argument scores use only the document and query.
+Corpus-relative scores take the corpus statistics as arguments.
+|Scan-driven registration of SQL score parameters.
+
+|No reference authority
+|One linearizable residence ledger per database: the Multi directory record, or a conditional-write object in classic deployments.
+Readers hold a catalog generation by compare-and-swap before opening storage and renew while they read.
+The collector advances a floor below every live hold and recovery root and deletes only objects retired at or below it.
+|`garbage_lifetime`, the fixed read lease and its collector wait, the reaper grace and wall-clock release stamps, the unbounded in-process registry.
+
+|Positional names
+|A physical name is the positional key plus the catalog's naming epoch, persisted in each block; a compactor reset starts a new epoch.
+|The reset fence against running collection.
+
+|System state in user tables
+|An engine-owned receipt map keyed by database, principal and key, holding a body digest; the resolver answers a duplicate with the original outcome and a mismatched body with `rtdb/idempotency-conflict`.
+Receipts and transaction metadata expire by log time and are removed physically.
+|`public.rtdb_idempotency_keys` and its SQL guard.
+
+|Proofs versus composition
+|Each premise of a verified decision becomes a capability only its owner can construct: a held view for storage reads, a deletion grant for provider deletes, live key material for cached pages.
+One composed TLA+ model of the residence is checked against traces emitted at every linearization point.
+|Unchecked caller premises.
+|===
+
+== Increments
+
+Each remaining increment has a design and handoff note in link:../../verification/redesign/README.md[verification/redesign].
+
+[cols="1,3,1",options="header"]
+|===
+|# |Increment |Status
+
+|1
+|System-time bound and external clamp.
+|Landed
+
+|2
+|Engine-owned retry receipts with body digest and principal scope.
+|Landed; physical expiry follows increment 8
+
+|3
+|Epoch-qualified physical names; delete the reset fence.
+|Landed; an input digest is unnecessary while an epoch separates every reset
+
+|4
+|Residence ledger with holds and collection floor; delete the timer stack.
+|Multi and native local storage enforce a catalog admission floor and retry trie retirement from installed receipts.
+Remote classic storage, renewal, full recovery-root integration and timer removal remain open.
+
+|5
+|Recovery roots as holds; collectable L0; reset from a root.
+|Multi binds checkpoint metadata and startup suffix holds.
+Pending archive captures protect their journal interval until archive publication or expiry.
+Recovery can verify members of the same pack against a shared fresh provider observation.
+Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
+Enrolled terminal storage can retire loose files with a write witness and an installed release.
+Full recovery closures, compactor reset, terminal pack coverage and live provider qualification remain open.
+
+|6
+|Sealing and the key ledger for every durable unit.
+|Revised design
+
+|7
+|History collection and custody-scoped erasure with readable successors and `erased-under-view`.
+|Modeled after the second review
+
+|8
+|Transaction metadata retention.
+|Planned
+
+|9
+|Capabilities, the composed residence model and trace validation, extended as each increment lands.
+|Planned
+|===
+
+== Placed serving and search
+
+link:../../verification/redesign/authority-boundaries.md[Authority boundaries] specifies placed attempt receipts, read indexes, logkeeper safety and CDC acknowledgement.
+The placed serving model checks receipt and freshness transitions on an abstract committed replica prefix.
+Placed resolution stages a history-, epoch- and principal-scoped outcome witness in the transaction's replica frame.
+The checkpoint carries that witness into recovery.
+The SQL connection issues a provisional receipt for asynchronous submission and exchanges it for a causal token after verifying the installed outcome.
+Synchronous commits issue the causal token alongside the verified outcome.
+A frozen attachment can confirm a token from the verified checkpoint it loaded.
+Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
+An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.
+The gateway retries a subscriber refusal on the holder when the command is still unanswered and the backend reports an idle transaction state.
+The native scoring contract is specified in link:fts.allium[Full-text search].
+
+=== Ranked cutoff at ties
+
+The existing cutoff uses a strict score bound and keeps all ties at the boundary.
+This preserves SQL results but may require scanning most postings when many documents have equal scores.
+Document-local scoring also removes document length from the rank key, so term-frequency ties deserve explicit coverage.
+
+Extend early termination only where the planner can prove a complete SQL ordering key and the search file can supply a conservative bound for that key.
+The bound combines each window's upper score with its earliest possible secondary key under the SQL comparator, including direction, null ordering and collation.
+Resident and persisted candidates share that comparator.
+The native index must encode a usable secondary key for the admitted ordering; an IID's hash order can bound a SQL ID only where the representation preserves that order.
+A window with an equal or unknown bound remains eligible for examination.
+The rank proof must cover each unread window, including those whose score ties the last retained row.
+Tests compare an exhaustive scan with the pruned plan over tied scores, across partitions, and with offset and limit.
+
+The five-argument score uses the caller's corpus observations and the declared stored-length statistic.
+A corpus computed with an ordinary SQL aggregate pays for its selected rows.
+A future precomputed corpus would need an exact visibility and temporal scope before a query could reuse it.

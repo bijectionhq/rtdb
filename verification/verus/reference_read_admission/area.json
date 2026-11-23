@@ -1,0 +1,130 @@
+{
+  "summary": "Admission of a fork's provider read at the exact physical residence.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "ignore_fence": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "    open && same_residence && same_media\n",
+          "replace": "    same_residence && same_media\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "function": "may_admit_reference_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_fence_and_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "    open && same_residence && same_media\n",
+          "replace": "    same_residence && same_media\n"
+        },
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "ensures admitted <==> open && same_residence && same_media,",
+          "replace": "ensures admitted <==> same_residence && same_media,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reference_read_admission/laws.rs",
+          "function": "a_fenced_owner_rejects_even_an_exact_reference",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_residence": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "    open && same_residence && same_media\n",
+          "replace": "    open && same_media\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "function": "may_admit_reference_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_residence_and_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "    open && same_residence && same_media\n",
+          "replace": "    open && same_media\n"
+        },
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "ensures admitted <==> open && same_residence && same_media,",
+          "replace": "ensures admitted <==> open && same_media,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reference_read_admission/laws.rs",
+          "function": "a_reference_requires_the_physical_residence_and_namespace",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_media": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "    open && same_residence && same_media\n",
+          "replace": "    open && same_residence\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "function": "may_admit_reference_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_media_and_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "    open && same_residence && same_media\n",
+          "replace": "    open && same_residence\n"
+        },
+        {
+          "file": "rust/crates/multi/src/reference/custody/admission.rs",
+          "find": "ensures admitted <==> open && same_residence && same_media,",
+          "replace": "ensures admitted <==> open && same_residence,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reference_read_admission/laws.rs",
+          "function": "a_reference_requires_the_physical_residence_and_namespace",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

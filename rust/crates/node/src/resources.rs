@@ -15,6 +15,12 @@ use tokio_util::sync::CancellationToken;
 pub type ResourceDriver = BoxFuture<'static, Result<()>>;
 pub type TransactionClock = dyn Fn() -> Result<Timestamp> + Send + Sync;
 
+#[async_trait]
+pub trait ReplicaReadIndex: Send + Sync {
+    /// Bounds writes completed before the call on the replica log opened with this capability.
+    async fn confirm(&self) -> Result<rtdb_storage::log::LogOffset>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogAccess { ReadOnly, SourceWriter, ReadWrite }
 impl LogAccess {
@@ -27,6 +33,8 @@ pub struct OpenedLogs {
     pub replica: Arc<dyn Log>,
     pub source_epoch: StorageEpoch,
     pub replica_epoch: StorageEpoch,
+    pub replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
+    pub await_authority: crate::AwaitAuthority,
     pub drivers: Vec<ResourceDriver>,
 }
 
@@ -39,10 +47,23 @@ pub struct DatabaseResources {
     pub io: Arc<IoRegion>,
 }
 
+pub struct AudienceReadStorage {
+    pub source: uuid::Uuid,
+    pub store: Arc<dyn ObjectStore>,
+}
+
+pub struct OpenedServingStores {
+    pub ordinary: Arc<dyn ObjectStore>,
+    pub audience: Option<AudienceReadStorage>,
+}
+
 pub struct DatabaseStorage {
     pub store: Arc<dyn ObjectStore>,
+    pub audience_storage: Option<AudienceReadStorage>,
     /// How recovery finds the latest block: listing, unless the provider knows where to start.
     pub blocks: rtdb_replication::BlockDiscovery,
+    pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
+    pub fragment_storage: Option<Arc<str>>,
     pub storage_epoch: StorageEpoch,
     pub storage_version: StorageVersion,
     /// The caller drains this region if later database assembly fails.
@@ -56,17 +77,36 @@ pub trait LogFactory: Send + Sync {
     async fn open(&self, configuration: &Any, access: LogAccess, cancellation: CancellationToken) -> Result<OpenedLogs>;
 }
 
+pub struct OpenedRecoveryStore {
+    pub store: Arc<dyn ObjectStore>,
+    /// The same admitted storage, when all object reads can use existing custody and audience transport.
+    pub audience: Option<Arc<dyn ObjectStore>>,
+    pub blocks: rtdb_replication::BlockDiscovery,
+    /// Held through disk-cache and provider I/O for checkpoint discovery and load.
+    pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
+    /// Identity of the actual opened storage for delegated scans.
+    pub fragment_storage: Option<Arc<str>>,
+}
+
 #[async_trait]
 pub trait RemoteStorageFactory: Send + Sync {
     /// The returned store is scoped to `storage_root`, under the provider's configured prefix.
     /// Retained provider operations belong to the supplied database region, including after caller cancellation.
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>>;
+    /// Opens the store and chooses checkpoint discovery under the provider's admission rules.
+    async fn open_for_recovery(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<OpenedRecoveryStore> {
+        let store = self.open(configuration, storage_root, io).await?;
+        let blocks = self.block_discovery(configuration).await?;
+        Ok(OpenedRecoveryStore { store, audience: None, blocks, checkpoint_metadata: None, fragment_storage: None })
+    }
     /// A remote store normally uses a disk cache. An isolated read-only
     /// factory may opt out to avoid retaining an extra physical copy.
     fn use_disk_cache(&self) -> bool { true }
-    /// Wraps the store after the node's disk cache, so that whatever this adds (decryption, say) happens above the cache and the cache holds only what `open` returned.
-    async fn wrap_cached(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> { Ok(cached) }
-    /// Identifies the raw objects returned by `open` before `wrap_cached`.
+    /// Wraps the ordinary disk view and any audience view admitted by `open_for_recovery`.
+    async fn wrap_stores(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>, _audience: Option<Arc<dyn ObjectStore>>) -> Result<OpenedServingStores> {
+        Ok(OpenedServingStores { ordinary: cached, audience: None })
+    }
+    /// Identifies the raw objects returned by `open` before `wrap_stores`.
     /// Two configurations may share an identity when a matching immutable key has the same bytes in both.
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<Cow<'a, [u8]>> {
         Ok(Cow::Borrowed(&configuration.value))
@@ -244,14 +284,27 @@ impl ResourceFactory for NativeResources {
             let storage_epoch = StorageEpoch(epoch);
             let root = ObjectKey::new(StorageRoot::new(CURRENT_STORAGE_VERSION, storage_epoch)?.key())?;
             let mut blocks = rtdb_replication::BlockDiscovery::List;
+            let mut checkpoint_metadata = None;
+            let mut fragment_storage = None;
+            let mut audience_storage = None;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
-                Some(database_config::Storage::LocalStorage(storage)) => Arc::new(LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?).join(root.as_str()), Arc::clone(&io))?),
+                Some(database_config::Storage::LocalStorage(storage)) => {
+                    let store = LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?)
+                        .join(root.as_str()), Arc::clone(&io))?;
+                    let store = if let Some(database_config::Log::LocalLog(log)) = &configuration.log {
+                        store.with_catalog_ledger(StorageEpoch(log.epoch.unwrap_or_default()))
+                    } else { store };
+                    Arc::new(store)
+                }
                 Some(database_config::Storage::RemoteStorage(storage)) => {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
                     let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
-                    let remote = factory.open(configuration, &root, Arc::clone(&io)).await?;
-                    blocks = factory.block_discovery(configuration).await?;
+                    let opened = factory.open_for_recovery(configuration, &root, Arc::clone(&io)).await?;
+                    let remote = opened.store;
+                    blocks = opened.blocks;
+                    checkpoint_metadata = opened.checkpoint_metadata;
+                    fragment_storage = opened.fragment_storage;
                     let storage = if factory.use_disk_cache() {
                         let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
                         let identity = factory.cache_identity(configuration)?;
@@ -260,10 +313,12 @@ impl ResourceFactory for NativeResources {
                     } else {
                         remote
                     };
-                    factory.wrap_cached(configuration, storage).await?
+                    let opened = factory.wrap_stores(configuration, storage, opened.audience).await?;
+                    audience_storage = opened.audience;
+                    opened.ordinary
                 }
             };
-            Ok(DatabaseStorage { store, blocks, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
+            Ok(DatabaseStorage { store, audience_storage, blocks, checkpoint_metadata, fragment_storage, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened
@@ -279,14 +334,16 @@ impl ResourceFactory for NativeResources {
                     None => MemoryLog::new(self.maximum_log_message_bytes),
                 };
                 Ok(OpenedLogs { source: Arc::new(source), replica: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)),
-                    source_epoch: StorageEpoch(epoch), replica_epoch: StorageEpoch(epoch), drivers: Vec::new() })
+                    source_epoch: StorageEpoch(epoch), replica_epoch: StorageEpoch(epoch), replica_read_index: None,
+                    await_authority: crate::AwaitAuthority::SourcePosition, drivers: Vec::new() })
             }
             Some(database_config::Log::LocalLog(log)) => {
                 let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
                 let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io))?;
                 let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(io))?;
                 let epoch = StorageEpoch(log.epoch.unwrap_or(0));
-                Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, drivers: source_driver.into_iter().chain(replica_driver).collect() })
+                Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, await_authority: crate::AwaitAuthority::SourcePosition,
+                    drivers: source_driver.into_iter().chain(replica_driver).collect() })
             }
             Some(database_config::Log::OtherLog(log)) => self.log_factories.get(type_name(log)?).ok_or_else(|| invalid("Native log factory is unavailable"))?.open(log, access, log_cancellation).await,
         }

@@ -27,6 +27,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tempfile.workspace = true
+uuid.workspace = true
 tokio-rustls = "=0.26.6"
 
 [dev-dependencies]

@@ -13,7 +13,7 @@ fn unqualified_decimal_preserves_each_declared_union_leg_and_runtime_value() {
     let expression = Expr::Cast { expr: Box::new(Expr::Parameter { index: 0, data_type: source.clone() }), target: CastTarget::DecimalDefault };
     assert_eq!(expression.data_type(), source);
     for value in values {
-        assert_eq!(evaluate(&expression, &Schema::default(), &[], &EvalContext { parameters: &[value.clone()], ..Default::default() }).unwrap(), value);
+        assert_eq!(evaluate(&expression, &Schema::default(), &[], &EvalContext { parameters: rtdb_expr::Parameters::Values(&[value.clone()]), ..Default::default() }).unwrap(), value);
     }
 }
 

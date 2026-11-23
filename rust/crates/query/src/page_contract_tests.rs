@@ -293,3 +293,54 @@ async fn limit_cannot_hide_a_filter_error_in_a_later_aggregate_result_group() {
     assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
     drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
+
+#[tokio::test]
+async fn evaluated_values_feed_the_batch_executor_as_arrow() {
+    let execution = execution(2);
+    let rows = [1, 3].map(|value| vec![Expr::binary(
+        rtdb_plan::BinaryOp::Add, Expr::Literal(Value::I64(value)), Expr::Literal(Value::I64(1)),
+    )]);
+    let relation = Arc::new(Relation::new(schema(), RelationNode::Values { rows: rows.into() }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut batches = build_columns(runtime, execution).await.unwrap().unwrap();
+    let batch = batches.next_batch().await.unwrap().unwrap();
+    let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else {
+        panic!("expected computed Arrow column");
+    };
+    let values = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+    assert_eq!(values.values().as_ref(), [2, 4]);
+}
+
+#[tokio::test]
+async fn unnesting_a_computed_list_keeps_parent_payloads_in_arrow() {
+    let execution = execution(128);
+    let input = table(&[2, 3]);
+    let parent = input.schema().fields()[0].expression();
+    let element = Field { id: ColumnId(1), name: "element".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+    let ordinal = Field { id: ColumnId(2), name: "ordinal".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I32) };
+    let expr = Expr::List(vec![parent, Expr::Literal(Value::I64(9))]);
+    let schema = Schema::new(vec![input.schema().fields()[0].clone(), element.clone(), ordinal.clone()]).unwrap();
+    let relation = Arc::new(Relation::new(schema, RelationNode::Unnest { input, expr, element, ordinality: Some(ordinal), outer: false }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut batches = build_columns(runtime, execution).await.unwrap().unwrap();
+    let batch = batches.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.len, 4);
+    assert!(!matches!(batch.columns[0], crate::columnar::Column::Values(_)));
+    assert_eq!(batch.columns[1].value(2).unwrap(), Value::I64(3));
+    assert_eq!(batch.columns[2].value(3).unwrap(), Value::I32(2));
+}
+
+#[tokio::test]
+async fn batch_analysis_counts_arrow_rows() {
+    let mut execution = execution(128);
+    let relation = table(&[2, 3, 5]);
+    let analysis = crate::analysis::AnalysisNode::new(&relation, &execution.context).unwrap();
+    execution.analysis = Some(Arc::clone(&analysis));
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut batches = build_columns(runtime, execution).await.unwrap().unwrap();
+    assert_eq!(batches.next_batch().await.unwrap().unwrap().len, 3);
+    assert!(batches.next_batch().await.unwrap().is_none());
+    let summary = analysis.rows(0).unwrap();
+    assert_eq!(summary[0][6], Value::I64(1));
+    assert_eq!(summary[0][7], Value::I64(3));
+}

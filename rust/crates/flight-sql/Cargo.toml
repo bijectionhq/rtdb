@@ -14,6 +14,7 @@ rtdb-query.workspace = true
 rtdb-expr.workspace = true
 rtdb-sql.workspace = true
 rtdb-node.workspace = true
+rtdb-storage.workspace = true
 rtdb-auth.workspace = true
 rtdb-tx.workspace = true
 arrow-array.workspace = true

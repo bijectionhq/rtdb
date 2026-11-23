@@ -4,7 +4,20 @@
 ADBC Flight SQL drivers use the same `rtdb-node` sessions, SQL preparation, query cursors, transaction resolver, and authentication as the PostgreSQL frontend.
 The source and regression cases remain uncompiled and unexecuted during Phase 1.
 Schema descriptions retain the supplied physical parameter fields, while query execution opens their signed vector view.
-Retained parameter IPC remains lossless, and bulk ingestion admits cells before constructing logical documents.
+Retained parameter IPC remains lossless.
+Prepared updates retain uploaded Arrow parameter batches through transaction buffering and encoding when the batch layouts agree.
+Separate uploads of the same statement can have different schemas when they are coalesced in a transaction.
+The source encoder aligns compatible argument vectors by position in Arrow and preserves the order of the argument rows.
+Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
+This includes lists, fixed-size lists and structs with compatible child fields.
+When a struct gains fields between compatible Arrow uploads, source encoding joins those fields in Arrow, including structs inside lists.
+Arrow batches targeting the same table can share a source-log document layout when their common columns agree and other columns are absent.
+When the same transaction also contains compatible row-backed puts for that table, source encoding builds vectors from those rows and combines them with the uploaded vectors in transaction order.
+Columns with compatible union legs share a dense union when their scalar types or nested container kinds differ between batches.
+Null and missing values use the union's null leg.
+Uploads can gather multiple tags for the same value layout into one Arrow child, including signed execution aliases.
+When a union with one value layout is normalized, the typed Arrow array's validity represents null entries.
+The typed document writer handles layouts that require cell conversion.
 
 == Composition and ownership
 
@@ -21,6 +34,8 @@ The driver also waits for the admitted-call monitor to reach zero before reporti
 
 Service methods and response streams are passive caller-owned work.
 The stream advertises the prepared result schema and conforms runtime pages through the passive `rtdb-columnar::DeclaredBatch` adapter.
+Columns that already match their declared field retain their Arrow buffers when the adapter conforms the rest of the page.
+Compatible nested field ordering and dense union identifiers can change while retaining the source value buffers.
 This follows the pinned Flight producer's ADBC `ArrowReader`, including NULL endpoint vectors under advertised timestamp fields.
 The encoder checks the complete declared schema before encoding physical buffers, including signed decimal precision and scale metadata.
 Schema and record-node regression sources remain unexecuted.
@@ -74,6 +89,8 @@ A Direct parser admission failure after eligibility returns its resource error, 
 Paired Flight SQL diagnostic execution remains pending.
 DoGet revalidates the redeeming session, waits its visibility barrier, then opens the captured basis through `NativeSession::query_context_at`.
 A ticket remains usable by a different authorized caller.
+Flight SQL opens a columnar query cursor where the operators can provide Arrow batches.
+An index-covered ordered point read streams typed results from the posting leaves under the ticket's captured basis.
 Query streams retain their cursor, connection, session lease, cancellation scope, and Arrow allocation owners through completion or cancellation.
 
 GetFlightInfo issues DML and SET once.
@@ -83,6 +100,15 @@ SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; tra
 Prepared handles are re-prepared against the current execution context on each use.
 Their parameter metadata uses positional unnamed nullable fields, and the source's field-4 `is_update` extension is retained.
 Prepared query binding retains the first Arrow batch.
+Flight SQL derives the result schema from the bound Arrow fields and encodes the batch when issuing a query ticket.
+Ticket redemption validates the argument batch and reads the first parameter row when opening the query.
+A pure projection of compatible bound parameters stays in Arrow.
+Compatible nested lists, fixed-size lists, and structs are projected as Arrow columns.
+Supported addition, subtraction, and multiplication read integer and floating-point arguments through the query engine's Arrow projection kernel.
+Supported division, comparisons, casts, and text functions read their parameters through the vector expression evaluator.
+For a batch with multiple rows, it copies the selected first row without retaining the rest of the batch.
+It reuses compatible buffers and normalizes Boolean padding and masked cells when copying is needed.
+An update submitted through `GetFlightInfo` passes the bound batch to the transaction path as Arrow arguments.
 Prepared update binding accumulates all Arrow batches by column position.
 Zero columns mean an unbound execution; columns with zero rows preserve an empty execution batch.
 
@@ -146,3 +172,731 @@ An empty message remains empty.
 Bounded anomaly metadata and custom commit-result errors omit an absent message field.
 Authentication uses its separate policy: faults hide their message, unsupported errors have no description when absent, and other absent messages use `authentication failed`.
 Raw host failures still require their source-specific conversion before entering these anomaly adapters.
+
+== Native owned relations
+
+`flightSql.ownedNativeActions: true` enables the owned-relation actions for a compatible installation.
+Both actions use the authenticated Flight session on an idle autocommit connection and require database write access.
+An embedded server enables `FlightConfig::owned_native_actions` and `NodeOptions::owned_relations`.
+
+Send `rtdb.owned.Create.v1`, `rtdb.owned.ReadPoint.v1`, or `rtdb.owned.Commit.v1` as the Flight `Action.type`.
+The body contains a big-endian unsigned 16-bit relation-name length, the logical relation name as ASCII bytes, and one terminated Arrow IPC stream containing exactly one nonempty record batch.
+The relation name contains 1–96 lowercase ASCII letters, digits, hyphens or underscores.
+The create batch contains unique column names, an `_id` column, and the document fields.
+Nullable `_valid_from` and `_valid_to` timestamp fields can supply row validity bounds.
+The point batch contains just one non-null `_id` cell.
+The connection's authenticated principal and attached database select the owned storage namespace.
+
+Success returns one Flight `Result` whose body is a terminated Arrow IPC stream.
+Create success contains one row with non-null signed 64-bit `tx_id` and `system_time_micros` fields.
+Point success contains the document columns and at most one row.
+Every point response Arrow schema contains `rtdb.owned.present_micros` as a signed decimal microsecond timestamp assigned by the store.
+A point result with no rows contains the schema and terminator, with zero record batches.
+An unknown relation uses a zero-field schema, and a missing entity in an existing relation uses its current schema.
+The Flight limit applies to the complete encoded Action and Result protobuf messages, with a default of 64 MiB.
+Failures use the Flight gRPC status and the existing anomaly metadata.
+
+Use `x-xtdb-database` for the initial Multi gateway connection and retain the resulting session cookie or bearer token.
+The gateway forwards these actions to the session's attached holder and fences that route at holder movement.
+A new holder requires a new authenticated session.
+A disconnected create has an unknown outcome and is not automatically retried.
+
+`rtdb.owned.Commit.v1` inserts an exclusive signed 64-bit big-endian Unix microsecond deadline between the relation name and Arrow IPC stream.
+The batch contains `_id` and a non-null Utf8 `_op` column with `create`, `replace`, `delete`, or `check`.
+Create and replace accept document fields.
+Delete accepts an identity and optional validity bounds, with null values for other document columns.
+Check accepts an identity and an observation, with null mutation bounds and document values.
+Create, replace, and delete apply in batch order in one atomic transaction.
+
+A nullable `_read_valid_micros: Int64` specifies the point to revalidate before mutation.
+A null `_read_system_micros: Int64` at that point asserts absence, and a non-null value asserts the exact previously observed winning revision.
+A mutation without a valid instant carries no observation.
+The point reply includes `rtdb.owned.valid_micros` for the observed instant and includes `rtdb.owned.revision_micros` when a row is present.
+These metadata values are signed decimal microseconds.
+A successful commit reply has the same schema as the create reply.
+An expired deadline or stale observation aborts the entire transaction before mutations apply.
+
+`rtdb.owned.Commit.v2` applies the same row schema and reply format to multiple relations in one transaction.
+Its body starts with one exclusive signed 64-bit big-endian microsecond deadline and an unsigned 16-bit big-endian group count.
+Each group is an unsigned 16-bit big-endian relation-name length, the ASCII relation name, an unsigned 32-bit big-endian IPC length, and exactly that many bytes of a terminated IPC stream.
+Each group contains one nonempty batch.
+Use up to 32 distinct relations and at most 4096 rows across the request.
+With zero groups, the action validates only the deadline and returns its ordered transaction key.
+The body ends immediately after the declared groups, or after the count when it is zero.
+All observations are checked against the same ordered state before any mutation applies.
+Mutations apply in group order and then row order, using the authenticated session's principal and database.
+
+Owned events carry their complete typed key. Its IID identifies the physical locality bucket.
+The complete key separates identities within a shared bucket and governs lookups, writes and erasure.
+
+=== Declaring a private relation schema
+
+Send `rtdb.owned.DeclareRelation.v1` with the relation prefix followed by a UTF-8 JSON object of at most 64 KiB.
+The object has one `fields` array with up to 128 distinct entries and an optional `validity` policy.
+Each entry has `name`, `type`, `optional`, and `nullable`, for example `{"name":"amount","type":{"kind":"i64"},"optional":false,"nullable":false}`.
+Field names are nonempty UTF-8 strings of at most 128 bytes, without control characters or a leading underscore.
+Supported scalar kinds are `bool`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f16`, `f32`, `f64`, `utf8`, `binary`, `date_day`, `instant`, `uuid`, and `decimal`.
+An `instant` is a zoned microsecond timestamp.
+A `decimal` type also declares `precision`, `scale`, and `bitWidth` (128 or 256).
+A declaration is accepted before the relation has stored data or another declaration.
+The result has the create reply schema.
+
+For a declared relation, create and replace enforce the field types at the ordering cut.
+A field may be omitted only when optional, and an explicit null requires nullable.
+A nullable Arrow column can carry both states across rows by including optional `_absent: List<Utf8>` with the names of that row's omitted payload cells.
+Each listed cell must be null or undefined in the incoming batch.
+Unknown payload fields are refused.
+The `explicit` validity policy is the default and accepts supported mutation validity metadata.
+The `acceptance` policy begins every Root put or delete at its ordered system time with an open valid end and rejects explicit endpoints.
+The `bounded_period` policy requires two finite, strictly ordered mutation endpoints on each Root assertion or retraction.
+An ordered transaction may affect one period per complete key. Separate ordered replacements may overlap at the same key, with the latest accepted assertion winning at each valid instant.
+Use the same complete entity key across periods and pass the requested valid instant to the held point action.
+World mutation and acceptance-only unique occupancy remain unavailable for this policy.
+Relations without a declaration continue to infer their schema.
+
+=== Holding one owned read cut
+
+Use `rtdb.owned.OpenRead.v2` with an empty body to reserve one present and retain its exact applied catalog.
+The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
+`rtdb.owned.OpenAppliedRead.v4` requests an already-applied hosted catalog from the current recovered holder.
+Its input is the 16-byte source installation UUID, a one-byte count from one to four, and that many exact transaction keys.
+Each key is a signed big-endian i64 transaction ID followed by a signed big-endian i64 ordered microsecond time.
+The final field is a big-endian u64 generation. Use zero outside a reserved audience session.
+Its result uses the same held handle and cut format.
+The selected transaction must equal or advance both coordinates of each supplied transaction in the same history.
+The node pins the exact installed storage catalog in the serving residence, confirms the recovered holder's source identity and checks the supplied transactions in that catalog.
+An inexact floor, foreign history, or a cut that cannot be retained is refused without waiting for a new log position.
+The handle admits held point, historical point and hosted control reads and applied confirmation.
+This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
+
+On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v18` on the audience gateway during its handshake.
+The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
+The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
+The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
+Before serving, the holder reserves 16 MiB of execution memory and 16 MiB of cache memory per permit. Both reservations are deducted before the ordinary allocation splits between cache and execution. It refuses startup if the node cannot fund both pools.
+Each session uses its own buffer pool on the audience cache budget from initial preparation through applied confirmation.
+Audience queries use local scans. The holder requires an uncached view of the live writer's exact S3 storage attachment for the installed source.
+That view shares the attachment's object mapping, custody and serving key and bypasses the ordinary SSD cache and its fill queue.
+Provider object reads use a distinct S3 HTTP client and credential cache, including when retained I/O outlives its caller.
+The configured source and its attached archive open that client with their own credential provider. A remote store without the client refuses the scoped read.
+Whole objects read into the buffer pool must match the reserved length. The pool funds the retained bytes and the temporary ciphertext and archive buffers before fetching the body.
+The reservations remain held while admitted provider work drains after cancellation. The read view requires a whole-object or scan-range reservation for every body.
+Native trie data uses 64 KiB plaintext frames. A point scan can read its footer and pages without decrypting the rest of the file. The object header authenticates the length and content identity, and every selected frame authenticates its key, identity and position.
+Retained archives bind the encrypted frame header in their manifest and authenticate only the requested frames before resealing them for the serving key. Native trie data and retained archives must be written in this format.
+Each audience action has cumulative ceilings of 256 object-store requests, 32 MiB of requested object bodies, 65,536 scan items and 64 MiB in decoding bounds.
+The holder charges these before the counted work. Admitted provider tasks retain the allowance and the call and session permits until their work drains. Listings, unbounded body reads and the ordinary object transport are unavailable during the action.
+Live trie scans locate rows under the audience execution budget without consulting the ordinary leaf caches.
+The holder refuses the handshake if the opened residence needs per-read registration for a legacy object reference or serves a retained archive from a local volume. An admitted S3 archive uses the custody hold acquired when the attachment opened.
+The installed source holder loads pack locations before accepting a session. Its own block publications register their locations before the catalog can be captured. A scheduled object lookup never searches for more packs or adopts a relocated pack.
+Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
+A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
+The audience handshake and subsequent actions use the reserved admission.
+The gateway resolves the placement at handshake, then forwards authenticated session actions to the sealed holder address.
+For each audience data action the holder reads the live member and current deployment over a DynamoDB client with its own credential provider.
+It checks the writer epoch, recovered checkpoint and exact attached database. A holder whose directory cannot install an audience read transport refuses audience startup.
+Applied acquisition and confirmation also check journal leadership on the holder's configured `--audience-journal-port`.
+Each logkeeper serves this port with `--audience-authority UUID/TURNS` and `--audience-authority-listen ADDR`.
+The connection and frame sizes are bounded. Each success confirms the exact journal, replica stream, active ensemble and durable writer epoch.
+A pending fence change refuses immediately until it is durable. Ordinary append and history-read queues do not carry these authority checks.
+Closing a local hold or session only releases resources. The directory, journal quorum, network, object storage, and scheduler still have service obligations.
+
+Before its first open, a reserved session must call `rtdb.owned.PrepareAppliedRead.v1`. The body is the same source and exact transaction floor as an applied open, without the generation. The action returns an empty stream after registering the captured catalog in the directory.
+The registration is session-bound and expires after 180 monotonic seconds. A read or confirmation shares it only for a catalog at or after the registered cut in the same attachment, storage version, storage epoch and replica epoch.
+An older registration keeps the retirement floor from passing this cut. In-flight snapshots keep their own references until reads and provider I/O drain.
+A changed or expired preparation requires a new session. Opening and confirming a hold never falls back to a new registration on a reserved session.
+Holder confirmation, exact transaction checks, and session generations still apply to each acquired cut.
+
+The reservation admits preparation, applied open and confirmation, held point and historical point reads, hosted control reads, and closure of the hold or session.
+The gateway routes only action RPCs on a reserved session.
+
+`rtdb.owned.ConfirmAppliedHosted.v5` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
+The point option is one zero byte for a control-only read or one byte of value one followed by the ordinary relation prefix, a big-endian u16 UTF-8 key length and key, and a signed big-endian i64 valid instant in microseconds.
+An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision.
+The original handle must come from `rtdb.owned.OpenAppliedRead.v4`.
+Every control must be a check from the placed attachment's installed allowlist.
+The point must be an ordinary Root point at the original held valid instant.
+The node proves the supplied floor and the original transaction on one newly pinned applied catalog.
+It checks the supplied control and point revisions and absences on the original and newly pinned catalogs.
+Success returns the newly captured transaction ID and time as two signed big-endian i64 values.
+A changed control or point returns one zero byte.
+The node refuses unproven cuts and checks the physical clock again before returning.
+This action appends no transaction and authorizes no write.
+
+Governed data pages carry a complete typed `_entity_key` on put, delete, and erase events. A native point seeks the canonical IID bucket and resolves only its exact key.
+Older governed pages without the key require a reset. Compaction resolves each complete key independently inside an IID bucket. Covered search and ordered paths use complete identities.
+
+Send `rtdb.owned.ReadHeldPoint.v1` with those 16 handle bytes followed by the ordinary ReadPoint action body.
+The Arrow response uses the held present and valid instant on every call, including missing rows.
+`rtdb.owned.ReadHeldPoint.v2` uses the same framing with exactly one Arrow row and two columns, `_id` and `valid_micros: Int64?`.
+A null `valid_micros` uses the held default. Otherwise it selects one business-valid microsecond within the original held system cut.
+`rtdb.owned.valid_micros` echoes the selected instant even when the row is absent, and `rtdb.owned.present_micros` stays at the held present.
+
+`rtdb.owned.ReadHeldHistoricalPoint.v1` inserts an eight-byte big-endian signed system time in microseconds immediately after the held handle, before the relation prefix.
+It uses the same point key, with null `valid_micros` selecting the requested system time on the valid axis.
+The relation's journal must cover the system time at or before the held cut.
+The point reply carries that requested system time in `rtdb.owned.present_micros`.
+
+`rtdb.owned.ReadHeldPositionPoint.v1` adds an eight-byte signed masked commit time and a four-byte unsigned first masked position, both big-endian, between the system time and the relation prefix.
+It requires an explicit valid instant on an admitted clear Root relation with retained history and no lifetime.
+The resolver omits puts and deletes at or after the specified position in the selected commit while resolving the point at the requested system cut.
+Position zero masks all assertions in the selected commit.
+Erasure fences and erase events apply to the masked read.
+The point response has the same coordinates as the unmasked historical point.
+
+Send `rtdb.owned.CloseRead.v1` with only the 16 handle bytes to release it.
+Close success has zero Flight results.
+
+Handles bind to their authenticated Flight session and database attachment.
+Each node holds at most 64 handles.
+A handle expires after at most 60 seconds or if its storage lease or holder is lost.
+A concurrent commit that prevents capture of the exact reserved head refuses the open with `rtdb.owned/capture-raced`.
+After holder movement or lease loss, open a new authenticated session and start a new attempt.
+The held read uses the serving node's retained catalog and does not survive a process restart.
+
+`rtdb.owned.DeclarePath.v1` uses the relation prefix and a terminated Arrow IPC stream with exactly one row.
+Its two columns are `_id: Utf8` for the path name and `columns: List<Utf8>` for the ordered key columns.
+The key consists of distinct stored columns and ends with `_id`.
+The relation must already exist in the authenticated owner's namespace.
+A successful declaration returns the same transaction-key Arrow row as Create.
+Ordered and search path declarations can be repeated with the same complete name, owner relation and columns.
+Ordered index layout 7 stores complete typed handles in postings, correction rows and their fences.
+Rebuild older ordered index artefacts before using covered paths under this layout.
+The declaration is immutable and private to the owner's index catalog.
+Index maintenance builds the generation after declaration.
+
+`rtdb.owned.ReadHeldRange.v1` uses the 16-byte held handle, a relation prefix, and a terminated Arrow IPC stream with one row.
+The row contains `path: Utf8`, the nullable typed `lower` and `upper` key cells, and `limit: Int64` between 1 and 128.
+Bounds address the leading path key, with an inclusive lower endpoint and an exclusive upper endpoint.
+A null endpoint leaves that side open.
+Results contain the covered path columns in ascending path order at the held present and valid instant.
+A missing declaration, missing generation, uncovered source frontier, unflushed data, or unsupported covering projection returns an explicit refusal.
+The service does not fall back to a primary or SQL scan.
+
+`rtdb.owned.ReadHeldRange.v2` uses the same handle and relation framing with one Arrow batch containing one row.
+Its fields are `path: Utf8`, `lower: Struct?`, `upper: Struct?`, `after: Struct?`, `descending: Bool`, and `limit: Int64` between 1 and 128.
+Each non-null endpoint contains every declared path column by name, including the full `_id` value.
+A null endpoint is open. Lower is inclusive and upper is exclusive in ascending path order for either direction.
+The exclusive `after` endpoint advances in the requested direction.
+For the next page, use the last returned row as `after` with the same held handle, path, bounds, and direction.
+The response uses the same covering schema and held time metadata as v1, with no record batch when the page is empty.
+
+A covered v2 page on a placed attachment with a live catalogue lease also returns `rtdb.owned.range_witness`, an opaque 32-digit hexadecimal nonce in the response schema.
+A covered empty page can carry a witness.
+Each held handle issues one nonce per observed relation, up to 32 relations.
+`rtdb.owned.Commit.v3` prefixes an unchanged Commit.v2 body with an unsigned 16-bit big-endian witness count (1–32), then that many pairs of 16 raw held-handle bytes and 16 raw nonce bytes.
+The commit reply is unchanged.
+`rtdb.owned.Commit.v4` uses the same framing and accepts zero through 32 witnesses.
+It adds the `erase` mutation for an exact root identity.
+An erase row accepts the typed `_id` and an optional point observation, with no validity endpoints or non-null payload values.
+The resolver refuses erase on a relation with a governed ordered, search, or unique path or a prefix-capacity rule and refuses any other mutation of the same identity in the same commit.
+Erase adds an all-history event and a distinct `erase` change entry at the ordered cut.
+It revokes reads at older cuts for the erased relation and refuses historical point and archived fallback reads preceding the identity's erase.
+Each identity's historical floor is keyed by its full typed handle inside an independently covered purge bucket.
+Colliding locators cannot advance each other's floors.
+Installations with owner-wide markers or per-relation erase markers without complete floor coverage require a reset before historical point reads or another erase in the affected scope.
+The receipt acknowledges ordered erasure. Disposal of backing objects and keys has its own lifecycle.
+Both values belong to the same authenticated session, database, and placed writer epoch.
+The handle must still admit reads when submitted, and the witness's exclusive ordering deadline may be earlier than the request deadline.
+The resolver compares the witnessed relation's complete event frontier at ordering before applying any mutations.
+Any intervening event on that owner relation invalidates the witness, including events outside the observed key span or valid instant.
+Events on other relations or owners do not invalidate it.
+Count replies carry no range witness.
+
+`rtdb.owned.CommitOrdered.v1` uses the same witness prefix with zero through 32 witnesses and the same deadline and Arrow entry framing.
+It preserves the order of relation runs, and the same relation may appear in multiple runs.
+The commit admits up to 4096 entries across at most 32 distinct relations.
+A check-only request can have zero groups, and this action accepts point and range checks with the ordinary root mutations.
+
+`rtdb.owned.CountHeldRange.v1` uses the same handle and relation framing with one terminated Arrow IPC batch containing one row.
+Its fields are `path: Utf8`, `lower: Struct?`, `upper: Struct?`, and `valid_micros: Int64`.
+Bounds are complete path keys with an inclusive lower endpoint, an exclusive upper endpoint and null for an open side.
+The result contains one non-null `count: UInt64` at the held system present and the requested signed microsecond business-valid instant.
+The result schema carries `rtdb.owned.present_micros` and `rtdb.owned.valid_micros`.
+The count requires the same complete generation as a covered range and uses subtree cardinalities without a scan fallback.
+
+`rtdb.owned.DeclareSearchPath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
+Its fields are `_id: Utf8` for the path name and `column: Utf8` for the stored clear-text column.
+The relation must already exist in the authenticated owner's namespace, and the column must contain only text or null.
+The FTS maintenance lane uses the private declaration to build the relation's search files.
+A successful declaration returns the same transaction-key Arrow row as Create.
+
+`rtdb.owned.SearchHeld.v5` takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, then a big-endian u32 overlay byte length and the optional Arrow overlay bytes.
+Next comes a big-endian u16 partition count (1 to 32), then a relation prefix and a path prefix per partition.
+A big-endian u32 offset (0 to 4096), u16 limit (1 to 128), and evidence flag byte (0 or 1) follow, then the UTF-8 query (up to 4096 bytes).
+The reply contains `_id` as a typed union of string, keyword, signed Int64 and UUID, `score: Float64`, and `partition: UInt64` as the zero-based request ordinal.
+Results sort by descending BM25 score across the full selected corpus, then by complete typed identity and partition ordinal.
+The held present and valid instant are in schema metadata, alongside `rtdb.owned.search_total` (the decimal count of all verified matches before slicing) and `rtdb.owned.search_scope` (the lowercase hex SHA-256 of the held handle, valid coordinate, overlay, ordered relation/path frame, and query under the v5 domain tag). The scope binds pages only within the same hold. An empty result has a schema and no record batch.
+Every selected partition must have complete format 11 search artefacts at the held cut. Corpus membership and cross-file temporal cuts use the complete canonical typed identity. Each matched posting nominates a physical row, which must have that same identity and winning revision at the held cut.
+A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as the concatenated lowercase hex of one 16-byte range nonce per partition in request order. This also covers a successful empty result.
+An overlay requires the configured placed hosted-control owner, the live Root validity and requested evidence. One Arrow batch carries `partition: UInt64`, `_id: Utf8`, and nullable `text: Utf8` for one to 64 exact staged shadows. Null text masks the old run. The whole-relation witnesses still describe the original source.
+
+`rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
+Its fields are `_id: Utf8` for the path name and `column: Utf8` for the canonical Binary key column.
+Declare up to 16 immutable named unique paths per owned relation before writing relation data. An exact retry of the declaration keeps its original definition. An existing empty typed relation must declare the key as Binary.
+On this relation the final state of each owned commit must give each live row a nonempty Binary key of at most 4096 bytes.
+Mutations use validity from their ordered present to infinity.
+The ordered resolver applies releases and claims as a group, so a commit may swap keys. Conflicts do not return the occupant or the key.
+A successful declaration returns the same transaction-key Arrow row as Create.
+
+`rtdb.owned.ReadHeldUnique.v1` takes the original 16-byte held read handle,
+the owned relation prefix, the declared unique path prefix, and one terminated
+Arrow IPC batch with exactly one row `key: Binary`, `valid_micros: Int64`.
+The valid instant must equal the held system instant because unique occupancy
+covers ordered-present membership. The relation's private declaration records
+its covered event frontier with the occupancy changes in the same transaction.
+A missing declaration or a frontier mismatch refuses the lookup.
+
+A successful reply begins with one 16-byte range witness nonce followed by the
+ordinary point IPC response. There is one full fact row for a unique hit,
+or no rows for a covered absence. The resolver revalidates this relation
+witness in the same way as other held range evidence. The complete occupancy
+identity, holder identity, and holder's declared key must all agree.
+
+=== Reading valid history at a held cut
+
+`rtdb.owned.ReadHeldValidDuring.v2` takes a 16-byte held handle, the relation prefix, and one terminated Arrow IPC stream.
+The stream contains one batch with one row and fields `_id`, `system_micros: Int64`, `valid_from_micros: Int64`, and `valid_to_micros: Int64`.
+The system cut and both valid endpoints must be non-null, with the valid start strictly before the valid end.
+One result contains a schema and zero or more record batches of the winning facts in ascending valid-time order.
+The `_valid_from` and `_valid_to` timestamps clip each slice to the request. A null `_valid_to` represents an unbounded end.
+Each row includes `_system_from`, the winning revision. Gaps and tombstones have no row.
+Schema metadata reports `rtdb.owned.present_micros`, `rtdb.owned.valid_from_micros`, and `rtdb.owned.valid_to_micros`.
+The returned present metadata identifies the system cut used for the read. A fresh hold can use its own cut or an earlier certified cut. A derived hold uses its selected cut and declared relations. Reads refuse more than 4096 slices or an oversized Flight result.
+
+`rtdb.owned.ReadHeldPositionValidDuring.v1` adds a signed big-endian 64-bit commit timestamp and an unsigned big-endian 32-bit first masked assertion position immediately after the held handle.
+It returns the same valid slices with that commit's assertions at and after the supplied position removed from resolution.
+Reads require a retained clear Root data relation and respect ordered erasure.
+They issue no commit witness.
+
+On placed writer sessions with retained leases, a fully completed valid window at the held head carries the same optional `rtdb.owned.range_witness` nonce as covered ranges, including a proven empty window.
+A fully covered held count also carries that nonce, including zero counts.
+The nonce depends on the entire relation's frontier at the held cut and retains the original session, placement and expiry.
+
+`rtdb.owned.ReadHeldVersions.v2` uses the held handle and relation prefix followed by one Arrow batch and one row.
+The request fields are `_id`, `system_from_micros: Int64`, `system_to_micros: Int64`, `after_revision: Int64`, `scan_limit: Int64`, `result_limit: Int64`, and `descending: Boolean`.
+Use a half-open system window at or before the held cut and zero for the initial journal revision. A derived hold admits only its declared relations and ends at its selected cut.
+The scan limit is 1–128 source groups. The result limit is 1 to the scan limit.
+The first result contains the last scanned revision as big-endian u64, a completion byte of 0 or 1, the floor in signed big-endian Unix microseconds, and the scanned group count as big-endian u16.
+The floor is the minimum i64 when coverage starts with an empty relation or the requested interval is empty.
+A placed head read may append a 16-byte relation witness after the full response renders.
+An incomplete page may have no matching versions. Continue from its last scanned revision with the same handle, window and direction.
+Each additional result is one Arrow stream containing the full winning valid timeline for one source group that touched the complete typed identity.
+A complete deletion still returns a version stream with schema and no record batch. Clients fill gaps from the explicit valid boundaries.
+Schema metadata includes `rtdb.owned.version_revision` and `rtdb.owned.version_micros` alongside the held present and full valid window.
+Requests before the certified floor refuse and report `history-floor-micros` in the anomaly context.
+Coverage or response-size failures refuse the page.
+
+`rtdb.owned.ReadHeldIdentityPage.v1` takes the 16-byte held handle, the relation prefix, and one terminated Arrow stream with one row.
+The fields are `system_micros: Int64`, `valid_micros: Int64`, `after: Utf8`, and `limit: Int64`. A null bound starts at the first key.
+The response echoes both time coordinates and carries visible UTF-8 identities from the admitted relation in strictly ascending order.
+The limit is 1–128. Schema metadata `rtdb.owned.identity_more` is 1 when the next page can resume after the last returned identity, including when the response reaches its byte bound.
+Historical cuts require certified coverage and honor ordered erasure floors.
+
+=== Working in a hosted checkpoint world
+
+The placed Multi host enables world actions on a listener configured for owned native actions.
+An authenticated, idle autocommit session must remain bound to its writer placement and epoch.
+The host resolves deployment and archive authority from the authenticated placement and the world record.
+
+`rtdb.owned.OpenWorldRead.v4` takes the world UUID and admits one live cut and its verified archived parent.
+The 57-byte result contains the opaque handle, live present, archived parent transaction ID and system time, last local application clock, initial data clock and one mode byte (0 retained, 1 held). Int64 minimum identifies an absent local application publication. Each integer is signed big-endian. Times are Unix microseconds.
+`rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then a relation prefix and a terminated single-row Arrow IPC stream with `_id` and non-null `valid_micros: Int64`.
+The response reports the held present and valid instant in schema metadata. A found row also carries its exact winning revision.
+Retained worlds are read-only. Held worlds accept fixed-valid replacements, tombstones and explicit clock advances.
+The point response schema includes `rtdb.owned.world_shadowed` (0 or 1). A local tombstone counts as a shadow.
+Every call reads the same live cut and archive root. The held handle stays bound to the original authenticated session and attachment.
+Use `rtdb.owned.CloseWorldRead.v1` with the 16-byte handle to cancel the read. Success has zero Flight results. The archive lease releases after in-flight I/O drains.
+A held read expires no later than 60 seconds or the world's own expiration. A drop fences new opens. Earlier admitted handles can read only while their original cut and archive lease still admit them.
+
+`rtdb.owned.ReadHeldWorldValidDuring.v2` takes the 16-byte held world handle, a source byte, a relation prefix and one Arrow row with `_id`, `valid_from_micros: Int64` and `valid_to_micros: Int64`.
+Source 0 resolves the combined world and source 1 resolves its archived parent for relations without fixed lifetimes.
+The reply carries the held present and resolved window in schema metadata. Each row carries `valid_from_micros`, `valid_to_micros` and the winning `system_from_micros` as signed Int64 values.
+Local tombstones leave gaps, which carry no rows.
+An authenticated placed hold with a live evidence lease returns one opaque `rtdb.owned.world_range_witness` even if the entire window is absent.
+Ordering checks the original parent pin and Root purge frontier in both modes.
+The combined view also checks the complete local relation frontier for a writable world.
+History refuses a cut lacking custody coverage or requiring more than 128 candidate slices.
+
+`rtdb.owned.ReadHeldWorldIdentityPage.v1` takes the 16-byte held world handle, a relation prefix and one Arrow request row.
+Supply `valid_micros: Int64`, `after: Utf8?` (an exclusive bound), and `limit: Int64` (1 through 128).
+The reply contains sorted `_id: Utf8` keys, the held world present and valid instant, and `rtdb.owned.identity_more`.
+Resume after the last visible identity when that flag is set.
+The page merges exact archived and local shadow candidates. A winning local tombstone hides the identity.
+Missing coverage, an archive purge floor after the parent cut, or excessive work refuses the page.
+
+World overlay groups use the following row shape.
+The group count is a big-endian u16 from 1 to 32.
+Each group consists of a relation prefix, its big-endian u32 Arrow length, and one terminated IPC stream with a nonempty batch.
+The request admits up to 4096 rows across all groups.
+Each row has exactly `_id`, `_op: Utf8`, `_valid_from_micros: Int64`, `_valid_to_micros: Int64`, and `fact: Struct?`.
+Both signed endpoints are required and specify a nonempty half-open interval. Use Int64 minimum and maximum for unbounded endpoints.
+A `replace` carries the complete fact fields in its struct. The struct may include `_absent: List<Utf8>` to omit named null cells.
+A `delete` carries a null struct and writes a world tombstone over the interval.
+The resolver validates replacements against the schema inherited from the archived cut and orders all groups atomically at the live world deadline.
+Success returns the standard transaction-key Arrow row.
+
+=== Reading owned relation changes
+
+`rtdb.owned.ReadHeldChanges.v2` takes the 16 raw held-handle bytes, a relation prefix, a signed 64-bit big-endian exclusive system time in microseconds, and an unsigned 16-bit big-endian maximum of 1–128 groups.
+The first tracked mutation installs a feed floor and its first group in the same ordered transaction.
+A relation with zero events is covered through the held present.
+A request that crosses untracked relation events or encounters a missing journal group is refused.
+
+The reply is a terminated Arrow stream with `revision: UInt64`, `system_time_micros: Int64` and `touches: List<Struct>`.
+Each touch contains the full native `_id`, `op: Utf8` (`put` or `delete`), `valid_from_micros: Int64`, and `valid_to_micros: Int64?`.
+The exclusive upper endpoint is null for an unbounded interval.
+A group records the relation's committed mutations in their original order.
+Writes exceeding the 1 MiB retained-value budget for a relation's group abort.
+A page stops before its next whole group if that group would exceed the 8 MiB retained-value budget.
+The `rtdb.owned.present_micros` schema metadata identifies the held cut.
+The `rtdb.owned.change_coverage_micros` metadata is the last returned group time if the page stopped early, or the held present when the relation is covered through the cut.
+Use the coverage time as the next exclusive system time.
+An empty page carries only the response schema and terminator.
+Revisions are dense within the authenticated owner's relation, and each returned system time belongs to a commit with a change on that relation.
+
+`rtdb.owned.ReadHeldWorldPoint.v2` with flag 1 may include `rtdb.owned.world_point_witness`, an opaque 32-digit hexadecimal nonce.
+The witness exists only under an authenticated placed read with a retained lease. It may accompany an absent result or an archived winner.
+The original session and placement must still own the held world read.
+A local tombstone has its own observed revision. An archived winner certifies local absence. The parent cut is fixed by the world registration.
+
+`rtdb.owned.CommitWorld.v3` validates an admitted world condition without writing any fact or publishing a clock.
+It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix microseconds, the held handle, a big-endian u16 witness count from 1 to 128, and the distinct 16-byte nonces.
+The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
+The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
+
+`rtdb.owned.SearchHeldWorld.v2` takes the original 16-byte world handle, a signed big-endian i64 valid instant and the big-endian u32 overlay IPC byte length, then the overlay bytes and the same partition, offset, limit, evidence flag and query framing as SearchHeld.v5.
+A zero overlay length selects the committed corpus.
+A nonempty overlay uses the same staged layout as SearchHeld.v5 and requires the installed placed writer, the live Proposal's present as the valid instant and original evidence from that writer's placement.
+A stage replaces the indexed contribution of the same typed identity in either committed layer.
+The scope includes the full stage, and the stage requires covered archived search artifacts.
+The evidence flag must be one, and every partition must have unchanged Root purge frontiers since the archive cut. Retained worlds require complete clear-text artefacts.
+Writable held and proposal worlds require a declared clear-text column in the archived relation and installed world schema. They exhaust the exact held local UTF-8 shadow keys, including tombstones and replacements without text. Matching typed archived runs are excluded before collecting token lengths or term frequencies. The local text and unshadowed archive contribute to one corpus and one rank window.
+The indexed branch limits the overlay to 4,096 shadow keys and 8 MiB of text, and uses the existing 100,000 matching-candidate limit across both sources. Only unavailable archive artefact coverage permits the bounded exact row path (4,096 visible identities and 8 MiB of text). Incomplete identity pages or unavailable purge coverage refuse the operation.
+The ranked reply carries the world present, requested valid instant, exact total and one held condition per partition, including for an empty result.
+Conditions validate the original archive pin and whole-corpus purge frontiers, plus the local relation touch frontier for writable worlds.
+
+`rtdb.owned.RetainReplayedWorld.v3` retains a provisional world on the held restore writer.
+A retained Held fork has two independently certified destination positions, an inherited Root cut and the exact replay of its source Held overlay.
+The reply carries the destination parent media and the optional Held ancestor media with its unchanged source world, pin and logical publication.
+World readmission binds both positions to the same Original replay before the restored world opens.
+The Held overlay also carries the Root transaction named by its archived source registration.
+
+Explicit earlier Root actions also accept a hold on a retained Held child.
+They resolve the selected position, schema, paths and purge history in its pinned Root archive.
+They return Root images and evidence at that position, including point absence and empty pages.
+
+`rtdb.owned.ReadHeldWorldAncestorChanges.v1` uses the same request and response framing as the archived Root change page.
+The selected position must equal the child's retained Held overlay cut, and the requested interval must start at or after the Root cut.
+`rtdb.owned.ReadHeldWorldVersion.v2` on that child certifies the address in the exact archived Held group, reads its logical clock, and resolves its timeline against the pinned Root.
+A winning Held tombstone leaves an absent slice.
+The existing exact-world preflight and path touch actions read from the same retained overlay for ordered history.
+They certify the exact local clock and path generation and resolve both sides against the child's pinned Root.
+Exact and as-of selection can also reopen an earlier Held publication on the same retained child.
+Point, valid interval, identity, range and rank requests use that overlay position together with the unchanged pinned Root.
+
+`rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
+It returns ordered local overlay groups after the supplied revision at or above the inherited basis.
+A retained Held child begins its journal at the inherited Held position and has no local writes. The archived parent is fixed.
+The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.
+
+`rtdb.owned.PublishWorldCut.v1` registers an initial archived cut or moves a retained world to a newer verified Root cut.
+The request supplies 16-byte IDs for the original Root hold, world, minted pin, predecessor world hold, capture and suffix. A nil suffix selects the capture itself.
+An initial request uses the world ID as its pin and a nil predecessor. An advance supplies the original retained-world hold and a freshly minted pin.
+Expiry and deadline follow as big-endian i64. An advance supplies Int64 minimum for expiry to inherit the original world's expiry.
+A clock-mode byte selects retained (0), held at the inherited clock (1), or held with an explicit start (2 followed by a big-endian i64 timestamp). An advance uses mode 0.
+The final fields are the 22-byte attempt ID, its 32-byte fingerprint, and check-only hosted controls.
+The archive owner retains the new cut before ordering. The resolver compares the exact predecessor pin before moving a retained world and checks the original Root head for an explicit forward clock start.
+The response carries the unchanged world ID followed by the transaction ID and system time as big-endian i64.
+
+An owned relation with acceptance validity may additionally declare a positive `lifetime_micros` before its first fact.
+Its source accepts immutable creation only, preserving complete identities after expiry so an old identity cannot be re-created.
+One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
+Mode 3 of `rtdb.owned.ReadHeldWorldPoint.v2` reads an ordinary point from the held parent.
+It returns a witness for the original pin and the relation's purge frontier, independent of the world's overlay.
+`rtdb.owned.CommitHostedWorldReads.v2` can order this evidence with Root writes and hosted controls.
+The request prefixes the hosted commit body with a counted-commit byte (0 or 1), a big-endian u16 hold count, and one section per distinct hold.
+Each section has a 16-byte handle, a big-endian u16 witness count, and 16 bytes per witness nonce.
+The commit admits one to eight holds with up to 128 witnesses each.
+
+A placed write to a declared Root data relation can carry a Binary `_ordered_micros` column.
+For each row with slots, its value starts with a big-endian u16 count in 1 through 1024.
+Each slot carries a u8 field-name length, the UTF-8 field name, a big-endian u32 byte offset in that Binary field, and a big-endian signed i64 offset in microseconds.
+Slots appear in field-name and byte-offset order. Each covers eight initially zero bytes and slots cannot overlap.
+The high bit of the byte offset selects a signed-order key slot in a declared Binary `p_` column. Hosted protocol 20 interprets the low 31 bits as the actual byte offset.
+The ordered resolver fills every slot from the same checked sum of acceptance time and offset.
+Payload slots take the big-endian signed sum and key slots take the big-endian sum with its sign bit flipped.
+The resolver removes the descriptor before checking the schema, updating occupancy and staging the row.
+World overlays and archive replay require their own images without this descriptor.
+
+A held retained parent point at its original archive basis also checks the live relation lifetime.
+It returns the same cutoff for a live fact, `rtdb.owned/lifetime-expired` for a fact that was visible at the basis and has since expired, and absence when no fact was visible at the basis.
+Live full-key range pages on a covered acceptance-lifetime path use the held present on the valid axis.
+A nonempty page carries `rtdb.owned.until_micros` set to its earliest exclusive row expiry.
+The placed witness expires by that time, and range encoding refuses a page whose expiry has already passed.
+Live full-key count uses the same frozen root and held present.
+For a nonempty lifetime count, bounded rank probes on that root find the first valid instant where its cardinality decreases.
+The count's metadata and original witness include this exclusive cutoff.
+The private lifetime declaration stores the immutable duration and an ordered monotone floor of creation times already expired.
+Native writes advance that floor together with accepted data. Live and archived reads require the exact floor format and declaration.
+An existing lifetime marker without the floor requires a reset.
+The protected marker also stores the replay-present sweep floor.
+Trusted native maintenance may nominate one exact created identity and a cutoff granted by its replay-retention authority.
+The ordered source requires superuser maintenance authority, a deadline, the original creation revision and expiry at or before the permitted cutoff.
+It orders an all-history retirement event, the monotone sweep floor and an `expired` journal touch together.
+Retries of retired identities publish no duplicate touch.
+`rtdb.owned.NominateHeldExpiry.v1` is a placed hosted-control read over the original 16-byte hold and the ordinary typed point request.
+It seals one exact expired identity from the installed lifetime at held present and returns one Arrow row containing `nomination`, `created_micros`, and `expiry_micros`.
+The sealed token expires with the hold and binds the complete identity, owning principal, relation, placement epoch, and original transaction key.
+The action carries no removal authority, replay cutoff, or document payload.
+`rtdb.owned.ReadHeldExpiryCandidates.v1` reads exact creation groups from the same live held journal.
+The request carries the original hold, relation, exclusive journal system time, and a group limit from one to eight.
+The result contains at most 64 signed candidates and a covered journal coordinate. An oversized group is never split or skipped.
+It uses the design's 24-hour window to diagnose eligible candidates on the held clock. The diagnostic cutoff does not authorize removal.
+Hosted sweep dispatch still requires the logical replay-retention owner. Archive-media collection remains separate.
+Leading-key, historical, and world ranges and historical or world counts remain unavailable for these relations.
+Other read coordinates and paths refuse this declaration.
+
+`rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
+It takes the v1 fields through the fingerprint and requires an all-zero predecessor handle.
+Mode 0 selects an independently archived cut at the exact original live Root transaction key.
+Mode 4 selects the accepted application publication read from the original live Root hold.
+The archived transaction and its application head must agree at that publication, and the ordered resolver checks that the head has not moved.
+An all-zero capture and suffix first select an already certified archive of the requested cut from the placed host's Directory.
+For a held application publication, a placed node configured with an independent `--archive-root` can otherwise copy the source's already published checkpoint when its exact system time equals that publication and its root digest is present.
+The Directory capture owner derives one reusable operation from the source checkpoint and archive and verifies it through the normal reopen path.
+If the published checkpoint does not match, the placed writer can use an older independently certified base whose replica boundary is still retained.
+It quorum-certifies a bounded applied interval, resolves the held publication to the original committed transaction key and source offset, and independently certifies only the contiguous prefix ending at that transaction. Later driver transactions serve only as a discovery ceiling.
+The normal suffix owner pins and archives that prefix, validates its replay, and reopens the full transaction key under the existing world registration. The discovery interval is bounded to 4,096 replica records and 8 MiB, and any unsupported replay frame, lost hold, trim, or custody gap refuses.
+Once the source checkpoint is superseded, the archive retirement owner can close an automatic copy without a live world, suffix, repair, or I/O pin.
+Archive discovery does not create a capture or advance the original hold.
+Next come a big-endian u16 range witness count and its original 16-byte Root handle and 16-byte nonce pairs, then the big-endian u32 byte length and ordered Root fact groups.
+Root groups may supply point checks, inserts, replacements and deletes.
+The remainder contains the common hosted groups with at least one check and optional checked replacements.
+With Root fact writes, the resolver publishes the Root head in the same transaction as the world registration, facts, hosted replacements and one shared immutable attempt marker.
+Without Root fact writes, at least one hosted replacement is required and the Root head does not advance.
+Mode 5 selects an initial writable Proposal at the exact held application publication; it requires checked hosted replacements and permits Root checks and writes.
+The Proposal registration retains the pre-commit Root publication. Any Root fact writes and their new head share its ordered attempt and hosted replacements.
+Mode 4 also admits an original retained predecessor handle with a fresh expiry and a distinct new pin ID.
+An authored advance carries one acceptance-valid Root replacement with its original positive point check and a checked existing owner row replacement.
+Its current application publication must strictly advance the exact predecessor before the Root replacement, new retained registration and hosted settlement can publish.
+The archive owner retires the previous physical pin after ordering.
+Mode 6 has the same hosted Root replacement framing and renews the original retained holder at its existing exact basis.
+The request supplies zero capture and suffix selectors, and the placed owner reuses the exact previously admitted archive.
+Renewal compares the original physical pin and refreshes its expiry without requiring the application head to still equal the retained basis.
+Mode 7 supplies a retained source handle, zero capture and suffix selectors, and a fresh world UUID used as its first physical pin.
+It creates one Root fact and independent custody of the source archive at the same transaction key.
+The source pin must retain its original registration and at least sixty seconds of standing beyond the ordered deadline.
+The original holder remains in place after the sibling order.
+Mode 8 supplies the original live Proposal handle and a fresh physical pin for the same writable world.
+The placed owner derives the archive from the original pin, and the source preserves the exact archived cut and Proposal overlay identity while extending its expiry.
+One acceptance-valid Root insert and its original absence check order with the new registration and checked owner controls.
+The old physical pin retires after ordering, while the Proposal remains active.
+Mode 9 uses the same predecessor and archive selection with a strictly shorter live expiry.
+It orders one acceptance-valid Root delete and its original present-key check with the Proposal registry replacement and hosted controls.
+The predecessor archive pin is eligible for retirement only after the order accepts.
+The response has the v1 layout.
+A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
+
+`rtdb.owned.CommitHeldWorlds.v4` orders one to eight world publications with optional Root facts and checks.
+Its request starts with a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.
+Each world supplies the 16-byte world ID and original held handle, a u16 witness count and its 16-byte nonces, and a 22-byte attempt ID.
+One effect byte follows. Overlay (0) carries the relation groups prefixed with a u32 byte length. Clock advance (1) carries the i64 target. Drop (2) carries no payload.
+The expected prior clock comes from the original hold. Overlay publication advances it by one microsecond. An explicit target must increase it and fit within the ordered commit time.
+After the worlds, a byte selects no Root section (0), Root validation (1), or Root publication (2).
+Kinds 1 and 2 carry the original 16-byte Root hold. Kind 2 also carries its 22-byte attempt ID.
+Next come a u16 Root range witness count and the original handle/nonce pairs, then the u32 byte length and ordered Root fact groups.
+Kind 1 supplies point checks, range checks, or both. Kind 2 also supplies Root inserts, replacements, or deletes.
+The request ends with the common check-only hosted ownership groups.
+Root kind 3 carries the original live Root handle and selects a single retained world Drop with zero world witnesses and no Root fact operations.
+It requires an original hosted check and one or two replacements with present expectations. The retained terminal registration and checked replacements order together.
+The Root head, local writes, clocks, terminal registrations and immutable attempt markers share one transaction key in the commit reply.
+The placed archive owner retires the exact dropped pins after the ordered result.
+Root section kind 4 supports one acceptance-valid Root delete together with the terminal registration of one retained world and checked hosted settlement.
+It uses the Root hold, range witnesses and group framing of kind 1, and reuses the world's immutable attempt ID.
+The Root groups must include the original positive point check for the deleted fact.
+The hosted groups require at least one check and allow one to five checked replacements, including at least one existing owner row.
+Root kind 5 can settle a bounded-period Proposal overlay and its hosted receipt in one transaction.
+Each changed entity must supply the complete-key point at its finite valid start and a local timeline frontier over the same inherited relation and pin.
+The ordered writer enforces the inherited bounded-period schema and admits one assertion or tombstone per complete entity key.
+Root kind 6 lands a reviewed Proposal under the original live Root and Proposal holds.
+Its acceptance-valid writes may replace the same complete key in order after the first checked create or replacement.
+Every write occupies a separate assertion position, and the first write binds the original Root presence or absence for that key.
+The original held Proposal supplies its final local point check for the same key.
+Fixed-period landings may assert several intervals for one complete key in the same accepted commit.
+Each distinct authored start requires a Root point check and a guarded point on the held Proposal's final timeline.
+Each written period relation also requires the held Root range and Proposal timeline frontiers.
+Root kind 7 selects one exact hosted Proposal Drop with the original Proposal handle and zero world witnesses.
+It carries the original live Root handle, a matching witnessed acceptance-valid Root delete, and checked custody replacements plus the registered receipt.
+The ordered source compares the physical pin and held overlay clock before terminal registration.
+The placed host retires that original pin only after acceptance.
+
+=== Polling hosted held dependencies
+
+`rtdb.owned.ObserveHeldHosted.v1` takes a live 16-byte held handle, the usual nonempty owned witness prefix, an exclusive signed 64-bit big-endian microsecond deadline, and a nonempty CommitHosted control group stream containing only explicit check-only entries.
+All whole-relation witnesses must belong to the same original handle.
+The action uses the existing placed hosted-control caller and allowlist. It compares fact witness touch frontiers and exact hosted control keys on one attached current snapshot. An unrelated control key does not invalidate coverage. Original control expectations and purge standing are checked before returning coverage.
+The response is one zero byte if a dependency was touched, or a signed 64-bit big-endian system microsecond through which the original dependencies are covered.
+The action submits no transaction and returns no fact or control rows. Expired, detached, fixed-valid or uncovered evidence is refused.
+
+=== Reading a merged held change feed
+
+`rtdb.owned.ReadHeldMergedChanges.v1` takes the 16-byte held handle, an exclusive signed Int64 ordered system time in big-endian microseconds, a big-endian unsigned 16-bit commit limit, and a big-endian unsigned 16-bit relation count followed by that many relation prefixes.
+Supply one to 32 distinct preadmitted owner root relation names and a limit of one to 128 commits.
+The server seeks each selected relation's exact journal at the same held cut and refuses gaps or an exclusive cursor that predates uncovered history.
+A relation with a proven empty history contributes no commits.
+
+The reply is a terminated Arrow stream with `revision: Int64` ordered system microseconds and `changes: List<Struct<relation: Utf8, touches: List<Struct>>>`.
+The touch fields match ReadHeldChanges.v2.
+All selected relations touched by the same commit share a row, with relations in name order and touches in the relation's original write order.
+A capped page stops before a whole commit if it would exceed the 8 MiB retained-value budget.
+A commit that cannot fit in an otherwise empty page is rejected.
+`rtdb.owned.change_coverage_micros` identifies the last returned revision of a partial page and the held present of an exhausted page.
+Resume from that coverage time.
+An empty covered page has no rows and carries the already-known held present in `rtdb.owned.present_micros`.
+
+=== Declaring owned partition capacity
+
+`rtdb.owned.DeclareCapacity.v2` takes the relation prefix and a terminated Arrow IPC stream with one batch and one row.
+Its fields are `column: Utf8`, `prefix_bytes: Int64` (0–4096), `cap: Int64` (positive), and `when: Binary`.
+`when` contains zero to four equality predicates in column-name order. Each consists of a one-byte UTF-8 column-name length and the name, followed by a big-endian u16 value length and the exact nonempty Binary value (up to 2052 bytes).
+An owned Root relation may declare up to 16 distinct projection and predicate combinations.
+A populated relation can declare its first cap when its schema requires validity from acceptance with an open end and has no creation lifetime.
+The resolver initializes the new rule's covered counters from the final visible rows at the declaring revision.
+If a prefix already exceeds the proposed cap, the transaction aborts with `rtdb.owned/capacity-already-exceeded`.
+Redeclaring a projection with the same predicate and prefix width changes its maximum while retaining its counters.
+Lowering the maximum checks the relation's final membership at the declaring revision, including any removals in that transaction.
+An admitted Root `rtdb.owned.CommitHosted.v1` can co-order capacity declarations with its catalog changes.
+Send each declaration in the target relation's fact group with `_op: Utf8` equal to `declare-capacity`, `_id: Utf8` equal to the projection column, and the four fields from DeclareCapacity.v2.
+The hosted batch must check the observed `bj_installation` authority row.
+The facts, counters and catalog changes commit together after the authority, catalog and capacity conditions all succeed.
+Held Original replay reinstalls complete-key capacity declarations at their recorded source transaction.
+The resolver checks that the replay reproduces the source relation's write frontier and exact counter effects before accepting the replay receipt.
+A held replay receipt carries `commit_positions` from the archived transaction.
+When the list is nonempty, the submitted governed events must follow that order, preserving sparse positions left by erased assertions.
+The resolver rejects extra or missing governed events before accepting the receipt.
+Successful declarations return the same transaction-key Arrow row as Create.
+Zero counts complete Binary keys. An empty complete key charges a single relation-wide bucket. Positive widths count prefixes of that length. Keys are limited to 4096 bytes.
+Each qualified projection and partition has its own counter. A row charges the rule only while all its predicates match. One shared relation frontier certifies all counters.
+Writes to the governed root must start at ordered present and have an unbounded valid end.
+The resolver applies same-transaction releases and claims together, then commits the facts and counters atomically.
+A capacity conflict or uncovered counter frontier aborts the commit.
+World writes to a governed relation refuse until the world can account for inherited occupancy.
+
+=== Holding a historical root publication
+
+`rtdb.owned.OpenReadAsOf.v1` takes the 16-byte fresh held read handle and a signed 64-bit big-endian requested system instant in microseconds.
+Next come the publication relation prefix, a big-endian unsigned 16-bit marker byte length followed by that UTF-8 marker, and a big-endian unsigned 16-bit scope count followed by that many relation prefixes.
+The scope comprises one to 32 distinct preadmitted root relations, including the publication relation.
+Each selected relation needs a covered journal floor and head or a proven empty history.
+The marker is read at the requested system cut and business-valid instant.
+Its visible row must cover all valid time.
+The derived handle uses the marker's actual commit time, which must also be inside every selected relation's certified history.
+
+The response is one byte zero for a covered absent marker, or the new 16-byte handle followed by its signed 64-bit big-endian system time.
+Use the handle with ReadHeldPoint.v1, ReadHeldPoint.v2, ReadHeldValidDuring.v2, ReadHeldVersions.v2, ReadHeldRange.v4, or CountHeldRange.v2 in the declared scope and CloseRead.v1 to release it.
+The default business-valid time is the selected marker time.
+The derived handle shares the original generation, lease and expiry and may serve requests after the fresh handle is closed.
+It carries no commit evidence.
+
+=== Fixed-valid range observations
+
+`rtdb.owned.DeclareFixedRange.v1` takes the relation prefix and one terminated Arrow IPC batch with one row.
+The fields are `path: Utf8`, `column: Utf8`, and `valid_micros: Int64`.
+Declare the relation's schema first and the fixed range before its first fact event.
+This declares one immutable path on the authored Binary column followed by the full native Utf8 `_id`, and returns the usual transaction-key row.
+The maximum timestamp cannot be used as a valid instant.
+
+`rtdb.owned.ReadHeldRange.v3` adds a seventh `valid_micros: Int64` field to v2.
+It traverses the covered path at that valid instant on the held system cut and uses the same handle and witness nonce in Commit.v3.
+When the declaration and valid instant match and `after` is absent, the exact witness protects the full requested half-open span, including a covered empty result and the unreturned part of a capped page.
+The ordered resolver validates both old and new full keys through at most 64 intervening dense journal groups.
+A group omits exact sides when its relevant IDs or keys fall outside the supported type or byte limits, or when its evidence could not be captured.
+
+`rtdb.owned.ReadHeldRange.v4` and `rtdb.owned.CountHeldRange.v2` add a `system_micros: Int64` field to v3 and v1 respectively.
+The system cut must be covered by the relation history on a fresh hold or equal the selected cut on a derived hold.
+Both actions require a covered index revision and return the requested system and valid instants in the reply metadata.
+Historical pages require the path to project `_id` for ordered erase validation.
+Historical pages and counts carry no commit witness.
+
+Held range and count actions can cover a cut by replaying up to 4096 uncheckpointed events from the captured relation, including up to eight flushed source files.
+This also covers relations that have no checkpoint yet when the retained sources supply the complete history.
+Before the first fact, the held declaration supplies the path field types and the exact empty result.
+An incomplete or over-limit replay yields no rows, count, or witness.
+The relation-frontier check still applies to moving-valid reads, continuation reads, and reads whose exact witness or intervening coverage is unavailable.
+
+=== Committing checked hosted control rows with owned facts
+
+`rtdb.owned.CommitHosted.v1` is enabled only for a live placed connection authenticated as `flightSql.hostedControls.owner` with `flightSql.ownedNativeActions` enabled.
+The operator's `flightSql.hostedControls.relations` sequence names the admitted ordinary `public.bj_*` tables.
+The body begins with the Commit.v3 unsigned Int16 big-endian witness count (zero to 32) and its 16-byte held handle plus 16-byte nonce pairs.
+Then come the signed Int64 big-endian exclusive deadline, an unsigned Int32 big-endian byte length, that many bytes of ordered fact groups, then the hosted control groups.
+Both sections use the Commit.v2 relation-group sequence framing. The control section has at least one group. A check-only transaction may omit fact groups.
+Fact groups may repeat a relation to preserve run order. The combined sections admit at most 32 distinct fact and control groups and 4096 total rows.
+
+Each control group contains one terminated Arrow batch with distinct field names.
+Every row has `_id: Utf8` and `_expected_micros: Int64?`. Replacement rows supply a complete image in the already installed ordinary column types. A row with `_check_only: Boolean` set to true carries only the ID and expectation and leaves the table unchanged.
+A null expectation requires exact absence.
+An existing row must contribute one exact valid slice from epoch to infinity at the ordered base.
+Control replacements use the same epoch-to-infinity interval.
+The resolver checks all control and fact observations before any mutation and aborts both sets of effects on failure.
+Use an absent-checked unique receipt key as one of the writes when the host needs to recover an indeterminate response.
+The response is the ordinary committed transaction-key row.
+
+`rtdb.owned.ReadHeldHostedControl.v2` uses the same installed placed owner
+and ordinary control allowlist as the commit actions. Send the original live,
+underived 16-byte held read handle, one ordinary control table prefix, then
+one terminated Arrow IPC batch with one row `_id: Utf8`. The ID is complete
+and bounded to 4096 bytes. No time override is accepted.
+
+The response is ordinary point IPC, with the original held present and
+`valid_micros` equal to zero. A hit is one row with the complete ID,
+ordinary control fields, and its original system revision in point metadata.
+Native writes to the Root receipt table stamp their local transaction ID.
+Reading a stamped receipt also returns `rtdb.owned.receipt_tx_id` as point metadata.
+Pair it with the system revision to name the exact transaction in applied confirmation.
+An installed table with a covered absent row returns its typed schema without
+a revision or rows. Send that revision or null as `_expected_micros` in a
+subsequent checked hosted commit. A missing table or a non-epoch valid slice
+refuses the read.
+
+`rtdb.owned.CommitHostedCounted.v2` prefixes this action with the ordered-present count conditions from Commit.v7.
+The resolver checks the ordinary control observations and every final owned count in the same transaction.
+
+`rtdb.owned.CommitHostedDeciding.v1` starts with a flags byte and a big-endian u32 length for the refusal section.
+The low bit selects a counted commit. The second bit selects a held-world read prefix after the refusal.
+The refusal section contains a length-prefixed fact group stream followed by the hosted control group stream.
+An optional held-world read prefix uses the same count, handles, and witness nonces as CommitHostedWorldReads.v2.
+An ordinary or counted hosted commit follows.
+Its placed live Root owner supplies the same attempt marker, the receipt publication marker, the same dispatch retirement and alternative bodies for the exact business and private execution receipt slots.
+A public decision may also supply one absent-checked `root_decision:<sha256>` admission slot in both alternatives.
+The identity and all fields other than its outcome body must match between the alternatives.
+Only uniqueness, capacity and final-count violations found after evaluating the primary candidate select the refusal.
+The resolver discards the candidate buffer and orders the alternative under the same transaction key and the original deadline, Root point and range guards, hosted-control guards, and any retained-world scope, pin, purge, overlay and point guards.
+A receipt-only request with a final count condition moves the Sync receipt head for either result.
+The successful response identifies the ordered decision revision.
+Read the exact business receipt at that revision to determine which outcome ordered.
+
+This action supports checked replacement and exact absence insertion for hosted controls.
+Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.
+
+An installed held restore may combine its exact writer, archive, hold, unsealed state, and predecessor checks with an absent-checked original transaction receipt.
+The native effects and the restore frontier replace in the same commit as that receipt.
+Copied native Root assertions retain their source valid intervals, including the original creation and expiry of a lifetime row.
+The destination system order still gives every applied transaction a fresh position above the archived cut.
+Generic SQL keeps the existing private relation boundary.
+
+=== Final-state prefix count
+
+`rtdb.owned.Commit.v7` begins with a nonzero big-endian `u16` condition count.
+Each condition includes one owned Root relation prefix, a zero clock byte for the ordered-present valid time,
+a big-endian `u16` length and UTF-8 Binary column name (1 to 96 bytes), a big-endian `u16` length and complete Binary prefix (0 to 4096 bytes), and a nonnegative big-endian `i64` maximum.
+Then send zero or more witness pairs, one deadline, and the ordered mutation groups.
+The fact groups preserve relation run order and may repeat a relation.
+
+Each condition requires an immutable unconditional `DeclareCapacity.v2` rule matching its relation, column and complete prefix.
+The resolver checks counter coverage against the ordered base before applying mutations.
+It compares each maximum with the covered count after applying all of this transaction's writes.
+An exceeded maximum aborts the entire transaction with
+`rtdb.owned/count-bound-exceeded`. Other clocks, world overlays, and erase
+entries are unsupported by this action.

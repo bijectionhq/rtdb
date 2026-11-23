@@ -5,15 +5,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
-use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, ForkPublication, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::Log;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, journal_endpoint, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
+
+mod holder;
+pub use holder::{HolderObservation, observe_holder};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 const CONCURRENT_SUSPICION_PROBES: usize = 16;
@@ -22,6 +25,13 @@ const CONCURRENT_SUSPICION_PROBES: usize = 16;
 pub async fn initialize_storage(storage: &CellStorage, keys: &dyn KeyService) -> Result<StorageNamespaces> {
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     storage_namespaces(bucket.as_ref(), keys).await
+}
+
+pub async fn enroll_terminal_storage(storage: &CellStorage, evidence: bytes::Bytes) -> Result<uuid::Uuid> {
+    let CellStorage::S3 { config } = storage else {
+        return Err(Anomaly::incorrect("rtdb.multi/terminal-storage", "Terminal enrollment requires an S3 cell"));
+    };
+    config.enroll_terminal_cell(&BTreeMap::new(), evidence).await
 }
 
 /// Creates a deployment, choosing its ensemble from the live logkeepers in its affinity order.
@@ -93,7 +103,7 @@ fn valid_installation_name(part: &str) -> bool {
         && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
+pub(crate) async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
     let members = directory.members().await?;
     let logkeepers: Vec<_> = members.iter().filter(|member| member.role == MemberRole::Logkeeper && member.state == MemberState::Eligible && member.is_live(now)).collect();
@@ -124,9 +134,11 @@ async fn update(directory: &dyn Directory, name: &str, change: impl Fn(&mut Depl
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while being updated")))
 }
 
-async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -> Result<Vec<String>> {
+pub(crate) async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -> Result<Vec<JournalEndpoint>> {
     match &record.move_from {
-        Some(previous) => Ok(previous.clone()),
+        Some(previous) if previous.iter().all(|endpoint| endpoint.journal().is_some()) => Ok(previous.clone()),
+        Some(_) => Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-identity-missing",
+            "Resume the cell transfer from its source directory to bind the source journal identities")),
         None => ensemble_servers(record, &members(directory).await?),
     }
 }
@@ -189,7 +201,7 @@ pub async fn flush_checkpoint(directory: &dyn Directory, original: &DeploymentRe
     }
     let address = control_address(&members(directory).await?, &holder)?;
     let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/capture-flush", "The holder did not publish an exact checkpoint in the original residence");
-    let Response::Flushed { block } = expect(
+    let Response::Flushed { checkpoint } = expect(
         &address, Request::Flush { name: original.name.clone() }, control,
     ).await? else { return Err(unavailable()); };
     let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
@@ -198,10 +210,34 @@ pub async fn flush_checkpoint(directory: &dyn Directory, original: &DeploymentRe
         if !matches_original(&after) || after.epoch != before.epoch || tokio::time::Instant::now() > deadline {
             return Err(unavailable());
         }
-        if after.checkpoint.is_some_and(|cut| cut.block >= block) {
+        if after.checkpoint == Some(checkpoint) {
             return Ok(after);
         }
+        if after.checkpoint.is_some_and(|cut| cut.block >= checkpoint.block) {
+            return Err(unavailable());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+pub(crate) async fn pin_checkpoint_suffix(
+    directory: &dyn Directory, installation: &DeploymentRecord, control: &ControlKey,
+    capture: uuid::Uuid, lease: uuid::Uuid, basis: rtdb_types::TransactionKey, expires_at_ms: i64,
+) -> Result<()> {
+    let unavailable = || Anomaly::new(
+        AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
+        "The installation did not pin the requested checkpoint suffix",
+    );
+    let holder = installation.holder.as_ref().ok_or_else(unavailable)?;
+    let address = control_address(&members(directory).await?, holder)?;
+    let response = expect(&address, Request::PinCheckpointSuffix {
+        name: installation.name.clone(), deployment: installation.id.parse().map_err(|_| unavailable())?,
+        capture, lease, basis, expires_at_ms,
+    }, control).await?;
+    match response {
+        Response::CheckpointSuffixPinned { pin } if pin.capture == capture && pin.basis == basis
+            && pin.expires_at_ms == expires_at_ms => Ok(()),
+        _ => Err(unavailable()),
     }
 }
 
@@ -212,7 +248,55 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
 
 pub(crate) async fn move_from_holding(directory: &dyn Directory, name: &str, target: &MemberId,
                                       source: Option<(&MemberId, u64)>, control: &ControlKey) -> Result<()> {
-    let members = members(directory).await?;
+    move_placement(directory, name, target, source, None, control).await
+}
+
+/// Move only the installation named by an actual holder observation.
+/// The source identity and epoch are checked inside the reservation CAS.
+pub async fn move_observed_holder(
+    directory: &dyn Directory,
+    original: &HolderObservation,
+    target: &MemberId,
+    control: &ControlKey,
+) -> Result<HolderObservation> {
+    let changed = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed",
+        "The commissioned writer or its database placement changed");
+    if original.authority.is_nil() || original.incarnation == 0 || original.epoch == 0
+        || original.directory_version == 0 || original.member_version == 0
+        || original.observed_at_ms <= 0 || original.lease_expires_at_ms <= original.observed_at_ms
+        || &original.holder == target
+    {
+        return Err(changed());
+    }
+    let name = directory.deployment(&original.authority.to_string()).await?
+        .ok_or_else(changed)?.name;
+    move_placement(
+        directory, &name, target, Some((&original.holder, original.epoch)), Some(original), control,
+    ).await?;
+    let successor = observe_holder(directory, original.authority, original.incarnation).await?;
+    if &successor.holder != target || successor.log_epoch != original.log_epoch
+        || successor.epoch <= original.epoch || successor.directory_version <= original.directory_version
+        || successor.engine_version != original.engine_version
+    {
+        return Err(changed());
+    }
+    Ok(successor)
+}
+
+async fn move_placement(directory: &dyn Directory, name: &str, target: &MemberId,
+                        source: Option<(&MemberId, u64)>, observed: Option<&HolderObservation>,
+                        control: &ControlKey) -> Result<()> {
+    let members = if let Some(observed) = observed {
+        let mut selected = BTreeMap::new();
+        for id in [&observed.holder, target] {
+            if let Some(record) = directory.member(id).await? {
+                selected.insert(record.id.clone(), record);
+            }
+        }
+        selected
+    } else {
+        members(directory).await?
+    };
     let address = control_address(&members, target)?;
     let reservation = PlacementMove {
         request: uuid::Uuid::new_v4(),
@@ -225,11 +309,25 @@ pub(crate) async fn move_from_holding(directory: &dyn Directory, name: &str, tar
         if source.is_some_and(|(member, epoch)| record.epoch != epoch || holder != Some(member)) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed", format!("{name} has already changed holders")));
         }
+        if observed.is_some_and(|observed| {
+            record.id != observed.authority.to_string()
+                || record.incarnation != observed.incarnation
+                || record.log_epoch != observed.log_epoch
+                || record.version < observed.directory_version
+                || [&observed.holder, target].into_iter().any(|member| {
+                    members.get(member).is_none_or(|member| member.engine_version != observed.engine_version)
+                })
+        }) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed",
+                "The observed installation or commissioned engine no longer matches"));
+        }
         if !members.get(target).is_some_and(|member| record.may_place_on(member, now)) {
             return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements of {name}")));
         }
         if holder == Some(target) { return Ok(()); }
-        if record.active_move(now).is_some_and(|intent| members.get(&intent.target).is_some_and(|member| record.may_place_on(member, now))) {
+        if record.active_move(now).is_some_and(|intent| observed.is_some()
+            || members.get(&intent.target).is_some_and(|member| record.may_place_on(member, now)))
+        {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} already has a reserved placement")));
         }
         record.move_intent = None;
@@ -367,58 +465,112 @@ pub async fn unquarantine(directory: &dyn Directory, name: &str) -> Result<Deplo
 
 async fn fork_source(directory: &dyn Directory, parent: &str) -> Result<DeploymentRecord> {
     let source = record(directory, parent).await?;
-    if !source.can_fork() {
+    if !source.can_fork() || source.serving_replay_capture.is_some() {
         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{parent} cannot be forked in its current state")));
     }
     Ok(source)
 }
 
-async fn fork_bucket(storage: &CellStorage, keys: &dyn KeyService, source: &DeploymentRecord) -> Result<crate::reference::Bucket> {
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
-    require_storage_namespaces(source, storage_namespaces(bucket.as_ref(), keys).await?)?;
-    Ok(bucket)
+struct ForkAccess {
+    bucket: crate::reference::Bucket,
+    io: Arc<rtdb_storage::IoRegion>,
+    preparation: ForkPublication,
+    maintenance: Option<Arc<std::fs::File>>,
+}
+
+async fn with_fork_access<F: std::future::Future<Output = Result<DeploymentRecord>>>(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    source: &DeploymentRecord,
+    task: Option<&rtdb_directory::HostedTask>,
+    operation: impl FnOnce(ForkAccess) -> F,
+) -> Result<DeploymentRecord> {
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
+    let lineage = &source.lineage;
+    let generation = directory.lineage_state(lineage).await?.retirement_generation();
+    let preparation = ForkPreparation { token: uuid::Uuid::new_v4(), generation };
+    let (change, publication) = if maintenance.is_some() {
+        let local_volume = storage.custody_namespace()?;
+        (LineageChange::PrepareFork { preparation, local_volume }, ForkPublication::Local(preparation))
+    } else {
+        (LineageChange::PrepareHostedFork { preparation, task: task.cloned() }, ForkPublication::Hosted(preparation))
+    };
+    directory.change_lineage(lineage, change).await?;
+    let io = rtdb_storage::IoRegion::new().child_holding(maintenance.clone().map(|lock| lock as Arc<dyn Send + Sync>));
+    let result = async {
+        let bucket = storage.bucket(Arc::clone(&io)).await?;
+        require_storage_namespaces(source, storage_namespaces(bucket.as_ref(), keys).await?)?;
+        operation(ForkAccess { bucket, io: Arc::clone(&io), preparation: publication, maintenance }).await
+    }.await;
+    io.close_and_wait().await;
+    if result.is_err() && let Err(error) = directory.change_lineage(lineage, LineageChange::ReleaseFork { preparation }).await
+    {
+        eprintln!("RTDB fork preparation {} is retained: {}", preparation.token, error.code);
+    }
+    result
+}
+
+#[derive(Clone, Copy)]
+pub struct ForkDestination<'a> {
+    pub name: &'a str,
+    pub org: Option<&'a str>,
+    pub hosted_task: Option<&'a rtdb_directory::HostedTask>,
 }
 
 /// Forks `parent` into a new deployment in its lineage.
 /// The parent is flushed, and the child references its objects and starts on fresh logs.
-pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
-    let holder = ensure_held(directory, parent, control).await?;
-    let members = members(directory).await?;
-    expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }, control).await?;
-    let _maintenance = storage.try_local_maintenance()?;
-    let source = fork_source(directory, parent).await?;
-    let bucket = fork_bucket(storage, keys, &source).await?;
-    fork_with_tail(directory, bucket.as_ref(), keys, &source, name, None, Vec::new(), 4 << 20).await
+pub async fn fork(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
+    fork_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, control).await
+}
+
+pub async fn fork_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, control: &ControlKey) -> Result<DeploymentRecord> {
+    let original = fork_source(directory.as_ref(), parent).await?;
+    if let Some(org) = destination.org { validate_org(org)?; }
+    let source = flush_checkpoint(directory.as_ref(), &original, control).await?;
+    let source = &source;
+    with_fork_access(directory.as_ref(), storage, keys, source, destination.hosted_task, |access|
+        fork_with_tail(directory.clone(), storage, access, keys, source, destination, None, Vec::new(), 4 << 20)).await
 }
 
 /// Forks `parent` as of one of its past blocks: the fork's state is that block's, and what the parent wrote after it is not the fork's.
 /// Only a block younger than the reaper's `grace` can be forked from: an object it needs that the parent released since is erased only once the grace has passed.
-pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: std::time::Duration) -> Result<DeploymentRecord> {
-    let _maintenance = storage.try_local_maintenance()?;
-    let source = fork_source(directory, parent).await?;
-    let bucket = fork_bucket(storage, keys, &source).await?;
-    let age = now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), block).await?;
-    if age >= grace.as_millis() as i64 { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age / 1000, grace.as_secs()))); }
-    fork_with_tail(directory, bucket.as_ref(), keys, &source, name, Some(block), Vec::new(), 4 << 20).await
+pub async fn fork_at_block(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: Duration) -> Result<DeploymentRecord> {
+    fork_block_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, block, grace).await
+}
+
+pub async fn fork_block_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, block: i64, grace: Duration) -> Result<DeploymentRecord> {
+    let source = fork_source(directory.as_ref(), parent).await?;
+    let source = &source;
+    with_fork_access(directory.as_ref(), storage, keys, source, destination.hosted_task, |access| async move {
+        let age = now_ms() - crate::reference::written_at_ms(access.bucket.as_ref(), &source.storage_prefix(), block).await?;
+        if age >= grace.as_millis() as i64 { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age / 1000, grace.as_secs()))); }
+        fork_with_tail(directory.clone(), storage, access, keys, source, destination, Some(block), Vec::new(), 4 << 20).await
+    }).await
 }
 
 /// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
 /// A time before the checkpoint is a past block's, which `fork_at_block` forks from.
-pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: std::time::Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    let _maintenance = storage.try_local_maintenance()?;
-    let source = fork_source(directory, parent).await?;
+pub async fn fork_at_time(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    fork_time_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, system_time, grace, maximum_message_bytes).await
+}
+
+pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    let source = fork_source(directory.as_ref(), parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
-    let bucket = fork_bucket(storage, keys, &source).await?;
-    if now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
-        return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
-    }
-    let servers = replica_servers(directory, &source).await?;
-    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
-    let material = fork_key(keys, &source).await?;
-    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &material, &source.replica_seal_scope())?;
-    let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
-    fork_with_tail(directory, bucket.as_ref(), keys, &source, name, Some(checkpoint.block), tail, maximum_message_bytes).await
+    let source = &source;
+    with_fork_access(directory.as_ref(), storage, keys, source, destination.hosted_task, |access| async move {
+        if now_ms() - crate::reference::written_at_ms(access.bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
+            return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
+        }
+        let servers = replica_servers(directory.as_ref(), source).await?;
+        let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
+        let material = fork_key(keys, source).await?;
+        let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?, &material, &source.replica_seal_scope())?;
+        let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
+        fork_with_tail(directory.clone(), storage, access, keys, source, destination, Some(checkpoint.block), tail, maximum_message_bytes).await
+    }).await
 }
 
 fn fork_unavailable(name: &str) -> Anomaly {
@@ -429,30 +581,62 @@ async fn fork_key(keys: &dyn KeyService, source: &DeploymentRecord) -> Result<[u
     keys.existing_key(&source.key_id()).await?.ok_or_else(|| fork_unavailable(&source.name))
 }
 
-async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, source: &DeploymentRecord, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    validate_org(&source.org)?;
-    let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
-    child.lineage = source.lineage.clone();
+async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, access: ForkAccess, keys: &dyn KeyService, source: &DeploymentRecord, destination: ForkDestination<'_>, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    let ForkAccess { bucket, io, preparation, maintenance } = access;
+    let org = destination.org.unwrap_or(&source.org);
+    validate_org(org)?;
+    let same_organisation = org == source.org;
+    let mut child = DeploymentRecord::new(destination.name, org, Vec::new(), now_ms());
+    if same_organisation { child.lineage.clone_from(&source.lineage); }
     child.parent = Some(source.id.clone());
     child.engine_pin = source.engine_pin.clone();
     child.log_epoch = source.log_epoch + 1;
     child.storage_namespaces = source.storage_namespaces;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
-    child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
-    let key = fork_key(keys, source).await?;
+    child.ensemble = choose_ensemble(directory.as_ref(), &child, source.ensemble.len()).await?;
+    let source_key = fork_key(keys, source).await?;
+    let selected = at_block.or_else(|| source.checkpoint.map(|checkpoint| checkpoint.block))
+        .ok_or_else(|| fork_unavailable(&source.name))?;
+    crate::archive::require_plain_fork_cut(bucket.clone(), source, &source_key, selected).await?;
+    if tail.iter().any(|envelope| matches!(&envelope.message,
+        rtdb_format::envelope::ReplicaBody::ResolvedTx(tx)
+            if tx.table_data.keys().any(|name| name.split_once('/').is_some_and(|(schema, _)| rtdb_types::TableRef::owned_schema(schema)))
+    )) {
+        return Err(fork_unavailable(&source.name));
+    }
     let child_stream = if tail.is_empty() {
         None
     } else {
         // The first holder claims the next epoch and seals the fork's tail.
         child.epoch = 1;
         crate::logs::renumber_into(&mut tail, rtdb_types::StorageEpoch(child.log_epoch))?;
-        let servers = replica_servers(directory, &child).await?;
+        let servers = replica_servers(directory.as_ref(), &child).await?;
         child.replica_journals.extend(servers.iter().cloned());
         Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
     };
+    let hosted = match preparation {
+        ForkPublication::Hosted(preparation) => {
+            let stage = directory.stage_hosted_fork(child.clone(), preparation).await?;
+            let mut target_io = io.child();
+            crate::store::track_hosted_fork_publications(&mut target_io, directory.clone(), child.id.clone(), preparation.token);
+            Some((stage, preparation.token, target_io))
+        }
+        _ => None,
+    };
     let prepared = async {
-        crate::reference::fork(bucket, &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
-        keys.install(&child.key_id(), key).await?;
+        let bucket = match &hosted {
+            Some((_, _, target_io)) => storage.bucket(target_io.clone()).await?,
+            None => bucket,
+        };
+        let key = if same_organisation {
+            crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), Some(selected)).await?;
+            keys.install(&child.key_id(), source_key).await?;
+            source_key
+        } else {
+            let key = keys.key(&child.key_id()).await?;
+            crate::archive::copy_fork_checkpoint(bucket.clone(), source, &source_key, &child, &key, Some(selected)).await?;
+            key
+        };
         if let Some(stream) = &child_stream {
             let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
             let writer = crate::logs::SealedLog::new(writer, &key, &child.replica_seal_scope())?;
@@ -462,15 +646,38 @@ async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::Ob
         }
         Ok(())
     }.await;
+    io.close_and_wait().await;
+    let prepared = match &hosted {
+        Some((_, region, _)) => prepared.and(crate::store::release_region(directory.as_ref(), &child.id, *region, false).await),
+        None => prepared,
+    };
     let published = match prepared {
-        Ok(()) => publish_fork(directory, source, &child).await,
+        Ok(()) => publish_fork(directory.as_ref(), source, &child, preparation).await,
         Err(error) => Err(ForkPublicationError::Rejected(error)),
     };
     match published {
         Ok(stored) => Ok(stored),
         Err(ForkPublicationError::Uncertain(error)) => Err(error),
         Err(ForkPublicationError::Rejected(error)) => {
-            if let Err(cleanup) = discard_fork(bucket, keys, &child, child_stream.as_ref()).await {
+            let cleanup = if let Some((stage, _, _)) = hosted {
+                async {
+                    if let Some(current) = directory.deployment(&stage.id).await?
+                        .filter(|current| current.lifecycle == Lifecycle::Restoring && current.hosted_fork_stage == stage.hosted_fork_stage)
+                    {
+                        close_hosted_fork(directory.as_ref(), current).await?;
+                    }
+                    Ok(())
+                }.await
+            } else {
+                async {
+                    let io = rtdb_storage::IoRegion::new().child_holding(maintenance.map(|lock| lock as Arc<dyn Send + Sync>));
+                    let bucket = storage.bucket(Arc::clone(&io)).await?;
+                    let result = discard_local_fork(bucket.as_ref(), keys, &child, child_stream.as_ref()).await;
+                    io.close_and_wait().await;
+                    result
+                }.await
+            };
+            if let Err(cleanup) = cleanup {
                 eprintln!("RTDB fork cleanup failed for {}: {cleanup}", child.id);
             }
             Err(error)
@@ -480,21 +687,23 @@ async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::Ob
 
 enum ForkPublicationError { Rejected(Anomaly), Uncertain(Anomaly) }
 
-async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, child: &DeploymentRecord) -> std::result::Result<DeploymentRecord, ForkPublicationError> {
+async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, child: &DeploymentRecord, preparation: ForkPublication) -> std::result::Result<DeploymentRecord, ForkPublicationError> {
     for _ in 0..8 {
         let current = directory.deployment(&source.id).await.map_err(ForkPublicationError::Rejected)?
             .filter(|current| current.can_fork() && current.epoch == source.epoch
                 && current.log_epoch == source.log_epoch && current.storage_prefix() == source.storage_prefix()
                 && current.storage_namespaces == child.storage_namespaces && current.engine_pin == child.engine_pin)
             .ok_or_else(|| ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{} changed while the fork was prepared", source.name))))?;
-        match directory.create_fork(child.clone(), current.version).await {
+        match directory.publish_fork(child.clone(), current.version, Some(preparation)).await {
             Ok(stored) => return Ok(stored),
             Err(error) if error.code == "rtdb.directory/fork-parent-changed" => continue,
             Err(error) => {
                 // Once the write is sent, a transport failure can hide successful publication.
                 match directory.deployment(&child.id).await {
-                    Ok(Some(stored)) if stored.parent == child.parent && stored.name == child.name => return Ok(stored),
-                    Ok(None) if error.code == "rtdb.directory/exists" => return Err(ForkPublicationError::Rejected(error)),
+                    Ok(Some(stored)) if stored.parent == child.parent && stored.name == child.name && stored.hosted_fork_stage.is_none() => return Ok(stored),
+                    Ok(_) if matches!(error.code.as_str(), "rtdb.directory/exists" | "rtdb.directory/lineage-changed" | "rtdb.directory/fork-stage-changed") => {
+                        return Err(ForkPublicationError::Rejected(error));
+                    }
                     _ => return Err(ForkPublicationError::Uncertain(error)),
                 }
             }
@@ -503,10 +712,53 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
     Err(ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{} kept changing while its fork was published", source.name))))
 }
 
-async fn discard_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
+async fn close_hosted_fork(directory: &dyn Directory, mut stage: DeploymentRecord) -> Result<()> {
+    let Some(hosted) = &stage.hosted_fork_stage else { return Ok(()); };
+    let region = hosted.preparation.token;
+    match stage.storage_regions.get_mut(&region) {
+        Some(rtdb_directory::StorageRegion::Remote { closed, publications, .. }) if !publications.is_empty() => *closed = true,
+        Some(rtdb_directory::StorageRegion::Remote { .. }) => { stage.storage_regions.remove(&region); }
+        _ => {}
+    }
+    let version = stage.version;
+    stage.lifecycle = Lifecycle::Deleting;
+    stage.epoch = stage.epoch.checked_add(1).ok_or_else(|| {
+        Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", stage.id))
+    })?;
+    directory.replace_deployment(stage, version).await?;
+    Ok(())
+}
+
+pub(crate) async fn close_abandoned_hosted_fork(directory: &dyn Directory, record: &DeploymentRecord) -> Result<()> {
+    let Some(stage) = &record.hosted_fork_stage else { return Ok(()); };
+    if record.lifecycle != Lifecycle::Restoring { return Ok(()); }
+    let lineage = crate::store::recover_hosted_lineage(directory, &stage.source_lineage).await?;
+    if lineage.preparations().any(|(preparation, _)| preparation == stage.preparation) { return Ok(()); }
+    close_hosted_fork(directory, record.clone()).await
+}
+
+pub(crate) struct ResidenceErasure<'a>(ErasureAuthority<'a>);
+
+enum ErasureAuthority<'a> {
+    Disposing(&'a rtdb_directory::ReferenceDisposal),
+    RejectedFork(&'a str),
+}
+
+impl ResidenceErasure<'_> {
+    pub(crate) fn prefix(&self) -> &str {
+        match self.0 {
+            ErasureAuthority::Disposing(permit) => permit.residence(),
+            ErasureAuthority::RejectedFork(prefix) => prefix,
+        }
+    }
+}
+
+async fn discard_local_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
     let key_removed = keys.destroy(&child.key_id()).await;
     let erase_objects = async {
-        if !crate::reference::erase_deployment(bucket, &child.storage_prefix(), &[]).await? {
+        let prefix = child.storage_prefix();
+        let erasure = ResidenceErasure(ErasureAuthority::RejectedFork(&prefix));
+        if !crate::reference::erase_deployment(bucket, &erasure, &[]).await? {
             return Err(Anomaly::fault("rtdb.multi/fork-cleanup", format!("Storage still contains staged objects for {}", child.id)));
         }
         Ok(())
@@ -717,7 +969,7 @@ async fn settle_cell_move(
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
     let current = record(directory, name).await?;
     if current.lifecycle == Lifecycle::Deleted { return deletion_receipt(current); }
-    let _maintenance = storage.try_local_maintenance()?;
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
     let legacy_namespace = if current.lifecycle == Lifecycle::Deleting && current.storage_namespaces.is_none() {
@@ -746,7 +998,7 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
     await_storage_drain(directory, storage, keys, &fenced).await?;
-    finish_disposal_with_lock(directory, storage, keys, &fenced.id, Some(fenced.incarnation), maximum_message_bytes).await?;
+    finish_disposal_with_lock(directory, storage, keys, &fenced.id, Some(fenced.incarnation), maximum_message_bytes, maintenance).await?;
     let deleted = directory.deployment(&fenced.id).await?.ok_or_else(|| deletion_changed(name))?;
     deletion_receipt(deleted)
 }
@@ -923,7 +1175,14 @@ async fn prepare_cell_move(
     }
     let source_stream = administration_stream(from.directory.as_ref(), &current, maximum_message_bytes).await?;
     let target_stream = administration_stream(to.directory.as_ref(), &arrival, maximum_message_bytes).await?;
-    if target_stream.servers.iter().any(|server| source_stream.servers.contains(server) || current.replica_journals.contains(server)) {
+    let source_journals = source_stream.servers.iter().chain(&current.replica_journals).chain(&current.log_copy_servers);
+    if let Some(legacy) = source_journals.clone().find(|endpoint| endpoint.journal().is_none()) {
+        return Err(unbound_inventory(legacy.address()));
+    }
+    let source_addresses: HashSet<_> = source_journals.clone().map(JournalEndpoint::address).collect();
+    let source_ids: HashSet<_> = source_journals.filter_map(JournalEndpoint::journal).collect();
+    if target_stream.servers.iter().any(|server| source_addresses.contains(server.address())
+        || server.journal().is_some_and(|id| source_ids.contains(id))) {
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-journal", "Cell moves require independent replica journals"));
     }
 
@@ -940,6 +1199,12 @@ async fn prepare_cell_move(
         {
             return Err(conflict());
         }
+        if record.has_live_suffix_pins(now_ms()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
+        }
+        record.checkpoint_suffix_pins.retain(|_, pin| {
+            pin.custody != rtdb_directory::CheckpointSuffixCustody::Capture || pin.archive_sha256.is_some()
+        });
         record.lifecycle = Lifecycle::Moving;
         record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
             Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", record.id))
@@ -959,7 +1224,7 @@ async fn prepare_cell_move(
         }));
         Ok(())
     }).await?;
-    let staged = if let Some(pending) = pending {
+    let mut staged = if let Some(pending) = pending {
         pending
     } else {
         let mut staged = source.clone();
@@ -967,6 +1232,7 @@ async fn prepare_cell_move(
         staged.incarnation = arrival.incarnation;
         staged.ensemble = arrival.ensemble;
         staged.storage_generation = Some(uuid::Uuid::new_v4());
+        staged.recovery_manifest_sha256 = None;
         staged.storage_namespaces = Some(target_binding);
         staged.disposal = None;
         staged.moved_at_ms = None;
@@ -979,8 +1245,13 @@ async fn prepare_cell_move(
         staged.replica_journals = target_stream.servers.iter().cloned().collect();
         staged.move_from = Some(source_stream.servers.clone());
         staged.storage_regions.clear();
+        staged.catalog_readers.clear();
+        staged.catalog_admission_floors.clear();
         staged.checkpoint_recovery = None;
+        staged.serving_replay_capture = None;
         staged.checkpoint_captures.clear();
+        staged.checkpoint_worlds.clear();
+        staged.checkpoint_suffix_pins.clear();
         staged.checkpoint_capture_retirements.clear();
         staged.archive_retirement = None;
         staged.retired_residences.clear();
@@ -994,6 +1265,8 @@ async fn prepare_cell_move(
             });
             if prior.archive_retirement.is_none() {
                 staged.checkpoint_captures.clone_from(&prior.checkpoint_captures);
+                staged.checkpoint_worlds.clone_from(&prior.checkpoint_worlds);
+                staged.checkpoint_suffix_pins.clone_from(&prior.checkpoint_suffix_pins);
                 staged.checkpoint_capture_retirements.clone_from(&prior.checkpoint_capture_retirements);
             }
         }
@@ -1018,12 +1291,23 @@ async fn prepare_cell_move(
     }
 
     if staged.move_from.as_ref() != Some(&source_stream.servers) {
-        return Err(conflict());
+        let previous = staged.move_from.as_ref().expect("a pending transfer has source journals");
+        let source_journals = &source_stream.servers;
+        if !same_transfer_journals(previous, source_journals) {
+            return Err(conflict());
+        }
+        staged = update_installation(to.directory.as_ref(), &staged.id, |record| {
+            if record.version != staged.version { return Err(conflict()); }
+            record.move_from = Some(source_journals.clone());
+            Ok(())
+        }).await?;
     }
     rtdb_logkeeper::seal(&source_stream, source.epoch).await?;
     await_storage_drain(from.directory.as_ref(), from.storage, from.keys, &source).await?;
     crate::store::reconcile_storage_regions(to.directory.as_ref(), to.storage, to.keys, &staged).await?;
-    stage_cell_storage(from, to, &source, &staged, hosted_task).await?;
+    let hosted_lineage = matches!(from.storage, CellStorage::S3 { .. }).then_some(source.lineage.as_str());
+    crate::store::with_source_lineage(from.directory.as_ref(), hosted_lineage, hosted_task.as_ref(),
+        Box::pin(stage_cell_storage(from, to, &source, &staged, hosted_task.clone()))).await?;
 
     rtdb_logkeeper::copy_retained(source_stream, target_stream, source.epoch).await?;
     let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
@@ -1035,6 +1319,15 @@ async fn prepare_cell_move(
         Ok(())
     }).await?;
     Ok((source, prepared))
+}
+
+fn same_transfer_journals(previous: &[JournalEndpoint], source_journals: &[JournalEndpoint]) -> bool {
+    previous.len() == source_journals.len() && previous.iter().zip(source_journals).all(|(stored, source)| {
+        match stored.journal() {
+            Some(id) => source.journal() == Some(id),
+            None => stored.address() == source.address(),
+        }
+    })
 }
 
 async fn stage_cell_storage(
@@ -1060,7 +1353,7 @@ async fn stage_cell_storage(
             return Err(cell_move_conflict(from, to, &staged.name));
         }
         record.storage_regions.insert(region, if local {
-            StorageRegion::Local { archive: None }
+            StorageRegion::Local { archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, }
         } else {
             crate::store::remote_storage_region(None, hosted_task.clone())
         });
@@ -1073,14 +1366,14 @@ async fn stage_cell_storage(
         if source.checkpoint.is_some() && material.is_none() {
             return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
         }
-        let source_bucket = from.storage.bucket(IoRegion::new()).await?;
+        let source_bucket = from.storage.bucket(io.clone()).await?;
         let target_bucket = to.storage.bucket(io.clone()).await?;
         crate::reference::materialize(
             source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
         ).await?;
-        if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, from.keys, IoRegion::new()).await? {
-            archive.materialize(staged, Arc::clone(&target_bucket)).await?;
-        }
+        crate::archive::materialize_serving_archive(
+            from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), hosted_task.as_ref(),
+        ).await?;
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }
@@ -1105,6 +1398,15 @@ pub(crate) async fn update_installation(
     id: &str,
     change: impl Fn(&mut DeploymentRecord) -> Result<()>,
 ) -> Result<DeploymentRecord> {
+    update_installation_under_disposal(directory, id, None, change).await
+}
+
+async fn update_installation_under_disposal(
+    directory: &dyn Directory,
+    id: &str,
+    disposal: Option<&rtdb_directory::ReferenceDisposal>,
+    change: impl Fn(&mut DeploymentRecord) -> Result<()>,
+) -> Result<DeploymentRecord> {
     for _ in 0..8 {
         let current = directory.deployment(id).await?.ok_or_else(|| {
             Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
@@ -1114,7 +1416,11 @@ pub(crate) async fn update_installation(
         if next == current {
             return Ok(current);
         }
-        if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? {
+        let replaced = match disposal {
+            Some(permit) => directory.settle_reference_disposal(permit, next, current.version).await?,
+            None => directory.replace_deployment(next, current.version).await?,
+        };
+        if let Cas::Applied(stored) = replaced {
             return Ok(stored);
         }
     }
@@ -1122,13 +1428,42 @@ pub(crate) async fn update_installation(
 }
 
 pub(crate) async fn administration_stream(directory: &dyn Directory, record: &DeploymentRecord, maximum_message_bytes: usize) -> Result<StreamConfig> {
-    let members = members(directory).await?;
-    let servers: Vec<String> = record.ensemble.iter().map(|id| {
-        members.get(id).map(|member| member.address.clone()).ok_or_else(|| {
-            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/administration-ensemble", format!("Logkeeper {id} is missing from the directory"))
-        })
-    }).collect::<Result<_>>()?;
+    let servers = ensemble_servers(record, &members(directory).await?).map_err(|error| {
+        Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/administration-ensemble",
+            error.message.unwrap_or_else(|| "The administration ensemble is unavailable".into()))
+    })?;
     Ok(StreamConfig { write_quorum: write_quorum(record.ensemble.len()), servers, stream: record.stream("replica"), maximum_message_bytes })
+}
+
+fn unbound_inventory(address: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-identity-missing",
+        format!("Bind the verified journal inventory for the legacy address {address}"))
+}
+
+/// Installs operator-verified journal bindings against the inventory version that was inspected.
+pub async fn bind_journal_inventory(
+    directory: &dyn Directory, id: &str, expected: rtdb_directory::Version,
+    bindings: BTreeMap<String, Vec<JournalEndpoint>>,
+) -> Result<DeploymentRecord> {
+    let changed = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/journal-inventory-changed",
+        format!("Installation {id} has changed since its journal inventory was inspected"));
+    let mut record = directory.deployment(id).await?.ok_or_else(&changed)?;
+    if record.version != expected || record.disposal.is_some() { return Err(changed()); }
+    let legacy: HashSet<_> = record.replica_journals.iter().chain(&record.log_copy_servers)
+        .filter(|endpoint| endpoint.journal().is_none()).map(JournalEndpoint::address).collect();
+    if bindings.len() != legacy.len() || bindings.is_empty() || !legacy.iter().all(|address| bindings.contains_key(*address))
+        || bindings.values().any(|journals| journals.is_empty() || journals.iter().any(|endpoint|
+            endpoint.address().is_empty() || !endpoint.journal().is_some_and(rtdb_types::valid_journal_identity)))
+    {
+        return Err(Anomaly::incorrect("rtdb.multi/journal-inventory", "Supply the verified journal identities and routes for every legacy address"));
+    }
+    let bind = |endpoint: JournalEndpoint| match endpoint {
+        JournalEndpoint::Address(address) => bindings[&address].clone(),
+        bound => vec![bound],
+    };
+    record.replica_journals = record.replica_journals.into_iter().flat_map(&bind).collect();
+    record.log_copy_servers = record.log_copy_servers.into_iter().flat_map(bind).collect();
+    directory.replace_deployment(record, expected).await?.applied().ok_or_else(changed)
 }
 
 /// Accepts serving disposal by fencing this installation in the directory.
@@ -1141,6 +1476,12 @@ async fn begin_disposal_at(directory: &dyn Directory, id: &str, incarnation: Opt
         if incarnation.is_some_and(|expected| expected != record.incarnation) {
             return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "The request names another residence"));
         }
+        if record.has_live_suffix_pins(now_ms()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
+        }
+        record.checkpoint_suffix_pins.retain(|_, pin| {
+            pin.custody != rtdb_directory::CheckpointSuffixCustody::Capture || pin.archive_sha256.is_some()
+        });
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),
@@ -1211,8 +1552,8 @@ pub(crate) async fn finish_disposal_at(
     incarnation: Option<u64>,
     maximum_message_bytes: usize,
 ) -> Result<DisposalReceipt> {
-    let _maintenance = storage.try_local_maintenance()?;
-    finish_disposal_with_lock(directory, storage, keys, id, incarnation, maximum_message_bytes).await
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
+    finish_disposal_with_lock(directory, storage, keys, id, incarnation, maximum_message_bytes, maintenance).await
 }
 
 async fn finish_disposal_with_lock(
@@ -1222,6 +1563,7 @@ async fn finish_disposal_with_lock(
     id: &str,
     incarnation: Option<u64>,
     maximum_message_bytes: usize,
+    maintenance: Option<Arc<std::fs::File>>,
 ) -> Result<DisposalReceipt> {
     let mut fenced = directory.deployment(id).await?.ok_or_else(|| {
         Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
@@ -1274,7 +1616,7 @@ async fn finish_disposal_with_lock(
     if let Some(deadline) = wait_until.filter(|&deadline| now_ms() < deadline) {
         return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/storage-lease-active", format!("The storage write lease expires at Unix milliseconds {deadline}")));
     }
-    let mut stream = if fenced.moved_at_ms.is_some() {
+    let mut stream = if fenced.moved_at_ms.is_some() || fenced.hosted_fork_stage.is_some() {
         StreamConfig {
             write_quorum: write_quorum(fenced.replica_journals.len()),
             servers: Vec::new(),
@@ -1284,7 +1626,8 @@ async fn finish_disposal_with_lock(
     } else {
         administration_stream(directory, &fenced, maximum_message_bytes).await?
     };
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let io = rtdb_storage::IoRegion::new().child_holding(maintenance.map(|lock| lock as Arc<dyn Send + Sync>));
+    let bucket = storage.bucket(io.clone()).await?;
     let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
     if fenced.storage_namespaces.is_none() {
         let configured = configured_cell_storage(directory, &fenced.name).await?;
@@ -1302,29 +1645,43 @@ async fn finish_disposal_with_lock(
     }
     require_storage_namespaces(&fenced, namespaces)?;
     let prefix = crate::reference::key(&fenced.storage_prefix())?;
-    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter()
-        .filter(|record| record.id != fenced.id).collect();
-    crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
     stream.servers.extend(fenced.replica_journals.iter().cloned());
     stream.servers.extend(fenced.log_copy_servers.iter().cloned());
-    if let Some(previous) = &fenced.move_from { stream.servers.extend(previous.iter().cloned()); }
-    stream.servers.sort();
-    stream.servers.dedup();
+    if let Some(previous) = &fenced.move_from {
+        if previous.iter().any(|endpoint| endpoint.journal().is_none()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-identity-missing",
+                "Resume the cell transfer from its source directory to bind the source journal identities"));
+        }
+        stream.servers.extend(previous.iter().cloned());
+    }
+    if !stream.servers.is_empty() {
+        stream.servers = retirement_journals(stream.servers, &members(directory).await?)?;
+    }
+    if matches!(storage, CellStorage::Local { .. }) {
+        crate::store::recover_local_lineage(directory, &fenced.lineage, storage.custody_namespace()?).await?;
+    } else {
+        crate::store::recover_hosted_lineage(directory, &fenced.lineage).await?;
+    }
+    let reference_disposal = directory.begin_reference_disposal(id, fenced.version).await?;
+    let erasure = ResidenceErasure(ErasureAuthority::Disposing(&reference_disposal));
+    let others = deletion_neighbors(directory, &fenced).await?;
+    crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
     stream.write_quorum = write_quorum(stream.servers.len());
     if !stream.servers.is_empty() {
         rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
     }
     let journals_retired_at_ms = now_ms();
     let (signed, serving_inventory) = match storage {
-        CellStorage::Local { .. } => erase_and_sign_disposal(
-            storage, bucket.as_ref(), keys, &fenced, &prefix, &others, namespaces, journals_retired_at_ms,
+        CellStorage::Local { .. } => erase_and_sign_local_disposal(
+            bucket.as_ref(), keys, &fenced, &erasure, &others, namespaces, journals_retired_at_ms,
         ).await?,
         CellStorage::S3 { config } => {
-            let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced).await?;
+            let (first, last) = observe_s3_inventory(directory, config, bucket.as_ref(), &fenced, &erasure, &others).await?;
             let signed = sign_disposal(&fenced, keys, namespaces, DeletionInventory::AllVersionsAndMultipartUploads, Some(first), last).await?;
             (signed, ServingInventory::S3VersionsAndUploads)
         }
     };
+    io.close_and_wait().await;
     let key_withdrawn_at_ms = signed.facts.key_destroyed_at_ms;
     let receipt = DisposalReceipt {
         deployment: fenced.id,
@@ -1336,9 +1693,11 @@ async fn finish_disposal_with_lock(
         serving_prefix_observed_empty_at_ms: now_ms().max(key_withdrawn_at_ms),
         serving_inventory,
     };
-    let deleted = update_installation(directory, id, |record| {
+    let deleted = update_installation_under_disposal(directory, id, Some(&reference_disposal), |record| {
         if record.epoch != receipt.epoch || record.incarnation != receipt.incarnation
-            || record.storage_prefix() != prefix.as_str() || record.storage_namespaces != Some(namespaces) {
+            || record.storage_prefix() != prefix.as_str() || record.storage_namespaces != Some(namespaces)
+            || record.disposal.is_none() && (record.replica_journals != fenced.replica_journals
+                || record.log_copy_servers != fenced.log_copy_servers || record.move_from != fenced.move_from) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} changed during disposal")));
         }
         match record.lifecycle {
@@ -1351,12 +1710,14 @@ async fn finish_disposal_with_lock(
                 {
                     return Err(deletion_changed(id));
                 }
+                record.replica_journals.clone_from(&receipt.journals);
                 record.disposal = Some(Box::new(receipt.clone()));
                 record.deletion_record = Some(Box::new(signed.clone()));
                 record.lifecycle = Lifecycle::Deleted;
                 Ok(())
             }
             Lifecycle::Deleted if record.moved_at_ms.is_some() => {
+                record.replica_journals.clone_from(&receipt.journals);
                 record.disposal = Some(Box::new(receipt.clone()));
                 Ok(())
             }
@@ -1366,24 +1727,38 @@ async fn finish_disposal_with_lock(
     deleted.disposal.map(|receipt| *receipt).ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
 }
 
-async fn erase_and_sign_disposal(
-    storage: &CellStorage,
+fn retirement_journals(
+    inventory: Vec<JournalEndpoint>, members: &BTreeMap<MemberId, MemberRecord>,
+) -> Result<Vec<JournalEndpoint>> {
+    let mut journals = BTreeMap::<String, JournalEndpoint>::new();
+    for endpoint in inventory {
+        let id = endpoint.journal().ok_or_else(|| unbound_inventory(endpoint.address()))?.to_owned();
+        let endpoint = members.get(&MemberId(id.clone())).filter(|member| member.role == MemberRole::Logkeeper)
+            .map_or(endpoint, journal_endpoint);
+        if let Some(other) = journals.insert(id, endpoint.clone()) && other != endpoint {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-route-ambiguous",
+                format!("The retired journal has conflicting routes {} and {}", other.address(), endpoint.address())));
+        }
+    }
+    Ok(journals.into_values().collect())
+}
+
+async fn erase_and_sign_local_disposal(
     bucket: &dyn rtdb_storage::ObjectStore,
     keys: &dyn KeyService,
     fenced: &DeploymentRecord,
-    prefix: &rtdb_storage::ObjectKey,
+    erasure: &ResidenceErasure<'_>,
     others: &[DeploymentRecord],
     namespaces: StorageNamespaces,
     journals_retired_at_ms: i64,
 ) -> Result<(DeletionRecord, ServingInventory)> {
     // Its forks keep what they share with it: those objects are copied into them before it goes.
-    if !crate::reference::erase_deployment(bucket, prefix.as_str(), others).await? {
+    if !crate::reference::erase_deployment(bucket, erasure, others).await? {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-prefix", format!("Installation {} still has serving objects", fenced.id)));
     }
-    let serving_inventory = storage.purge_serving_inventory(prefix).await?;
     let objects_erased_at_ms = now_ms().max(journals_retired_at_ms);
     let signed = sign_disposal(fenced, keys, namespaces, DeletionInventory::CurrentObjects, None, objects_erased_at_ms).await?;
-    Ok((signed, serving_inventory))
+    Ok((signed, ServingInventory::LocalDirectory))
 }
 
 async fn sign_disposal(
@@ -1455,8 +1830,9 @@ async fn advance_observation(directory: &dyn Directory, deployment: &DeploymentR
     Ok(())
 }
 
-async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, config: &rtdb_s3::S3Config,
-                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord) -> Result<(i64, i64)> {
+async fn observe_s3_inventory(directory: &dyn Directory, config: &rtdb_s3::S3Config,
+                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord,
+                             erasure: &ResidenceErasure<'_>, others: &[DeploymentRecord]) -> Result<(i64, i64)> {
     let first_empty_at_ms = match deployment.deletion_observation {
         Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms }) => {
             if first_empty_at_ms < 0 || last_empty_at_ms < s3_write_lease_horizon(first_empty_at_ms) || last_empty_at_ms > now_ms() {
@@ -1466,8 +1842,10 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
         }
         Some(DeletionObservation::Empty { observed_at_ms }) => observed_at_ms,
         Some(DeletionObservation::Fenced { .. }) => {
-            let others = deletion_neighbors(directory, deployment).await?;
-            erase_inventory(storage, bucket, deployment, &others).await?;
+            crate::reference::preserve_residence(bucket, erasure, others).await?;
+            let prefix = rtdb_storage::ObjectKey::new(erasure.prefix())?;
+            CellStorage::s3_inventory(config).await?.purge(&prefix).await?;
+            if !bucket.list(Some(&prefix)).await?.is_empty() { return Err(deletion_incomplete(deployment)); }
             let observed_at_ms = now_ms();
             advance_observation(directory, deployment, Some(DeletionObservation::Empty { observed_at_ms })).await?;
             return Err(observation_pending(observed_at_ms));
@@ -1476,10 +1854,9 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
     };
     if now_ms() < s3_write_lease_horizon(first_empty_at_ms) { return Err(observation_pending(first_empty_at_ms)); }
 
-    let cell = rtdb_storage::ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
-    let inventory = config.versioned_inventory(&cell, &BTreeMap::new()).await?;
-    let prefix = rtdb_storage::ObjectKey::new(deployment.storage_prefix())?;
-    if !inventory.is_empty(&prefix).await? {
+    let inventory = CellStorage::s3_inventory(config).await?;
+    let prefix = rtdb_storage::ObjectKey::new(erasure.prefix())?;
+    if !inventory.is_empty(&prefix).await? || !bucket.list(Some(&prefix)).await?.is_empty() {
         advance_observation(directory, deployment, Some(DeletionObservation::Fenced { leases_expire_at_ms: now_ms() })).await?;
         return Err(deletion_incomplete(deployment));
     }
@@ -1493,12 +1870,6 @@ fn deletion_incomplete(deployment: &DeploymentRecord) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name))
 }
 
-async fn erase_inventory(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord]) -> Result<DeletionInventory> {
-    let storage_prefix = deployment.storage_prefix();
-    if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? { return Err(deletion_incomplete(deployment)); }
-    storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await
-}
-
 /// A saved replica prefix that can be passed to the offline verifier.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AuditAnchor {
@@ -1508,11 +1879,26 @@ pub struct AuditAnchor {
     pub digest: String,
 }
 
+/// Acceptance-stage coordinates from one retained replica record.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AuditAcceptanceStage {
+    pub replica_offset: i64,
+    pub source_position: i64,
+    pub term: i64,
+    pub ordered_at_micros: i64,
+    pub staging_clock_upper_micros: i64,
+    pub cutoff_micros: i64,
+}
+
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AuditReport {
     pub records: usize,
     pub transactions: usize,
+    #[serde(default)]
+    pub retained_acceptance_stages: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_retained_acceptance_stage: Option<AuditAcceptanceStage>,
     pub highest_term: i64,
     pub violations: Vec<String>,
     #[serde(default)]
@@ -1559,6 +1945,17 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
             report.highest_term = report.highest_term.max(envelope.term.0);
             if let ReplicaBody::ResolvedTx(tx) = &envelope.message {
                 report.transactions += 1;
+                if let Some(stage) = tx.checked_acceptance_stage()? {
+                    report.retained_acceptance_stages += 1;
+                    report.last_retained_acceptance_stage = Some(AuditAcceptanceStage {
+                        replica_offset: record.metadata.offset.0,
+                        source_position: stage.source_position.0,
+                        term: envelope.term.0,
+                        ordered_at_micros: stage.ordered_at.0,
+                        staging_clock_upper_micros: stage.clock_upper.0,
+                        cutoff_micros: stage.cutoff.0,
+                    });
+                }
                 for (what, value, last) in [("transaction id", tx.tx_id, &mut last_tx), ("system time", tx.system_time_micros, &mut last_time), ("source position", tx.src_msg_id, &mut last_source)] {
                     if let Some(value) = value {
                         if value <= *last { report.violations.push(format!("position {}: {what} {value} does not rise past {}", record.metadata.offset.0, *last)); }
@@ -1664,6 +2061,8 @@ pub struct ControllerOptions {
     pub interval: Duration,
     pub grace: Duration,
     pub rebalance_moves: usize,
+    pub load_limits: crate::load::LoadLimits,
+    pub read_width: Option<crate::read_width::ReadWidthOptions>,
     /// Consecutive failed probes after which a node is confirmed dead, ahead of its lease.
     pub suspicion_probes: u32,
     pub probe_timeout: Duration,
@@ -1672,43 +2071,60 @@ pub struct ControllerOptions {
 }
 
 impl Default for ControllerOptions {
-    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
+    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, load_limits: Default::default(), read_width: None, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
 }
 
-pub struct FailedMemberProbe { endpoint: String, consecutive: u32 }
+pub struct FailedMemberProbe { control: String, pgwire: String, consecutive: u32 }
 
-/// Probes every live node's agent, and confirms dead those that failed `suspicion_probes` probes in a row (`ConfirmSuspicion`).
+impl FailedMemberProbe {
+    fn matches(&self, member: &MemberRecord) -> bool {
+        member.control_address.as_deref() == Some(self.control.as_str()) && member.address == self.pgwire
+    }
+}
+
+/// Probes every live node's control and pgwire endpoints and confirms consecutive failures for the same endpoint pair.
 /// Safety never depends on the verdict: a wrongly confirmed node's writes are already fenced by the epoch its successor claims.
 pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeMap<MemberId, FailedMemberProbe>, options: &ControllerOptions) -> Result<usize> {
     use futures::StreamExt;
 
+    if options.suspicion_probes == 0 { return Ok(0); }
     let now = now_ms();
     let mut members = directory.members().await?;
     members.retain(|member| {
         let probe = member.role == MemberRole::Node && member.is_live(now) && member.control_address.is_some();
-        if !probe || failures.get(&member.id).is_some_and(|failure| Some(&failure.endpoint) != member.control_address.as_ref()) {
+        if !probe || failures.get(&member.id).is_some_and(|failure| !failure.matches(member)) {
             failures.remove(&member.id);
         }
         probe
     });
     let mut probes = std::pin::pin!(futures::stream::iter(members).map(|member| async move {
         let address = member.control_address.as_deref().expect("members without control addresses were filtered");
-        let answered = matches!(control::call(address, &Request::Ping, options.probe_timeout, &options.control).await, Ok(Response::Done));
-        (member, answered)
+        match control::ping(address, options.probe_timeout, &options.control).await {
+            Ok(overflows) => {
+                let pgwire_ok = crate::gateway::probe_pgwire(&member.address, options.probe_timeout, overflows.is_some()).await;
+                let crowded = if !pgwire_ok && let Some(before) = overflows {
+                    matches!(control::ping(address, options.probe_timeout, &options.control).await, Ok(Some(after)) if before != after)
+                } else { false };
+                (member, true, pgwire_ok || crowded)
+            }
+            Err(_) => (member, false, false),
+        }
     }).buffer_unordered(CONCURRENT_SUSPICION_PROBES));
     let mut confirmed = 0;
-    while let Some((member, answered)) = probes.next().await {
-        if answered { failures.remove(&member.id); continue; }
-        let failure = failures.entry(member.id.clone()).or_insert_with(|| FailedMemberProbe {
-            endpoint: member.control_address.clone().expect("the member was probed at this address"),
-            consecutive: 0,
-        });
-        failure.consecutive = failure.consecutive.saturating_add(1);
-        if failure.consecutive >= options.suspicion_probes {
+    while let Some((member, control_ok, pgwire_ok)) = probes.next().await {
+        let previous = failures.get(&member.id);
+        let consecutive = crate::member_probe::failed_rounds(previous.map_or(0, |probe| probe.consecutive),
+            previous.is_some_and(|probe| probe.matches(&member)), control_ok, pgwire_ok);
+        if consecutive == 0 { failures.remove(&member.id); continue; }
+        let failure = FailedMemberProbe {
+            control: member.control_address.clone().expect("the member was probed at this address"),
+            pgwire: member.address.clone(), consecutive,
+        };
+        if consecutive >= options.suspicion_probes {
             // The suspect may still be renewing its lease, so the confirmation re-reads and retries rather than losing to a renewal.
             let mut current = member.clone();
             for _ in 0..8 {
-                if matches!(current.state, MemberState::Dead | MemberState::Retired) || current.control_address != member.control_address { break; }
+                if matches!(current.state, MemberState::Dead | MemberState::Retired) || !failure.matches(&current) { break; }
                 let mut dead = current.clone();
                 dead.state = MemberState::Dead;
                 match directory.replace_member(dead, current.version).await? {
@@ -1718,6 +2134,8 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
                 }
             }
             failures.remove(&member.id);
+        } else {
+            failures.insert(member.id, failure);
         }
     }
     Ok(confirmed)
@@ -1725,13 +2143,24 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
 
 pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOptions, cancellation: CancellationToken) {
     let mut failures = BTreeMap::new();
+    let mut samples = crate::load::LoadSamples::default();
+    let mut read_width = crate::read_width::ReadWidthScaler::default();
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(options.interval) => {
                 let _ = reap_members(directory.as_ref(), options.grace).await;
                 if options.suspicion_probes > 0 { let _ = confirm_suspicions(directory.as_ref(), &mut failures, &options).await; }
-                if options.rebalance_moves > 0 { let _ = rebalance(directory.as_ref(), options.rebalance_moves, &options.control).await; }
+                if let Some(policy) = options.read_width {
+                    let _ = read_width.adjust(directory.as_ref(), policy, &options.control, options.probe_timeout).await;
+                }
+                if options.rebalance_moves > 0 {
+                    if options.load_limits.enabled() {
+                        let _ = crate::load::rebalance(directory.as_ref(), options.rebalance_moves, options.load_limits, &options.control, &mut samples).await;
+                    } else {
+                        let _ = rebalance(directory.as_ref(), options.rebalance_moves, &options.control).await;
+                    }
+                }
             }
         }
     }
@@ -1837,8 +2266,37 @@ mod tests {
     use rtdb_directory::MemoryDirectory;
     use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 
-    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, create_deployment, delete_deployment, erase_and_sign_disposal};
+    use super::{CellStorage, DeploymentRecord, Directory, ErasureAuthority, KeyService, Lifecycle, ResidenceErasure, create_deployment, delete_deployment, erase_and_sign_local_disposal};
     use crate::keys::LocalKeyService;
+
+    async fn publish_test_fork_cut(
+        directory: &dyn Directory, bucket: &crate::reference::Bucket, mut record: DeploymentRecord,
+        keys: &LocalKeyService, block: i64,
+    ) -> DeploymentRecord {
+        use rtdb_format::{block::proto, catalog::BlockCatalog, keys::block_key};
+        use rtdb_types::{BlockIndex, ReplicaPosition, SourcePosition, StorageEpoch};
+
+        let root = format!("{}/{}", record.storage_prefix(), crate::archive::checkpoint_storage_root().unwrap());
+        let store = crate::reference::PrefixedStore::new(bucket.clone(), root);
+        crate::store::check_root(&store, &record.id, true).await.unwrap();
+        let packed = crate::packing::PackingStore::open(std::sync::Arc::new(store), crate::packing::PackDiscovery::List).await.unwrap();
+        let material = keys.key(&record.key_id()).await.unwrap();
+        let plaintext = crate::store::EncryptingStore::new(packed, &material).unwrap();
+        let epoch = StorageEpoch(record.log_epoch);
+        let mut catalog = BlockCatalog::from_proto(proto::Block {
+            block_index: Some(block),
+            boundary_replica_msg_id: Some(ReplicaPosition::from_epoch_offset(epoch, 0).unwrap().0),
+            latest_processed_msg_id: Some(SourcePosition::from_epoch_offset(epoch, 0).unwrap().0),
+            latest_completed_tx: Some(proto::TxKey { tx_id: Some(0), system_time: Some(1) }),
+            ..Default::default()
+        }).unwrap();
+        plaintext.put(&ObjectKey::new(block_key(BlockIndex(block)).unwrap()).unwrap(), catalog.encode_for_publication().into()).await.unwrap();
+        record.checkpoint = Some(rtdb_directory::Checkpoint {
+            block, boundary: 0, source: 0, system_time: 1, root_sha256: catalog.publication_sha256(),
+        });
+        let version = record.version;
+        directory.replace_deployment(record, version).await.unwrap().applied().unwrap()
+    }
 
     #[tokio::test]
     async fn a_new_deployment_rejects_an_organisation_with_multiple_path_components() {
@@ -1849,8 +2307,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_deletion_and_fork_retry_before_mutating_storage_when_maintenance_is_active() {
+    async fn retirement_needs_versioned_custody_for_every_legacy_address() {
+        use super::{BTreeMap, JournalEndpoint, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, bind_journal_inventory, retirement_journals};
+
+        let address = "127.0.0.1:7654";
+        let replacement = MemberRecord {
+            id: MemberId::fresh(), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
+            availability_zone: "local".into(), engine_version: String::new(), lease_expires_at_ms: i64::MAX,
+            state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::default(),
+            storage_namespaces: None, version: 1,
+        };
+        let members = BTreeMap::from([(replacement.id.clone(), replacement)]);
         let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.replica_journals.insert(address.into());
+        let record = directory.create_deployment(record).await.unwrap();
+        let refused = retirement_journals(record.replica_journals.iter().cloned().collect(), &members).unwrap_err();
+        assert_eq!(refused.code, "rtdb.multi/journal-identity-missing");
+
+        let journals = [7655, 7656].map(|port| JournalEndpoint::Member {
+            address: format!("127.0.0.1:{port}"), journal: MemberId::fresh().0,
+        });
+        let bindings = BTreeMap::from([(address.to_owned(), journals.to_vec())]);
+        let stale = bind_journal_inventory(directory.as_ref(), &record.id, record.version + 1, bindings.clone()).await.unwrap_err();
+        assert_eq!(stale.code, "rtdb.multi/journal-inventory-changed");
+        let bound = bind_journal_inventory(directory.as_ref(), &record.id, record.version, bindings).await.unwrap();
+        let admitted = retirement_journals(bound.replica_journals.into_iter().collect(), &members).unwrap();
+        assert_eq!(admitted.into_iter().collect::<std::collections::BTreeSet<_>>(), journals.into_iter().collect());
+    }
+
+    #[test]
+    fn a_staged_copy_can_follow_a_journal_to_its_new_route() {
+        use super::{JournalEndpoint, MemberId, same_transfer_journals};
+
+        let journal = MemberId::fresh().0;
+        let previous = JournalEndpoint::Member { address: "127.0.0.1:7654".into(), journal: journal.clone() };
+        let rerouted = JournalEndpoint::Member { address: "127.0.0.1:7655".into(), journal };
+        let replacement = JournalEndpoint::Member { address: previous.address().into(), journal: MemberId::fresh().0 };
+        assert!(same_transfer_journals(&[previous.clone()], &[rerouted.clone()]));
+        assert!(!same_transfer_journals(&[previous.clone()], &[replacement]));
+        assert!(!same_transfer_journals(&[previous.address().into()], &[rerouted]));
+    }
+
+    #[tokio::test]
+    async fn local_deletion_and_fork_retry_before_mutating_storage_when_maintenance_is_active() {
+        let directory: std::sync::Arc<dyn Directory> = MemoryDirectory::new();
         let data = tempfile::tempdir().unwrap();
         let storage = CellStorage::Local { root: data.path().join("objects") };
         let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
@@ -1860,7 +2361,7 @@ mod tests {
 
         let deletion = delete_deployment(directory.as_ref(), &storage, &keys, "shop", 4 << 20).await.unwrap_err();
         assert_eq!(deletion.code, "rtdb.multi/storage-maintenance-busy");
-        let fork = super::fork_at_block(directory.as_ref(), &storage, &keys, "shop", "fork", 0, std::time::Duration::from_secs(60)).await.unwrap_err();
+        let fork = super::fork_at_block(&directory, &storage, &keys, "shop", "fork", 0, std::time::Duration::from_secs(60)).await.unwrap_err();
         assert_eq!(fork.code, "rtdb.multi/storage-maintenance-busy");
         assert_eq!(directory.deployment(&deployment.id).await.unwrap(), Some(deployment.clone()));
         assert!(directory.deployment_by_name("fork").await.unwrap().is_none());
@@ -1868,6 +2369,93 @@ mod tests {
 
         drop(maintenance);
         assert!(storage.try_local_maintenance().unwrap().is_some());
+    }
+
+    struct DisposalTraceStore<'a> {
+        inner: &'a dyn ObjectStore,
+        effects: parking_lot::Mutex<Vec<(&'static str, String)>>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for DisposalTraceStore<'_> {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+            self.inner.head(key).await
+        }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            self.inner.get(key).await
+        }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+            self.inner.get_range(key, range).await
+        }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+            self.inner.put(key, bytes).await?;
+            self.effects.lock().push(("copy-fork", key.to_string()));
+            Ok(())
+        }
+        async fn put_file(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<()> {
+            self.inner.put_file(key, path).await?;
+            self.effects.lock().push(("copy-fork", key.to_string()));
+            Ok(())
+        }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
+            self.inner.list(directory).await
+        }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+            self.inner.delete(key).await?;
+            assert!(matches!(self.inner.head(key).await, Err(rtdb_storage::Error::MissingObject(_))));
+            self.effects.lock().push(("erase-residence", key.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn local_disposal_records_copy_and_removal_of_each_publication() {
+        let data = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
+        let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+        let directory = MemoryDirectory::new();
+        let mut source = DeploymentRecord::new("source", "acme", Vec::new(), 0);
+        let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
+        source.storage_namespaces = Some(namespaces);
+        let source = directory.create_deployment(source).await.unwrap();
+        let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
+        let source_prefix = source.storage_prefix();
+        let source_store = format!("{source_prefix}/v06");
+        for name in ["old", "shared"] {
+            let key = ObjectKey::new(format!("{source_store}/{name}")).unwrap();
+            bucket.put(&key, Bytes::from_static(name.as_bytes())).await.unwrap();
+        }
+
+        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
+        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let fork_store = format!("{}/v06", child.storage_prefix());
+        for name in ["old", "shared"] {
+            let owned = ObjectKey::new(format!("{fork_store}/{name}")).unwrap();
+            assert!(matches!(bucket.head(&owned).await, Err(rtdb_storage::Error::MissingObject(_))));
+        }
+        let fenced = super::begin_disposal(directory.as_ref(), &source.id).await.unwrap();
+        let permit = directory.begin_reference_disposal(&fenced.id, fenced.version).await.unwrap();
+        assert_eq!(permit.residence(), source_prefix);
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
+        let watched = DisposalTraceStore { inner: bucket.as_ref(), effects: Default::default() };
+        let (proof, _) = erase_and_sign_local_disposal(
+            &watched, &keys, &fenced, &erasure, &[child], namespaces, 0,
+        ).await.unwrap();
+        assert!(proof.facts.verified_empty);
+        for name in ["old", "shared"] {
+            let copied = ObjectKey::new(format!("{fork_store}/{name}")).unwrap();
+            assert_eq!(bucket.get(&copied).await.unwrap(), name.as_bytes());
+        }
+        let effects: Vec<_> = watched.effects.into_inner().into_iter()
+            .filter(|(_, path)| path.ends_with("/old") || path.ends_with("/shared"))
+            .collect();
+        assert_eq!(effects.len(), 4, "each publication is copied and removed once");
+        if let Some(path) = std::env::var_os("RTDB_RESIDENCE_DISPOSAL_TRACE_PATH") {
+            let trace = serde_json::json!({ "source_store": source_store, "fork_store": fork_store, "effects": effects });
+            std::fs::write(path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+        }
     }
 
     struct RetainingStore<'a>(&'a MemoryStore);
@@ -1884,25 +2472,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hosted_fork_survives_restart_until_its_preparation_has_drained() {
+        use rtdb_directory::{ForkPreparation, LineageChange};
+
+        let root = tempfile::tempdir().unwrap();
+        MemoryDirectory::initialize(root.path()).unwrap();
+        let directory = MemoryDirectory::open(root.path()).unwrap();
+        let parent = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let mut child = DeploymentRecord::new("preview", "acme", vec![], 0);
+        child.parent = Some(parent.id.clone());
+        child.lineage.clone_from(&parent.lineage);
+        let preparation = ForkPreparation { token: uuid::Uuid::new_v4(), generation: 0 };
+        directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
+        let stage = directory.stage_hosted_fork(child.clone(), preparation).await.unwrap();
+        drop(directory);
+
+        let directory = MemoryDirectory::open(root.path()).unwrap();
+        let stage = directory.deployment(&stage.id).await.unwrap().unwrap();
+        super::close_abandoned_hosted_fork(directory.as_ref(), &stage).await.unwrap();
+        assert_eq!(directory.deployment(&stage.id).await.unwrap().as_ref(), Some(&stage));
+        directory.change_lineage(&parent.lineage, LineageChange::ReleaseFork { preparation }).await.unwrap();
+        super::close_abandoned_hosted_fork(directory.as_ref(), &stage).await.unwrap();
+
+        let closed = directory.deployment(&stage.id).await.unwrap().unwrap();
+        assert_eq!(closed.lifecycle, Lifecycle::Deleting);
+        assert_eq!(closed.storage_prefix(), child.storage_prefix());
+        assert_eq!(closed.hosted_fork_stage, stage.hosted_fork_stage);
+        assert!(closed.storage_regions.is_empty());
+        assert!(directory.deployment_by_name(&child.name).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn hosted_disposal_materializes_inherited_objects_before_provider_erasure() {
+        use crate::reference::{fork, preserve_residence};
+
+        let bucket = MemoryStore::default();
+        let directory = MemoryDirectory::new();
+        let mut parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let inherited = DeploymentRecord::new("preview", "acme", vec![], 0);
+        let shadowed = DeploymentRecord::new("shadowed-preview", "acme", vec![], 0);
+        let source = ObjectKey::new(format!("{}/v06/rows", parent.storage_prefix())).unwrap();
+        let inherited_copy = ObjectKey::new(format!("{}/v06/rows", inherited.storage_prefix())).unwrap();
+        let shadow = ObjectKey::new(format!("{}/v06/rows", shadowed.storage_prefix())).unwrap();
+        let released = ObjectKey::new(format!("{}/v06/~garbage/10-removed", parent.storage_prefix())).unwrap();
+        bucket.put(&source, Bytes::from_static(b"parent")).await.unwrap();
+        bucket.put(&released, Bytes::from_static(b"collected release marker")).await.unwrap();
+        for child in [&inherited, &shadowed] {
+            fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        }
+        bucket.put(&shadow, Bytes::from_static(b"shadow")).await.unwrap();
+        bucket.delete(&released).await.unwrap();
+        parent.lifecycle = Lifecycle::Deleting;
+        let parent = directory.create_deployment(parent).await.unwrap();
+        let permit = directory.begin_reference_disposal(&parent.id, parent.version).await.unwrap();
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
+        let children = [inherited, shadowed];
+
+        preserve_residence(&bucket, &erasure, &children).await.unwrap();
+        assert_eq!(bucket.get(&source).await.unwrap(), Bytes::from_static(b"parent"));
+        assert_eq!(bucket.get(&inherited_copy).await.unwrap(), Bytes::from_static(b"parent"));
+        assert_eq!(bucket.get(&shadow).await.unwrap(), Bytes::from_static(b"shadow"));
+
+        bucket.delete(&source).await.unwrap();
+        preserve_residence(&bucket, &erasure, &children).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_disposal_refuses_an_unreadable_declared_source_before_purging_the_inventory() {
+        let bucket = MemoryStore::default();
+        let directory = MemoryDirectory::new();
+        let mut parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let child = DeploymentRecord::new("preview", "acme", vec![], 0);
+        let source = ObjectKey::new(format!("{}/v06/rows", parent.storage_prefix())).unwrap();
+        let unrelated = ObjectKey::new(format!("{}/v06/~local-only", parent.storage_prefix())).unwrap();
+        bucket.put(&source, Bytes::from_static(b"parent")).await.unwrap();
+        crate::reference::fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        bucket.put(&unrelated, Bytes::from_static(b"untouched")).await.unwrap();
+        bucket.delete(&source).await.unwrap();
+        parent.lifecycle = Lifecycle::Deleting;
+        parent.deletion_observation = Some(rtdb_directory::DeletionObservation::Fenced { leases_expire_at_ms: 0 });
+        let parent = directory.create_deployment(parent).await.unwrap();
+        let permit = directory.begin_reference_disposal(&parent.id, parent.version).await.unwrap();
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
+        let config = rtdb_s3::S3Config::new("");
+
+        let error = super::observe_s3_inventory(directory.as_ref(), &config, &bucket, &parent, &erasure, &[child]).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.storage/missing-object");
+        assert!(error.to_string().contains(source.as_str()));
+        assert_eq!(bucket.get(&unrelated).await.unwrap(), Bytes::from_static(b"untouched"));
+        assert_eq!(directory.deployment(&parent.id).await.unwrap().unwrap().deletion_observation, parent.deletion_observation);
+    }
+
+    #[tokio::test]
     async fn deletion_can_retry_and_keeps_the_key_if_the_prefix_is_still_populated() {
         let data = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(data.path()).unwrap();
-        let storage = CellStorage::Local { root: data.path().join("objects") };
         let mut deployment = DeploymentRecord::new("shop", "acme", vec![], 0);
         deployment.lifecycle = Lifecycle::Deleting;
         let key = keys.key(&deployment.key_id()).await.unwrap();
         let bucket = MemoryStore::default();
         let namespaces = super::storage_namespaces(&bucket, &keys).await.unwrap();
         deployment.storage_namespaces = Some(namespaces);
-        let prefix = ObjectKey::new(deployment.storage_prefix()).unwrap();
+        let directory = MemoryDirectory::new();
+        let deployment = directory.create_deployment(deployment).await.unwrap();
+        let permit = directory.begin_reference_disposal(&deployment.id, deployment.version).await.unwrap();
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
         let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
-        let error = erase_and_sign_disposal(&storage, &RetainingStore(&bucket), &keys, &deployment, &prefix, &[], namespaces, 0).await.unwrap_err();
+        let error = erase_and_sign_local_disposal(&RetainingStore(&bucket), &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/disposal-prefix");
         assert_eq!(keys.key(&deployment.key_id()).await.unwrap(), key);
 
-        let (proof, _) = erase_and_sign_disposal(&storage, &bucket, &keys, &deployment, &prefix, &[], namespaces, 0).await.unwrap();
+        let (proof, _) = erase_and_sign_local_disposal(&bucket, &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap();
         assert!(proof.facts.verified_empty);
         assert!(bucket.list(Some(&ObjectKey::new(deployment.storage_prefix()).unwrap())).await.unwrap().is_empty());
         assert_eq!(keys.existing(&deployment.key_id()).await.unwrap_err().code, "rtdb.multi/key-destroyed");
@@ -1919,6 +2601,7 @@ mod tests {
         let mut source = DeploymentRecord::new("shop", "acme", vec![], 0);
         source.storage_namespaces = Some(super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
         let source = directory.create_deployment(source).await.unwrap();
+        let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
         let key = keys.key(&source.key_id()).await.unwrap();
         let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
@@ -1926,7 +2609,9 @@ mod tests {
         let mut updated = source.clone();
         updated.read_width = 2;
         let updated = directory.replace_deployment(updated, source.version).await.unwrap().applied().unwrap();
-        let child = super::fork_with_tail(directory.as_ref(), bucket.as_ref(), &keys, &source, "child", None, Vec::new(), 4 << 20).await.unwrap();
+        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source,
+                super::ForkDestination { name: "child", org: None, hosted_task: None }, None, Vec::new(), 4 << 20)).await.unwrap();
         assert_eq!(keys.existing(&child.key_id()).await.unwrap(), key);
         let before = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
 
@@ -1934,7 +2619,9 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         deleting.epoch += 1;
         directory.replace_deployment(deleting, updated.version).await.unwrap().applied().unwrap();
-        let error = super::fork_with_tail(directory.as_ref(), bucket.as_ref(), &keys, &updated, "refused", None, Vec::new(), 4 << 20).await.unwrap_err();
+        let error = super::with_fork_access(directory.as_ref(), &storage, &keys, &updated, None, |access|
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &updated,
+                super::ForkDestination { name: "refused", org: None, hosted_task: None }, None, Vec::new(), 4 << 20)).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/fork-unavailable");
         assert!(directory.deployment_by_name("refused").await.unwrap().is_none());
         let after = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
@@ -1943,6 +2630,64 @@ mod tests {
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "key")
                 && entry.metadata().unwrap().len() == crate::keys::KEY_BYTES as u64).count();
         assert_eq!(live_keys, 2);
+    }
+
+    #[tokio::test]
+    async fn disposal_restart_copies_live_referrers_and_rejects_an_old_fork_preparation() {
+        let data = tempfile::tempdir().unwrap();
+        let state = data.path().join("directory");
+        std::fs::create_dir(&state).unwrap();
+        MemoryDirectory::initialize(&state).unwrap();
+        let directory = MemoryDirectory::open(&state).unwrap();
+        let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
+        let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+        let mut source = DeploymentRecord::new("source", "acme", Vec::new(), 0);
+        let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
+        source.storage_namespaces = Some(namespaces);
+        let source = directory.create_deployment(source).await.unwrap();
+        let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
+        let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
+        let bytes = Bytes::from_static(b"rows");
+        bucket.put(&object, bytes.clone()).await.unwrap();
+
+        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
+        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let destination = super::ForkDestination { name: "grandchild", org: None, hosted_task: None };
+        let old_generation = directory.lineage_state(&child.lineage).await.unwrap().open_generation().unwrap();
+        let preparation = super::ForkPublication::Remote { generation: old_generation };
+        let mut staged = DeploymentRecord::new(destination.name, &child.org, Vec::new(), 0);
+        staged.parent = Some(child.id.clone());
+        staged.lineage.clone_from(&child.lineage);
+        staged.storage_namespaces = child.storage_namespaces;
+        crate::reference::fork(bucket.as_ref(), &child.storage_prefix(), &staged.storage_prefix(), None).await.unwrap();
+
+        let fenced = super::begin_disposal(directory.as_ref(), &source.id).await.unwrap();
+        directory.begin_reference_disposal(&fenced.id, fenced.version).await.unwrap();
+        drop(directory);
+        let directory = MemoryDirectory::open(&state).unwrap();
+        let restarted = directory.lineage_state(&child.lineage).await.unwrap();
+        assert_eq!(restarted.open_generation(), None, "a restarted directory retains the disposal cut");
+        super::finish_disposal(directory.as_ref(), &storage, &keys, &source.id, 4 << 20).await.unwrap();
+        assert_eq!(directory.lineage_state(&child.lineage).await.unwrap().open_generation(), Some(old_generation + 1),
+            "the durable receipt reopens its disposal generation");
+
+        let stale = super::publish_fork(directory.as_ref(), &child, &staged, preparation).await;
+        assert!(matches!(stale, Err(super::ForkPublicationError::Rejected(ref error)) if error.code == "rtdb.directory/lineage-changed"),
+            "a stale preparation cannot publish after disposal");
+        assert!(directory.deployment_by_name(&staged.name).await.unwrap().is_none());
+        super::discard_local_fork(bucket.as_ref(), &keys, &staged, None).await.unwrap();
+        assert!(matches!(bucket.get(&object).await, Err(rtdb_storage::Error::MissingObject(_))));
+        let copied = ObjectKey::new(format!("{}/v06/rows", child.storage_prefix())).unwrap();
+        assert_eq!(bucket.get(&copied).await.unwrap(), bytes);
+
+        let child = publish_test_fork_cut(directory.as_ref(), &bucket, child, &keys, 1).await;
+        let grandchild = super::with_fork_access(directory.as_ref(), &storage, &keys, &child, None, |access|
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &child, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let child_store = format!("{}/v06", child.storage_prefix());
+        let manifest = crate::reference::Base::load(bucket.as_ref(), &format!("{}/v06", grandchild.storage_prefix())).await.unwrap();
+        assert_eq!(manifest.objects.get("rows"), Some(&child_store));
     }
 
     #[tokio::test]

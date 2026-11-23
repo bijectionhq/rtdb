@@ -8,7 +8,7 @@ publish.workspace = true
 
 [features]
 default = ["search"]
-search = ["dep:rtdb-search"]
+search = ["dep:rtdb-search", "dep:rtdb-text"]
 fts-experiments = ["search", "rtdb-search/experiments"]
 kafka = ["dep:rtdb-kafka"]
 kafka-connect = ["kafka"]
@@ -19,6 +19,11 @@ pg-source = ["dep:rtdb-pg-source"]
 all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source"]
 
 [dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
 sha2.workspace = true
 stacker.workspace = true
 rtdb-types.workspace = true
@@ -42,6 +47,7 @@ rtdb-azure = { workspace = true, optional = true }
 rtdb-gcs = { workspace = true, optional = true }
 rtdb-pg-source = { workspace = true, optional = true }
 rtdb-search = { workspace = true, optional = true }
+rtdb-text = { workspace = true, optional = true }
 async-trait.workspace = true
 futures.workspace = true
 prost-types.workspace = true
@@ -53,14 +59,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-arrow-array.workspace = true
-arrow-buffer.workspace = true
-arrow-ipc.workspace = true
-arrow-schema.workspace = true
-bytes.workspace = true
-rtdb-text.workspace = true
 tempfile.workspace = true
 tantivy.workspace = true
 

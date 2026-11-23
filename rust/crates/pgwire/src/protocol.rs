@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, TransactionStatus, control_schema};
+use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, ReplaySubmissionPermit, TransactionStatus, control_schema};
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::QueryCursor;
@@ -9,9 +9,13 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
-enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
+fn replay_requires_autocommit() -> Anomaly {
+    Anomaly::unsupported("rtdb.pgwire/replay-command", "Automatic replay requires a single autocommit statement without transaction controls")
+}
+
+enum PreparedKind { Empty, Query(PreparedSql), CopyOut(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
 impl PreparedControl {
     fn statement(&self) -> &ControlStatement {
@@ -90,12 +94,13 @@ pub(crate) struct ProtocolSession {
     statements: BTreeMap<String, RegisteredStatement>,
     portals: BTreeMap<String, Portal>,
     copy: Option<crate::copy::CopyInput>,
+    replay_permit: Option<GatewayReplayPermit>,
 }
 impl ProtocolSession {
     pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
         let reported_settings = session.state().settings_revision();
         Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0,
-            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None }
+            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None, replay_permit: None }
     }
     pub fn extended(&self) -> bool { self.extended }
     pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.session.state_mut().close(); }
@@ -128,10 +133,44 @@ impl ProtocolSession {
     fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: search_path(self.session.state().parameter("search_path").unwrap_or("public")), ..Default::default() } }
     fn begin_implicit(&mut self, read_only: Option<bool>) -> Result<()> { if self.session.state().status() != TransactionStatus::Idle { return Ok(()); } let mut settings = rtdb_node::TransactionSettings::default(); settings.access = read_only.map(|read_only| if read_only { rtdb_node::AccessSettings::ReadOnly(Default::default()) } else { rtdb_node::AccessSettings::ReadWrite(Default::default()) }); self.session.state_mut().begin_with(settings)?; self.implicit = true; Ok(()) }
     fn end_transaction(&mut self) { self.portals.clear(); self.implicit = false; self.transaction_generation = self.transaction_generation.wrapping_add(1); }
-    async fn commit(&mut self) -> Result<()> { let _sample = rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction); let result = self.session.state_mut().commit_tx(None).await; self.end_transaction(); if let CommitResult::Executed(tx) = result? { if let Some(error) = tx.error() { return Err(error.clone()); } } Ok(()) }
+    async fn commit(&mut self, permit: Option<ReplaySubmissionPermit>) -> Result<()> {
+        let _sample = rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction);
+        let state = self.session.state_mut();
+        let result = match permit {
+            Some(permit) => state.commit_tx_with_replay_permit(permit).await,
+            None => state.commit_tx(None).await,
+        };
+        self.end_transaction();
+        if let CommitResult::Executed(tx) = result? && let Some(error) = tx.error() { return Err(error.clone()); }
+        Ok(())
+    }
     fn rollback(&mut self) -> Result<()> { self.session.state_mut().rollback_tx()?; self.end_transaction(); Ok(()) }
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
+        if self.replay_permit.is_some() && frame.tag != b'Q' {
+            return Err(protocol("A gateway replay permit must be followed by a simple query"));
+        }
+        if frame.tag == GATEWAY_SESSION_STATE_TAG && frame.body.first() == Some(&GATEWAY_REPLAY_PERMIT_KIND) {
+            if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
+                return Err(protocol("A gateway replay permit requires an idle gateway session"));
+            }
+            let permit = GatewayReplayPermit::decode(&frame.body).ok_or_else(|| protocol("Invalid gateway replay permit"))?;
+            self.session.state_mut().set_gateway_key(permit.nonce.simple().to_string())?;
+            self.replay_permit = Some(permit);
+            if permit.mode != GatewayReplayMode::Dispatch { writer.ready(b'I').await?; }
+            return Ok(());
+        }
+        if frame.tag == GATEWAY_SESSION_STATE_TAG && let Some((&kind @ (GATEWAY_KEY_KIND | GATEWAY_KEY_CONFIRM_KIND), key)) = frame.body.split_first() {
+            // Failure here ends the connection before it can execute the following command.
+            if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
+                return Err(protocol("A gateway key requires an idle gateway session"));
+            }
+            let key = std::str::from_utf8(key).ok().filter(|key| key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .ok_or_else(|| protocol("Invalid gateway key"))?;
+            self.session.state_mut().set_gateway_key(key.to_owned())?;
+            if kind == GATEWAY_KEY_CONFIRM_KIND { writer.ready(b'I').await?; }
+            return Ok(());
+        }
         if self.skip_until_sync && frame.tag != b'S' { return Ok(()); }
         if self.copy.is_some() && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
         let result = self.message(&frame, writer).await;
@@ -187,7 +226,7 @@ impl ProtocolSession {
                     let decoded = rtdb_pg_codec::decode(ty, format, bytes, self.node.memory()).map_err(|error| invalid_argument(error, index, format))?;
                     let (value, charge) = decoded.into_parts(); arguments.push(value); charges.push(charge);
                 }
-                let requires_exact_arity = matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(_)))
+                let requires_exact_arity = matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(_) | PreparedKind::CopyOut(_)))
                     || matches!(prepared.control(), Some(ControlStatement::Execute { .. }));
                 if requires_exact_arity && count != prepared.oids.len() { return Err(protocol("Argument count differs from prepared statement")); }
                 let count = usize::from(input.short()?); let result_formats = (0..count).map(|_| Format::from_code(input.short()? as i16)).collect::<Result<Vec<_>>>()?; input.end()?;
@@ -209,12 +248,12 @@ impl ProtocolSession {
                 let name = input.string()?.to_owned(); let limit = input.integer()?; input.end()?; if limit < 0 { return Err(protocol("Execute row limit cannot be negative")); }
                 let generation = self.transaction_generation;
                 let mut portal = self.portals.remove(&name).ok_or_else(|| protocol("no such portal"))?;
-                let result = self.execute(&mut portal, limit as usize, false, writer).await;
+                let result = self.execute(&mut portal, limit as usize, false, None, writer).await;
                 if generation == self.transaction_generation { self.portals.insert(name, portal); }
                 result?;
             }
             b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
-            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit().await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
+            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit(None).await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'd' => { self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))?.append(input.remaining()).await?; }
             b'c' => {
@@ -295,7 +334,10 @@ impl ProtocolSession {
             keyword_shape()
         } else if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.node.memory())
             .map_err(|error| extended_syntax_error(source, original, error, self.node.memory()))? {
-            self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?)
+            match control.statement() {
+                ControlStatement::CopyOut { query } => self.prepare_copy_out(query, options, &oids, settings).await?,
+                _ => self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?),
+            }
         } else {
             let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
@@ -312,7 +354,10 @@ impl ProtocolSession {
         if let Some(settings) = settings { options.search_path = search_path(settings.search_path); }
         let shape = match syntax {
             ExecutableSyntax::FrontendResponse(_) => keyword_shape(),
-            ExecutableSyntax::Control(control) => self.execute_columns(control_shape(PreparedControl::Batch(control.bind(&options)?), 0)?),
+            ExecutableSyntax::Control(control) => match control.bind(&options)? {
+                ControlStatement::CopyOut { query } => self.prepare_copy_out(&query, options, &[], settings).await?,
+                control => self.execute_columns(control_shape(PreparedControl::Batch(control), 0)?),
+            },
             ExecutableSyntax::Sql(syntax) => {
                 let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
                 sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
@@ -320,6 +365,22 @@ impl ProtocolSession {
         };
         drop(allocation);
         self.retain_prepared(source, Vec::new(), shape)
+    }
+
+    async fn prepare_copy_out(
+        &mut self, query: &str, mut options: rtdb_sql::PrepareOptions, oids: &[i32], settings: Option<PreparationSettings<'_>>,
+    ) -> Result<PreparedShape> {
+        let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
+        for (index, &oid) in oids.iter().enumerate() {
+            if let Some(ty) = PgType::from_oid(oid).and_then(PgType::logical_type) {
+                options.parameter_types.insert(index, ty.maybe());
+            }
+        }
+        let query = PreparedSql::prepare(query, &context, options, rtdb_node::ResultSignaturePolicy::Dynamic)?;
+        if query.is_dml() { return Err(protocol("COPY TO requires a read query")); }
+        let parameter_count = query.parameter_count();
+        if oids.len() > parameter_count { return Err(protocol("Too many COPY parameter types")); }
+        Ok(PreparedShape { kind: PreparedKind::CopyOut(query), columns: None, parameter_count })
     }
 
     fn retain_prepared(&self, source: &str, mut oids: Vec<i32>, shape: PreparedShape) -> Result<Arc<Prepared>> {
@@ -363,7 +424,7 @@ impl ProtocolSession {
     }
 
     async fn planning_warnings<W: AsyncWrite + Unpin>(prepared: &Prepared, writer: &mut Writer<W>) -> Result<()> {
-        if let Some(PreparedKind::Query(statement) | PreparedKind::Dml(statement)) = prepared.ordinary_kind() {
+        if let Some(PreparedKind::Query(statement) | PreparedKind::CopyOut(statement) | PreparedKind::Dml(statement)) = prepared.ordinary_kind() {
             for notice in statement.notices() { writer.planning_warning(&notice.message).await?; }
         }
         Ok(())
@@ -377,6 +438,14 @@ impl ProtocolSession {
         let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
+            (Some(PreparedKind::CopyOut(query)), _) => {
+                if self.session.state().is_read_write() { return Err(protocol("COPY TO requires a read transaction")); }
+                let _active = self.cancellations.enter(&token);
+                let context = self.session.query_context_with(&token, true).await?;
+                let types = portal.arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
+                Some(token.run_until_cancelled(query.open_query_columns_typed(context, std::mem::take(&mut portal.arguments), &types))
+                    .await.ok_or_else(cancelled)??)
+            },
             (Some(PreparedKind::Query(query)), _) => {
                 let _active = self.cancellations.enter(&token);
                 let checked = !self.session.state().is_read_write();
@@ -414,7 +483,7 @@ impl ProtocolSession {
     fn record_transaction_error(&self) { if let Some(observer) = self.node.execution_observer() { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
     async fn description<W: AsyncWrite + Unpin>(columns: Option<&[Column]>, fallback: PgType, writer: &mut Writer<W>) -> Result<()> { match columns { Some(columns) => writer.columns(columns, fallback).await, None => writer.empty(b'n').await } }
 
-    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
+    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, commit_dml_before_reply: bool, permit: Option<ReplaySubmissionPermit>, writer: &mut Writer<W>) -> Result<()> {
         let prepared = Arc::clone(&portal.prepared);
         let failed = self.session.state().status() == TransactionStatus::Failed;
         let control = prepared.control();
@@ -435,6 +504,18 @@ impl ProtocolSession {
                 token.run_until_cancelled(self.stream(portal, source, limit, writer)).await.ok_or_else(cancelled)?
                     .map_err(|error| if token.is_cancelled() { cancelled() } else { error })
             }
+            (PreparedKind::CopyOut(_), _) => {
+                if limit != 0 { return Err(protocol("COPY TO cannot suspend a portal")); }
+                self.begin_implicit(Some(true))?;
+                let PortalState::Query(query) = std::mem::replace(&mut portal.state, PortalState::Ready) else {
+                    return Err(protocol("COPY TO portal has no cursor"));
+                };
+                let memory = self.node.query_memory();
+                let token = portal.cancellation.clone();
+                let _active = self.cancellations.enter(&token);
+                token.run_until_cancelled(crate::copy::write_arrow(query.cursor, &memory, writer))
+                    .await.ok_or_else(cancelled)?
+            }
             (PreparedKind::Dml(statement), _) => {
                 if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "DML is not allowed on the READ ONLY server")); }
                 if self.session.state().is_read_only() { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-tx", "DML is not allowed in a READ ONLY transaction").with_context("query", source.into())); }
@@ -443,7 +524,7 @@ impl ProtocolSession {
                 let _arguments = self.node.memory().reserve(bound)?;
                 let args = if portal.arguments.is_empty() { None } else { Some(rtdb_tx::SqlArguments::from_rows(vec![portal.arguments.clone()], self.node.memory())?) };
                 self.session.state_mut().execute_operation(statement.dml_operation(args)?).await?;
-                if commit_dml_before_reply { self.commit().await?; }
+                if commit_dml_before_reply { self.commit(permit).await?; }
                 match statement.ordered_index_command_tag() {
                     Some(tag) => writer.string(b'C', tag).await,
                     None => writer.string(b'C', &dml_tag(source)).await,
@@ -498,7 +579,6 @@ impl ProtocolSession {
         let PortalState::Query(query) = &mut portal.state else { return Err(protocol("Query portal has no cursor")); };
         let environment = self.environment()?; let mut emitted = 0;
         let memory = self.node.query_memory();
-        let mut body = Vec::new();
         while limit == 0 || emitted < limit {
             if query.batch.as_ref().is_none_or(|batch| query.row == batch.batch().num_rows()) {
                 loop { query.batch = query.cursor.next_batch().await?; query.row = 0; if query.batch.as_ref().is_none_or(|batch| batch.batch().num_rows() != 0) { break; } }
@@ -508,23 +588,21 @@ impl ProtocolSession {
             let schema = batch.batch().schema();
             let row = query.row;
             let consumption: Result<()> = async {
-                let bound = (0..columns.len()).try_fold(columns.len() * 128 + 4096, |bound, column| bound.checked_add(rtdb_columnar::estimate_read_cell_bytes(schema.field(column), batch.batch().column(column).as_ref(), row)?).ok_or_else(|| protocol("Result row allocation overflow")))?;
-                let _scratch = memory.reserve(bound)?;
-                body.clear();
-                body.extend_from_slice(&u16::try_from(columns.len()).map_err(|_| protocol("Too many columns"))?.to_be_bytes());
+                let _scratch = memory.reserve(4096)?;
+                let mut body = DataRow::new(&memory)?;
+                let count = u16::try_from(columns.len()).map_err(|_| protocol("Too many columns"))?;
+                body.reserve(2)?;
+                body.bytes.extend_from_slice(&count.to_be_bytes());
                 for (index, column) in columns.iter().enumerate() {
                     let array = batch.batch().column(index).as_ref();
                     if direct_cell(column.ty, column.format, schema.field(index), array, row, &environment, &mut body)? { continue; }
-                    let value = rtdb_columnar::read_value_as(&query.types[index], schema.field(index), array, row)?;
-                    match rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)? {
-                        None => body.extend_from_slice(&(-1i32).to_be_bytes()),
-                        Some(encoded) => {
-                            body.extend_from_slice(&i32::try_from(encoded.as_slice().len()).map_err(|_| protocol("Value too large"))?.to_be_bytes());
-                            body.extend_from_slice(encoded.as_slice());
-                        }
+                    let cell = rtdb_columnar::ArrowCell { field: schema.field(index), array, row };
+                    match rtdb_pg_codec::encode_arrow(column.ty, column.format, &query.types[index], cell, &environment, &memory)? {
+                        None => body.null_cell()?,
+                        Some(encoded) => body.cell(encoded.as_slice())?,
                     }
                 }
-                writer.row_body(&body).await
+                writer.row_body(&body.bytes).await
             }.await;
             if let Err(error) = consumption { query.cursor.record_consumer_error(); return Err(error); }
             query.row += 1; query.sent = query.sent.checked_add(1).ok_or_else(|| protocol("Result row count overflow"))?; emitted += 1;
@@ -535,13 +613,14 @@ impl ProtocolSession {
 
     async fn simple<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
         self.extended = false; self.portals.remove("");
-        let result = self.simple_statements(source, writer).await;
+        let permit = self.replay_permit.take();
+        let result = self.simple_statements(source, permit, writer).await;
         if let Err(error) = result { writer.error(error.anomaly(), self.environment()?.fallback(), false).await?; }
         if self.copy.is_none() { self.report_ready(writer).await?; }
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(
-        &mut self, original: &str, writer: &mut Writer<W>,
+        &mut self, original: &str, mut permit: Option<GatewayReplayPermit>, writer: &mut Writer<W>,
     ) -> std::result::Result<(), SimpleQueryFailure> {
         let normalized = normalized_simple_text(original);
         let keyword = keyword_prefix(normalized);
@@ -584,6 +663,9 @@ impl ProtocolSession {
         };
         let mut batch = parsed.map_err(|error| SimpleQueryFailure::from_batch(error, &source, original, &memory))?;
         let single_autocommit = batch.len() == 1 && self.session.state().status() == TransactionStatus::Idle;
+        if !single_autocommit && permit.is_some_and(|permit| permit.mode == GatewayReplayMode::Replay) {
+            return Err(replay_requires_autocommit().into());
+        }
         while let Some(statement) = batch.next_for_execution() {
             let start_transaction = match &statement {
                 BatchExecution::Prepare(_) => true,
@@ -593,17 +675,20 @@ impl ProtocolSession {
                 },
             };
             if start_transaction { self.begin_implicit(None)?; }
-            let result = self.run_simple_statement(statement, single_autocommit, writer).await;
+            let permit = if single_autocommit { permit.take() } else { None };
+            let result = self.run_simple_statement(statement, single_autocommit, permit, writer).await;
             self.simple_statement_result(result, writer).await?;
         }
         drop(batch);
         self.settle_simple_transaction().await.map_err(Into::into)
     }
 
-    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
+    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, commit_dml_before_reply: bool, permit: Option<GatewayReplayPermit>, writer: &mut Writer<W>) -> Result<()> {
+        let replay = permit.is_some_and(|permit| permit.mode == GatewayReplayMode::Replay);
         let (syntax, allocation) = match statement {
             BatchExecution::Command { syntax, allocation } => (syntax, allocation),
             BatchExecution::Prepare(statement) => {
+                if replay { return Err(replay_requires_autocommit()); }
                 if self.session.state().status() == TransactionStatus::Failed {
                     return Err(protocol("current transaction is aborted, commands ignored until ROLLBACK is received"));
                 }
@@ -616,11 +701,19 @@ impl ProtocolSession {
             }
         };
         let prepared = self.prepare_batch_command(syntax, allocation, None).await?;
+        let permit = match prepared.ordinary_kind() {
+            Some(PreparedKind::Dml(_)) => permit.map(|permit| ReplaySubmissionPermit {
+                key: format!("{}/0", permit.nonce.simple()), not_after: permit.not_after,
+            }),
+            Some(PreparedKind::Query(_) | PreparedKind::Empty | PreparedKind::Keywords) => None,
+            _ if replay => return Err(replay_requires_autocommit()),
+            _ => None,
+        };
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
         let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
         if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
-        self.execute(&mut portal, 0, commit_dml_before_reply, writer).await
+        self.execute(&mut portal, 0, commit_dml_before_reply, permit, writer).await
     }
 
     async fn simple_statement_result<W: AsyncWrite + Unpin>(&mut self, result: Result<()>, writer: &mut Writer<W>) -> Result<()> {
@@ -640,7 +733,7 @@ impl ProtocolSession {
             if self.session.state().status() == TransactionStatus::Failed {
                 self.rollback()?;
             } else {
-                self.commit().await?;
+                self.commit(None).await?;
             }
         }
         Ok(())
@@ -825,55 +918,220 @@ fn admit_rewrite_syntax(original_bytes: usize, rewritten_bytes: usize, memory: &
     Ok(Some(memory.reserve(rewritten - original)?))
 }
 
-/// Appends a cell's length and PostgreSQL encoding straight from its array, where the array is a plain integer, float,
-/// boolean or string layout and the column's type is the one it encodes as, exactly as `rtdb_pg_codec::encode_value`
-/// encodes the cell's value. Returns false, leaving `out` as it was, for a cell that takes the value path.
-fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, environment: &SessionEnvironment, out: &mut Vec<u8>) -> Result<bool> {
+/// Unsupported layouts leave the row intact for the value codec.
+fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, environment: &SessionEnvironment, out: &mut DataRow) -> Result<bool> {
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type, Float64Type};
-    use arrow_schema::DataType;
-    if !field.metadata().is_empty() { return Ok(false); }
+    use arrow_array::types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+        TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType};
+    use arrow_schema::{DataType, TimeUnit as ArrowUnit, UnionMode};
+    use rtdb_types::TimeUnit;
+
+    let data_type = array.data_type();
+    let is_uuid = data_type == &DataType::FixedSizeBinary(16) && field.extension_type_name() == Some("uuid");
+    if !field.metadata().is_empty() && !is_uuid { return Ok(false); }
+    if let DataType::Union(fields, UnionMode::Dense) = data_type {
+        let union = array.as_any().downcast_ref::<arrow_array::UnionArray>().ok_or_else(|| protocol("Invalid result union"))?;
+        let tag = union.type_id(row);
+        let child = fields.iter().find_map(|(id, field)| (id == tag).then_some(field)).ok_or_else(|| protocol("Result union has no active field"))?;
+        return direct_cell(ty, format, child, union.child(tag).as_ref(), union.value_offset(row), environment, out);
+    }
     let binary = format == Format::Binary;
-    let fits = match (array.data_type(), ty) {
+    let fits = match (data_type, ty) {
+        (DataType::Null, _) => field.is_nullable(),
         (DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64, PgType::Int2 | PgType::Int4 | PgType::Int8) => true,
-        (DataType::Float64, PgType::Float8) | (DataType::Boolean, PgType::Bool) | (DataType::Utf8, PgType::Text | PgType::VarChar) => true,
+        (DataType::Float32 | DataType::Float64, PgType::Float4 | PgType::Float8)
+        | (DataType::Boolean, PgType::Bool) | (DataType::Utf8, PgType::Text | PgType::VarChar | PgType::Keyword)
+        | (DataType::Timestamp(..), PgType::Timestamp | PgType::TimestampTz)
+        | (DataType::Binary, PgType::Bytes) => true,
+        (DataType::FixedSizeBinary(_), PgType::Bytes) => !is_uuid,
+        (DataType::FixedSizeBinary(16), PgType::Uuid) => is_uuid,
         _ => false,
     };
     if !fits { return Ok(false); }
-    if array.is_null(row) { out.extend_from_slice(&(-1i32).to_be_bytes()); return Ok(true); }
-    let mut cell = |bytes: &[u8]| -> Result<()> {
-        out.extend_from_slice(&i32::try_from(bytes.len()).map_err(|_| protocol("Value too large"))?.to_be_bytes());
-        out.extend_from_slice(bytes);
-        Ok(())
-    };
-    match array.data_type() {
+    if data_type == &DataType::Null || array.is_null(row) {
+        out.null_cell()?;
+        return Ok(true);
+    }
+    match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-            let value = match array.data_type() {
+            let value = match data_type {
                 DataType::Int8 => i64::from(array.as_primitive::<Int8Type>().value(row)),
                 DataType::Int16 => i64::from(array.as_primitive::<Int16Type>().value(row)),
                 DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
                 _ => array.as_primitive::<Int64Type>().value(row),
             };
-            if binary { match ty { PgType::Int2 => cell(&(value as i16).to_be_bytes())?, PgType::Int4 => cell(&(value as i32).to_be_bytes())?, _ => cell(&value.to_be_bytes())? } }
-            else { cell(value.to_string().as_bytes())? }
+            if binary {
+                match ty {
+                    PgType::Int2 => out.cell(&(value as i16).to_be_bytes())?,
+                    PgType::Int4 => out.cell(&(value as i32).to_be_bytes())?,
+                    _ => out.cell(&value.to_be_bytes())?,
+                }
+            } else {
+                out.cell(value.to_string().as_bytes())?;
+            }
         }
-        DataType::Float64 => {
-            let value = array.as_primitive::<Float64Type>().value(row);
-            if binary { cell(&value.to_be_bytes())? } else { cell(&rtdb_pg_codec::encode_value(ty, format, &Value::F64(value), environment)?)? }
+        DataType::Float32 | DataType::Float64 => {
+            let value = if data_type == &DataType::Float32 {
+                f64::from(array.as_primitive::<Float32Type>().value(row))
+            } else {
+                array.as_primitive::<Float64Type>().value(row)
+            };
+            match (ty, binary) {
+                (PgType::Float4, true) => out.cell(&(value as f32).to_be_bytes())?,
+                (PgType::Float8, true) => out.cell(&value.to_be_bytes())?,
+                (PgType::Float4, false) => out.cell(rtdb_types::java_f32_text(value as f32).as_bytes())?,
+                _ => out.cell(rtdb_types::java_f64_text(value).as_bytes())?,
+            }
         }
         DataType::Boolean => {
             let value = array.as_boolean().value(row);
-            if binary { cell(&[u8::from(value)])? } else { cell(if value { b"t" } else { b"f" })? }
+            if binary { out.cell(&[u8::from(value)])?; }
+            else { out.cell(if value { b"t" } else { b"f" })?; }
         }
-        _ => cell(array.as_string::<i32>().value(row).as_bytes())?,
+        DataType::Utf8 => out.cell(array.as_string::<i32>().value(row).as_bytes())?,
+        DataType::Binary | DataType::FixedSizeBinary(_) if ty == PgType::Bytes => {
+            let bytes = if data_type == &DataType::Binary {
+                array.as_binary::<i32>().value(row)
+            } else {
+                array.as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                    .ok_or_else(|| protocol("Invalid result binary array"))?.value(row)
+            };
+            if binary {
+                out.cell(bytes)?;
+            } else {
+                let len = bytes.len().checked_mul(2).and_then(|len| len.checked_add(2)).ok_or_else(|| protocol("Value too large"))?;
+                let length = i32::try_from(len).map_err(|_| protocol("Value too large"))?;
+                out.reserve(len.checked_add(4).ok_or_else(|| protocol("Value too large"))?)?;
+                out.bytes.extend_from_slice(&length.to_be_bytes());
+                out.bytes.extend_from_slice(b"\\x");
+                for &byte in bytes {
+                    let hex = b"0123456789abcdef";
+                    out.bytes.extend_from_slice(&[hex[(byte >> 4) as usize], hex[(byte & 0xf) as usize]]);
+                }
+            }
+        }
+        DataType::FixedSizeBinary(16) => {
+            let bytes = array.as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                .ok_or_else(|| protocol("Invalid result UUID array"))?.value(row);
+            if binary { out.cell(bytes)?; }
+            else {
+                let uuid = uuid::Uuid::from_slice(bytes).map_err(|_| protocol("Invalid result UUID"))?;
+                out.cell(uuid.hyphenated().encode_lower(&mut uuid::Uuid::encode_buffer()).as_bytes())?;
+            }
+        }
+        DataType::Timestamp(unit, timezone) => {
+            let (value, unit) = match unit {
+                ArrowUnit::Second => (array.as_primitive::<TimestampSecondType>().value(row), TimeUnit::Second),
+                ArrowUnit::Millisecond => (array.as_primitive::<TimestampMillisecondType>().value(row), TimeUnit::Millisecond),
+                ArrowUnit::Microsecond => (array.as_primitive::<TimestampMicrosecondType>().value(row), TimeUnit::Microsecond),
+                ArrowUnit::Nanosecond => (array.as_primitive::<TimestampNanosecondType>().value(row), TimeUnit::Nanosecond),
+            };
+            let bytes = rtdb_pg_codec::encode_timestamp(format, value, unit, timezone.as_deref(), ty == PgType::TimestampTz, environment)?;
+            out.cell(&bytes)?;
+        }
+        _ => unreachable!("The result layout was checked"),
     }
     Ok(true)
+}
+
+struct DataRow {
+    bytes: Vec<u8>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl DataRow {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { bytes: Vec::new(), reservation: memory.reserve(256)? })
+    }
+
+    fn reserve(&mut self, additional: usize) -> Result<()> {
+        let overflow = || protocol("Result row allocation overflow");
+        let needed = self.bytes.len().checked_add(additional).ok_or_else(overflow)?;
+        let current = self.bytes.capacity();
+        if current >= needed { return Ok(()); }
+        let maximum = current.checked_mul(2).ok_or_else(overflow)?.max(needed).max(32);
+        let lease = Arc::get_mut(&mut self.reservation).expect("A DataRow owns its allocation");
+        lease.grow_to(maximum.checked_add(current).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
+        self.bytes.try_reserve_exact(maximum - self.bytes.len()).map_err(|_| overflow())?;
+        lease.shrink_to(self.bytes.capacity().checked_add(256).ok_or_else(overflow)?)
+    }
+
+    fn null_cell(&mut self) -> Result<()> {
+        self.reserve(4)?;
+        self.bytes.extend_from_slice(&(-1i32).to_be_bytes());
+        Ok(())
+    }
+
+    fn cell(&mut self, bytes: &[u8]) -> Result<()> {
+        let length = i32::try_from(bytes.len()).map_err(|_| protocol("Value too large"))?;
+        self.reserve(bytes.len().checked_add(4).ok_or_else(|| protocol("Value too large"))?)?;
+        self.bytes.extend_from_slice(&length.to_be_bytes());
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use rtdb_sql::BatchStatement;
     use super::*;
+
+    #[test]
+    fn postgres_arrow_cells_match_the_value_codec_in_both_formats() {
+        use rtdb_types::{LogicalType, ScalarType, TimeUnit};
+
+        let environment = SessionEnvironment::default();
+        let memory = MemoryBudget::new(1 << 20);
+        let instant = Value::Timestamp {
+            value: -1001, unit: TimeUnit::Nanosecond, timezone: Some("UTC".into()),
+        };
+        let cases = [
+            (PgType::Bytes, Value::Binary(vec![0, 9, 127, 255])),
+            (PgType::Bytes, Value::FixedSizeBinary(vec![1, 2, 3])),
+            (PgType::Uuid, Value::Uuid([3; 16])),
+            (PgType::Float4, Value::F32(-0.0)),
+            (PgType::Float8, Value::F32(1.0 / 3.0)),
+            (PgType::Timestamp, instant.clone()),
+            (PgType::TimestampTz, instant),
+        ];
+        for (ty, value) in cases {
+            let logical = value.logical_type().maybe();
+            let field = rtdb_columnar::to_field("result", &logical).unwrap();
+            let array = rtdb_columnar::copy_array(&logical, &[Value::Null, value.clone()]).unwrap();
+            for format in [Format::Text, Format::Binary] {
+                let mut actual = DataRow::new(&memory).unwrap();
+                assert!(direct_cell(ty, format, &field, array.as_ref(), 0, &environment, &mut actual).unwrap());
+                assert_eq!(actual.bytes, (-1i32).to_be_bytes());
+                actual.bytes.clear();
+                assert!(direct_cell(ty, format, &field, array.as_ref(), 1, &environment, &mut actual).unwrap());
+                let payload = rtdb_pg_codec::encode_value(ty, format, &value, &environment).unwrap();
+                assert_eq!(&actual.bytes[..4], &(payload.len() as i32).to_be_bytes());
+                assert_eq!(&actual.bytes[4..], payload.as_slice());
+            }
+        }
+        let logical = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::I32));
+        let field = rtdb_columnar::to_field("result", &logical).unwrap();
+        let array = rtdb_columnar::copy_array(&logical, &[Value::I64(7), Value::I32(-5)]).unwrap();
+        let mut output = DataRow::new(&memory).unwrap();
+        for row in 0..array.len() {
+            assert!(direct_cell(PgType::Int8, Format::Text, &field, array.as_ref(), row, &environment, &mut output).unwrap());
+        }
+        assert_eq!(&output.bytes, b"\0\0\0\x017\0\0\0\x02-5");
+    }
+
+    #[test]
+    fn postgres_text_bytea_charges_its_wire_allocation_until_drop() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = vec![0xc0; 20 * 1024];
+        let values = arrow_array::BinaryArray::from(vec![input.as_slice()]);
+        let field = arrow_schema::Field::new("b", arrow_schema::DataType::Binary, false);
+        let mut output = DataRow::new(&memory).unwrap();
+        assert!(direct_cell(PgType::Bytes, Format::Text, &field, &values, 0, &SessionEnvironment::default(), &mut output).unwrap());
+        assert_eq!(output.bytes.len(), 6 + input.len() * 2);
+        assert!(memory.used_bytes() >= output.bytes.capacity());
+        drop(output);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     fn simple_query_marker(source: &str) -> Option<SimpleQueryMarker> {
         super::simple_query_marker(normalized_simple_text(source))
@@ -990,7 +1248,7 @@ mod tests {
         }
     }
 
-    async fn test_frontend() -> (ProtocolSession, rtdb_node::NodeDriver) {
+    async fn test_frontend(replication_enabled: bool) -> (ProtocolSession, rtdb_node::NodeDriver) {
         use rtdb_columnar::MemoryBudget;
 
         struct Services;
@@ -1016,17 +1274,117 @@ mod tests {
         ).await.unwrap();
         let identity = auth.authenticate_trusted("xtdb").unwrap();
         let services = rtdb_node::NodeServices::local(auth.clone(), fixtures.clone(), auth, fixtures);
-        let options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
+        let mut options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
+        options.replication.enabled = replication_enabled;
         let (node, driver) = Node::open(options, services).await.unwrap();
         let session = node.session("xtdb", identity).unwrap();
-        let startup = Startup { parameters: BTreeMap::new(), gateway_session_state: false, gateway_settings: false, _reservation: node.memory().reserve(0).unwrap() };
+        let startup = Startup { parameters: BTreeMap::new(), gateway_session_state: false, gateway_settings: false, replica_read: false, _reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
     }
 
     #[tokio::test]
+    async fn a_gateway_key_is_installed_without_a_reply_and_rejection_ends_the_session() {
+        let (mut frontend, driver) = test_frontend(false).await;
+        let memory = Arc::clone(frontend.node.memory());
+        let key = "00000000000000000000000000000001";
+        let frame = |key: &str| Frame {
+            tag: GATEWAY_SESSION_STATE_TAG,
+            body: [&[GATEWAY_KEY_KIND], key.as_bytes()].concat(),
+            charge: memory.reserve(0).unwrap(),
+        };
+        let mut writer = Writer::new(Vec::new(), memory.clone());
+        assert!(frontend.handle(frame(key), &mut writer).await.is_err());
+
+        frontend.startup.gateway_session_state = true;
+        frontend.handle(frame(key), &mut writer).await.unwrap();
+        assert!(frontend.handle(frame("invalid"), &mut writer).await.is_err());
+        assert!(writer.into_inner().is_empty());
+        drop(frontend);
+        driver.close_without_run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retried_writes_stay_keyed_through_session_reset_and_malformed_metadata() {
+        let (mut frontend, driver) = test_frontend(true).await;
+        frontend.startup.gateway_session_state = true;
+        let node = frontend.node.clone();
+        let driver = tokio::spawn(driver.run());
+        let memory = Arc::clone(node.memory());
+        let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+        frontend.simple("INSERT INTO counters (_id, n) VALUES (1, 0), (2, 0), (3, 0)", &mut writer).await.unwrap();
+
+        for (keys, command) in [
+            ([1, 1], "DISCARD ALL; UPDATE counters SET n = n + 1 WHERE _id = 1"),
+            ([2, 2], "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 123}); UPDATE counters SET n = n + 1 WHERE _id = 2; COMMIT"),
+            ([3, 4], "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 'application-key'}); UPDATE counters SET n = n + 1 WHERE _id = 3; COMMIT"),
+        ] {
+            for id in keys {
+                let key = format!("{id:032x}");
+                let prelude = Frame { tag: GATEWAY_SESSION_STATE_TAG, body: [&[GATEWAY_KEY_CONFIRM_KIND], key.as_bytes()].concat(), charge: memory.reserve(0).unwrap() };
+                frontend.handle(prelude, &mut writer).await.unwrap();
+                frontend.simple(command, &mut writer).await.unwrap();
+            }
+        }
+        frontend.simple("SELECT n FROM counters ORDER BY _id", &mut writer).await.unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = crate::wire::Reader::new(bytes.as_slice(), memory);
+        let mut counters = Vec::new();
+        while let Some(frame) = reader.read(1 << 20).await.unwrap() {
+            assert_ne!(frame.tag, b'E', "{}", String::from_utf8_lossy(&frame.body));
+            if frame.tag == b'D' { counters.push(frame.body[6..].to_vec()); }
+        }
+        assert_eq!(counters, [b"1".to_vec(), b"1".to_vec(), b"1".to_vec()]);
+        drop(frontend);
+        node.shutdown();
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_permits_bind_one_autocommit_write_and_refuse_batches_and_expired_submissions() {
+        let (mut frontend, driver) = test_frontend(true).await;
+        frontend.startup.gateway_session_state = true;
+        let node = frontend.node.clone();
+        let driver = tokio::spawn(driver.run());
+        let memory = Arc::clone(node.memory());
+        let future_cutoff = rtdb_types::Timestamp(node.now().0 + 60_000_000);
+        let expired_cutoff = rtdb_types::Timestamp(node.now().0 - 1);
+        let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+        frontend.simple("INSERT INTO counters (_id, n) VALUES (1, 0), (2, 0), (3, 0)", &mut writer).await.unwrap();
+
+        for (id, mode, not_after, sql) in [
+            (1, GatewayReplayMode::Dispatch, future_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 1"),
+            (1, GatewayReplayMode::Replay, future_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 1"),
+            (2, GatewayReplayMode::Dispatch, future_cutoff, "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 'app-key'}); UPDATE counters SET n = n + 1 WHERE _id = 2; COMMIT"),
+            (2, GatewayReplayMode::Replay, future_cutoff, "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 'app-key'}); UPDATE counters SET n = n + 1 WHERE _id = 2; COMMIT"),
+            (3, GatewayReplayMode::Dispatch, expired_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 3"),
+            (3, GatewayReplayMode::Replay, expired_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 3"),
+        ] {
+            let permit = GatewayReplayPermit { nonce: uuid::Uuid::from_u128(id), not_after, mode };
+            let frame = Frame { tag: GATEWAY_SESSION_STATE_TAG, body: permit.encode().to_vec(), charge: memory.reserve(0).unwrap() };
+            frontend.handle(frame, &mut writer).await.unwrap();
+            frontend.simple(sql, &mut writer).await.unwrap();
+        }
+        frontend.simple("SELECT n FROM counters ORDER BY _id", &mut writer).await.unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = crate::wire::Reader::new(bytes.as_slice(), memory);
+        let mut counters = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(frame) = reader.read(1 << 20).await.unwrap() {
+            if frame.tag == b'D' { counters.push(frame.body[6..].to_vec()); }
+            if frame.tag == b'E' { errors.push(String::from_utf8_lossy(&frame.body).into_owned()); }
+        }
+        assert_eq!(counters, [b"1".to_vec(), b"1".to_vec(), b"0".to_vec()]);
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("Automatic replay requires"), "{errors:?}");
+        drop(frontend);
+        node.shutdown();
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn a_single_autocommit_write_reports_success_only_after_commit() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(true).await;
         let node = frontend.node.clone();
         let memory = Arc::clone(node.memory());
         let driver = tokio::spawn(driver.run());
@@ -1069,7 +1427,7 @@ mod tests {
             fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
         }
 
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let input = b"Q\0\0\0\x0cSELEC 1\0";
@@ -1088,7 +1446,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_argument_slots_are_admitted_before_publishing_a_portal() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let prepared = frontend.prepare_client("SET TIME ZONE 'UTC'", Vec::new(), None).await.unwrap();
         frontend.register_statement(Cow::Borrowed("zone"), prepared).unwrap();
@@ -1126,7 +1484,7 @@ mod tests {
 
     #[tokio::test]
     async fn extended_namespace_rewrite_holds_syntax_growth_through_plan_admission() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let original = DBEAVER_NAMESPACE_QUERY;
@@ -1236,7 +1594,7 @@ mod tests {
         assert!(parse_probe.peak_bytes() < portal_peak);
         assert!(batch_bytes + writer_probe.peak_bytes() < portal_peak);
 
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
 
         let initial_timezone = frontend.session.state().effective_timezone().to_owned();
@@ -1288,7 +1646,7 @@ mod tests {
         let (requested, _) = expected.message.as_deref().unwrap().split_once(" from budget ").unwrap();
         assert_eq!(short.used_bytes(), 0);
 
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new(), None).await.unwrap();
@@ -1339,7 +1697,7 @@ mod tests {
 
     #[tokio::test]
     async fn retained_prepare_outlives_parse_frame_and_retries_after_leaf_admission_failure() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let leaf = "SET TIME ZONE 'UTC'";
@@ -1370,7 +1728,7 @@ mod tests {
         let leaf_bytes = leaf.len() * 128 + 8192;
         let held = memory.reserve(memory.limit_bytes() - retained - arguments - leaf_bytes + 1).unwrap();
         let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
-        let error = frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap_err();
+        let error = frontend.execute(&mut portal, 0, false, None, &mut writer).await.unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let request = format!("Cannot reserve {leaf_bytes} bytes");
         assert!(error.message.as_deref().unwrap().starts_with(request.as_str()));
@@ -1378,7 +1736,7 @@ mod tests {
         drop(held);
         assert_eq!(memory.used_bytes(), retained);
 
-        frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap();
+        frontend.execute(&mut portal, 0, false, None, &mut writer).await.unwrap();
         assert!(old_statement.upgrade().is_none());
         frontend.portals.insert("portal".into(), portal);
         let mut body = vec![b'S'];

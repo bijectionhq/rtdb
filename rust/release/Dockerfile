@@ -7,7 +7,7 @@ RUN . /etc/os-release && test "$VERSION_CODENAME" = bookworm \
     && rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
     && apt-get update \
-    && apt-get install --no-install-recommends -y cmake pkg-config perl libsasl2-dev \
+    && apt-get install --no-install-recommends -y cmake make pkg-config perl libsasl2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /source
@@ -21,7 +21,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
 FROM build-environment AS multi-build
 RUN test "$(rustc --version | cut -d ' ' -f 2)" = 1.94.1 \
-    && cargo build --manifest-path rust/Cargo.toml --release --locked -p rtdb-multi --features dynamodb
+    && cargo build --manifest-path rust/Cargo.toml --release --locked -p rtdb-multi --features dynamodb,s3-key-vault
 
 FROM build-environment AS build
 RUN test "$(rustc --version | cut -d ' ' -f 2)" = 1.94.1 \
@@ -64,7 +64,7 @@ ENV TZ=UTC
 STOPSIGNAL SIGTERM
 
 FROM runtime-environment AS multi
-LABEL io.rtdb.hosted-protocol=13
+LABEL io.rtdb.hosted-protocol=37 io.rtdb.pgwire-arrow-copy-out=true
 RUN apt-get update \
     && apt-get install --no-install-recommends -y curl jq netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*

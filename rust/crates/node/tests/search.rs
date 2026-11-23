@@ -30,7 +30,7 @@ struct TickClock(AtomicI64);
 impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) } }
 fn services() -> NodeServices {
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
-    NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) }
+    NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, ..NodeServices::local_with_search_format(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures), rtdb_node::SearchFileFormat::Paged) }
 }
 fn options() -> NodeOptions {
     let mut options = NodeOptions::default();
@@ -95,6 +95,8 @@ async fn search_index_definitions_are_documents_as_of_their_transaction() {
     ]]);
     let version = rows(session.query_sql("SELECT version FROM xt.search_indexes", vec![]).await.unwrap()).await;
     assert_eq!(version, [vec![Value::I64(created.tx_key().tx_id.0)]], "the version is the defining transaction");
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX IF NOT EXISTS docs_text ON docs (body) WITH (history = false)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(rows(session.query_sql("SELECT version FROM xt.search_indexes", vec![]).await.unwrap()).await, version);
     assert!(session.state_mut().execute_tx(vec![sql("DROP SEARCH INDEX docs_text")], AutonomousTxOptions::default()).await.unwrap().committed());
     assert!(rows(session.query_sql(definitions, vec![]).await.unwrap()).await.is_empty());
     let created_at = Value::Timestamp { value: created.tx_key().system_time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
@@ -138,6 +140,158 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
         assert!(record.definition_id().starts_with("docs_body~a"));
     }
     database.build_artefacts().await.unwrap();
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn owned_search_counts_no_documents_for_null_or_absent_text() {
+    use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, StructFields};
+
+    let mut options = options();
+    options.owned_relations = true;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("owned-sparse-search").unwrap();
+    let path = OwnedRelation::new("owned-sparse-body").unwrap();
+    let schema = OwnedSchema::from_json(br#"{"fields":[{"name":"body","type":{"kind":"utf8"},"optional":true,"nullable":true}],"validity":"acceptance"}"#).unwrap();
+    let rows = rtdb_tx::Documents::new(vec![
+        StructFields::from([("_id".into(), Value::I64(1))]),
+        StructFields::from([("_id".into(), Value::I64(2)), ("body".into(), Value::Null)]),
+    ], node.memory()).unwrap();
+    let installed = session.state_mut().execute_tx(vec![
+        TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
+        TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: "body".into() },
+        TxOp::OwnedInsertDocs { relation: relation.clone(), documents: rows, valid_from: None, valid_to: None },
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(installed.committed(), "{:?}", installed.error());
+
+    let held = session.open_owned_read().await.unwrap();
+    assert_eq!(held.search_corpus(&relation, &path, "invoice").await.unwrap().documents, 0);
+    let partitions = [(relation, path)];
+    let (empty, _) = held.ranked_search_page(&partitions, "invoice", 0, 4, false).await.unwrap();
+    assert_eq!(empty.total, 0);
+    let mut staged = HeldTextCorpus::new(Arc::clone(node.memory()), "invoice").unwrap();
+    staged.shadow(0, EntityId::Integer(1), Some("invoice")).unwrap();
+    let (populated, _) = held.ranked_search_with_overlay(&partitions, "invoice", 0, 4, false, None, Some(staged)).await.unwrap();
+    assert_eq!(populated.total, 1);
+    assert_eq!(populated.hits[0].id, EntityId::Integer(1));
+    drop(held);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() {
+    verify_owned_search_artefacts(13).await;
+}
+
+#[tokio::test]
+async fn an_owned_corpus_reads_a_published_format_eleven_file() {
+    verify_owned_search_artefacts(11).await;
+}
+
+#[tokio::test]
+async fn an_owned_corpus_reads_a_published_format_fourteen_tree() {
+    verify_owned_search_artefacts(14).await;
+}
+
+async fn verify_owned_search_artefacts(format: u32) {
+    use rtdb_types::{EntityId, OwnedRelation, StructFields};
+
+    let mut options = options();
+    options.owned_relations = true;
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let runtime = match format {
+        11 => rtdb_search::SearchRuntime::with_tantivy_files(16 << 20),
+        14 => rtdb_search::SearchRuntime::with_tree_files(16 << 20),
+        _ => rtdb_search::SearchRuntime::new(16 << 20),
+    };
+    let services = NodeServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()], ..services() };
+    let (node, driver) = Node::open(options, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("owned-search-docs").unwrap();
+    let path = OwnedRelation::new("owned-body").unwrap();
+    let documents = rtdb_tx::Documents::new((0..20).map(|id| StructFields::from([
+        ("_id".into(), Value::I64(id)),
+        ("body".into(), Value::Utf8("an invoice".into())),
+        ("secret".into(), Value::Binary(vec![7, 9])),
+    ])).collect(), node.memory()).unwrap();
+    let insert = TxOp::OwnedInsertDocs { relation: relation.clone(), documents, valid_from: Some(Timestamp(0)), valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    let declare = |column: &str| TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: column.into() };
+    let rejected = session.state_mut().execute_tx(vec![declare("secret")], AutonomousTxOptions::default()).await.unwrap();
+    assert!(!rejected.committed());
+    let accepted = session.state_mut().execute_tx(vec![declare("body")], AutonomousTxOptions::default()).await.unwrap();
+    assert!(accepted.committed(), "{:?}", accepted.error());
+    let changed = rtdb_tx::Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(0)),
+        ("body".into(), Value::Utf8("paid".into())),
+    ])], node.memory()).unwrap();
+    let replace = TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: changed, valid_from: Some(Timestamp(0)), valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![replace], AutonomousTxOptions::default()).await.unwrap().committed());
+    let uncovered = session.open_owned_read().await.unwrap();
+    assert_eq!(uncovered.search_corpus(&relation, &path, "invoice paid").await.unwrap_err().code, "rtdb.owned/search-uncovered");
+    let partitions = [(relation.clone(), path.clone())];
+    let staged = || {
+        let mut stage = rtdb_node::HeldTextCorpus::new(Arc::clone(node.memory()), "invoice").unwrap();
+        stage.shadow(0, EntityId::Integer(1), None).unwrap();
+        stage.shadow(0, EntityId::Integer(2), Some("paid")).unwrap();
+        stage.shadow(0, EntityId::String("1".into()), Some("an invoice")).unwrap();
+        stage
+    };
+    let (uncovered_rank, _) = uncovered.ranked_search_with_overlay(
+        &partitions, "invoice", 0, 2, false, None, Some(staged()),
+    ).await.unwrap();
+    assert_eq!(uncovered_rank.total, 18);
+    assert_eq!(uncovered_rank.hits[0].id, EntityId::String("1".into()));
+    assert_eq!(uncovered_rank.hits[1].id, EntityId::Integer(3));
+    drop(uncovered);
+    let private_catalog = OwnedRelation::search_catalog("xtdb");
+    let direct = format!("SELECT _id FROM {}.\"{}\"", private_catalog.schema, private_catalog.table);
+    assert!(session.query_sql(&direct, vec![]).await.is_err());
+
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let catalog = database.trie_catalog();
+    let table = relation.table("xtdb");
+    let settled: Vec<_> = catalog.current_tries(&table).into_iter().filter(|trie| trie.key.level() > 0).collect();
+    assert!(!settled.is_empty(), "compaction produced no settled owned trie");
+    assert!(settled.iter().all(|trie| trie.artefacts.iter().any(|record| {
+        record.kind() == "search" && record.definition_id().starts_with("owned-body~a")
+            && record.definition_id().ends_with(&format!("f{format}"))
+            && record.definition_version() == accepted.tx_key().tx_id.0
+    })));
+    let held = session.open_owned_read().await.unwrap();
+    let corpus = held.search_corpus(&relation, &path, "invoice paid").await.unwrap();
+    assert_eq!(corpus.documents, 20);
+    assert_eq!(corpus.tokens, 39);
+    assert_eq!(corpus.frequencies["invoice"], 19);
+    assert_eq!(corpus.frequencies["paid"], 1);
+    let (covered_rank, _) = held.ranked_search_with_overlay(
+        &partitions, "invoice", 0, 2, false, None, Some(staged()),
+    ).await.unwrap();
+    assert_eq!(covered_rank.total, uncovered_rank.total);
+    assert_eq!(covered_rank.hits, uncovered_rank.hits);
+    let (hits, _) = held.ranked_search(&partitions, "invoice", 2, false).await.unwrap();
+    assert_eq!(hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
+        [rtdb_types::EntityId::Integer(1), rtdb_types::EntityId::Integer(2)]);
+    assert_eq!(hits[0].score.to_bits(), hits[1].score.to_bits());
+    let (page, _) = held.ranked_search_page(&partitions, "invoice", 1, 2, false).await.unwrap();
+    assert_eq!(page.total, 19);
+    assert_eq!(page.hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        [rtdb_types::EntityId::Integer(2), rtdb_types::EntityId::Integer(3)]);
+    let (paid, _) = held.ranked_search(&partitions, "paid", 2, false).await.unwrap();
+    assert_eq!(paid[0].id, rtdb_types::EntityId::Integer(0));
+    drop(held);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
@@ -200,6 +354,28 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
     let groups: std::collections::BTreeSet<_> = shared.iter().filter_map(|key| key.part_group()).collect();
     assert_eq!(shared.len(), groups.len() * 4, "every member of a group shares its file: {shared:?}");
     assert!(shared.iter().any(|key| key.level() == 2 && key.recency().is_none()), "the level-2 partition group's members share one search file: {shared:?}");
+    let docs = TableRef::new("public", "docs");
+    let snapshot = database.snapshot();
+    let slug = &snapshot.table_entry(&docs).unwrap().slug;
+    let mut expected_files = std::collections::BTreeMap::new();
+    for trie in snapshot.trie_catalog().current_tries(&docs) {
+        for record in trie.artefacts.iter().filter(|record| record.kind() == "search") {
+            let key = slug.recorded_artefact_key(&trie.key, record).unwrap();
+            expected_files.insert(key, record.file_size.unwrap());
+        }
+    }
+    let files = rows(session.query_sql(
+        "SELECT object_key, file_size FROM xt.live_trie_artefacts WHERE schema_name = 'public' AND table_name = 'docs' AND kind = 'search'",
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(files.len(), expected_files.len(), "each live file is charged once");
+    for file in files {
+        let [Value::Utf8(key), Value::I64(size)] = file.as_slice() else { panic!("invalid file usage: {file:?}") };
+        assert_eq!(expected_files.remove(key), Some(*size));
+        let object = rtdb_storage::ObjectKey::new(key.clone()).unwrap();
+        assert_eq!(database.object_store().head_fresh(&object).await.unwrap().size, u64::try_from(*size).unwrap());
+    }
+    assert!(expected_files.is_empty());
     let mut compared = 0;
     let mut answers = std::collections::BTreeMap::<&str, std::collections::BTreeSet<Vec<i64>>>::new();
     for query in ["overdue", "invoice overdue", "red blue", "paid book", "absent", "\"red blue\"", "overdue \"late book\""] {
@@ -224,28 +400,41 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
 }
 
 #[tokio::test]
-async fn search_score_ranks_rarer_terms_above_common_ones_once_the_corpus_is_indexed() {
+async fn search_scores_agree_across_plans_and_ignore_unselected_documents() {
     let mut options = options();
     options.file_size_target = 1;
     options.automatic_artefacts = false;
     let (node, driver) = Node::open(options, services()).await.unwrap();
     let driver = tokio::spawn(driver.run());
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
-    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
-    let mut operations = Vec::new();
-    for id in 0..40 { operations.push(sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'common words here'}}"))); }
-    operations.push(sql("INSERT INTO docs RECORDS {_id: 100, body: 'common rare words'}"));
-    operations.push(sql("INSERT INTO docs RECORDS {_id: 101, body: 'common common words'}"));
-    assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
+    let writes = vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql("INSERT INTO docs RECORDS {_id: 100, body: 'common rare words'}"),
+        sql("INSERT INTO docs RECORDS {_id: 101, body: 'common common words'}"),
+    ];
+    assert!(session.state_mut().execute_tx(writes, AutonomousTxOptions::default()).await.unwrap().committed());
+    let statement = |predicate: &str| format!("SELECT _id, SEARCH_SCORE(body, 'common rare') AS score FROM docs WHERE {predicate} ORDER BY score DESC, _id LIMIT 2");
+    let indexed = statement("MATCH(body, 'common')");
+    let expected = rows(session.query_sql(&indexed, vec![]).await.unwrap()).await;
+    let scoring = rtdb_text::Query::parse("common rare");
+    assert_eq!(expected, [(100, "common rare words"), (101, "common common words")].map(|(id, body)| {
+        vec![Value::I64(id), Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens(body), None))]
+    }));
+
+    let unselected = (0..40).map(|id| sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'rare words'}}"))).collect();
+    assert!(session.state_mut().execute_tx(unselected, AutonomousTxOptions::default()).await.unwrap().committed());
     let database = node.catalog().database("xtdb").unwrap();
     database.flush().await.unwrap();
     node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
     database.compaction().unwrap().compact_all().await.unwrap();
     database.build_artefacts().await.unwrap();
-    let ranked = rows(session.query_sql("SELECT _id, SEARCH_SCORE(body, 'common rare') AS score FROM docs WHERE MATCH(body, 'common') ORDER BY score DESC, _id LIMIT 3", vec![]).await.unwrap()).await;
-    assert_eq!(ranked.iter().map(|row| row[0].clone()).collect::<Vec<_>>(), [Value::I64(100), Value::I64(101), Value::I64(0)], "{ranked:?}");
-    let scores: Vec<f64> = ranked.iter().map(|row| match row[1] { Value::F64(score) => score, ref other => panic!("{other:?}") }).collect();
-    assert!(scores[0] > 2.0 * scores[1], "the rare term carries more weight than a repeated common one: {scores:?}");
+    let residual = statement("MATCH(body, 'common') OR _id = -1");
+    assert_eq!(rows(session.query_sql(&indexed, vec![]).await.unwrap()).await, expected);
+    assert_eq!(rows(session.query_sql(&residual, vec![]).await.unwrap()).await, expected);
+    assert!(session.state_mut().execute_tx(
+        vec![sql("DROP SEARCH INDEX docs_body")], AutonomousTxOptions::default(),
+    ).await.unwrap().committed());
+    assert_eq!(rows(session.query_sql(&indexed, vec![]).await.unwrap()).await, expected);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
@@ -392,8 +581,7 @@ async fn plain_match_scans_when_the_index_build_cannot_fit() {
     node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
     let actual = ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'invoice')", vec![]).await.unwrap()).await);
     assert_eq!(actual, [1]);
-    let corpus = rtdb_text::Corpus { documents: 2, tokens: 3, frequencies: [("invoice".into(), 1)].into() };
-    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice overdue"), Some(&corpus));
+    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice overdue"), None);
     let scored = rows(session.query_sql("SELECT _id, SEARCH_SCORE(body, 'invoice') FROM docs WHERE MATCH(body, 'invoice')", vec![]).await.unwrap()).await;
     assert_eq!(scored, [vec![Value::I64(1), Value::F64(score)]]);
     node.shutdown();
@@ -440,8 +628,7 @@ async fn plain_match_scans_historical_pages_with_independent_recency_order() {
     let query = "SELECT _id FROM docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-05T00:00:00Z' WHERE MATCH(body, 'invoice')";
     assert_eq!(ids(rows(session.query_sql(query, vec![]).await.unwrap()).await), (0..24).collect::<Vec<_>>());
     let scored = "SELECT _id, SEARCH_SCORE(body, 'invoice') AS score FROM docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-05T00:00:00Z' WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 1";
-    let corpus = rtdb_text::Corpus { documents: 24, tokens: 24, frequencies: [("invoice".into(), 24)].into() };
-    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice"), Some(&corpus));
+    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice"), None);
     assert_eq!(rows(session.query_sql(scored, vec![]).await.unwrap()).await, [vec![Value::I64(0), Value::F64(score)]]);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
@@ -478,6 +665,65 @@ async fn a_ranked_cutoff_counts_only_rows_that_pass_every_match() {
 }
 
 #[tokio::test]
+async fn explicit_search_statistics_rank_the_admitted_corpus() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let committed = session.state_mut().execute_tx(vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql("INSERT INTO docs RECORDS {_id: 1, body: 'invoice paid invoice', admitted: TRUE}"),
+        sql("INSERT INTO docs RECORDS {_id: 2, body: 'paid', admitted: TRUE}"),
+        sql("INSERT INTO docs RECORDS {_id: 3, body: 'invoice paid secret', admitted: FALSE}"),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(committed.committed());
+    let ranked = "
+        WITH MATERIALIZED admitted_docs AS (SELECT _id, body FROM docs WHERE admitted),
+        counts AS (
+            SELECT COUNT(SEARCH_LENGTH(body)) AS n, SUM(SEARCH_LENGTH(body)) AS tokens,
+                   COUNT(CASE WHEN MATCH(body, 'invoice') THEN 1 END) AS invoices,
+                   COUNT(CASE WHEN MATCH(body, 'paid') THEN 1 END) AS paid
+            FROM admitted_docs
+        )
+        SELECT d._id, SEARCH_SCORE(d.body, 'invoice paid', c.n, c.tokens, ARRAY[c.invoices, c.paid]) AS score
+        FROM admitted_docs AS d CROSS JOIN counts AS c
+        WHERE MATCH(d.body, 'invoice paid')
+        ORDER BY score DESC, d._id LIMIT 1";
+    let first = rows(session.query_sql(ranked, vec![]).await.unwrap()).await;
+    let corpus = rtdb_text::Corpus {
+        documents: 2,
+        tokens: 4,
+        frequencies: std::collections::BTreeMap::from([("invoice".into(), 1), ("paid".into(), 2)]),
+    };
+    let scorer = rtdb_text::Scorer::new(rtdb_text::Query::parse("invoice paid"), Some(&corpus));
+    let score = scorer.bm25(&rtdb_text::tokens("invoice paid invoice"));
+    assert_eq!(first, [vec![Value::I64(1), Value::F64(score)]]);
+    let terms = rows(session.query_sql(
+        r#"SELECT SEARCH_TERMS('"Invoice paid" invoice')"#,
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(terms, [vec![Value::List(vec![Value::Utf8("invoice".into()), Value::Utf8("paid".into())])]]);
+    let fingerprint = rows(session.query_sql(
+        "SELECT SEARCH_LENGTH(42), SEARCH_LENGTH(''), \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']) = \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']), \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']) = \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'c'])",
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(fingerprint, [vec![Value::Null, Value::I64(0), Value::Bool(true), Value::Bool(false)]]);
+
+
+    let changed = session.state_mut().execute_tx(vec![
+        sql("INSERT INTO docs RECORDS {_id: 3, body: 'public list archived', admitted: FALSE}"),
+        sql("INSERT INTO docs RECORDS {_id: 4, body: 'invoice paid another secret', admitted: FALSE}"),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(changed.committed());
+    assert_eq!(rows(session.query_sql(ranked, vec![]).await.unwrap()).await, first);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_the_first() {
     let mut options = options();
     options.file_size_target = 1;
@@ -509,6 +755,7 @@ async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_
     }
     let ranked = |rows: Vec<Vec<Value>>| rows.into_iter().map(|row| (row[0].clone(), row[1].clone())).collect::<Vec<_>>();
     for (filter, scoring) in [("MATCH(body, 'invoice')", "invoice overdue"), ("MATCH(body, 'overdue late')", "late"), ("MATCH(body, 'book')", "book red paid"),
+        ("MATCH(body, '\"red paid\"')", "red paid"),
         ("MATCH(body, 'invoice') AND MATCH(body, 'paid')", "invoice overdue"), ("MATCH(body, 'book') AND _id % 3 = 0", "book")] {
         for valid in ["2020-06-01Z", "2022-06-01Z"] {
             for system in [None, Some(systems[0]), Some(systems[1])] {
@@ -533,14 +780,268 @@ async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_
 }
 
 /// Records how many IIDs each narrowing named, to tell a ranked narrowing from an unranked one.
-struct Recording { inner: Arc<rtdb_search::SearchAccelerator>, sizes: std::sync::Mutex<Vec<usize>> }
+struct Recording { inner: Arc<rtdb_search::SearchAccelerator>, sizes: std::sync::Mutex<Vec<usize>>, retained: std::sync::Mutex<Vec<usize>> }
 #[async_trait]
 impl rtdb_query::ScanAccelerator for Recording {
     async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<std::collections::BTreeSet<rtdb_types::Iid>>> {
-        let candidates = self.inner.candidate_iids(request).await?;
-        if let Some(candidates) = &candidates { self.sizes.lock().unwrap().push(candidates.len()); }
-        Ok(candidates)
+        self.inner.candidate_iids(request).await
     }
+
+    async fn select_candidates(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<rtdb_query::ScanSelection>> {
+        let selection = self.inner.select_candidates(request).await?;
+        if let Some(selection) = &selection {
+            self.sizes.lock().unwrap().push(selection.iids.len());
+            let retained = selection.scores.as_ref().map_or(0, |scores| selection.iids.iter().filter(|iid| scores.row(*iid).is_some()).count());
+            self.retained.lock().unwrap().push(retained);
+        }
+        Ok(selection)
+    }
+}
+
+#[tokio::test]
+async fn an_integer_tie_break_prunes_persisted_hits_and_accounts_for_live_replacements() {
+    verify_ranked_integer_ties(false).await;
+}
+
+#[tokio::test]
+async fn the_arrow_tree_resolves_and_reuses_winning_rows_after_live_replacements() {
+    verify_ranked_integer_ties(true).await;
+}
+
+async fn verify_ranked_integer_ties(tree: bool) {
+    let mut settings = options();
+    settings.file_size_target = 1;
+    settings.automatic_artefacts = false;
+    let runtime = if tree { rtdb_search::SearchRuntime::with_tree_files(64 << 20) }
+        else { rtdb_search::SearchRuntime::new(64 << 20) };
+    let mut accelerator = rtdb_search::SearchAccelerator::with_runtime(Arc::clone(&runtime));
+    accelerator.max_candidates = 2400;
+    let recording = Arc::new(Recording { inner: Arc::new(accelerator), sizes: Default::default(), retained: Default::default() });
+    let services = NodeServices { scan_accelerators: vec![recording.clone()], artefact_kinds: vec![runtime.artefacts()], ..services() };
+    let (node, driver) = Node::open(settings, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let table = TableRef::new("public", "docs");
+    let transactions = [-2048..0, 0..2048].into_iter().map(|ids| {
+        let rows = ids.map(|id| rtdb_types::StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("body".into(), Value::Utf8(if id % 2 == 0 { "invoice audit audit" } else { "invoice about a library book audit" }.into())),
+        ])).collect();
+        TxOp::PutDocs { table: table.clone(), documents: rtdb_tx::Documents::new(rows, node.memory()).unwrap(),
+            valid_from: Some(Timestamp(0)), valid_to: None }
+    });
+    let statements = std::iter::once(sql("CREATE SEARCH INDEX docs_body ON docs (body)")).chain(transactions).collect();
+    let result = session.state_mut().execute_tx(statements, AutonomousTxOptions::default()).await.unwrap();
+    assert!(result.committed(), "{:?}", result.error());
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+
+    let query = "SELECT _id, body, SEARCH_SCORE(body, 'invoice') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 3";
+    let oracle = "SELECT _id, body, SEARCH_SCORE(body, 'invoice') AS score FROM docs WHERE CASE WHEN MATCH(body, 'invoice') THEN TRUE ELSE FALSE END ORDER BY score DESC, _id LIMIT 3";
+    for expected in [[-2048, -2047, -2046], [-3000, -2047, -2046]] {
+        recording.sizes.lock().unwrap().clear();
+        recording.retained.lock().unwrap().clear();
+        let got = rows(session.query_sql(query, vec![]).await.unwrap()).await;
+        assert_eq!(got, rows(session.query_sql(oracle, vec![]).await.unwrap()).await);
+        assert_eq!(ids(got), expected);
+        assert_eq!(*recording.sizes.lock().unwrap(), [3]);
+        if tree { assert_eq!(*recording.retained.lock().unwrap(), [3]); }
+        recording.sizes.lock().unwrap().clear();
+        recording.retained.lock().unwrap().clear();
+        let dense_order = |sql: &str| sql.replace("SEARCH_SCORE(body, 'invoice')", "SEARCH_SCORE(body, 'audit')")
+            .replace("ORDER BY score DESC, _id", "ORDER BY score DESC, _id, _system_from");
+        let dense = dense_order(query);
+        let dense_oracle = dense_order(oracle);
+        let got = rows(session.query_sql(&dense, vec![]).await.unwrap()).await;
+        assert_eq!(got, rows(session.query_sql(&dense_oracle, vec![]).await.unwrap()).await);
+        let expected = if expected[0] == -2048 { [-2048, -2046, -2044] } else { [-2046, -2044, -2042] };
+        assert_eq!(ids(got), expected);
+        assert_eq!(*recording.sizes.lock().unwrap(), [3]);
+        if tree { assert_eq!(*recording.retained.lock().unwrap(), [3]); }
+        if expected[0] == -2048 {
+            let changed = session.state_mut().execute_tx(vec![
+                sql("INSERT INTO docs RECORDS {_id: -2048, body: 'paid'}"),
+                sql("INSERT INTO docs RECORDS {_id: -3000, body: 'invoice'}"),
+            ], AutonomousTxOptions::default()).await.unwrap();
+            assert!(changed.committed());
+        }
+    }
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn corruption_in_a_scoring_only_page_falls_back_and_queues_repair() {
+    let mut settings = options();
+    settings.file_size_target = 1;
+    settings.automatic_artefacts = false;
+    let runtime = rtdb_search::SearchRuntime::new(16 << 20);
+    let services = NodeServices { scan_accelerators: vec![runtime.accelerator()], artefact_kinds: vec![runtime.artefacts()], ..services() };
+    let (node, driver) = Node::open(settings, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let body = (0..96).map(|term| format!("token{term:03}")).collect::<Vec<_>>().join(" ");
+    let created = session.state_mut().execute_tx(vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql(&format!("INSERT INTO docs RECORDS {{_id: 1, body: '{body}'}}")),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(created.committed(), "{:?}", created.error());
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let snapshot = database.snapshot();
+    let table = TableRef::new("public", "docs");
+    let slug = &snapshot.table_entry(&table).unwrap().slug;
+    let (trie, record) = snapshot.trie_catalog().current_tries(&table).into_iter().find_map(|trie| {
+        trie.artefacts.iter().find(|record| record.definition_id().ends_with("f13")).map(|record| (trie, record))
+    }).unwrap();
+    let key = rtdb_storage::ObjectKey::new(slug.recorded_artefact_key(&trie.key, record).unwrap()).unwrap();
+    let store = database.object_store();
+    let original = store.get(&key).await.unwrap();
+    let trailer = original.len() - 10;
+    let footer_len = arrow_ipc::reader::read_footer_length(original[trailer..].try_into().unwrap()).unwrap();
+    let footer = arrow_ipc::root_as_footer(&original[trailer - footer_len..trailer]).unwrap();
+    let block = footer.recordBatches().unwrap().get(6);
+    let mut corrupted = original.to_vec();
+    corrupted[(block.offset() + i64::from(block.metaDataLength())) as usize] ^= 1;
+    store.delete(&key).await.unwrap();
+    store.put(&key, corrupted.into()).await.unwrap();
+
+    let statement = "SELECT _id, SEARCH_SCORE(body, 'token095') AS score FROM docs WHERE MATCH(body, 'token000') ORDER BY score DESC, _id LIMIT 1";
+    assert_eq!(ids(rows(session.query_sql(statement, vec![]).await.unwrap()).await), [1]);
+    assert_eq!(runtime.suspects("xtdb").len(), 1);
+    database.build_artefacts().await.unwrap();
+    assert!(runtime.suspects("xtdb").is_empty());
+    assert_eq!(store.get(&key).await.unwrap(), original);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn compatible_writers_keep_both_search_formats_through_restart() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| Some(directory.path().join(name).to_string_lossy().into_owned());
+    let mut settings = options();
+    settings.file_size_target = 1;
+    settings.automatic_artefacts = false;
+    settings.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: path("store"), epoch: Some(0) })),
+            ..Default::default()
+        },
+        skipped: Default::default(),
+    };
+    let template = services();
+    let table = TableRef::new("public", "docs");
+    let mut published = std::collections::BTreeSet::new();
+    for (phase, format) in [11, 12, 13, 14, 11].into_iter().enumerate() {
+        let runtime = match format {
+            11 => rtdb_search::SearchRuntime::with_tantivy_files(16 << 20),
+            14 => rtdb_search::SearchRuntime::with_tree_files(16 << 20),
+            _ => rtdb_search::SearchRuntime::with_paged_files(16 << 20, format == 13),
+        };
+        let services = NodeServices {
+            resources: Arc::new(NativeResources::default().with_local_log_clock(Arc::clone(&template.clock), false)),
+            artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()],
+            ..template.clone()
+        };
+        let (node, driver) = Node::open(settings.clone(), services).await.unwrap();
+        let driver = tokio::spawn(driver.run());
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+        if phase == 0 {
+            let result = session.state_mut().execute_tx(vec![
+                sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+                sql("INSERT INTO docs RECORDS {_id: 1, body: 'invoice'}, {_id: -2, body: 'overdue invoice'}"),
+            ], AutonomousTxOptions::default()).await.unwrap();
+            assert!(result.committed(), "{:?}", result.error());
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+            database.compaction().unwrap().compact_all().await.unwrap();
+        }
+        database.build_artefacts().await.unwrap();
+        published.insert(match format { 11 => "f11", 12 => "f12", 13 => "f13", _ => "f14" });
+        let catalog = database.trie_catalog();
+        let seen: std::collections::BTreeSet<_> = catalog.current_tries(&table).into_iter()
+            .flat_map(|trie| trie.artefacts.iter())
+            .filter(|record| record.kind() == "search")
+            .map(|record| &record.definition_id()[record.definition_id().len() - 3..]).collect();
+        assert_eq!(seen, published, "phase {phase}");
+        let sql = "SELECT _id, SEARCH_SCORE(body, 'invoice') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 1";
+        assert_eq!(ids(rows(session.query_sql(sql, vec![]).await.unwrap()).await), [-2]);
+        drop(session);
+        node.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_ranked_snapshot_combines_a_tree_and_an_older_search_format() {
+    use rtdb_index::{LiveIndex, Snapshot};
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext};
+
+    let mut settings = options();
+    settings.file_size_target = 1;
+    settings.automatic_artefacts = false;
+    let runtime = rtdb_search::SearchRuntime::with_tree_files(64 << 20);
+    let (node, driver) = Node::open(settings, NodeServices {
+        artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()], ..services()
+    }).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let table = TableRef::new("public", "docs");
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let mut older = std::collections::BTreeSet::new();
+    for (phase, statement) in [
+        "INSERT INTO docs RECORDS {_id: -2, body: 'invoice invoice invoice'}, {_id: 1, body: 'invoice'}",
+        "INSERT INTO docs RECORDS {_id: -2, body: 'paid'}, {_id: -1, body: 'invoice invoice'}",
+    ].into_iter().enumerate() {
+        let mut operations = vec![sql(statement)];
+        if phase == 0 { operations.insert(0, sql("CREATE SEARCH INDEX docs_body ON docs (body)")); }
+        assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+        database.compaction().unwrap().compact_all().await.unwrap();
+        database.build_artefacts().await.unwrap();
+        if phase == 0 {
+            older.extend(database.trie_catalog().current_tries(&table).into_iter().map(|trie| trie.key.clone()));
+        }
+    }
+    let pinned = database.snapshot();
+    let catalog = pinned.trie_catalog();
+    let earlier = catalog.current_tries(&table).into_iter().find(|trie| older.contains(&trie.key)).unwrap();
+    let record = earlier.artefacts.iter().find(|record| record.definition_id().ends_with("f14")).unwrap();
+    let catalog = catalog.without_artefacts(&table, [(earlier.key.clone(), record.clone())]);
+    assert!(catalog.current_tries(&table).into_iter().any(|trie| trie.artefacts.iter().any(|record| record.definition_id().ends_with("f14"))));
+    let mixed = Snapshot::new(Arc::new(catalog), Arc::new(pinned.table_catalog().clone()),
+        Arc::new(LiveIndex::new(pinned.block_index(), pinned.tx_basis(), Default::default())));
+    let input = CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".into(), DatabaseSnapshot {
+        partitions: vec![mixed], storage: Arc::clone(database.storage()),
+    })]), false).unwrap();
+    let memory = Arc::clone(node.memory());
+    let recording = Arc::new(Recording { inner: runtime.accelerator(), sizes: Default::default(), retained: Default::default() });
+    let context = QueryContext::new(input, Arc::clone(&memory), Timestamp(i64::MAX / 2), "UTC", Default::default(), &cancellation).unwrap()
+        .with_accelerators(Arc::from([recording.clone() as Arc<dyn rtdb_query::ScanAccelerator>]));
+    let statement = "SELECT _id, body, SEARCH_SCORE(body, 'invoice') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 2";
+    let prepared = rtdb_sql::prepare_in(statement, &context.catalog, &Default::default(), &memory).unwrap();
+    let cursor = PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, vec![]).await.unwrap();
+    let selected = rows(cursor).await;
+    assert_eq!(ids(selected.clone()), [-1, 1]);
+    assert_eq!(selected, rows(session.query_sql(statement, vec![]).await.unwrap()).await);
+    assert_eq!(*recording.retained.lock().unwrap(), [2]);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -570,7 +1071,7 @@ async fn a_ranked_limit_over_several_partitions_returns_the_same_rows_as_ranking
         partitions.push(database.snapshot());
     }
     let memory = rtdb_columnar::MemoryBudget::new(1 << 30);
-    let recording = Arc::new(Recording { inner: rtdb_search::SearchRuntime::new(64 << 20).accelerator(), sizes: Default::default() });
+    let recording = Arc::new(Recording { inner: rtdb_search::SearchRuntime::new(64 << 20).accelerator(), sizes: Default::default(), retained: Default::default() });
     let run = |query: String| {
         let catalog = rtdb_query::CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".to_string(), rtdb_query::DatabaseSnapshot { partitions: partitions.clone(), storage: Arc::clone(database.storage()) })]), false).unwrap();
         let (memory, recording) = (Arc::clone(&memory), Arc::clone(&recording));
@@ -721,7 +1222,7 @@ async fn an_index_without_history_answers_past_queries_as_scanning_does_with_no_
 }
 
 #[tokio::test]
-async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_compaction() {
+async fn resolved_document_scores_are_unmoved_by_compaction() {
     let mut options = options();
     options.file_size_target = 1;
     options.automatic_artefacts = false;
@@ -733,7 +1234,6 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
     let words = ["invoice", "overdue", "paid", "book", "late", "red"];
     let mut seed = 41u64;
     let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
-    let mut last = None;
     for round in 0..3 {
         for id in 0..60 {
             let body: Vec<_> = (0..1 + next() % 5).map(|_| words[next() % words.len()]).collect();
@@ -743,7 +1243,7 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
                 2 => format!("INSERT INTO docs RECORDS {{_id: {id}, title: 'untitled'}}"),
                 _ => format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{}'}}", body.join(" ")),
             };
-            last = Some(session.state_mut().execute_tx(vec![sql(&statement)], AutonomousTxOptions::default()).await.unwrap().tx_key().system_time);
+            assert!(session.state_mut().execute_tx(vec![sql(&statement)], AutonomousTxOptions::default()).await.unwrap().committed());
         }
         if round < 2 {
             database.flush().await.unwrap();
@@ -751,23 +1251,13 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
             if round == 0 { database.compaction().unwrap().compact_all().await.unwrap(); }
         }
     }
-    let basis = chrono::DateTime::from_timestamp_micros(last.unwrap().0).unwrap().to_rfc3339();
-    let visible = rows(session.query_sql(&format!("SELECT body FROM docs FOR VALID_TIME AS OF TIMESTAMP '{basis}' FOR SYSTEM_TIME AS OF TIMESTAMP '{basis}'"), vec![]).await.unwrap()).await;
     let scoring = rtdb_text::Query::parse("invoice overdue");
-    let mut corpus = rtdb_text::Corpus::default();
-    for row in &visible {
-        let tokens = match &row[0] { Value::Null => continue, Value::Utf8(text) => rtdb_text::tokens(text), _ => Vec::new() };
-        corpus.documents += 1;
-        corpus.tokens += u64::from(rtdb_text::stored_length(tokens.len()));
-        for term in scoring.terms() { if tokens.contains(term) { *corpus.frequencies.entry(term.clone()).or_default() += 1; } }
-    }
-    for term in scoring.terms() { corpus.frequencies.entry(term.clone()).or_default(); }
     let query = "SELECT _id, body, SEARCH_SCORE(body, 'invoice overdue') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY _id";
     let scored = rows(session.query_sql(query, vec![]).await.unwrap()).await;
     assert!(scored.len() > 5, "{scored:?}");
     for row in &scored {
         let Value::Utf8(body) = &row[1] else { panic!("{row:?}") };
-        assert_eq!(row[2], Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens(body), Some(&corpus))), "{row:?} against {corpus:?}");
+        assert_eq!(row[2], Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens(body), None)), "{row:?}");
     }
     database.flush().await.unwrap();
     node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
@@ -779,7 +1269,7 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
 }
 
 #[tokio::test]
-async fn same_transaction_writes_count_only_the_visible_terms_in_bm25() {
+async fn same_transaction_writes_score_only_the_visible_document() {
     let mut options = options();
     options.automatic_artefacts = false;
     let (node, driver) = Node::open(options, services()).await.unwrap();
@@ -797,15 +1287,10 @@ async fn same_transaction_writes_count_only_the_visible_terms_in_bm25() {
     assert!(result.committed(), "{result:?}");
 
     let scoring = rtdb_text::Query::parse("beta");
-    let corpus = rtdb_text::Corpus {
-        documents: 2,
-        tokens: 5,
-        frequencies: std::collections::BTreeMap::from([("beta".into(), 1)]),
-    };
     let statement = "SELECT _id, SEARCH_SCORE(body, 'beta') AS score FROM docs WHERE MATCH(body, 'visible') ORDER BY score DESC LIMIT 1";
     let expected = vec![vec![
         Value::I64(1),
-        Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens("visible beta beta"), Some(&corpus))),
+        Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens("visible beta beta"), None)),
     ]];
 
     assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, expected);

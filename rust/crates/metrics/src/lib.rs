@@ -18,11 +18,11 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, ExecutionError, ExecutionObserver, ExecutionTimer};
 use rtdb_types::{Anomaly, Result, TableRef};
 
-const TIMERS: [ExecutionTimer; 7] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob];
-struct Counters { query_errors: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
+const TIMERS: [ExecutionTimer; 9] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob, ExecutionTimer::DurableCommitLag, ExecutionTimer::StagedCommitLag];
+struct Counters { query_errors: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, durable_commit_clock_invalid: step::Counter, staged_commit_clock_invalid: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
 impl Counters {
     fn roll(&mut self, now: i64, closing: bool) {
-        for counter in [&mut self.query_errors, &mut self.transaction_errors, &mut self.collection_errors].into_iter().chain(self.kafka_warnings.iter_mut()).chain(self.connections.iter_mut()) { counter.poll(now, closing); }
+        for counter in [&mut self.query_errors, &mut self.transaction_errors, &mut self.collection_errors, &mut self.durable_commit_clock_invalid, &mut self.staged_commit_clock_invalid].into_iter().chain(self.kafka_warnings.iter_mut()).chain(self.connections.iter_mut()) { counter.poll(now, closing); }
     }
 }
 struct State { timers: Vec<histogram::Timer>, counters: Counters }
@@ -48,7 +48,7 @@ impl Registry {
         let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(TIMERS.len() * histogram::Timer::RETAINED_BYTES).and_then(|bytes| bytes.checked_add(node_id.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let now = wall_time_millis();
         Ok(Arc::new(Self { node_id: node_id.to_owned(), memory,
-            state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] } }), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
+            state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), durable_commit_clock_invalid: step::Counter::new(now), staged_commit_clock_invalid: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] } }), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
             #[cfg(feature = "kafka")]
             sources: Arc::new(Mutex::new(kafka::Sources::default())),
         }))
@@ -68,7 +68,7 @@ impl Registry {
 }
 impl ExecutionObserver for Registry {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration) {
-        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6 };
+        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8 };
         self.state.lock().timers[index].record(elapsed, wall_time_millis());
     }
     fn record_error(&self, error: ExecutionError) {
@@ -79,6 +79,18 @@ impl ExecutionObserver for Registry {
     fn connection_event(&self, event: ConnectionEvent) {
         let index = match event { ConnectionEvent::Opened => 0, ConnectionEvent::Cancelled => 1, ConnectionEvent::Refused => 2 };
         let mut state = self.state.lock(); state.counters.connections[index].add(1);
+    }
+    fn record_durable_commit_lag(&self, lag: Option<Duration>) {
+        match lag {
+            Some(lag) => self.record_duration(ExecutionTimer::DurableCommitLag, lag),
+            None => self.state.lock().counters.durable_commit_clock_invalid.add(1),
+        }
+    }
+    fn record_staged_commit_lag(&self, lag: Option<Duration>) {
+        match lag {
+            Some(lag) => self.record_duration(ExecutionTimer::StagedCommitLag, lag),
+            None => self.state.lock().counters.staged_commit_clock_invalid.add(1),
+        }
     }
 }
 impl CollectionObserver for Registry {
@@ -98,7 +110,8 @@ impl Registry {
         let provided_bytes = provided.iter().flat_map(|rows| rows.rows()).try_fold(0usize, |bytes, row| bytes.checked_add(metric_bytes(row)?).ok_or_else(overflow))?;
         #[cfg(feature = "kafka")]
         let mut sources = self.sources.lock();
-        let mut count = 18usize.checked_add(provided_count).ok_or_else(overflow)?;
+        // Five execution counters, three connections, five Kafka warnings and three gauges.
+        let mut count = (TIMERS.len() + 16).checked_add(provided_count).ok_or_else(overflow)?;
         #[cfg(feature = "kafka")]
         let labels = { count = count.checked_add(sources.len().checked_mul(6).ok_or_else(overflow)?).ok_or_else(overflow)?; sources.label_bytes()? };
         #[cfg(not(feature = "kafka"))]
@@ -119,6 +132,8 @@ impl Registry {
         rows.push(self.counter("query.error", state.counters.query_errors.value(now, step)));
         rows.push(self.counter("tx.error", state.counters.transaction_errors.value(now, step)));
         rows.push(self.counter("rtdb.gc.error", state.counters.collection_errors.value(now, step)));
+        rows.push(self.counter("rtdb.replica.commit.clock_invalid", state.counters.durable_commit_clock_invalid.value(now, step)));
+        rows.push(self.counter("rtdb.replica.commit.staged_clock_invalid", state.counters.staged_commit_clock_invalid.value(now, step)));
         for (name, count) in ["pgwire.total_connections", "pgwire.cancelled_connections", "pgwire.connections_refused"].into_iter().zip(&mut state.counters.connections) { rows.push(self.counter(name, count.value(now, step))); }
         for (reason, count) in ["acknowledgements_overridden", "idempotence_disabled", "insufficient_replicas", "unclean_election", "configuration_unavailable"].into_iter().zip(&mut state.counters.kafka_warnings) {
             let mut tags = self.tags(); tags.insert("reason".into(), reason.into());

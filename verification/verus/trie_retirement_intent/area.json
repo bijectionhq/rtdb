@@ -1,0 +1,95 @@
+{
+  "summary": "A durable trie retirement intent accepts a receipt from its journal strictly after selection.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "ignore_journal": {
+      "defect": "A later receipt may come from a different replica journal.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "find": "    selected_epoch == installed_epoch && selected < installed\n}",
+          "replace": "    selected < installed\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "function": "receipt_follows_selection",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_journal_and_contract": {
+      "defect": "The function and contract change together. A later receipt may come from a different replica journal.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "find": "    selected_epoch == installed_epoch && selected < installed\n}",
+          "replace": "    selected < installed\n}"
+        },
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "find": "out <==> selected_epoch == installed_epoch && selected < installed",
+          "replace": "out <==> selected < installed"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/trie_retirement_intent/laws.rs",
+          "function": "a_later_receipt_from_another_journal_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "allow_equal": {
+      "defect": "The selection position is mistaken for its later installed removal.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "find": "    selected_epoch == installed_epoch && selected < installed\n}",
+          "replace": "    selected_epoch == installed_epoch && selected <= installed\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "function": "receipt_follows_selection",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "allow_equal_and_contract": {
+      "defect": "The function and contract change together. The selection position is mistaken for its later installed removal.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "find": "    selected_epoch == installed_epoch && selected < installed\n}",
+          "replace": "    selected_epoch == installed_epoch && selected <= installed\n}"
+        },
+        {
+          "file": "rust/crates/format/src/trie_retirement_step.rs",
+          "find": "out <==> selected_epoch == installed_epoch && selected < installed",
+          "replace": "out <==> selected_epoch == installed_epoch && selected <= installed"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/trie_retirement_intent/laws.rs",
+          "function": "an_equal_or_older_receipt_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

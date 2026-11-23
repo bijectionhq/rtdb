@@ -1,5 +1,14 @@
 -- allium: 3
 -- rtdb-multi.allium
+-- Writable checkpoint worlds store collision probes in their local scope alongside shadows.
+-- A shadow miss probes the root registry at the world's retained archived cut.
+-- The world registration record retains its internal UUID address.
+-- Hosted fork selects a registered capture in the authenticated writer's deployment and derives its basis from the verified archive root.
+-- Hosted world writes use the retained schema and the ordered registration's lifetime.
+-- A held world point handle keeps one ordered local capture and one verified archive region until bounded expiry or close.
+-- The captured registration fences new opens after ordered drop while an earlier handle stays inside its retained read admission.
+-- A held point condition preserves the local shadow revision, including a tombstone, or verified local absence.
+-- Ordered conditional world writes validate the witnessed placement, deadline and all local conditions before applying effects.
 --
 -- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.
 -- A deployment is one RTDB database belonging to one customer application.
@@ -7,6 +16,9 @@
 --
 -- Status: target design, ahead of the implementation.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
+-- The target serving protocol uses scoped attempt receipts and a loglet read index.
+-- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
+-- verification/redesign/authority-boundaries.md describes the migration and proof premises.
 -- Where this spec and an existing spec describe the same mechanism, the existing spec describes the code as it stands and this one describes where it is going:
 --   - election and the term fence: log-processor-lifecycle.allium
 --   - the source log, the replica log and the block cycle: db.allium
@@ -63,6 +75,11 @@
 -- - LINEAGE -- a root deployment and every fork descended from it within one organisation.
 --   Objects are shared within a lineage and never across one.
 
+-- A catalog reader has one durable hold in its serving storage region.
+-- Each admission sees the residence's catalog floor in the version that orders the new hold.
+-- A batch admits readers with different cuts only if each cut satisfies that floor.
+-- A release after an uncertain admission fences the older directory version.
+
 ------------------------------------------------------------
 -- External Entities
 ------------------------------------------------------------
@@ -77,6 +94,7 @@ external entity KeyService {
     -- A key-management service (KMS).
     -- Wraps and unwraps data keys under a key bound to an encryption context, and destroys keys irreversibly.
     -- The regional deployment key vault is outside the payload backup and tracks destroyed identities.
+    -- The hosted S3 vault uses the same custody entry for a first residence whether its key identity omits the initial incarnation or spells it out.
 }
 
 external entity Clock {
@@ -122,8 +140,8 @@ value CellId {
 }
 
 value MemberId {
-    -- One process lifetime.
-    -- A restarted process registers a new MemberId.
+    -- Logkeepers retain their member identity with their durable journal.
+    -- Other roles register an identity for each process lifetime.
     uuid: String
 }
 
@@ -179,6 +197,23 @@ value Checkpoint {
     -- The hash of the log record at lsn, so recovery verifies the tail it replays continues this history.
     chain_hash: String
     format_version: Integer
+    recovery_manifest_digest: String?
+}
+
+value CheckpointMetadataRead {
+    id: String
+    first_block: Integer
+}
+
+value ReplicaReplayHold {
+    id: String
+    first_required: Lsn
+    owner: MemberId
+}
+
+value CertifiedReplicaPrefix {
+    through: Lsn
+    digest: String
 }
 
 value Loglet {
@@ -278,8 +313,7 @@ config {
     -- Liveness.
     member_heartbeat: Duration = 500.milliseconds
     member_lease: Duration = 3.seconds
-    -- Independent gateway reports that corroborate a suspicion before the controller confirms it.
-    suspicion_reporters: Integer = 2
+    failed_serving_probe_rounds: Integer = 2
 
     -- The log.
     ensemble_size: Integer = 3
@@ -307,11 +341,15 @@ config {
 
     -- Transactions.
     idempotency_window: Duration = 1.hours
+    command_replay_window: Duration = 30.seconds
+    replay_permit_age: Duration = 30.minutes
     system_time_skew_bound: Duration = 500.milliseconds
 
     -- Reads.
     subscriber_basis_wait: Duration = 20.milliseconds
     max_read_width: Integer = 8
+    read_sessions_per_node: Integer = 0
+    read_width_quiet_samples: Integer = 3
 
     -- Control.
     activations_per_node_per_second: Integer = 200
@@ -369,12 +407,17 @@ contract Directory {
 
     @invariant StaticStability
         -- A directory outage stalls activations, moves, flush publication and lifecycle changes.
-        -- It does not stop a placed holder from committing or serving reads.
-        --   Tails grow while publication is stalled, bounded by log-server capacity, and flush backpressure turns that bound into write stalls rather than data risk.
+        -- An installed holder continues to commit while its own loglet quorum accepts its epoch and has capacity.
+        -- A node may serve while it can establish the requested freshness and its storage entitlement covers the read.
+        -- Flush backpressure limits the unpublished tail.
 
     @invariant DirectoryFormatsPreservePlacement
         -- During the parked-row format rollout, upgraded readers accept both layouts.
         -- Both layouts carry the same deployment state and use the item's version for CAS.
+        -- A catalog admission floor persists in both layouts, scoped to its residence, storage root, object namespace and replica journal.
+        -- The current serving writer advances the floor from a durable installed trie-removal receipt.
+        -- The same versioned update coordinates floor advancement and reader admission.
+        -- An older or untracked held catalog blocks advancement, and a new reader at an older or untracked cut is refused once the floor exists.
         -- Enable packed writes after all readers can decode them.
 
     @invariant PlacementWorkScalesWithHoldings
@@ -388,10 +431,11 @@ contract LogService {
     -- What a cell's log servers supply, per deployment.
     -- The log servers are logkeepers, built for this contract; the loglet kind is recorded per loglet, so another kind can back a deployment from its next epoch.
     -- A deployment's log is a dense sequence of records addressed by Lsn, carried by a chain of loglets.
-    -- Each server address contributes at most one acknowledgement to a loglet's quorum.
     append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
     seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
     check: (deployment: DeploymentId, epoch: Epoch) -> Epoch
+    activate: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> ()
+    read_index: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> Lsn
     read: (deployment: DeploymentId, from: Lsn) -> List<LogRecord>
     subscribe: (deployment: DeploymentId, from: Lsn) -> Stream<LogRecord>
     trim: (deployment: DeploymentId, through: Lsn) -> Lsn
@@ -409,6 +453,14 @@ contract LogService {
         -- A logkeeper serves only while it holds the journal's exclusive lock and its member lease.
         -- A replacement must reacquire the journal and obtain a new lease after the prior lease ends.
         -- A stable advertised address remains reserved for that journal.
+
+    @invariant QuorumsCountDistinctJournals
+        -- Each loglet slot names a distinct durable journal.
+        -- The client verifies the journal on each session before sending a journal operation.
+        -- A journal verifies that a bound operation addresses its identity before acting.
+        -- A failed or different identity contributes no vote to recovery, append, repair, read confirmation or retention.
+        -- Copy reservation and disposal retain journal identities for the full inventory, including members that have left the serving ensemble.
+        -- A legacy address inventory requires verified custody recorded at the inspected directory version before it authorizes a cell transfer or retirement.
 
     @invariant LocalJournalHasProcessBoundTransport
         -- A standalone authority addresses its journal by the retained journal ID.
@@ -441,9 +493,18 @@ contract LogService {
         -- A deployment with no appends causes no log traffic: no heartbeat, no no-op, no timer.
 
     @invariant SealsAreAnnounced
-        -- Every acknowledgement of an append, a commit or a check for a deployment says whether that server's promised epoch for it was still at most the writer's epoch when the server decided the request, which is after the writer sent it.
-        -- A check changes nothing and needs no durable round; it is what an idle writer sends.
-        --   This is what a holder serving a linearizable read waits on (ServeLinearizableReadOnWriter).
+        -- A holder confirms its epoch from a quorum of positive replies to requests sent during the confirmation round.
+        -- A positive reply establishes that the server's promised and synced epochs were both equal to the holder's epoch when the server decided the request.
+        -- An idle holder sends an epoch check that waits behind preceding journal work and writes no event of its own.
+        -- A refusal reporting a higher epoch deposes the holder.
+
+    @invariant ReadIndexUsesTheActiveLoglet
+        -- Before writing, the holder activates a durable write quorum for the epoch, the member identities and the configured quorum size.
+        -- A journal acknowledges activation only at its promised and synced epoch and records at most one ensemble for that epoch.
+        -- A higher promise revokes the activation.
+        -- A positive read-index reply requires that activation and reports the last held position after preceding journal work is durable.
+        -- A read index takes the maximum last held position from an intersecting write quorum of positive replies.
+        -- A subscriber waits for committed application through the result before taking its query snapshot.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
@@ -475,8 +536,12 @@ contract ObjectStorage {
     inventory: (prefix: String) -> List<String>
 
     @invariant ObjectsAreImmutable
-        -- Every object is written once, under a key never reused.
-        -- So a cached object or range is correct forever or unreachable; nothing is ever invalidated.
+        -- Each published payload has an immutable identity.
+        -- A terminal physical key accepts one payload and retains its tombstone after retirement until residence disposal.
+
+    @invariant TerminalAllocationPolicy
+        -- The provisioning authority binds the exact provider root and its lifetime storage policy before enrollment.
+        -- The provider fences ordinary writes before activation and enforces create-once publication afterward.
 
     @invariant WritersCarryTheirEpoch
         -- Every object a holder writes is under prefix + "/e" + epoch, written with put-if-absent, using a StorageCredential scoped to that epoch's prefix.
@@ -484,7 +549,7 @@ contract ObjectStorage {
 
     @invariant OnlyTheReaperDeletes
         -- No node, gateway or worker holds a credential that can delete.
-        -- The reaper deletes, and only objects the reachability rule (ReapUnreachable) has found unreachable for reaper_grace.
+        -- The reaper deletes objects after a reachability release or a completed ordered-page retirement fence.
 
     @invariant VisibilityIsByReference
         -- An object has effect only once a committed log record or a published manifest references it.
@@ -593,6 +658,9 @@ entity DeploymentRecord {
     -- Empty when the tail is sealed and flushed.
     loglets: List<Loglet>
     checkpoint: Checkpoint?
+    replica_anchor: CertifiedReplicaPrefix?
+    replica_replays: Set<ReplicaReplayHold>
+    checkpoint_metadata_reads: Set<CheckpointMetadataRead>
     -- A holder confirms its epoch with a quorum for reads.
     linearizable_reads: Boolean
     -- How many ranks of the affinity order may serve reads.
@@ -834,6 +902,7 @@ entity GatewayRoute {
     -- A gateway's cached view of one active deployment: its holder and epoch, pushed for the active set.
     -- A wrong view costs one redirect; a gateway never authorises a write by its view.
     -- A route to a running writer can check that member by ID before considering the eligible fleet.
+    -- A gateway follows a redirect after the target confirms its serving endpoint and epoch.
     deployment: DeploymentId
     holder: MemberId?
     epoch: Epoch
@@ -952,21 +1021,23 @@ rule ExpireLease {
 }
 
 rule ConfirmSuspicion {
-    -- Gateways report connection failures to the controller.
-    -- Safety never depends on this verdict, so it can be quick: a wrong one costs one seal and a cache move.
-    when: SuspicionReported(member, reporters)
+    when: ServingProbeFailureObserved(member, endpoints, consecutive_failures)
 
-    requires: member.state in {eligible, draining}
-    requires: count(reporters) >= config.suspicion_reporters
-    requires: not LeaseRenewedSince(member, earliest(reporters.reported_at))
+    requires: member.state in {joining, eligible, draining}
+    requires: consecutive_failures >= config.failed_serving_probe_rounds
+    requires: endpoints = CurrentServingEndpoints(member)
 
     ensures:
         member.state = dead
 }
 
 rule ProbeMemberLiveness {
-    -- A controller pass issues up to sixteen member probes at a time.
-    -- Missing replies count against the endpoint that was probed.
+    -- A controller pass probes up to sixteen members at a time.
+    -- A round succeeds when control answers and the Pgwire listener returns its serving probe response.
+    -- During a rollout, the controller checks TCP reachability for a member without the serving probe.
+    -- The serving probe is admitted separately from authenticated sessions.
+    -- A missed probe during startup-admission overflow gives no failure evidence.
+    -- A successful round or a change to either endpoint clears preceding failures.
     when: ControllerProbeDue(cell)
 
     ensures:
@@ -1133,7 +1204,11 @@ rule AnswerRetryFromWindow {
 }
 
 rule ResolveAndAppend {
-    -- The holder resolves against its state, pipelining later transactions against speculative state, and exposes nothing until the append commits.
+    -- The holder resolves against its state, pipelining later transactions against speculative state.
+    -- An asynchronous submission returns an authenticated, opaque receipt for the deployment history, writer epoch, local sequence, principal and fresh nonce.
+    -- A placed session accepts only receipts and causal tokens from the same deployment history and principal.
+    -- The resolved replica record carries the exact attempt identity.
+    -- Only its durable applied outcome supplies a causal basis.
     when: TxArrived(holding, tx, key)
 
     requires: holding.state = serving
@@ -1152,6 +1227,14 @@ rule ResolveAndAppend {
 }
 
 rule ApplyOnCommit {
+    -- The applied outcome and its basis are retained against the exact attempt through the receipt window, including at recovery.
+    -- The indexed outcome witness is written in the same resolved delta as the transaction result.
+    -- Its visible receipt window starts at the logged intake timestamp.
+    -- The current writer can redeem an attempt once the installed prefix covers its intake sequence and the exact outcome witness is readable.
+    -- To classify a missing outcome as unresolved, the serving attachment installs the recovered prefix that closes the attempt's writer epoch.
+    -- A receipt expires one hour after its recorded intake time.
+    -- Redemption exchanges the receipt for a causal token naming the installed replica prefix that contains the durable outcome.
+    -- Reading at an implicit basis first installs at least the prefix named by the causal token.
     when: AppendCommitted(holding, record: ResolvedTx)
 
     requires: holding.state = serving
@@ -1253,6 +1336,81 @@ rule ConsumeIntake {
 --
 -- A flush writes one pack and one manifest under the holder's epoch, commits BlockUploaded, then publishes the checkpoint.
 -- The log record is the commit point for readers; the directory checkpoint is the commit point for trimming and cold start.
+--
+-- An owned-point checkpoint world reads one exact transaction from an accepted independent capture.
+-- Its locator binds the deployment, capture, manifest digest and complete transaction key.
+-- Opening a point read requires a published root digest and an admission in the capture's original retention inventory.
+-- The admission holds until the query cursor and its archive I/O drain.
+-- The read loads only the checkpoint closure, with no replay of the serving tail.
+-- A writable checkpoint world durably pins that capture before ordering its owner-scoped registration.
+-- A world opens against an authenticated attachment when the durable pin and ordered registration name the same cut and remain live.
+-- Child writes are confined to one world, and the ordered resolver checks that world's expiry before applying any writes.
+-- A fork records its owner's declared relation schemas from the exact archived parent.
+-- The retention pin binds their digest, and the ordered resolver checks local facts against the retained schemas.
+-- A local replacement or tombstone covers only its written half-open business-valid interval.
+-- A world point checks the complete local identity at the requested valid instant.
+-- If no local version exists at that instant the point reads its archived parent at the same valid instant.
+-- A retained point view of an exact Held publication independently pins its original Root archive and the certified Held overlay.
+-- A child of that retained view pins the same Root and Held positions under its own retention.
+-- Ordering checks the immediate source's standing and unchanged archive binding.
+-- The ordered registration checks the source Held generation and binds both prepared positions to the new child.
+-- A point on the retained child reads the archived Held replacement or tombstone first and consults the pinned Root only for an unshadowed identity.
+-- Point release validates the child's registration and the current Root purge frontier.
+-- A validation carrying an exclusive clock limit checks its exact world and pin at ordering.
+-- Held validation compares the accepted Held clock, Proposal validation compares the ordered present, and retained validation compares the fixed inherited clock.
+-- A valid-time window on the child combines boundaries from both retained cuts and resolves each slice by the same point rule.
+-- The child pages the merged identities of both cuts, applying the same tombstone rule before emitting a candidate.
+-- The child seeks both retained orders for a declared path only when its definition agrees across the two cuts.
+-- The owner merges only the covered prefix and resolves the winning point for each ordered candidate.
+-- An exact count starts with the original Root order total and corrects membership for every bounded Held shadow, including tombstones.
+-- Text ranking reads the original Root corpus from covered search artifacts or a bounded projection at the same admitted cut.
+-- The corpus masks each replaced or withdrawn identity with its retained Held shadow before computing statistics.
+-- Live Proposal search overlays the installed writer's bounded staged changes before corpus statistics and binds the staged corpus to its continuation.
+-- A retained Held child restored from an Original archive retains the separately certified destination Root and Held overlay positions before world readmission.
+-- The Held overlay archive keeps its original world, pin, logical publication and source Root coordinate even when the source Held world is dropped or its Root pin is relocated.
+-- An explicit retained Root position uses that original Root archive under the child's frame and exact schema and purge guards.
+-- Held overlay assertion history reads only exact accepted journal groups in the bounded archived region and resolves them against the same pinned Root.
+-- Ordered history opens the two images around the same accepted Held group and checks that the requested path generation covers both cuts.
+-- An earlier effective read uses a certified Held clock publication inside the retained overlay cap and the same pinned Root.
+-- A retained descendant can select that earlier publication while independently retaining the same physical archive suffix.
+-- All descendant reads use the selected publication as their upper system bound. Original restore relocates the archive end and separately certifies the selected clock.
+-- A retained child's own change journal starts at its inherited Held overlay cut and advances through its covered local groups or an issued present.
+-- Dropping the source line leaves both independently retained positions available to the child.
+-- A complete valid window includes covered absence across both sources.
+-- An authenticated placed hold can witness the completed window under its original archive pin and the selected relation's local event and Root purge frontiers.
+-- The same placed writer can submit those read conditions with a Root publication.
+-- The ordered resolver checks each live world registration and its witness before publishing the Root effects.
+-- A placed Root writer can put an acceptance-relative timestamp into an admitted binary field.
+-- The ordered writer fills declared binary order keys from the same acceptance instant before validating uniqueness and capacity.
+-- On final native uniqueness or capacity refusal, a placed Root owner may settle the original registered dispatch in the same transaction.
+-- The selected refusal publishes its exact receipt and marker using the original guards, deadline and acceptance reading.
+-- No tentative application facts survive the refusal.
+-- The ordered resolver fills each disjoint slot from the transaction reading and checks the completed row against its declared schema.
+-- Committed events and archive replay carry filled values and require no slot metadata.
+-- While a world is retained the archive retirement fence cannot close its capture.
+-- A completed world-parent suffix remains available while its preparation lease, the held restore, or a retained world still holds it.
+-- The reaper closes an expired suffix after its last world reference and its admitted provider regions have drained.
+-- A closed suffix admits no more readers or copies, and another materialization uses a fresh identity.
+-- Suffix retirement empties that suffix's provider inventory before releasing its Directory slot.
+-- An initial retained fork at the original live Root key may share one ordered publication with checked Root writes and checked hosted controls.
+-- A live hold may select its accepted application publication as the initial retained basis.
+-- An initial Proposal may inherit that same application basis when its creation and the checked hosted settlement share one ordered attempt.
+-- That Proposal has no initial local overlay. Root writes, when present, advance the Root head in the same transaction and leave the Proposal parent at the original publication.
+-- A hosted bounded-period Proposal assertion carries the original complete-entity point at its finite valid start and a local timeline frontier for the same world relation and pin.
+-- The ordered resolver admits one assertion or tombstone per complete entity key under the inherited bounded-period schema and settles its existing hosted controls with the overlay.
+-- A reviewed Proposal landing checks the exact Root and Proposal points, writes the Root effects, and retires the Proposal in one ordered transaction.
+-- A landing of one finite period replacement checks both points at its valid start and validates the Root relation and local Proposal timeline frontiers before ordering the reviewed extent.
+-- The same order advances the Root head and the public table frontiers carried by the placed writer, and settles the replay head, landing receipt, and proof locator.
+-- The placed owner may select the existing certified archive from its Directory and reopens it to compare the held transaction or its exact application publication before ordering.
+-- A fork of the held application publication compares the same Root head in the ordered source transaction.
+-- Archive admission precedes ordering, and the registration, Root head, writes, control replacements and one immutable attempt marker become visible at one transaction key.
+-- A retained registration with checked hosted replacements and no Root fact writes leaves the Root head unchanged.
+-- The placed replay inventory binds the new retained registration and exact Root relation set, and separately identifies the admitted hosted tables receiving replacements.
+-- Early drop orders a terminal owner-scoped marker before the directory releases its capture pin.
+-- An installed owner can order one read-only world drop with existing hosted owner-row replacements checked at the same cut.
+-- The terminal registration and checked hosted replacements are bound to the same signed outcome and leave the Root head unchanged.
+-- The terminal marker refuses later world opens and writes.
+-- A retry may release the original pin after observing the same terminal marker.
 ------------------------------------------------------------
 
 rule FlushOnTailBudget {
@@ -1317,6 +1475,11 @@ rule FlushOnRows {
 rule WritePackAndManifest {
     -- A small flush writes one pack: every table's trie data, metadata and catalog delta, with a footer index, read by range.
     -- A large flush may write one pack per table.
+    -- A versioned pack ties every ranged member read to the physical publication of its index.
+    -- Recovery and checkpoint copy planning may verify multiple members against one fresh observation of their containing pack.
+    -- A copy reads each member from the publication named by its plan.
+    -- A moved pack is verified using the index of its destination publication.
+    -- A reference transferred into a fork opens the copied pack through its own index and provider version.
     -- The boot object inlines catalogs, schema and the top trie levels, up to boot_inline_limit.
     -- A flush waiter returns a holder-lost result when its holding is deposed.
     when: FlushStarted(holding)
@@ -1333,6 +1496,19 @@ rule PublishCheckpoint {
     -- An explicit flush returns after publishing its adopted checkpoint for the current holding.
     -- Publication is a cas conditional on the epoch, batched per node.
     -- A checkpointed store with an independent object inventory can recover its packs by name.
+    -- The directory receipt binds the adopted logical root bytes to the published coordinate.
+    -- A serving checkpoint commits to its replay inventory in the same directory update as its log boundary.
+    -- The inventory is derived from the root and the verified table blocks.
+    -- Each entry binds its logical path and length to the provider version where available.
+    -- An unversioned entry uses the immutable-object contract.
+    -- The receipt binds the journal epoch and the first replica record required after the checkpoint.
+    -- Fresh storage observations must cover every member before the holder can publish.
+    -- Park and idle suspension use the same publication rule.
+    -- Ordinary startup of a receipted cut protects its root metadata and replay suffix in a single compare-and-replace.
+    -- Startup verifies the root bytes against the receipt before following its table pointers.
+    -- Startup verifies the inventory commitment under that admission before installing the cut.
+    -- A transfer or repair that changes storage custody starts with its separately verified copy.
+    -- Opening a replacement after a gap requires a fresh directory admission.
     when: AppendCommitted(holding, record: BlockUploaded)
 
     ensures:
@@ -1342,13 +1518,64 @@ rule PublishCheckpoint {
                 boot: record.boot,
                 lsn: record.through_lsn,
                 chain_hash: record.hash,
-                format_version: holding.deployment.format_version
+                format_version: holding.deployment.format_version,
+                recovery_manifest_digest: RecoveryInventoryDigest(holding, record)
             ),
             loglets: LogletsAbove(holding.deployment.loglets, record.through_lsn)
         })
-        LogTrimmed(holding.deployment.id, through: record.through_lsn)
         holding.tail_bytes = TailBytesAbove(holding, record.through_lsn)
         holding.oldest_unflushed_at = OldestAbove(holding, record.through_lsn)
+}
+
+rule TrimCertifiedReplicaPrefix {
+    -- The checkpoint's boundary record supplies the intake position on reopen.
+    -- An active suffix pin retains its first required replica record until its verified archive publication is recorded or the pin expires.
+    -- A separately captured suffix retains its capture until explicit archive retirement.
+    -- A world-parent suffix protects its capture for the duration of its preparation lease, held restore, and retained world references.
+    -- A copy admitted against a pending suffix retains its first required replica record until its provider region drains.
+    -- Archive certification covers every replica offset and replay applies only the messages admitted by the checkpoint's term fence.
+    -- Fenced, discarded and voided records survive a transfer at their original offsets and require no offloaded payload.
+    when: ReplicaPrefixCertified(holding, through, digest)
+
+    requires: Directory.read(holding.deployment.id).checkpoint.recovery_manifest_digest != null
+    requires: through < Directory.read(holding.deployment.id).checkpoint.lsn
+    requires: not exists replay in Directory.read(holding.deployment.id).replica_replays: replay.first_required <= through
+    requires: ArchivedAndPendingSuffixesCoverTrim(holding.deployment, through)
+
+    ensures:
+        Directory.cas(holding.deployment.id, holding.epoch, change: {
+            replica_anchor: CertifiedReplicaPrefix.created(through: through, digest: digest)
+        })
+        LogTrimmed(holding.deployment.id, through: through)
+}
+
+rule AdmitLatestCheckpointReplay {
+    when: LatestCheckpointReplayRequested(deployment, after: Lsn, tip: Lsn, owner)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        if record.replica_anchor != null and after < record.replica_anchor.through:
+            RefreshCheckpointDiscovery(deployment, after: after)
+        else:
+            if after < tip:
+                let replay = ReplicaReplayHold.created(id: FreshIdentity(), first_required: Successor(after), owner: owner)
+                Directory.cas(deployment.id, record.version, change: {
+                    replica_replays: record.replica_replays + {replay}
+                })
+            AdmitReplicaCursor(deployment, after: after)
+}
+
+rule ReleaseReplicaReplay {
+    -- A close fences an ambiguous registration even when its hold is absent.
+    when: ReplicaReplayReleaseRequested(deployment, replay)
+
+    requires: ReplayCaughtUpOrDrained(replay) or ReplayOwnerConfirmedStopped(replay)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        Directory.cas(deployment.id, record.version, change: {
+            replica_replays: record.replica_replays - {replay}
+        })
 }
 
 ------------------------------------------------------------
@@ -1429,17 +1656,98 @@ rule NoteReleased {
             GarbageCandidate.created(object: object, lineage: holding.deployment.lineage, released_at: now)
 }
 
+rule AdmitCheckpointMetadata {
+    when: StartupStoreRequested(deployment, requested_checkpoint)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        if requested_checkpoint != null and requested_checkpoint != record.checkpoint:
+            RefreshCheckpointRequest(deployment)
+        else:
+            let read = CheckpointMetadataRead.created(id: FreshIdentity(), first_block: PublishedBlockOrOrigin(record))
+            Directory.cas(deployment.id, record.version, change: {
+                checkpoint_metadata_reads: record.checkpoint_metadata_reads + {read}
+            })
+            StartupMayReadCheckpointMetadataAtOrAbove(read.first_block)
+}
+
+rule ReleaseCheckpointMetadata {
+    when: StartupCheckpointReadsDrained(deployment, read)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        Directory.cas(deployment.id, record.version, change: {
+            checkpoint_metadata_reads: record.checkpoint_metadata_reads - {read}
+        })
+}
+
 rule ReapUnreachable {
     -- An object is deleted only when no published manifest of any live deployment in its lineage references it, and reaper_grace has passed since it was released.
-    -- The reaper's deletions are conditional on the lineage's version, which every fork and every deletion bumps, so a fork created mid-sweep keeps what it references.
+    -- Shared publications advance the lineage's reference revision.
     -- When the reaper cannot determine reachability, it keeps the affected release records for a later pass.
+    -- Withdrawing an inherited reference removes only the selected name and owner from the latest manifest.
+    -- The reaper confirms that withdrawal before deleting a local copy that shadows the reference.
+    -- A failed physical removal keeps its release record for the next pass.
+    -- A local sweep reserves the lineage against its current shared-reference revision after draining local preparation.
+    -- Local path erasure is internal to the admitted maintenance task.
+    -- Whole-residence erasure uses the prefix admitted by the directory's disposal permit.
+    -- Local cleanup of a definitively rejected fork uses the unpublished fork's own prefix.
+    -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
+    -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
+    -- A cell's remote object store admits physical deletion through provider retirement and inventory operations.
+    -- A hosted path sweep withdraws eligible inherited references and preserves the provider payloads and release markers.
+    -- Owned hosted payloads and markers wait for provider retirement authority.
+    -- An S3 loose-file release with an installed publication witness records the exact provider version.
+    -- A hosted pack is erased by exact version after the indexed members of that same version each have a mature release.
+    -- Only checkpoint metadata may be covered by this pack collector. A newer published pack must be present in the same store.
+    -- The owner CAS checks the pack's block and the greatest covered metadata block against its current checkpoint and holds.
+    -- An exact absence observation permits residual member release markers to settle while a replacement pack remains available.
+    -- Hosted preparation for a fork, checkpoint capture or cell transfer holds its source lineage until provider work drains.
     when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
 
     requires: not exists d in LiveDeploymentsOf(candidate.lineage): candidate.object in ReferencedBy(d.checkpoint.manifest)
+    requires: for block in CheckpointMetadataIn(candidate.object):
+        block < PublishedBlockOrOrigin(OwnerOf(candidate.object))
+        and not exists read in OwnerOf(candidate.object).checkpoint_metadata_reads: read.first_block <= block
 
     ensures:
         ObjectStorage.delete_all_versions(candidate.object.key)
         candidate.deleted = true
+}
+
+rule WithdrawForkReferences {
+    -- Each manifest update uses the successor of the sequence whose bytes it read.
+    -- A fresh lookup confirms the current sequence and the missing selected references before retirement continues.
+    -- Hosted withdrawal retains earlier slots.
+    -- An admitted local sweep can prune slots below the confirmed head.
+    when: ForkReferenceWithdrawalRequested(store, selected)
+
+    ensures:
+        let current = ConfirmCurrentReferenceManifest(store)
+        let remaining = current.references - selected
+        if remaining != current.references:
+            WriteImmutableReferenceManifest(store, current.sequence + 1, remaining)
+        if ConfirmedCurrentManifestExcludes(store, selected):
+            ForkReferenceWithdrawalConfirmed(store, selected)
+}
+
+rule RetireOrderedIndexPages {
+    -- An independently compacted index publishes its scrubbed replacement before closing earlier page scopes.
+    -- The captured catalog closes dropped definitions, including prefixes that only exist in provider inventories.
+    -- A new definition has its own physical name. The catalog retains the closure after its page inventory is removed.
+    -- Serving replicas register a scope before retaining any decoded page or starting provider I/O.
+    -- Each provider upload records its exact upload ID in the same directory authority that closes the scope.
+    -- Closure ends new replica registrations and upload admissions. Registered replicas stop taking
+    -- new work after seeing closure and release their permit only after their retained copies and I/O drain.
+    when: OrderedPageScopeClosed(scope)
+
+    requires:
+        EveryServingPermitReleasedOrOwnerStopped(scope)
+        and EveryAdmittedProviderUploadSettled(scope)
+
+    ensures:
+        EveryObjectVersionAndUploadRemoved(scope)
+        EmptyProviderInventoryRecorded(scope)
 }
 
 rule ScrubOrphans {
@@ -1671,9 +1979,15 @@ rule DrainMember {
 
 rule Rebalance {
     -- The balancer moves deployments off a node over a watermark on any LoadVector dimension, each to its next eligible rank.
+    -- A write rate compares accepted source bytes across observations of the same holding epoch.
+    -- Query CPU uses native query opening and result-batch execution time on the holder.
+    -- A move using rates uses members with observations for each active holding.
     -- Each eligible target belongs to the deployment's placement pool.
     -- A reservation uses the source holding's identity and epoch from the plan.
     -- A conflicting reservation or a changed source ends the current pass.
+    -- Configured byte watermarks use sampled live batch and in-memory object cache charges on active writers.
+    -- A target must fit every configured watermark after the proposed move.
+    -- A busy source samples only its local active holders.
     when: NodeOverWatermark(member, dimension)
 
     ensures:
@@ -1704,6 +2018,18 @@ rule BoundInitialGreeting {
         if connection.startup_received:
             ClientMayRetryStartup(connection)
         ConnectionClosed(connection)
+}
+
+rule RouteWriterThroughControl {
+    when: DirectPgwireStartupUnavailable(gateway, holder)
+
+    requires: GatewayHasCellGrant(gateway)
+    requires: PgwireAuthenticationIsPeerAddressIndependent(holder)
+
+    ensures:
+        LocalPgwireConnectionOpened(holder)
+        StartupSentToHolderForAuthentication(gateway, holder)
+        PlacementUnchanged(holder)
 }
 
 rule TouchConnectedBackend {
@@ -1754,8 +2080,8 @@ rule ServeOnWriter {
 }
 
 rule ServeLinearizableReadOnWriter {
-    -- A holder serves a linearizable read only after acknowledgements from a write quorum, to requests sent after the query arrived, show its loglet unsealed beyond its epoch.
-    --   A busy holder takes them from its next appends and commits, an idle one from a check per server; that adds at most one round and involves no clock.
+    -- A holder serves a linearizable read only after a write quorum confirms its promised and synced epoch in a round that starts after the query arrives.
+    -- A busy holder can use positive replies to appends and commits sent during the round, and an idle holder sends one check per server.
     --   Concurrent queries share one confirmation round, at most one is in flight per holder, and a query arriving during one waits for the next.
     when: QueryArrived(holding, query, session)
 
@@ -1787,7 +2113,63 @@ rule ConfirmHostedSource {
         if not SealedIn(round, holding.deployment):
             let cut = SampleSource(holding)
             AwaitApplied(holding, cut)
-            HostedSourceConfirmed(session, history: holding.deployment.id, cut: cut)
+            let applied = LatestAppliedTransaction(holding)
+            HostedSourceConfirmed(session, history: holding.deployment.id, applied_transaction: applied)
+        else:
+            Replied(session, unavailable: true)
+}
+
+rule ConfirmHostedSourceOwner {
+    when: HostedSourceOwnerRequested(holding, session)
+
+    requires: session.deployment = holding.deployment.id
+    requires: holding.state = serving
+    requires: Directory.read(holding.deployment.id).holder = holding.member
+    requires: Directory.read(holding.deployment.id).epoch = holding.epoch
+    requires: Directory.read(holding.deployment.id).linearizable_reads
+    requires: Directory.read(holding.deployment.id).checkpoint = null
+              or holding.applied_lsn >= Directory.read(holding.deployment.id).checkpoint.lsn
+
+    ensures:
+        let round = NextRoundAcknowledged(holding)
+        if not SealedIn(round, holding.deployment):
+            HostedSourceOwnerConfirmed(session, history: holding.deployment.id)
+        else:
+            Replied(session, unavailable: true)
+}
+
+rule OpenHostedAppliedRead {
+    when: HostedAppliedReadRequested(holding, session, floor)
+
+    requires: session.deployment = holding.deployment.id
+    requires: ConfirmHostedSourceOwner(holding, session)
+
+    ensures:
+        let captured = CaptureAppliedCatalog(holding)
+        if CurrentCatalogLease(holding, captured)
+           and CoversTransaction(captured.basis, floor):
+            HeldReadOpened(session, captured, basis: captured.basis)
+        else:
+            Replied(session, unavailable: true)
+}
+
+rule ConfirmHostedAppliedRead {
+    when: HostedAppliedConfirmationRequested(holding, session, original, floor, controls, point, cutoff)
+
+    requires: original.session = session
+    requires: controls.all(CheckFromInstalledAllowlist)
+    requires: point = null or OrdinaryRootPointAt(point, original.basis)
+
+    ensures:
+        let current = CaptureAppliedCatalog(holding)
+        if CurrentCatalogLease(holding, current)
+           and CoversTransaction(current.basis, original.basis)
+           and CoversTransaction(current.basis, floor)
+           and MatchesControls(original, controls)
+           and MatchesControls(current, controls)
+           and (point = null or (MatchesPoint(original, point) and MatchesPoint(current, point)))
+           and Clock.now < cutoff:
+            HostedAppliedControlsConfirmed(session, basis: current.basis)
         else:
             Replied(session, unavailable: true)
 }
@@ -1796,10 +2178,13 @@ rule ServeOnSubscriber {
     when: QueryArrived(subscription, query, session)
 
     ensures:
-        if session.freshness = linearizable:
-            let committed = ReadIndexFromHolder(subscription.deployment)
-            AwaitApplied(subscription, committed)
-            Served(query, tier: subscriber, at: committed)
+        if session.freshness = linearizable and NeedsImplicitBasis(query, session):
+            let bound = ConfirmActiveLogletReadIndex(subscription.deployment)
+            if bound != null and AwaitApplied(subscription, bound, within: config.subscriber_basis_wait):
+                CaptureImplicitBasis(query, from: subscription.applied_lsn)
+                Served(query, tier: subscriber, at: subscription.applied_lsn)
+            else:
+                Replied(query, behind: true)
         else if subscription.applied_lsn >= session.basis.lsn:
             Served(query, tier: subscriber, at: subscription.applied_lsn)
         else:
@@ -1810,8 +2195,21 @@ rule ServeOnSubscriber {
                 -- The gateway retries on the holder.
 }
 
+rule RetrySubscriberRefusalOnHolder {
+    when: SubscriberRefused(session, query, behind: true)
+
+    requires: NoResponseDelivered(query)
+    requires: BackendReportsIdle(session)
+
+    ensures:
+        RoutedToHolder(session.deployment, query)
+}
+
 rule ServeSnapshot {
-    -- A read at a basis at or below the checkpoint needs neither the log nor a live index.
+    -- The snapshot uses the exact root admitted for this attachment.
+    -- The checkpoint confirms a causal token whose history, journal and principal match and whose bound is within the installed cut.
+    -- A matching attempt outcome in the checkpoint can be exchanged for a causal token at that cut.
+    -- A receipt beyond the cut or an attempt whose outcome is absent receives a retryable checkpoint-behind response.
     when: QueryArrived(member, query, session)
 
     requires: query.basis.lsn <= Directory.read(session.deployment).checkpoint.lsn
@@ -1821,19 +2219,27 @@ rule ServeSnapshot {
 }
 
 rule WidenOnPressure {
+    -- The controller counts authenticated, replica-eligible Pgwire sessions at their serving nodes.
+    -- Observed pressure can widen the route when the next affinity rank has reported.
+    -- A widening reserves one more eligible read rank and replicas open on demand.
+    -- The gateway applies the wider route to subsequent connections and reconnects.
     when: ReadOverflow(deployment)
 
-    requires: deployment.read_width < config.max_read_width
+    requires: config.read_sessions_per_node > 0
+              and deployment.read_width < config.max_read_width
 
     ensures:
         Directory.cas(deployment.id, deployment.epoch, change: { read_width: deployment.read_width + 1 })
-        Subscription.created(deployment: deployment, member: Affinity.rank(deployment, deployment.read_width + 1), applied_lsn: deployment.checkpoint.lsn)
 }
 
 rule NarrowOnQuiet {
+    -- A replica outside the remaining affinity ranks retires when the node observes the narrower width.
+    -- Quiet uses half the widening capacity for each serving node.
+    -- Consecutive quiet observations of the writer pool must agree on the writer epoch and width for config.read_width_quiet_samples samples.
     when: ReadQuiet(deployment)
 
-    requires: deployment.read_width > 1
+    requires: config.read_sessions_per_node > 0
+              and deployment.read_width > 1
 
     ensures:
         Directory.cas(deployment.id, deployment.epoch, change: { read_width: deployment.read_width - 1 })
@@ -1883,6 +2289,11 @@ rule PrewarmOnJoin {
 
 rule RefineKeyForLargeDeployments {
     -- A deployment whose data exceeds one member's cache distributes scan fragments by (storage identity, table, trie prefix), so each member keeps a stable slice warm.
+    -- The coordinator keeps its captured snapshot for a local fallback.
+    -- A delegated executor must capture the requested transaction head with no private overlays.
+    -- The request identifies the coordinator's opened storage residence and replica epoch.
+    -- The router and the executor each check that identity against their own authority.
+    -- The executor holds the captured snapshot until admitted provider reads have completed.
     when: ScanPlanned(deployment, scan)
 
     requires: deployment.cache_bytes > PerMemberCacheShare()
@@ -1899,7 +2310,17 @@ rule RefineKeyForLargeDeployments {
 rule Fork {
     -- A fork within an organisation is a new deployment in the parent's lineage.
     -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
+    -- The shared key grants are in the same erasure custody domain.
     -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.
+    -- The child, its name and the cell-local shared-reference revision publish atomically.
+    -- A fork of a fork advances the same revision as the original lineage.
+    -- A local fork acquires a preparation in the current lineage generation before reading storage and consumes it when the child publishes.
+    -- A hosted fork holds a preparation in the current lineage generation through provider I/O.
+    -- Its child identity and physical custody are recorded before it writes objects, keys or journals.
+    -- Each provider upload is recorded on its staged child before submission.
+    -- Publication checks the exact staged child, the current preparation and a drained storage region.
+    -- An intervening retirement therefore requires fresh preparation.
+    -- Local preparation, publication and reclamation hold the same volume maintenance lock through their admitted provider work.
     when: ForkRequested(parent, basis, org)
 
     -- The child and its name publish at a version that still admits forks.
@@ -1929,14 +2350,43 @@ rule Fork {
 }
 
 rule ForkAcrossOrganisations {
-    -- A fork into another organisation is a server-side copy, re-encrypted under the child's key, into a new lineage.
+    -- A fork into another organisation creates its own lineage and key.
+    -- Its independent copy leaves the original lineage's shared-reference revision unchanged.
+    -- Its checkpoint closure and its selected tail are copied under the child's key before the directory publishes the child.
+    -- The destination root follows the required data, metadata, retained level-zero sources and recorded usable artefacts.
+    -- The copy checks the table bytes used to discover those dependencies against the root manifest when present.
+    -- Each planned member binds its logical path, length and observed provider publication.
+    -- A packed member's physical dependency names the containing pack, including an inherited pack.
+    -- This copy has independent key custody and its own erasure authority.
+    -- Publication checks the parent in the writer epoch and storage generation used to prepare the copy.
     when: ForkRequested(parent, basis, org)
 
     requires: org != parent.org
+              and parent.lifecycle in {live, quarantined}
 
     ensures:
         let child = CreateDeployment(org)
         CopiedAndReencrypted(from: ForkCheckpoint(parent, basis), to: child)
+}
+
+rule RecoverUnpublishedHostedFork {
+    -- A staged child reserves its identity and can acquire its serving name only during publication.
+    -- A holder's definitive rejection follows the drain of its preparation I/O.
+    -- A reaper can close an abandoned stage after the source preparation has been released.
+    -- Attested task stoppage can release an abandoned preparation.
+    -- The stage version orders reaper recovery against publication.
+    -- Closing the stage closes its storage region to further publication and retains unresolved upload IDs.
+    -- The reaper verifies the physical namespace and settles each retained upload before provider inventory disposal.
+    -- An unpublished stage contributes no references to the served lineage.
+    when: HostedForkCleanupRequested(stage)
+
+    requires: DefinitiveRejectionAfterDrain(stage) or SourcePreparationReleased(stage)
+
+    ensures:
+        if Directory.cas(stage.id, stage.version, change: { lifecycle: deleting, epoch: Next(stage.epoch) }):
+            SettleStagedProviderPublications(stage)
+            if ServingPublicationsSettled(stage):
+                DisposeStagedResidence(stage)
 }
 
 rule ForkReadsAreCapped {
@@ -2029,11 +2479,41 @@ rule VerifyWriterDuringWatchStartup {
             WriteRefused(record)
 }
 
+rule EnrollTerminalS3Allocation {
+    -- The allocation names a provider root disjoint from legacy storage.
+    -- The provisioning authority attests the provider policy for that exact root from its allocation onward.
+    when: TerminalAllocationEnrollmentRequested(operator, allocation, qualification)
+
+    requires: QualificationAuthenticatesExactAllocation(qualification, allocation)
+    requires: ServingBucketNeverVersioned(allocation.namespace)
+    requires: ProviderFencesOrdinaryWritesUntilActivation(allocation)
+    requires: ProviderEnforcesCreateOnceForAllocationLifetime(allocation)
+
+    ensures:
+        if StoredQualificationAndActivationMarkerAuthenticate(allocation):
+            TerminalAllocationEnrolled(allocation)
+        else if FreshTerminalInventoryContainsOnlyEnrollmentResidue(allocation):
+            StoreImmutableQualification(allocation, qualification)
+            InstallAllocationActivationMarker(allocation)
+            TerminalAllocationEnrolled(allocation)
+}
+
+rule OpenTerminalS3Allocation {
+    when: TerminalAllocationAccessRequested(requester, allocation)
+
+    requires: StoredQualificationAndActivationMarkerAuthenticate(allocation)
+    requires: AdapterUsesExactProviderRoot(allocation)
+
+    ensures:
+        OpenEnrolledTerminalAllocation(allocation)
+}
+
 rule RefreshScopedS3Session {
     when: S3WriteCredentialsRequested(record, writer_epoch)
 
     requires: DeploymentStillUsesStoragePrefix(record)
     requires: WriterOrCompactorAuthorized(record, writer_epoch)
+    requires: TerminalStorageUsesScopedConditionalCreation(record)
 
     ensures:
         let session = ProviderAssumedWriteRole(prefix: record.storage_root.prefix, max_age: config.credential_ttl)
@@ -2045,19 +2525,29 @@ rule RefreshScopedS3Session {
 }
 
 rule TransferSharedObjects {
-    -- Objects of the deleted deployment still referenced by another live deployment in its lineage move to that deployment's ownership by re-wrapping their data keys; no bytes are copied.
+    -- Disposal closes fork publication under the current version of the drained physical residence.
+    -- The close advances the lineage generation and survives interrupted attempts.
+    -- The referrer inventory is loaded after the close.
+    -- Each surviving referrer receives the bytes under its own prefix.
+    -- Hosted disposal enumerates declared fallback references into the admitted prefix, including sources absent from the current object listing.
+    -- An unavailable payload leaves disposal pending until every surviving referrer has a readable copy.
+    -- Release bookkeeping that has already disappeared can remain absent.
     when: DeletionDue(record)
+
+    requires: ServingStorageRegionsDrained(record)
 
     ensures:
         for object in OwnedBy(record) where ReferencedByAnotherLiveMember(record.lineage, object):
-            DataKeyRewrapped(object, to: FirstLiveReferrer(record.lineage, object))
-        BumpLineageVersion(record.lineage)
+            for referrer in LiveReferrers(record.lineage, object):
+                CopyInto(referrer.storage_root.prefix, object)
 }
 
 rule EraseAndProve {
     -- If the inventory still contains objects, the deployment remains deleting and can retry with the same epoch.
     -- A destroyed key cannot be installed or allocated again under the same deployment identity in that cell.
-    -- The terminal CAS keeps the signed receipt with the tombstone so a retry returns the same receipt.
+    -- The terminal transaction keeps the signed receipt with the tombstone and reopens the exact lineage disposal together.
+    -- A retry returns the same receipt.
+    -- Hosted removal uses the multipart and version inventory of the admitted prefix after reference transfer.
     when: SharedObjectsTransferred(record)
 
     requires: DeploymentPrefixIsDisjoint(record)
@@ -2067,7 +2557,7 @@ rule EraseAndProve {
     ensures:
         RetireReplicaJournals(record.id, record.epoch, AllRecordedJournals(record))
         AbortMultipartUploadsUnder(record.storage_root.prefix)
-        DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
+        DeleteAllVersionsUnder(record.storage_root.prefix)
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
         KeyService.destroy(record.key_id)
         let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, inventory_scope: all_versions_and_multipart_uploads, signature: SignedByCell())
@@ -2077,6 +2567,7 @@ rule EraseAndProve {
 rule PublishInventoryReceipt {
     -- A local store attests to the current inventory.
     -- An S3 store attests to its multipart and version inventories after aborting uploads and removing data versions and delete markers.
+    -- The receipt and the reopening of the matching physical disposal are atomic.
     when: InventoryEmptied(record, namespaces, inventory_scope)
 
     requires: record.lifecycle = deleting
@@ -2090,7 +2581,123 @@ rule PublishInventoryReceipt {
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
 }
 
+rule SettleObservedS3Version {
+    -- Every retry sends the immutable identifier retained by the retirement authority.
+    -- The hosted trie release binds the marker version from the same response as the release body.
+    -- The physical owner fences both paths while the installed release is in flight.
+    -- Data and marker retirement each need an exact absence observation.
+    -- The directory clears the owner fence and reopens the lineage atomically.
+    -- Settlement uses a fresh, complete lookup scoped to the exact key and version.
+    when: ExactVersionRetirementContinued(retirement)
+
+    requires: ExactVersionRetirementAuthorized(retirement)
+    requires: PhysicalNamespaceMatches(retirement)
+    requires: PhysicalKeyMatches(retirement)
+    requires: ImmutableS3Version(retirement.version)
+
+    ensures:
+        if FreshVersionInventoryConfirmsAbsence(retirement.namespace, retirement.key, retirement.version):
+            ExactVersionRetirementSettled(retirement)
+        else if FreshVersionInventoryAllowsRemovalWithoutExposingOlderData(retirement):
+            DeleteExactS3Version(retirement.namespace, retirement.key, retirement.version)
+            if FreshVersionInventoryConfirmsAbsence(retirement.namespace, retirement.key, retirement.version):
+                ExactVersionRetirementSettled(retirement)
+}
+
+rule AdmitNeverVersionedTombstoneUpload {
+    -- An empty provider upload acquires one slot in the authorized retirement before payload submission.
+    when: NeverVersionedTombstoneUploadReserved(retirement, key, upload)
+
+    requires: ExactVersionRetirementAuthorized(retirement)
+    requires: RetirementKeyMatches(retirement, key)
+    requires: NoRetainedTombstoneUpload(retirement, key)
+
+    ensures:
+        RecordTombstoneUpload(retirement, key, upload)
+        AllowConditionalTombstoneCompletion(retirement, key, upload)
+}
+
+rule SettleNeverVersionedRetirement {
+    -- The reaper can resume both exact upload identities after interruption.
+    -- Serving reads treat a tombstone as an absent object, and the provider retains the key against create-if-absent writes.
+    when: NeverVersionedRetirementContinued(retirement)
+
+    requires: ExactVersionRetirementAuthorized(retirement)
+    requires: ServingBucketVersioningProhibited(retirement.namespace)
+    requires: PhysicalOwnerFencedForObject(retirement.data_key)
+    requires: PhysicalOwnerFencedForObject(retirement.release_key)
+
+    ensures:
+        for upload in RetainedTombstoneUploads(retirement):
+            DrainExactTombstoneUpload(upload)
+            if FreshProviderObservationConfirmsUploadClosed(upload):
+                ForgetTombstoneUpload(retirement, upload)
+        if NoRetainedTombstoneUploads(retirement) and FreshTombstoneObservationsMatch(retirement) and ServingBucketNeverVersioned(retirement.namespace):
+            SettleOwnerFenceAndReopenLineage(retirement)
+}
+
+rule AuthorizeTerminalS3Retirement {
+    when: HostedLooseFileReleaseDue(release)
+
+    requires: InstalledCatalogFloorCovers(release)
+    requires: TerminalAllocationMatchesPublication(release)
+    requires: CurrentProviderKeyAndTagMatchInstalledPublication(release)
+    requires: CurrentReleaseMarkerMatchesReservedRetirement(release)
+    requires: PublishedCheckpointAndAdmittedRecoveriesCoverRelease(release)
+    requires: LineageReservedFor(release)
+    requires: NoCurrentManifestReferences(release.physical_key)
+    requires: PhysicalOwnerRevisionMatchesValidatedFence(release)
+
+    ensures:
+        ExactVersionRetirementAuthorized(release)
+}
+
+rule AuthorizeHostedVersionErasure {
+    -- The retirement reservation binds the physical version, release marker and source residence together.
+    -- The reservation closes fork preparation and publication while the reaper scans the current manifests of the lineage.
+    -- The physical owner's storage region orders new inherited reads of the affected keys against the reservation.
+    -- Authorization compares the same owner revision and fence that passed the retention checks.
+    -- The source's committed recovery inventory covers the installed removal.
+    -- A startup or replay hold may retain an older cut.
+    -- An admitted metadata reader without a replay bound retains the removal until its provider work drains.
+    -- Settlement reopens admission after a complete provider inventory confirms absence of the selected version.
+    when: HostedLooseFileReleaseDue(release)
+
+    requires: InstalledCatalogFloorCovers(release)
+    requires: PublishedCheckpointAndAdmittedRecoveriesCoverRelease(release)
+    requires: LineageReservedFor(release)
+    requires: NoCurrentManifestReferences(release.physical_key)
+    requires: PhysicalOwnerRevisionMatchesValidatedFence(release)
+
+    ensures:
+        ExactVersionRetirementAuthorized(release)
+}
+
+rule RecoverHostedReleaseWitness {
+    -- An older release can use the authenticated installation receipt for its exact catalog cut and object.
+    -- The original release remains durable when the provider hides the released version from current-name listing.
+    -- The source fence drains inherited reads of the protected object and the older marker before removal.
+    when: LegacyHostedReleaseDue(release)
+
+    requires: InstalledCatalogFloorCovers(release)
+    requires: AuthenticatedReceiptNamesPublication(release.residence, release.cut, release.object, version)
+
+    ensures:
+        HostedVersionReleasePrepared(release, version, ReceiptOf(release))
+}
+
 rule HostedCheckpointCapture {
+    -- A new archive receipt covers the verified replay inventory.
+    -- Shared group artefacts are recorded once. Required files must be available before the receipt is published.
+    -- A historical stage carries the inventory format of its source archive.
+    -- An archive copy from serving storage registers a metadata hold on the selected checkpoint.
+    -- A new hold may cover the published checkpoint or inherit uninterrupted coverage from an older admission.
+    -- The hold persists until its provider work drains. A verified existing archive can be returned after the source hold ends.
+    -- The source plan is checked against the full exact body observation before resealing each member.
+    -- A serving read supplied by an archive carries the archive's physical identity.
+    -- The capture region retains its destination and its serving archive source independently.
+    -- A local source copy holds the cell maintenance witness through admitted I/O.
+    -- A cell transfer that materializes repair data retains the archive in its original directory and custody.
     when: AuthenticatedRecoveryCapture(authority, name, capture_id)
 
     requires: ConfiguredOrganizationOwns(authority, name)
@@ -2122,6 +2729,23 @@ rule HostedCheckpointRecovery {
             RetainAndReturnRecoveryReceipt(authority, capture_id, manifest_digest)
 }
 
+rule RetainServingReplayArchive {
+    -- A parked root can select an independently verified replay capture of its exact current checkpoint.
+    -- The installation publishes the capture and the recovery inventory digest observed in its archive custody together.
+    -- A new region opens that source under its own admission before rechecking the published inventory.
+    -- Later captures can inherit the admitted source and a newer verified checkpoint can replace it.
+    -- A superseded archive stays available to readers admitted under its identity until their work drains.
+    when: AuthenticatedReplayArchiveRetention(authority, name, capture_id, manifest_digest)
+
+    requires: ConfiguredOrganizationOwns(authority, name)
+              and RootInstallation(authority)
+              and AcceptedArchiveManifest(authority, capture_id, manifest_digest)
+              and ExactParkedServingReplayCut(authority, capture_id)
+
+    ensures:
+        SelectServingReplayArchiveAndInventory(authority, capture_id, manifest_digest)
+}
+
 rule StageHistoricalCheckpoint {
     when: HistoricalCheckpointStageRequested(capture, target, operation)
 
@@ -2148,6 +2772,48 @@ rule ReadHeldCheckpoint {
         DrainReadersBeforeReleasingStageStorage(target)
 }
 
+rule InspectHeldCheckpointOwnedRelations {
+    when: AuthenticatedHeldStageOwnedInventoryRequested(source, capture, target, operation, inventory_digest)
+
+    requires: ExactHeldStage(target, operation, inventory_digest)
+              and OriginalStageCapture(target, source, capture)
+
+    ensures:
+        AcquireHeldStageStorageRegion(target)
+        VerifyAndReadFrozenInventory(target, inventory_digest)
+        ReturnOriginalTransactionAndSingleOwnedNamespaceInventory(target)
+        DrainReadersBeforeReleasingStageStorage(target)
+}
+
+rule StreamHeldCheckpointOwnedEventFiles {
+    when: AuthenticatedHeldStageOwnedEventsRequested(source, capture, target, operation, inventory_digest)
+
+    requires: ExactHeldStage(target, operation, inventory_digest)
+              and OriginalStageCapture(target, source, capture)
+              and CompleteReplayInventory(target)
+
+    ensures:
+        AcquireHeldStageStorageRegion(target)
+        VerifyAndReadFrozenInventory(target, inventory_digest)
+        StreamCurrentOwnedTrieEventFilesAtOriginalTransaction(target)
+        ConfirmStageHeldBeforeCompletingStream(target)
+        DrainReadersBeforeReleasingStageStorage(target)
+}
+
+rule ReplayHeldNativeRootEffects {
+    when: HeldDestinationOrdersNativeArchiveTransaction(target, archive, original, predecessor)
+
+    requires: CurrentPlacedRestoreWriter(target)
+              and ActiveRestoreHoldForArchive(target, archive)
+              and ExactNativeReplayPredecessor(target, predecessor)
+              and AbsentOriginalReplayReceipt(target, original)
+
+    ensures:
+        PreserveOriginalValidIntervalsAndCreationExpiry(original)
+        CoOrderRootEffectsAndOriginalReplayReceipt(target, original)
+        AdvanceNativeReplayFrontier(target, original)
+}
+
 rule RetireCheckpointArchives {
     when: RecoveryRetirementAuthorized(record)
 
@@ -2170,10 +2836,12 @@ rule ObserveS3Inventory {
 
     ensures:
         if record.deletion_observation.first_empty_at = null:
-            EraseS3Inventory(record.storage_root.prefix)
-            Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(first_empty_at: now, second_empty_at: null) })
+            if RequiredSharedObjectsMaterialized(record):
+                EraseS3Inventory(record.storage_root.prefix)
+                if S3InventoryIsEmpty(record.storage_root.prefix) and ServingObjectsAreAbsent(record.storage_root.prefix):
+                    Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(first_empty_at: now, second_empty_at: null) })
         else if record.deletion_observation.second_empty_at = null and now >= record.deletion_observation.first_empty_at + config.credential_ttl:
-            if S3InventoryIsEmpty(record.storage_root.prefix):
+            if S3InventoryIsEmpty(record.storage_root.prefix) and ServingObjectsAreAbsent(record.storage_root.prefix):
                 Directory.cas(record.id, record.version, change: { deletion_observation.second_empty_at: now })
             else:
                 Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(leases_expire_at: now) })
@@ -2406,7 +3074,7 @@ invariant QuarantineIsolates {
 ------------------------------------------------------------
 
 actor Gateway {
-    -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, routes by affinity, reports suspicion.
+    -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, and routes by affinity.
     -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
     -- A configured gateway refuses plaintext startup before any holder receives credentials.
     -- A Flight SQL gateway forwards the authenticated transport peer using a proof for the deployment and writer epoch.
@@ -2473,11 +3141,25 @@ surface ClientAccess {
 
     @guarantee MovesAreInvisible
         -- A planned handoff stalls writes for one log round plus a redirect, and touches no client connection.
-        -- A failover stalls writes until detection and claim complete, and a retried commit returns the outcome the first attempt had.
+        -- A failover stalls writes until detection and claim complete.
+        -- A successful replay of a previously committed permitted write recovers the original committed outcome.
         -- A dispatch failure preserves any complete command response the gateway has received.
         -- A writable pgwire pipeline waits for ReadyForQuery between command cycles so each autocommit cycle has its own retry key.
         -- A copy-in transfer can send its input frames before ReadyForQuery.
-        -- An unanswered keyed command can be retried under its original key, including an extended-protocol exchange flushed before Sync.
+        -- The gateway can resend unanswered extended-protocol setup frames before execution.
+        -- The gateway can ask a replacement to replay an unanswered simple query under its original command permit.
+        -- A replacement admits replay of a single autocommit statement before executing any part of it.
+        -- Transaction control and batches return an unknown outcome after an ambiguous failure.
+        -- A writer installs a key before executing the command it guards.
+        -- The writer preserves the gateway key through changes to SQL session state.
+        -- An unanswered write can be replayed only when both writers support the same private permit contract.
+        -- The permit contract protects a command even if a legacy resolver inherits its admitted source record.
+        -- The gateway waits for the replacement writer to acknowledge the original permit before replaying the command.
+        -- The dispatch and replay share an exclusive submission cutoff issued when the command starts, within replay_permit_age.
+        -- Both writers refuse a permitted submission at or after that cutoff before appending it.
+        -- Every committed permitted write records its command key with its effects, and retains the marker through the cutoff.
+        -- An aborted attempt leaves the existing marker state intact, and another admitted attempt can still commit if that state has no marker.
+        -- Closed storage before the first command reply allows a keyed retry on a newer writer epoch.
         -- A holder's driver shutdown during a command leaves the outcome unknown until a keyed retry returns it.
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
         -- SQL PREPARE and named pgwire Parse retain the search path and timezone used when they were registered.
@@ -2485,7 +3167,9 @@ surface ClientAccess {
         -- Acknowledged DISCARD ALL clears the prepared statements eligible for replay.
         -- An open pgwire session renews idle protection for its current backend and stops renewing it when that connection closes.
         -- A failed startup ends the client's authentication exchange.
-        -- A finite reconnect window bounds the time an established session waits for a replacement holder.
+        -- A finite reconnect window bounds the time an idle session waits for a replacement holder.
+        -- Recovery of a pending command uses one command_replay_window across replacement writers until the gateway takes a reply for forwarding to the client.
+        -- After the window elapses without a reply, the command's outcome is reported as unknown.
         -- A placement notification can start the next reconnect attempt before its fallback timer elapses.
         -- A replacement connection must resolve the original deployment identity.
         -- When startup specifies an installation, the backend verifies the identity of its attached database before the gateway confirms readiness.
@@ -2497,11 +3181,25 @@ surface ClientAccess {
         -- Closing a session frees its reserved capacity.
         -- A gateway admits buffered frame bytes before reading the body and releases the charge when their last owner drops them.
 
+    @guarantee WriterDialRecovery
+        -- A failed dial to a confirmed writer is retryable within the enclosing startup or replay window.
+        -- A gateway attempt follows placement changes while that window remains open.
+
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.
 
-    @guarantee OneOutcomePerKey
-        -- A transaction retried with the same idempotency key within idempotency_window has exactly one outcome, whichever member answers.
+    @guarantee AtMostOneCommitPerPermit
+        -- Retries sharing one private permit produce at most one committed effect.
+        -- A permitted write uses its own engine-owned marker under the command key.
+        -- The writer refuses a permit if the transaction supplies a different application key.
+
+    @guarantee OrdinaryRetryReceipts
+        -- The ordinary retry identity is the database, the authenticated principal and the key.
+        -- Its receipt records a digest of the transaction's operations and effect-bearing options.
+        -- A retry with the same body is answered with the original's outcome; a different body under the identity aborts with rtdb/idempotency-conflict.
+        -- The resolver decides from engine-owned receipts in xt.idempotency_receipts, which SQL cannot write, valid for idempotency_window of system time.
+        -- A string application key takes precedence over the gateway key and must be stable across attempts for deduplication.
+        -- A transaction without a usable application key uses the gateway key and its transaction ordinal.
 }
 
 surface HolderToLog {
@@ -2529,11 +3227,11 @@ surface ControlPlane {
     context cell: Cell
 
     provides:
-        SuspicionReported(controller, member, reporters)
         MoveChosen(controller, record, target)
         NodeOverWatermark(controller, member, dimension)
         EngineRolloutStarted(controller, cell, version)
         CellMoveRequested(controller, record, target_cell)
+        AuthenticatedReplayArchiveRetention(authority, name, capture_id, manifest_digest)
 
     contracts:
         demands Directory
@@ -2552,11 +3250,35 @@ surface StorageAccess {
 
     context holding: Holding
 
+    provides:
+        TerminalAllocationAccessRequested(node, allocation)
+
     contracts:
         demands ObjectStorage
 
     @guarantee ZombiesCannotDamageStorage
         -- A deposed holder can create only orphans under its own epoch's prefix until its credential expires, and can delete nothing.
+}
+
+surface TerminalStorageEnrollment {
+    facing operator: Operator
+
+    provides:
+        TerminalAllocationEnrollmentRequested(operator, allocation, qualification)
+
+    contracts:
+        demands ObjectStorage
+}
+
+surface TerminalStorageMaintenance {
+    facing reaper: Reaper
+
+    provides:
+        TerminalAllocationAccessRequested(reaper, allocation)
+        HostedLooseFileReleaseDue(release)
+
+    contracts:
+        demands ObjectStorage
 }
 
 ------------------------------------------------------------

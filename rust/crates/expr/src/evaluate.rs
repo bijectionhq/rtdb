@@ -5,7 +5,7 @@ use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
 use arrow_array::RecordBatch;
 use rtdb_columnar::{MemoryBudget, OwnedBatch, copy_array, estimate_builder_bytes, to_field};
 use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
-use rtdb_types::{Anomaly, LogicalType, Result, Instant, Value};
+use rtdb_types::{Anomaly, ListValue, LogicalType, Result, Instant, Value};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -25,12 +25,45 @@ pub fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<'_>) ->
 
 pub struct OuterRow<'a> { pub schema: &'a Schema, pub values: &'a [Value] }
 
+pub trait ParameterLookup: Sync {
+    fn width(&self) -> usize;
+    fn value(&self, index: usize) -> Result<Option<&Value>>;
+    fn known_value(&self, index: usize) -> Option<&Value>;
+    fn arrow_cell(&self, index: usize) -> Option<ArrowParameterCell<'_>>;
+    fn correlated_value(&self, _depth: usize, _position: usize, _scope: Option<&crate::EvaluationScope>) -> Result<Option<Value>> {
+        Ok(None)
+    }
+}
+
+pub type ArrowParameterCell<'a> = rtdb_columnar::ArrowCell<'a>;
+
+#[derive(Clone, Copy)]
+pub enum Parameters<'a> {
+    Values(&'a [Value]),
+    Lookup(&'a dyn ParameterLookup),
+}
+
+impl<'a> Parameters<'a> {
+    pub fn width(self) -> usize {
+        match self { Self::Values(values) => values.len(), Self::Lookup(lookup) => lookup.width() }
+    }
+    pub fn get(self, index: usize) -> Result<Option<&'a Value>> {
+        match self { Self::Values(values) => Ok(values.get(index)), Self::Lookup(lookup) => lookup.value(index) }
+    }
+    pub fn known(self, index: usize) -> Option<&'a Value> {
+        match self { Self::Values(values) => values.get(index), Self::Lookup(lookup) => lookup.known_value(index) }
+    }
+    pub fn arrow_cell(self, index: usize) -> Option<ArrowParameterCell<'a>> {
+        match self { Self::Values(_) => None, Self::Lookup(lookup) => lookup.arrow_cell(index) }
+    }
+}
+
 /// Borrowed scalar inputs and allocation scope.
 /// With no allocation scope, the caller must reserve primitive expression intermediates and returned values independently.
 /// Reached stored Transit object decoding requires an allocation scope, including equality and field access.
 /// Catalog-dependent evaluation borrows the captured catalog and requires an allocation scope for enumeration.
 pub struct EvalContext<'a> {
-    pub parameters: &'a [Value],
+    pub parameters: Parameters<'a>,
     /// Complete declared vector types for the bound parameters, including unselected union legs.
     /// When supplied, the slice must have the same width as `parameters` and overrides expression annotations.
     /// Each type must describe its parameter cell using execution vector types.
@@ -41,22 +74,16 @@ pub struct EvalContext<'a> {
     pub snapshot_token: Option<&'a str>,
     pub allocation: Option<&'a crate::EvaluationScope>,
     pub catalog: Option<&'a dyn crate::PgCatalogLookup>,
-    /// Corpus statistics `search_score` ranks against, keyed by query text; without them a term's inverse document frequency is 1.
-    pub corpora: Option<&'a dyn CorpusLookup>,
-}
-
-pub trait CorpusLookup: Send + Sync {
-    fn scorer(&self, query: &str) -> Arc<rtdb_text::Scorer>;
 }
 
 impl Default for EvalContext<'_> {
-    fn default() -> Self { Self { parameters: &[], parameter_types: None, current_time: Instant::default(), timezone: "UTC", outer_rows: &[], snapshot_token: None, allocation: None, catalog: None, corpora: None } }
+    fn default() -> Self { Self { parameters: Parameters::Values(&[]), parameter_types: None, current_time: Instant::default(), timezone: "UTC", outer_rows: &[], snapshot_token: None, allocation: None, catalog: None } }
 }
 
 impl EvalContext<'_> {
     fn with_allocation<'a>(&'a self, allocation: &'a crate::EvaluationScope) -> EvalContext<'a> {
         EvalContext { parameters: self.parameters, parameter_types: self.parameter_types, current_time: self.current_time, timezone: self.timezone,
-            outer_rows: self.outer_rows, snapshot_token: self.snapshot_token, allocation: Some(allocation), catalog: self.catalog, corpora: self.corpora }
+            outer_rows: self.outer_rows, snapshot_token: self.snapshot_token, allocation: Some(allocation), catalog: self.catalog }
     }
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> { crate::admission::Admission::for_context(self.allocation).reserve(bytes) }
 }
@@ -155,13 +182,13 @@ impl IndexedListBatches {
     }
 }
 
-enum ListStorage { Integer(crate::series::IntegerSeries), Bins { reader: crate::temporal_functions::RangeBins,length: usize }, Values(Vec<Value>) }
+enum ListStorage { Integer(crate::series::IntegerSeries), Bins { reader: crate::temporal_functions::RangeBins,length: usize }, List(ListValue), Values(Vec<Value>) }
 
 /// Owned list cells or an immutable generated-list descriptor.
 /// Retain the evaluation scope until the result is dropped or its `retained_bytes` charge is transferred.
 pub struct EvaluatedList { storage: ListStorage }
 impl EvaluatedList {
-    pub fn len(&self) -> usize { match &self.storage { ListStorage::Integer(series) => series.len(), ListStorage::Bins { length,.. } => *length, ListStorage::Values(values) => values.len() } }
+    pub fn len(&self) -> usize { match &self.storage { ListStorage::Integer(series) => series.len(), ListStorage::Bins { length,.. } => *length, ListStorage::List(list) => list.len(), ListStorage::Values(values) => values.len() } }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     /// Bounds the temporary allocation made by `get`; reserve it before calling and retain it while the returned cell lives.
     pub fn cell_allocation_bound(&self) -> usize { if matches!(self.storage,ListStorage::Bins {..}) { 4096 } else { 0 } }
@@ -171,6 +198,7 @@ impl EvaluatedList {
         match &self.storage {
             ListStorage::Integer(series) => (index < series.len()).then(|| std::borrow::Cow::Owned(series.nth(index))),
             ListStorage::Bins { reader,length } => (index < *length).then(|| std::borrow::Cow::Owned(reader.nth(index))),
+            ListStorage::List(list) => list.get(index),
             ListStorage::Values(values) => values.get(index).map(std::borrow::Cow::Borrowed),
         }
     }
@@ -179,6 +207,7 @@ impl EvaluatedList {
         let base = std::mem::size_of::<Self>();
         match &self.storage {
             ListStorage::Integer(_) | ListStorage::Bins {..} => Ok(base),
+            ListStorage::List(list) => base.checked_add(list.retained_payload_bytes()?).ok_or_else(overflow),
             ListStorage::Values(values) => {
                 let spare = (values.capacity() - values.len()).checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
                 values.iter().try_fold(base.checked_add(spare).ok_or_else(overflow)?, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))
@@ -188,7 +217,7 @@ impl EvaluatedList {
 }
 
 /// Evaluates a list-table input with the projection validation and cancellation contract of `evaluate_projection_async`.
-/// Integer series and range bins retain their constant-size readers; other lists are materialized and non-list inputs produce no cells.
+/// Integer series, range bins, and packed lists retain their existing storage. Non-list inputs produce no cells.
 /// Returned cells borrow no inputs; the caller retains the allocation scope until it transfers the result charge.
 pub async fn evaluate_list_async(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<EvaluatedList> {
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate_list_async(row,context).await
@@ -267,6 +296,36 @@ fn binary_value(op: BinaryOp, left: Value, right: Value, context: &EvalContext<'
     }
 }
 
+/// An input provider for the current expression row. Values are decoded only when demanded.
+pub trait RowInput: Sync {
+    fn value(&self, index: usize, allocation: Option<&crate::EvaluationScope>) -> Result<Option<Value>>;
+    fn arrow_cell(&self, _index: usize) -> Option<ArrowParameterCell<'_>> { None }
+}
+
+#[derive(Clone, Copy)]
+pub enum ExpressionRow<'a> {
+    Values(&'a [Value]),
+    Borrowed(&'a dyn RowInput),
+}
+
+impl<'a> ExpressionRow<'a> {
+    fn arrow_cell(self, index: usize) -> Option<ArrowParameterCell<'a>> {
+        match self {
+            Self::Values(_) => None,
+            Self::Borrowed(row) => row.arrow_cell(index),
+        }
+    }
+
+    fn value(self, schema: &Schema, id: rtdb_plan::ColumnId, context: &EvalContext<'_>) -> Result<Value> {
+        let missing = || Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", id.0));
+        let index = schema.position(id).ok_or_else(missing)?;
+        match self {
+            Self::Values(row) => retained_clone(row.get(index).ok_or_else(missing)?, context),
+            Self::Borrowed(row) => row.value(index, context.allocation)?.ok_or_else(missing),
+        }
+    }
+}
+
 macro_rules! expression_body {
     ($expression:expr, $input_schema:expr, $input_row:expr, $inputs:expr, $eval:ident, $call:ident, $reader:ident) => {{
     let (expr, schema, row, context) = ($expression, $input_schema, $input_row, $inputs);
@@ -278,13 +337,19 @@ macro_rules! expression_body {
             ))?;
             Ok(Value::Duration { value: nanos / 1000, unit: rtdb_types::TimeUnit::Microsecond })
         }
-        Expr::Column { id, .. } => retained_clone(schema.position(*id).and_then(|index| row.get(index))
-            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", id.0)))?, context),
-        Expr::Parameter { index, .. } => retained_clone(context.parameters.get(*index)
+        Expr::Column { id, .. } => row.value(schema, *id, context),
+        Expr::Parameter { index, .. } => retained_clone(context.parameters.get(*index)?
             .ok_or_else(|| Anomaly::incorrect("xtdb/missing-parameter", format!("Missing parameter ${}", index + 1)))?, context),
-        Expr::Correlated { depth, id, .. } => retained_clone(context.outer_rows.get(*depth)
-            .and_then(|outer| outer.schema.position(*id).and_then(|index| outer.values.get(index)))
-            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-correlated-column", "Correlated row is unavailable"))?, context),
+        Expr::Correlated { depth, id, .. } => {
+            let missing = || Anomaly::fault("rtdb.expr/missing-correlated-column", "Correlated row is unavailable");
+            let outer = context.outer_rows.get(*depth).ok_or_else(missing)?;
+            let index = outer.schema.position(*id).ok_or_else(missing)?;
+            if let Parameters::Lookup(inputs) = context.parameters
+                && let Some(value) = inputs.correlated_value(*depth, index, context.allocation)? {
+                return Ok(value);
+            }
+            retained_clone(outer.values.get(index).ok_or_else(missing)?, context)
+        }
         Expr::Unary { op, expr } => {
             let value = $eval!(expr)?;
             unary_value(*op,value)
@@ -377,10 +442,8 @@ macro_rules! expression_body {
             Ok(Value::Struct(values))
         },
         Expr::RowCopy(fields) => Ok(Value::Struct(fields.iter().map(|field| {
-            let value = schema.position(field.id).and_then(|index| row.get(index))
-                .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", field.id.0)))?;
             context.reserve(field.name.len().checked_add(4096).ok_or_else(overflow)?)?;
-            Ok((field.name.clone(), retained_clone(value, context)?))
+            Ok((field.name.clone(), row.value(schema, field.id, context)?))
         }).collect::<Result<_>>()?)),
         Expr::In { expr, values, negated } => {
             let value = $eval!(expr)?;
@@ -409,7 +472,7 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate(row,context)
 }
 
-fn evaluate_inner(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+fn evaluate_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<Value> {
     macro_rules! eval { ($child:expr) => { evaluate_inner($child, schema, row, context) }; }
     macro_rules! call { ($name:expr, $args:expr) => { scalar_call($name, $args, context) }; }
     macro_rules! reader { ($expression:expr) => { reader::execute_sync($expression,schema,row,context) }; }
@@ -423,12 +486,12 @@ pub async fn evaluate_async(expr: &Expr, schema: &Schema, row: &[Value], context
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate_async(row,context).await
 }
 
-async fn evaluate_async_inner(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+async fn evaluate_async_inner(expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>) -> Result<Value> {
     if !expr.requires_suspension() { return evaluate_inner(expr, schema, row, context); }
     evaluate_suspending(expr, schema, row, context)?.await
 }
 
-fn evaluate_suspending<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Value], context: &'a EvalContext<'a>) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>> {
+fn evaluate_suspending<'a>(expr: &'a Expr, schema: &'a Schema, row: ExpressionRow<'a>, context: &'a EvalContext<'a>) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>> {
     let future = async move {
         macro_rules! eval { ($child:expr) => { evaluate_async_inner($child, schema, row, context).await }; }
         macro_rules! call { ($name:expr, $args:expr) => { crate::functions::scalar_call_async($name, $args, context).await }; }
@@ -485,18 +548,22 @@ pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalCo
     }
     let container_bytes = batch.num_rows().checked_mul(std::mem::size_of::<Value>() + std::mem::size_of::<Arc<rtdb_columnar::MemoryReservation>>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
     let _containers = budget.reserve(container_bytes)?;
-    let parameter_bytes = context.parameters.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
-    let _parameters = budget.reserve(parameter_bytes)?;
-    let mut parameters = context.parameters.to_vec();
-    parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+    let normalized = if let Parameters::Values(values) = context.parameters {
+        let bytes = values.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
+        let reservation = budget.reserve(bytes)?;
+        let mut values = values.to_vec();
+        values.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        Some((values, reservation))
+    } else { None };
+    let parameters = normalized.as_ref().map_or(context.parameters, |(values, _)| Parameters::Values(values));
     let preparation = crate::EvaluationScope::new(budget)?;
-    let preparation_context = EvalContext { parameters: &parameters,parameter_types: context.parameter_types,current_time: context.current_time,timezone: context.timezone,outer_rows: context.outer_rows,snapshot_token: context.snapshot_token,allocation: Some(&preparation),catalog: context.catalog,corpora: context.corpora };
+    let preparation_context = EvalContext { parameters,parameter_types: context.parameter_types,current_time: context.current_time,timezone: context.timezone,outer_rows: context.outer_rows,snapshot_token: context.snapshot_token,allocation: Some(&preparation),catalog: context.catalog };
     let invocation = ExpressionInvocation::prepare(&expr.expr,&expr.schema,&preparation_context)?;
     let mut values = Vec::with_capacity(batch.num_rows());
     let mut scratch = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
         let scope = crate::EvaluationScope::new(budget)?;
-        let context = EvalContext { parameters: &parameters, parameter_types: context.parameter_types, current_time: context.current_time, timezone: context.timezone, outer_rows: context.outer_rows, snapshot_token: context.snapshot_token, allocation: Some(&scope), catalog: context.catalog, corpora: context.corpora };
+        let context = EvalContext { parameters, parameter_types: context.parameter_types, current_time: context.current_time, timezone: context.timezone, outer_rows: context.outer_rows, snapshot_token: context.snapshot_token, allocation: Some(&scope), catalog: context.catalog };
         let _decimal_validation = budget.reserve(4096)?;
         scope.reserve(batch.columns().iter().zip(batch.schema().fields()).try_fold(0usize, |bytes, (array, field)| bytes.checked_add(rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), index)?).ok_or_else(overflow))?)?;
         let row = batch.columns().iter().zip(batch.schema().fields()).map(|(array, field)| rtdb_columnar::read_execution_value(field, array.as_ref(), index)).collect::<Result<Vec<_>>>()?;

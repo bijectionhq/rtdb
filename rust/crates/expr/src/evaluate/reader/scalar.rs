@@ -54,7 +54,7 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
         Expr::Parameter { index,data_type } => {
             if let Some(ty) = frame.context.parameter_types.and_then(|types| types.get(*index)) { retained_type(ty,frame)? }
             else if *data_type == LogicalType::Nothing {
-                let value = frame.context.parameters.get(*index).ok_or_else(||Anomaly::incorrect("xtdb/missing-parameter",format!("Missing parameter ${}",index + 1)))?;
+                let value = frame.context.parameters.get(*index)?.ok_or_else(||Anomaly::incorrect("xtdb/missing-parameter",format!("Missing parameter ${}",index + 1)))?;
                 frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;
                 value.logical_type()
             } else { retained_type(data_type,frame)? }
@@ -256,6 +256,9 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 ready(calls::subscript(input.demand().await?,index.demand().await?,frame)?.await?,frame)
             }
             Expr::Field { expr: input,name,.. } => {
+                if let Some(cell) = frame.arrow_input(expr) {
+                    return ready(box_cell(from_arrow(cell, frame)?)?, frame);
+                }
                 let input = prepare(input,frame)?.await?;
                 if rtdb_plan::field_type(&input.ty,name) == LogicalType::Null { return nil(frame); }
                 deferred(ty,async move {

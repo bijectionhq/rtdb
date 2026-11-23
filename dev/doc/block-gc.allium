@@ -13,10 +13,24 @@
 -- read path. As a result this collector needs NO replica-log coordination —
 -- the leader just DELETEs its garbage and moves on.
 --
+-- Multi records a logical release first. For a versioned S3 block pack,
+-- the release names the owned pack and the exact publication observed for the member.
+-- The physical owner verifies a newer published pack in the same store,
+-- checks every member against mature releases for that version, and retains
+-- checkpoint metadata at or above an active startup or capture floor.
+-- A covered pack must contain only checkpoint metadata. An ordinary hosted
+-- release by path can withdraw a reference but cannot erase an owned pack.
+--
 -- Offloaded replica-message payloads (`oversized/b{idx}-{uuid}.binpb`, see db.allium's OversizedMessage) are collected by the same cycle, keyed on block index and swept by the same rule.
 -- They are the one kind here whose read path is not confined to startup: a payload is fetched while APPLYING its replica-log record, so `blocks_to_keep` doubles as the bound on how far a follower may lag before its payloads are collected under it.
 -- The block-file reasoning above therefore does NOT carry over — a delete here can break a running read path, and that is the price of having no replica-log coordination.
 -- A follower past the bound does not skip the record: the fetch throws out of the replica tail, which notifies the watchers' error state, and since that state is absorbing the database stops consuming and stays unqueryable until the process restarts.
+--
+-- A native local store can retain a separately exported current checkpoint as a repair base.
+-- The block collector skips its checkpoint metadata and offloaded replica payloads at or above the installed anchor.
+-- Anchor replacement and physical removal serialize at the storage root.
+-- A durable successor anchor permits the ordinary block retention rule to collect older files.
+-- The store retains the anchor across restarts.
 --
 -- Per-database, leader-only, signal-driven. Same lifecycle and trigger model
 -- as Trie GC (see gc.allium): constructed when the LeaderSystem opens,

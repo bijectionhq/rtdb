@@ -6,12 +6,13 @@ use vstd::multiset::Multiset;
 use vstd::prelude::*;
 
 pub(super) type Head = (usize, usize);
-pub(super) type Key = (u128, i64);
+pub(super) type Key = (u128, i64, u32);
 
 #[cfg(verus_keep_ghost)]
 verus! {
     pub open spec fn ordered_keys(left: Key, right: Key) -> bool {
-        left.0 < right.0 || (left.0 == right.0 && left.1 >= right.1)
+        left.0 < right.0
+            || (left.0 == right.0 && (left.1 > right.1 || (left.1 == right.1 && left.2 >= right.2)))
     }
 
     pub open spec fn valid_head(pages: Seq<Seq<Key>>, head: Head) -> bool {
@@ -172,7 +173,8 @@ verus! {
     ensures out == !ordered_keys(right, left),
 ))]
 pub(super) fn precedes(left: Key, right: Key) -> bool {
-    left.0 < right.0 || (left.0 == right.0 && left.1 > right.1)
+    left.0 < right.0
+        || (left.0 == right.0 && (left.1 > right.1 || (left.1 == right.1 && left.2 > right.2)))
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(

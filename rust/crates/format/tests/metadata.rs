@@ -114,6 +114,8 @@ fn metadata_pages_keep_their_summaries_after_releasing_page_scratch() {
     use rtdb_types::{EntityId, Interval};
 
     let events = (0..1024).map(|id| StoredEvent {
+        commit_position: 0,
+        entity_key: None,
         iid: EntityId::Integer(id).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
         operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None,
     }).collect::<Vec<_>>();
@@ -141,7 +143,7 @@ fn metadata_builder_rebases_nested_column_indices_across_data_pages() {
     use rtdb_types::{Iid, Interval};
 
     let document = BTreeMap::from([("nested".into(), Value::Struct(StructFields::from([("n".into(), Value::I64(5))])))]);
-    let event = StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(document.clone().into()), recency: None };
+    let event = StoredEvent { commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(document.clone().into()), recency: None };
     let fields = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
     let batch = build_event_batch(&[event], Some(fields), None).unwrap();
     let mut writer = MetadataBuilder::new(false, false);
@@ -167,7 +169,7 @@ fn a_sliced_pages_temporal_bounds_are_those_of_its_own_rows() {
     use rtdb_format::metadata::MetadataBuilder;
     use rtdb_types::{Iid, Interval};
 
-    let event = |n: i64| StoredEvent { iid: Iid([n as u8; 16]), system_from: Timestamp(10 * n), valid_time: Interval::from_micros(n, 100 * n).unwrap(), operation: StoredOperation::Delete, recency: None };
+    let event = |n: i64| StoredEvent { commit_position: 0, entity_key: None, iid: Iid([n as u8; 16]), system_from: Timestamp(10 * n), valid_time: Interval::from_micros(n, 100 * n).unwrap(), operation: StoredOperation::Delete, recency: None };
     let batch = build_event_batch(&[event(1), event(2), event(3), event(4)], None, None).unwrap().slice(1, 2);
     let mut writer = MetadataBuilder::new(false, false);
     writer.write_leaf(&batch).unwrap();
@@ -187,6 +189,8 @@ fn a_read_metadata_file_retains_its_stored_nodes_rather_than_their_decoded_stati
     let mut written = Vec::new();
     for page in 0..64i64 {
         let events = (page * 1024..page * 1024 + 1024).map(|id| StoredEvent {
+            commit_position: 0,
+            entity_key: None,
             iid: EntityId::Integer(id).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("sku".into(), Value::Utf8(format!("sku-{id}")))])), recency: None,
         }).collect::<Vec<_>>();
@@ -201,6 +205,15 @@ fn a_read_metadata_file_retains_its_stored_nodes_rather_than_their_decoded_stati
     let read = MetadataFile::read(bytes.into()).unwrap();
     assert!(read.stored_bytes() * 2 < bound, "a read file retains {} of the {bound} its decoding is bounded by", read.stored_bytes());
     let decoded = read.nodes().iter().filter_map(|node| match node { MetadataNode::Leaf { columns, .. } => Some(columns.values().unwrap().into_owned()), _ => None }).collect::<Vec<_>>();
+    for (page, node) in read.nodes().iter().enumerate() {
+        let MetadataNode::Leaf { columns, .. } = node else { continue; };
+        let statistics = columns.statistics().unwrap();
+        assert_eq!(statistics.root_column("_id").unwrap().bound("numbers", "min"), Some((page * 1024) as f64));
+        let sku = statistics.root_column("sku").unwrap();
+        assert_eq!(sku.count(), Some(1024));
+        let bloom = rtdb_format::bloom::BloomFilter::from_bytes(sku.bloom().unwrap()).unwrap();
+        assert!(bloom.contains_value(&Value::Utf8(format!("sku-{}", page * 1024))).unwrap());
+    }
     let present = |columns: &[Value]| columns.iter().map(|column| match column {
         Value::Struct(fields) => Value::Struct(fields.iter().filter(|(_, value)| !matches!(value, Value::Null)).map(|(key, value)| (key.clone(), value.clone())).collect()),
         other => other.clone(),

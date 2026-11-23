@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use rtdb_format::{database::proto::DatabaseConfig, log::proto::resolved_tx::DbOp};
 use rtdb_replication::DatabaseEffects;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use crate::Database;
 
@@ -176,7 +176,7 @@ impl DatabaseCatalog {
 
 pub(crate) enum CatalogCommand {
     Apply { operation: DbOp, completion: oneshot::Sender<Result<()>> },
-    AttachLocal { name: String, configuration: DatabaseConfig, completion: oneshot::Sender<Result<Option<Arc<Database>>>> },
+    AttachLocal { name: String, configuration: DatabaseConfig, slot: Option<OwnedSemaphorePermit>, completion: oneshot::Sender<Result<Option<Arc<Database>>>> },
     DetachLocal { name: String, completion: oneshot::Sender<Result<()>> },
 }
 

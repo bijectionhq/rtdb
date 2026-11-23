@@ -1,5 +1,5 @@
 {
-  "summary": "Checkpoint recovery may retry only a strictly newer advertised checkpoint.",
+  "summary": "Checkpoint recovery advances the block and respects the admitted journal boundary.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,8 +7,90 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 4,
+  "min_verified_functions": 9,
   "controls": {
+    "accept_changed_published_boundary": {
+      "defect": "The published block number is enough to admit a changed replica boundary.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "Some(boundary) if loaded_block == published_block => boundary == published_boundary,",
+          "replace": "Some(_boundary) if loaded_block == published_block => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "function": "accepts_published_checkpoint",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "accept_changed_published_boundary_with_weakened_contract": {
+      "defect": "The published block number is enough to admit a changed replica boundary.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "Some(boundary) if loaded_block == published_block => boundary == published_boundary,",
+          "replace": "Some(_boundary) if loaded_block == published_block => true,"
+        },
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "(loaded_block == published_block && boundary == published_boundary)",
+          "replace": "(loaded_block == published_block)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_discovery/laws.rs",
+          "function": "the_published_block_requires_its_exact_boundary",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "accept_unchanged_successor_boundary": {
+      "defect": "A larger block number is enough even when the boundary does not advance.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "Some(boundary) => loaded_block > published_block && boundary > published_boundary,",
+          "replace": "Some(boundary) => loaded_block > published_block && boundary >= published_boundary,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "function": "accepts_published_checkpoint",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "accept_unchanged_successor_boundary_with_weakened_contract": {
+      "defect": "A larger block number is enough even when the boundary does not advance.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "Some(boundary) => loaded_block > published_block && boundary > published_boundary,",
+          "replace": "Some(boundary) => loaded_block > published_block && boundary >= published_boundary,"
+        },
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "|| (loaded_block > published_block && boundary > published_boundary)",
+          "replace": "|| (loaded_block > published_block && boundary >= published_boundary)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_discovery/laws.rs",
+          "function": "a_later_block_requires_a_later_boundary",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 8
+    },
     "repeat_same_checkpoint": {
       "defect": "An unchanged listing can cause a retry without progress.",
       "mutate": [

@@ -34,9 +34,9 @@ pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
                 let first = bounds.trim_lsn.saturating_add(1).max(0);
                 let window = (first <= bounds.commit_lsn).then_some([first, bounds.commit_lsn]);
                 if let Some(window) = window { responders.push((server, window)); }
-                audit.windows.insert(config.servers[server].clone(), window);
+                audit.windows.insert(config.servers[server].address().to_owned(), window);
             }
-            Err(error) => { audit.unavailable.insert(config.servers[server].clone(), error.to_string()); }
+            Err(error) => { audit.unavailable.insert(config.servers[server].address().to_owned(), error.to_string()); }
         }
     }
     let Some([first, through]) = quorum_overlap(&responders, config.write_quorum) else { return Ok(audit) };
@@ -48,8 +48,8 @@ pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
     }).collect::<FuturesUnordered<_>>();
     while let Some((server, proof)) = proofs.next().await {
         match proof {
-            Ok(digest) => { audit.digests.insert(config.servers[server].clone(), digest); }
-            Err(error) if error.category == AnomalyCategory::Unavailable => { audit.unavailable.insert(config.servers[server].clone(), error.to_string()); }
+            Ok(digest) => { audit.digests.insert(config.servers[server].address().to_owned(), digest); }
+            Err(error) if error.category == AnomalyCategory::Unavailable => { audit.unavailable.insert(config.servers[server].address().to_owned(), error.to_string()); }
             Err(error) => return Err(error),
         }
     }
@@ -109,6 +109,161 @@ pub async fn certify_committed_prefix(config: &StreamConfig, through: i64, prefi
     Ok(JournalDigest { stream: config.stream.clone(), interval: [start, through], digest })
 }
 
+/// Certifies exactly this retained interval, seeded at its first offset.
+pub async fn certify_committed_range(config: &StreamConfig, first: i64, through: i64) -> Result<JournalDigest> {
+    validate(config)?;
+    if first < 0 || through < first { return Err(range_unavailable()); }
+    let ensemble = Ensemble::new(config.clone());
+    let mut proofs = (0..ensemble.len()).map(|server| {
+        let ensemble = &ensemble;
+        async move {
+            let status = ensemble.read(server, 0, 0, Duration::ZERO).await?;
+            if status.trim_lsn >= first || status.commit_lsn < through { return Err(range_unavailable()); }
+            durable_chain(ensemble, server, first, through, None).await
+        }
+    }).collect::<FuturesUnordered<_>>();
+    let mut accepted = None;
+    let mut agreeing = 0;
+    while let Some(result) = proofs.next().await {
+        let digest = match result {
+            Ok(digest) => digest,
+            Err(error) if error.category == AnomalyCategory::Unavailable => continue,
+            Err(error) => return Err(error),
+        };
+        if accepted.as_ref().is_some_and(|previous| previous != &digest) {
+            return Err(Anomaly::fault("rtdb.logkeeper/audit-divergence", "Replicas disagree on the retained interval"));
+        }
+        accepted = Some(digest);
+        agreeing += 1;
+    }
+    let digest = accepted.filter(|_| agreeing >= config.write_quorum).ok_or_else(range_unavailable)?;
+    Ok(JournalDigest { stream: config.stream.clone(), interval: [first, through], digest })
+}
+
+fn range_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/retained-range-unavailable", "The exact committed interval is unavailable")
+}
+
+/// A bounded cursor through an immutable committed interval. Pages are
+/// provisional until the final raw history digest matches the certificate.
+pub struct CertifiedRangeReader {
+    ensemble: Ensemble,
+    certificate: JournalDigest,
+    chain: RetainedChain,
+    next: i64,
+    preferred: usize,
+}
+
+impl CertifiedRangeReader {
+    pub fn new(config: &StreamConfig, certificate: &JournalDigest) -> Result<Self> {
+        validate(config)?;
+        let [first, through] = certificate.interval;
+        if certificate.stream != config.stream || first < 0 || through < first
+            || through == i64::MAX || certificate.digest_bytes().is_none()
+        {
+            return Err(range_unavailable());
+        }
+        Ok(Self {
+            ensemble: Ensemble::new(config.clone()),
+            certificate: certificate.clone(),
+            chain: RetainedChain::new(&config.stream, first),
+            next: first,
+            preferred: 0,
+        })
+    }
+
+    /// Returns at most one bounded protocol page. Observe completion before
+    /// publishing anything that depends on the replayed records.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<crate::protocol::Entry>>> {
+        let through = self.certificate.interval[1];
+        if self.next > through {
+            if self.chain.digest() != self.certificate.digest { return Err(range_unavailable()); }
+            return Ok(None);
+        }
+        let max_entries = u32::try_from(through - self.next + 1).unwrap_or(u32::MAX)
+            .min(MAXIMUM_BATCH_ENTRIES);
+        for offset in 0..self.ensemble.len() {
+            let server = (self.preferred + offset) % self.ensemble.len();
+            let Ok(page) = self.ensemble.read(server, self.next, max_entries, Duration::ZERO).await else {
+                continue;
+            };
+            if page.trim_lsn >= self.next || page.commit_lsn < through || page.entries.is_empty()
+                || page.entries.len() > max_entries as usize
+                || page.entries.iter().enumerate().any(|(index, entry)| entry.lsn != self.next + index as i64)
+            {
+                continue;
+            }
+            for entry in &page.entries { self.chain.append(entry); }
+            self.next += page.entries.len() as i64;
+            self.preferred = server;
+            if self.next > through && self.chain.digest() != self.certificate.digest {
+                return Err(range_unavailable());
+            }
+            return Ok(Some(page.entries));
+        }
+        Err(range_unavailable())
+    }
+}
+
+/// Reads one complete retained copy whose raw bytes match the exact-range certificate.
+pub async fn copy_certified_range(
+    config: &StreamConfig, certificate: &JournalDigest, maximum_bytes: usize, maximum_entries: usize,
+) -> Result<Vec<crate::protocol::Entry>> {
+    validate(config)?;
+    let [first, through] = certificate.interval;
+    let count = through.checked_sub(first).and_then(|difference| difference.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok()).filter(|count| *count > 0 && *count <= maximum_entries)
+        .ok_or_else(range_unavailable)?;
+    if certificate.stream != config.stream || first < 0 { return Err(range_unavailable()); }
+    let ensemble = Ensemble::new(config.clone());
+    for server in 0..ensemble.len() {
+        let copy = async {
+            let mut retained = Vec::with_capacity(count);
+            let mut remaining = maximum_bytes;
+            let mut next = first;
+            let mut chain = RetainedChain::new(&config.stream, first);
+            while retained.len() < count {
+                let limit = u32::try_from(count - retained.len()).unwrap_or(u32::MAX).min(MAXIMUM_BATCH_ENTRIES);
+                let page = ensemble.read(server, next, limit, Duration::ZERO).await?;
+                if next <= page.trim_lsn || page.commit_lsn < through || page.entries.is_empty() {
+                    return Err(range_unavailable());
+                }
+                for entry in page.entries {
+                    if entry.lsn != next || entry.lsn > through { return Err(range_unavailable()); }
+                    remaining = remaining.checked_sub(entry.payload.len().saturating_add(64)).ok_or_else(range_unavailable)?;
+                    chain.append(&entry);
+                    retained.push(entry);
+                    if next == through { break; }
+                    next += 1;
+                }
+            }
+            if chain.digest() != certificate.digest { return Err(range_unavailable()); }
+            Ok::<_, Anomaly>(retained)
+        }.await;
+        if let Ok(entries) = copy { return Ok(entries); }
+    }
+    Err(range_unavailable())
+}
+
+/// Rechecks archived records against their exact interval in the original replica stream.
+pub fn verify_certified_range(certificate: &JournalDigest, entries: &[crate::protocol::Entry]) -> Result<()> {
+    let [first, through] = certificate.interval;
+    if first < 0 || entries.first().map(|entry| entry.lsn) != Some(first)
+        || entries.last().map(|entry| entry.lsn) != Some(through)
+    {
+        return Err(range_unavailable());
+    }
+    let mut chain = RetainedChain::new(&certificate.stream, first);
+    for (index, entry) in entries.iter().enumerate() {
+        if first.checked_add(i64::try_from(index).map_err(|_| range_unavailable())?) != Some(entry.lsn) {
+            return Err(range_unavailable());
+        }
+        chain.append(entry);
+    }
+    if chain.digest() != certificate.digest { return Err(range_unavailable()); }
+    Ok(())
+}
+
 async fn durable_chain(ensemble: &Ensemble, server: usize, mut from: i64, through: i64, mut preceding_digest: Option<[u8; 32]>) -> Result<String> {
     loop {
         let page = ensemble.digest_page(server, from, through, preceding_digest).await?;
@@ -146,7 +301,7 @@ async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> 
         let page = ensemble.read(server, next, MAXIMUM_BATCH_ENTRIES, Duration::ZERO).await?;
         if next <= page.trim_lsn {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/audit-trimmed", format!(
-                "Replica {} trimmed position {next} during the audit", ensemble.config.servers[server])));
+                "Replica {} trimmed position {next} during the audit", ensemble.config.servers[server].address())));
         }
         if page.entries.is_empty() {
             return Err(incomplete(ensemble, server, next));
@@ -161,7 +316,7 @@ async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> 
 }
 
 fn incomplete(ensemble: &Ensemble, server: usize, position: i64) -> Anomaly {
-    Anomaly::fault("rtdb.logkeeper/audit-gap", format!("Replica {} omitted committed position {position}", ensemble.config.servers[server]))
+        Anomaly::fault("rtdb.logkeeper/audit-gap", format!("Replica {} omitted committed position {position}", ensemble.config.servers[server].address()))
 }
 
 #[cfg(test)]

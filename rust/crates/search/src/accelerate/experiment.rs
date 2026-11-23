@@ -1,8 +1,9 @@
-//! Point-query experiments over the same trie files and corpus as the native SQL accelerator.
+//! Point-query experiments over the same trie files and score as the native SQL accelerator.
 
 pub mod workload;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rtdb_query::ScanRequest;
@@ -69,12 +70,12 @@ impl PointRanking {
         }
         if limit == 0 { return Ok((Ok(Vec::new()), work)); }
         let Some(definition) = accelerator.definition(request, column).await? else { return Ok((Err(Fallback::IndexCoverage), work)) };
-        accelerator.register_corpora(request, column, &definition).await?;
-        let TrieFiles::Complete(Found { files, skipped }) = accelerator.trie_files(request, &definition).await?
+        let scoring = Query::parse(scoring);
+        let TrieFiles::Complete(Found { files, skipped }) = accelerator.trie_files(request, &definition, column, &[matching, &scoring], super::LoadSearch::Match, None).await?
             else { return Ok((Err(Fallback::IndexCoverage), work)) };
-        let scoring = rtdb_expr::CorpusLookup::scorer(request.corpora, scoring);
+        let scoring = Arc::new(rtdb_text::Scorer::new(scoring, None));
         let Some(rank_scorer) = scoring.for_ranking() else { return Ok((Err(Fallback::ScoreDomain), work)); };
-        let cutter = Cutter::new(&files, &skipped, request, &accelerator.runtime);
+        let cutter = Cutter::new(&files, &skipped, request);
         let mut cursors = Vec::new();
         let tie_bounds = ranking == Ranking::ScoreAndId;
         for group in by_file(&files) {

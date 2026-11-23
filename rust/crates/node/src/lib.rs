@@ -1,9 +1,12 @@
 mod ordered_index;
+pub use ordered_index::{path_columns_at_cut, stable_owned_path_columns};
+pub use ordered_index::{OwnedCountRequest, OwnedDecimalSum, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, owned_count as count_owned_cut, measure_owned_cut, range_owned_cut};
 mod session;
 mod resources;
 mod catalog;
 mod config;
 mod database;
+mod read_currency;
 mod node;
 mod backends;
 mod runtime;
@@ -21,10 +24,19 @@ pub use kafka_connect::{KafkaConnectSourceFactory, KafkaIndexerFactory};
 
 pub use session::*;
 pub use resources::*;
+mod placed_receipts;
+pub use placed_receipts::{AwaitAuthority, ClosedEpochRecovery, PlacedReceiptCodec};
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
-pub use node::{IDEMPOTENCY_KEY_PARAMETER, IDEMPOTENCY_TABLE, NOT_HELD, NativeSession, Node, NodeDriver, NodeServices, ReadFence};
+pub use rtdb_tx::{ArchivedWorldConstraints, HostedControlWrite, WorldConstraintArchive};
+pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
+pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityPage, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
+pub use node::{AppliedOwnedPoint, AppliedReadFloor};
+pub use node::SearchFileFormat;
+#[cfg(feature = "search")]
+pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};
+pub use node::{archived_changes_at_cut, archived_path_touch_at_cut, archived_versions_at_cut, IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldAcceptedCut, OwnedWorldEffect, OwnedWorldFork, OwnedWorldWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldVersionRead, OwnedWorldWrite, ReadFence, WorldClockRequest};
 
 mod statement;
 pub use statement::{PreparedSql, ResultSignaturePolicy};

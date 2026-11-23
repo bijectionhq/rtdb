@@ -15,22 +15,22 @@ fn committed(id: i64, time: i64) -> Arc<TransactionResult> { Arc::new(Transactio
 async fn applied_prefix_remains_readable_after_ingestion_failure_and_restart_releases_new_waits() {
     let monitor = monitor();
     let cancellation = CancellationToken::new();
-    monitor.applied(Some(SourcePosition(9)), Some(committed(7, 70)), Some(vec![1, 2])).unwrap();
+    monitor.applied(Some(SourcePosition(9)), Some(committed(7, 70).into()), Some(vec![1, 2])).unwrap();
     let fault = Anomaly::fault("test/ingestion", "broken ingestion");
     monitor.ingestion_failed(fault.clone());
     monitor.await_source(SourcePosition(9), &cancellation).await.unwrap();
     assert_eq!(monitor.await_tx(TxId(7), &cancellation).await.unwrap().unwrap().tx_key().system_time, Timestamp(70));
     assert_eq!(monitor.await_tx(TxId(8), &cancellation).await.unwrap_err(), fault);
     monitor.driver_restarted();
-    monitor.applied(Some(SourcePosition(10)), Some(committed(8, 80)), None).unwrap();
+    monitor.applied(Some(SourcePosition(10)), Some(committed(8, 80).into()), None).unwrap();
     assert_eq!(monitor.await_system_time(Timestamp(80), &cancellation).await.unwrap().external_token.as_deref(), Some(&[1, 2][..]));
 }
 
 #[tokio::test]
 async fn invalid_progress_does_not_partially_publish_source_or_token() {
     let monitor = monitor();
-    monitor.applied(Some(SourcePosition(9)), Some(committed(7, 70)), Some(vec![1])).unwrap();
-    assert!(monitor.applied(Some(SourcePosition(10)), Some(committed(7, 80)), Some(vec![2])).is_err());
+    monitor.applied(Some(SourcePosition(9)), Some(committed(7, 70).into()), Some(vec![1])).unwrap();
+    assert!(monitor.applied(Some(SourcePosition(10)), Some(committed(7, 80).into()), Some(vec![2])).is_err());
     let progress = monitor.current();
     assert_eq!(progress.source_position, SourcePosition(9));
     assert_eq!(progress.tx_key.unwrap().system_time, Timestamp(70));
@@ -38,6 +38,35 @@ async fn invalid_progress_does_not_partially_publish_source_or_token() {
     monitor.stopped();
     monitor.await_tx(TxId(7), &CancellationToken::new()).await.unwrap();
     assert!(monitor.await_source(SourcePosition(10), &CancellationToken::new()).await.is_err());
+}
+
+#[tokio::test]
+async fn cancelling_a_wait_leaves_other_subscriptions_and_applied_progress_intact() {
+    let monitor = monitor();
+    let cancelled = CancellationToken::new();
+    let surviving = CancellationToken::new();
+    let source = monitor.await_source(SourcePosition(4), &cancelled);
+    let transaction = monitor.await_system_time(Timestamp(70), &surviving);
+    tokio::pin!(source, transaction);
+    assert!(futures::poll!(&mut source).is_pending());
+    assert!(futures::poll!(&mut transaction).is_pending());
+
+    cancelled.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(5), &mut source).await.unwrap().unwrap_err();
+    assert_eq!(error.code, "xtdb/ingestion-interrupted");
+    assert!(monitor.fault().is_none());
+    assert_eq!(monitor.current().source_position, SourcePosition(-1));
+    assert!(futures::poll!(&mut transaction).is_pending());
+
+    let expected = committed(7, 70);
+    monitor.applied(Some(SourcePosition(4)), Some(Arc::clone(&expected).into()), Some(vec![1])).unwrap();
+    let applied = tokio::time::timeout(Duration::from_secs(5), &mut transaction).await.unwrap().unwrap();
+    assert_eq!(applied.source_position, SourcePosition(4));
+    assert_eq!(applied.tx_key, Some(expected.tx_key()));
+    assert_eq!(applied.latest_result, Some(expected.into()));
+    assert_eq!(applied.external_token.as_deref(), Some(&[1][..]));
+    let older = tokio::time::timeout(Duration::from_secs(5), monitor.await_tx(TxId(6), &surviving)).await.unwrap().unwrap();
+    assert!(older.is_none());
 }
 
 #[test]

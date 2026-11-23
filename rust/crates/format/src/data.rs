@@ -1,11 +1,19 @@
+mod columns;
+
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
-use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
+use arrow_array::{Array, ArrayRef, BinaryArray, NullArray, RecordBatch, StructArray, TimestampMicrosecondArray, UInt32Array, UnionArray,
+    builder::BinaryBuilder};
+use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
+
+#[cfg(test)]
+use arrow_array::{StringArray, cast::AsArray};
+#[cfg(test)]
+use rtdb_types::ScalarType;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoredOperation {
@@ -16,8 +24,12 @@ pub enum StoredOperation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredEvent {
+    /// Canonical complete identity for governed data. IID stays a physical route.
+    pub entity_key: Option<Arc<[u8]>>,
     pub iid: Iid,
     pub system_from: Timestamp,
+    /// Zero for writes outside an ordered Proposal landing.
+    pub commit_position: u32,
     pub valid_time: Interval,
     pub operation: StoredOperation,
     pub recency: Option<Timestamp>,
@@ -25,7 +37,7 @@ pub struct StoredEvent {
 
 impl StoredEvent {
     pub fn header(&self) -> EventHeader {
-        EventHeader { iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: match &self.operation {
+        EventHeader { commit_position: self.commit_position, iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: match &self.operation {
             StoredOperation::Put(_) => EventOp::Put, StoredOperation::Delete => EventOp::Delete, StoredOperation::Erase => EventOp::Erase,
         } }
     }
@@ -35,6 +47,7 @@ impl StoredEvent {
 pub trait EncodedEvent {
     fn header(&self) -> EventHeader;
     fn recency(&self) -> Option<Timestamp>;
+    fn entity_key(&self) -> Option<&[u8]> { None }
     /// Whether every column the event's put document holds is among `fields`.
     fn put_within(&self, fields: &StructFields<LogicalType>) -> bool;
     /// The put document's `name` cell under the column type `ty`, as `struct_field_cell` takes it of the decoded document.
@@ -54,6 +67,7 @@ pub enum PutColumn<'a> {
 impl EncodedEvent for StoredEvent {
     fn header(&self) -> EventHeader { StoredEvent::header(self) }
     fn recency(&self) -> Option<Timestamp> { self.recency }
+    fn entity_key(&self) -> Option<&[u8]> { self.entity_key.as_deref() }
     fn put_within(&self, fields: &StructFields<LogicalType>) -> bool {
         match &self.operation { StoredOperation::Put(document) => document.keys().all(|name| fields.contains_key(name)), _ => true }
     }
@@ -71,8 +85,10 @@ impl EncodedEvent for StoredEvent {
 pub struct PageEvent {
     page: Arc<EventPage>,
     offset: usize,
+    row: usize,
     pub iid: Iid,
     pub system_from: Timestamp,
+    pub commit_position: u32,
     pub valid_time: Interval,
     pub op: EventOp,
     pub recency: Option<Timestamp>,
@@ -82,68 +98,136 @@ pub struct PageEvent {
 
 #[derive(Debug)]
 struct EventPage {
-    put: Option<(arrow_array::StructArray, arrow_schema::Fields, StructFields<LogicalType>)>,
-    _owner: Option<OwnedBatch>,
+    put: Option<(StructArray, Vec<LogicalType>)>,
+    keys: Option<BinaryArray>,
 }
 
-pub fn put_page_events(
-    documents: OwnedBatch,
-    types: StructFields<LogicalType>,
-    headers: Vec<(Iid, Interval)>,
-    system_from: Timestamp,
-) -> Result<Vec<PageEvent>> {
-    if headers.len() != documents.batch().num_rows() { return Err(invalid("Document and event counts differ")); }
-    let array = arrow_array::StructArray::from(documents.batch().clone());
-    let fields = array.fields().clone();
-    let page = Arc::new(EventPage { put: Some((array, fields, types)), _owner: Some(documents) });
-    Ok(headers.into_iter().enumerate().map(|(offset, (iid, valid_time))| PageEvent {
-        page: Arc::clone(&page), offset, iid, system_from, valid_time, op: EventOp::Put, recency: None,
-        bytes: std::sync::OnceLock::new(),
-    }).collect())
+#[derive(Clone, Copy)]
+struct PutRef<'a> {
+    array: &'a StructArray,
+    types: PutFieldTypes<'a>,
+    offset: usize,
+}
+
+#[derive(Clone, Copy)]
+enum PutFieldTypes<'a> {
+    Ordered(&'a [LogicalType]),
+    Named(&'a StructFields<LogicalType>),
+}
+
+impl<'a> PutRef<'a> {
+    fn field_type(self, index: usize) -> Result<&'a LogicalType> {
+        let ty = match self.types {
+            PutFieldTypes::Ordered(types) => types.get(index),
+            PutFieldTypes::Named(types) => types.get(self.array.fields()[index].name()),
+        };
+        ty.ok_or_else(|| invalid("Put column has no logical type"))
+    }
+
+    fn column(self, name: &str) -> PutColumn<'a> {
+        match self.position(name) {
+            Some(index) => PutColumn::Stored(&self.array.fields()[index], self.array.column(index).as_ref(), self.offset),
+            None => PutColumn::Absent,
+        }
+    }
+    fn value(self, name: &str, ty: &LogicalType) -> Result<Value> {
+        match self.position(name) {
+            Some(index) => match self.field_type(index)? {
+                LogicalType::Nothing => Ok(Value::Undefined),
+                stored => rtdb_columnar::read_value_as(stored, &self.array.fields()[index], self.array.column(index).as_ref(), self.offset),
+            },
+            None => Ok(match ty { LogicalType::Nothing => Value::Undefined, _ => Value::Null }),
+        }
+    }
+    fn position(self, name: &str) -> Option<usize> { self.array.fields().iter().position(|field| field.name() == name) }
+    fn within(self, fields: &StructFields<LogicalType>) -> bool {
+        self.array.fields().iter().all(|column| fields.contains_key(column.name()))
+    }
+}
+
+/// A borrowed event with its document addressed within an Arrow batch.
+pub struct EventRef<'a> {
+    header: EventHeader,
+    recency: Option<Timestamp>,
+    put: Option<PutRef<'a>>,
+    entity_key: Option<&'a [u8]>,
+}
+
+pub use rtdb_columnar::TextCell as PutText;
+
+impl<'a> EventRef<'a> {
+    pub fn validate_document(&self, memory: &Arc<MemoryBudget>) -> Result<()> {
+        let Some(put) = self.put else { return Ok(()); };
+        for (index, field) in put.array.fields().iter().enumerate() {
+            let logical = put.field_type(index)?;
+            if *logical != LogicalType::Nothing {
+                rtdb_columnar::validate_readable_cell(field, put.array.column(index).as_ref(), logical, put.offset, memory)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrows ordinary UTF-8 cells from a validated put document.
+    pub fn put_text(&self, name: &str) -> Result<PutText<'a>> {
+        let Some(put) = self.put else { return Ok(PutText::Missing); };
+        let Some(position) = put.position(name) else { return Ok(PutText::Missing); };
+        let logical = put.field_type(position)?;
+        rtdb_columnar::text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
+    }
+
+    pub fn physical_entity_key(&self) -> Option<&'a [u8]> { self.entity_key }
+
+    pub fn put_identity(&self) -> Result<Option<rtdb_columnar::EntityIdRef<'a>>> {
+        match self.put.map(|put| put.column("_id")) {
+            Some(PutColumn::Stored(field, array, row)) => rtdb_columnar::read_entity_id(field, array, row).map(Some),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl EncodedEvent for EventRef<'_> {
+    fn header(&self) -> EventHeader { self.header }
+    fn recency(&self) -> Option<Timestamp> { self.recency }
+    fn entity_key(&self) -> Option<&[u8]> { self.entity_key }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool { self.put.is_none_or(|put| put.within(fields)) }
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
+        let put = self.put.ok_or_else(|| invalid("Only a put event has document cells"))?;
+        put.value(name, ty).map(std::borrow::Cow::Owned)
+    }
+    fn put_column(&self, name: &str) -> Option<PutColumn<'_>> { self.put.map(|put| put.column(name)) }
 }
 
 impl PageEvent {
-    pub fn put_types(&self) -> Option<&StructFields<LogicalType>> {
-        self.page.put.as_ref().map(|(_, _, types)| types)
-    }
-
     /// The bytes the event's document decodes to at most, which encoding its cells may hold at once.
     pub fn document_bytes(&self) -> Result<usize> {
         if let Some(bytes) = self.bytes.get() { return Ok(*bytes); }
         let bytes = match (&self.page.put, self.op) {
-            (Some((array, fields, _)), EventOp::Put) => fields.iter().enumerate().try_fold(0usize, |bytes, (index, field)| {
+            (Some((array, _)), EventOp::Put) => array.fields().iter().enumerate().try_fold(0usize, |bytes, (index, field)| {
                 bytes.checked_add(rtdb_columnar::estimate_read_cell_bytes(field, array.column(index).as_ref(), self.offset)?).ok_or_else(event_size)
             })?,
             _ => 0,
         };
         Ok(*self.bytes.get_or_init(|| bytes))
     }
+    fn put_ref(&self) -> Option<PutRef<'_>> {
+        let (Some((array, types)), EventOp::Put) = (&self.page.put, self.op) else { return None; };
+        Some(PutRef { array, types: PutFieldTypes::Ordered(types), offset: self.offset })
+    }
 }
 
 impl EncodedEvent for PageEvent {
-    fn header(&self) -> EventHeader { EventHeader { iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: self.op } }
+    fn header(&self) -> EventHeader { EventHeader { commit_position: self.commit_position, iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: self.op } }
     fn recency(&self) -> Option<Timestamp> { self.recency }
+    fn entity_key(&self) -> Option<&[u8]> { self.page.keys.as_ref().map(|keys| keys.value(self.row)) }
     fn put_within(&self, fields: &StructFields<LogicalType>) -> bool {
-        match (&self.page.put, self.op) { (Some((_, columns, _)), EventOp::Put) => columns.iter().all(|column| fields.contains_key(column.name())), _ => true }
+        self.put_ref().is_none_or(|put| put.within(fields))
     }
     fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
-        let (Some((array, fields, types)), EventOp::Put) = (&self.page.put, self.op) else { return Err(invalid("Only a put event has document cells")) };
-        // As reading the document struct does: a column it stores reads under its own type, and one it lacks falls back
-        // as `struct_field_cell` falls back for a key the document has no value for.
-        Ok(std::borrow::Cow::Owned(match fields.iter().position(|field| field.name() == name) {
-            Some(index) => match types.get(name).ok_or_else(|| invalid("Put column has no logical type"))? {
-                LogicalType::Nothing => Value::Undefined,
-                stored => rtdb_columnar::read_value_as(stored, &fields[index], array.column(index).as_ref(), self.offset)?,
-            },
-            None => match ty { LogicalType::Nothing => Value::Undefined, _ => Value::Null },
-        }))
+        let put = self.put_ref().ok_or_else(|| invalid("Only a put event has document cells"))?;
+        put.value(name, ty).map(std::borrow::Cow::Owned)
     }
     fn put_column(&self, name: &str) -> Option<PutColumn<'_>> {
-        let (Some((array, fields, _)), EventOp::Put) = (&self.page.put, self.op) else { return None };
-        Some(match fields.iter().position(|field| field.name() == name) {
-            Some(index) => PutColumn::Stored(&fields[index], array.column(index).as_ref(), self.offset),
-            None => PutColumn::Absent,
-        })
+        self.put_ref().map(|put| put.column(name))
     }
 }
 
@@ -156,6 +240,8 @@ pub struct EventBatch {
     valid_to: usize,
     op: usize,
     recency: Option<usize>,
+    entity_keys: Option<usize>,
+    commit_positions: Option<usize>,
     /// The put leg's logical type, derived from its field on the first put read.
     put_type: std::sync::Arc<std::sync::OnceLock<LogicalType>>,
 }
@@ -171,6 +257,25 @@ impl EventBatch {
         let valid_to = field_index("_valid_to")?;
         let op = field_index("op")?;
         let recency = schema.index_of("_recency").ok();
+        let entity_keys = schema.index_of(ENTITY_KEY_FIELD).ok();
+        let commit_positions = schema.index_of(COMMIT_POSITION_FIELD).ok();
+        if entity_keys.is_some() != commit_positions.is_some() {
+            return Err(invalid("Governed event pages require entity keys and commit positions together"));
+        }
+        if let Some(index) = entity_keys
+            && (schema.field(index).is_nullable()
+                || batch.column(index).as_any().downcast_ref::<BinaryArray>().is_none()
+                || batch.column(index).null_count() != 0)
+        {
+            return Err(invalid("Governed events require non-null binary entity keys"));
+        }
+        if let Some(index) = commit_positions
+            && (schema.field(index).is_nullable()
+                || !batch.column(index).as_any().is::<UInt32Array>()
+                || batch.column(index).null_count() != 0)
+        {
+            return Err(invalid("Governed events require non-null UInt32 commit positions"));
+        }
         for index in [Some(system_from), Some(valid_from), Some(valid_to), recency].into_iter().flatten() {
             if batch.column(index).as_any().downcast_ref::<TimestampMicrosecondArray>().is_none() || batch.column(index).null_count() != 0 {
                 return Err(invalid(format!("{} must contain non-null microsecond timestamps", schema.field(index).name())));
@@ -190,28 +295,23 @@ impl EventBatch {
                 (name, _) => return Err(invalid(format!("Unknown event operation: {name}"))),
             }
         }
-        Ok(Self { batch, iid, system_from, valid_from, valid_to, op, recency, put_type: Default::default() })
+        Ok(Self { batch, iid, system_from, valid_from, valid_to, op, recency, entity_keys, commit_positions, put_type: Default::default() })
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
     /// The page's events read in place, each reading its document's cells only as an event batch encodes them.
     pub fn page_events(&self) -> Result<Vec<PageEvent>> {
-        self.page_events_at(0..self.len())
-    }
-
-    pub fn page_events_at(&self, rows: impl IntoIterator<Item = usize>) -> Result<Vec<PageEvent>> {
         let union = self.operations()?;
         let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
         let put = match legs.iter().find(|(_, leg)| leg.name() == "put") {
             Some((id, leg)) => {
-                let array = union.child(id).as_any().downcast_ref::<arrow_array::StructArray>().ok_or_else(|| invalid("Put operations must contain document structs"))?.clone();
-                let DataType::Struct(fields) = leg.data_type() else { return Err(invalid("Put operations must contain document structs")) };
+                let array = union.child(id).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Put operations must contain document structs"))?.clone();
                 let LogicalType::Struct(types) = rtdb_columnar::from_field(leg)? else { return Err(invalid("A put operation must contain a document struct")) };
-                Some((array, fields.clone(), types))
+                Some((array, types.into_iter().map(|(_, ty)| ty).collect()))
             }
             None => None,
         };
-        let page = Arc::new(EventPage { put, _owner: None });
+        let page = Arc::new(EventPage { put, keys: self.keys().cloned() });
         let mut ops = [None; 128];
         for (id, leg) in legs.iter() {
             let op = match leg.name().as_str() { "put" => EventOp::Put, "delete" => EventOp::Delete, "erase" => EventOp::Erase, name => return Err(invalid(format!("Unknown event operation: {name}"))) };
@@ -221,10 +321,11 @@ impl EventBatch {
         let times = |index: usize| self.batch.column(index).as_any().downcast_ref::<TimestampMicrosecondArray>().map(|array| array.values()).ok_or_else(|| invalid("Event timestamp array type changed"));
         let (system_from, valid_from, valid_to) = (times(self.system_from)?, times(self.valid_from)?, times(self.valid_to)?);
         let recency = self.recency.map(times).transpose()?;
-        rows.into_iter().map(|row| {
-            if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
+        let positions = self.positions();
+        (0..self.len()).map(|row| {
             let op = usize::try_from(union.type_id(row)).ok().and_then(|id| ops[id]).ok_or_else(|| invalid("Event operation type ID has no leg"))?;
-            Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
+            Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), row, iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
+                commit_position: positions.map_or(0, |positions| positions.value(row)),
                 valid_time: Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?, op,
                 recency: recency.map(|recency| Timestamp(recency[row])), bytes: std::sync::OnceLock::new() })
         }).collect()
@@ -235,6 +336,21 @@ impl EventBatch {
     }
     pub fn len(&self) -> usize { self.batch.num_rows() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    pub fn has_entity_keys(&self) -> bool { self.entity_keys.is_some() }
+
+    fn keys(&self) -> Option<&BinaryArray> {
+        self.entity_keys.and_then(|index| self.batch.column(index).as_any().downcast_ref::<BinaryArray>())
+    }
+
+    fn positions(&self) -> Option<&UInt32Array> {
+        self.commit_positions.and_then(|index| self.batch.column(index).as_any().downcast_ref::<UInt32Array>())
+    }
+
+    pub fn entity_key(&self, row: usize) -> Result<Option<&[u8]>> {
+        if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
+        Ok(self.keys().map(|keys| keys.value(row)))
+    }
 
     pub fn iid(&self, row: usize) -> Result<Iid> {
         IidView::new(self.batch.column(self.iid).as_ref())?.get(row)
@@ -247,6 +363,7 @@ impl EventBatch {
             name => return Err(invalid(format!("Unknown event operation: {name}"))),
         };
         Ok(EventHeader {
+            commit_position: self.positions().map_or(0, |positions| positions.value(row)),
             iid: self.iid(row)?,
             system_from: self.timestamp(self.system_from, row)?,
             valid_time: Interval::new(self.timestamp(self.valid_from, row)?, self.timestamp(self.valid_to, row)?)?,
@@ -254,12 +371,50 @@ impl EventBatch {
         })
     }
 
+    /// Borrows a row and the logical types of its batch's put fields.
+    pub fn event_ref<'a>(&'a self, row: usize, put_types: &'a [LogicalType]) -> Result<EventRef<'a>> {
+        let header = self.header(row)?;
+        self.event_ref_at(row, header, PutFieldTypes::Ordered(put_types))
+    }
+
+    /// Borrows an event using the whole put field's validated layout for its cells.
+    pub fn borrow_event(&self, row: usize) -> Result<EventRef<'_>> {
+        let header = self.header(row)?;
+        let types = if header.op == EventOp::Put {
+            let (field, _, _) = self.operation(row)?;
+            let logical = self.put_layout(field)?;
+            let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+            let LogicalType::Struct(types) = logical else { return Err(invalid("A put operation must contain a document struct")); };
+            PutFieldTypes::Named(types)
+        } else {
+            PutFieldTypes::Ordered(&[])
+        };
+        self.event_ref_at(row, header, types)
+    }
+
+    fn event_ref_at<'a>(&'a self, row: usize, header: EventHeader, put_types: PutFieldTypes<'a>) -> Result<EventRef<'a>> {
+        let put = if header.op == EventOp::Put {
+            let (_, array, offset) = self.operation(row)?;
+            let array = array.as_any().downcast_ref::<StructArray>().filter(|array| array.is_valid(offset))
+                .ok_or_else(|| invalid("A put operation must contain a document struct"))?;
+            Some(PutRef { array, types: put_types, offset })
+        } else { None };
+        let recency = self.recency.map(|index| self.timestamp(index, row)).transpose()?;
+        Ok(EventRef { header, recency, put, entity_key: self.entity_key(row)? })
+    }
+
+    fn put_layout(&self, field: &Field) -> Result<&LogicalType> {
+        if let Some(logical) = self.put_type.get() { return Ok(logical); }
+        let logical = rtdb_columnar::from_field(field)?;
+        Ok(self.put_type.get_or_init(|| logical))
+    }
+
     pub fn read_event(&self, row: usize) -> Result<StoredEvent> {
         let header = self.header(row)?;
         let operation = match header.op {
             EventOp::Put => {
                 let (field, array, offset) = self.operation(row)?;
-                let logical = match self.put_type.get() { Some(logical) => logical, None => { let derived = rtdb_columnar::from_field(field)?; self.put_type.get_or_init(|| derived) } };
+                let logical = self.put_layout(field)?;
                 let Value::Struct(document) = rtdb_columnar::read_value_as(logical, field, array.as_ref(), offset)? else {
                     return Err(invalid("A put operation must contain a document struct"));
                 };
@@ -268,23 +423,8 @@ impl EventBatch {
             EventOp::Delete => StoredOperation::Delete,
             EventOp::Erase => StoredOperation::Erase,
         };
-        Ok(StoredEvent { iid: header.iid, system_from: header.system_from, valid_time: header.valid_time, operation,
+        Ok(StoredEvent { commit_position: header.commit_position, entity_key: self.entity_key(row)?.map(Arc::from), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time, operation,
             recency: self.recency.map(|index| self.timestamp(index, row)).transpose()? })
-    }
-
-    pub fn read_put_field(&self, row: usize, name: &str) -> Result<Value> {
-        if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
-        let (operation, array, offset) = self.operation(row)?;
-        if operation.name() != "put" { return Ok(Value::Null); }
-        let document = array.as_any().downcast_ref::<arrow_array::StructArray>()
-            .filter(|array| !array.is_null(offset))
-            .ok_or_else(|| invalid("A put operation must contain a document struct"))?;
-        let Some(index) = document.fields().iter().position(|field| field.name() == name) else {
-            return Ok(Value::Null);
-        };
-        let field = &document.fields()[index];
-        if field.data_type() == &DataType::Null { return Ok(Value::Null); }
-        rtdb_columnar::read_value(field, document.column(index).as_ref(), offset)
     }
 
     fn timestamp(&self, index: usize, row: usize) -> Result<Timestamp> {
@@ -306,6 +446,79 @@ pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<StructFields
     event_batch(events, put_fields, iid_encoding, false, None, PutLeg::First)
 }
 
+#[test]
+fn validating_a_borrowed_document_keeps_errors_in_unread_fields() {
+    let fields = StructFields::from([
+        ("uri".into(), LogicalType::Scalar(ScalarType::Uri)),
+        ("body".into(), LogicalType::Scalar(ScalarType::Utf8)),
+    ]);
+    let event = StoredEvent {
+        commit_position: 0,
+        entity_key: None,
+        iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([
+            ("uri".into(), Value::Uri("https://example.com".into())),
+            ("body".into(), Value::Utf8("indexed text".into())),
+        ])),
+    };
+    let batch = build_event_batch(&[event], Some(fields), None).unwrap();
+    let schema = batch.schema();
+    let op = schema.index_of("op").unwrap();
+    let union = batch.column(op).as_union();
+    let DataType::Union(legs, _) = union.data_type() else { panic!("Expected union"); };
+    let children = legs.iter().map(|(id, field)| {
+        if field.name() != "put" { return Arc::clone(union.child(id)); }
+        let put = union.child(id).as_struct();
+        let mut columns = put.columns().to_vec();
+        let uri = put.fields().iter().position(|field| field.name() == "uri").unwrap();
+        columns[uri] = Arc::new(StringArray::from(vec!["%"]));
+        Arc::new(StructArray::try_new(put.fields().clone(), columns, None).unwrap()) as ArrayRef
+    }).collect();
+    let mut columns = batch.columns().to_vec();
+    columns[op] = Arc::new(UnionArray::try_new(legs.clone(), union.type_ids().clone(), union.offsets().cloned(), children).unwrap());
+    let batch = EventBatch::new(RecordBatch::try_new(schema, columns).unwrap()).unwrap();
+    let event = batch.borrow_event(0).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    assert_eq!(event.validate_document(&memory).unwrap_err().code, batch.read_event(0).unwrap_err().code);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn borrowed_events_validate_the_put_layout_when_a_put_is_read() {
+    let fields = StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]);
+    let events = [StoredOperation::Delete, StoredOperation::Put(StructFields::from([
+        ("body".into(), Value::Utf8("indexed text".into())),
+    ]))].into_iter().map(|operation| StoredEvent {
+        commit_position: 0,
+        entity_key: None,
+        iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,
+    }).collect::<Vec<_>>();
+    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let schema = batch.schema();
+    let op = schema.index_of("op").unwrap();
+    let union = batch.column(op).as_union();
+    let DataType::Union(legs, _) = union.data_type() else { panic!("Expected union"); };
+    let children = legs.iter().map(|(id, _)| Arc::clone(union.child(id))).collect();
+    let legs = legs.iter().map(|(id, field)| {
+        let field = if field.name() == "put" {
+            Arc::new(field.as_ref().clone().with_metadata([
+                (rtdb_columnar::EXTENSION_NAME_KEY.to_owned(), "unrecognized".into()),
+            ].into_iter().collect()))
+        } else {
+            Arc::clone(field)
+        };
+        (id, field)
+    }).collect();
+    let union = UnionArray::try_new(legs, union.type_ids().clone(), union.offsets().cloned(), children).unwrap();
+    let mut fields = schema.fields().to_vec();
+    fields[op] = Arc::new(fields[op].as_ref().clone().with_data_type(union.data_type().clone()));
+    let mut columns = batch.columns().to_vec();
+    columns[op] = Arc::new(union);
+    let batch = EventBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()).unwrap();
+    assert_eq!(batch.borrow_event(0).unwrap().header().op, EventOp::Delete);
+    assert_eq!(batch.borrow_event(1).err().unwrap().code, batch.read_event(1).unwrap_err().code);
+}
+
 /// Reconstructs stored cells under their captured put schema, preserving raw decimal coefficients.
 /// Every value must belong to that schema; no decimal parameter or coefficient is converted.
 /// The caller admits column construction and event-array overhead before calling.
@@ -321,20 +534,77 @@ enum PutLeg { First, Last }
 /// Builds an owned index batch with scratch for one document column at a time, laid out as a live page.
 /// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
 pub fn owned_event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
-    let metadata = put_fields.as_ref().map_or(Ok(4096), |fields| {
+    let (mut builder, metadata) = event_builder(events.len(), put_fields.as_ref(), memory)?;
+    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder), PutLeg::Last)?;
+    builder.finish_with_metadata(batch, metadata)
+}
+
+fn event_builder(rows: usize, put_fields: Option<&StructFields<LogicalType>>, memory: &Arc<MemoryBudget>) -> Result<(BatchBuilder, usize)> {
+    let metadata = put_fields.map_or(Ok(4096), |fields| {
         fields.iter().try_fold(4096usize, |bytes, (name, ty)| {
             ty.retained_bytes()?.checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
                 .and_then(|bytes| bytes.checked_mul(8)).and_then(|size| bytes.checked_add(size)).ok_or_else(event_size)
         })
     })?;
-    let headers = events.len().checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
-    let mut builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
-    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder), PutLeg::Last)?;
-    builder.finish_with_metadata(batch, metadata)
+    let headers = rows.checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
+    let builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
+    Ok((builder, metadata))
+}
+
+/// `source_bytes` is the shared source allocation held by the document buffers.
+pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    if documents.len() != headers.len() || documents.null_count() != 0
+        || !matches!(documents.data_type(), DataType::Struct(_))
+        || headers.iter().any(|header| header.op != EventOp::Put || header.commit_position != 0) {
+        return Err(invalid("Put headers and their Arrow documents disagree"));
+    }
+    let retained = documents.get_array_memory_size().max(source_bytes.unwrap_or_default());
+    let field = Field::new("put", documents.data_type().clone(), false);
+    let mut selected = documents.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
+    if selected < retained {
+        for row in 0..documents.len() {
+            selected = selected.checked_add(rtdb_columnar::estimate_event_copy_cell_bytes(&field, documents.as_ref(), row)?).ok_or_else(event_size)?;
+            if selected >= retained { break; }
+        }
+    }
+    // A source record can share one large document buffer across thousands of small puts.
+    let (documents, copy) = if selected < retained {
+        let layout = crate::ipc::schema_translation_bound(&Schema::new(vec![field]))?;
+        let scratch = selected.checked_add(layout).ok_or_else(event_size)?;
+        match memory.reserve(scratch) {
+            Ok(scratch) => {
+                let cells = (0..documents.len()).map(|row| Some((0, row))).collect::<Vec<_>>();
+                let compact = rtdb_columnar::copy_event_cells(&[documents.as_ref()], &cells)?;
+                (compact, Some(scratch))
+            }
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (documents, None),
+            Err(error) => return Err(error),
+        }
+    } else {
+        (documents, None)
+    };
+    let bound = headers.len().checked_mul(128).and_then(|bytes| bytes.checked_add(documents.get_array_memory_size()))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
+    let mut reservation = if let Some(mut reservation) = copy {
+        let lease = Arc::get_mut(&mut reservation).expect("put copy owns its reservation");
+        if bound > lease.bytes() { lease.grow_to(bound)?; } else { lease.shrink_to(bound)?; }
+        reservation
+    } else { memory.reserve(bound)? };
+    let fields = UnionFields::new(0..3, [
+        Field::new("delete", DataType::Null, true),
+        Field::new("erase", DataType::Null, true),
+        Field::new("put", documents.data_type().clone(), false),
+    ]);
+    let offsets = (0..headers.len()).map(|offset| i32::try_from(offset).map_err(invalid)).collect::<Result<Vec<_>>>()?;
+    let operations = UnionArray::try_new(fields, ScalarBuffer::from(vec![2; headers.len()]), Some(ScalarBuffer::from(offsets)),
+        vec![Arc::new(NullArray::new(0)), Arc::new(NullArray::new(0)), documents]).map_err(invalid)?;
+    let batch = event_columns(headers, Arc::new(operations), None, None)?;
+    Arc::get_mut(&mut reservation).expect("put construction owns its reservation").shrink_to(batch.get_array_memory_size())?;
+    OwnedBatch::with_reservation(batch, reservation)
 }
 
 /// A batch has a `put` leg when it holds a put or declares document columns, as the reference's relation gains one.
-fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>, put_leg: PutLeg) -> Result<RecordBatch> {
+fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, mut builder: Option<&mut BatchBuilder>, put_leg: PutLeg) -> Result<RecordBatch> {
     let mut puts = Vec::new();
     let mut deletes = 0usize;
     let mut erases = 0usize;
@@ -361,13 +631,55 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
     let mut op_fields = vec![Arc::new(Field::new("delete", DataType::Null, true)), Arc::new(Field::new("erase", DataType::Null, true))];
     let mut children: Vec<ArrayRef> = vec![Arc::new(NullArray::new(deletes)), Arc::new(NullArray::new(erases))];
     if let Some(fields) = put_fields {
-        let documents = put_columns(&puts, fields, copy, builder)?;
+        let documents = put_columns(&puts, fields, copy, builder.as_deref_mut())?;
         let index = usize::try_from(put_id).map_err(invalid)?;
         op_fields.insert(index, Arc::new(Field::new("put", documents.data_type().clone(), false)));
         children.insert(index, documents);
     }
     let op_fields = UnionFields::new(0..op_fields.len() as i8, op_fields);
-    let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields.clone(), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
+    let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields, ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
+    let recencies = events.iter().any(|event| event.recency().is_some()).then(|| {
+        events.iter().map(|event| event.recency().map(|time| time.0).ok_or_else(|| invalid("Mixed recency presence in one event batch"))).collect::<Result<Vec<_>>>()
+    }).transpose()?;
+    let plain = event_columns(&headers, op, iid_encoding, recencies)?;
+    if !events.iter().any(|event| event.entity_key().is_some()) {
+        if headers.iter().any(|header| header.commit_position != 0) {
+            return Err(invalid("A commit position requires a governed event"));
+        }
+        return Ok(plain);
+    }
+
+    let bytes = events.iter().try_fold(0usize, |bytes, event| {
+        let key = event.entity_key().ok_or_else(|| invalid("A governed page mixed keyed and plain events"))?;
+        bytes.checked_add(key.len()).ok_or_else(event_size)
+    })?;
+    i32::try_from(bytes).map_err(invalid)?;
+    let _charge = builder.as_deref().map(|builder| builder.reserve_scratch(bytes)).transpose()?;
+    let mut keys = BinaryBuilder::with_capacity(events.len(), bytes);
+    for event in events {
+        keys.append_value(event.entity_key().ok_or_else(|| invalid("A governed page is missing an entity key"))?);
+    }
+    let mut fields = plain.schema().fields().to_vec();
+    fields.push(Arc::new(entity_key_field()));
+    fields.push(Arc::new(commit_position_field()));
+    let mut columns = plain.columns().to_vec();
+    columns.push(Arc::new(keys.finish()));
+    columns.push(Arc::new(UInt32Array::from_iter_values(headers.iter().map(|header| header.commit_position))));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)
+}
+
+pub const ENTITY_KEY_FIELD: &str = "_entity_key";
+const COMMIT_POSITION_FIELD: &str = "_commit_position";
+
+pub fn entity_key_field() -> Field {
+    Field::new(ENTITY_KEY_FIELD, DataType::Binary, false)
+}
+
+pub fn commit_position_field() -> Field {
+    Field::new(COMMIT_POSITION_FIELD, DataType::UInt32, false)
+}
+
+fn event_columns(headers: &[EventHeader], op: ArrayRef, iid_encoding: Option<RunEndWidth>, recencies: Option<Vec<i64>>) -> Result<RecordBatch> {
     let iids: Vec<_> = headers.iter().map(|header| header.iid).collect();
     let iids = build_iids(&iids, iid_encoding)?;
     let time_type = DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()));
@@ -376,13 +688,12 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
         Field::new("_system_from", time_type.clone(), false),
         Field::new("_valid_from", time_type.clone(), false),
         Field::new("_valid_to", time_type.clone(), false),
-        Field::new("op", DataType::Union(op_fields, UnionMode::Dense), false),
+        Field::new("op", op.data_type().clone(), false),
     ];
     let times = |values: Vec<i64>| Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
     let mut columns = vec![iids, times(headers.iter().map(|header| header.system_from.0).collect()),
         times(headers.iter().map(|header| header.valid_time.lower().0).collect()), times(headers.iter().map(|header| header.valid_time.upper().0).collect()), op];
-    if events.iter().any(|event| event.recency().is_some()) {
-        let recencies = events.iter().map(|event| event.recency().map(|time| time.0).ok_or_else(|| invalid("Mixed recency presence in one event batch"))).collect::<Result<Vec<_>>>()?;
+    if let Some(recencies) = recencies {
         fields.push(Field::new("_recency", time_type, false));
         columns.push(times(recencies));
     }
@@ -402,11 +713,22 @@ fn put_columns<E: EncodedEvent>(
     let mut columns = Vec::with_capacity(fields.len());
     for (name, ty) in fields {
         let field = to_field(&name, &ty)?;
-        if copy && let Some(column) = gather_column(documents, &field, builder.as_deref_mut())? {
+        if copy && let Some(column) = columns::gather_column(documents, &field, &ty, builder.as_deref_mut())? {
             schema.push(Arc::new(field));
             columns.push(column);
             continue;
         }
+        let _scratch = builder.as_deref().map(|builder| {
+            let bytes = documents.iter().try_fold(0usize, |bytes, doc| {
+                let cell = match doc.put_column(&name) {
+                    Some(PutColumn::Stored(field, array, row)) => rtdb_columnar::estimate_read_cell_bytes(field, array, row)?,
+                    Some(PutColumn::Absent) => std::mem::size_of::<Value>(),
+                    None => 0,
+                };
+                bytes.checked_add(cell).ok_or_else(event_size)
+            })?;
+            builder.reserve_scratch(bytes)
+        }).transpose()?;
         let cells = documents.iter().map(|doc| doc.put_cell(&name, &ty)).collect::<Result<Vec<_>>>()?;
         let build = || {
             let values = cells.iter().map(|cell| cell.as_ref().clone()).collect::<Vec<_>>();
@@ -422,191 +744,33 @@ fn put_columns<E: EncodedEvent>(
     build_struct_array(schema.into(), &columns, documents.len(), None)
 }
 
-/// The column `field` describes, copied from the arrays its documents' pages store it in, when every page stores it
-/// under that same flat layout (or lacks it, for a nullable column): the array `copy_array` builds from the cells read.
-fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field, builder: Option<&mut BatchBuilder>) -> Result<Option<ArrayRef>> {
-    use arrow_schema::TimeUnit as Unit;
-    let flat = match field.data_type() {
-        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-            | DataType::Float32 | DataType::Float64 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) | DataType::Duration(_)
-            | DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-            | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => true,
-        DataType::Time32(unit) => matches!(unit, Unit::Second | Unit::Millisecond),
-        DataType::Time64(unit) => matches!(unit, Unit::Microsecond | Unit::Nanosecond),
-        _ => false,
-    };
-    let vector_width = match field.data_type() {
-        DataType::FixedSizeList(item, width) if *width > 0 && item.metadata().is_empty() => match item.data_type() {
-            DataType::Float32 => Some(*width as usize * 4),
-            DataType::Float64 => Some(*width as usize * 8),
-            _ => None,
-        },
-        _ => None,
-    };
-    let variable_float = matches!(field.data_type(), DataType::List(item)
-        if item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64));
-    if (!flat && vector_width.is_none() && !variable_float) || !field.metadata().is_empty() || documents.is_empty() { return Ok(None); }
-    let mut sources = Vec::with_capacity(documents.len());
-    for document in documents {
-        match document.put_column(field.name()) {
-            Some(PutColumn::Stored(source, array, row)) if source.data_type() == field.data_type() && source.metadata().is_empty() => {
-                if !field.is_nullable() && array.is_null(row) { return Ok(None); }
-                sources.push(array.is_valid(row).then_some((array, row)));
-            }
-            Some(PutColumn::Absent) if field.is_nullable() => sources.push(None),
-            _ => return Ok(None),
-        }
-    }
-    let build = || gather(field.data_type(), &sources);
-    match builder {
-        Some(builder) => {
-            let bound = if let Some(width) = vector_width {
-                documents.len().checked_mul(width.checked_add(128).ok_or_else(event_size)?)
-                    .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?
-            } else {
-                sources.iter().try_fold(4096usize, |bytes, source| {
-                    let cell = match source {
-                        Some((array, row)) => rtdb_columnar::estimate_read_cell_bytes(field, *array, *row)?,
-                        None => 0,
-                    };
-                    bytes.checked_add(cell.checked_mul(2).ok_or_else(event_size)?)
-                        .and_then(|bytes| bytes.checked_add(128)).ok_or_else(event_size)
-                })?
-            };
-            builder.column(bound, build).map(Some)
-        }
-        None => build().map(Some),
-    }
-}
-
-fn gather(data_type: &DataType, sources: &[Option<(&dyn Array, usize)>]) -> Result<ArrayRef> {
-    use arrow_array::{builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, PrimitiveBuilder, StringBuilder}, cast::AsArray, types::*};
-    use arrow_schema::TimeUnit as Unit;
-    let layout = || invalid("Stored put column disagrees with its declared layout");
-    macro_rules! primitive {
-        ($ty:ty) => {{
-            let mut builder = PrimitiveBuilder::<$ty>::with_capacity(sources.len()).with_data_type(data_type.clone());
-            for source in sources {
-                match source {
-                    Some((array, row)) => builder.append_value(array.as_primitive_opt::<$ty>().ok_or_else(layout)?.value(*row)),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        }};
-    }
-    macro_rules! cells {
-        ($builder:expr, |$array:ident, $row:ident| $cell:expr) => {{
-            let mut builder = $builder;
-            for source in sources {
-                match source {
-                    Some(($array, $row)) => { let ($array, $row) = (*$array, *$row); builder.append_value($cell); }
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        }};
-    }
-    Ok(match data_type {
-        DataType::Int8 => primitive!(Int8Type), DataType::Int16 => primitive!(Int16Type), DataType::Int32 => primitive!(Int32Type), DataType::Int64 => primitive!(Int64Type),
-        DataType::UInt8 => primitive!(UInt8Type), DataType::UInt16 => primitive!(UInt16Type), DataType::UInt32 => primitive!(UInt32Type), DataType::UInt64 => primitive!(UInt64Type),
-        DataType::Float32 => primitive!(Float32Type), DataType::Float64 => primitive!(Float64Type),
-        DataType::Date32 => primitive!(Date32Type), DataType::Date64 => primitive!(Date64Type),
-        DataType::Time32(Unit::Second) => primitive!(Time32SecondType), DataType::Time32(Unit::Millisecond) => primitive!(Time32MillisecondType),
-        DataType::Time64(Unit::Microsecond) => primitive!(Time64MicrosecondType), DataType::Time64(Unit::Nanosecond) => primitive!(Time64NanosecondType),
-        DataType::Timestamp(Unit::Second, _) => primitive!(TimestampSecondType), DataType::Timestamp(Unit::Millisecond, _) => primitive!(TimestampMillisecondType),
-        DataType::Timestamp(Unit::Microsecond, _) => primitive!(TimestampMicrosecondType), DataType::Timestamp(Unit::Nanosecond, _) => primitive!(TimestampNanosecondType),
-        DataType::Duration(Unit::Second) => primitive!(DurationSecondType), DataType::Duration(Unit::Millisecond) => primitive!(DurationMillisecondType),
-        DataType::Duration(Unit::Microsecond) => primitive!(DurationMicrosecondType), DataType::Duration(Unit::Nanosecond) => primitive!(DurationNanosecondType),
-        DataType::Decimal32(_, _) => primitive!(Decimal32Type), DataType::Decimal64(_, _) => primitive!(Decimal64Type),
-        DataType::Decimal128(_, _) => primitive!(Decimal128Type), DataType::Decimal256(_, _) => primitive!(Decimal256Type),
-        DataType::Boolean => cells!(BooleanBuilder::with_capacity(sources.len()), |array, row| array.as_boolean_opt().ok_or_else(layout)?.value(row)),
-        DataType::Utf8 => cells!(StringBuilder::with_capacity(sources.len(), 0), |array, row| array.as_string_opt::<i32>().ok_or_else(layout)?.value(row)),
-        DataType::Binary => cells!(BinaryBuilder::with_capacity(sources.len(), 0), |array, row| array.as_binary_opt::<i32>().ok_or_else(layout)?.value(row)),
-        DataType::FixedSizeBinary(width) => {
-            let mut builder = FixedSizeBinaryBuilder::with_capacity(sources.len(), *width);
-            for source in sources {
-                match source {
-                    Some((array, row)) => builder.append_value(array.as_fixed_size_binary_opt().ok_or_else(layout)?.value(*row)).map_err(invalid)?,
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        }
-        DataType::List(_) => {
-            let null = arrow_array::new_null_array(data_type, 1);
-            let mut arrays: Vec<&dyn Array> = vec![null.as_ref()];
-            let mut sources_by_address = std::collections::HashMap::new();
-            let picks = sources.iter().map(|source| match source {
-                Some((array, row)) => {
-                    let address = *array as *const dyn Array as *const ();
-                    let index = *sources_by_address.entry(address).or_insert_with(|| {
-                        arrays.push(*array);
-                        arrays.len() - 1
-                    });
-                    (index, *row)
-                }
-                None => (0, 0),
-            }).collect::<Vec<_>>();
-            arrow_select::interleave::interleave(&arrays, &picks).map_err(invalid)?
-        }
-        DataType::FixedSizeList(item, width) => {
-            let lists = sources.iter().map(|source| source.map(|(array, row)| {
-                array.as_any().downcast_ref::<FixedSizeListArray>().map(|array| (array, row)).ok_or_else(layout)
-            }).transpose()).collect::<Result<Vec<_>>>()?;
-            let child = match item.data_type() {
-                DataType::Float32 => gather_vector_values::<Float32Type>(&lists, *width as usize)?,
-                DataType::Float64 => gather_vector_values::<Float64Type>(&lists, *width as usize)?,
-                _ => return Err(layout()),
-            };
-            let nulls = lists.iter().any(Option::is_none)
-                .then(|| NullBuffer::new(BooleanBuffer::collect_bool(lists.len(), |row| lists[row].is_some())));
-            Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *width, child, nulls).map_err(invalid)?)
-        }
-        _ => return Err(layout()),
-    })
-}
-
-fn gather_vector_values<T: arrow_array::ArrowPrimitiveType>(lists: &[Option<(&FixedSizeListArray, usize)>], width: usize) -> Result<ArrayRef> {
-    use arrow_array::{builder::PrimitiveBuilder, cast::AsArray};
-    let mut values = PrimitiveBuilder::<T>::with_capacity(lists.len().checked_mul(width).ok_or_else(event_size)?);
-    for list in lists {
-        match list {
-            Some((list, row)) => {
-                let child = list.values().as_primitive_opt::<T>().ok_or_else(|| invalid("Invalid stored vector child"))?;
-                let start = list.value_offset(*row) as usize;
-                if child.null_count() == 0 {
-                    values.append_slice(&child.values()[start..start + width]);
-                } else {
-                    for component in start..start + width {
-                        if child.is_null(component) { values.append_null(); } else { values.append_value(child.value(component)); }
-                    }
-                }
-            }
-            None => values.append_nulls(width),
-        }
-    }
-    Ok(Arc::new(values.finish()))
-}
-
 /// Keeps the declared recency column even when a page is empty.
 pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, false)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, false, None)
 }
 
 /// Copies stored cells with the same ownership obligations as `copy_event_batch`, retaining empty-page recency metadata.
 pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None)
 }
 
 /// As `copy_event_batch_with_recency`, for events of any kind that encode their own cells.
 pub fn copy_encoded_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None)
 }
 
-fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
+/// Copies a compaction page and retains its output arrays under the caller's memory budget.
+pub fn owned_encoded_batch_with_recency<E: EncodedEvent>(
+    events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, memory: &Arc<MemoryBudget>,
+) -> Result<OwnedBatch> {
+    let (mut builder, metadata) = event_builder(events.len(), put_fields.as_ref(), memory)?;
+    let batch = event_batch_with_recency(events, put_fields, iid_encoding, recency, true, Some(&mut builder))?;
+    builder.finish_with_metadata(batch, metadata)
+}
+
+fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool, builder: Option<&mut BatchBuilder>) -> Result<RecordBatch> {
     if events.iter().any(|event| event.recency().is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
-    let batch = event_batch(events, put_fields, iid_encoding, copy, None, PutLeg::First)?;
+    let batch = event_batch(events, put_fields, iid_encoding, copy, builder, PutLeg::First)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();
         fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));
@@ -628,9 +792,51 @@ mod tests {
     use super::*;
     use rtdb_types::{EntityId, ScalarType};
 
+    #[test]
+    fn a_staged_put_charges_only_the_selected_part_of_its_large_source_buffer() {
+        use arrow_array::{StringArray, StructArray};
+
+        let other = "x".repeat(1 << 20);
+        let strings = Arc::new(StringArray::from(vec!["selected", other.as_str()]));
+        let documents = StructArray::try_new(vec![Field::new("v", DataType::Utf8, false)].into(), vec![strings], None).unwrap();
+        let selected = Arc::new(documents.slice(0, 1));
+        let memory = MemoryBudget::new(1 << 17);
+        let header = EventHeader { commit_position: 0, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
+        assert!(selected.get_array_memory_size() > memory.limit_bytes());
+
+        let batch = owned_put_batch(selected, &[header], None, &memory).unwrap();
+        let event = EventBatch::new(batch.batch().clone()).unwrap().read_event(0).unwrap();
+
+        assert_eq!(event.operation, StoredOperation::Put(StructFields::from([("v".into(), Value::Utf8("selected".into()))])));
+        assert!(memory.used_bytes() < 4096);
+        drop(batch);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_small_staged_put_releases_its_shared_source_record() {
+        use arrow_array::{StringArray, StructArray};
+
+        let content = StructArray::try_new(vec![Field::new("v", DataType::Utf8, false)].into(), vec![Arc::new(StringArray::from(vec!["kept"]))], None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("doc", content.data_type().clone(), false), Field::new("other-op", DataType::Utf8, false)]));
+        let other = "x".repeat(1 << 20);
+        let source = RecordBatch::try_new(schema, vec![Arc::new(content), Arc::new(StringArray::from(vec![other.as_str()]))]).unwrap();
+        let source_memory = MemoryBudget::new(1 << 22);
+        let source = OwnedBatch::new(source, &source_memory).unwrap();
+        let memory = MemoryBudget::new(1 << 17);
+        let header = EventHeader { commit_position: 0, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
+
+        let batch = owned_put_batch(Arc::clone(source.batch().column(0)), &[header], Some(source.reservation().bytes()), &memory).unwrap();
+        drop(source);
+
+        assert_eq!(source_memory.used_bytes(), 0);
+        let event = EventBatch::new(batch.batch().clone()).unwrap().read_event(0).unwrap();
+        assert_eq!(event.operation, StoredOperation::Put(StructFields::from([("v".into(), Value::Utf8("kept".into()))])));
+    }
+
     fn page(value: Value) -> Vec<PageEvent> {
         let document = StructFields::from([("v".into(), value.clone())]);
-        let event = StoredEvent { iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(document), recency: None };
+        let event = StoredEvent { commit_position: 0, entity_key: None, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(document), recency: None };
         let types = StructFields::from([("v".into(), value.logical_type())]);
         EventBatch::new(build_event_batch(&[event], Some(types), None).unwrap()).unwrap().page_events().unwrap()
     }
@@ -638,44 +844,25 @@ mod tests {
     #[test]
     fn a_column_every_page_stores_under_its_output_layout_is_copied_from_the_pages() {
         let events = [page(Value::I64(1)), page(Value::I64(2))].concat();
-        let field = to_field("v", &LogicalType::Scalar(ScalarType::I64)).unwrap();
-        assert!(gather_column(&events.iter().collect::<Vec<_>>(), &field, None).unwrap().is_some());
-    }
-
-    #[test]
-    fn vector_gather_preserves_parent_and_component_nulls() {
-        let element = LogicalType::Scalar(ScalarType::F32).maybe();
-        let vector = LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(2), element: Box::new(element) }.maybe();
-        let types = StructFields::from([("v".into(), vector.clone())]);
-        let rows = [
-            Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into()),
-            Value::Null,
-            Value::FixedSizeList(vec![Value::F32(4.0), Value::F32(5.0)].into()),
-        ].into_iter().enumerate().map(|(id, value)| StoredEvent {
-            iid: EntityId::Integer(id as i64).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
-            operation: StoredOperation::Put(StructFields::from([("v".into(), value)])), recency: None,
-        }).collect::<Vec<_>>();
-        let original = EventBatch::new(build_event_batch(&rows, Some(types.clone()), None).unwrap()).unwrap();
-        let events = original.page_events().unwrap();
-        let field = to_field("v", &vector).unwrap();
+        let ty = LogicalType::Scalar(ScalarType::I64);
+        let field = to_field("v", &ty).unwrap();
         let memory = MemoryBudget::new(1 << 20);
         let mut builder = BatchBuilder::new(4096, &memory).unwrap();
-        let sources = [&events[2], &events[0], &events[1]];
-        let column = gather_column(&sources, &field, Some(&mut builder)).unwrap().unwrap();
-        let list = column.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-        let child = list.values().as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
-        assert!(list.is_null(2));
-        assert!(child.is_null(3));
-        assert_eq!(child.value(2).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(&child.values()[..2], &[4.0, 5.0]);
+        let selected = columns::gather_column(&events.iter().collect::<Vec<_>>(), &field, &ty, Some(&mut builder)).unwrap().unwrap();
+        let values = selected.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[1, 2]);
     }
 
     #[test]
-    fn a_column_a_page_stores_under_another_layout_is_built_from_its_cells() {
+    fn a_column_stored_under_two_layouts_joins_their_arrow_vectors() {
         let events = [page(Value::I64(1)), page(Value::Utf8("a".into()))].concat();
-        let union = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8));
-        for ty in [LogicalType::Scalar(ScalarType::I64), union] {
-            assert!(gather_column(&events.iter().collect::<Vec<_>>(), &to_field("v", &ty).unwrap(), None).unwrap().is_none());
-        }
+        let events: Vec<_> = events.iter().collect();
+        let integer = LogicalType::Scalar(ScalarType::I64);
+        assert!(columns::gather_column(&events, &to_field("v", &integer).unwrap(), &integer, None).unwrap().is_none());
+        let union = integer.join(&LogicalType::Scalar(ScalarType::Utf8));
+        let field = to_field("v", &union).unwrap();
+        let selected = columns::gather_column(&events, &field, &union, None).unwrap().unwrap();
+        assert_eq!(rtdb_columnar::read_value(&field, selected.as_ref(), 0).unwrap(), Value::I64(1));
+        assert_eq!(rtdb_columnar::read_value(&field, selected.as_ref(), 1).unwrap(), Value::Utf8("a".into()));
     }
 }

@@ -7,6 +7,9 @@ use rtdb_types::format_iso_duration as duration_text;
 use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::{EncodedValue, binary::{PG_EPOCH_DAYS, PG_EPOCH_MICROS}, invalid, size_error};
 
+mod arrow;
+pub use arrow::encode_arrow;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format { Text, Binary }
 impl Format {
@@ -33,7 +36,7 @@ pub fn encode(ty: PgType, format: Format, value: &Value, environment: &SessionEn
     if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
     let mut bound = value.retained_bytes()?.checked_mul(32).and_then(|n| n.checked_add(8192)).ok_or_else(size_error)?;
     if ty == PgType::Numeric && format == Format::Binary {
-        if let Value::Decimal(value) = value { bound = bound.checked_add(crate::binary::numeric_allocation_bound(value)?).ok_or_else(size_error)?; }
+        if let Value::Decimal(value) = value { bound = bound.checked_add(crate::binary::numeric_allocation_bound(&value.unscaled, value.scale)?).ok_or_else(size_error)?; }
     }
     let reservation = memory.reserve(bound)?;
     let bytes = encode_value(ty, format, value, environment)?;
@@ -60,17 +63,10 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         }
         PgType::Bool => { let Value::Bool(value) = value else { return Err(incompatible(ty, value)); }; if binary { vec![u8::from(*value)] } else { if *value { b"t" } else { b"f" }.to_vec() } }
         PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword => match value { Value::Utf8(value) => value.as_bytes().to_vec(), Value::Keyword(value) => value.as_str().as_bytes().to_vec(), _ => return Err(incompatible(ty, value)) },
-        PgType::Numeric => { let Value::Decimal(decimal) = value else { return Err(incompatible(ty, value)); }; if binary { crate::binary::numeric_write(decimal)? } else { decimal_text(decimal).into_bytes() } }
+        PgType::Numeric => { let Value::Decimal(decimal) = value else { return Err(incompatible(ty, value)); }; if binary { crate::binary::numeric_write(&decimal.unscaled, decimal.scale)? } else { decimal_text(decimal).into_bytes() } }
         PgType::Timestamp | PgType::TimestampTz => {
             let Value::Timestamp { value, unit, timezone } = value else { return Err(incompatible(ty, value)); };
-            if binary {
-                let nanos = nanos(*value, *unit);
-                let micros = if ty == PgType::Timestamp { nanos / 1000 } else { nanos.div_euclid(1000) };
-                i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS).to_be_bytes().to_vec()
-            } else {
-                let format = if environment.parameter("datestyle") == Some("iso8601") { TimestampText::Iso } else { TimestampText::Pg };
-                timestamp_text(*value, *unit, timezone.as_deref().filter(|_| ty == PgType::TimestampTz), format)?.into_bytes()
-            }
+            encode_timestamp(format, *value, *unit, timezone.as_deref(), ty == PgType::TimestampTz, environment)?
         }
         PgType::Date => {
             let days = match value {
@@ -95,6 +91,18 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         PgType::Default => return Err(unsupported(ty, "writer")),
     };
     Ok(bytes)
+}
+
+/// Encodes the physical timestamp cell using the result field's PostgreSQL timestamp type.
+pub fn encode_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Option<&str>, zoned: bool, environment: &SessionEnvironment) -> Result<Vec<u8>> {
+    if format == Format::Binary {
+        let nanos = nanos(value, unit);
+        let micros = if zoned { nanos.div_euclid(1000) } else { nanos / 1000 };
+        Ok(i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS).to_be_bytes().to_vec())
+    } else {
+        let format = if environment.parameter("datestyle") == Some("iso8601") { TimestampText::Iso } else { TimestampText::Pg };
+        Ok(timestamp_text(value, unit, timezone.filter(|_| zoned), format)?.into_bytes())
+    }
 }
 
 fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironment) -> Result<Vec<u8>> {

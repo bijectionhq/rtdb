@@ -182,6 +182,11 @@ rule StartupCreatesFixedSet {
 
 rule PlacementAdmitsLocally {
     -- A placed node runs a database when the authority placing it says so, and no log-borne instruction reaches it.
+    -- Preparing an attachment occupies its name in the placement queue until the request completes.
+    -- Different names can prepare concurrently up to the placed-open limit.
+    -- The catalog owner publishes each successful preparation before it acts on the next local request for that name.
+    -- The catalog owner drains a completed preparation if it observes shutdown before publication.
+    -- The node applies backpressure before admitting more preparation requests than the placed-open limit.
     when: NodeAdmittedLocally(db_name, db_config)
     requires: catalog.membership_source = placed
     requires: not catalog.holds(db_name)

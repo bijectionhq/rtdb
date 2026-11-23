@@ -34,16 +34,16 @@ Update this section as work lands.
 | 0 | `tests/footprint.rs`: in a debug build, an open idle (empty) deployment costs about 94 KiB resident and 9 tasks, and activates in about 8 ms; the disk cache is keyed by the store; a placed node's query opens only its own database ; `StorageRoot` builds every database's storage root and puts it under a provider's prefix | multi derives each deployment's prefix from its record, above the `StorageRoot`, rather than giving `StorageRoot` an epoch-named multi layout |
 | 1 | a session on a placed node sees only its own database, including its transaction inspection commands and await positions; one pool's idle cache entries no longer starve another's; a node bounds its holdings' unflushed rows together (`--max-tail-rows`); a deployment's store refuses any other deployment ; in classic mode, a user list's `grants` limit users to the databases granted them | |
 | 2 | the directory with in-memory, TCP and DynamoDB backends (DynamoDB tested against DynamoDB Local); members, leases, pools; `Membership::Placed`; claims without elections; idle terms append nothing. The local authority can persist its directory on a private volume. Each local holding reconciles against the shared watch from its claim version onward. | watches follow the backend's change feed (DynamoDB Streams on DynamoDB, a subscription over TCP), with a poll every ten intervals as a safety net; each process follows the cell feed once, and receivers with the same deployment and interval share one watch and safety-net poller; DynamoDB stream startup refreshes watched keys after its iterators open and scans the table only for whole-feed consumers; a separate cell-wide watch service remains open |
-| 3 | one quorum append per transaction: the only durable stream is the replica stream, and the source log is the holder's in-process intake, started past every position the replica stream may hold; a transaction carrying an idempotency key in its metadata commits at most once, and a retry is answered with the original's outcome ; the gateway keys every command of a writable session, and resends a command whose holder went away before any of its replies reached the client, under the same key. A duplicate's outcome comes from durable metadata in its own deployment and at the retry's system time. | a command partly answered, or one that ends an explicit transaction begun on a former holder, is still reported as of unknown outcome; keying costs a writable command a pipelined `SET` and its transactions an assertion and a put |
+| 3 | one quorum append per transaction: the only durable stream is the replica stream, and the source log is the holder's in-process intake, started past every position the replica stream may hold; a transaction carrying an idempotency key in its metadata commits at most once, and a retry is answered with the original's outcome ; the gateway keys each command of a writable session and can replay an unanswered single autocommit write using a private permit acknowledged by both writer versions. A duplicate's outcome comes from durable metadata in its own deployment and at the retry's system time. | a command partly answered, or one that ends an explicit transaction begun on a former holder, is still reported as of unknown outcome; keying adds an assertion and a put to each transaction. A replay waits for acknowledgement of the protected key |
 | 4 | the logkeeper: append-time epoch promises, seal, recovery by synced epoch, background repair, seal announcements and `confirm_leadership`, moving a stream to a new ensemble, segment files shared by every stream on a server, from which retained entries are read on demand: a server holds each stream's index of entry locations and a bounded cache of recently written or read payloads (`--cache-bytes`, 64 MiB by default). A journal opens before its member is advertised and retains its identity when the process restarts. | segments are per server rather than per writer member; segments are retired by compaction, which copies every retained entry into a new base segment, rather than one by one as their entries are trimmed |
 | 5 | the store is fenced by the holder's epoch, cannot delete (a delete is a garbage record), and the reaper erases released objects and packs after a grace period. Managed S3 writes record their multipart identity before sending payload bytes and complete conditionally with a deployment-scoped grant. | Writer epochs in object paths and independently issued credentials remain open. The holder, conditional publication and checkpoint recovery checks protect the current storage layout. |
 | 6 | a block flush writes one object, its block's pack, which holds the catalog and is the boot object; placed nodes flush within 15 minutes and on park; the directory's checkpoint names the last published block, and a cold start finds its latest block by probing forward from it, and reads that block's pack, which names every other, listing nothing. Explicit flushes publish the adopted checkpoint before replying. | the boot object inlines the catalog and per-table block files but not the top trie levels, which are read from their own level-0 pack entries |
 | 7 | compaction workers compact the deployments that rank them first and relay the result to the holder, which publishes it; holders on such a cell run no compactor | |
 | 8 | parking after idleness, under `--max-active`, on drain, and waking on the next connection; operation locks are released with their last users and trim watermarks with their holdings. Ordinary parking drains admitted writes and publishes the adopted checkpoint when releasing the holder. | Opt-in resident-idle retains the placement and checkpoint, closes local execution resources, and wakes through a new epoch. A local in-memory directory run measured 100,000 resident placements with zero additional node execution bytes or tasks. |
-| 9 | the gateway reads pgwire frames, survives a planned move or a holder's death while the session is idle, replays the startup and prepared statements, and resends a command a former holder refused as not held; once the first holder has authenticated the client, each reconnection carries a capability the gateway signs with the cell's secret, which a node accepts in place of the password for that deployment alone. The pgwire gateway can terminate TLS and bind a connection to a specific installation. | The first connection's authentication runs on its node. The Flight SQL gateway supports one cell and binds server-local sessions to the current writer. Transparent Flight SQL recovery and cross-cell routing remain open. |
+| 9 | the gateway reads pgwire frames, survives a planned move or a holder's death while the session is idle, replays the startup and prepared statements, and replays eligible unanswered commands after losing or receiving a refusal from a former holder; once the first holder has authenticated the client, each reconnection carries a capability the gateway signs with the cell's secret, which a node accepts in place of the password for that deployment alone. The pgwire gateway can terminate TLS and bind a connection to a specific installation. | The first connection's authentication runs on its node. The Flight SQL gateway supports one cell and binds server-local sessions to the current writer. Transparent Flight SQL recovery and cross-cell routing remain open. |
 | 10 | read replicas fed by the log for read-only sessions within a deployment's read width; opt-in linearizable reads confirmed with the logkeepers before each query ; a snapshot session (`rtdb.read=snapshot`) reads the deployment as of its checkpoint on any node, the holder last, opened from object storage with frozen logs and no logkeeper, and closed before the reaper's grace runs out, serving any basis at or below the checkpoint ; a deployment whose persisted tries outgrow a node's disk cache (by default; `AgentOptions::fragments` sets the threshold and depth, and no command-line flag does yet) splits each whole-table scan into 16 trie-prefix fragments, each read at the coordinator's basis by the node that ranks first for `{storage identity}/{table}/{prefix}` among the nodes that may take placements, which opens a log-fed replica for it if it has none, and answered over the control protocol as Arrow IPC; a fragment whose reader fails or is not at the basis is read by the coordinator itself. Pgwire read-only sessions spread across the available replicas within the configured width. | scan fragments are split by the scan on the coordinating node, not by a cell-wide planner, and the size test is the deployment's persisted trie bytes against the node's disk-cache size rather than `PerMemberCacheShare`; a fragment carries the projection, the evaluated temporal bounds and the predicates any node evaluates alike, but not those on parameters, outer rows, the clock or chance, which the coordinator alone applies, and comes back whole in one response rather than streamed, a slice too large for one response being read by the coordinator instead; a reader at or past the coordinator's basis serves a fragment as of the basis, except that what was erased since is gone; `_id` lookups and multi-partition databases are never split |
-| 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal. Member probes have bounded concurrency, drains move one holding at a time, and `status --placements-only` reads indexed demand by pool. | Autoscaling acts on the reported signal outside RTDB. Load-vector rebalancing and automatic read-width adjustment remain open. |
-| 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by reference into the parent's lineage on fresh logs: a fork's `~base` manifest names where each object it shares physically lives, and whatever erases a shared object (the reaper, the parent's deletion) copies it into the forks still referencing it first; a cell move materializes every reference; deletion durably drops the stream from addressed replicas, empties the inventory including S3 versions, destroys the local key and stores a signed receipt bound to the deployment’s namespaces; a fork can also be taken at a past block younger than the reaper's grace, referencing only what existed when that block was written. Local fork, reaper, move and disposal operations serialize their inventory mutations. Hosted disposal waits for storage admissions and retires every recorded replica journal. | a fork is of the current state, of a past block, or of a time at or after the checkpoint, whose tail up to it is copied into the fork's stream, rather than of any basis with its tail in a pack; a time before the checkpoint must be forked as a past block, and a tail holding an oversized transaction is refused; a forked tail's transactions take new ids in the fork's log epoch; a referenced object is copied out before its owner erases it rather than kept in place, and the reaper and forks use a grace interval, and enforcing concurrent reference publication requires the spec's lineage fence |
+| 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal. Member probes have bounded concurrency, drains move one holding at a time, and `status --placements-only` reads indexed demand by pool. | Autoscaling acts on the reported signal outside RTDB. The controller can rebalance using write rate, query CPU, live batch and cache byte watermarks. The controller can also adjust Pgwire read width from live session demand. |
+| 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by reference into the parent's lineage on fresh logs: a fork's `~base` manifest names where each object it shares physically lives, and whatever erases a shared object (the reaper, the parent's deletion) copies it into the forks still referencing it first; a cell move materializes every reference; deletion durably drops the stream from addressed replicas, empties the inventory including S3 versions, destroys the local key and stores a signed receipt bound to the deployment’s namespaces; a fork can also be taken at a past block younger than the reaper's grace, referencing only what existed when that block was written. Local fork, reaper, move and disposal operations serialize their inventory mutations. Hosted disposal waits for storage admissions and retires every recorded replica journal. Cross-organisation forks copy the checkpoint and selected log tail with their own key. | a fork is of the current state, of a past block, or of a time at or after the checkpoint, whose tail up to it is copied into the fork's stream, rather than of any basis with its tail in a pack; a time before the checkpoint must be forked as a past block, and a tail holding an oversized transaction is refused; a forked tail's transactions take new ids in the fork's log epoch; a referenced object is copied out before its owner erases it rather than kept in place, and the reaper and forks use a grace interval, and enforcing concurrent reference publication requires the spec's lineage fence |
 | 13 | persistent cell placement with DynamoDB and a local in-memory cell map, gateway forwarding, creation in the least occupied cell, restartable cell moves that carry the unflushed tail across; the old cell's reaper erases what a move left there once the grace has passed since the move. The destination has a durable object copy and sealed replica tail before cutover. Each residence retains independent storage and key custody. | The source is fenced during the copy. Provider-backed movement and cleanup still require staging qualification. The source reaper needs its key authority. |
 | 14 | the chaos test and the history audit; `crates/simulation` runs one deployment's single-writer protocol from a seed (members claiming through the directory, three logkeeper state machines, a modelled writer, crashes, partitions, broken connections) and checks the epoch and log invariants after every step; it also runs a cell's storage lifecycle from a seed (deployments writing through their real store stacks, releasing, forking now and at a past block, reaper passes, deletions and cell moves, over in-memory buckets on a simulated clock, with injected pack read failures and move cleanup), checking that each deployment reads exactly what it wrote or inherited and has not released and nothing its parent wrote after the fork point, and gateway sessions (the real session over loopback TCP to stub backends that die during startup, before or after executing, between replies, or after preparing a named statement), checking that every command runs at most once, exactly once if the client was told it succeeded, and that the client sees only its own command's replies | three simulations of parts of a cell rather than one of a whole cell: the storage run has no nodes, directory or logkeepers and its admin sequences are modelled around the real calls, the session backends are stubs, with simple commands and extended-protocol prepared reads; combined directory, provider and runtime failures remain to be simulated |
 
@@ -58,7 +58,9 @@ A PostgreSQL startup database of `NAME@UUID`, with the UUID in lowercase 32-digi
 The gateway confirms the matched UUID in the startup parameter `rtdb_installation_id` after the backend checks its attached database.
 A replacement backend must verify the same installation before the gateway replays session state.
 Deploy nodes with the cell secret and this protocol support before routing gateways that require installation verification.
-`SHOW rtdb_hosted_source_barrier` returns the deployment ID after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+`SHOW rtdb_hosted_source_barrier` returns the deployment ID, applied transaction ID and ordered system time after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+The transaction ID and time are both null before any transaction is applied.
+Hosted protocol 17 includes this barrier, the source owner read and both held-world valid window sources.
 The holder must recover the checkpoint published in the directory or an authenticated successor before answering.
 A gateway reconnect keeps the original deployment ID.
 Restoring an older node or object copy requires a recoverable checkpoint and tail from the live directory and logkeeper ensemble.
@@ -175,14 +177,23 @@ witness and exact manifest, and verifies every object under the capture's
 media key. The receipt binds the supplied observation ID to the original
 capture point and digest.
 
+On a parked installation, `capture_checkpoint` uses the already published cut.
+The recovery listener accepts `retain_serving_replay` with the capture ID and `manifest_sha256` of that cut.
+Upgrade the serving and recovery processes that share the directory before selecting a serving replay archive.
+It verifies the original archive in independent custody and publishes its physical inventory receipt together with the selected capture.
+The next holder and later capture operations can read the selected archive while replaying the original installation's ordered tail.
+A parked installation can repeat the operation at a newer captured checkpoint.
+Regions that already use an older source retain that archive until their provider work drains.
+Direct forks of an installation with an attached archive require a separate materialization path.
+
 `discard_checkpoint_capture` installs a permanent release for one capture
 ID in its original cell. It can close an unattempted ID and prevents a late
 capture from creating archive state. Physical retirement waits for the
 recorded capture and repair readers, withdraws only the archive key, and
 purges the capture's versions and unfinished uploads. The release receipt
 and authority witness remain available. The serving installation keeps
-its own key and placement. A capture used by the current repair still
-belongs to the serving closure and cannot be discarded independently.
+its own key and placement.
+A capture used by the current repair or selected for serving replay belongs to the serving closure until the installation replaces or releases it.
 
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
@@ -216,6 +227,12 @@ the exact stage receipt. After opening the verified inventory it writes
 the acknowledgement and serves one read-only PgWire session on that same
 connection. It closes the session on loss of the directory fence or when
 the recovery action's lifetime expires.
+
+The private `inspect_checkpoint_stage_owned_relations` action takes the same source, capture, and stage selectors as `open_checkpoint_stage`.
+It requires a complete replay stage and returns the original transaction key, the captured owner namespace digest, the sorted physical relation names, and the canonical native schema declarations.
+A stage without owned relations returns an empty inventory.
+Multiple namespaces, unsupported native tables, and an owned namespace missing its declaration catalog refuse inspection.
+The action returns metadata only and leaves the PgWire catalog unchanged.
 
 The hosted `discard_checkpoint_stage` action binds the original capture
 digest and stage operation. It reserves a disposal tombstone if a stage has
@@ -564,6 +581,26 @@ The source of the intermittent long tail and lower aggregate throughput on the 6
 
 ### Stage 5: the storage fence and manifests
 
+#### Enrollment for terminal S3 storage
+
+The terminal profile uses `s3://BUCKET?terminal=ALLOCATION.PUBLIC_KEY`, where `ALLOCATION` is a fresh UUID and `PUBLIC_KEY` is an Ed25519 public key encoded in unpadded base64url.
+Provision the matching bucket-level `cell-terminal-<simple-uuid>` prefix and its create-once policy before granting serving credentials.
+Bucket-level prefixes of that form are reserved for terminal allocations.
+Keep serving credentials fenced until enrollment completes and preserve the policy and bootstrap records for the allocation's lifetime.
+Serving principals create new objects, and the qualified retirement principal alone can conditionally replace a retired payload with its permanent tombstone.
+Allocation disposal must drain provider writes before removing terminal objects.
+
+Run `rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE` with provisioning credentials authorized to read the provider inventory and conditionally write the two bootstrap records.
+The qualification file is a JSON envelope with `payload` and `signature` strings encoded in unpadded base64url.
+The raw payload is a JSON object with `policy` set to `create_once_v1`, the `allocation` UUID, the provider-encoded physical `root` without a trailing slash, and `namespace` containing the exact `bucket`, `region`, and `endpoint` (`null` for the default endpoint).
+The Ed25519 signature covers the bytes `rtdb.s3/terminal-enrollment/v1`, one zero byte, and the raw payload in order.
+The signer attests that the named allocation has been protected since creation and is reserved for the same provider account and policies throughout its lifetime.
+The command prints the enrolled allocation UUID.
+The same command can settle an interrupted bootstrap, and the enrolled URL is the storage-root configuration for readers, scoped writers and the reaper.
+The bucket policy and provider roles must be qualified independently of the command's inventory checks.
+
+See [the recovery-root design](../../verification/redesign/R5-recovery-roots.md#never-versioned-serving-buckets) for the retirement and disposal requirements.
+
 **Why.**
 A deposed holder must be unable to damage storage, and recovery must not depend on listing (spec contract `ObjectStorage`).
 
@@ -756,7 +793,34 @@ Moves are invisible to clients only if the gateway owns connections and session 
    Local pgwire startup, including routing and the holder's greeting, has a 35-second deadline.
    If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
+   A writer with gateway key support installs the key before executing the following command.
+   SQL session changes and `DISCARD ALL` preserve the installed gateway key.
+   For ordinary keyed transactions, string application keys take precedence over the gateway key and must stay stable for deduplication.
+   An ordinary keyed transaction without a string application key uses the gateway's key and transaction ordinal.
+   If installation fails, the writer closes its backend connection before it executes that command.
+   The gateway resends an unanswered simple query under a private permit when both writers support the permit contract.
+   The replacement acknowledges the permit and checks that the request is a single autocommit statement before executing it.
+   A permitted write has one engine-owned marker under the command key, separate from application keys.
+   The original and successor share the submission cutoff issued at command start.
+   Both reject a permitted write before append if it reaches submission at or after the cutoff.
+   The marker covers the entire permit window even when the writers' clocks differ.
+   The gateway issues permits for up to 30 minutes from the initial command and keeps the same cutoff across replacements.
+   An ambiguous batch, transaction-control command or extended Execute returns an unknown outcome.
+   Extended-protocol setup can still be replayed before any execution frame is forwarded.
+   Mixed-version cells continue to serve fresh commands.
+   Roll gateways first and drain sessions using the old permit before relying on the new contract.
+   The gateway authorizes replay only for writers advertising the current permit capability in both attempts.
+   The current permit capability records a leading assertion that aborts before user operations when executed by a legacy resolver.
+   A compatible resolver checks and removes that assertion before it runs the protected mutation.
+   Serve pre-existing records issued under the old permit with a compatible resolver until their source prefix has resolved.
+   Place the writers' backend listeners on the private cell network and expose the gateway listener to clients.
+   The gateway uses one 30-second window from the first replayable failure until it takes a replacement's first reply for forwarding to the client.
+   All attempts to recover the pending command share that window.
+   If that window expires, the client receives SQLSTATE `08006` with an unknown outcome.
+   Automatic write replay requires the original permit to still be admissible at the replacement.
+   A storage-close reply during handoff requires a newer writer epoch for the next replay.
    A gateway routing directly to a known writer reads that member by ID before considering other candidates.
+   A redirect is followed through the replacement node’s control endpoint so pgwire connects after the replacement confirms its endpoint and epoch.
    The writer checks its own membership by ID when it reuses a running placement.
    If a placed database detaches or changes while a query checks authority, the node refuses before planning so the gateway can retry.
    A direct Flight SQL session on a placed node supplies `x-xtdb-database` on its first authenticated request.
@@ -767,7 +831,7 @@ Moves are invisible to clients only if the gateway owns connections and session 
    A backend session belongs to the local placement it opens against.
    If the node opens a new placement with the same name, the gateway must establish a new backend session.
    A driver that stops during execution can leave the outcome unknown.
-   The gateway replays the command under its original key when the client has received no answer.
+   The gateway replays eligible unanswered commands under their original permit.
    Writable pgwire sessions accept pipelined frames and dispatch one command cycle at a time.
    Each autocommit cycle gets its own key after the previous cycle's ReadyForQuery.
    In an explicit transaction, the cycles retain the transaction's key through commit or rollback.
@@ -819,6 +883,26 @@ Read-your-writes across tiers; a zombie holder cannot serve a linearizable read;
 
 **Done when** a hot deployment's reads spread across its read width with bounded staleness.
 
+Nodes use the same eligible affinity ranks as the gateway when opening a log-fed read replica.
+A narrower width retires out-of-rank replicas that serve only Pgwire reads, and their gateway sessions reconnect within the remaining width.
+A replica serving scan fragments can remain attached.
+
+Each fragment returns selected storage columns as Arrow vectors, preserving their row order and field layout.
+A fragment can send more than one IPC frame when selected rows use different layouts.
+Enable automatic width with `rtdb-multi controller --read-sessions-per-node N`.
+With this policy enabled, the controller manages the width of live writer placements and manual width changes are subject to later adjustment.
+The default maximum width is eight, including the writer, and `--max-read-width N` can set a different ceiling.
+The controller samples authenticated read-only Pgwire connections on writers and replicas across gateways.
+Snapshots, Flight SQL and writable Pgwire sessions are outside this demand signal.
+Above the configured session count, the controller widens one rank at a time up to available affinity ranks and the configured ceiling.
+Once a replica is admitted, capacity calculations assign eligible read sessions to replicas and reserve the writer for writes and fallback.
+Wider routing opens replicas on demand for new connections and for sessions that reconnect.
+Narrowing uses half the widening thresholds for three complete observations of the same width and writer epoch.
+A missing sample in the writer’s pool resets that quiet sequence.
+Widening can proceed on observed pressure when the next affinity rank has reported.
+Upgrade the serving nodes and gateways before enabling the controller policy.
+
+
 ### Stage 11: the controller
 
 **Why.**
@@ -826,14 +910,37 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 
 **Changes.**
 
-1. Crate `controller`: suspicion confirmation from corroborated gateway reports; admission of prewarmed members; drain (`DrainMember`); rebalancing on `LoadVector` watermarks (`Rebalance`); the drainer for orphaned tails (`DrainOrphanedTails`); quarantine (`CountActivationCrash`); engine rollouts (`RollEngine`).
+1. Crate `controller` covers serving endpoint health, admission of prewarmed members, drain, load-watermark rebalancing, orphaned tails, quarantine and engine rollouts.
    The controller probes at most 16 live node endpoints concurrently.
-   An unanswered probe contributes to confirmation only while the membership record still names the endpoint that was probed.
-   The running controller uses periodic probes and does not consume gateway reports.
+   Each round checks the control response and the Pgwire listener's response to a private serving probe.
+   The serving probe needs no authenticated Pgwire session slot.
+   A listener whose control response predates the serving probe is checked for TCP reachability.
+   Consecutive failures count only for one unchanged address pair.
+   A ready round resets the count, and a member with either address changed cannot be confirmed dead by the old observation.
+   A capable listener answers a private serving preface before the gateway sends a Pgwire startup message.
+   The gateway can retry a missed preface or a failed control connection before the startup deadline.
+   A placed node prepares up to eight independent database opens at a time.
+   The catalog owner publishes ready databases and preserves request order for each name.
+   The controller clears failure evidence when it observes startup inspection overflow during a probe.
+   A gateway with a failed direct route can reach the same writer through a signed control-plane relay to that writer's local Pgwire listener.
+   The relay runs the ordinary Pgwire authentication and is available when the node's authentication rules are independent of the peer address.
+   A gateway's direct-path failure alone leaves placement unchanged.
+   When the writer's serving endpoint fails from the controller's perspective, progress requires an eligible successor that reaches storage and a write quorum.
    A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
    It runs the handoffs one at a time.
    The source's identity and epoch must still match at reservation.
    A rebalancer ends its current pass when another operation has reserved the deployment or changed the source holding.
+   The optional `--rebalance-write-bytes-per-second`, `--rebalance-query-cpu-ms-per-second`, `--rebalance-tail-bytes` and `--rebalance-cache-bytes` are per-node watermarks.
+   The controller samples up to 16 eligible endpoints concurrently and chooses moves from the strongest configured pressure.
+   The live tail sample counts the current block's retained event batches and their headers.
+   The cache sample counts bytes charged to the deployment's in-memory pool, including decoded views and outstanding read leases.
+   The write rate uses encoded source bytes accepted by the holder between two observations of the same epoch.
+   The query CPU rate records thread CPU spent opening native queries and producing result batches on the holder.
+   Linux and macOS nodes start measuring that counter on the first controller probe that requests it for a holding.
+   With a rate watermark configured, a node with an unsampled holding waits for another observation before participating in moves.
+   The next eligible member in the deployment's affinity order must fit the sampled load under every configured limit.
+   Moves through the configured watermarks are limited to eight per pass by default.
+   Use `--rebalance MOVES` to override that limit.
    A recently used deployment keeps serving on a draining node while its pool has no eligible successor.
 2. Planned handoff (`IntendMove`, `HandOff`): subscription warm-up, hot-range prefetch from the source, admission pause, `Handoff` record, claim by move intent.
    The gateway, claim rule, and rebalancer use the same eligibility check for the general and isolation pools.
@@ -844,6 +951,7 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    Before releasing the placement, the source pauses transaction admission and waits for all admitted writes to apply.
    When the drained source has at most 64 live rows and 16 replica records since its last adopted boundary, it can park without uploading a block.
    The successor seals the quorum and recovers the durable tail before it confirms leadership.
+   It checks the newest eight replica records for the source position before scanning older history.
    A node reuses encrypted disk-cache data for the same physical deployment across writer epochs, subscribers and snapshots.
    A new storage generation has a different cache identity.
    Once a write quorum acknowledges the recovered commit position, the successor can leave a delayed replica to background repair.
@@ -962,6 +1070,14 @@ The completed prefetch trials measured 169.7–686.4 ms during scale-out and 97.
 The 48-move gap p99 ranged from 100.3 to 2,358.4 ms on the baseline and from 129.2 to 3,032.8 ms with the prefetch.
 The branch keeps the existing handoff path while the prefetch strategy is evaluated.
 
+A second comparison ran three paired release trials with the same 32,768-update Zipf workload and 48 continuous handoffs per build.
+In this experiment, opening the checkpoint and quorum log overlapped after authorizing the storage region.
+All six Zipf counters and all six handoff counters verified on a shared development host.
+Baseline scale-out p99 ranged from 105.8 to 255.9 ms and scale-in p99 ranged from 74.0 to 292.9 ms.
+With overlapping opens, those ranges were 148.4–2,304.7 ms and 111.8–3,734.8 ms.
+The 48-move gap p99 ranged from 122.3 to 182.2 ms on the baseline and from 133.8 to 212.5 ms with overlapping opens.
+Checkpoint and quorum-log opens remain sequential.
+
 ### Stage 12: encryption, lineages, forks and deletion
 
 **Why.**
@@ -974,6 +1090,9 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
 3. Fork: a new record in the lineage with a fork checkpoint referencing the parent's objects plus one pack of the parent's tail to the fork basis; inherited reads capped at the fork basis; cross-organisation forks copied and re-encrypted.
    Fork reads retry their local copy if the reaper transfers an inherited object between the first local read and the read from its original owner.
    A reference-manifest read repeats the listing if a concurrent revision replaced the listed manifest.
+   Use `rtdb-multi fork --org ORG` to copy a checkpoint or historical fork into another organisation in the same cell.
+   The destination owns its key, lineage, checkpoint objects and replica tail.
+   The directory publishes the child after copying its selected checkpoint and tail and checking the source's epoch and storage generation.
 4. Deletion: fence by epoch bump, seal and drop the stream, wait `credential_ttl`, re-wrap shared objects to a surviving referrer, delete all versions, prove the prefix empty twice, destroy the key, sign the deletion record.
    The delete command durably drops the stream from every member of its current ensemble and any pending source ensemble before proceeding to object erasure.
    A missing replica leaves the deployment fenced in `deleting`.
@@ -1023,8 +1142,18 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    The full proof also requires a separately trusted, epoch-scoped storage credential issuer, provider KMS erasure and exclusion of concurrent administrative writers such as earlier reaper or lineage-transfer passes.
    A deployment moving between cells keeps ownership of its source tail until cutover.
 
+**Hosted key custody.**
+The hosted Multi binary can use a dedicated S3 key vault configured with `s3://BUCKET?region=REGION`.
+The bucket must have never enabled versioning, and vault objects use S3 server-side encryption.
+Creation uses conditional writes and verifies the installed value before returning.
+Withdrawal conditionally replaces the current key with a permanent tombstone and rechecks bucket versioning before acknowledging the withdrawal.
+The cell namespace and deletion signer are stored separately from per-deployment, stage and checkpoint keys.
+The directory records the selected storage and key namespaces before a residence opens.
+
 **Tests.**
-A fork costs constant time regardless of size; a deleted parent's children still read their inherited data; a deleted deployment's objects are unreadable from the moment its key is destroyed.
+A same-organisation fork copies no payload.
+A cross-organisation fork copies the selected checkpoint and tail with an independent key and remains readable after the source is erased.
+A deleted deployment's objects are unreadable from the moment its key is destroyed.
 
 **Done when** deletion produces a signed record and the scrubber finds nothing left under the prefix.
 
@@ -1142,6 +1271,43 @@ RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_TIMEOUT_SECONDS=240 RTDB_TEST_PGWI
   durable_pgwire_updates_under_zipf_activity -- --ignored --exact --nocapture
 ```
 
+**Three-availability-zone recovery and startup**
+
+The AWS qualification ran a release build on one C7g.4xlarge and two C7g.large instances in three us-east-1 availability zones.
+Each zone hosted a logkeeper with fsync enabled, and the directory used durable file-backed TCP service.
+The cells used AWS S3 for data and a separate AWS S3 key vault.
+The gateway and controller ran in separate zones.
+The release builds used the `s3-key-vault` feature and disabled link-time optimization.
+
+Each default-block run allocated 89 deployments, seeded 25, ran 2,048 acknowledged updates over 16 persistent sessions, and checked the final total.
+The recovery run explicitly checkpointed 24 installations and acknowledged another update on each immediately before it killed the writer.
+A burst admitted up to 24 clients at a time across 24 recovered installations and 64 previously unopened ones.
+Each recovered installation returned the checkpoint and acknowledged tail, then accepted another write.
+
+| Phase | Serial preparation `572d72d81f` | Parallel preparation `27590505d0` | Parallel preparation with gateway TCP_NODELAY |
+| --- | ---: | ---: | ---: |
+| Warm update p99 | 320 ms | 320 ms | 311 ms |
+| Gateway-only partition startup p99, 24 sessions | 1.14 s | 1.14 s | 1.04 s |
+| Recovered startup and verification query p99, 24 sessions | 8.53 s | 3.57 s | 2.90 s |
+| Cold startup and verification query p99, 64 sessions | 7.43 s | 1.30 s | 1.33 s |
+| End of the combined recovery and cold-start burst | 22.51 s | 5.37 s | 5.17 s |
+
+Per-client measurements start when the benchmark admits the request.
+Burst duration includes time waiting for admission.
+The parallel build also includes the upstream checkpoint table manifest change.
+The last column repeats that build with TCP_NODELAY on accepted gateway client sockets.
+The partition trials blocked the gateway's direct Pgwire port to the only writer and allowed the controller's path.
+All 24 clients in each trial reached that writer through its control relay.
+
+A second workload forced a checkpoint after 64 rows or six seconds.
+The serial build hit the startup deadline during the combined burst.
+On the parallel build all 88 startups completed and all 24 recovered deployments accepted another write.
+Recovery p99 was 9.91 s, cold-start p99 was 3.09 s, and the full burst took 10.69 s.
+Warm update p99 in that forced-flush run was 2.23 s.
+With TCP_NODELAY enabled, the forced-flush trial again completed all 88 startups and verified 24 post-recovery writes.
+That trial recorded 10.12 s recovery p99, 3.30 s cold-start p99, 11.56 s to finish the burst, and 2.30 s warm update p99.
+
+
 **DynamoDB parked item size**
 
 For an unheld deployment with three UUID logkeeper IDs, the prepared DynamoDB item uses the following estimated storage from attribute names and values.
@@ -1163,6 +1329,7 @@ Writes convert eligible rows as they are created or updated.
 Switching writers back to `dynamodb:PREFIX` stops new packed writes.
 Existing packed rows require a rewrite to JSON before downgrading any reader.
 Held deployments, operation journals and records with non-UUID logkeeper IDs continue to use JSON.
+Parked records with ordered-index fences also use JSON.
 DynamoDB Local verifies mixed layouts, the holder index, conditional updates and Streams delivery.
 Rebalancing and compaction placement query live members' holdings with bounded concurrency.
 The DynamoDB holder index omits unheld rows and verifies each hit by a strongly consistent read.
@@ -1234,7 +1401,8 @@ The next table compares how many handoffs a draining member could execute concur
 | 8 | 2,958–4,953 | 14.0–23.7 | 12.7–119.7 | 18.4–208.3 |
 | 2 | 4,570–4,827 | 13.8–14.8 | 12.8–24.2 | 11.1–19.5 |
 
-The draining node now runs two handoffs at a time and still takes up to eight per pass.
+That comparison configured the drain to run two handoffs at a time.
+The current drain runs one at a time and takes up to eight per pass.
 The optional latency limit fails a run when either scale transition reaches the specified p99.
 On the integrated build with journal backpressure, shared gateway heartbeats and idle flushing, two of three trials passed the 30 ms limit in both transitions.
 The third scale-in measured 36.4 ms p99, and every counter still matched.
@@ -1244,6 +1412,16 @@ RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_S
   cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
   durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
 ```
+
+**Guarded gateway keys**
+
+A release run moved all 1,000 deployments and then killed a holder responsible for 350 of them.
+The surviving cell preserved the exact counter in every deployment.
+Three release trials with 32 warm deployments, 16 workers and four connections per deployment each verified all 32,768 Zipf updates.
+Those trials ran alongside JVM verification jobs and measured 100.9–276.2 ms p99 during scale-out and 101.5–163.5 ms during scale-in.
+Three repeats after those verification jobs finished verified the same counter totals and measured 38.1–164.7 ms p99 during scale-out and 70.5–100.8 ms during scale-in.
+Other workloads remained active on the shared host.
+The 30 ms acceptance target remains open.
 
 ## 6. Existing specs affected
 

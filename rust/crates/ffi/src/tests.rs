@@ -315,12 +315,16 @@ fn ffi_batch_survives_statement_cursor_and_database_close() {
 #[test]
 fn adbc_unnamed_parameters_are_bound_by_ordinal_and_copied() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
+    let producer = MemoryBudget::new(16 * 1024 * 1024);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("", DataType::Int64, false), Field::new("", DataType::Int64, false)])), vec![Arc::new(Int64Array::from(vec![3])), Arc::new(Int64Array::from(vec![7]))]).unwrap();
-    let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
-    let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
-    let values = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
+    let original = batch.column(0).to_data().buffers()[0].as_ptr();
+    let (mut array, mut schema) = arrow::export_batch(OwnedBatch::new(batch, &producer).unwrap(), &producer).unwrap();
+    let values = unsafe { arrow::import_arguments(&mut array, &mut schema, &memory) }.unwrap();
     assert!(array.release.is_none()); assert!(schema.release.is_none());
-    assert_eq!(values.arguments.rows().next().unwrap(), &[rtdb_types::Value::I64(3), rtdb_types::Value::I64(7)]);
+    assert_eq!(producer.used_bytes(), 0);
+    let page = values.arguments.single_arrow_page().unwrap();
+    assert_ne!(page.batch().column(0).to_data().buffers()[0].as_ptr(), original);
+    assert_eq!(&*values.arguments.rows().next().unwrap().unwrap(), &[rtdb_types::Value::I64(3), rtdb_types::Value::I64(7)]);
     assert_eq!(values.names, vec!["", ""]);
     drop(values); assert_eq!(memory.used_bytes(), 0);
 }
@@ -337,7 +341,7 @@ fn adbc_unsigned_parameter_buffers_execute_as_signed_and_preserve_typed_nulls() 
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("", DataType::UInt64, true)])), vec![Arc::new(arrow_array::UInt64Array::from(vec![value]))]).unwrap();
         let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
         let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
-        let imported = unsafe { arrow::import_rows(&mut array, &mut schema, statement.session.region.memory()) }.unwrap();
+        let imported = unsafe { arrow::import_arguments(&mut array, &mut schema, statement.session.region.memory()) }.unwrap();
         assert_eq!(imported.arguments.types(), &[rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64).maybe()]);
         statement.bind(imported).unwrap();
         let cursor = statement.query(&token).unwrap();
@@ -359,7 +363,7 @@ fn adbc_unsigned_bulk_documents_admit_ids_before_submission() {
     let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("_id", DataType::UInt64, false), Field::new("v", DataType::UInt64, false)])), vec![Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX])), Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX]))]).unwrap();
     let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
     let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
-    statement.bind(unsafe { arrow::import_rows(&mut array, &mut schema, statement.session.region.memory()) }.unwrap()).unwrap();
+    statement.bind(unsafe { arrow::import_arguments(&mut array, &mut schema, statement.session.region.memory()) }.unwrap()).unwrap();
     assert_eq!(statement.update(&token).unwrap(), 1);
     statement.replace_source("SELECT _id,v FROM unsigned_docs", false).unwrap();
     let cursor = statement.query(&token).unwrap();
@@ -442,9 +446,9 @@ fn decimal_c_data_uses_signed_parameters_and_retains_detached_schema_children() 
             assert_eq!(schema.child(0).format(), expected);
             assert!(!schema.child(0).metadata().unwrap().contains_key(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY));
             assert!(!schema.child(0).metadata().unwrap().contains_key(rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY));
-            let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
+            let imported = unsafe { arrow::import_arguments(&mut array, &mut schema, &memory) }.unwrap();
             assert_eq!(imported.arguments.types(), &[ty.clone()]);
-            assert_eq!(imported.arguments.rows().next().unwrap(), &[value]);
+            assert_eq!(&*imported.arguments.rows().next().unwrap().unwrap(), &[value]);
             drop(imported); assert_eq!(memory.used_bytes(), 0);
             let schema = arrow::export_schema(&Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]), &memory).unwrap();
             let mut child = unsafe { std::mem::replace(&mut **schema.children, FFI_ArrowSchema::empty()) };
@@ -463,7 +467,7 @@ fn foreign_decimal_scale_annotations_are_rejected_and_owned_inputs_released() {
     let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![field])));
     let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
     let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
-    assert!(unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.is_err());
+    assert!(unsafe { arrow::import_arguments(&mut array, &mut schema, &memory) }.is_err());
     assert!(array.release.is_none()); assert!(schema.release.is_none()); assert_eq!(memory.used_bytes(), 0);
     }
 }
@@ -477,11 +481,11 @@ fn nested_decimal_c_data_restores_each_union_child_scale() {
     let value = Value::list([i32::MIN, i32::MAX].into_iter().map(|scale| Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap())).collect());
     let page = RecordBatch::try_new(Arc::new(Schema::new(vec![rtdb_columnar::to_field("values", &ty).unwrap()])), vec![rtdb_columnar::build_array(&ty, &[Value::Null, value.clone()]).unwrap()]).unwrap();
     let (mut array, mut schema) = arrow::export_batch(OwnedBatch::new(page, &memory).unwrap(), &memory).unwrap();
-    let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
+    let imported = unsafe { arrow::import_arguments(&mut array, &mut schema, &memory) }.unwrap();
     assert_eq!(imported.arguments.types(), &[ty]);
     let mut rows = imported.arguments.rows();
-    assert_eq!(rows.next().unwrap(), &[Value::Null]);
-    assert_eq!(rows.next().unwrap(), &[value]);
+    assert_eq!(&*rows.next().unwrap().unwrap(), &[Value::Null]);
+    assert_eq!(&*rows.next().unwrap().unwrap(), &[value]);
     assert!(rows.next().is_none());
     drop(rows);
     drop(imported); assert_eq!(memory.used_bytes(), 0);

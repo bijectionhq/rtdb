@@ -8,13 +8,13 @@ use rtdb_types::{Anomaly, AnomalyCategory, PgType, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use crate::{CAPABILITY_PARAMETER, DELEGABLE_PARAMETER, GATEWAY_AWAIT_TOKEN_PARAMETER, GATEWAY_SETTINGS_PARAMETER, REQUIRED_INSTALLATION_PARAMETER, ServerConfig, VERIFIED_INSTALLATION_PARAMETER, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
+use crate::{CAPABILITY_PARAMETER, DELEGABLE_PARAMETER, GATEWAY_AWAIT_TOKEN_PARAMETER, GATEWAY_REPLICA_READ_PARAMETER, GATEWAY_SETTINGS_PARAMETER, REQUIRED_INSTALLATION_PARAMETER, ServerConfig, VERIFIED_INSTALLATION_PARAMETER, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
 type Stream = Box<dyn Socket>;
 
-pub(crate) struct Startup { pub parameters: BTreeMap<String, String>, pub gateway_session_state: bool, pub gateway_settings: bool, pub _reservation: Arc<MemoryReservation> }
+pub(crate) struct Startup { pub parameters: BTreeMap<String, String>, pub gateway_session_state: bool, pub gateway_settings: bool, pub replica_read: bool, pub _reservation: Arc<MemoryReservation> }
 pub(crate) struct ConnectionDriver { process: i32, stream: Stream, address: SocketAddr, encrypted: bool, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken }
 impl ConnectionDriver {
     pub fn new(
@@ -37,6 +37,7 @@ impl ConnectionDriver {
             Some(Ok(Ok(Some(session)))) => session,
         };
         let stream = stream.take().ok_or_else(|| protocol("Connection transport is absent after authentication"))?;
+        let _read_session = settings.replica_read.then(|| session.track_replica_read_session()).transpose()?;
         let registration = self.registry.register(self.process);
         if let Some(observer) = self.node.execution_observer() { observer.connection_event(rtdb_plan::ConnectionEvent::Opened); }
         let mut protocol = crate::protocol::ProtocolSession::new(session, self.node, self.config.clone(), settings, Arc::clone(&registration.slot));
@@ -79,7 +80,7 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
     loop {
         let stream = transport.as_mut().ok_or_else(|| protocol("Missing PostgreSQL transport"))?;
         let extra = if config.gateway_session_state {
-            GATEWAY_AWAIT_TOKEN_PARAMETER.len() + GATEWAY_SETTINGS_PARAMETER.len() + 2 * ("on".len() + 2)
+            GATEWAY_AWAIT_TOKEN_PARAMETER.len() + GATEWAY_SETTINGS_PARAMETER.len() + GATEWAY_REPLICA_READ_PARAMETER.len() + 3 * ("on".len() + 2)
         } else { 0 };
         let extra = extra + if config.capabilities.is_some() { REQUIRED_INSTALLATION_PARAMETER.len() + 36 + 2 } else { 0 };
         let frame = Reader::new(&mut **stream, Arc::clone(node.memory())).startup(extra).await?;
@@ -113,6 +114,8 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 let gateway_session_state = requested.remove(GATEWAY_AWAIT_TOKEN_PARAMETER).as_deref() == Some("on")
                     && config.gateway_session_state;
                 let gateway_settings = requested.remove(GATEWAY_SETTINGS_PARAMETER).as_deref() == Some("on")
+                    && gateway_session_state;
+                let replica_read = requested.remove(GATEWAY_REPLICA_READ_PARAMETER).as_deref() == Some("on")
                     && gateway_session_state;
                 let database = requested.get("database").map_or("xtdb", String::as_str);
                 if config.playground { node.database_or_attach(database.to_owned(), Default::default()).await?; }
@@ -163,14 +166,19 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 if delegable { writer.parameter(DELEGABLE_PARAMETER, "on").await?; }
                 if let Some(required) = &required_installation { writer.parameter(VERIFIED_INSTALLATION_PARAMETER, required).await?; }
                 writer.backend_key(process).await?;
-                if gateway_session_state { writer.gateway_await_token(None).await?; }
+                if gateway_session_state {
+                    writer.gateway_await_token(None).await?;
+                    writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_KEY_KIND]).await?;
+                    writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_KEY_CONFIRM_KIND]).await?;
+                    writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_REPLAY_PERMIT_KIND]).await?;
+                }
                 if gateway_settings {
                     writer.gateway_settings(&[]).await?;
                     writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_SQL_PREPARE_KIND]).await?;
                     writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_NAMED_PARSE_KIND]).await?;
                 }
                 writer.ready(b'I').await?;
-                return Ok(Some((session, Startup { parameters, gateway_session_state, gateway_settings, _reservation: reservation })));
+                return Ok(Some((session, Startup { parameters, gateway_session_state, gateway_settings, replica_read, _reservation: reservation })));
             }
             _ => return Err(protocol("Unknown protocol version")),
         }

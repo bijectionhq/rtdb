@@ -21,7 +21,7 @@ fn segments(data_dir: &Path) -> (usize, u64) {
 }
 
 fn config(server: &Server, stream: usize) -> StreamConfig {
-    StreamConfig { servers: vec![server.address.to_string()], stream: format!("deployment-{stream}/1/replica"), write_quorum: 1, maximum_message_bytes: 64 * 1024 }
+    StreamConfig { servers: vec![server.address.to_string().into()], stream: format!("deployment-{stream}/1/replica"), write_quorum: 1, maximum_message_bytes: 64 * 1024 }
 }
 
 async fn payloads(log: &dyn Log, from: i64) -> Vec<String> {

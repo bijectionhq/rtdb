@@ -85,7 +85,7 @@ fn walk(value: &Yaml, shape: Shape, path: &str, report: &mut QualificationReport
                     "memoryCache" => Shape::Fields(&["maxSizeBytes", "maxSizeRatio"]),
                     "diskCache" => Shape::Fields(&["path", "maxSizeBytes", "maxSizeRatio"]),
                     "compactor" => Shape::Fields(&["threads", "reeIids", "withinFileRecencyBranching"]),
-                    "garbageCollector" => Shape::Fields(&["enabled", "blocksToKeep", "garbageLifetime"]),
+                    "garbageCollector" => Shape::Fields(&["enabled", "blocksToKeep", "garbageLifetime", "readerLease", "readerLeaseMargin"]),
                     "search" => Shape::Fields(&["enabled", "threads"]),
                     "tracer" => Shape::Fields(&["enabled", "endpoint", "serviceName", "queryTracing", "transactionTracing"]),
                     "users" => Shape::Users,

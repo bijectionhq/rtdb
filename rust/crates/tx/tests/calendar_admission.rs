@@ -12,7 +12,7 @@ fn transaction_object_owners_admit_wide_dates_before_durable_copying() {
     let documents = Documents::new(vec![StructFields::from([("d".into(),value.clone())])],&memory).unwrap();
     assert_eq!(documents.rows()[0]["d"],expected);
     let arguments = SqlArguments::from_rows(vec![vec![Value::list(vec![value.clone()])]],&memory).unwrap();
-    assert_eq!(arguments.rows().next().unwrap(),[Value::list(vec![expected.clone()])]);
+    assert_eq!(&*arguments.rows().next().unwrap().unwrap(),[Value::list(vec![expected.clone()])]);
     let metadata = UserMetadata::new(Value::Struct(StructFields::from([("d".into(),value)])),&memory).unwrap();
     assert_eq!(metadata.value(),&Value::Struct(StructFields::from([("d".into(),expected)])));
     drop(documents);drop(arguments);drop(metadata);

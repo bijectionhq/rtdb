@@ -1,18 +1,21 @@
 use std::fs::File;
-use std::borrow::Cow;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, RecordBatch, UnionArray};
-use arrow_schema::{DataType, Field, Schema};
-use rtdb_columnar::MemoryBudget;
-use rtdb_types::{ListValue, ListView, Result, StructFields, Value};
-use serde::{Deserialize, Serialize};
+use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_buffer::Buffer;
+use arrow_ipc::{reader::{StreamReader, read_record_batch}, writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter}};
+use arrow_schema::{Schema, SchemaRef};
+use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_types::{Result, Value};
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
-use crate::{cursor::OwnedRow, invalid};
-
-const ARROW_ROW: u64 = 1 << 63;
+use crate::{
+    columnar::ColumnBatch,
+    cursor::OwnedRow,
+    fragment::{FragmentBytes, decode_batches, encode_batch},
+    invalid,
+};
 
 /// A query's spill files, in a directory created by the first of them: most queries never spill.
 pub(crate) struct SpillRegion { directory: std::sync::OnceLock<TempDir>, limit: u64, retained: AtomicU64, peak: AtomicU64 }
@@ -51,26 +54,111 @@ impl SpillFile {
 pub(crate) struct SpillWriter { file: BufWriter<File>, position: u64, retained: Arc<SpillFile> }
 impl SpillWriter {
     pub fn position(&mut self) -> Result<u64> { Ok(self.position) }
-    pub fn reader(&mut self, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
-        self.file.flush().map_err(io_error)?;
-        self.retained.reader(memory)
-    }
     pub fn write(&mut self, values: &[Value], memory: &Arc<MemoryBudget>) -> Result<()> {
-        let retained = values.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(|| invalid("row-size", "Spill row size overflow")))?;
-        let _temporary = memory.reserve(retained.checked_mul(8).ok_or_else(|| invalid("row-size", "Encoded spill row size overflow"))?)?;
-        let (encoding, bytes) = if values.iter().any(has_vector) {
-            (ARROW_ROW, encode_arrow_row(values)?)
-        } else { (0, serde_json::to_vec(values).map_err(io_error)?) };
-        let length = u64::try_from(bytes.len()).map_err(io_error)?;
-        if length >= ARROW_ROW { return Err(invalid("row-size", "Spill row size overflow")); }
-        let count = length + 8;
+        let overflow = || invalid("row-size", "Spill row size overflow");
+        let metadata = values.len().checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+        let mut builder = BatchBuilder::new(metadata, memory)?;
+        let mut fields = Vec::with_capacity(values.len());
+        let mut arrays = Vec::with_capacity(values.len());
+        for (position, value) in values.iter().enumerate() {
+            let logical = value.logical_type();
+            let field = rtdb_columnar::to_field(&position.to_string(), &logical)?;
+            let value = std::slice::from_ref(value);
+            let bound = rtdb_columnar::estimate_builder_bytes(&logical, value)?;
+            arrays.push(builder.column(bound, || rtdb_columnar::copy_array(&logical, value))?);
+            fields.push(field);
+        }
+        let options = RecordBatchOptions::new().with_row_count(Some(1));
+        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options).map_err(ipc_error)?;
+        let batch = builder.finish(batch)?;
+        let schema_bytes = batch.batch().schema_ref().fields().iter().try_fold(0usize, |bytes, field| {
+            bytes.checked_add(field.size()).ok_or_else(overflow)
+        })?;
+        self.write_arrow(&batch, schema_bytes, memory, "spill-row")
+    }
+
+    pub fn write_frame(&mut self, bytes: &[u8]) -> Result<()> {
+        self.write_frame_parts(&[bytes])
+    }
+
+    fn write_frame_parts(&mut self, parts: &[&[u8]]) -> Result<()> {
+        let overflow = || invalid("row-size", "Spill row size overflow");
+        let length = parts.iter().try_fold(0u64, |bytes, part| bytes.checked_add(part.len() as u64).ok_or_else(overflow))?;
+        let count = length.checked_add(8).ok_or_else(overflow)?;
         self.retained.region.reserve(count)?;
         self.retained.bytes.fetch_add(count, Ordering::Relaxed);
-        self.file.write_all(&(length | encoding).to_le_bytes()).map_err(io_error)?;
-        self.file.write_all(&bytes).map_err(io_error)?;
+        self.file.write_all(&length.to_le_bytes()).map_err(io_error)?;
+        for part in parts { self.file.write_all(part).map_err(io_error)?; }
         self.position += count;
         Ok(())
     }
+
+    /// Writes a batch whose fixed schema the caller retains through spill and replay.
+    pub fn write_record(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<()> {
+        let overflow = || invalid("join-spill", "Arrow spill encoding exceeds addressable memory");
+        let bytes = batch.schema_ref().fields().iter().try_fold(8192usize, |bytes, field| {
+            field.size().checked_mul(8).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        })?;
+        let bound = rtdb_columnar::shared_allocation_size(batch)?.checked_mul(6)
+            .and_then(|body| body.checked_add(bytes)).ok_or_else(overflow)?;
+        let _scratch = memory.reserve(bound)?;
+        let (dictionaries, data) = IpcDataGenerator::default().encode(
+            batch, &mut DictionaryTracker::new(false), &IpcWriteOptions::default(), &mut CompressionContext::default(),
+        ).map_err(ipc_error)?;
+        if !dictionaries.is_empty() { return Err(invalid("join-spill", "Spilled records require a dictionary-free schema")); }
+        let header = (data.ipc_message.len() as u64).to_le_bytes();
+        self.write_frame_parts(&[&header, &data.ipc_message, &data.arrow_data])
+    }
+
+    pub fn write_arrow(&mut self, batch: &OwnedBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {
+        let batch = batch.batch();
+        let bound = batch.get_array_memory_size().checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(schema_bytes.checked_mul(8)?))
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(|| invalid(error, "Arrow spill allocation bound overflow"))?;
+        let _scratch = memory.reserve(bound)?;
+        let ipc_error = |cause: arrow_schema::ArrowError| invalid(error, cause);
+        let mut ipc = StreamWriter::try_new(Vec::new(), batch.schema().as_ref()).map_err(ipc_error)?;
+        ipc.write(batch).map_err(ipc_error)?;
+        self.write_frame(&ipc.into_inner().map_err(ipc_error)?)
+    }
+
+    pub fn write_columns(&mut self, batch: &ColumnBatch, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if batch.len == 0 { return self.write_frame(&[0]); }
+        match batch.spill_record(schema, memory) {
+            Ok(Some(record)) => {
+                let start = self.position()?;
+                let schema_bytes = crate::runtime_schema::schema_bound(schema)?;
+                let written = self.write_frame(&[1])
+                    .and_then(|()| self.write_arrow(&record, schema_bytes, memory, "spill-columns"));
+                match written {
+                    Ok(()) => return Ok(()),
+                    Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => self.discard_from(start)?,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(None) => (),
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+            Err(error) => return Err(error),
+        }
+        let mut fragments = FragmentBytes::new(memory)?;
+        encode_batch(batch, memory, &mut fragments)?;
+        self.write_frame(&[2])?;
+        self.write_frame(fragments.as_slice())
+    }
+
+    /// Drops unpublished frames written after the supplied frame boundary.
+    pub fn discard_from(&mut self, offset: u64) -> Result<()> {
+        let bytes = self.position.checked_sub(offset).ok_or_else(|| invalid("invalid-spill", "Spill rollback exceeds its file"))?;
+        self.file.flush().map_err(io_error)?;
+        self.file.get_ref().set_len(offset).map_err(io_error)?;
+        self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        self.position = offset;
+        self.retained.bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.retained.region.retained.fetch_sub(bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
         self.file.flush().map_err(io_error)?;
         Ok(self.retained)
@@ -86,171 +174,184 @@ impl SpillReader {
     }
     pub fn rewind(&mut self) -> Result<()> { self.file.seek(SeekFrom::Start(0)).map_err(io_error)?; Ok(()) }
     pub fn next(&mut self) -> Result<Option<OwnedRow>> {
+        let Some(batch) = self.read_arrow(false, "spill-row")? else { return Ok(None); };
+        let batch = batch.batch();
+        if batch.num_rows() != 1 { return Err(invalid("invalid-spill", "Spill record must contain one row")); }
+        let columns = batch.schema_ref().fields().iter().zip(batch.columns());
+        let bound = columns.clone().try_fold(4096usize, |bytes, (field, array)| {
+            let cell = if field.data_type() == &arrow_schema::DataType::Null && !field.is_nullable() {
+                std::mem::size_of::<Value>()
+            } else {
+                rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0)?
+            };
+            bytes.checked_add(cell).ok_or_else(|| invalid("row-size", "Decoded spill row size overflow"))
+        })?;
+        let reservation = self.memory.reserve(bound)?;
+        let values = columns.map(|(field, array)| {
+            if field.data_type() == &arrow_schema::DataType::Null && !field.is_nullable() { Ok(Value::Undefined) }
+            else { rtdb_columnar::read_value(field, array.as_ref(), 0) }
+        }).collect::<Result<Vec<_>>>()?;
+        OwnedRow::with_reservation(values, reservation).map(Some)
+    }
+
+    pub fn read_frame(&mut self, expansion: usize) -> Result<Option<(Vec<u8>, Arc<MemoryReservation>)>> {
         let mut prefix = [0u8; 8];
         match self.file.read(&mut prefix[..1]).map_err(io_error)? { 0 => return Ok(None), _ => {} }
         self.file.read_exact(&mut prefix[1..]).map_err(io_error)?;
-        let header = u64::from_le_bytes(prefix);
-        let length = usize::try_from(header & !ARROW_ROW).map_err(io_error)?;
+        let length = usize::try_from(u64::from_le_bytes(prefix)).map_err(io_error)?;
         if length as u64 > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill", "Spill row exceeds its file")); }
-        let bound = length.checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("row-size", "Decoded spill size overflow"))?;
+        let bound = length.checked_mul(expansion).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("row-size", "Decoded spill size overflow"))?;
         let reservation = self.memory.reserve(bound)?;
         let mut bytes = vec![0; length];
         self.file.read_exact(&mut bytes).map_err(io_error)?;
-        let values = if header & ARROW_ROW != 0 { decode_arrow_row(&bytes)? }
-            else { serde_json::from_slice::<Vec<Value>>(&bytes).map_err(io_error)? };
-        drop(bytes);
-        let row = OwnedRow::new(values, &self.memory)?;
-        drop(reservation);
-        Ok(Some(row))
+        Ok(Some((bytes, reservation)))
     }
-}
 
-fn has_vector(value: &Value) -> bool {
-    match value {
-        Value::List(list) | Value::FixedSizeList(list) => match list.view() {
-            ListView::Values(values) => values.iter().any(has_vector),
-            typed => !typed.is_empty(),
-        },
-        Value::Set(values) => values.iter().any(has_vector),
-        Value::Struct(fields) => fields.values().any(has_vector),
-        Value::Map { entries, .. } => entries.iter().any(|(key, value)| has_vector(key) || has_vector(value)),
-        _ => false,
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-enum SpillCell<'a> {
-    Scalar(Cow<'a, Value>),
-    Vector { index: usize, fixed: bool },
-    List(Vec<SpillCell<'a>>),
-    Fixed(Vec<SpillCell<'a>>),
-    Set(Vec<SpillCell<'a>>),
-    Struct(StructFields<SpillCell<'a>>),
-    Map { entries: Vec<(SpillCell<'a>, SpillCell<'a>)>, sorted: bool },
-}
-
-impl<'a> SpillCell<'a> {
-    fn extract(value: &'a Value, arrays: &mut Vec<ArrayRef>) -> Result<Self> {
-        fn sequence<'a>(values: &'a [Value], arrays: &mut Vec<ArrayRef>) -> Result<Vec<SpillCell<'a>>> {
-            values.iter().map(|value| SpillCell::extract(value, arrays)).collect()
+    pub fn read_arrow(&mut self, allow_empty: bool, error: &str) -> Result<Option<OwnedBatch>> {
+        let Some((bytes, mut reservation)) = self.read_frame(6)? else { return Ok(None); };
+        let ipc_error = |cause: arrow_schema::ArrowError| invalid(error, cause);
+        let mut ipc = StreamReader::try_new(Cursor::new(bytes), None).map_err(ipc_error)?;
+        let batch = ipc.next().ok_or_else(|| invalid("invalid-spill", "Arrow spill frame contains no batch"))?.map_err(ipc_error)?;
+        if (!allow_empty && batch.num_rows() == 0) || ipc.next().transpose().map_err(ipc_error)?.is_some() {
+            return Err(invalid("invalid-spill", "Arrow spill frame must contain exactly one admissible batch"));
         }
-        Ok(match value {
-            Value::List(list) | Value::FixedSizeList(list) => {
-                let fixed = matches!(value, Value::FixedSizeList(_));
-                let list_cell = |values| if fixed { Self::Fixed(values) } else { Self::List(values) };
-                let components: ArrayRef = match list.view() {
-                    ListView::Values(values) => return Ok(list_cell(sequence(values, arrays)?)),
-                    view if view.is_empty() => return Ok(list_cell(Vec::new())),
-                    ListView::F32(array) => Arc::new(array.clone()),
-                    ListView::F64(array) => Arc::new(array.clone()),
-                    ListView::Union(array) => Arc::new(array.clone()),
-                };
-                let index = arrays.len();
-                let width = i32::try_from(components.len()).map_err(io_error)?;
-                let item = Arc::new(Field::new("item", components.data_type().clone(), components.null_count() != 0));
-                arrays.push(Arc::new(FixedSizeListArray::try_new(item, width, components, None).map_err(io_error)?));
-                Self::Vector { index, fixed }
+        drop(ipc);
+        let overflow = || invalid(error, "Arrow spill size overflow");
+        let schema = batch.schema_ref().fields().iter().try_fold(256usize, |bytes, field| {
+            field.size().checked_mul(4).and_then(|size| bytes.checked_add(size))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<crate::columnar::Column>())).ok_or_else(overflow)
+        })?;
+        let bytes = batch.get_array_memory_size().checked_add(schema).ok_or_else(overflow)?;
+        let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
+        if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
+        OwnedBatch::with_reservation(batch, reservation).map(Some)
+    }
+
+    pub fn read_columns(&mut self, width: usize) -> Result<Option<ColumnBatch>> {
+        let Some((marker, _charge)) = self.read_frame(1)? else { return Ok(None); };
+        self.read_columns_frame(&marker, width)
+    }
+
+    pub fn read_columns_frame(&mut self, marker: &[u8], width: usize) -> Result<Option<ColumnBatch>> {
+        match marker {
+            [0] => ColumnBatch::empty_with_width(width, &self.memory).map(Some),
+            [1] => {
+                let batch = self.read_arrow(false, "spill-columns")?
+                    .ok_or_else(|| invalid("invalid-spill", "Spilled Arrow page is absent"))?;
+                ColumnBatch::from_owned(batch).map(Some)
             }
-            Value::Set(values) => Self::Set(sequence(values, arrays)?),
-            Value::Struct(fields) => Self::Struct(fields.iter().map(|(name, value)| {
-                Ok((name.clone(), Self::extract(value, arrays)?))
-            }).collect::<Result<_>>()?),
-            Value::Map { entries, sorted } => Self::Map {
-                entries: entries.iter().map(|(key, value)| Ok((Self::extract(key, arrays)?, Self::extract(value, arrays)?))).collect::<Result<_>>()?,
-                sorted: *sorted,
-            },
-            _ => Self::Scalar(Cow::Borrowed(value)),
-        })
-    }
-
-    fn restore(self, vectors: &[ArrayRef]) -> Result<Value> {
-        Ok(match self {
-            Self::Scalar(value) => value.into_owned(),
-            Self::Vector { index, fixed } => {
-                let list = vectors.get(index).and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
-                    .filter(|array| array.len() == 1 && array.is_valid(0))
-                    .ok_or_else(|| invalid("invalid-spill", "Invalid spilled embedding column"))?;
-                let values = list.values();
-                let vector = match values.data_type() {
-                    DataType::Float32 => values.as_any().downcast_ref::<Float32Array>().cloned().map(ListValue::from_f32),
-                    DataType::Float64 => values.as_any().downcast_ref::<Float64Array>().cloned().map(ListValue::from_f64),
-                    DataType::Union(..) => values.as_any().downcast_ref::<UnionArray>().cloned().and_then(ListValue::from_float_union),
-                    _ => None,
-                }.ok_or_else(|| invalid("invalid-spill", "Invalid spilled embedding type"))?;
-                if fixed { Value::FixedSizeList(vector) } else { Value::List(vector) }
+            [2] => {
+                let (bytes, _charge) = self.read_frame(1)?
+                    .ok_or_else(|| invalid("invalid-spill", "Spilled Arrow fragments are absent"))?;
+                let mut batches = decode_batches(&bytes, &self.memory)?;
+                if batches.len() == 1 { return Ok(batches.pop()); }
+                if batches.is_empty() { return Err(invalid("invalid-spill", "Spilled page has no Arrow fragments")); }
+                let rows = batches.iter().try_fold(0usize, |count, batch| {
+                    count.checked_add(batch.len).ok_or_else(|| invalid("invalid-spill", "Spilled page row count overflow"))
+                })?;
+                let bound = rows.checked_mul(std::mem::size_of::<(usize, usize)>())
+                    .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("invalid-spill", "Spilled page selection overflow"))?;
+                let _picks = self.memory.reserve(bound)?;
+                let picks = batches.iter().enumerate().flat_map(|(index, batch)| (0..batch.len).map(move |row| (index, row))).collect::<Vec<_>>();
+                let columns = (0..width).collect::<Vec<_>>();
+                ColumnBatch::take_rows(&batches, &picks, &columns, &self.memory).map(Some)
             }
-            Self::List(values) => Value::list(Self::restore_list(values, vectors)?),
-            Self::Fixed(values) => Value::FixedSizeList(Self::restore_list(values, vectors)?.into()),
-            Self::Set(values) => Value::Set(Self::restore_list(values, vectors)?),
-            Self::Struct(fields) => Value::Struct(fields.into_iter().map(|(name, value)| Ok((name, value.restore(vectors)?))).collect::<Result<_>>()?),
-            Self::Map { entries, sorted } => Value::Map {
-                entries: entries.into_iter().map(|(key, value)| Ok((key.restore(vectors)?, value.restore(vectors)?))).collect::<Result<_>>()?,
-                sorted,
-            },
-        })
+            _ => Err(invalid("invalid-spill", "Invalid spill page header")),
+        }
     }
 
-    fn restore_list(values: Vec<Self>, vectors: &[ArrayRef]) -> Result<Vec<Value>> {
-        values.into_iter().map(|value| value.restore(vectors)).collect()
+    pub fn read_record(&mut self, schema: &SchemaRef, retained_metadata: usize) -> Result<Option<OwnedBatch>> {
+        let Some((frame, mut reservation)) = self.read_frame(8)? else { return Ok(None); };
+        let bytes = Buffer::from_vec(frame);
+        let type_error = || invalid("join-spill", "Malformed Arrow record frame");
+        let size = bytes.get(..8).and_then(|prefix| prefix.try_into().ok())
+            .map(u64::from_le_bytes).and_then(|size| usize::try_from(size).ok()).ok_or_else(type_error)?;
+        let offset = size.checked_add(8).filter(|size| *size <= bytes.len()).ok_or_else(type_error)?;
+        let message = arrow_ipc::root_as_message(&bytes[8..offset]).map_err(ipc_error)?;
+        let metadata = message.header_as_record_batch().ok_or_else(type_error)?;
+        let body = bytes.slice(offset);
+        if message.bodyLength() as u64 != body.len() as u64 { return Err(type_error()); }
+        if metadata.compression().is_some() {
+            return Err(type_error());
+        }
+        let buffers = metadata.buffers().ok_or_else(type_error)?;
+        for buffer in buffers {
+            let start = usize::try_from(buffer.offset()).map_err(|_| type_error())?;
+            let length = usize::try_from(buffer.length()).map_err(|_| type_error())?;
+            if start.checked_add(length).is_none_or(|end| end > body.len()) { return Err(type_error()); }
+        }
+        let batch = read_record_batch(&body, metadata, Arc::clone(schema), &Default::default(), None, &message.version()).map_err(ipc_error)?;
+        let retained = rtdb_columnar::shared_allocation_size(&batch)?.checked_add(512)
+            .and_then(|bytes| bytes.checked_add(retained_metadata))
+            .ok_or_else(|| invalid("join-spill", "Decoded spill size exceeds addressable memory"))?;
+        let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
+        if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
+        OwnedBatch::with_reservation(batch, reservation).map(Some)
     }
 }
 
-fn encode_arrow_row(values: &[Value]) -> Result<Vec<u8>> {
-    let mut vectors = Vec::new();
-    let cells = values.iter().map(|value| SpillCell::extract(value, &mut vectors)).collect::<Result<Vec<_>>>()?;
-    let row = serde_json::to_vec(&cells).map_err(io_error)?;
-    let mut columns: Vec<ArrayRef> = vec![Arc::new(BinaryArray::from_iter_values([row.as_slice()]))];
-    columns.extend(vectors);
-    let schema = Arc::new(Schema::new(columns.iter().enumerate().map(|(index, array)| {
-        Field::new(index.to_string(), array.data_type().clone(), false)
-    }).collect::<Vec<_>>()));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(io_error)?;
-    let mut bytes = Vec::new();
-    let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut bytes, &schema).map_err(io_error)?;
-    writer.write(&batch).map_err(io_error)?;
-    writer.finish().map_err(io_error)?;
-    drop(writer);
-    Ok(bytes)
-}
-
-fn decode_arrow_row(bytes: &[u8]) -> Result<Vec<Value>> {
-    let mut reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None).map_err(io_error)?;
-    let batch = reader.next().transpose().map_err(io_error)?
-        .filter(|batch| batch.num_rows() == 1 && batch.num_columns() > 0)
-        .ok_or_else(|| invalid("invalid-spill", "Missing Arrow spill row"))?;
-    let row = batch.column(0).as_any().downcast_ref::<BinaryArray>()
-        .filter(|values| values.is_valid(0)).ok_or_else(|| invalid("invalid-spill", "Missing Arrow spill descriptor"))?;
-    let cells = serde_json::from_slice::<Vec<SpillCell<'_>>>(row.value(0)).map_err(io_error)?;
-    SpillCell::restore_list(cells, &batch.columns()[1..])
-}
+fn ipc_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { invalid("join-spill", error) }
 
 fn io_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { rtdb_types::Anomaly::fault("rtdb.query/spill-io", error.to_string()) }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn arrow_records_share_one_schema_across_spill_offsets() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
 
-    #[test]
-    fn arrow_embedding_survives_spill_and_random_access() {
-        let memory = MemoryBudget::new(16 << 20);
-        let region = Arc::new(SpillRegion::new(16 << 20).unwrap());
-        let mut writer = region.create().unwrap();
-        writer.write(&[Value::I64(5)], &memory).unwrap();
-        let position = writer.position().unwrap();
-        let components = Float64Array::from(vec![Some(-0.0), None, Some(f64::from_bits(0x7ff8000000000003))]);
-        let document = Value::Struct(StructFields::from([("embedding".into(), Value::FixedSizeList(ListValue::from_f64(components)))]));
-        writer.write(&[Value::Utf8("doc".into()), document], &memory).unwrap();
-        let file = writer.finish().unwrap();
-        let mut reader = file.reader(memory).unwrap();
-        reader.seek(position).unwrap();
-        let row = reader.next().unwrap().unwrap();
-        let vector = row.values[1].field("embedding").unwrap();
-        let Some(ListView::F64(array)) = vector.list_view() else { panic!("expected Arrow components"); };
-        assert_eq!(array.value(0).to_bits(), (-0.0_f64).to_bits());
-        assert!(array.is_null(1));
-        assert_eq!(array.value(2).to_bits(), 0x7ff8000000000003);
-        assert!(reader.next().unwrap().is_none());
-        reader.rewind().unwrap();
-        assert_eq!(reader.next().unwrap().unwrap().values, [Value::I64(5)]);
+    let memory = MemoryBudget::new(1 << 20);
+    let spill = Arc::new(SpillRegion::new(1536).unwrap());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+    let batch = |key, value| RecordBatch::try_new(Arc::clone(&schema), vec![
+        Arc::new(Int64Array::from(vec![key])), Arc::new(StringArray::from(vec![value])),
+    ]).unwrap();
+    let first = batch(1, Some("first"));
+    let second = batch(2, None);
+    let mut writer = spill.create().unwrap();
+    writer.write_record(&first, &memory).unwrap();
+    let offset = writer.position().unwrap();
+    writer.write_record(&second, &memory).unwrap();
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    reader.seek(offset).unwrap();
+    assert_eq!(reader.read_record(&schema, 0).unwrap().unwrap().batch(), &second);
+    assert!(reader.read_record(&schema, 0).unwrap().is_none());
+    reader.rewind().unwrap();
+    assert_eq!(reader.read_record(&schema, 0).unwrap().unwrap().batch(), &first);
+    drop(reader);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(spill.retained_bytes(), 0);
+}
+
+
+#[test]
+fn spill_replays_mixed_struct_fields_as_arrow_positions() {
+    use crate::columnar::{Column, ColumnBatch, pack_evaluated_column};
+    use rtdb_plan::{Binder, Schema};
+    use rtdb_types::StructFields;
+
+    let memory = MemoryBudget::new(1 << 23);
+    let spill = Arc::new(SpillRegion::new(1 << 20).unwrap());
+    let values = [
+        Value::Struct(StructFields::from([("a".into(), Value::I64(3))])),
+        Value::Struct(StructFields::from([("b".into(), Value::Utf8("text".into()))])),
+        Value::Struct(StructFields::from([("a".into(), Value::I64(5))])),
+    ];
+    let ty = values.iter().map(Value::logical_type).reduce(|left, right| left.join(&right)).unwrap();
+    let schema = Schema::new(vec![Binder::default().field("doc", None, ty).unwrap()]).unwrap();
+    let (column, charge) = pack_evaluated_column(&values, &memory).unwrap();
+    let mut batch = ColumnBatch::settled(vec![], values.len(), memory.reserve(256).unwrap()).unwrap();
+    batch.append_column(column, charge, &memory).unwrap();
+
+    let mut writer = spill.create().unwrap();
+    writer.write_columns(&batch, &schema, &memory).unwrap();
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let replayed = reader.read_columns(1).unwrap().unwrap();
+    assert!(matches!(replayed.columns[0], Column::Selected(_)));
+    for (row, expected) in values.into_iter().enumerate() {
+        assert_eq!(replayed.columns[0].value(row).unwrap(), expected);
     }
+    assert!(reader.read_columns(1).unwrap().is_none());
 }

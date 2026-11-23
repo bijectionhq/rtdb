@@ -5,11 +5,27 @@ use rtdb_auth::{Authenticator, NativeHttp};
 use rtdb_columnar::MemoryBudget;
 use rtdb_metrics::Registry;
 use rtdb_node::{Node, NodeDriver, NodeServices, SystemClock, TransactionClock};
+use rtdb_tx::TransactionAuthorization;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{config::NodeConfiguration, health::{HealthConfig, HealthDriver, HealthHandle}};
+
+struct HostedTransactionAuthority {
+    auth: Arc<Authenticator>,
+    owner: String,
+}
+
+impl TransactionAuthorization for HostedTransactionAuthority {
+    fn check_role_membership(&self, database: &str, principal: Option<&str>) -> Result<()> {
+        self.auth.check_role_membership(database, principal)
+    }
+
+    fn is_hosted_control_owner(&self, principal: &str) -> bool {
+        principal == self.owner
+    }
+}
 
 /// What a node placed by an outside authority needs beyond its configuration.
 pub struct PlacedOptions {
@@ -28,10 +44,12 @@ pub struct PlacedOptions {
     /// Accepts capabilities minted by the cell's gateways in place of a password.
     pub capabilities: Option<Arc<dyn rtdb_pgwire::CapabilityVerifier>>,
     pub flight_peer: Option<Arc<dyn rtdb_flight_sql::FlightPeerVerifier>>,
+    pub flight_owned_worlds: Option<Arc<dyn rtdb_flight_sql::OwnedWorldHost>>,
+    pub world_constraints: Option<Arc<dyn rtdb_node::WorldConstraintArchive>>,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub health: Option<SocketAddr> }
+pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub audience_flight: Option<SocketAddr>, pub health: Option<SocketAddr> }
 
 #[derive(Clone)]
 pub struct ServerHandle {
@@ -39,6 +57,7 @@ pub struct ServerHandle {
     auth: Arc<Authenticator>,
     metrics: Arc<Registry>,
     addresses: ListenerAddresses,
+    primary_pgwire: Option<rtdb_pgwire::ServerHandle>,
     cancellation: CancellationToken,
 }
 impl ServerHandle {
@@ -46,6 +65,7 @@ impl ServerHandle {
     pub fn authenticator(&self) -> &Arc<Authenticator> { &self.auth }
     pub fn metrics(&self) -> &Arc<Registry> { &self.metrics }
     pub fn addresses(&self) -> &ListenerAddresses { &self.addresses }
+    pub fn primary_pgwire(&self) -> Option<&rtdb_pgwire::ServerHandle> { self.primary_pgwire.as_ref() }
     pub fn shutdown(&self) { self.cancellation.cancel(); }
 }
 
@@ -53,7 +73,7 @@ pub struct ServerDriver {
     handle: ServerHandle,
     node: NodeDriver,
     pgwire: Vec<(rtdb_pgwire::ServerHandle, rtdb_pgwire::ServerDriver)>,
-    flight: Option<(rtdb_flight_sql::ServerHandle, rtdb_flight_sql::ServerDriver)>,
+    flight: Vec<(rtdb_flight_sql::ServerHandle, rtdb_flight_sql::ServerDriver)>,
     health: Option<(HealthHandle, HealthDriver)>,
     registrations: Vec<rtdb_metrics::MetricRegistration>,
     tracing: Option<(crate::tracing::TraceExportHandle, crate::tracing::TraceExporter)>,
@@ -102,6 +122,7 @@ impl ServerDriver {
 
     async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>) -> Result<(ServerHandle, Self)> {
         let mut options = config.node_options(allocation_limit_bytes)?;
+        options.owned_relations = config.flight_sql.as_ref().is_some_and(|flight| flight.port >= 0 && flight.owned_native_actions);
         if let Some(placed) = &placed {
             options.membership = rtdb_node::Membership::Placed;
             options.replication.claim_wait = Some(placed.claim_wait);
@@ -119,6 +140,14 @@ impl ServerDriver {
         let tracer = tracing.as_ref().map(|(handle, _)| handle.recorder().clone() as Arc<dyn rtdb_plan::Tracer>);
         let http = Arc::new(NativeHttp::new(Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024)?);
         let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
+        let authority: Arc<dyn TransactionAuthorization> = match config.flight_sql.as_ref()
+            .filter(|flight| flight.port >= 0 && flight.owned_native_actions)
+            .and_then(|flight| flight.hosted_controls.as_ref())
+            .filter(|policy| policy.relations.contains("bj_installation"))
+        {
+            Some(policy) => Arc::new(HostedTransactionAuthority { auth: auth.clone(), owner: policy.owner.clone() }),
+            None => auth.clone(),
+        };
         let (resources, external_sources, mut registrations) = crate::resources::open(&config, &memory, &metrics)?;
         let mut resources = match transaction_clock {
             Some(clock) => resources.with_log_clock(clock),
@@ -129,13 +158,15 @@ impl ServerDriver {
         let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
         let flight_peer = placed.as_ref().and_then(|placed| placed.flight_peer.clone());
+        let flight_owned_worlds = placed.as_ref().and_then(|placed| placed.flight_owned_worlds.clone());
+        let world_constraints = placed.as_ref().and_then(|placed| placed.world_constraints.clone());
         let gateway_session_state = placed.is_some();
         if let Some(placed) = placed {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
         }
-        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, read_fence, scan_fragmenter,
-            ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
+        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter,
+            ..NodeServices::local_with_search_format(authority, metrics.clone(), auth.clone(), metrics.clone(), config.search.write_format) };
         if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
         let cancellation = CancellationToken::new();
@@ -158,18 +189,30 @@ impl ServerDriver {
                 pgwire.push((handle, driver));
             }
         }
-        let flight = match &config.flight_sql {
-            Some(settings) if settings.port >= 0 => {
-                let configuration = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
-                    transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
-                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
-                    forwarded_peer: flight_peer, ..Default::default() };
-                let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
-                addresses.flight_sql = Some(handle.address());
-                Some((handle, driver))
+        let mut flight = Vec::new();
+        if let Some(settings) = &config.flight_sql
+            && settings.port >= 0
+        {
+            let ordinary = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
+                transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
+                session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
+                forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions,
+                hosted_controls: settings.hosted_controls.clone(),
+                reserved_applied_source: settings.audience.map(|(_, audience)| audience.source()),
+                ..Default::default() };
+            if let Some((address, audience)) = settings.audience {
+                let reserved = rtdb_flight_sql::FlightConfig {
+                    address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None,
+                    ..ordinary.clone()
+                };
+                let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(reserved, node.clone(), auth.clone()).await?;
+                addresses.audience_flight = Some(handle.address());
+                flight.push((handle, driver));
             }
-            _ => None,
-        };
+            let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(ordinary, node.clone(), auth.clone()).await?;
+            addresses.flight_sql = Some(handle.address());
+            flight.push((handle, driver));
+        }
         let health = match &config.health {
             Some(settings) if settings.port >= 0 => {
                 let configuration = HealthConfig { address: address(&settings.host, settings.port).await?, ..Default::default() };
@@ -185,7 +228,9 @@ impl ServerDriver {
             Ok(listeners) => listeners,
             Err(error) => return match driver.close_without_run().await { Ok(()) => Err(error), Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())) },
         };
-        let handle = ServerHandle { node, auth, metrics, addresses, cancellation };
+        let primary_pgwire = pgwire.iter().find(|(listener, _)| Some(listener.address()) == addresses.pgwire)
+            .map(|(listener, _)| listener.clone());
+        let handle = ServerHandle { node, auth, metrics, addresses, primary_pgwire, cancellation };
         Ok((handle.clone(), Self { handle, node: driver, pgwire, flight, health, registrations, tracing, metric_export }))
     }
 
@@ -208,7 +253,8 @@ impl ServerDriver {
         let mut listeners = JoinSet::new();
         let mut pgwire = Vec::new();
         for (handle, driver) in self.pgwire { pgwire.push(handle); listeners.spawn(driver.run()); }
-        let flight = self.flight.map(|(handle, driver)| { listeners.spawn(driver.run()); handle });
+        let mut flight = Vec::new();
+        for (handle, driver) in self.flight { flight.push(handle); listeners.spawn(driver.run()); }
         let health = self.health.map(|(handle, driver)| { listeners.spawn(driver.run()); handle });
         enum Exit { Requested, Node(std::result::Result<Result<()>, JoinError>), Listener(Option<std::result::Result<Result<()>, JoinError>>) }
         let exit = tokio::select! {
@@ -224,7 +270,7 @@ impl ServerDriver {
             Exit::Listener(result) => result.and_then(|result| joined(result).err()).or_else(|| Some(unexpected("listener"))),
         };
         for listener in pgwire { listener.shutdown(); }
-        if let Some(listener) = flight { listener.shutdown(); }
+        for listener in flight { listener.shutdown(); }
         if let Some(listener) = health { listener.shutdown(); }
         while let Some(result) = listeners.join_next().await { remember(&mut failure, joined(result)); }
         self.handle.node.shutdown();

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::Result;
-use crate::{Decoder, Lsn, PgTransaction, Remote, SourceConfig, config::{identifier, replication_literal}, decoder::PG_EPOCH_MICROS, wire::{Connection, Input, protocol, server_error}};
+use crate::{ArrowPgTransaction, Decoder, Lsn, Remote, SourceConfig, config::{identifier, replication_literal}, decoder::PG_EPOCH_MICROS, wire::{Connection, Input, protocol, server_error}};
 
 pub(crate) struct ChangeStream { connection: Connection, decoder: Decoder, received: Lsn }
-pub(crate) struct StreamUpdate { pub received: Lsn, pub transaction: Option<PgTransaction>, pub reply_requested: bool }
+pub(crate) struct StreamUpdate { pub received: Lsn, pub transaction: Option<ArrowPgTransaction>, pub reply_requested: bool }
 impl ChangeStream {
     pub async fn open(remote: &Remote, config: &SourceConfig, start: Lsn, memory: Arc<MemoryBudget>) -> Result<Self> {
         let mut connection = Connection::open(remote, true, Arc::clone(&memory)).await?;
@@ -21,7 +21,10 @@ impl ChangeStream {
                     return match input.u8()? {
                         b'w' => {
                             let start = Lsn(input.u64()?); input.u64()?; input.i64()?; self.received = self.received.max(start);
-                            let transaction = self.decoder.receive(input.rest())?;
+                            let transaction = self.decoder.receive_arrow(input.rest())?;
+                            if let Some(transaction) = &transaction {
+                                self.received = self.received.max(transaction.lsn);
+                            }
                             Ok(StreamUpdate { received: self.received, transaction, reply_requested: false })
                         }
                         b'k' => { self.received = self.received.max(Lsn(input.u64()?)); input.i64()?; let reply_requested = input.u8()? != 0; input.end()?; Ok(StreamUpdate { received: self.received, transaction: None, reply_requested }) }

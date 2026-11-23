@@ -12,8 +12,8 @@
   (xt/q tu/*node* query {:snapshot-token (basis/->time-basis-str {"xtdb" [system-time]}), :default-tz #xt/zone "UTC"}))
 
 (t/deftest all-system-time
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]] {:system-time #inst "3000"})
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]] {:system-time #inst "3001"})
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx1"}]] {:system-time #inst "2000"})
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last-updated "tx2"}]] {:system-time #inst "2001"})
 
   (t/is (= {{:last-updated "tx1"} 1, {:last-updated "tx2"}, 1}
            (frequencies (xt/q tu/*node* "SELECT foo.last_updated FROM foo FOR ALL VALID_TIME"))))

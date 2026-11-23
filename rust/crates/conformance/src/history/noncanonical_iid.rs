@@ -245,7 +245,7 @@ async fn joins_on_replayed_iids_keep_visible_rows_through_l0_and_restart() -> Re
         let database = node.catalog().database("xtdb")?;
         let progress = database.progress().current();
         if progress.source_position != source
-            || !progress.latest_result.is_some_and(|result| result.committed() && result.tx_key() == tx)
+            || !progress.latest_result.is_some_and(|completed| completed.result().committed() && completed.result().tx_key() == tx)
         {
             return Err("Fixture source transactions did not commit through the local log".into());
         }

@@ -12,7 +12,7 @@ That scan can materialize a full-file MATCH bitmap on a cache miss, even for a s
 Obtaining document frequencies still enumerates term postings across files, and the first call through a table corpus calculates them twice.
 On a cold path with no local file, the runtime currently requests the complete search bundle.
 These are separate costs and each needs its own measurement.
-[Ranker and search answers](../../rust/crates/search/src/accelerate.rs) · [Scan handoff](../../rust/crates/query/src/scan.rs) · [Corpus](../../rust/crates/search/src/corpus.rs) · [Bundle reads](../../rust/crates/search/src/runtime.rs)
+[Ranker and search answers](../../rust/crates/search/src/accelerate.rs) · [Scan handoff](../../rust/crates/query/src/scan.rs) · [Bundle reads](../../rust/crates/search/src/runtime.rs)
 
 The previous benchmark compared correctness fixes using 100,000 synthetic documents, five indexed tries, and repeated queries on an Apple M4 Max.
 Broad top-20 took approximately 44 ms with one MATCH and 52 ms with two, while selective top-20 took about 3.3 ms.
@@ -345,7 +345,7 @@ The workload harness uses the native SQL planner and executor from `621022aad`.
 It generates tickets with skewed document lengths, recurring phrases, a mix of common and rare terms, and structured status and cohort fields.
 The workload is synthetic and approximates ticket search shapes.
 The measurements use a locked Rust release build with four Tokio workers on an Apple M4 Max and RTDB's in-memory object storage.
-Each measured query and its oracle use the same captured query context, trie files, and BM25 corpus.
+In this experiment, each measured query and its oracle used the same captured query context, trie files, and BM25 corpus.
 The oracle evaluates MATCH from resolved row values and disables both ranked and unranked candidate narrowing.
 Each comparison checks the ordered IDs, floating-point scores, projected values, and valid and system interval boundaries.
 
@@ -448,7 +448,7 @@ The native SQL harness compares both policies on one captured context with the s
 The measurement branch was based on main at `5eba8e9ea`.
 Baseline applies the ordered scope after scoring, and the current route applies it before scoring.
 Both timings include acquiring the scope from the ordered index.
-The exhaustive SQL oracle resolves rows, evaluates MATCH from the result and uses the same full corpus for scores.
+In this experiment, the exhaustive SQL oracle resolved rows, evaluated MATCH from the result and used the same full corpus for scores.
 All 348 result comparisons matched, including 36 temporal canaries across live and compacted state.
 The comparisons checked ordered IDs, scores, projected values and both time intervals.
 

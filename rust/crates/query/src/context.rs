@@ -6,7 +6,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, CatalogRuntime, QualifiedTable, TableBinding};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::{invalid, spill::SpillRegion};
@@ -14,13 +14,42 @@ use crate::{invalid, spill::SpillRegion};
 #[derive(Clone)]
 pub struct DatabaseSnapshot { pub partitions: Vec<Snapshot>, pub storage: Arc<BufferPool> }
 
+/// Binds the physical catalog in this snapshot to the store that will serve its reads.
+pub async fn retain_catalog_snapshot(snapshot: Snapshot, storage: &BufferPool) -> Result<Snapshot> {
+    match storage.object_store().retain_catalog(snapshot.catalog_cut()).await? {
+        Some(permit) => Ok(snapshot.with_catalog_read(permit)),
+        None => Ok(snapshot),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderedIndexStorage {
+    pub table: TableRef,
+    pub name: String,
+    pub version: i64,
+    pub through_block: i64,
+    pub bytes: i64,
+}
+
+#[async_trait::async_trait]
+pub trait OrderedIndexInventory: Send + Sync {
+    /// Resolve the published index files for the database in this query's captured catalog.
+    async fn sample(&self, database: &str, context: &QueryContext) -> Result<rtdb_plan::CatalogRows<OrderedIndexStorage>>;
+}
+
 #[derive(Clone)]
 pub struct CatalogSnapshot {
     pub(crate) default_database: String,
     pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
+    owned_relation: Option<(QualifiedTable, Option<rtdb_types::EntityId>)>,
+    pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
+    owned_read_guard: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
+    pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
+    pub(crate) fragment_residence: Option<crate::FragmentResidence>,
+    read_lease: Option<Arc<rtdb_storage::ReadLease>>,
 }
 
 impl CatalogSnapshot {
@@ -31,11 +60,22 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, runtime: None, fragmenter: None })
+        Ok(Self { default_database, databases, transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
+    pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
+        self.ordered_indexes = Some(inventory);
+        self
+    }
     /// Splits this catalog's scans into fragments wherever `fragmenter` asks.
-    pub fn with_fragmenter(mut self, fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>) -> Self { self.fragmenter = fragmenter; self }
+    pub fn with_fragmenter(mut self, fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>, residence: Option<crate::FragmentResidence>) -> Self {
+        self.fragmenter = fragmenter;
+        self.fragment_residence = residence;
+        self
+    }
+    /// Provider requests for this catalog's files begin only while the lease admits them.
+    pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
+    pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
     /// Reserves schema enumeration and joins before creating the returned table bindings.
     /// Clones of the result share its retained allocation charge.
@@ -53,7 +93,18 @@ impl CatalogSnapshot {
         if crate::system_schema::definition(&table.name.table).is_some() && !table.columns.contains_key(&field.name) { LogicalType::Null }
         else { rtdb_columnar::execution_type(&field.data_type) }
     }
+    pub(crate) fn owned_identity(&self) -> Option<&rtdb_types::EntityId> {
+        self.owned_relation.as_ref().and_then(|(_, id)| id.as_ref())
+    }
+    pub(crate) fn permits_table(&self, name: &QualifiedTable) -> bool {
+        match &self.owned_relation {
+            Some((admitted, _)) => admitted == name,
+            None => !TableRef::owned_schema(&name.table.schema),
+        }
+    }
     fn binding(&self, database: &str, table: &TableRef) -> Result<Option<TableBinding>> {
+        let name = QualifiedTable { database: database.to_owned(), table: table.clone() };
+        if !self.permits_table(&name) { return Ok(None); }
         let snapshots = &self.database(database)?.partitions;
         if let Some(definition) = crate::system_schema::definition(table) { return Ok(Some(definition.binding(database))); }
         if !snapshots.iter().any(|snapshot| snapshot.contains_table(table)) { return Ok(None); }
@@ -69,7 +120,7 @@ impl CatalogSnapshot {
             let next = snapshot.column_types(table);
             columns = Some(match columns { Some(previous) => rtdb_index::merge_column_types(&previous, &next), None => next });
         }
-        Ok(Some(TableBinding { name: QualifiedTable { database: database.to_owned(), table: table.clone() }, oid, columns: columns.unwrap_or_default() }))
+        Ok(Some(TableBinding { name, oid, columns: columns.unwrap_or_default() }))
     }
 }
 
@@ -78,7 +129,14 @@ impl Catalog for CatalogSnapshot {
     fn databases(&self) -> BTreeSet<String> { self.databases.keys().cloned().collect() }
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> { self.binding(&name.database, &name.table) }
     fn tables(&self, database: &str) -> Result<Vec<TableBinding>> {
-        let names: BTreeSet<_> = self.database(database)?.partitions.iter().flat_map(Snapshot::tables).collect();
+        if let Some((admitted, _)) = &self.owned_relation {
+            return if admitted.database == database {
+                Ok(self.table(admitted)?.into_iter().collect())
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let names: BTreeSet<_> = self.database(database)?.partitions.iter().flat_map(Snapshot::tables).filter(|table| !TableRef::owned_schema(&table.schema)).collect();
         let names: BTreeSet<_> = names.into_iter().chain(crate::system_schema::DEFINITIONS.iter().map(|definition| TableRef::new(definition.schema, definition.name))).collect();
         names.iter().map(|table| self.binding(database, table)?.ok_or_else(|| invalid("missing-table", "Enumerated table has no binding"))).collect()
     }
@@ -138,7 +196,7 @@ pub struct QueryContext {
     pub(crate) trace_parent: Option<rtdb_plan::SpanContext>,
     pub(crate) read_basis: Option<Arc<crate::settings::ReadBasis>>,
     pub(crate) accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>,
-    pub(crate) corpora: Arc<crate::accelerate::CorpusRegistry>,
+    pub(crate) query_cpu: Option<Arc<crate::QueryCpu>>,
 }
 
 impl QueryContext {
@@ -152,29 +210,56 @@ impl QueryContext {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, read_basis: None, accelerators: Arc::from(Vec::new()), corpora: Arc::default() }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, read_basis: None, accelerators: Arc::from(Vec::new()), query_cpu: None }))
     }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
     pub fn with_observer(self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
         Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: observer, tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), corpora: Arc::clone(&self.corpora) })
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: observer, tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), query_cpu: self.query_cpu.clone() })
     }
     /// Scans opened from this context consult these before opening; see `ScanAccelerator`.
     pub fn with_accelerators(self: Arc<Self>, accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>) -> Arc<Self> {
         Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators, corpora: Arc::clone(&self.corpora) })
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators, query_cpu: self.query_cpu.clone() })
     }
     /// Applies explicit span parentage to subsequently opened executions without thread-local context.
     pub fn with_tracer(self: Arc<Self>, tracer: Option<Arc<dyn rtdb_plan::Tracer>>, parent: Option<rtdb_plan::SpanContext>) -> Arc<Self> {
         Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer, trace_parent: parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), corpora: Arc::clone(&self.corpora) })
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer, trace_parent: parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), query_cpu: self.query_cpu.clone() })
     }
-    pub(crate) fn with_score_corpus(mut self: Arc<Self>, requested: bool) -> Arc<Self> {
-        Arc::make_mut(&mut self).corpora = Arc::new(crate::accelerate::CorpusRegistry::for_query(requested));
+
+    pub fn with_query_cpu(mut self: Arc<Self>, counter: Option<Arc<crate::QueryCpu>>) -> Arc<Self> {
+        if let Some(counter) = counter { Arc::make_mut(&mut self).query_cpu = Some(counter); }
         self
     }
+
+    pub(crate) fn for_owned_relation(mut self: Arc<Self>, table: QualifiedTable, id: Option<rtdb_types::EntityId>) -> Arc<Self> {
+        let context = Arc::make_mut(&mut self);
+        context.catalog.owned_relation = Some((table, id));
+        context.catalog.runtime = None;
+        context.catalog.fragmenter = None;
+        context.accelerators = Default::default();
+        self
+    }
+
+    pub fn with_owned_read_guard(mut self: Arc<Self>, guard: Arc<dyn Fn() -> Result<()> + Send + Sync>) -> Arc<Self> {
+        let slot = &mut Arc::make_mut(&mut self).catalog.owned_read_guard;
+        *slot = Some(if let Some(base) = slot.take() {
+            Arc::new(move || { base()?; guard() })
+        } else {
+            guard
+        });
+        self
+    }
+
+    pub(crate) fn has_owned_read_guard(&self) -> bool {
+        self.catalog.owned_read_guard.is_some()
+    }
+
     pub fn check_cancelled(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
+        if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { return Err(cancelled()); }
+        if let Some(guard) = &self.catalog.owned_read_guard { guard()?; }
+        Ok(())
     }
     /// Checks for cancellation at the first of every 1024 indices: reading a token takes its lock, which per row adds up.
     pub fn check_cancelled_at(&self, index: usize) -> Result<()> {
@@ -188,7 +273,7 @@ impl QueryContext {
     }
     pub(crate) fn execution_child_with_memory(&self, memory: Arc<MemoryBudget>) -> Arc<Self> {
         Arc::new(Self { catalog: self.catalog.clone(), memory, current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.child_token(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), corpora: Arc::clone(&self.corpora) })
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.child_token(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone(), trace_parent: self.trace_parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), query_cpu: self.query_cpu.clone() })
     }
 }
 
@@ -203,20 +288,70 @@ pub(crate) struct Execution {
     pub analysis: Option<Arc<crate::analysis::AnalysisNode>>,
 }
 
-pub(crate) struct OuterRows { rows: Vec<(rtdb_plan::Schema, Arc<crate::cursor::OwnedRow>)>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
+#[derive(Clone)]
+enum OuterInput {
+    Values(Arc<crate::cursor::OwnedRow>),
+    Arrow { batch: Arc<crate::columnar::ColumnBatch>, row: usize },
+}
+
+impl OuterInput {
+    fn expression(&self) -> rtdb_expr::ExpressionRow<'_> {
+        match self {
+            Self::Values(row) => rtdb_expr::ExpressionRow::Values(&row.values),
+            Self::Arrow { .. } => rtdb_expr::ExpressionRow::Borrowed(self),
+        }
+    }
+}
+
+impl rtdb_expr::RowInput for OuterInput {
+    fn value(&self, index: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
+        let Self::Arrow { batch, row } = self else { return Ok(None); };
+        batch.columns.get(index).map(|column| column.expression_value(*row, false, scope)).transpose()
+    }
+
+    fn arrow_cell(&self, index: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
+        let Self::Arrow { batch, row } = self else { return None; };
+        batch.columns.get(index)?.expression_cell(*row)
+    }
+}
+
+pub(crate) struct OuterRows { rows: Vec<(rtdb_plan::Schema, OuterInput)>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl OuterRows {
+    fn expression_rows(&self) -> Vec<rtdb_expr::OuterRow<'_>> {
+        self.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow {
+            schema,
+            values: match row {
+                OuterInput::Values(row) => &row.values,
+                OuterInput::Arrow { .. } => &[],
+            },
+        }).collect()
+    }
+
     pub fn schemas(&self) -> impl Iterator<Item = &rtdb_plan::Schema> { self.rows.iter().map(|(schema, _)| schema) }
     pub fn empty(memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(256)?;
         Ok(Arc::new(Self { rows: Vec::new(), _reservation: reservation }))
     }
-    pub fn prepend(&self, schema: &rtdb_plan::Schema, row: Arc<crate::cursor::OwnedRow>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    fn prepend(&self, schema: &rtdb_plan::Schema, row: OuterInput, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let bound = self.rows.iter().try_fold(crate::runtime_schema::schema_bound(schema)?, |bytes, (schema, _)| {
             bytes.checked_add(crate::runtime_schema::schema_bound(schema)?).ok_or_else(|| crate::invalid("outer-size", "Outer schema allocation exceeds addressable memory"))
         })?;
         let reservation = memory.reserve(bound)?;
         let mut rows = Vec::with_capacity(self.rows.len() + 1); rows.push((schema.clone(), row)); rows.extend(self.rows.iter().cloned());
         Ok(Arc::new(Self { rows, _reservation: reservation }))
+    }
+}
+
+struct ExpressionInputs<'a> { parameters: &'a crate::parameters::BoundParameters, outer: &'a OuterRows }
+
+impl rtdb_expr::ParameterLookup for ExpressionInputs<'_> {
+    fn width(&self) -> usize { rtdb_expr::ParameterLookup::width(self.parameters) }
+    fn value(&self, position: usize) -> Result<Option<&Value>> { self.parameters.get(position) }
+    fn known_value(&self, position: usize) -> Option<&Value> { rtdb_expr::ParameterLookup::known_value(self.parameters, position) }
+    fn arrow_cell(&self, position: usize) -> Option<rtdb_columnar::ArrowCell<'_>> { rtdb_expr::ParameterLookup::arrow_cell(self.parameters, position) }
+
+    fn correlated_value(&self, depth: usize, position: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
+        self.outer.rows.get(depth).map_or(Ok(None), |(_, row)| rtdb_expr::RowInput::value(row, position, scope))
     }
 }
 
@@ -230,22 +365,35 @@ impl Execution {
     }
 
     pub async fn bind_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: Arc<crate::cursor::OwnedRow>) -> Result<Self> {
+        self.bind_outer(arguments, schema, OuterInput::Values(row)).await
+    }
+
+    pub async fn bind_arrow_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema,
+        batch: Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<Self> {
+        self.bind_outer(arguments, schema, OuterInput::Arrow { batch, row }).await
+    }
+
+    async fn bind_outer(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: OuterInput) -> Result<Self> {
         let scope = self.scope()?;
-        let parameter_count = arguments.iter().try_fold(self.parameters.values().len(), |count, (index, _)| index.checked_add(1).map(|next| count.max(next)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameter index overflow")))?;
-        let retained_bytes = self.parameters.bytes()?;
-        scope.reserve(parameter_count.checked_mul(std::mem::size_of::<Value>() + std::mem::size_of::<rtdb_types::LogicalType>()).and_then(|bytes| bytes.checked_mul(2)).and_then(|bytes| bytes.checked_add(retained_bytes)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameters exceed addressable memory"))?)?;
-        let mut parameters = Vec::with_capacity(parameter_count);
-        parameters.extend_from_slice(self.parameters.values());
-        parameters.resize(parameter_count, Value::Null);
+        let parameter_count = arguments.iter().try_fold(self.parameters.types().len(), |count, (index, _)| index.checked_add(1).map(|next| count.max(next)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameter index overflow")))?;
+        let slots = parameter_count.checked_mul(std::mem::size_of::<rtdb_types::LogicalType>())
+            .and_then(|bytes| bytes.checked_add(arguments.len().checked_mul(std::mem::size_of::<(usize, Value)>())?))
+            .ok_or_else(|| crate::invalid("parameter-count", "Apply parameters exceed addressable memory"))?;
+        let existing = self.parameters.types().iter().try_fold(slots, |bytes, ty| {
+            bytes.checked_add(ty.retained_bytes()?).ok_or_else(|| crate::invalid("parameter-count", "Apply parameters exceed addressable memory"))
+        })?;
+        scope.reserve(existing)?;
+        let mut parameters = Vec::with_capacity(arguments.len());
         let mut types = Vec::with_capacity(parameter_count);
         types.extend_from_slice(self.parameters.types());
         types.resize(parameter_count, rtdb_types::LogicalType::Null);
         for (index, expression) in arguments {
             types[*index] = self.expression_type(&scope, expression, schema)?;
-            parameters[*index] = self.evaluate(&scope, expression, schema, &row.values).await?;
+            let invocation = self.prepare_expression(expression, schema, &scope)?;
+            parameters.push((*index, self.evaluate_invocation_row(&scope, &invocation, row.expression()).await?));
         }
         let outer = self.outer.prepend(schema, row, &self.context.memory)?;
-        Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(crate::parameters::BoundParameters::new(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
+        Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(self.parameters.overlay(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
     }
     pub fn child(&self, index: usize) -> Self {
         let mut execution = self.clone(); execution.analysis = self.analysis.as_ref().and_then(|node| node.child(index)); execution
@@ -253,8 +401,9 @@ impl Execution {
     pub fn scope(&self) -> Result<rtdb_expr::EvaluationScope> { rtdb_expr::EvaluationScope::new(&self.context.memory) }
     pub fn expression_type(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema) -> Result<rtdb_types::LogicalType> {
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema,row)|rtdb_expr::OuterRow { schema,values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.values(),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog), corpora: Some(self.context.corpora.as_ref()) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
         rtdb_expr::expression_type(expression,schema,&context)
     }
     pub async fn evaluate(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, row: &[Value]) -> Result<Value> {
@@ -264,18 +413,26 @@ impl Execution {
     pub fn prepare_expression<'a>(&self, expression: &'a rtdb_plan::Expr, schema: &'a rtdb_plan::Schema, scope: &rtdb_expr::EvaluationScope) -> Result<rtdb_expr::ExpressionInvocation<'a>> {
         self.context.check_cancelled()?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema,row)|rtdb_expr::OuterRow { schema,values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.values(),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog), corpora: Some(self.context.corpora.as_ref()) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
         rtdb_expr::ExpressionInvocation::prepare(expression,schema,&context)
     }
     pub async fn evaluate_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &[Value]) -> Result<Value> {
+        self.evaluate_invocation_row(scope, invocation, rtdb_expr::ExpressionRow::Values(row)).await
+    }
+    pub async fn evaluate_invocation_row(
+        &self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>,
+        row: rtdb_expr::ExpressionRow<'_>,
+    ) -> Result<Value> {
         self.context.check_cancelled()?;
         scope.reserve(4096)?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.values(), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog), corpora: Some(self.context.corpora.as_ref()) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
-            invocation.evaluate_projection_async(row,&context))).await.flatten().ok_or_else(cancelled)?
+            invocation.evaluate_projection_row_async(row,&context))).await.flatten().ok_or_else(cancelled)?
     }
     pub async fn open_list(&self, expression: rtdb_plan::Expr, page_rows: Option<std::num::NonZeroUsize>) -> Result<crate::list::ListCursor> {
         let execution = self.clone();
@@ -284,9 +441,10 @@ impl Execution {
             let scope = execution.scope()?;
             let schema = rtdb_plan::Schema::default();
             scope.reserve(execution.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| crate::invalid("outer-size", "Outer row bindings exceed addressable memory"))?)?;
-            let outer_rows: Vec<_> = execution.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
-            let eval = rtdb_expr::EvalContext { parameters: execution.parameters.values(), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
-                timezone: &execution.context.timezone, outer_rows: &outer_rows, snapshot_token: execution.context.snapshot_token(), allocation: Some(&scope), catalog: Some(&execution.context.catalog), corpora: Some(execution.context.corpora.as_ref()) };
+            let outer_rows = execution.outer.expression_rows();
+            let inputs = ExpressionInputs { parameters: &execution.parameters, outer: &execution.outer };
+            let eval = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
+                timezone: &execution.context.timezone, outer_rows: &outer_rows, snapshot_token: execution.context.snapshot_token(), allocation: Some(&scope), catalog: Some(&execution.context.catalog) };
             let invocation = rtdb_expr::ExpressionInvocation::prepare(&expression, &schema, &eval)?;
             let page_rows = page_rows.map_or(execution.context.options.list_batch_rows,std::num::NonZeroUsize::get);
             let list = invocation.open_list(&[], &eval, page_rows).await?;
@@ -302,13 +460,14 @@ impl Execution {
         };
         crate::list::ListCursor::open(Box::pin(stream), context).await
     }
-    pub async fn evaluate_list_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &[Value]) -> Result<rtdb_expr::EvaluatedList> {
+    pub async fn evaluate_list_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: rtdb_expr::ExpressionRow<'_>) -> Result<rtdb_expr::EvaluatedList> {
         self.context.check_cancelled()?;
         scope.reserve(4096)?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
-        let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
-        let context = rtdb_expr::EvalContext { parameters: self.parameters.values(), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog), corpora: Some(self.context.corpora.as_ref()) };
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
-            invocation.evaluate_list_async(row,&context))).await.flatten().ok_or_else(cancelled)?
+            invocation.evaluate_list_row_async(row,&context))).await.flatten().ok_or_else(cancelled)?
     }
 }

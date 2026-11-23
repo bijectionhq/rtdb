@@ -1,11 +1,15 @@
-use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
 
 use rtdb_columnar::IidView;
-use rtdb_types::{Anomaly, Iid, Result};
+use rtdb_types::{Anomaly, Iid, MemoryBudget, MemoryReservation, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::bucketer::invalid_bucket_depth;
+use crate::leaf_load_step::validate_persisted_order;
+use crate::leaf_sort_step::{merge_overflow_rows, merge_pending_rows};
+use crate::leaf_split_step::{split_subtree, SplitContents};
+use crate::partition_step::group_base4_rows;
 use crate::{Bucketer, Path};
 
 /// Indexed rows must keep the same IID for every operation on a retained trie.
@@ -56,10 +60,26 @@ impl Leaf {
     pub fn sorted_rows<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Arc<[u32]>> {
         if self.log.is_empty() { return Ok(Arc::clone(&self.data)); }
         if let Some(sorted) = self.sorted.get() { return Ok(Arc::clone(sorted)); }
-        let log = sort(reader, self.log.iter().copied())?;
-        let merged: Arc<[u32]> = merge(reader, &self.data, &log)?.into();
+        let merged: Arc<[u32]> = self.merge_rows(reader)?.into();
         let _ = self.sorted.set(Arc::clone(&merged));
         Ok(merged)
+    }
+
+    /// Copies and orders rows in the caller's budget without consulting or populating the shared leaf cache.
+    pub fn sorted_rows_in<R: IidReader + ?Sized>(&self, reader: &R, memory: &Arc<MemoryBudget>) -> Result<(Vec<u32>, Arc<MemoryReservation>)> {
+        let overflow = || Anomaly::incorrect("rtdb/trie-sort-allocation", "Trie sorting allocation exceeds addressable memory");
+        let bytes = self.len().checked_mul(std::mem::size_of::<u32>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(overflow)?;
+        let retained = memory.reserve(bytes)?;
+        if self.log.is_empty() { return Ok((self.data.to_vec(), retained)); }
+        let scratch = self.log.len().checked_mul(std::mem::size_of::<crate::leaf_sort_step::KeyedRow>() + std::mem::size_of::<u32>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+        let _scratch = memory.reserve(scratch)?;
+        Ok((self.merge_rows(reader)?, retained))
+    }
+
+    fn merge_rows<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Vec<u32>> {
+        merge_pending_rows(&self.data, self.log.iter().copied(), |row| reader.iid(row).map(|iid| iid.0))
     }
 }
 
@@ -171,35 +191,14 @@ impl MemoryHashTrie {
 
 impl Default for MemoryHashTrie { fn default() -> Self { Self::new(TrieConfig::default()) } }
 
-fn compare<R: IidReader + ?Sized>(reader: &R, left: u32, right: u32) -> Result<Ordering> {
-    Ok(reader.iid(left)?.cmp(&reader.iid(right)?).then_with(|| right.cmp(&left)))
-}
-
-fn sort<R: IidReader + ?Sized>(reader: &R, rows: impl Iterator<Item = u32>) -> Result<Vec<u32>> {
-    let mut keyed = rows.map(|row| Ok((reader.iid(row)?, row))).collect::<Result<Vec<_>>>()?;
-    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    Ok(keyed.into_iter().map(|(_, row)| row).collect())
-}
-
-fn merge<R: IidReader + ?Sized>(reader: &R, left: &[u32], right: &[u32]) -> Result<Vec<u32>> {
-    let mut merged = Vec::with_capacity(left.len() + right.len());
-    let (mut li, mut ri) = (0, 0);
-    while li < left.len() && ri < right.len() {
-        if compare(reader, left[li], right[ri])? == Ordering::Less { merged.push(left[li]); li += 1; }
-        else { merged.push(right[ri]); ri += 1; }
-    }
-    merged.extend_from_slice(&left[li..]);
-    merged.extend_from_slice(&right[ri..]);
-    Ok(merged)
-}
-
 fn insert_rows<R: IidReader + ?Sized>(
     node: &Arc<TrieNode>, reader: &R, rows: impl ExactSizeIterator<Item = u32>, config: TrieConfig,
 ) -> Result<Arc<TrieNode>> {
     match node.as_ref() {
         TrieNode::Branch { path, children } => {
-            let mut buckets: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::new());
-            for row in rows { buckets[Bucketer::DEFAULT.bucket(reader.iid(row)?, path.len())? as usize].push(row); }
+            let buckets = group_base4_rows(
+                rows, path.len(), |row| reader.iid(row).map(|iid| iid.0), invalid_bucket_depth,
+            )?;
             let mut next = children.clone();
             for (bucket, rows) in buckets.iter().enumerate() {
                 if rows.is_empty() { continue; }
@@ -219,9 +218,9 @@ fn insert_rows<R: IidReader + ?Sized>(
                 let next = Arc::new(TrieNode::Leaf(Leaf::new(leaf.path.clone(), Arc::clone(&leaf.data), log.into())));
                 if count == config.log_limit { compact(&next, reader, config) } else { Ok(next) }
             } else {
-                let new_rows = sort(reader, rows)?;
-                let pending = sort(reader, leaf.log.iter().copied())?;
-                let merged = merge(reader, &leaf.data, &merge(reader, &pending, &new_rows)?)?;
+                let merged = merge_overflow_rows(&leaf.data, leaf.log.iter().copied(), rows, |row| {
+                    reader.iid(row).map(|iid| iid.0)
+                })?;
                 build_subtree(leaf.path.clone(), merged, reader, config, true)
             }
         }
@@ -243,19 +242,21 @@ fn compact<R: IidReader + ?Sized>(node: &Arc<TrieNode>, reader: &R, config: Trie
 }
 
 fn build_subtree<R: IidReader + ?Sized>(path: Path, rows: Vec<u32>, reader: &R, config: TrieConfig, recursive: bool) -> Result<Arc<TrieNode>> {
-    if rows.len() <= config.page_limit || path.len() == Bucketer::DEFAULT.max_depth() {
-        return Ok(Arc::new(TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([])))));
-    }
-    let mut buckets: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::new());
-    for row in rows { buckets[Bucketer::DEFAULT.bucket(reader.iid(row)?, path.len())? as usize].push(row); }
-    let mut children = std::array::from_fn(|_| None);
-    for (bucket, rows) in buckets.into_iter().enumerate() {
-        if rows.is_empty() { continue; }
-        let child_path = path.child(bucket as u8, Bucketer::DEFAULT)?;
-        children[bucket] = Some(if recursive { build_subtree(child_path, rows, reader, config, true)? }
-        else { Arc::new(TrieNode::Leaf(Leaf::new(child_path, rows.into(), Arc::from([])))) });
-    }
-    Ok(Arc::new(TrieNode::Branch { path, children }))
+    split_subtree(
+        path.into_buckets(),
+        rows,
+        |row| reader.iid(row).map(|iid| iid.0),
+        invalid_bucket_depth,
+        |buckets, contents| {
+            let path = Path::from_split_buckets(buckets);
+            Arc::new(match contents {
+                SplitContents::Leaf(rows) => TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([]))),
+                SplitContents::Branch(children) => TrieNode::Branch { path, children },
+            })
+        },
+        config.page_limit,
+        recursive,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,11 +285,9 @@ fn import<R: IidReader + ?Sized>(node: PersistedNode, path: Path, reader: &R) ->
                     return Err(Anomaly::incorrect("rtdb/trie-row-path", "Persisted row lies outside its trie path"));
                 }
             }
-            for pair in rows.windows(2) {
-                if compare(reader, pair[0], pair[1])? == Ordering::Greater {
-                    return Err(Anomaly::incorrect("rtdb/trie-row-order", "Persisted trie rows are out of IID/newest-first order"));
-                }
-            }
+            validate_persisted_order(&rows, |row| reader.iid(row).map(|iid| iid.0), || {
+                Anomaly::incorrect("rtdb/trie-row-order", "Persisted trie rows are out of IID/newest-first order")
+            })?;
             Ok(Arc::new(TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([])))))
         }
         PersistedNode::Branch(children) => {

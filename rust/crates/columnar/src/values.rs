@@ -15,6 +15,54 @@ pub fn build_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> 
     build_values(logical, values, true)
 }
 
+/// Builds a column from scalar evaluation results using bounded temporary cell storage.
+pub fn copy_evaluated_cells(
+    ty: &LogicalType, rows: usize, memory: &Arc<crate::MemoryBudget>,
+    mut bound: impl FnMut(usize) -> Result<usize>, mut read: impl FnMut(usize) -> Result<Value>,
+) -> Result<(ArrayRef, Arc<crate::MemoryReservation>)> {
+    const CELLS: usize = 128;
+    let overflow = || Anomaly::incorrect("rtdb/column-size", "Evaluated column exceeds addressable memory");
+    let _inventory = memory.reserve(rows.div_ceil(CELLS).checked_mul(128)
+        .and_then(|size| size.checked_add(256)).ok_or_else(overflow)?)?;
+    let mut arrays = Vec::with_capacity(rows.div_ceil(CELLS));
+    for start in (0..rows).step_by(CELLS) {
+        let end = start.saturating_add(CELLS).min(rows);
+        let bytes = (start..end).try_fold((end - start) * std::mem::size_of::<Value>(), |bytes, row| {
+            bytes.checked_add(bound(row)?).ok_or_else(overflow)
+        })?;
+        let _cells = memory.reserve(bytes)?;
+        let values = (start..end).map(&mut read).collect::<Result<Vec<_>>>()?;
+        let mut scratch = memory.reserve(crate::estimate_builder_bytes(ty, &values)?)?;
+        let array = copy_array(ty, &values)?;
+        Arc::get_mut(&mut scratch).expect("Cell writer owns its chunk").shrink_to(array.get_array_memory_size())?;
+        arrays.push((array, scratch));
+    }
+    match arrays.len() {
+        0 => {
+            let mut scratch = memory.reserve(crate::estimate_builder_bytes(ty, &[])?)?;
+            let array = copy_array(ty, &[])?;
+            Arc::get_mut(&mut scratch).expect("Cell writer owns its empty vector").shrink_to(array.get_array_memory_size())?;
+            Ok((array, scratch))
+        }
+        1 => Ok(arrays.pop().expect("The evaluated column has one chunk")),
+        _ => {
+            let field = crate::to_field("value", ty)?;
+            let bytes = arrays.iter().try_fold(rows.checked_mul(64).ok_or_else(overflow)?, |bytes, (array, _)| {
+                (0..array.len()).try_fold(bytes, |bytes, row| {
+                    let cell = crate::estimate_copy_cell_bytes(&field, array.as_ref(), row)?;
+                    bytes.checked_add(cell.checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
+                })
+            })?;
+            let mut scratch = memory.reserve(bytes)?;
+            let inputs = arrays.iter().map(|(array, _)| array.as_ref()).collect::<Vec<_>>();
+            let picks = arrays.iter().enumerate().flat_map(|(source, (array, _))| (0..array.len()).map(move |row| (source, row))).collect::<Vec<_>>();
+            let array = crate::copy_selected_cells(&inputs, &picks)?;
+            Arc::get_mut(&mut scratch).expect("Cell writer owns its result").shrink_to(array.get_array_memory_size())?;
+            Ok((array, scratch))
+        }
+    }
+}
+
 /// Reconstructs typed cells without revalidating decimal precision against their stored coefficients.
 /// Every nonnull value must belong to its target logical type, including exact decimal parameters.
 /// Coefficient width is checked; values are neither rescaled nor relabeled.
@@ -468,7 +516,9 @@ fn build_float_union_lists(item: &Arc<Field>, width: Option<i32>, values: &[Valu
                     ListView::Values(_) if list.is_empty() => arrow_array::new_empty_array(item.data_type()),
                     ListView::Values(_) => return Ok(None),
                 };
-                let Some(array) = crate::conform::conform_float_components(source, item) else { return Ok(None); };
+                let source_field = Field::new(item.name(), source.data_type().clone(), source.null_count() != 0);
+                let Ok((_, array)) = crate::relayout_arrow_column(source, &source_field, item) else { return Ok(None); };
+                if array.data_type() != item.data_type() { return Ok(None); }
                 Some(array)
             }
             _ => return Ok(None),

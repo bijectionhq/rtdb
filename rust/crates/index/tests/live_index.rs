@@ -28,7 +28,7 @@ fn stored_event_copy_preserves_raw_decimal_and_retains_charge_after_index_releas
     for precision in [i32::MIN, 0, 1, 256, i32::MAX] {
         let value = Value::Decimal(DecimalValue::new(123i128.to_be_bytes().to_vec(), precision, i32::MAX, 128).unwrap());
         let declared = StructFields::from([("v".into(), value.logical_type())]);
-        let events = [StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+        let events = [StoredEvent { commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("v".into(), value)])), recency: None }];
         if precision < 3 { assert!(IndexBatch::from_events(&events, &declared, &memory).is_err()); }
         let copied = IndexBatch::copy_events_with_put_schema(&events, &declared, &memory).unwrap();
@@ -93,7 +93,7 @@ fn events_appended_by_reference_and_by_value_stage_as_one_tables_rows() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);
     let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
-    let event = |id| StoredEvent { iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
+    let event = |id| StoredEvent { commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
     tx.append_to(&table(), event(1)).unwrap();
     tx.append(table(), event(2)).unwrap();
     tx.append_to(&table(), event(3)).unwrap();
@@ -181,6 +181,45 @@ fn block_adoption_publishes_catalogs_and_rollover_together() {
     assert!(state.open_snapshot(None).contains_table(&table()));
     assert_eq!(state.value().table_catalog().metadata(&table()).unwrap().row_count, 1);
     assert_eq!(state.value().live().block_row_count(), 0);
+}
+
+#[test]
+fn retained_snapshots_resolve_their_trie_rows_after_discard_and_rollover() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let table = table();
+    state.apply(&stage(&state, &budget, 0)).unwrap();
+    let pinned = state.open_snapshot(Some(key(0).system_time));
+
+    let mut tx = TransactionBuffer::new(
+        state.resolving_snapshot(&[]).unwrap(), key(1), Arc::clone(&budget),
+    ).unwrap();
+    tx.put(table.clone(), document(42, 42), Interval::ALL).unwrap();
+    let discarded = tx.snapshot().unwrap();
+    drop(tx);
+    assert_eq!(rows(&state.open_snapshot(None)), 1);
+
+    let prepared = state.prepare_block().unwrap();
+    let durable = block(&prepared);
+    let catalog_trie = CatalogTrie::notification(TrieKey::l0(BlockIndex(0)).unwrap(), 10, None).unwrap();
+    let tries = BTreeMap::from([(table.clone(), vec![catalog_trie])]);
+    let table_blocks = prepared.table_blocks(&tries, Timestamp(101)).unwrap();
+    state.adopt_block(prepared, durable, &table_blocks, &tries, Timestamp(101)).unwrap();
+    state.apply(&stage(&state, &budget, 1)).unwrap();
+    let next = state.open_snapshot(Some(key(1).system_time));
+    drop(state);
+
+    for (snapshot, expected) in [(pinned, vec![0]), (discarded, vec![42, 0]), (next, vec![1])] {
+        let segments = snapshot.segments(&table);
+        assert_eq!(segments.len(), expected.len());
+        for (segment, id) in segments.iter().zip(expected) {
+            assert_eq!(segment.trie().sorted_rows(segment.as_ref()).unwrap(), [0]);
+            let location = segment.locate(0).unwrap();
+            let header = segment.header_at(location).unwrap();
+            assert_eq!(header.iid, EntityId::Integer(id).iid());
+            assert_eq!(segment.row(0).unwrap().header().unwrap(), header);
+        }
+    }
 }
 
 #[test]

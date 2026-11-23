@@ -15,6 +15,71 @@ macro_rules! position {
 position!(SourcePosition: i64, ReplicaPosition: i64, TxId: i64, BlockIndex: i64,
     Term: i64, TermSequence: i64, StorageEpoch: i32, StorageVersion: i32);
 
+/// The installed replica prefix captured with a physical catalog.
+/// The journal epoch is explicit because its empty prefix is encoded as epoch base minus one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCut {
+    pub storage_version: StorageVersion,
+    pub storage_epoch: StorageEpoch,
+    pub replica_epoch: StorageEpoch,
+    pub through: ReplicaPosition,
+}
+
+/// Identifies the provider namespace within which object versions are meaningful.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct S3ObjectNamespace {
+    pub bucket: String,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+}
+
+/// An observed version of a physical object. This carries no permission to erase it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalObjectVersion {
+    pub namespace: S3ObjectNamespace,
+    /// The exact object key as stored by S3, including provider path encoding.
+    pub key: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalObjectPublication {
+    pub namespace: S3ObjectNamespace,
+    pub key: String,
+    pub allocation: uuid::Uuid,
+    pub etag: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PhysicalObjectPublication {
+    Version(PhysicalObjectVersion),
+    Terminal(TerminalObjectPublication),
+}
+
+impl PhysicalObjectPublication {
+    pub fn into_version(self) -> Option<PhysicalObjectVersion> {
+        match self {
+            Self::Version(version) => Some(version),
+            Self::Terminal(_) => None,
+        }
+    }
+}
+
+/// A conditional write at one physical S3 key in a bucket that has never been versioned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct S3TombstoneTarget {
+    pub namespace: S3ObjectNamespace,
+    pub key: String,
+    pub condition: S3TombstoneCondition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3TombstoneCondition {
+    Absent,
+    Matches(String),
+}
+
 const OFFSET_LIMIT: i64 = 1_i64 << 48;
 const EPOCH_LIMIT: i32 = 1_i32 << 15;
 

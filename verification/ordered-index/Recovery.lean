@@ -1,4 +1,7 @@
 import Temporal
+import Buckets
+import DistinctPage
+import OrderedRead
 
 set_option autoImplicit false
 
@@ -62,6 +65,66 @@ theorem serving_independent (capture : List (Event K)) (left right : Coverage ca
     serve capture left systemAt validAt = serve capture right systemAt validAt := by
   rw [serve_exact, serve_exact]
 
+
+/-- An ordered route and an authoritative scan may traverse different duplicate
+runs. Once their authorized candidate sets agree, exact replay preserves the
+page, its lookahead, and the ordered keys inspected to register the read. -/
+theorem ordered_route_preserves_page_and_witness
+    {V : Type} (capture : Nat → List (Event K))
+    (coverage : (key : Nat) → Coverage (capture key))
+    (project : Nat → K → Option V) (native scanned : List Nat)
+    (nativeSorted : native.Pairwise (· ≤ ·)) (scannedSorted : scanned.Pairwise (· ≤ ·))
+    (sameKeys : ∀ key, key ∈ native ↔ key ∈ scanned)
+    (systemAt : Nat) (validAt : Int) (limit : Nat) :
+    let nativeKeys := distinctRuns none native
+    let scanKeys := distinctRuns none scanned
+    let index key := (serve (capture key) (coverage key) systemAt validAt).bind (project key)
+    let scan key := (tableAt (capture key) systemAt validAt).bind (project key)
+    observation (nativeKeys.filterMap index) limit =
+      observation (scanKeys.filterMap scan) limit
+      ∧ inspected index (limit + 1) nativeKeys = inspected scan (limit + 1) scanKeys := by
+  dsimp
+  have keys := distinct_runs_refine_membership native scanned nativeSorted scannedSorted sameKeys
+  have rows : (fun key => (serve (capture key) (coverage key) systemAt validAt).bind (project key)) =
+      (fun key => (tableAt (capture key) systemAt validAt).bind (project key)) := by
+    funext key
+    rw [serve_exact]
+  rw [keys, rows]
+  exact ⟨rfl, rfl⟩
+
+def keysAtBuckets (buckets : Span K → List Bucket) (point : Nat) (spans : List (Span K)) : List K :=
+  spans.flatMap fun span => List.replicate (hits point (buckets span)) span.key
+
+private theorem keysAtBuckets_refines_spans (buckets : Span K → List Bucket)
+    (point : Nat) (validAt : Int) (spans : List (Span K))
+    (exact : ∀ span ∈ spans, hits point (buckets span) =
+      if span.valid.contains validAt then 1 else 0) :
+    let keys := keysAtBuckets buckets point spans
+    keys.head? = seekSpan validAt spans ∧ keys.length = hitsSpans validAt spans := by
+  induction spans with
+  | nil => simp [keysAtBuckets, seekSpan, hitsSpans]
+  | cons span rest ih =>
+    have head := exact span (by simp)
+    obtain ⟨restHead, restLength⟩ := ih (fun row member => exact row (by simp [member]))
+    change (List.replicate (hits point (buckets span)) span.key ++
+      keysAtBuckets buckets point rest).head? = seekSpan validAt (span :: rest) ∧
+      (List.replicate (hits point (buckets span)) span.key ++
+        keysAtBuckets buckets point rest).length = hitsSpans validAt (span :: rest)
+    by_cases contains : span.valid.contains validAt <;>
+      simp [hitsSpans, seekSpan, head, contains, restHead, restLength, Nat.add_comm]
+
+/-- Exact tiling and temporal projection give one matching indexed tuple per
+visible IID, with the same point value as the original captured events. -/
+theorem bucket_postings_refine_table (buckets : Span K → List Bucket)
+    (events : List (Event K)) (systemAt : Nat) (validAt : Int) (point : Nat)
+    (ordered : ∀ event ∈ events, event.valid.lower ≤ event.valid.upper)
+    (exact : ∀ span ∈ events.foldl (edits systemAt) [], hits point (buckets span) =
+      if span.valid.contains validAt then 1 else 0) :
+    let keys := keysAtBuckets buckets point (events.foldl (edits systemAt) [])
+    keys.head? = tableAt events systemAt validAt ∧ keys.length ≤ 1 := by
+  obtain ⟨value, count⟩ := keysAtBuckets_refines_spans buckets point validAt _ exact
+  exact ⟨value.trans (replay_refines_table events systemAt validAt),
+    count ▸ replay_keeps_one events systemAt validAt [] (by simp [hitsSpans]) ordered⟩
 
 def weight {A : Type} (rows : A → Nat) : List A → Nat
   | [] => 0

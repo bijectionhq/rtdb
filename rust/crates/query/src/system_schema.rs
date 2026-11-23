@@ -45,6 +45,8 @@ pub(crate) const DEFINITIONS: &[Definition] = &[
     definition!("pg_catalog", "pg_opclass", "oid:i opcmethod:i opcname:s opcnamespace:i opcowner:i opcfamily:i opcintype:i opcdefault:b opckeytype:i"),
     definition!("pg_catalog", "pg_index", "indexrelid:i indrelid:i indnatts:i indnkeyatts:i indisunique:b indnullsnotdistinct:b indisprimary:b indisexclusion:b indimmediate:b indisclustered:b indisvalid:b indcheckxmin:b indisready:b indislive:b indisreplident:b indkey:li? indcollation:li? indclass:li? indoption:li? indexprs:s? indpred:s?"),
     definition!("xt", "trie_stats", "schema_name:s table_name:s trie_key:s level:i recency:date? trie_state:s data_file_size:l row_count:l? temporal_metadata:temporal?"),
+    definition!("xt", "live_trie_artefacts", "schema_name:s table_name:s object_key:s kind:s definition_id:s definition_version:l historical:b file_size:l?"),
+    definition!("xt", "live_ordered_index_storage", "schema_name:s table_name:s index_name:s definition_version:l through_block:l file_bytes:l"),
     definition!("xt", "live_tables", "schema_name:s table_name:s row_count:l"),
     definition!("xt", "live_columns", "schema_name:s table_name:s col_name:s col_type:s"),
     definition!("xt", "metrics_timers", "name:s tags:tags count:l mean_time:duration? p75_time:duration? p95_time:duration? p99_time:duration? p999_time:duration? max_time:duration?"),

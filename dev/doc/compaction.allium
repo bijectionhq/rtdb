@@ -203,15 +203,19 @@ contract OutputSegmentLayout {
 
     @invariant OutputPagesShareTheMergedSchema
         -- Every page in an output data file uses the merged schema, including its field types and nullability.
+        -- Normalization retains the complete entity-key column in governed event data.
+        -- Temporal resolution tracks each complete governed key independently when several keys share an IID.
+        -- Compaction copies compatible document cells from selected Arrow positions in both stages.
+        -- It aligns evolving nested fields and union legs to the merged schema and writes typed nulls for absent fields.
+        -- Rebuilt pages use the event writer's encoding for undefined union padding under null containers and for bottom-typed fields widened to unions.
 
     @invariant DecimalFieldsCarryTheirLogicalParameters
         -- Each decimal field in an output Arrow schema carries the merged field's signed 32-bit precision and scale, including decimal fields nested in containers.
         -- Its coefficient buffers represent values at that scale.
         -- Copied cells retain their coefficient bytes and their decimal type leg in the merged schema.
 
-    @invariant FloatingPointListStatisticsUseArrowBuffers
-        -- Counts of present floating-point list values use the parent validity bitmap.
-        -- Numeric bounds use the component buffers.
+    @invariant PageMetadataReadsArrowCells
+        -- Page metadata derives numeric statistics and logical presence from Arrow cells.
 
     @invariant MillisecondDateStatisticsUseEpochDays
         -- A millisecond date's page statistics and value hash use its epoch day, obtained by truncating the stored milliseconds divided by milliseconds per day toward zero.

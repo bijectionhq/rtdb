@@ -188,3 +188,17 @@ fn a_caller_control_allowance_is_admitted_with_payload_before_reservation_constr
         }
     }
 }
+
+
+#[test]
+fn moving_a_charge_does_not_require_headroom() {
+    let memory = rtdb_types::MemoryBudget::new(128);
+    let mut destination = memory.reserve(80).unwrap();
+    let mut source = memory.reserve(48).unwrap();
+    std::sync::Arc::get_mut(&mut destination).unwrap().absorb(std::sync::Arc::get_mut(&mut source).unwrap()).unwrap();
+    assert_eq!((destination.bytes(), source.bytes(), memory.used_bytes()), (128, 0, 128));
+    drop(source);
+    assert_eq!(memory.used_bytes(), 128);
+    drop(destination);
+    assert_eq!(memory.used_bytes(), 0);
+}

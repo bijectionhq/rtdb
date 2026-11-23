@@ -1,7 +1,7 @@
 {
-  "summary": "Query and compaction share the same base-four IID digit for every valid depth.",
-  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 7,
+  "summary": "The production base-four trie split preserves leaf order, row multiplicity, and child path membership.",
+  "flags": ["--no-external-by-default", "--verify-module", "partition_step", "--verify-module", "leaf_split_step", "--verify-module", "laws", "--rlimit", "40"],
+  "min_verified_functions": 25,
   "controls": {
     "drop_last_digit": {
       "defect": "The final base-four digit cannot be selected.",
@@ -15,7 +15,7 @@
         "function": "base4_bucket",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 24
     },
     "drop_last_digit_with_weakened_contract": {
       "defect": "Both the function and the local contract promise only the first 63 digits.",
@@ -32,8 +32,32 @@
         "file": "verification/verus/iid_partition/laws.rs",
         "function": "every_iid_digit_can_be_selected",
         "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "precondition not satisfied"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "Call to non-static function fails to satisfy `callee.requires(args)`"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "child_membership_extends_parent_membership",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "child_membership_extends_parent_membership",
+        "category": "precondition not satisfied"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 21
     },
     "collapse_buckets": {
       "defect": "Only bucket zero is returned for every valid IID depth.",
@@ -47,7 +71,7 @@
         "function": "base4_bucket",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 24
     },
     "collapse_buckets_with_weakened_contract": {
       "defect": "Both the function and its local contract assign all valid inputs to bucket zero.",
@@ -64,8 +88,166 @@
         "file": "verification/verus/iid_partition/laws.rs",
         "function": "a_high_leading_byte_cannot_belong_to_bucket_zero",
         "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "child_membership_extends_parent_membership",
+        "category": "assertion failed"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 21
+    },
+    "accept_smaller_iid_digit": {
+      "defect": "An IID whose first differing digit is smaller is accepted under that path.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "return Ordering::Less;",
+        "replace": "return Ordering::Equal;"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 24
+    },
+    "send_row_to_next_bucket": {
+      "defect": "Every row goes to a different child.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "buckets[usize::from(bucket)].push(row);",
+        "replace": "buckets[(usize::from(bucket) + 1) % 4].push(row);"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 24
+    },
+    "prepend_row_to_bucket": {
+      "defect": "A child receives its rows in reverse input order.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "buckets[usize::from(bucket)].push(row);",
+        "replace": "buckets[usize::from(bucket)].insert(0, row);"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 24
+    },
+    "route_unreadable_iid_as_zero": {
+      "defect": "Grouping admits a row after its IID lookup fails.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "Err(error) => return Err(error),",
+        "replace": "Err(_) => [0; 16],"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 24
+    },
+    "drop_nonempty_child": {
+      "defect": "The recursive split discards bucket zero's input rows.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "find": "let first_node = split_child(&path, 0, first, read_iid,",
+        "replace": "let first_node = split_child(&path, 0, Vec::new(), read_iid,"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_subtree",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 24
+    },
+    "swap_child_positions": {
+      "defect": "The constructed branch swaps the positions of its first two children.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "find": "let children = [first_node, second_node, third_node, fourth_node];",
+        "replace": "let children = [second_node, first_node, third_node, fourth_node];"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_subtree",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_subtree",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_subtree",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 24
+    },
+    "append_wrong_digit": {
+      "defect": "Every child path appends zero irrespective of the child's bucket.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "find": "child_path.push(bucket);",
+        "replace": "child_path.push(0);"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_child",
+        "category": "precondition not satisfied"
+      }, {
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_child",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_child",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 24
+    },
+    "split_at_maximum_depth": {
+      "defect": "The split keeps selecting an IID digit below the maximum depth.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "find": "if rows.len() <= page_limit || depth == 64 {",
+        "replace": "if rows.len() <= page_limit {"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_subtree",
+        "category": "precondition not satisfied"
+      }, {
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_subtree",
+        "category": "precondition not satisfied"
+      }],
+      "min_verified_functions": 24
+    },
+    "recurse_during_one_level_split": {
+      "defect": "A request for a one-level split recurses into its children.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "find": "let result = if recursive {",
+        "replace": "let result = if true {"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_child",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 24
     }
   }
 }

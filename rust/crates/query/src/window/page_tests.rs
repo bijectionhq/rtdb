@@ -37,6 +37,30 @@ fn expressions(functions: &[WindowFunction]) -> Vec<WindowExpr> {
 }
 
 #[tokio::test]
+async fn columnar_window_validates_unprojected_bottom_cells_before_emitting_ordinals() {
+    use arrow_array::NullArray;
+    use crate::columnar::Column;
+    struct Batches(Option<ColumnBatch>);
+    #[async_trait]
+    impl BatchCursor for Batches {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.take()) }
+    }
+
+    let execution = execution(1);
+    let baseline = execution.context.memory.used_bytes();
+    let logical = LogicalType::Nothing;
+    let field = rtdb_columnar::to_field("bottom", &logical).unwrap();
+    let column = Column::Arrow { array: Arc::new(NullArray::new(1)), field: Arc::new(field), logical: Some(logical) };
+    let batch = ColumnBatch::settled(vec![column], 1, execution.context.memory.reserve(1024).unwrap()).unwrap();
+    let mut cursor = BatchWindow::new(Box::new(Batches(Some(batch))), Schema::default(), &[], vec![],
+        &expressions(&[WindowFunction::RowNumber]), false, execution.clone()).unwrap();
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb/zero-leg-read");
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
 async fn partition_mapping_preserves_semantic_pages_including_empty_pages() {
     for batch_rows in [1,1024] {
         let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();

@@ -12,6 +12,11 @@
 --
 --   A live table is a VALUE, and a transaction writes it through a TRANSIENT derived from that value.
 --   The transient appends only, and what it appends the value it came from cannot see; committing it yields the table's next value, and applying a transaction installs those values.
+--   A table's immutable row lineage advances when rows are appended.
+--   Arrow chunk coalescing preserves row addresses and lineage.
+--   The row lineage starts a new generation at its revision limit.
+--   The derived index builds coverage anew for that generation.
+--   A derived posting page can serve a related snapshot when its covered rows lie in both snapshots' shared prefix.
 --   One coroutine writes a transient, and it is never published mid-flight.
 --   Columnar puts retain their Arrow values alongside resolved IIDs and valid-time intervals until the events are encoded.
 --   Row-based operations carry homogeneous floating-point lists as typed Arrow component buffers.
@@ -30,7 +35,8 @@
 --     3. READ BACK. The node's own read of the replica log delivers each record to whichever role is live, so on a leader it is that leader reading its own writes back.
 --        The read belongs to the node rather than to the term, so a term ending surrenders no position.
 --     4. APPLY. Each record has met the term fence on the way in, so what reaches the term is its own to apply (see ApplyRecord).
---        Applying the leader's own transaction imports it from the QUEUE HEAD, which still holds its rows, so nothing is re-read from the replica record — that record's job was to confirm durability and term.
+--        Applying the leader's own transaction imports its rows from the matching QUEUE HEAD.
+--        The native leader checks the encoded read-back against its pending append, and the Kotlin leader checks the transaction ID against the staged head.
 --        THIS is where a committed transaction becomes queryable, and where an external caller's durability handle completes.
 --
 --   Resolution and apply never interleave, so a transaction is never half-applied.
@@ -155,6 +161,9 @@ entity LiveIndex {
     -- Rows APPLIED into the currently-open block, and the gauge the leader cuts on.
     -- Counted where a transaction's rows land, so a transaction resolved but never applied contributes nothing to it, whichever term resolved it.
     block_row_count: Integer
+    -- The placement load sample counts the event batches and decoded headers retained by the current block.
+    -- The gauge resets when the next block opens.
+    live_batch_bytes: Integer
 
     -- Durable live tables: they hold only applied rows.
     tables: LiveTable with index = this
@@ -205,6 +214,12 @@ entity StagedTx {
 entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
     -- Staging retains the completed rows and their schema.
+    -- Ordinary document operations and SQL put mutations stage document vectors with the event headers for their selected positions.
+    -- Staging copies compatible Arrow document columns from their input arrays when combining writes in transaction order.
+    -- Native SQL puts can stage scalar document columns directly from the mutation query batch.
+    -- A create-only insert checks each requested interval against the transaction snapshot before staging that document from its Arrow vector.
+    -- Staging views retain shared Arrow source allocations while exposing only the buffer spans they use.
+    -- When memory admits the copy, a put with a large shared source allocation copies its selected cells into compact Arrow buffers.
     -- A staged put preserves its declared column types, including columns with only null cells.
     -- A table's columns, a struct's fields and a union's legs keep the order they were first written in; types compare without regard to that order.
     -- Temporary memory used during construction is released before staging.
@@ -518,9 +533,11 @@ rule ApplyResolvedTx {
     -- The leader reads its OWN staged transaction back at its own term and IMPORTS it.
     -- This is where a committed transaction becomes queryable: durably replicated AND confirmed unfenced.
     --
-    -- It imports from the QUEUE HEAD, which still holds the transaction's rows, so nothing is re-read from the replica record.
-    -- The leader takes the head before checking that its transaction ID matches the record.
-    -- When ID validation, partition apply, or applied progress publication fails, any external handle for the selected transaction receives the original fault.
+    -- The native read-back must confirm the encoded transaction at its pending append sequence before the leader can buffer or apply it.
+    -- Before importing rows from the queue head, the native leader checks that it is the transaction owned by that pending append.
+    -- Both engines apply the queue head's catalog operation after matching the transaction.
+    -- A native read-back fault reaches the pending caller when the admitted term and sequence identify its submission.
+    -- A failure applying the staged transaction or advancing its progress reaches that transaction's pending caller.
     --
     -- The DURABLE head advance ALONE makes the transaction queryable.
     -- The shared external snapshot is a lazily-advanced cache, rebuilt on the next demanding read, and is not refreshed here.

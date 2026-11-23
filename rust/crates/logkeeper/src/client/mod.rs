@@ -10,10 +10,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ensemble::{Ack, Ensemble, MAXIMUM_BATCH_BYTES, MAXIMUM_BATCH_ENTRIES, check_retained};
 use futures::stream::{FuturesUnordered, StreamExt};
+use prost::Message;
 use rtdb_storage::log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_storage::{Error, Result};
-use rtdb_types::{Anomaly, Timestamp};
+use rtdb_types::{Anomaly, JournalEndpoint, Timestamp, valid_journal_identity};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,14 +23,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use writer::{Tip, Writer};
 
-pub use audit::{RetainedAudit, audit_retained, certify_committed_prefix};
+pub use audit::{CertifiedRangeReader, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, copy_certified_range, verify_certified_range};
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub stream: String,
     pub write_quorum: usize,
     pub maximum_message_bytes: usize,
@@ -39,7 +40,7 @@ pub struct StreamConfig {
 /// A chain lists a stream's loglets oldest first; one stream name names the stream on every ensemble, and a server may belong to several of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loglet {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub start_lsn: i64,
 }
 
@@ -86,8 +87,17 @@ fn validate(config: &StreamConfig) -> rtdb_types::Result<()> {
     if config.servers.is_empty() || config.stream.is_empty() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a stream needs a name and at least one server"));
     }
-    if config.servers.iter().collect::<BTreeSet<_>>().len() != config.servers.len() {
+    if config.servers.iter().map(JournalEndpoint::address).collect::<BTreeSet<_>>().len() != config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a server address can occupy only one slot per ensemble"));
+    }
+    let mut journals = BTreeSet::new();
+    for journal in config.servers.iter().filter_map(JournalEndpoint::journal) {
+        if !valid_journal_identity(journal) || !journals.insert(journal) {
+            return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "each member slot needs a distinct journal identity"));
+        }
+    }
+    if !journals.is_empty() && journals.len() != config.servers.len() {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a member ensemble needs an identity for every slot"));
     }
     if config.write_quorum == 0 || config.write_quorum > config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", format!("write quorum {} must be between 1 and the {} servers", config.write_quorum, config.servers.len())));
@@ -157,6 +167,30 @@ pub async fn copy_retained(source: StreamConfig, destination: StreamConfig, epoc
     Ok(())
 }
 
+/// Quorum-commits one page of a reserved target genesis. A replayed page is
+/// accepted only if its stored overlap agrees byte for byte. Only the terminal
+/// page asserts that the destination ends at this page's last offset.
+pub async fn bootstrap_committed_page(
+    config: &StreamConfig, epoch: u64, checkpoint: LogOffset, first: LogOffset,
+    entries: &[crate::protocol::Entry], terminal: bool,
+) -> rtdb_types::Result<()> {
+    validate(config)?;
+    let bytes = entries.iter().try_fold(0usize, |total, entry| total.checked_add(entry.encoded_len() + 16));
+    if epoch == 0 || checkpoint.0 < -1 || first.0 <= checkpoint.0 || entries.len() > 4096
+        || bytes.is_none_or(|bytes| bytes as u64 > MAXIMUM_BATCH_BYTES)
+        || first.0.checked_add(entries.len() as i64).is_none() || (entries.is_empty() && !terminal)
+        || entries.iter().enumerate().any(|(offset, entry)|
+            entry.lsn != first.0 + offset as i64 || entry.epoch == 0
+                || entry.epoch > epoch || entry.payload.len() > config.maximum_message_bytes)
+    {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/bootstrap", "The replica genesis page does not follow its checkpoint"));
+    }
+    Writer::bootstrap_committed_page(
+        &Ensemble::new(config.clone()), epoch, checkpoint.0, first.0, entries, terminal,
+    ).await?;
+    Ok(())
+}
+
 /// Reads committed entries from whichever reachable server has the highest commit lsn, failing over on error.
 pub async fn open_reader(config: StreamConfig, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
     validate(&config)?;
@@ -200,6 +234,15 @@ pub async fn seal(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<LogOf
     Ok(LogOffset(replies.iter().map(|(_, sealed)| sealed.last_lsn).max().unwrap_or(-1)))
 }
 
+/// Fences the original stream and settles exactly the history its normal
+/// recovery would select. The settled epoch has no activated append writer.
+pub async fn seal_recover_committed(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<LogOffset> {
+    validate(config)?;
+    if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "epochs start at 1")); }
+    let ensemble = Ensemble::new(config.clone());
+    Ok(LogOffset(Writer::seal_recover_committed(&ensemble, epoch).await?))
+}
+
 /// Lets every server drop entries at or below `through`, which must be committed.
 pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Result<()> {
     validate(config)?;
@@ -229,7 +272,7 @@ pub async fn drop_stream(config: &StreamConfig, epoch: u64) -> rtdb_types::Resul
             Ok(Ack::Refused(refused)) => format!("promised epoch {}", refused.promised),
             Err(error) => error.to_string(),
         };
-        failures.push(format!("{}: {failure}", config.servers[server]));
+        failures.push(format!("{}: {failure}", config.servers[server].address()));
     }
     if failures.is_empty() { return Ok(()); }
     Err(Error::Remote { key: config.stream.clone(), message: format!("stream drop is incomplete: {}", failures.join("; ")) }.into())
@@ -250,6 +293,36 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()>
 }
 
 impl QuorumLog {
+    /// Bounds writes completed before this call on the exact active ensemble.
+    /// The caller must wait for committed application through the returned position.
+    pub async fn read_index(&self, epoch: u64) -> Result<LogOffset> {
+        let ensemble = &self.shared.ensemble;
+        let quorum = ensemble.config.write_quorum;
+        let unavailable = |message: &str| Error::Remote { key: ensemble.config.stream.clone(), message: message.into() };
+        if quorum <= ensemble.len() / 2 { return Err(unavailable("read indexes require intersecting write quorums")); }
+        let mut replies: FuturesUnordered<_> = (0..ensemble.len()).map(|server| ensemble.read_index(server, epoch)).collect();
+        let mut confirmed = 0;
+        let mut last = -1;
+        loop {
+            let reply = tokio::select! {
+                _ = self.shared.cancellation.cancelled() => return Err(Error::Closed("quorum log closed".into())),
+                reply = replies.next() => reply,
+            };
+            let Some(reply) = reply else { break };
+            match reply {
+                Ok(Ack::Accepted(held)) => {
+                    confirmed += 1;
+                    last = last.max(held.last_lsn);
+                    if confirmed == quorum { return Ok(LogOffset(last)); }
+                }
+                Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
+                _ => (),
+            }
+            if confirmed + replies.len() < quorum { break; }
+        }
+        Err(unavailable("a write quorum did not confirm the active loglet"))
+    }
+
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
     pub fn loglets(&self) -> Vec<Loglet> {
         let shared = &self.shared;
@@ -258,7 +331,7 @@ impl QuorumLog {
             .collect()
     }
 
-    /// For the stream's writer: succeeds once a write quorum of servers has confirmed, in a round that started after this call, that the stream is not sealed beyond the writer's epoch.
+    /// For the stream's writer: succeeds once a write quorum has confirmed the writer's promised and synced epoch in a round that started after this call.
     /// A read served afterwards from what the writer had committed is linearizable, since no successor can have committed before the call began; this involves no clock.
     /// Concurrent callers share one round, so a burst costs at most two; a server reporting a higher promise deposes the writer, failing this and its appends with `Error::Deposed`.
     pub async fn confirm_leadership(&self) -> rtdb_types::Result<()> {
@@ -267,6 +340,16 @@ impl QuorumLog {
         tokio::select! {
             _ = self.shared.cancellation.cancelled() => Err(Error::Closed("shutdown".into()).into()),
             confirmed = writer.confirm_leadership() => confirmed.map_err(Into::into),
+        }
+    }
+
+    /// Confirms only the active epoch, using the installed read-only journal port.
+    pub async fn confirm_authority(&self, port: u16) -> rtdb_types::Result<()> {
+        self.shared.check_open()?;
+        let Role::Writer(writer) = &self.shared.role else { return Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream)).into()) };
+        tokio::select! {
+            _ = self.shared.cancellation.cancelled() => Err(Error::Closed("shutdown".into()).into()),
+            confirmed = writer.confirm_authority(port) => confirmed.map_err(Into::into),
         }
     }
 }
@@ -419,6 +502,10 @@ impl Shared {
 
 #[async_trait]
 impl Log for QuorumLog {
+    fn maximum_append_bytes(&self) -> Option<usize> {
+        matches!(&self.shared.role, Role::Writer(_)).then_some(self.shared.ensemble.config.maximum_message_bytes)
+    }
+
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         let maximum = self.shared.ensemble.config.maximum_message_bytes;
         if payload.len() > maximum { return Err(Error::MessageTooLarge { size: payload.len(), maximum }); }
@@ -435,6 +522,10 @@ impl Log for QuorumLog {
         let (_, trim) = self.shared.bounds().await?;
         let first = trim.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         Ok(Some(LogOffset(first)))
+    }
+
+    async fn recovery_tail(&self, after: LogOffset) -> Result<Option<Box<dyn LogTail>>> {
+        self.tail(after).await.map(Some)
     }
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {

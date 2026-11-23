@@ -448,6 +448,15 @@ return rr.Diagram(rr.Choice(0, begin, 'COMMIT', 'ROLLBACK'))
 * `BEGIN`, `START TRANSACTION`, `COMMIT` and `ROLLBACK` are SQL statements over the Postgres wire protocol only.
   [ADBC](/adbc) and Flight SQL clients open and end transactions through their own transaction API, and reject these statements as SQL; they set a transaction's options with [`SET TRANSACTION`](#set-transaction-v22).
 
+On a placed RTDB deployment, `COMMIT ASYNC` makes an attempt receipt available through `SHOW AWAIT_TOKEN` or the `await_token` column of `SHOW LATEST_SUBMITTED_TX`.
+Pass the receipt as `AWAIT_TOKEN` on a connection authenticated as the same user to the same deployment.
+A read waits for the exact attempt's durable outcome before pinning its basis.
+The receipt is valid for one hour from submission.
+If failover closes the attempt's writer epoch before it commits a durable outcome, a later read with that receipt reports `rtdb/attempt-unresolved`.
+After a synchronous commit, the await token identifies an applied replica prefix and remains valid across writer changes in that deployment.
+A connection routed with `rtdb.read=snapshot` uses the directory's verified checkpoint receipt to confirm covered await tokens.
+If the checkpoint is too old to confirm the token, the read returns `rtdb/checkpoint-behind`.
+
 ### SET TRANSACTION (v2.2+)
 
 ```railroad

@@ -1,13 +1,13 @@
 {
   "summary": "The compaction heap initializes one head per ordered page, extracts the minimum occurrence and retains exactly the remaining cursors.",
-  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws", "--rlimit", "30"],
   "min_verified_functions": 20,
   "controls": {
     "reverse_system_time": {
       "mutate": [{
         "file": "rust/crates/maintenance/src/merge/row_heap.rs",
-        "find": "left.1 > right.1",
-        "replace": "left.1 < right.1"
+        "find": "(left.1 > right.1 || (left.1 == right.1 && left.2 > right.2))",
+        "replace": "(left.1 < right.1 || (left.1 == right.1 && left.2 > right.2))"
       }],
       "expect": [{
         "file": "rust/crates/maintenance/src/merge/row_heap.rs",

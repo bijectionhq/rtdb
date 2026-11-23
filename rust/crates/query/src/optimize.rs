@@ -9,7 +9,7 @@ pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
 
 fn prepare_with(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<Relation>> {
     let required = relation.schema().ids();
-    annotate_top_k(prune(relation, &required, ids)?)
+    annotate_top_k(prune(relation, &required, ids)?, ids)
 }
 
 /// Column ids no field or expression of the plan uses, for the columns the optimizer adds.
@@ -103,13 +103,24 @@ fn has_match(predicate: &Expr) -> bool {
 
 /// Marks the scan under `ORDER BY search_score(column, query) DESC ... LIMIT n` with that ranking, when only projections stand between them and the scan has a MATCH on the same column.
 /// The scan may then hand on only the rows that can be among the first n, which is what the sort above would keep.
-fn annotate_top_k(relation: Arc<Relation>) -> Result<Arc<Relation>> {
+fn annotate_top_k(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<Relation>> {
     let rebuilt = match relation.node() {
-        RelationNode::Project { input, expressions } => RelationNode::Project { input: annotate_top_k(Arc::clone(input))?, expressions: expressions.clone() },
-        RelationNode::Rename { input, prefix, expressions } => RelationNode::Rename { input: annotate_top_k(Arc::clone(input))?, prefix: prefix.clone(), expressions: expressions.clone() },
+        RelationNode::Project { input, expressions } => RelationNode::Project { input: annotate_top_k(Arc::clone(input), ids)?, expressions: expressions.clone() },
+        RelationNode::Rename { input, prefix, expressions } => RelationNode::Rename { input: annotate_top_k(Arc::clone(input), ids)?, prefix: prefix.clone(), expressions: expressions.clone() },
         RelationNode::SortLimit { input, order_by, offset, fetch: Some(fetch) } => {
             let limit = match offset { Some(offset) => Expr::binary(BinaryOp::Add, offset.clone(), fetch.clone()), None => fetch.clone() };
             let Some(input) = push_top_k(input, order_by, &limit, &[], false)? else { return Ok(relation) };
+            if let Some(first) = order_by.first()
+                && let Some((input, field)) = add_ranked_score(&input, &first.expr, ids)?
+            {
+                let mut order_by = order_by.clone();
+                order_by[0].expr = field.expression();
+                let sorted = Arc::new(Relation::new(input.schema().clone(), RelationNode::SortLimit {
+                    input, order_by, offset: offset.clone(), fetch: Some(fetch.clone()),
+                })?);
+                let output = relation.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
+                return Ok(Arc::new(sorted.project(output)?));
+            }
             RelationNode::SortLimit { input, order_by: order_by.clone(), offset: offset.clone(), fetch: Some(fetch.clone()) }
         }
         _ => return Ok(relation),
@@ -152,8 +163,10 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
             RelationNode::Filter { input, predicate: predicate.clone() }
         }
         RelationNode::Distinct { input } if !distinct => {
-            let ([field], [sort]) = (relation.schema().fields(), order) else { return Ok(None) };
-            if !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id) {
+            let fields = relation.schema().fields();
+            if fields.len() != order.len() || fields.iter().any(|field| {
+                !order.iter().any(|sort| matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id))
+            }) {
                 return Ok(None);
             }
             let Some(input) = push_top_k(input, order, limit, residuals, true)? else { return Ok(None) };
@@ -175,7 +188,16 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
                 let name = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str());
                 let evaluated: Vec<ColumnId> = scan.matches.iter().filter(|evaluated| Some(evaluated.column.as_str()) == name).map(|evaluated| evaluated.id).collect();
                 if !scan.predicates.iter().any(|predicate| has_match_on(predicate, *id, &evaluated)) { return Ok(None); }
-                scan.top_k = Some(rtdb_plan::ScanTopK { column: *id, query: query.clone(), limit: limit.clone() });
+                let ascending_id = match order {
+                    [_, tie, ..] if !tie.descending => match &tie.expr {
+                        Expr::Column { id, .. } if scan.columns.iter().any(|field| field.id == *id && field.name == "_id") => Some(*id),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                scan.top_k = Some(rtdb_plan::ScanTopK {
+                    column: *id, query: query.clone(), limit: limit.clone(), score: None, ascending_id,
+                });
             }
             return Ok(Some(Arc::new(Relation::scan(scan)?)));
         }
@@ -184,7 +206,68 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
     Ok(Some(Arc::new(Relation::new(relation.schema().clone(), node)?)))
 }
 
+fn add_ranked_score(
+    relation: &Arc<Relation>, expression: &Expr, ids: &mut Ids,
+) -> Result<Option<(Arc<Relation>, rtdb_plan::Field)>> {
+    let mut rebuilt = |input: &Arc<Relation>, expressions: &[NamedExpr]| -> Result<Option<_>> {
+        let mut pushed = expression.clone();
+        pushed.rewrite(&mut |expression| {
+            if let Expr::Column { id, .. } = expression
+                && let Some(named) = expressions.iter().find(|named| named.field.id == *id)
+            {
+                *expression = named.expr.clone();
+            }
+        });
+        let Some((input, score)) = add_ranked_score(input, &pushed, ids)? else { return Ok(None); };
+        let expressions = expressions.iter().map(|named| NamedExpr {
+            field: named.field.clone(),
+            expr: if named.expr == pushed { score.expression() } else { named.expr.clone() },
+        }).collect::<Vec<_>>();
+        Ok(Some((input, score, expressions)))
+    };
+    let (node, field) = match relation.node() {
+        RelationNode::Scan(scan) => {
+            let mut scan = scan.clone();
+            let Some(top_k) = &mut scan.top_k else { return Ok(None); };
+            let Expr::Call { name, args, return_type } = expression else { return Ok(None); };
+            if !name.eq_ignore_ascii_case("search_score")
+                || !matches!(args.as_slice(), [Expr::Column { id, .. }, query] if *id == top_k.column && query == &top_k.query)
+            {
+                return Ok(None);
+            }
+            let id = ids.next()?;
+            let field = rtdb_plan::Field {
+                id, name: format!("search_score_{}", id.0), qualifier: None,
+                qualified_only: true, unnamed: true, data_type: return_type.clone().maybe(),
+            };
+            top_k.score = Some(id);
+            scan.columns.push(field.clone());
+            return Ok(Some((Arc::new(Relation::scan(scan)?), field)));
+        }
+        RelationNode::Project { input, expressions } => {
+            let Some((input, score, mut expressions)) = rebuilt(input, expressions)? else { return Ok(None); };
+            expressions.push(NamedExpr { field: score.clone(), expr: score.expression() });
+            (RelationNode::Project { input, expressions }, score)
+        }
+        RelationNode::Rename { input, expressions, prefix } => {
+            let Some((input, score, mut expressions)) = rebuilt(input, expressions)? else { return Ok(None); };
+            expressions.push(NamedExpr { field: score.clone(), expr: score.expression() });
+            (RelationNode::Rename { input, prefix: prefix.clone(), expressions }, score)
+        }
+        RelationNode::Extend { input, expressions } => {
+            let Some((input, score, expressions)) = rebuilt(input, expressions)? else { return Ok(None); };
+            return Ok(Some((Arc::new(input.extend(expressions)?), score)));
+        }
+        _ => return Ok(None),
+    };
+    let schema = Schema::new(relation.schema().fields().iter().cloned().chain([field.clone()]).collect())?;
+    Ok(Some((Arc::new(Relation::new(schema, node)?), field)))
+}
+
 fn ordered_index_filter(expression: &Expr) -> bool {
+    if let Expr::Unary { op: rtdb_plan::UnaryOp::IsNull | rtdb_plan::UnaryOp::IsNotNull, expr } = expression {
+        return matches!(expr.as_ref(), Expr::Column { .. });
+    }
     let Expr::Binary { op, left, right } = expression else { return false; };
     if matches!(op, BinaryOp::And | BinaryOp::Or) {
         return ordered_index_filter(left) && ordered_index_filter(right);
@@ -204,6 +287,10 @@ fn has_match_on(predicate: &Expr, column: ColumnId, evaluated: &[ColumnId]) -> b
 }
 
 fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) -> Result<Arc<Relation>> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || prune_at(relation, required, ids))
+}
+
+fn prune_at(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) -> Result<Arc<Relation>> {
     match relation.node() {
         RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
             let expressions = expressions.iter().filter(|named| required.contains(&named.field.id)).cloned().collect::<Vec<_>>();
@@ -279,7 +366,7 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) 
                 columns.extend(aggregate.argument.iter().chain(&aggregate.filter).flat_map(Expr::referenced_columns));
                 columns.extend(aggregate.order_by.iter().flat_map(|order| order.expr.referenced_columns()));
             }
-            let input = annotate_top_k(prune(Arc::clone(input), &columns, ids)?)?;
+            let input = annotate_top_k(prune(Arc::clone(input), &columns, ids)?, ids)?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() })?))
         }
         RelationNode::Window { input, partition_by, order_by, expressions } => {

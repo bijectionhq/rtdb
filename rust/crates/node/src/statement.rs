@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{MemoryReservation, OwnedBatch, Selection};
 use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
@@ -21,18 +21,30 @@ struct PreparedData {
     _reservation: Arc<MemoryReservation>,
     plan: std::sync::Mutex<Option<CachedPlan>>,
 }
-enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType> }, Dml }
+enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType>, parameter_projection: bool }, Dml }
 
 /// An immutable SQL preparation; each query execution binds against its supplied snapshot.
 /// Session access checks and read-basis capture precede this API and remain the caller's obligation.
 #[derive(Clone)]
 pub struct PreparedSql(Arc<PreparedData>);
 
-/// Binding and planning recurse as deep as the statement's expressions nest, which only long source can reach,
-/// so a long statement is prepared on a stack of its own rather than overflowing the caller's.
 fn deep<T>(source: &str, prepare: impl FnOnce() -> T) -> T {
     const DEEP_SOURCE_BYTES: usize = 4096;
-    if source.len() < DEEP_SOURCE_BYTES { prepare() } else { stacker::grow(64 << 20, prepare) }
+    if source.len() >= DEEP_SOURCE_BYTES {
+        stacker::grow(64 << 20, prepare)
+    } else {
+        stacker::maybe_grow(512 << 10, 8 << 20, prepare)
+    }
+}
+
+#[cfg(test)]
+mod stack_tests {
+    #[test]
+    fn short_sql_preparation_checks_the_callers_remaining_stack() {
+        stacker::grow(128 << 10, || {
+            super::deep("SELECT 1", || assert!(stacker::remaining_stack().unwrap() > 512 << 10));
+        });
+    }
 }
 
 impl PreparedSql {
@@ -126,7 +138,7 @@ impl PreparedSql {
                     query.schema().clone()
                 };
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
-                PreparedResult::Query { schema, pg_types }
+                PreparedResult::Query { schema, pg_types, parameter_projection: query.is_parameter_projection() }
             }
             StatementKind::Session => return Err(session_statement(source, &options, &context.memory)),
         };
@@ -167,25 +179,67 @@ impl PreparedSql {
 
     /// Opens one argument row using its vector field types, preserving typed nulls and empty containers.
     /// Unsigned storage types and values enter execution at the corresponding signed width.
-    pub async fn open_query_typed(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
+    pub async fn open_query_typed(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
+        self.open_query_batches(context, arguments, types, false).await
+    }
+
+    /// Opens Arrow batches directly for a client that consumes Arrow.
+    pub async fn open_query_columns_typed(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
+        self.open_query_batches(context, arguments, types, true).await
+    }
+
+    pub async fn try_open_query_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<Option<QueryCursor>> {
+        if arguments.batch().num_rows() == 0 || !self.0.options.parameter_types.is_empty() { return Ok(None); }
+        if arguments.batch().num_columns() != self.parameter_count() {
+            return Err(parameter_error("Argument count differs from the prepared statement"));
+        }
+        if let Some(cursor) = self.try_open_parameter_projection(Arc::clone(&context), arguments, types).await? {
+            return Ok(Some(cursor));
+        }
+        let arguments = if arguments.batch().num_rows() == 1 {
+            arguments.clone()
+        } else {
+            match arguments.select(&Selection::Indices(vec![0])) {
+                Ok(row) => row,
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        };
+        let query = deep(self.source(), || self.bind(&context, types, true))?;
+        if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
+        let cursor = query.execute_arrow_columns(context, arguments, 0, types, Some(self.source())).await?;
+        if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
+        Ok(Some(cursor))
+    }
+
+    /// Uses the first Arrow parameter row directly when the query only projects parameters.
+    pub async fn try_open_parameter_projection(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<Option<QueryCursor>> {
+        if !matches!(&self.0.result, PreparedResult::Query { parameter_projection: true, .. })
+            || self.0.policy != ResultSignaturePolicy::Dynamic || !self.0.options.parameter_types.is_empty()
+            || arguments.batch().num_rows() == 0 || types.len() != self.parameter_count() {
+            return Ok(None);
+        }
+        let projection = async {
+            let query = deep(self.source(), || self.bind(&context, types, true))?;
+            query.execute_parameter_projection(context, arguments, types, Some(self.source())).await
+        }.await;
+        match projection {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            result => result,
+        }
+    }
+
+    async fn open_query_batches(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType], columnar: bool) -> Result<QueryCursor> {
         if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
         arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
         let query = deep(self.source(), || self.bind(&context, types, true))?;
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
-        let cursor = query.execute_with_text(context, arguments, Some(self.source())).await?;
-        if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
-        Ok(cursor)
-    }
-
-    pub async fn open_query_arrow(&self, context: Arc<QueryContext>, arguments: rtdb_columnar::OwnedBatch) -> Result<QueryCursor> {
-        let schema = arguments.batch().schema_ref();
-        if schema.fields().len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
-        let _schema = context.memory.reserve(rtdb_format::ipc::schema_translation_bound(schema)?)?;
-        let types = schema.fields().iter().map(|field| rtdb_columnar::from_field(field)).collect::<Result<Vec<_>>>()?;
-        let query = deep(self.source(), || self.bind(&context, &types, true))?;
-        if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
-        let cursor = query.execute_arrow(context, arguments, Some(self.source()), &self.0.options.parameter_types).await?;
+        let cursor = if columnar {
+            query.execute_columns_with_text(context, arguments, Some(self.source())).await?
+        } else {
+            query.execute_column_rows(context, arguments, Some(self.source())).await?
+        };
         if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
         Ok(cursor)
     }
@@ -221,7 +275,7 @@ impl PreparedSql {
     }
 
     fn check_signature(&self, actual: &Schema) -> Result<()> {
-        let PreparedResult::Query { schema, pg_types } = &self.0.result else { return Err(kind_error()); };
+        let PreparedResult::Query { schema, pg_types, .. } = &self.0.result else { return Err(kind_error()); };
         let compatible = match self.0.policy {
             ResultSignaturePolicy::Dynamic => true,
             ResultSignaturePolicy::Exact => schema.fields().iter().map(|field| (&field.name, &field.data_type)).eq(actual.fields().iter().map(|field| (&field.name, &field.data_type))),
@@ -289,7 +343,7 @@ fn retained_bytes(source: &String, options: &PrepareOptions, parameters: &Vec<Lo
     bytes = bytes.checked_add(options.search_path.capacity().checked_mul(std::mem::size_of::<String>()).ok_or_else(size_error)?).and_then(|n| n.checked_add(parameters.capacity().checked_mul(std::mem::size_of::<LogicalType>())?)).ok_or_else(size_error)?;
     bytes = bytes.checked_add(notices.capacity().checked_mul(std::mem::size_of::<SqlNotice>()).ok_or_else(size_error)?).ok_or_else(size_error)?;
     for notice in notices { bytes = bytes.checked_add(notice.message.capacity()).ok_or_else(size_error)?; }
-    if let PreparedResult::Query { schema, pg_types } = result {
+    if let PreparedResult::Query { schema, pg_types, .. } = result {
         bytes = bytes.checked_add(pg_types.capacity().checked_mul(std::mem::size_of::<PgType>()).ok_or_else(size_error)?).ok_or_else(size_error)?;
         for field in schema.fields() { bytes = bytes.checked_add(field.data_type.retained_bytes()?).and_then(|n| n.checked_add(field.name.capacity())).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }
     }

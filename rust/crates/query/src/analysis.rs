@@ -28,6 +28,18 @@ pub(crate) struct AnalysisNode {
     _reservation: Arc<MemoryReservation>,
 }
 impl AnalysisNode {
+    fn observe(&self, elapsed: Duration, rows: Option<usize>, scan: Option<ScanCounts>) -> Result<()> {
+        let mut counts = self.counts.lock().map_err(|_| invalid("analysis-state", "Analysis counters were poisoned"))?;
+        counts.total = counts.total.saturating_add(elapsed);
+        if let Some(rows) = rows {
+            counts.first.get_or_insert(elapsed);
+            counts.pages = counts.pages.wrapping_add(1);
+            counts.rows = counts.rows.wrapping_add(rows as i64);
+        }
+        if let Some(scan) = scan { counts.scan = scan; }
+        Ok(())
+    }
+
     pub fn new(relation: &Relation, context: &Arc<QueryContext>) -> Result<Arc<Self>> {
         let reservation = context.memory.reserve(bound(relation)?)?;
         Self::build(relation, &reservation)
@@ -112,14 +124,29 @@ impl PageCursor for Measured {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         let started = Instant::now();
         let result = self.input.next_page().await;
-        let elapsed = started.elapsed();
-        let mut counts = self.node.counts.lock().map_err(|_| invalid("analysis-state", "Analysis counters were poisoned"))?;
-        counts.total = counts.total.saturating_add(elapsed);
-        if let Ok(Some(page)) = &result {
-            counts.first.get_or_insert(elapsed); counts.pages = counts.pages.wrapping_add(1); counts.rows = counts.rows.wrapping_add(page.len() as i64);
-        }
-        if let Some(scan) = self.input.scan_counts() { counts.scan = scan; }
+        self.node.observe(started.elapsed(), result.as_ref().ok().and_then(|page| page.as_ref()).map(OwnedPage::len), self.input.scan_counts())?;
         result
+    }
+    fn scan_counts(&self) -> Option<ScanCounts> { self.input.scan_counts() }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
+}
+
+pub(crate) fn wrap_batches(input: crate::columnar::BoxBatchCursor, node: Option<Arc<AnalysisNode>>) -> crate::columnar::BoxBatchCursor {
+    match node { Some(node) => Box::new(MeasuredBatches { input, node }), None => input }
+}
+
+struct MeasuredBatches { input: crate::columnar::BoxBatchCursor, node: Arc<AnalysisNode> }
+
+#[async_trait]
+impl crate::columnar::BatchCursor for MeasuredBatches {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        let started = Instant::now();
+        let result = self.input.next_batch().await;
+        self.node.observe(started.elapsed(), result.as_ref().ok().and_then(|batch| batch.as_ref()).map(|batch| batch.len), self.input.scan_counts())?;
+        result
+    }
+    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> {
+        self.input.skip_complete_pages(rows)
     }
     fn scan_counts(&self) -> Option<ScanCounts> { self.input.scan_counts() }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }

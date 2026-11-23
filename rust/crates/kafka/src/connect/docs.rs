@@ -131,7 +131,7 @@ impl TransactionWriter for DocWriter {
     async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
         let system_from = transaction.tx_key().system_time;
         let operation = self.operation.take().ok_or_else(|| error("indexer-reused", "Document writer was already resolved"))?;
-        transaction.append(self.table.clone(), StoredEvent { iid: self.iid, system_from, valid_time: Interval::new(system_from, Timestamp::MAX)?, operation, recency: None })?;
+        transaction.append(self.table.clone(), StoredEvent { commit_position: 0, entity_key: None, iid: self.iid, system_from, valid_time: Interval::new(system_from, Timestamp::MAX)?, operation, recency: None })?;
         Ok(WriterResult::Committed { user_metadata: None })
     }
 }

@@ -7,8 +7,10 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::basis::{decode_time_basis, decode_tx_basis, encode_time_basis, encode_tx_basis};
 use rtdb_plan::AccessMode;
 use rtdb_tx::{SubmitOptions, SubmittedTx, TransactionResult, TxOp, UserMetadata};
-use rtdb_types::{Anomaly, Result, TimeBasis, Instant, Timestamp, TxBasis, TxId};
+use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio_util::sync::CancellationToken;
+
+use crate::placed_receipts::is_placed_token;
 
 #[async_trait]
 pub trait SessionService: Send + Sync {
@@ -21,9 +23,21 @@ pub trait SessionService: Send + Sync {
     /// Supplies the query clock; implementations with finer precision override the microsecond clock lift.
     fn query_instant(&self) -> Instant { self.now().into() }
     fn snapshot_basis(&self) -> Result<TimeBasis>;
+    async fn fresh_snapshot_basis(&self, _cancellation: &CancellationToken) -> Result<TimeBasis> { self.snapshot_basis() }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()>;
+    async fn await_client_token(&self, token: Option<&str>, timeout: Duration, cancellation: &CancellationToken) -> Result<Option<String>> {
+        self.await_basis(token.map(decode_tx_basis).transpose()?, timeout, cancellation).await?;
+        Ok(None)
+    }
+    async fn check_submission_basis(&self, _database: &str, _token: Option<&str>, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx>;
+    async fn submit_replay(&self, _database: &str, _operations: Vec<TxOp>, _options: SubmitOptions, _permit: ReplaySubmissionPermit, _cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        Err(Anomaly::unsupported("rtdb.node/private-replay-unsupported", "This session service cannot submit a private replay"))
+    }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult>;
+    async fn await_submission(&self, database: &str, submitted: &SubmittedTx, cancellation: &CancellationToken) -> Result<(TransactionResult, Option<String>)> {
+        Ok((self.await_transaction(database, submitted.tx_id, cancellation).await?, None))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,8 +84,22 @@ pub struct TransactionSettings {
     pub timezone: OptionUpdate<String>,
 }
 
+/// A trusted frontend's one-command key and exclusive submission cutoff in UTC microseconds.
+/// The key is 32 hexadecimal digits followed by `/0`.
+/// The frontend supplies the same permit on the initial submission and each retry.
+pub struct ReplaySubmissionPermit {
+    pub key: String,
+    pub not_after: Timestamp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitMode { Sync, Async }
+
+enum Submission {
+    Ordinary,
+    Replay(ReplaySubmissionPermit),
+    PresentReservation,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionStatus { Idle, Pending, Reading, Writing, Failed, Closed }
@@ -125,8 +153,30 @@ struct DmlBuffer { operations: Vec<BufferedOperation> }
 impl DmlBuffer {
     fn append(&mut self, operation: TxOp, memory: &Arc<MemoryBudget>) -> Result<()> {
         let bytes = match &operation {
+            TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } => relation.name().len(),
+            TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedSweepExpired { relation, id, .. } => relation.name().len()
+                .checked_add(id.as_value().retained_bytes()?).ok_or_else(allocation_overflow)?,
+            TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column } =>
+                (relation.name().len() + name.name().len()).checked_add(column.capacity()).ok_or_else(allocation_overflow)?,
+            TxOp::OwnedCheckCapacity { relation, column, prefix, .. } => relation.name().len()
+                .checked_add(column.capacity()).and_then(|bytes| bytes.checked_add(prefix.capacity()))
+                .ok_or_else(allocation_overflow)?,
+            TxOp::OwnedDeclareCapacity { relation, column, when, .. } =>
+                (relation.name().len() + column.capacity()).checked_add(when.capacity()).ok_or_else(allocation_overflow)?,
+            TxOp::OwnedDeclareRelation { relation, schema } => relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(allocation_overflow)?,
+            TxOp::OwnedDeclarePath { relation, name, columns } => columns.iter().try_fold(
+                relation.name().len() + name.name().len(), |bytes, column| bytes.checked_add(column.capacity() + 64).ok_or_else(allocation_overflow),
+            )?,
+            TxOp::HostedControl(control) => control.retained_bytes()?,
+            TxOp::OwnedForkWorld { record, attempt, .. } => Value::document_retained_bytes(record)?.saturating_add(attempt.len() + 128),
+            TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. } => attempt.len() + 128,
+            TxOp::OwnedCheckWorldPurge { relation, .. } => relation.name().len(),
+            TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal => 0,
+            TxOp::OwnedDeclareFixedRange { relation, rule } => relation.name().len() + rule.path.capacity() + rule.column.capacity(),
+            TxOp::OwnedCheckRange { relation, fixed, .. } =>
+                relation.name().len() + fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes()),
             TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. } => sql.capacity(),
-            TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,
+            TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,
         }.checked_add(std::mem::size_of::<BufferedOperation>() * 2 + 128).ok_or_else(allocation_overflow)?;
         let reservation = memory.reserve(bytes)?;
         match (self.operations.last_mut().map(|entry| &mut entry.operation), operation) {
@@ -203,6 +253,7 @@ pub struct Session {
     settings_revision: u64,
     last_submitted: Option<LastSubmittedTx>,
     parameters: BTreeMap<String, Parameter>,
+    gateway_key: Option<(RetainedText, u64)>,
     /// The session key its transactions were last keyed under, and the sequence number of the next.
     idempotency_sequence: Option<(String, u64)>,
     cancellation: CancellationToken,
@@ -215,7 +266,7 @@ impl Session {
         let database = RetainedText::new(database.into(), service.memory())?;
         let timezone = RetainedText::new(timezone, service.memory())?;
         Ok(Self { service, database, lifecycle: Lifecycle::Open(None), auto_commit: true, default_access_mode: None,
-            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, settings_revision: 0, last_submitted: None, parameters: BTreeMap::new(), idempotency_sequence: None, cancellation: parent.child_token() })
+            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, settings_revision: 0, last_submitted: None, parameters: BTreeMap::new(), gateway_key: None, idempotency_sequence: None, cancellation: parent.child_token() })
     }
     fn ensure_open(&self) -> Result<()> {
         if matches!(self.lifecycle, Lifecycle::Closed) { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); }
@@ -244,6 +295,14 @@ impl Session {
     pub fn effective_await_token(&self) -> Option<&str> { self.transaction().and_then(Transaction::await_token).or(self.await_token.as_deref()) }
     pub fn connection_await_token(&self) -> (u64, Option<&str>) { (self.await_token_revision, self.await_token.as_deref()) }
     pub fn last_submitted(&self) -> Option<&LastSubmittedTx> { self.last_submitted.as_ref() }
+    pub fn last_submitted_await_token(&self) -> Option<&str> {
+        if let Some(LastSubmittedTx::Submitted(tx)) = self.last_submitted()
+            && let Some(receipt) = &tx.placed_receipt
+        {
+            return Some(receipt);
+        }
+        self.effective_await_token()
+    }
     pub fn cancellation(&self) -> &CancellationToken { &self.cancellation }
     pub fn status(&self) -> TransactionStatus {
         match &self.lifecycle {
@@ -284,6 +343,11 @@ impl Session {
             self.settings_revision = self.settings_revision.wrapping_add(1);
         }
         self.parameters.insert(name, Parameter { value, _entry: entry });
+        Ok(())
+    }
+    pub fn set_gateway_key(&mut self, key: String) -> Result<()> {
+        self.ensure_open()?;
+        self.gateway_key = Some((RetainedText::new(key, self.service.memory())?, 0));
         Ok(())
     }
     pub fn settings_revision(&self) -> u64 { self.settings_revision }
@@ -375,7 +439,7 @@ impl Session {
                 let old = match &tx.phase { Phase::Pending(Some(options)) => options.clone(), _ => ReadOptions::default() };
                 let options = ReadOptions { snapshot_token: update_text(&settings.snapshot_token, &old.snapshot_token, &memory)?, snapshot_time: settings.snapshot_time.apply(&old.snapshot_time),
                     clock_time: settings.clock_time.apply(&old.clock_time), await_token: update_text(&settings.await_token, &old.await_token, &memory)? };
-                if let Some(token) = &options.await_token { decode_tx_basis(token)?; }
+                if let Some(token) = &options.await_token && !is_placed_token(token) { decode_tx_basis(token)?; }
                 Some(Phase::Pending(Some(options)))
             }
             Some(AccessSettings::ReadWrite(settings)) => {
@@ -432,11 +496,14 @@ impl Session {
         self.auto_commit = enabled;
         Ok(())
     }
-    async fn pin(&self, options: &ReadOptions) -> Result<QueryBasis> {
+    async fn pin(&self, options: &ReadOptions) -> Result<(QueryBasis, Option<String>)> {
         let token = options.await_token.as_deref().or(self.await_token.as_deref());
-        self.service.await_basis(token.map(decode_tx_basis).transpose()?, Duration::from_secs(60), &self.cancellation).await?;
-        let snapshot = match &options.snapshot_token { Some(token) => decode_time_basis(token)?, None => self.service.snapshot_basis()? };
-        Ok(QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.query_instant()), timezone: self.effective_timezone().to_owned() })
+        let applied = self.service.await_client_token(token, Duration::from_secs(60), &self.cancellation).await?;
+        let snapshot = match &options.snapshot_token {
+            Some(token) => decode_time_basis(token)?,
+            None => self.service.fresh_snapshot_basis(&self.cancellation).await?,
+        };
+        Ok((QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.query_instant()), timezone: self.effective_timezone().to_owned() }, applied))
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {
         self.revalidate().await?;
@@ -449,10 +516,15 @@ impl Session {
             }
         }
         let options = match self.transaction().map(|tx| &tx.phase) { Some(Phase::Pending(Some(options))) => options.clone(), _ => ReadOptions::default() };
-        let basis = self.pin(&options).await?;
+        let (basis, applied) = self.pin(&options).await?;
+        let mut local_token = options.await_token;
+        if let Some(token) = applied {
+            if local_token.is_some() { local_token = Some(RetainedText::new(token, self.service.memory())?); }
+            else { self.set_await_token(Some(token))?; }
+        }
         if self.transaction().is_some() || !self.auto_commit {
             let retained = RetainedBasis::copy(&basis, self.service.memory())?;
-            if let Some(tx) = self.transaction_mut() { tx.phase = Phase::Reading { basis: retained, await_token: options.await_token }; }
+            if let Some(tx) = self.transaction_mut() { tx.phase = Phase::Reading { basis: retained, await_token: local_token }; }
             else { self.lifecycle = Lifecycle::Open(Some(Transaction::new(Phase::Reading { basis: retained, await_token: None }, &self.timezone))); }
         }
         Ok(basis)
@@ -463,14 +535,14 @@ impl Session {
         let options = match self.transaction().map(|tx| &tx.phase) {
             Some(Phase::Pending(Some(options))) => options.clone(),
             Some(Phase::Reading { basis, await_token }) => {
-                self.service.await_basis(await_token.as_deref().or(self.await_token.as_deref()).map(decode_tx_basis).transpose()?, Duration::from_secs(60), &self.cancellation).await?;
+                self.service.await_client_token(await_token.as_deref().or(self.await_token.as_deref()), Duration::from_secs(60), &self.cancellation).await?;
                 let mut basis = basis.basis.clone();
                 basis.timezone = self.effective_timezone().to_owned();
                 return Ok(basis);
             }
             _ => ReadOptions::default(),
         };
-        self.pin(&options).await
+        self.pin(&options).await.map(|(basis, _)| basis)
     }
     pub async fn unchecked_read_basis(&mut self) -> Result<QueryBasis> {
         if matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Pending(Some(_)) | Phase::Reading { .. })) {
@@ -511,35 +583,60 @@ impl Session {
         Ok(None)
     }
     async fn submit_operations(&mut self, operations: Vec<TxOp>, options: SubmitOptions, mode: CommitMode) -> Result<CommitResult> {
-        self.submit_to(self.database.to_string(), operations, options, mode).await
+        self.submit_to(self.database.to_string(), operations, options, mode, Submission::Ordinary).await
     }
-    async fn submit_to(&mut self, database: String, operations: Vec<TxOp>, mut options: SubmitOptions, mode: CommitMode) -> Result<CommitResult> {
+    async fn submit_to(&mut self, database: String, operations: Vec<TxOp>, mut options: SubmitOptions, mode: CommitMode, submission: Submission) -> Result<CommitResult> {
         let observer = self.service.execution_observer();
         let _sample = rtdb_plan::ExecutionSample::new(observer.clone(), match mode { CommitMode::Async => rtdb_plan::ExecutionTimer::TxSubmit, CommitMode::Sync => rtdb_plan::ExecutionTimer::TxExecute });
         self.revalidate().await?;
         self.ensure_open()?;
+        if self.default_access_mode == Some(AccessMode::ReadOnly)
+            && operations.iter().any(TxOp::is_owned)
+        {
+            return Err(Anomaly::incorrect("xtdb/read-only-tx", "Cannot write an owned relation in a read-only session"));
+        }
+        self.service.check_submission_basis(&database, self.await_token.as_deref(), &self.cancellation).await?;
         options.user = self.service.user().map(str::to_owned);
         if options.default_tz.is_empty() { options.default_tz = self.timezone.to_string(); }
-        // Each transaction submitted under a session key takes the next key in its sequence, unless its metadata names its own: a command resent under the same key replays the same sequence.
-        if let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
+        let ordinary = matches!(&submission, Submission::Ordinary);
+        let reserve_present = matches!(&submission, Submission::PresentReservation);
+        if ordinary && let Some((key, sequence)) = &mut self.gateway_key {
+            options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{}/{sequence}", &**key), self.service.memory())?);
+            *sequence += 1;
+        } else if ordinary && let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
             let sequence = match &mut self.idempotency_sequence { Some((current, next)) if *current == key => { *next += 1; *next - 1 } sequence => { *sequence = Some((key.clone(), 1)); 0 } };
             options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{key}/{sequence}"), self.service.memory())?);
         }
-        let submitted = self.service.submit(&database, operations, options, &self.cancellation).await.inspect_err(|_| {
+        let submitted = match submission {
+            Submission::Replay(permit) => self.service.submit_replay(&database, operations, options, permit, &self.cancellation).await,
+            Submission::Ordinary | Submission::PresentReservation => self.service.submit(&database, operations, options, &self.cancellation).await,
+        }.inspect_err(|_| {
             if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
         })?;
-        let next = TxBasis { databases: BTreeMap::from([(database.clone(), vec![submitted.tx_id])]) };
-        let token = match &self.await_token { Some(token) => decode_tx_basis(token)?.merge(&next)?, None => next };
-        let token = RetainedText::new(encode_tx_basis(&token), self.service.memory())?;
+        let token = if let Some(receipt) = &submitted.placed_receipt {
+            receipt.clone()
+        } else {
+            let next = TxBasis { databases: BTreeMap::from([(database.clone(), vec![submitted.tx_id])]) };
+            let token = match &self.await_token { Some(token) => decode_tx_basis(token)?.merge(&next)?, None => next };
+            encode_tx_basis(&token)
+        };
         match mode {
-            CommitMode::Async => { self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Submitted(submitted)); Ok(CommitResult::Submitted(submitted)) }
+            CommitMode::Async => {
+                self.set_await_token(Some(token))?;
+                self.last_submitted = Some(LastSubmittedTx::Submitted(submitted.clone()));
+                Ok(CommitResult::Submitted(submitted))
+            }
             CommitMode::Sync => {
-                let result = {
+                let (result, applied) = {
                     let _await = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxAwait);
-                    self.service.await_transaction(&database, submitted.tx_id, &self.cancellation).await?
+                    self.service.await_submission(&database, &submitted, &self.cancellation).await?
                 };
+                if reserve_present && result.tx_key().tx_id != submitted.tx_id {
+                    return Err(Anomaly::fault("rtdb.node/present-reservation", "The ordered present resolved at a different source position"));
+                }
                 if matches!(result, TransactionResult::Aborted { .. }) { if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
-                self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
+                self.set_await_token(Some(applied.unwrap_or(token)))?;
+                self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
                 Ok(CommitResult::Executed(result))
             }
         }
@@ -549,7 +646,7 @@ impl Session {
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/tx-already-in-progress", "Cannot submit a transaction while another is in progress on this connection - commit or roll back first")); }
         let timezone = rtdb_expr::normalize_timezone(options.default_timezone.as_deref().unwrap_or(&self.timezone))?;
         self.submit_to(options.database.unwrap_or_else(|| self.database.to_string()), operations,
-            SubmitOptions { default_tz: timezone, system_time: options.system_time, user: None, user_metadata: options.user_metadata }, mode).await
+            SubmitOptions { default_tz: timezone, system_time: options.system_time, user: None, user_metadata: options.user_metadata }, mode, Submission::Ordinary).await
     }
     pub async fn submit_tx(&mut self, operations: Vec<TxOp>, options: AutonomousTxOptions) -> Result<SubmittedTx> {
         match self.autonomous(operations, options, CommitMode::Async).await? {
@@ -563,17 +660,58 @@ impl Session {
             _ => Err(Anomaly::fault("rtdb.node/execute-result", "Synchronous execution returned no transaction result")),
         }
     }
+    pub(crate) async fn reserve_ordered_present(&mut self) -> Result<TransactionKey> {
+        self.ensure_open()?;
+        if self.default_access_mode == Some(AccessMode::ReadOnly) || self.is_read_only() {
+            return Err(Anomaly::incorrect("xtdb/read-only-tx", "Cannot reserve an ordered present in a read-only session or transaction"));
+        }
+        if !self.auto_commit || self.transaction().is_some() {
+            return Err(Anomaly::incorrect("xtdb/tx-already-in-progress", "Ordered present reservation requires an idle session in autocommit mode"));
+        }
+        let metadata = UserMetadata::new(
+            Value::Struct(rtdb_types::StructFields::from([("rtdb_present_reservation".into(), Value::Bool(true))])),
+            self.service.memory(),
+        )?;
+        let options = SubmitOptions { user_metadata: Some(metadata), default_tz: self.timezone.to_string(), ..SubmitOptions::default() };
+        let result = self.submit_to(
+            self.database.to_string(), Vec::new(), options, CommitMode::Sync, Submission::PresentReservation,
+        ).await?;
+        match result {
+            CommitResult::Executed(TransactionResult::Committed { tx_key }) => Ok(tx_key),
+            CommitResult::Executed(TransactionResult::Aborted { error: Some(error), .. }) => Err((*error).clone()),
+            _ => Err(Anomaly::fault("rtdb.node/present-reservation", "The ordered present transaction did not commit")),
+        }
+    }
+
     pub async fn commit_tx(&mut self, mode: Option<CommitMode>) -> Result<CommitResult> {
+        self.commit_tx_inner(mode, None).await
+    }
+
+    /// Commits one buffered write synchronously under a trusted frontend's private permit.
+    /// A duplicate returns the original committed key when resolution reaches its marker.
+    /// An empty or multi-operation write buffer is rejected.
+    pub async fn commit_tx_with_replay_permit(&mut self, permit: ReplaySubmissionPermit) -> Result<CommitResult> {
+        self.commit_tx_inner(Some(CommitMode::Sync), Some(permit)).await
+    }
+
+    async fn commit_tx_inner(&mut self, mode: Option<CommitMode>, replay: Option<ReplaySubmissionPermit>) -> Result<CommitResult> {
         self.revalidate().await?;
         self.require_usable_transaction()?;
         let Lifecycle::Open(tx) = &mut self.lifecycle else { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); };
-        let Some(tx) = tx.take() else { return Ok(CommitResult::NoTransaction); };
+        let Some(tx) = tx.take() else {
+            return if replay.is_some() { Err(replay_operation_count()) } else { Ok(CommitResult::NoTransaction) };
+        };
         self.replace_timezone(tx.session_timezone);
-        let Phase::Writing { buffer, options } = tx.phase else { return Ok(CommitResult::NoTransaction); };
+        let Phase::Writing { buffer, options } = tx.phase else {
+            return if replay.is_some() { Err(replay_operation_count()) } else { Ok(CommitResult::NoTransaction) };
+        };
+        if replay.is_some() && buffer.operations.len() != 1 { return Err(replay_operation_count()); }
         let mode = mode.unwrap_or(if options.asynchronous { CommitMode::Async } else { CommitMode::Sync });
         let (operations, reservations): (Vec<_>, Vec<_>) = buffer.operations.into_iter().map(|entry| (entry.operation, entry._reservation)).unzip();
-        let result = self.submit_operations(operations, SubmitOptions { default_tz: tx.timezone.to_string(), system_time: options.system_time,
-            user: None, user_metadata: options.user_metadata }, mode).await;
+        let result = self.submit_to(self.database.to_string(), operations, SubmitOptions {
+            default_tz: tx.timezone.to_string(), system_time: options.system_time,
+            user: None, user_metadata: options.user_metadata,
+        }, mode, replay.map_or(Submission::Ordinary, Submission::Replay)).await;
         drop(reservations);
         result
     }
@@ -595,3 +733,7 @@ fn update_text(update: &OptionUpdate<String>, old: &Option<RetainedText>, memory
     }
 }
 fn allocation_overflow() -> Anomaly { Anomaly::incorrect("rtdb.node/session-allocation", "Session allocation size exceeds usize") }
+
+fn replay_operation_count() -> Anomaly {
+    Anomaly::incorrect("rtdb.node/private-replay-operation-count", "Private replay requires exactly one buffered write operation")
+}

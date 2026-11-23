@@ -8,16 +8,75 @@ use common::*;
 use rtdb_directory::MemberPool;
 use rtdb_multi::{admin, deployment::CellStorage};
 
-fn storage() -> Option<CellStorage> {
-    let endpoint = std::env::var("RTDB_S3_ENDPOINT").ok()?;
-    let bucket = std::env::var("RTDB_S3_BUCKET").unwrap_or_else(|_| "rtdb-test".into());
-    Some(CellStorage::parse(&format!("s3://{bucket}/run-{}?endpoint={endpoint}&path_style=true&region=us-east-1", uuid::Uuid::new_v4().simple())).unwrap())
+use common::s3_storage as storage;
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn checkpoint_and_durable_tail_survive_loss_of_one_two_or_all_workers() {
+    let Some(storage) = storage() else { eprintln!("RTDB_S3_ENDPOINT is not set: skipped"); return };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut cell = Cell::start_on(Some(storage), vec![MemberPool::General; 3], None, None, None).await;
+        let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+        let client = cell.connect("shop").await;
+        client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10), (2, 20), (3, 30)").await.unwrap();
+        let holder = cell.holder("shop").await.unwrap();
+        cell.node(holder).agent.flush("shop").await.unwrap();
+        let checkpoint = cell.directory.deployment(&deployment.id).await.unwrap().unwrap().checkpoint.unwrap();
+        client.simple_query("UPDATE orders SET total = 11 WHERE _id = 1").await.unwrap();
+        client.simple_query("DELETE FROM orders WHERE _id = 2").await.unwrap();
+        let mut expected_history = order_history(&client).await;
+        drop(client);
+
+        let mut expected = vec!["11".to_owned(), "30".to_owned()];
+        for losses in 1..=3 {
+            let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            assert_eq!(before.checkpoint, Some(checkpoint));
+            let holder = cell.holder("shop").await.unwrap();
+            let victims: Vec<_> = std::iter::once(holder)
+                .chain(cell.nodes.iter().enumerate().filter_map(|(index, node)| {
+                    (index != holder && node.is_some()).then_some(index)
+                }))
+                .take(losses)
+                .collect();
+            assert_eq!(victims.len(), losses);
+            let started = std::time::Instant::now();
+            let departing = victims.iter().map(|&index| cell.nodes[index].take().unwrap());
+            for result in futures::future::join_all(departing.map(|node| node.kill())).await {
+                result.unwrap();
+            }
+            if losses == 3 {
+                assert!(cell.nodes.iter().all(Option::is_none));
+                cell.add_node().await;
+            }
+
+            let recovered = connect_eventually(&cell, "shop").await;
+            let after = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            assert!(after.epoch > before.epoch);
+            assert_eq!(after.checkpoint, Some(checkpoint));
+            assert_eq!(values(&recovered, "SELECT total FROM orders").await, expected);
+            assert_eq!(order_history(&recovered).await, expected_history);
+            eprintln!("loss of {losses} worker(s): recovered and verified results in {:?}", started.elapsed());
+            let id = losses + 3;
+            let total = 30 + losses;
+            recovered.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, {total})")).await.unwrap();
+            expected.push(total.to_string());
+            assert_eq!(values(&recovered, "SELECT total FROM orders").await, expected);
+            expected_history = order_history(&recovered).await;
+            drop(recovered);
+            if losses < 3 {
+                for _ in 0..losses {
+                    cell.add_node().await;
+                }
+            }
+        }
+        cell.stop().await;
+    }).await.expect("the worker-loss scenarios stalled");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cell_keeps_its_deployments_forks_and_deletions_in_s3() {
     let Some(storage) = storage() else { eprintln!("RTDB_S3_ENDPOINT is not set: skipped"); return };
-    tokio::time::timeout(Duration::from_secs(60), exercise_cell(storage))
+    tokio::time::timeout(Duration::from_secs(180), exercise_cell(storage))
         .await.expect("S3 cell lifecycle stalled");
 }
 
@@ -43,11 +102,20 @@ async fn exercise_cell(storage: CellStorage) {
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
     let parent = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     eprintln!("S3 phase: fork parent");
-    let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    prove_rejected_fork_disposal(&cell, &child).await;
     let copied = rtdb_multi::reference::stores(bucket.as_ref(), &child.storage_prefix()).await.unwrap();
     for store in &copied {
         assert!(rtdb_multi::reference::physical_objects(bucket.as_ref(), store).await.unwrap().is_empty(), "a fork on S3 references its parent's objects rather than copying them");
     }
+    let external = admin::fork_into(
+        &cell.directory, &cell.storage(), &cell.keys(), "shop",
+        admin::ForkDestination { name: "outside-preview", org: Some("recipient"), hosted_task: None }, &control(),
+    ).await.unwrap();
+    let versioned = rtdb_multi::reference::stores(bucket.as_ref(), &external.storage_prefix()).await.unwrap();
+    assert_eq!(versioned.len(), 1);
+    assert!(rtdb_multi::reference::Base::load(bucket.as_ref(), &versioned[0]).await.unwrap().objects.is_empty());
+
     eprintln!("S3 phase: read and write fork");
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5"]);
@@ -58,7 +126,7 @@ async fn exercise_cell(storage: CellStorage) {
     cell.node(holder).agent.park("shop-preview").await.unwrap();
 
     eprintln!("S3 phase: delete parent");
-    let deletion = prove_s3_erasure(&cell, &parent.id, false).await;
+    let deletion = prove_s3_erasure(&cell, &parent.id, true).await;
     assert!(deletion.facts.verified_empty, "the parent's current objects are gone from S3");
     assert_eq!(deletion.facts.inventory, rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads);
     let prefix = rtdb_storage::ObjectKey::new(parent.storage_prefix()).unwrap();
@@ -67,14 +135,57 @@ async fn exercise_cell(storage: CellStorage) {
     assert_eq!(values(&preview, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5", "50"], "the fork outlives its parent, its shared objects copied into it first");
     drop(preview);
 
+    let outside = connect_eventually(&cell, "outside-preview").await;
+    assert_eq!(values(&outside, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5"]);
+    drop(outside);
+
     eprintln!("S3 phase: reap");
     let deployments = cell.directory.deployments().await.unwrap();
-    let references = rtdb_multi::reference::References::scan(bucket.as_ref(), &deployments).await.unwrap();
-    for record in deployments.iter().filter(|record| record.lifecycle != rtdb_directory::Lifecycle::Deleted) {
-        rtdb_multi::store::reap(bucket.as_ref(), record, Duration::from_secs(3600), &references).await.unwrap();
+    for outcome in rtdb_multi::store::reaper_pass(bucket.as_ref(), &deployments, rtdb_directory::now_ms(), Duration::from_secs(3600)).await.unwrap() {
+        outcome.unwrap();
     }
     eprintln!("S3 phase: stop cell");
     cell.stop().await;
+}
+
+async fn prove_rejected_fork_disposal(cell: &Cell, published: &rtdb_directory::DeploymentRecord) {
+    use rtdb_directory::{DeletionObservation, Lifecycle, ServingInventory, now_ms};
+    use rtdb_multi::keys::KeyService;
+    use rtdb_storage::{IoRegion, ObjectKey};
+
+    let directory = cell.directory.as_ref();
+    let storage = cell.storage();
+    let keys = cell.keys();
+    assert_eq!(admin::fork(&cell.directory, &storage, &keys, "shop", &published.name, &control()).await.unwrap_err().code, "rtdb.directory/exists");
+    let rejected = directory.deployments().await.unwrap().into_iter().find(|record| {
+        record.name == published.name && record.hosted_fork_stage.is_some()
+    }).unwrap();
+    let id = &rejected.id;
+    let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+    let prefix = ObjectKey::new(rejected.storage_prefix()).unwrap();
+    assert_eq!(rejected.lifecycle, Lifecycle::Deleting);
+    assert!(!bucket.list(Some(&prefix)).await.unwrap().is_empty());
+    assert!(keys.existing_key(&rejected.key_id()).await.unwrap().is_some());
+    assert_eq!(directory.deployment_by_name(&published.name).await.unwrap().unwrap().id, published.id);
+
+    let finish = || admin::finish_disposal(directory, &storage, &keys, id, 4 << 20);
+    let replace_observation = |observation| async move {
+        let mut current = directory.deployment(id).await.unwrap().unwrap();
+        current.deletion_observation = Some(observation);
+        let version = current.version;
+        assert!(directory.replace_deployment(current, version).await.unwrap().applied().is_some());
+    };
+    assert_eq!(finish().await.unwrap_err().code, "rtdb.multi/storage-lease-active");
+    replace_observation(DeletionObservation::Fenced { leases_expire_at_ms: 0 }).await;
+    assert_eq!(finish().await.unwrap_err().code, "rtdb.multi/deletion-verification-pending");
+    let age = (rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE).as_millis() as i64;
+    replace_observation(DeletionObservation::Empty { observed_at_ms: now_ms() - age }).await;
+    let receipt = finish().await.unwrap();
+    assert_eq!(receipt.deployment, *id);
+    assert_eq!(receipt.serving_inventory, ServingInventory::S3VersionsAndUploads);
+    assert!(bucket.list(Some(&prefix)).await.unwrap().is_empty());
+    assert_eq!(keys.existing_key(&rejected.key_id()).await.unwrap_err().code, "rtdb.multi/key-destroyed");
+    assert_eq!(directory.deployment_by_name(&published.name).await.unwrap().unwrap().id, published.id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -395,4 +506,89 @@ async fn a_holder_paused_at_a_pack_upload_cannot_replace_its_successors_block() 
         cell.stop().await;
     }).await.expect("paused S3 upload scenario stalled");
     proxy.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordered_index_erasure_retires_the_old_hosted_provider_generation() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use rtdb_storage::{IoRegion, ObjectKey};
+    use tokio_util::sync::CancellationToken;
+
+    let Some(storage @ CellStorage::S3 { .. }) = storage() else {
+        eprintln!("RTDB_S3_ENDPOINT is not set: skipped");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let CellStorage::S3 { config } = &storage else { unreachable!() };
+        let root = ObjectKey::new("cell").unwrap();
+        let inventory = config.versioned_inventory(&root, &BTreeMap::new()).await.unwrap();
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+
+        let cell = Cell::start_on(Some(storage.clone()), vec![MemberPool::General; 2], None, None, None).await;
+        let deployment = admin::create_deployment(cell.directory.as_ref(), "ordered", "acme", 3).await.unwrap();
+        let client = cell.connect("ordered").await;
+        client.simple_query("CREATE INDEX order_keys ON orders (key, _id)").await.unwrap();
+        client.simple_query("INSERT INTO orders RECORDS {_id: 1, key: 'erased'}, {_id: 2, key: 'kept'}").await.unwrap();
+
+        let holder = cell.holder("ordered").await.unwrap();
+        let node = cell.node(holder);
+        let database = node.server.node().catalog().database("ordered").unwrap();
+        node.agent.flush("ordered").await.unwrap();
+        database.build_artefacts().await.unwrap();
+
+        let deployed = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let index = deployed.ordered_indexes.keys().next().unwrap().clone();
+        let original = ObjectKey::new(format!("{index}/generations/0000000000000000")).unwrap();
+        assert!(!inventory.is_empty(&original).await.unwrap());
+        assert_eq!(values(&client, "SELECT DISTINCT key FROM orders WHERE key >= 'a' ORDER BY key LIMIT 2").await,
+                   ["erased", "kept"]);
+
+        client.simple_query("ERASE FROM orders WHERE _id = 1").await.unwrap();
+        node.agent.flush("ordered").await.unwrap();
+        database.build_artefacts().await.unwrap();
+        let advanced = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let scope = advanced.ordered_indexes[&index].oldest_generation;
+        assert!(scope > 0);
+
+        let stop = CancellationToken::new();
+        let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
+            cell.directory.clone(), storage.clone(), Some(Arc::new(cell.keys())),
+            Duration::from_secs(3600), Duration::from_millis(20), stop.clone(),
+        ));
+        let observed = loop {
+            let current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            let state = &current.ordered_indexes[&index];
+            if state.audited_before >= scope && !state.generations.contains_key(&0) {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(inventory.is_empty(&original).await.unwrap());
+        assert!(bucket.list(Some(&original)).await.unwrap().is_empty());
+        assert!(observed.ordered_indexes[&index].generations.contains_key(&scope));
+        assert_eq!(values(&client, "SELECT DISTINCT key FROM orders WHERE key >= 'a' ORDER BY key LIMIT 2").await,
+                   ["kept"]);
+
+        client.simple_query("DROP INDEX order_keys").await.unwrap();
+        node.agent.flush("ordered").await.unwrap();
+        database.build_artefacts().await.unwrap();
+        loop {
+            let current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            if !current.ordered_indexes.contains_key(&index) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let replacement = ObjectKey::new(format!("{index}/generations/{scope:016x}")).unwrap();
+        assert!(inventory.is_empty(&replacement).await.unwrap());
+        assert_eq!(values(&client, "SELECT DISTINCT key FROM orders WHERE key >= 'a' ORDER BY key LIMIT 2").await,
+                   ["kept"]);
+
+        stop.cancel();
+        reaper.await.unwrap();
+        drop(database);
+        drop(client);
+        cell.stop().await;
+    }).await.expect("hosted ordered-index retirement stalled");
 }

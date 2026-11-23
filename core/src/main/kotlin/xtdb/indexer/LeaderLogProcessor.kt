@@ -125,6 +125,7 @@ internal class LeaderLogProcessor(
 
     private fun applyResolvedTx(tx: ResolvedTx) {
         try {
+            applyDbOp(tx.dbOp)
             tx.sealTables().closeAllOnCatch { partitionState.applyTx(tx.txKey, it) }
 
             watchers.notifyApplied(tx.srcMsgId, tx.txResult, tx.externalSourceToken)
@@ -169,13 +170,9 @@ internal class LeaderLogProcessor(
 
         when (val msg = record.message) {
             is ReplicaMessage.ResolvedTx -> {
-                // Ahead of the tx itself, so a caller that submitted an attach can use the database as
-                // soon as its transaction returns — and once, whichever way the tx below is applied.
-                // Nothing to guard on `committed`: a refused dbOp resolves to an abort carrying no dbOp.
-                applyDbOp(msg.dbOp)
-
                 // Below this term: a previous leader's, replayed from the block this term inherited, so never resolved here.
                 if (msg.termId < leaderTerm) {
+                    applyDbOp(msg.dbOp)
                     applyResolvedTx(msg)
                 } else {
                     val head = txResolver.removeHead()

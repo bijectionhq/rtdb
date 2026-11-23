@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use arrow_array::{RecordBatch, RecordBatchOptions, make_array};
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, FieldRef, Schema, SchemaRef, UnionFields, UnionMode};
 use rtdb_types::Result;
 
@@ -14,6 +16,33 @@ pub(super) fn adapt(schema: &SchemaRef) -> Result<SchemaRef> {
         return Ok(Arc::clone(schema));
     }
     Ok(Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())))
+}
+
+pub(super) fn adapt_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+    let schema = adapt(batch.schema_ref())?;
+    if Arc::ptr_eq(&schema, batch.schema_ref()) { return Ok(None); }
+    let columns = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
+        retype(array.to_data(), field.data_type()).map(make_array)
+    }).collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map(Some).map_err(invalid)
+}
+
+fn retype(data: ArrayData, target: &DataType) -> Result<ArrayData> {
+    if data.data_type() == target { return Ok(data); }
+    let types = match target {
+        DataType::Struct(fields) => fields.iter().map(|field| field.data_type()).collect::<Vec<_>>(),
+        DataType::Union(fields, _) => fields.iter().map(|(_, field)| field.data_type()).collect(),
+        DataType::List(field) | DataType::LargeList(field) | DataType::ListView(field) | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) | DataType::Map(field, _) => vec![field.data_type()],
+        DataType::RunEndEncoded(ends, values) => vec![ends.data_type(), values.data_type()],
+        DataType::Dictionary(_, values) => vec![values.as_ref()],
+        _ => return Err(invalid("Arrow decoding schema changed a storage type")),
+    };
+    if data.child_data().len() != types.len() { return Err(invalid("Arrow decoding schema changed the number of children")); }
+    let children = data.child_data().iter().zip(types).map(|(child, target)| retype(child.clone(), target))
+        .collect::<Result<Vec<_>>>()?;
+    data.into_builder().data_type(target.clone()).child_data(children).build().map_err(invalid)
 }
 
 fn adapt_field(field: &FieldRef, depth: usize, position: FieldPosition) -> Result<FieldRef> {

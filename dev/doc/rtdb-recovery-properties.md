@@ -176,7 +176,7 @@ Each open refinement obligation must connect those transitions to the Rust code 
 | S4 · Repair preserves the committed prefix | Fixed-ensemble TLC checks recovery selection and incomplete copying. | Prove the repair boundary and old-ensemble to new-ensemble handoff, including stale overwrite and failure during the copy. |
 | S5 · Readiness implies correct recovery | TLC checks writable readiness and reaches a post-restart read and write, and Lean proves the exact basis and upper bound of successful abstract checkpoint-only reads. | Show the actual readiness and query paths establish checkpoint completeness, enforce the basis, and refine those checks. |
 | S6 · A quorum represents real journals | TLC counterexamples for address reuse and early registration, plus a loopback reproduction of early registration with the Rust binary. | Reproduce address reuse against Rust and establish a durable identity and readiness contract for existing ensembles. |
-| S7 · A keyed retry has one effect | Lean proves that an atomically recorded commit retains its original outcome and has one mutation in a single unexpired key window. | Verify the gateway and the durable idempotency transaction, including key derivation, replay eligibility, and expiration. |
+| S7 · A keyed retry has one effect | Lean proves at most one mutation under the same protected permit for arbitrary admitted clock samples and retry order. TLC checks delayed originals, legacy writers, changing application keys, early expiry and marker deletion as weakened controls. Verus checks production admission helpers, and the live-cell test loses a committed reply and reads one effect on a replacement. | Prove the full refinement of ordered journal recovery and the resolver's protected marker transaction. Ambiguous batches, transaction controls and extended writes return an unknown outcome. |
 | Conditional recovery liveness | Weak-fairness TLC checks for one deployment and an intact fixed-ensemble quorum. | Prove progress across the fault boundary with admissible demand, replacement compute, and the actual readiness and retry protocol. |
 
 [CheckpointTrim.lean](../lean/CheckpointTrim.lean) distinguishes a deployment's own published checkpoint from an inherited read checkpoint.
@@ -186,6 +186,13 @@ Durable pack completeness is a premise at upload, and publication checks the wri
 Applying that theorem to Logkeepers requires distinct inventory entries tied to the correct journals and a durable promise that survives restart.
 [IdempotencyWindow.lean](../lean/IdempotencyWindow.lean) checks arbitrary commit, reply, and disconnect traces for a single eligible key before expiration.
 Its commit transition installs the outcome atomically with the only mutation, which is the contract the Rust resolver and idempotency table must establish.
+[GatewayReplay.lean](../../verification/multi/lean/GatewayReplay.lean) proves effective-key preservation for a fixed application key or a private command key and ordinal.
+It also proves that any number of replacements preserve the first recovery cutoff.
+The [gateway model](../../verification/multi/tla/RTDBGatewayReplay.tla) checks a bounded single-command schedule with three weakened configurations.
+[Verus checks the production cutoff-selection step](../../verification/verus/replay_deadline/proof.rs).
+The full composition with the asynchronous gateway, SQL execution, and the durable journal remains open.
+The private engine replay study checks the shared cutoff, protected marker creation and durable outcome lookup.
+The deployed claim still requires the gateway to send the same permit on each attempt and to enforce writer compatibility and command eligibility. [Engine replay evidence](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority)
 [CheckpointReplay.lean](../lean/CheckpointReplay.lean) proves that replaying exactly the suffix above a checkpoint gives the same result as folding the whole committed prefix through the requested basis.
 It also proves that the abstract snapshot response uses the requested basis within the checkpoint's coverage.
 The production refinement must connect the packed catalog and bitemporal query state to this complete logical prefix.
@@ -205,7 +212,29 @@ A seal quorum made up of the fresh journal and the original journal that never h
 With `RTDBRecoveryIdentityStartup.cfg`, registration followed by a failed journal open leaves the process eligible.
 In a loopback cell, pass a regular file as the Logkeeper's `--data` path to reproduce the startup failure with the Rust binary.
 After 3.5 seconds, `status` reported one live Logkeeper while its advertised socket refused connections, and the process reported `Not a directory` during shutdown.
-The pushed Rust revision resolves old ensemble members to network addresses and registers a new Logkeeper before the serving task opens its journal. [Address resolution](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/deployment.rs#L213-L217) · [Registration](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/process.rs#L168-L176) · [Journal open](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/logkeeper/src/server/mod.rs#L36-L47)
+The original reproduction ran against a revision that registered the logkeeper before opening its journal and identified replicas by their network addresses. [Historical registration path](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/process.rs#L168-L176)
+The current process opens and locks the journal before claiming membership.
+The client associates the endpoint with the durable journal ID and verifies each new session before sending commands.
+The journal checks the target identity on bound commands before acting.
+Activation identifies a set of journals and its quorum size, allowing different routes to the same membership.
+Recovery, ordinary appends, serving checks, replica repair and retention use that same connection boundary. [Connection](../../rust/crates/logkeeper/src/client/connection.rs) · [Ensemble](../../rust/crates/logkeeper/src/client/ensemble.rs)
+
+### Upgrading cell journals
+
+Upgrade logkeepers while retaining their journal directories, then quiesce directory writers, holders and cell administration while upgrading the clients that write journal inventories.
+Keep a quorum of logkeepers available within each ensemble during the logkeeper rollout.
+Upgraded readers accept legacy address inventories and packed parked records.
+Directory clients that predate bound inventories must be upgraded before those inventories are written.
+Reopen held deployments at a higher epoch to install the identity-bound activation.
+Resume an interrupted legacy cell transfer with both source and destination directories available so it can bind the source membership before copying.
+Before retiring or transferring an installation with an address-only inventory, verify each historical journal that received its replica stream.
+Use retained `MEMBER` files and historical placement records to identify the journals, and collect their current routes.
+Run `rtdb-multi list --directory DIR` to obtain the installation ID, inventory and version.
+Supply a JSON object mapping every legacy address to an array of verified objects with `address` and `journal` fields.
+Include all verified journals if more than one used the same legacy address.
+Run `rtdb-multi bind-journal-inventory --directory DIR --id UUID --version N --bindings FILE` to record that inventory at the inspected version.
+The command updates only the directory.
+The next transfer or disposal uses the resulting journal IDs, and disposal waits for all named journals to affirm retirement.
 
 ## Archive restore and physical replay
 

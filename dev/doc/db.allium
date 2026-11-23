@@ -86,6 +86,7 @@ external entity Compactor {
 external entity ExternalSource {
     -- A system outside XTDB that feeds a database by change data capture, e.g. Postgres logical replication.
     -- On assignment it is handed an indexing callback and an opaque resume token to start after, and feeds transactions in directly.
+    -- The native PostgreSQL direct mirror stages snapshots and logical changes from Arrow arrays.
     -- An external-source database assigns its own monotonically increasing tx_id off the RESOLVED head rather than taking it from the source-log position.
     -- A client submit is rejected for such a database: transactions enter only through the source.
 }
@@ -211,8 +212,7 @@ entity TxResolver {
 
     -- The queue itself is not modelled here.
     -- What db.allium relies on is the ORDER PROPERTY that makes the queue head predictable: resolution order = append order = read-back order, and terms are unique per leader.
-    -- So an equal-term resolved transaction read back is always the matching head, which is why apply can import without re-reading the record.
-    -- It is checked rather than assumed (see LeaderAppliesOwnTx).
+    -- An equal-term resolved transaction must match the staged head before apply can import its rows (see LeaderAppliesOwnTx).
 }
 
 entity TableCatalog {
@@ -241,7 +241,9 @@ entity Watchers {
     --
     -- A block's covered source position is reported on the ADOPT, by whichever role adopts the block: a node that has not recorded the block claims none of the position it covers, so a caller that flushes a block and then awaits this watermark is told of it once the flush is done.
     --
-    -- An ingestion fault puts them into a failed state, and every subsequent await throws (see ProcessingErrorHaltsNode).
+    -- A Kotlin wait that observes a failed state receives an IngestionStoppedException carrying the fault, including when its watermark was reached before the fault.
+    -- The native monitor checks its applied watermarks first and reports the fault to requests the applied prefix has yet to satisfy.
+    -- Cancelling a wait releases that subscription and leaves the other waits and applied watermarks in place.
     latest_tx_id: MessageId
     latest_source_msg_id: MessageId
     latest_tx_result: TransactionResult?
@@ -367,8 +369,48 @@ entity SourceMessage {
 
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
-    -- Source encoding admits and builds operation body columns one at a time.
-    -- A fixed-size float column can be supplied and replayed as Arrow buffers with its list validity within the document leg.
+    -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
+    -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
+    -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
+    -- Source encoding writes IID lists from their fixed-size bytes.
+    -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
+    -- PATCH replay binds compatible document and IID vectors to the mutation plan as one list of records.
+    -- Put and create-only insert replay retain their Arrow document vectors.
+    -- A put record without an IID vector derives its IIDs from the document ID cells.
+    -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
+    -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
+    -- Rows are grouped by their evaluated bounds in first-seen order and retain their order within each group.
+    -- A document layout retains its schema and column metadata while releasing translation scratch after construction.
+    -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
+    -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
+    -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
+    -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
+    -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
+    -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
+    -- Admitted bulk uploads can retain date, time and duration vectors through source replay.
+    -- Compatible document vectors retain the UUID extension for their UUID values through source encoding and replay.
+    -- When an upload adds fields inside a fixed-size list, layout alignment copies only the selected entries and required null padding.
+    -- Struct fields added across compatible uploads join in Arrow with typed nulls for earlier documents, including structs inside lists.
+    -- Batches with compatible column types retain first-seen column order and represent missing columns as nulls without converting the documents to rows.
+    -- Source encoding retains compatible Arrow vectors when the same table's puts also contain row-backed documents.
+    -- Differently typed columns can share a dense union in the source message and retain their Arrow representation on replay.
+    -- Union children can be compatible nested containers such as lists and structs.
+    -- Null and missing values use that union's null leg.
+    -- When the allocation budget allows, uploaded union tags for the same value layout share a canonical Arrow child, including signed execution aliases.
+    -- A normalized union with one value layout uses that Arrow type and its validity bitmap.
+    -- A historical native keyed submission can carry an optional guard envelope with a submission clock sample and guard position.
+    -- Current ordinary keyed submissions carry the key in metadata and omit the historical guard envelope.
+    -- The key marker is valid from its submission sample, inclusive, until one hour later, exclusive.
+    -- For a record carrying the envelope, the failed assertion must have the recorded position to identify a duplicate.
+    -- Typed outcome lookup selects the latest marker visible at the retry's system time whose validity extends past the retry's submission sample.
+    -- A private replay submission instead carries its engine key, admission sample and exclusive cutoff.
+    -- These values are required together when the private replay envelope is present.
+    -- Submission refuses a sample at or after the cutoff before appending a source record.
+    -- A new permit record identifies its legacy-resolver assertion in the envelope and places that assertion first in its operations.
+    -- A supporting resolver checks and consumes the assertion before resolving the user's operations.
+    -- A resolver that ignores the new field leaves the assertion in the operation sequence.
+    -- An existing marker can resolve the duplicate before operation execution.
+    -- Execution of the assertion aborts the transaction before any user operation.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present
@@ -470,6 +512,10 @@ variant ResolvedTxMessage : ReplicaMessage {
     -- The leader's RESOLVE-side source watermark when this record was produced: for a source-log transaction its own position, for an external-source one the leader's current source-log position, so that followers keep their durable watermark in step between block boundaries.
     -- Null only on records written before the field existed, where readers fall back to the tx_id or to the tracked watermark.
     src_msg_id: MessageId?
+
+    -- A strict placed commit retains its rounded writer staging sample and exclusive staging cutoff inline with its effect and receipt. The sample and resolved system time both precede the cutoff. These coordinates record the admission check before quorum durability.
+    staging_clock_upper: Timestamp?
+    staging_cutoff: Timestamp?
 }
 
 variant BlockBoundaryMessage : ReplicaMessage {
@@ -630,6 +676,24 @@ config {
 -- A replica that already installed the checkpoint skips its upload before the hold for a later pending block.
 -- If producing that later block fails during promotion, the replica follows with the checkpoint confirmed and the later block still pending.
 -- The writer checks shared storage for the catalog, table and L0 files before appending an older confirmation.
+-- The same fresh storage check applies before submitting a new confirmation of the recovered current checkpoint.
+-- A packed file's check requires the containing pack to be present in storage.
+-- The pack index confines entries to the payload before the trailer.
+-- With provider versions, the pack metadata, trailer, index and each returned member range must name the same physical publication.
+-- Hosted publication records the digest of the adopted catalog bytes next to its checkpoint coordinate.
+-- A hosted serving receipt also commits to the exact replay inventory, including each logical length and any observed physical version.
+-- Its digest covers the root, replica epoch and first required replica offset.
+-- The admitted store recomputes the inventory commitment from fresh storage observations before opening the cut.
+-- A single fresh observation can cover members that share an admitted pack.
+-- A hosted prefix trim requires a checkpoint with this commitment.
+-- Startup, cursor recovery and checkpoint suffix admission check the same persisted prefix authorization.
+-- An unpublished archived suffix retains its journal interval while its pin is active.
+-- Publishing its verified archive transfers that interval to archive custody.
+-- A live archive copy admits its first required offset in the same update that opens its provider region.
+-- That region retains the original suffix until its provider work drains.
+-- Opening a directory receipt verifies fresh root bytes before loading table metadata.
+-- An ordinary startup admits the root metadata and first required replica offset in one directory update.
+-- The startup grant lasts through cursor admission and the drain of the provider reads it owns.
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.
@@ -638,12 +702,51 @@ config {
 -- Recovery derives that protection from the restored catalog. Block adoption derives it from the persisted table blocks.
 -- Ordinary latest-block recovery refreshes discovery after a missing root or table block.
 -- It retries only when the refreshed listing reveals a strictly newer block.
--- Before installing an ordinary latest checkpoint, startup also checks for an observed replica
--- prefix gap and may use only a strictly newer reported checkpoint if that check finds one.
--- Exact recovery keeps its selected block. Archive recovery requires its anchor and probes only
--- its contiguous successors. The replica tail is still opened and validated by the driver.
--- Exact-block and restored-archive discovery keep their own checkpoint requirements.
--- The retained-prefix observation does not hold the suffix in place.
+-- With a provider that admits a cursor during recovery, ordinary startup opens the replica tail before installing the checkpoint.
+-- A trimmed first required offset triggers refresh and may select only a strictly newer reported checkpoint.
+-- An admitted hosted checkpoint binds its block number and replica boundary within one journal.
+-- A stored catalog at the admitted block must match the boundary exactly.
+-- A successor must advance both the block and the replica boundary in that journal, including on a retry after prefix collection.
+-- The opened replica log must belong to the same journal as the admitted checkpoint.
+-- On a hosted loglet, each connection verifies the durable identity named by its ensemble slot before sending replay or recovery operations.
+-- A new Rust checkpoint root carries the SHA-256 digest of each table block, keyed by the table registry OID.
+-- The root is written after every referenced table block write completes.
+-- Recovery checks the manifest covers exactly those OIDs and checks the stored bytes before accepting table metadata.
+-- Roots without this manifest use the existing table-block load.
+-- New archive captures and independent fork copies derive their dependency inventory from the verified table blocks.
+-- The replay inventory includes data and metadata for live and nascent tries and retained level-zero sources.
+-- It includes recorded artefacts for live and nascent members, with one object per shared group key.
+-- A copy uses its verified root bytes or rechecks them on a fresh read.
+-- It also rechecks table bytes read for copying against those used to derive the inventory.
+-- A planned source member carries its logical length and the physical version observed for that dependency.
+-- An observed version includes the namespace, physical key and provider token.
+-- The body supplying that member must match the plan. Two responses without version evidence rely on the immutable-object contract.
+-- Existing archive receipts retain their original primary inventory. A stage verifies the inventory format recorded by its capture.
+-- An archive capture registers its source metadata hold with its selected checkpoint in the same directory update.
+-- A retry at an older checkpoint inherits the hold only if an open region still protects that metadata.
+-- A completed archive can be verified and returned without opening serving storage.
+-- A repair-backed copy admits the prior repair archive and the new destination in the same directory update.
+-- A serving-store open and a transfer that materializes repair contents also name the admitted repair archive.
+-- A closed region cannot start a repair read. Pending provider mutations retain their archive obligations through settlement.
+-- Local archive copies and forks retain their maintenance witness through completion of admitted provider work.
+-- Other admission failures end startup with the provider error.
+-- The replication driver consumes the admitted cursor for that same log and boundary.
+-- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.
+-- Ordinary recovery with a matching journal boundary seeds the cut after the driver opens its replica tail.
+-- The driver advances the cut through delivered records after pending block adoption and resolution read-back buffers have drained.
+-- A placed replication driver publishes its installed replica prefix and the source position covered by that same prefix together.
+-- Receipt redemption uses the paired source position to know when to search for the exact attempt within an epoch.
+-- On a later writer epoch, the installed recovered replica prefix establishes when the search for a previous attempt is complete.
+-- A frozen attachment establishes its receipt cut when the loaded block, replica boundary and root digest match the admitted exact checkpoint.
+-- An exact attempt witness in that checkpoint establishes a positive outcome at its cut.
+-- Missing outcomes from a frozen checkpoint remain retryable.
+-- Snapshots captured before the advance retain their original cut.
+-- Exact and restored recovery modes and checkpoints without a matching journal boundary leave the cut unavailable.
+-- An unrecognized replica body stops further advances on that open partition.
+-- A direct compactor reset suspends new cuts on that open partition.
+-- Providers that defer cursor admission can still report an advisory floor and open the tail in the replication driver.
+-- Exact recovery keeps its selected block. Archive recovery requires its anchor and probes only its contiguous successors.
+-- A successful cursor admission does not reserve the replica suffix against later trimming.
 --
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
 --
@@ -668,9 +771,11 @@ config {
 --   1. Finish the live index's block, yielding L0 tries — one per table that took rows in this block, and none at all for a table that took none.
 --      Each L0 page retains its computed metadata summary for the metadata file and releases temporary allocations for scanning that page.
 --      Each L0 page uses the table's captured column schema and the order of the leaf's rows.
+--      The live trie writer gathers compatible document vectors from the leaf's selected positions when a field's layout changes during the block.
 --      A block cut with no transactions in it therefore writes no tries whatsoever.
 --   2. Compute the trie layout those L0 tries imply, which is what the per-table block files record and what the trie catalog will hold once the adopt has added them.
 --   3. Build the per-table block files and upload one for EVERY table the table catalog knows, not only the tables from step 1.
+--      Per-table cardinality sketches hash the captured live Arrow cells in physical field order and exclude logical nulls.
 --      Block GC's per-table sweep depends on this — see block-gc.allium, EveryTableBlockAtCurrentIndex.
 --   4. Build and persist the block file, carrying the boundary's term and its position within that term, which are what seed a restarted node's fence and term position, and stamp the database's last-upload time.
 --   5. Append the upload to the replica log and await it.
@@ -864,10 +969,23 @@ rule LeaderProcessesTx {
         -- The refused transaction uses the normally assigned system time, so it still advances the resolved head.
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
+        -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.
+        -- PATCH gap filling preserves the ordered valid-time pages and selects compatible document vectors.
+        -- The patch projection keeps existing cells when a patch cell is null and keeps the patch's field set for an uncovered interval.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
     -- For concrete document writes, forbidden columns abort with the table reference and offending column names in source schema order.
     -- SQL insert plans report each forbidden projection as a planning error.
+        -- The resolver looks up a private replay key against its ordered prefix before applying user operations.
+        -- A matching marker has a validity interval overlapping the submission sample or a later instant.
+        -- A successful first execution records its marker atomically with its user effects.
+        -- The marker expires at the later of the permit cutoff and one hour after the admission sample.
+        -- Private replay markers can be created by the resolver only and are protected from application writes and erases.
+        -- A duplicate records the original transaction key in its durable outcome and skips the user operations.
+        -- A caller error while looking up a private marker records a durable abort for that attempt and skips its user operations.
+        -- A placed request carries a nonce and an attempt scope bound to its history and writer epoch.
+        -- Resolution combines the scope with the authenticated principal and source position from the record.
+        -- The resolved frame carries that identity and its transaction outcome witness in the same delta.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }
@@ -1074,6 +1192,9 @@ rule LeaderAppliesRecord {
     -- Apply one record read back off our own replica log, fenced by TERM.
     -- The fence discards anything below this term, ends this term on anything above it, and discards a rival's losing claim at this same term, its position being behind this term's.
     -- So a record reaching here carries this term, unless it was held behind the block this term inherited and drained at the adopt, having met the fence at its own position under a lower term.
+    -- The native driver matches a read-back of its own resolved transaction to the pending append at its sequence before apply or buffering.
+    -- A record at the sequence of a pending transaction must carry that transaction, including when an oversized envelope supplies its payload separately.
+    -- A mismatch faults the processor, delivers the fault to a pending caller identified by the admitted term and sequence, and leaves the transaction's rows, catalog and applied progress untouched.
     when: HandleReplicaMessage(record)
     requires: log_processor.mode = Leader
 
@@ -1098,28 +1219,31 @@ rule LeaderAppliesRecord {
 
 rule LeaderAppliesOwnTx {
     -- The leader reads its own staged transaction back at its own term and IMPORTS it, from the resolver's QUEUE HEAD.
-    -- The head still holds the transaction's rows, so nothing is re-read from the replica record; that record's only job was to confirm durability and term.
-    -- A head whose tx_id doesn't match the record just read back, or no head at all, is a fault (xtdb.indexer/leader-read-back-mismatch).
+    -- Apply must find the corresponding staged transaction at the head of the resolver queue, or it faults with xtdb.indexer/leader-read-back-mismatch.
+    -- The matched staged transaction supplies the catalog operation on both engines.
+    -- The native driver applies the partition before the catalog operation.
+    -- The Kotlin leader applies the catalog operation before importing the staged rows.
     --
     -- This is the point at which the transaction becomes queryable: the DURABLE head advances here, the watchers advance here, and an external caller's durability handle completes here — after, not before, the transaction is durable.
     --
     -- The database operation it carries is applied here, as a follower applies it on its own read — before the durability handle completes, so a caller that submitted an attach can use the database the moment its transaction returns.
     when: ApplyOwnRecord(record)
     requires: record.kind = ResolvedTxMessage
-    requires: record.term_id >= log_processor.leader_term
+    requires: record.term_id = log_processor.leader_term
 
-    -- Take the head FIRST, then check it.
-    -- Taking it first is what makes the failure path safe: once off the queue, the end of the term can no longer reach it, so this rule owns failing its durability handle on ANY throw here, the tx_id mismatch included.
+    -- In the native driver, the pending append retains the caller's durability handle when apply takes the staged head.
+    -- A failure applying the transaction or publishing its progress is delivered to that caller.
     let head = TakeResolvedHead(tx_resolver)
-    requires: head.tx_key.tx_id = record.tx_id
+    requires: OwnReadbackMatchesHead(record, head)
 
     ensures:
-        -- Everything reported below comes from the HEAD, not from the record: the head still holds the transaction's result, watermark stamp and token, which is exactly why the record needs no re-reading.
-        -- The two agree by construction — the head is what was stamped onto the record at append time.
+        -- The staged head supplies the rows, catalog operation, result and source progress.
         ApplyResolvedTx(tx_resolver, head)
-        if record.committed and record.db_op != null:
-            ApplyDbOpToCatalog(database.catalog, record.db_op)
+        if head.tx_result.committed and head.db_op != null:
+            ApplyDbOpToCatalog(database.catalog, head.db_op)
         watchers.notifyTx(head.tx_result, head.src_msg_id, head.external_source_token)
+        if head.external_source_token != null:
+            ExternalReplicaPrefixApplied(database, head.external_source_token)
 }
 
 rule LeaderAppliesInheritedTx {
@@ -1133,6 +1257,8 @@ rule LeaderAppliesInheritedTx {
         if record.committed and record.db_op != null:
             ApplyDbOpToCatalog(database.catalog, record.db_op)
         ApplyResolvedTxFromRecord(record)
+        if record.external_source_token != null:
+            ExternalReplicaPrefixApplied(database, record.external_source_token)
 }
 
 rule LeaderUploadsBlockOnBoundary {
@@ -1522,16 +1648,9 @@ rule ClientOpensSnapshot {
 }
 
 rule ExternalSourceLearnsDurableExtent {
-    -- Confirming a resume token tells the upstream it may discard everything behind it, so a confirmed position is a claim that we can recover without it.
-    -- Only a durable block backs that claim: between apply and the next block the sole copies are the replica log and the leader's live index, and the upstream cannot re-send what we told it to drop.
-    --
-    -- So this token, and not the applied position, is the source's licence to confirm.
-    -- It is also not the watchers' token, which is the one that may run ahead — replica-log replay advances it past block boundaries — which is why the token an assignment starts after is not a position we are entitled to confirm.
-    --
-    -- What a source does with the licence is its own rule: it may confirm further where the log above the extent demonstrably holds nothing of ours. See pgsrc.allium.
-    --
-    -- The gap this opens is the block cadence: a database whose blocks stop landing pins the upstream's log while ingestion and queries stay healthy.
-    -- That is a monitoring obligation, not a correctness one (#5867).
+    -- Confirmation permits the upstream to discard its history through the token.
+    -- An adopted block supplies a recoverable token to the source.
+    -- The source's protocol determines how that token bounds confirmation.
     when: BlockBecameDurable(database, external_source_token)
     requires: log_processor.mode = Leader
     requires: database.external_source != null
@@ -1544,10 +1663,23 @@ rule ExternalSourceLearnsDurableExtent {
         )
 }
 
+rule ExternalSourceLearnsReplayExtent {
+    -- Synced local journals retain the durable prefix through restart.
+    -- Synced local storage retains the checkpoint files used to open that prefix.
+    -- The leader can supply the token from applied read-back before a block adopts it.
+    when: ExternalReplicaPrefixApplied(database, external_source_token)
+    requires: log_processor.mode = Leader
+    requires: database.external_source != null
+    requires: RetainsSyncedJournalsAndCheckpoints(database)
+
+    ensures:
+        RecoverableReplayExtentAdvanced(source: log_processor.external_source, token: external_source_token)
+}
+
 ---- Rules: Error Handling
 
 rule ProcessingErrorHaltsNode {
-    -- A genuine ingestion fault: the watchers move to a failed state, and every subsequent await throws.
+    -- A genuine ingestion fault marks the watchers as failed and surfaces the cause according to the engine's wait rules.
     --
     -- A SUPERSESSION is not one of these, and neither is an interruption of the term: see LeaderSuperseded.
     -- Poisoning the watchers on a routine leadership handover would surface it to queries as a failed database.
@@ -1642,26 +1774,83 @@ contract CompactorReset {
         -- The operator keeps every other node, client and upstream writer stopped throughout the reset.
         -- The maintenance node catches up through a completed block with indexing enabled and compaction and automatic garbage collection disabled.
 
-    @invariant SurvivingL0Files
-        -- The replacement catalog contains the L0 files found in object storage with both metadata and data present.
-        -- A metadata file whose paired data is absent contributes no trie.
-        -- L0 file sizes come from the data objects, and temporal metadata is recovered when those files are read.
+    @invariant InstalledL0Inventory
+        -- A reset without a retained export uses the L0 identities bound by the installed checkpoint and its table inventories.
+        -- That plan verifies the recorded data and metadata pairs before acceptance.
+        -- The observed data length matches the checkpoint's recorded length where present.
+        -- An incomplete inventory refuses preparation.
+
+    @invariant RetainedPrimaryReplay
+        -- A native local maintenance node can rebuild its adopted checkpoint using the detached export of its persisted repair anchor and the durable journal it holds.
+        -- The persisted anchor binds the export block, digest and journal boundary.
+        -- Replay verifies both endpoints and stops at the adopted transaction head and table registry.
+        -- Rebuilt pairs are synchronized before the successor is published.
+        -- Rebuilt compacted pairs use names disjoint from prior resets and normal compactor outputs.
+        -- Original L0 identities remain available to bind the inputs of source-order replay.
 
     @invariant PublicationPrecedesDeletion
         -- A reset with a completed transaction publishes the replacement catalog in a new block.
-        -- Compacted files become eligible for deletion after the maintenance node adopts that block in the term that accepted the reset.
-        -- Deletion removes each compacted trie's metadata before its data.
+        -- A coordinated store records the compacted file identities and required block and naming epoch before publication.
+        -- The adopted root must cover the required block and naming epoch in the selected journal, and its catalog and checkpoint must have withdrawn the named tries, before the leader confirms their removal.
+        -- Physical retirement follows the installed removal receipt and coordinated catalog floor.
+        -- An exclusive reset on an uncoordinated store deletes each compacted trie's metadata before its data after adoption.
 
     @invariant CapturedCatalogIdentity
         -- A reset prepared from an earlier catalog or block is rejected if either changes before acceptance.
+        -- A replayed replacement also requires an empty live block and the same installed and live transaction head as the replay target.
 
     @invariant InterruptedResetRetainsRecovery
         -- A reset interrupted before its block is adopted retains all compacted files.
-        -- An interruption during deletion retains the published L0 recovery catalog and any remaining compacted files.
+        -- An interruption during retirement leaves the published replacement catalog and a durable retirement intent for each unsettled batch on a coordinated store.
+        -- Collection can finish eligible reset retirements after restart and after earlier reader tickets drain.
+
+    @invariant SuccessorJournalCatalogCut
+        -- A native node that reopens a recovered checkpoint in a fresh journal initially leaves the catalog cut untracked.
+        -- Discoverable recovery can publish a cut after adopting a checkpoint in the current journal whose boundary the installed replica prefix covers.
 
     @invariant DryRunPlan
-        -- A dry run performs the initial catch-up flush and reports the replacement L0 catalog and proposed deletions.
+        -- A dry run performs the initial catch-up flush and reports the prospective primary catalog and retirements.
         -- Its plan leaves the catalog and files as they stood after that catch-up.
+}
+
+contract OrderedIndexReplay {
+    @invariant AdoptedEventCoverage
+        -- Ordered-index maintenance checks its flushed inputs against the captured table's adopted L0 inventory.
+        -- If a data object is missing, a native local database can rebuild from a retained journal from the first block through the captured checkpoint.
+        -- The journal admits the captured boundary and transaction head, confirms the intervening blocks, and reproduces the event count of each recorded nonempty block.
+        -- Publication requires complete inventory and total row coverage.
+
+    @invariant ErasureBeforePublication
+        -- A journal rebuild identifies the last erase of each entity across the captured inputs before projecting events into the ordered index.
+        -- The rebuilt historical roots exclude events from before that erase.
+}
+
+contract LocalCheckpointRepair {
+    @invariant ExactLocalAnchor
+        -- The operator selects a known-good base and a later target by block number and root SHA-256.
+        -- The base binds all its table blocks and has its live and nascent primary data and metadata available, including when retained as a separate snapshot export.
+        -- The same stopped local replica journal covers both checkpoint boundaries.
+        -- Repair holds the journal's writer lock throughout the rebuild.
+
+    @invariant RetainedRepairBase
+        -- With the serving journal locked, the operator can install an independently stored export of the current checkpoint as its retained repair base.
+        -- Admission verifies the serving and exported root publications, the export's complete primary inventory, and the matching record in the local journal.
+        -- Installation follows synchronization of the exported files and their directory entries.
+        -- The store preserves block catalogs, per-table block files and offloaded replica payloads at and beyond that block across restarts.
+        -- An operator advances protection by installing a newer verified base in the same replica journal.
+        -- The collector synchronizes the replacement anchor before removing files covered by the previous anchor.
+        -- A repair can reopen the persisted anchor under the original journal lock and select it as its base.
+        -- The detached checkpoint must match the anchor's block, digest and replica boundary.
+
+    @invariant ReplayThroughSelectedCut
+        -- The rebuild copies the base primary inventory and replays admitted resolved transactions through the exact target boundary.
+        -- The rebuilt checkpoint has the selected target's transaction head and table registry.
+        -- A missing or incompatible boundary, missing source dependency or unsupported database effect prevents publication.
+
+    @invariant DetachedPublication
+        -- Repair stages a separate local store with its own primary inventory and reads back the completed checkpoint and bound table blocks.
+        -- Publication exposes that store with the rebuilt checkpoint's digest after the rebuild and read-back succeed.
+        -- Activating the rebuilt store uses a fresh log at a higher epoch.
 }
 
 contract StandaloneCompactor {
@@ -1691,6 +1880,7 @@ surface MaintenanceCommands {
     contracts:
         fulfils OfflineSnapshotExport
         fulfils CompactorReset
+        fulfils LocalCheckpointRepair
         fulfils StandaloneCompactor
 }
 
@@ -1727,6 +1917,53 @@ surface QueryAccess {
     @guarantee ExecutionReadsOneSnapshot
         -- A single query execution opens one snapshot of this database and derives from it every answer it gives about this database: the schema it resolves names against, the oids `::regclass` resolves through, and the rows it reads.
         -- An execution spanning several databases holds one such snapshot per database.
+
+    @guarantee ColumnarScanProjection
+        -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
+        -- A scan can read compatible leaf counts, bounds, and Bloom bytes directly from metadata arrays.
+        -- Equality selection on a keyword ID includes the native and reference persisted digests.
+        -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
+        -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
+        -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
+        -- Their key index retains Arrow batches and compares compatible nulls, booleans, signed integers, text and binary cells at their indexed positions.
+        -- Compatible global counts and floating-point sums and averages reduce Arrow columns and emit scalar result vectors.
+        -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
+        -- Grouped output keeps the configured transport row limit.
+        -- Scalar aggregates read their operands as needed and write compatible results as Arrow columns.
+        -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys when the aggregate specifies an order.
+        -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
+        -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
+        -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
+        -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
+        -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
+        -- A shared mark can replay its candidate Arrow pages to evaluate arbitrary Boolean comparisons.
+        -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
+        -- Outer joins track unmatched build positions through partition replay.
+        -- A correlated query retains its outer Arrow row position and gathers its output from the selected dependent positions.
+        -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
+        -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
+        -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
+        -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
+        -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
+        -- A nested field read can select its child from an input struct vector.
+        -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
+        -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
+        -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
+        -- Adjacent compatible projections can pass computed scalar results as Arrow columns, including into a mutation's document projection.
+        -- A literal table with stable scalar columns builds one Arrow batch before its consumers run.
+        -- Literal tables and stacked scalar projections gather output up to the configured transport row limit before encoding it.
+        -- A list expression over inputs with a shared compatible layout interleaves the child values in Arrow.
+        -- A struct expression over compatible Arrow fields retains the child arrays.
+        -- Selecting a compatible struct child combines its validity with the parent validity in Arrow.
+        -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
+        -- A projected dense union with compatible children retains its Arrow array when it already matches the result layout.
+        -- A compatible projected array can be aligned to the result's nested fields and union legs in Arrow.
+        -- When selected cells need layout alignment before they can share one array, the scan retains their source vectors and positions.
+        -- Reading a selected struct during evaluation preserves which keys its source has.
+        -- Compatible fixed-size lists stay in Arrow through sparse selection and output.
+        -- A sparse selection of compatible in-memory maps also stays in Arrow.
+        -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
+        -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
 }
 
 ---- Deferred Specifications
@@ -1754,9 +1991,13 @@ deferred ApplyDbOpToCatalog
   -- Bring the catalog into line with a committed database operation, swallowing a caller fault: the transaction has already committed, so a node that cannot carry the instruction out holds none of a database the cluster agrees exists.
   -- See: database-lifecycle.allium AdmitInstructionCreatesEntry, RemoveBeginsTeardown
 deferred TakeResolvedHead
-  -- Remove and return the OLDEST staged transaction, passing responsibility for it to the caller, which must then import it, or fail its durability handle, on every path.
-  -- Removal precedes validation deliberately; see LeaderAppliesOwnTx.
+  -- Remove and return the oldest staged transaction for the caller to verify against the read-back it is about to apply.
+  -- A failure after removal still reaches the caller's durability handle (see LeaderAppliesOwnTx).
   -- See: live-index.allium ApplyResolvedTx
+deferred OwnReadbackMatchesHead -- see: ../../allium/live-index.allium
+  -- Match the record to the oldest staged transaction in the current term.
+  -- The native driver requires the pending append's encoded transaction and the staged transaction it owns.
+  -- The Kotlin leader compares the transaction ID with its staged head.
 deferred ApplyResolvedTx
   -- Apply on read-back: import the head's rows into the durable live tables, advance the DURABLE head to it, and complete its durability handle.
   -- See: live-index.allium ApplyResolvedTx

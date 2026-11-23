@@ -29,6 +29,12 @@ Each retained snapshot keeps its captured transaction head separately from the r
 Executions made from the same context share its memory budget and spill quota.
 `QueryCursor` owns the operator tree and advances it on the caller's coroutine.
 Dropping a cursor releases its operator state and spill files.
+For eligible Arrow queries, UNION ALL forwards its inputs' batches, preserving duplicates and input order.
+A sort over input columns retains the batches and orders their row positions using the SQL key comparator.
+Compatible signed integers, UTF-8 strings and UTC microsecond timestamps compare directly from Arrow buffers.
+Other key layouts use the scalar SQL comparator.
+The sort gathers payload columns in the new order and preserves input order for ties.
+When a sort spills, its runs and merge output use Arrow IPC under the query's spill quota.
 The passive Mark cursor completes its shared candidate build in memory or under the query spill quota before producing a nullable Boolean result.
 An uncorrelated build precedes input evaluation and is shared across input rows; correlated builds retain their input row only while constructing and comparing that row's candidates.
 Uncorrelated comparisons stop at true, while correlated VALUES comparisons demand the complete candidate batch.
@@ -81,6 +87,17 @@ Spill files are scoped temporary resources with a retained-byte quota.
 
 * Visibility resolution merges each common trie task in IID order and descending system time, with newer segments first at equal system times.
   Emitted rows are grouped by contributing source page, with persisted pages before live pages.
+* Persisted scans open the Arrow footer and request the pages that survive pruning.
+  Compatible uncompressed columns can keep their source buffers through IPC decoding and through contiguous scan selections.
+  Compatible lists and structs stay columnar through scan projection.
+  Projected columns use Arrow nulls for pages where the field is absent when the other pages share a layout or form a scalar union.
+  A dense union with compatible children stays columnar through sparse projection and keeps its Arrow array when it matches the result layout.
+  The query cursor also adapts compatible Arrow layouts to the declared result, including mixed unions and newly nullable struct fields.
+  Scan columns that need layout alignment keep source vectors and row positions through identity projection and filtering.
+  Evaluation reads each selected cell under its source layout, so earlier struct versions keep their original keys.
+  The cursor aligns compatible selected layouts and emits sparse fixed-size list selections using Arrow buffers.
+  The same selection works on maps from the live index.
+  The buffer pool can retain decoded pages and parsed footers independently of the file's encoded payload.
 * The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.
 * Temporal file selection includes live candidates before dropping persisted files.
 * Page selection uses temporal summaries, recency ceilings, and IID ranges, with a bypass option for comparison tests.
@@ -260,6 +277,9 @@ Virtual `information_schema` and `pg_catalog` relations resolve from declared sc
 Their rows derive from the captured table registry, column types, database names, and shared PostgreSQL descriptors.
 The declared empty constraint, dependency, extension, and index relations follow the pinned JVM information-schema producers.
 `xt.live_tables`, `xt.live_columns`, and `xt.trie_stats` read retained partition generations.
+`xt.live_trie_artefacts` reports one row per recorded object reachable from a live trie, including partition group objects shared by multiple tries.
+Its rows identify the table, object, definition version, and current or historical family.
+`file_size` is the published object's recorded size in bytes, or null when the record has no size.
 `SystemCursor` computes its allocation bound by borrowing live segments and counting trie catalog entries in place.
 `xt.live_tables` and `xt.live_columns` borrow the same segments to produce rows.
 Runtime user, role, and metric relations require an explicit `CatalogRuntime`; an absent provider reports an unavailable anomaly when that relation is scanned.

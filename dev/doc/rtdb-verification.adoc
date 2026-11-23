@@ -62,7 +62,7 @@ Exercise cache invalidation and overlapping readers in deterministic simulation.
 
 |FTS-1
 |Accelerated MATCH yields the same rows as the reference scan.
-Under one defined score corpus and SQL tie semantics, ranked pruning preserves the top K.
+For the two-argument score and SQL tie semantics, ranked pruning preserves the top K.
 Missing indexes and optional work denied by the acceleration budget permit a scan when its inputs are readable.
 |Verus on rectangle merging, temporal cut decisions and cutoff admission.
 Differentially compare accelerated and scan-only execution over the same basis.

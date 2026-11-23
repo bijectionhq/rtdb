@@ -36,7 +36,15 @@ The link:../../rust/crates/expr/README.adoc[expression reference] records the im
 `CREATE SEARCH INDEX docs_text ON docs (title, body)` defines a search index over a table's columns; `DROP SEARCH INDEX docs_text` removes it.
 Definitions are documents in `xt.search_indexes`, so they can be queried as of any basis.
 
-`MATCH(body, 'overdue invoice')` holds when the column's text holds every term of the query, and `SEARCH_SCORE(body, 'overdue invoice')` ranks it by BM25.
+`MATCH(body, 'overdue invoice')` holds when the column's text holds every term of the query.
+`SEARCH_SCORE(body, 'overdue invoice')` ranks a document by its term frequencies, using BM25 term-frequency saturation with unit weights and unit length normalization.
+For corpus-relative BM25, use `SEARCH_SCORE(body, query, document_count, total_stored_length, document_frequencies)`.
+Aggregate `SEARCH_LENGTH` and the document frequencies over the rows eligible for your corpus, at the appropriate time bounds.
+`SEARCH_LENGTH` returns null for values outside the UTF-8 leg of a column.
+`SEARCH_CORPUS_FINGERPRINT(ids, bodies)` returns a SHA-256 digest of the ordered pairs from equally sized text arrays.
+Use a stable array order to bind a continuation to an exact corpus.
+The frequency array follows the term order returned by `SEARCH_TERMS(query)`.
+Queries that used the two-argument form for corpus-relative ranking need to pass those statistics explicitly.
 Both see the version of each row visible at the query's valid and system time, whatever `FOR VALID_TIME` and `FOR SYSTEM_TIME` select.
 Terms are split on non-alphanumeric characters and lowercased; only string values match.
 A phrase in double quotes, `MATCH(body, '"overdue invoice" paid')`, matches only its terms side by side and in order.
@@ -46,8 +54,13 @@ A scan with `MATCH` uses those files to narrow the candidates it resolves.
 The node option `search: {enabled: false}` turns off the lane and acceleration.
 `MATCH` still returns the same rows.
 `search: {threads: N}` sizes the lane per database.
+`search: {writeFormat: 14}` enables authenticated Arrow search files for newly indexed tries.
+The server defaults to format 11 for rolling upgrades.
+Upgrade all readers and maintenance lanes that share the database before enabling Arrow writes.
+Upgraded nodes can read and repair retained format 11, 12, 13 and 14 files.
 Accelerated queries score against the column values visible at the snapshot.
-`ORDER BY SEARCH_SCORE(body, ...) DESC LIMIT n` over a `MATCH` on the same column resolves only the rows that can rank among the first `n`.
+The search accelerator can prune a ranked limit over the two-argument score and a `MATCH` on the same column.
+The five-argument score uses the ordinary SQL sort and limit.
 See link:../../rust/crates/search/README.adoc[the search reference] and link:fts.allium[the specification].
 
 == Operations
@@ -94,3 +107,8 @@ Run `SHOW rtdb_source_barrier` outside a transaction before opening a read that 
 The command reads the current database's durable source position and waits for local apply through that position.
 Read on the same connection once the command returns `1`.
 The command returns an error on a node without an indexer or a database that ingests transactions through an external source.
+
+Use `SHOW rtdb_hosted_source_owner` in the read transaction used to verify known exact transaction coordinates.
+It returns the source history only when the attached hosted holder has recovered the directory's durable checkpoint and a quorum confirms its current epoch.
+The confirmation samples no source-log tip and makes no claim about whether a particular transaction is applied.
+The caller checks its exact coordinates inside the read snapshot and refuses when the snapshot does not contain them.

@@ -1,17 +1,50 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::sync::{Arc, Mutex, Weak};
 use rtdb_auth::Authenticator;
 use rtdb_node::Node;
 use rtdb_types::{Anomaly, Result};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, error::network};
 
+pub const SERVING_PROBE: [u8; 8] = *b"RTDB\0\0\0\x01";
+pub const SERVING_STARTUP: [u8; 8] = *b"RTDB\0\0\0\x02";
+pub const SERVING_REPLY: [u8; 4] = *b"RTOK";
+const STARTUP_INSPECTIONS: usize = 64;
+const STARTUP_INSPECTION_TIMEOUT: Duration = Duration::from_millis(100);
+
+async fn inspect_startup(mut stream: TcpStream, address: SocketAddr) -> Option<(TcpStream, SocketAddr)> {
+    let inspect = async {
+        let mut bytes = [0; SERVING_PROBE.len()];
+        loop {
+            let read = stream.peek(&mut bytes).await?;
+            if read == 0 { return Ok::<_, std::io::Error>(true); }
+            if bytes[..read] != SERVING_PROBE[..read] && bytes[..read] != SERVING_STARTUP[..read] {
+                return Ok(false);
+            }
+            if read == SERVING_PROBE.len() {
+                let probe_only = bytes == SERVING_PROBE;
+                stream.read_exact(&mut bytes).await?;
+                stream.set_nodelay(true)?;
+                stream.write_all(&SERVING_REPLY).await?;
+                return Ok(probe_only);
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    match tokio::time::timeout(STARTUP_INSPECTION_TIMEOUT, inspect).await {
+        Ok(Ok(true) | Err(_)) => None,
+        _ => Some((stream, address)),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct ServerStatus { pub active_connections: usize, pub pending_connections: usize, pub accepted_connections: u64, pub refused_connections: u64, pub stopped: bool }
+pub struct ServerStatus { pub active_connections: usize, pub pending_connections: usize, pub accepted_connections: u64, pub refused_connections: u64, pub startup_probe_overflows: u64, pub stopped: bool }
 
 #[derive(Clone)]
 pub struct ServerHandle { address: SocketAddr, shutdown: CancellationToken, status: watch::Receiver<ServerStatus>, memory: Arc<rtdb_columnar::MemoryBudget>, registry: Weak<CancellationRegistry> }
@@ -57,7 +90,7 @@ impl ServerDriver {
     pub async fn run(self) -> Result<()> {
         let cancellation = CancellationToken::new();
         let draining = CancellationToken::new();
-        let mut tasks = JoinSet::new(); let mut pending = VecDeque::new(); let mut next_process = 0i32;
+        let mut tasks = JoinSet::new(); let mut inspections = JoinSet::new(); let mut pending = VecDeque::new(); let mut next_process = 0i32;
         let mut state = ServerStatus::default(); let mut failure = None;
         'accept: loop {
             while tasks.len() < self.config.maximum_connections {
@@ -67,17 +100,41 @@ impl ServerDriver {
                 tasks.spawn(connection.run());
             }
             state.active_connections = tasks.len(); state.pending_connections = pending.len(); self.status.send_replace(state.clone());
-            tokio::select! {
+            let connection = tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => break,
-                completion = tasks.join_next(), if !tasks.is_empty() => { if let Some(Err(error)) = completion { failure = Some(Anomaly::fault("xtdb.pgwire/connection-task", error.to_string())); break; } },
+                completion = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = completion { failure = Some(Anomaly::fault("xtdb.pgwire/connection-task", error.to_string())); break; }
+                    None
+                },
+                inspection = inspections.join_next(), if !inspections.is_empty() => inspection.and_then(|result| result.ok()).flatten(),
                 accepted = self.listener.accept() => match accepted {
-                    Ok((stream, address)) => { state.accepted_connections = state.accepted_connections.saturating_add(1); if tasks.len() < self.config.maximum_connections || pending.len() < self.config.pending_connections { if let Err(error) = stream.set_nodelay(true) { failure = Some(network(error)); break; } pending.push_back((stream, address)); } else { state.refused_connections = state.refused_connections.saturating_add(1); if let Some(observer) = self.node.execution_observer() { observer.connection_event(rtdb_plan::ConnectionEvent::Refused); } drop(stream); } },
+                    Ok((stream, address)) => {
+                        state.accepted_connections = state.accepted_connections.saturating_add(1);
+                        if self.config.gateway_session_state && inspections.len() < STARTUP_INSPECTIONS {
+                            inspections.spawn(inspect_startup(stream, address));
+                            None
+                        } else {
+                            if self.config.gateway_session_state {
+                                state.startup_probe_overflows = state.startup_probe_overflows.saturating_add(1);
+                            }
+                            Some((stream, address))
+                        }
+                    }
                     Err(error) => { failure = Some(network(error)); break; },
                 },
+            };
+            if let Some((stream, address)) = connection {
+                if tasks.len() < self.config.maximum_connections || pending.len() < self.config.pending_connections {
+                    if let Err(error) = stream.set_nodelay(true) { failure = Some(network(error)); break; }
+                    pending.push_back((stream, address));
+                } else {
+                    state.refused_connections = state.refused_connections.saturating_add(1);
+                    if let Some(observer) = self.node.execution_observer() { observer.connection_event(rtdb_plan::ConnectionEvent::Refused); }
+                }
             }
         }
-        drop(self.listener); pending.clear(); draining.cancel();
+        drop(self.listener); pending.clear(); inspections.shutdown().await; draining.cancel();
         let deadline = tokio::time::sleep(self.config.drain_timeout); tokio::pin!(deadline);
         while !tasks.is_empty() {
             tokio::select! { _ = &mut deadline => break, completion = tasks.join_next() => if let Some(Err(error)) = completion { if failure.is_none() { failure = Some(Anomaly::fault("xtdb.pgwire/connection-task", error.to_string())); } } }

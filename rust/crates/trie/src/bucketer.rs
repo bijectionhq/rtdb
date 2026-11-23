@@ -3,6 +3,10 @@ use std::cmp::Ordering;
 use rtdb_types::{Anomaly, Iid, Result};
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn invalid_bucket_depth() -> Anomaly {
+    Anomaly::incorrect("rtdb/trie-depth", "IID bucketing exceeds 128 bits")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bucketer { level_bits: u8 }
 
@@ -19,17 +23,19 @@ impl Bucketer {
     pub fn level_bits(self) -> u8 { self.level_bits }
 
     pub fn bucket(self, iid: Iid, level: usize) -> Result<u8> {
-        let depth_error = || Anomaly::incorrect("rtdb/trie-depth", "IID bucketing exceeds 128 bits");
         if self == Self::DEFAULT {
-            return crate::base4_bucket(&iid.0, level).ok_or_else(depth_error);
+            return crate::base4_bucket(&iid.0, level).ok_or_else(invalid_bucket_depth);
         }
-        if level >= self.max_depth() { return Err(depth_error()); }
+        if level >= self.max_depth() { return Err(invalid_bucket_depth()); }
         let bit = level * self.level_bits as usize;
         Ok((iid.0[bit / 8] >> (8 - self.level_bits as usize - bit % 8)) & (self.width() - 1) as u8)
     }
 
     pub fn compare_path(self, iid: Iid, path: &Path) -> Result<Ordering> {
         self.validate(path)?;
+        if self == Self::DEFAULT {
+            return Ok(crate::partition_step::compare_base4_path(&iid.0, path.as_slice()));
+        }
         for (level, value) in path.as_slice().iter().enumerate() {
             let order = self.bucket(iid, level)?.cmp(value);
             if order != Ordering::Equal { return Ok(order); }
@@ -80,6 +86,8 @@ impl Path {
     pub fn as_slice(&self) -> &[u8] { &self.0 }
     pub fn len(&self) -> usize { self.0.len() }
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub(crate) fn into_buckets(self) -> Vec<u8> { self.0 }
+    pub(crate) fn from_split_buckets(buckets: Vec<u8>) -> Self { Self(buckets) }
     pub fn child(&self, bucket: u8, bucketer: Bucketer) -> Result<Self> {
         let mut child = self.0.clone();
         child.push(bucket);

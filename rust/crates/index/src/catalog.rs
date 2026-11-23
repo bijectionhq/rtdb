@@ -71,6 +71,9 @@ pub struct TableCatalog {
 impl TableCatalog {
     pub fn load(block: Option<BlockCatalog>, table_blocks: &BTreeMap<TableRef, TableBlock>) -> Result<Self> {
         let entries: BTreeMap<_, _> = block.as_ref().map(BlockCatalog::table_entries).transpose()?.unwrap_or_default().into_iter().map(|entry| (entry.table.clone(), entry)).collect();
+        if entries.keys().any(|table| TableRef::owned_schema(&table.schema) && !table.supported_owned_name()) {
+            return Err(invalid("Unknown owned relation policy or invalid owned relation name in checkpoint"));
+        }
         let expected: BTreeSet<_> = entries.keys().collect();
         let actual: BTreeSet<_> = table_blocks.keys().collect();
         if expected != actual { return Err(invalid("Table blocks do not match the block's recorded registry")); }

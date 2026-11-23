@@ -36,6 +36,121 @@ async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxPageCursor {
 fn inverse_equals_one(column: Expr) -> Expr { Expr::binary(BinaryOp::Eq,Expr::binary(BinaryOp::Divide,literal(1),column),literal(1)) }
 
 #[tokio::test]
+async fn correlated_mark_adds_a_nullable_boolean_to_the_original_arrow_input() {
+    let execution = execution(1);
+    let relation = mark(table(0, &[1, 2]), table(1, &[1]), Expr::binary(BinaryOp::Eq, column(0), column(1)), true);
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected an Arrow mark");
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.len, 2);
+    assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+    assert_eq!(batch.columns[1].value(0).unwrap(), Value::Bool(true));
+    assert_eq!(batch.columns[1].value(1).unwrap(), Value::Bool(false));
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn uncorrelated_arrow_membership_matches_page_marks_with_null_and_empty_builds() {
+    let execution = execution(2);
+    let schema = |id| Schema::new(vec![field(id, LogicalType::Scalar(ScalarType::I64).maybe())]).unwrap();
+    let values = |id, values: &[Value]| Arc::new(Relation::new(schema(id), RelationNode::Values {
+        rows: values.iter().cloned().map(|value| vec![Expr::Literal(value)]).collect(),
+    }).unwrap());
+    let input = [Value::I64(1), Value::I64(4), Value::Null];
+    for (candidates, expected) in [
+        (vec![Value::I64(1), Value::Null], [Value::Bool(true), Value::Null, Value::Null]),
+        (vec![Value::I64(1)], [Value::Bool(true), Value::Bool(false), Value::Null]),
+        (vec![], [Value::Bool(false), Value::Bool(false), Value::Bool(false)]),
+    ] {
+        let relation = mark(values(0, &input), values(1, &candidates),
+            Expr::binary(BinaryOp::Eq, schema(0).fields()[0].expression(), schema(1).fields()[0].expression()), false);
+        let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &execution.context.memory).unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow membership");
+        let batch = columns.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.len, 3);
+        assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+        assert_eq!((0..3).map(|row| batch.columns[1].value(row).unwrap()).collect::<Vec<_>>(), expected);
+        let mut pages = open(relation, &execution).await;
+        assert_eq!(pages.next_page().await.unwrap().unwrap().rows().iter().map(|row| row.values[1].clone()).collect::<Vec<_>>(), expected);
+        assert!(columns.next_batch().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn membership_spill_keeps_probe_payloads_and_global_null_facts() {
+    let execution = execution_threshold(1, 1);
+    let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+    let candidate = field(1, data_type);
+    let dependent = Arc::new(Relation::new(Schema::new(vec![candidate.clone()]).unwrap(), RelationNode::Values {
+        rows: vec![vec![literal(1)], vec![literal(2)], vec![Expr::Literal(Value::Null)]],
+    }).unwrap());
+    let relation = mark(table(0, &[1, 3, 2]), dependent,
+        Expr::binary(BinaryOp::Eq, column(0), candidate.expression()), false);
+    let mut pages = open(Arc::clone(&relation), &execution).await;
+    let mut expected = Vec::new();
+    while let Some(page) = pages.next_page().await.unwrap() {
+        expected.extend(page.rows().iter().map(|row| row.values.clone()));
+    }
+    drop(pages);
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow membership spill");
+    let mut actual = Vec::new();
+    while let Some(batch) = columns.next_batch().await.unwrap() {
+        assert!(execution.context.spill_bytes() > 0);
+        assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+        actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+    }
+    assert_eq!(actual, expected);
+    assert!(actual.contains(&vec![Value::I64(3), Value::Null]));
+    assert_eq!(actual.len(), 3);
+    assert_eq!(execution.context.spill_bytes(), 0);
+}
+
+#[tokio::test]
+async fn correlated_scalar_apply_keeps_computed_dependent_vectors() {
+    use rtdb_plan::{ApplyKind, NamedExpr};
+    let execution = execution(2);
+    let input = table(0, &[1, 2]);
+    let value = field(2, LogicalType::Scalar(ScalarType::I64));
+    let dependent = Arc::new(table(1, &[10]).project(vec![NamedExpr { field: value.clone(), expr: Expr::binary(
+        BinaryOp::Add, column(1), Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64) },
+    ) }]).unwrap());
+    let output = field(3, value.data_type.maybe());
+    let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+    let relation = Arc::new(Relation::new(schema, RelationNode::Apply {
+        input, dependent, arguments: vec![(0, column(0))], kind: ApplyKind::Scalar, output: Some(output),
+    }).unwrap());
+    let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow Apply");
+    let batch = columns.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.len, 2);
+    assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+    let actual = (0..batch.len).map(|row| batch.columns[1].value(row).unwrap()).collect::<Vec<_>>();
+    assert_eq!(actual, [Value::I64(11), Value::I64(12)]);
+    let mut pages = open(relation, &execution).await;
+    assert_eq!(actual, pages.next_page().await.unwrap().unwrap().rows().iter().map(|row| row.values[1].clone()).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn correlated_mark_checks_every_comparison_in_a_coalesced_dependent_page() {
+    let execution = execution(100);
+    let dependent = union(table(1, &[0; 100]), union(table(1, &[1]), table(1, &[2])));
+    let dependent = Arc::new(dependent.filter(Expr::Literal(Value::Bool(true))).unwrap());
+    let eq = |value| Expr::binary(BinaryOp::Eq, column(1), literal(value));
+    let comparison = Expr::Case {
+        branches: vec![(eq(0), Expr::Literal(Value::Bool(false))), (eq(1), Expr::Literal(Value::Bool(true)))],
+        otherwise: Box::new(inverse_equals_one(Expr::binary(BinaryOp::Subtract, column(1), literal(2)))),
+    };
+    let relation = mark(table(0, &[1]), dependent, comparison, true);
+    let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow membership output");
+    let mut pages = open(relation, &execution).await;
+    let error = columns.next_batch().await.err().unwrap();
+    assert_eq!(pages.next_page().await.err().unwrap().code, error.code);
+    assert_eq!(error.code, "xtdb.expression/division-by-zero");
+}
+
+#[tokio::test]
 async fn mark_hashes_eligibility_keys_and_keeps_unknown_marks_in_memory_and_on_disk() {
     let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
     let left_field = field(0,data_type.clone());

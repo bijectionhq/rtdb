@@ -146,6 +146,70 @@ fn reset_rebuilds_l0_from_supplied_objects_and_clears_compaction() {
 }
 
 #[test]
+fn a_delayed_notice_removes_or_adopts_only_its_named_incarnation() {
+    use rtdb_index::{PartitionState, PartitionValue};
+    use rtdb_trie::TrieConfig;
+
+    let l0 = notification("l00-rc-b00", 10);
+    let old = notification("l01-rc-b00", 10);
+    let current = |name: &str| {
+        let mut trie = notification(name, 10);
+        trie.key = trie.key.with_epoch(1);
+        trie
+    };
+    let table = table();
+    let state = PartitionState::new(PartitionValue::loaded(
+        TrieCatalog::new(20).unwrap(), TableCatalog::default(), TrieConfig::default(),
+    ).unwrap());
+    state.reset_to_l0(BTreeMap::from([(table.clone(), vec![l0])])).unwrap();
+    let add = |tries| state.add_tries(&BTreeMap::from([(table.clone(), tries)]), Timestamp(10)).unwrap();
+    add(vec![old.clone()]);
+    assert!(state.value().trie_catalog().trie(&table, &old.key).is_none(), "a delayed publication from before reset must not be adopted");
+    let first = current("l01-rc-b00");
+    let next = current("l01-rc-b01");
+    add(vec![first.clone(), next]);
+    assert!(matches!(state.value().trie_catalog().trie(&table, &first.key).unwrap().state, TrieState::Garbage { .. }));
+    state.delete_tries(&BTreeMap::from([(table.clone(), BTreeSet::from([old.key]))]));
+    assert!(state.value().trie_catalog().trie(&table, &first.key).is_some(), "a delayed retirement must preserve the replacement");
+    state.delete_tries(&BTreeMap::from([(table.clone(), BTreeSet::from([first.key.clone()]))]));
+    assert!(state.value().trie_catalog().trie(&table, &first.key).is_none(), "retirement of the exact garbage key must succeed");
+}
+
+#[test]
+fn a_follower_installs_the_naming_epoch_and_exact_catalog_of_a_reset_checkpoint() {
+    use rtdb_index::{PartitionState, PartitionValue};
+    use rtdb_trie::TrieConfig;
+
+    let table = table();
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let catalog = apply(&[("l00-rc-b00", 10), ("l01-rc-b00", 10)]);
+    let leader = PartitionState::new(PartitionValue::loaded(catalog.clone(), tables.clone(), TrieConfig::default()).unwrap());
+    let follower = PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap());
+    let l0 = notification("l00-rc-b00", 10);
+    leader.reset_to_l0(BTreeMap::from([(table.clone(), vec![l0.clone()])])).unwrap();
+
+    let leader_prepared = leader.prepare_block().unwrap();
+    let no_new_tries = BTreeMap::new();
+    let block = BlockCatalog::from_proto(pb::Block {
+        block_index: Some(leader_prepared.block_index().0),
+        tables: vec![entry.to_proto()],
+        naming_epoch: Some(1),
+        ..Default::default()
+    }).unwrap();
+    let table_blocks = leader_prepared.table_blocks(&no_new_tries, Timestamp(101)).unwrap();
+    follower.adopt_block(follower.prepare_block().unwrap(), block, &table_blocks, &no_new_tries, Timestamp(101)).unwrap();
+
+    let installed = follower.value();
+    assert_eq!(installed.trie_catalog().naming_epoch(), 1);
+    assert_eq!(current(installed.trie_catalog()), BTreeSet::from([l0.key.to_string()]));
+    let mut new = notification("l01-rc-b00", 10);
+    new.key = new.key.with_epoch(1);
+    follower.add_tries(&BTreeMap::from([(table.clone(), vec![new.clone()])]), Timestamp(102)).unwrap();
+    assert_eq!(current(follower.value().trie_catalog()), BTreeSet::from([new.key.to_string()]));
+}
+
+#[test]
 fn absent_columns_widen_only_when_the_other_side_has_put_data_5911() {
     let old = StructFields::from([("a".into(), LogicalType::Scalar(ScalarType::I64))]);
     let declared = StructFields::from([("b".into(), LogicalType::Nothing)]);
@@ -185,7 +249,7 @@ fn catalog_allocates_the_first_free_suffix_for_colliding_table_slugs() {
 }
 
 fn artefact(definition_id: &str, version: i64, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
-    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None }
+    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None, file_size: None, published_version: None }
 }
 
 #[test]

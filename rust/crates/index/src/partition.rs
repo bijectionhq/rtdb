@@ -4,10 +4,17 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey};
 
-use crate::{CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
+use crate::{CatalogCut, CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
+
+#[derive(Clone, Copy, Debug)]
+enum CatalogPublication {
+    Untracked,
+    Installed(CatalogCut),
+    Suspended,
+}
 
 #[derive(Clone, Debug)]
 pub struct PartitionValue {
@@ -16,20 +23,35 @@ pub struct PartitionValue {
     table_catalog: Arc<TableCatalog>,
     live: Arc<LiveIndex>,
     live_snapshot: Option<Arc<LiveIndex>>,
+    catalog_publication: CatalogPublication,
 }
 
 impl PartitionValue {
     pub fn loaded(trie_catalog: TrieCatalog, table_catalog: TableCatalog, config: TrieConfig) -> Result<Self> {
+        let trie_catalog = trie_catalog.with_naming_epoch(table_catalog.block().map_or(0, BlockCatalog::naming_epoch));
         let block_index = BlockIndex(table_catalog.block_index().map_or(-1, |index| index.0).checked_add(1).ok_or_else(|| invalid("Block index exhausted"))?);
         let latest_completed_tx = table_catalog.block().and_then(BlockCatalog::latest_completed_tx);
         let checkpoint_tries = table_catalog.block_index().map(|_| Arc::new(CheckpointTries::capture(&trie_catalog)));
         Ok(Self { trie_catalog: Arc::new(trie_catalog), checkpoint_tries, table_catalog: Arc::new(table_catalog),
-            live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), live_snapshot: None })
+            live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), live_snapshot: None, catalog_publication: CatalogPublication::Untracked })
     }
     pub fn trie_catalog(&self) -> &Arc<TrieCatalog> { &self.trie_catalog }
     pub fn table_catalog(&self) -> &Arc<TableCatalog> { &self.table_catalog }
     pub fn live(&self) -> &Arc<LiveIndex> { &self.live }
-    pub fn snapshot(&self) -> Snapshot { Snapshot::new(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog), Arc::clone(&self.live)) }
+    pub fn snapshot(&self) -> Snapshot { self.snapshot_with_live(&self.live) }
+
+    pub fn retains_trie(&self, table: &TableRef, key: &TrieKey) -> bool {
+        self.trie_catalog.trie(table, key).is_some()
+            || self.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key))
+    }
+
+    fn snapshot_with_live(&self, live: &Arc<LiveIndex>) -> Snapshot {
+        let cut = match self.catalog_publication {
+            CatalogPublication::Installed(cut) => Some(cut),
+            CatalogPublication::Untracked | CatalogPublication::Suspended => None,
+        };
+        Snapshot::new(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog), Arc::clone(live)).with_catalog_cut(cut)
+    }
 }
 
 #[derive(Debug)]
@@ -72,13 +94,11 @@ impl BlockPreparation {
 #[derive(Debug, Default)]
 struct Retention {
     readers: Vec<Weak<TrieCatalog>>,
-    collecting: Weak<()>,
 }
 
 pub struct TrieCollection {
     current: Arc<PartitionValue>,
     readers: Vec<Arc<TrieCatalog>>,
-    _collecting: Arc<()>,
 }
 
 impl TrieCollection {
@@ -127,12 +147,7 @@ impl PartitionState {
         let value = self.value.read();
         let mut retention = self.retention.lock();
         let readers = retention.readers.iter().filter_map(Weak::upgrade).collect();
-        let collecting = retention.collecting.upgrade().unwrap_or_else(|| {
-            let collecting = Arc::new(());
-            retention.collecting = Arc::downgrade(&collecting);
-            collecting
-        });
-        TrieCollection { current: Arc::clone(&value), readers, _collecting: collecting }
+        TrieCollection { current: Arc::clone(&value), readers }
     }
 
     /// Captures the latest applied state for a reader, including transaction resolution.
@@ -140,6 +155,28 @@ impl PartitionState {
         let value = self.value.read();
         self.retain_catalog(&value);
         value.snapshot()
+    }
+
+    /// Publishes a prefix after the replica driver has finished installing it.
+    /// A reset suspends publication until adoption of its new naming epoch.
+    pub fn publish_catalog_cut(&self, cut: CatalogCut) -> Result<()> {
+        let mut value = self.value.write();
+        match value.catalog_publication {
+            CatalogPublication::Suspended => return Ok(()),
+            CatalogPublication::Installed(previous) => {
+                if cut.storage_version != previous.storage_version || cut.storage_epoch != previous.storage_epoch
+                    || cut.replica_epoch != previous.replica_epoch || cut.through < previous.through
+                {
+                    return Err(invalid("Installed catalog prefix changed history or moved backwards"));
+                }
+                if cut == previous { return Ok(()); }
+            }
+            CatalogPublication::Untracked => {}
+        }
+        let mut next = value.as_ref().clone();
+        next.catalog_publication = CatalogPublication::Installed(cut);
+        *value = Arc::new(next);
+        Ok(())
     }
 
     /// The caller's basis barrier runs before this capture; this passive object never waits for log progress.
@@ -150,14 +187,14 @@ impl PartitionState {
             if let Some(live) = &value.live_snapshot {
                 if fresh(live) {
                     self.retain_catalog(&value);
-                    return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live));
+                    return value.snapshot_with_live(live);
                 }
             }
         }
         let mut value = self.value.write();
         self.retain_catalog(&value);
         if let Some(live) = &value.live_snapshot {
-            if fresh(live) { return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live)); }
+            if fresh(live) { return value.snapshot_with_live(live); }
         }
         let mut next = value.as_ref().clone();
         next.live_snapshot = Some(Arc::clone(&next.live));
@@ -182,7 +219,12 @@ impl PartitionState {
     pub fn add_tries(&self, additions: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<()> {
         let mut value = self.value.write();
         let mut trie_catalog = value.trie_catalog.as_ref().clone();
-        for (table, tries) in additions { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
+        let epoch = trie_catalog.naming_epoch();
+        for (table, tries) in additions {
+            // A completed job can reach the replica journal after a compactor reset.
+            let current = tries.iter().filter(|trie| trie.key.level() == 0 || trie.key.epoch() == epoch);
+            trie_catalog = trie_catalog.with_tries(table.clone(), current.cloned(), as_of)?;
+        }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(trie_catalog);
         *value = Arc::new(next);
@@ -212,11 +254,23 @@ impl PartitionState {
     }
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<()> {
         let mut value = self.value.write();
-        if self.retention.lock().collecting.strong_count() != 0 {
-            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/collecting", "Trie collection is still in progress"));
-        }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(value.trie_catalog.reset_to_l0(replacements)?);
+        next.catalog_publication = CatalogPublication::Suspended;
+        *value = Arc::new(next);
+        Ok(())
+    }
+    pub fn reset_to_replayed_primary(&self, catalog: TrieCatalog, target: TransactionKey) -> Result<()> {
+        let mut value = self.value.write();
+        if value.table_catalog.block().and_then(BlockCatalog::latest_completed_tx) != Some(target)
+            || value.live.latest_completed_tx() != Some(target) || value.live.block_row_count() != 0
+            || value.trie_catalog.naming_epoch().checked_add(1) != Some(catalog.naming_epoch())
+        {
+            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/catalog-moved", "The recovered primary no longer covers the installed reset cut"));
+        }
+        let mut next = value.as_ref().clone();
+        next.trie_catalog = Arc::new(catalog);
+        next.catalog_publication = CatalogPublication::Suspended;
         *value = Arc::new(next);
         Ok(())
     }
@@ -237,15 +291,29 @@ impl PartitionState {
         if block.block_index() != value.live.block_index() || block.latest_completed_tx() != value.live.latest_completed_tx() {
             return Err(invalid("Durable block does not describe the prepared live boundary"));
         }
-        let mut trie_catalog = value.trie_catalog.as_ref().clone();
-        for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
+        let epoch = block.naming_epoch();
+        let trie_catalog = if value.trie_catalog.naming_epoch() == epoch {
+            let mut current = value.trie_catalog.as_ref().clone();
+            for (table, tries) in tries { current = current.with_tries(table.clone(), tries.clone(), as_of)?; }
+            current
+        } else {
+            // A reset checkpoint replaces the catalog, including for a node that
+            // did not perform the reset or that is recovering an interrupted reset.
+            durable_tries.with_naming_epoch(epoch)
+        };
+        let old_epoch = value.table_catalog.block().map_or(0, BlockCatalog::naming_epoch);
+        let catalog_publication = match value.catalog_publication {
+            CatalogPublication::Suspended if epoch > old_epoch && epoch == value.trie_catalog.naming_epoch() => CatalogPublication::Untracked,
+            publication => publication,
+        };
         let table_catalog = value.table_catalog.adopt(block, &prepared.metadata)?;
         if !table_catalog.tables().keys().eq(table_blocks.keys()) {
             return Err(invalid("Table blocks do not match the adopted checkpoint registry"));
         }
         let live = value.live.next_block()?;
         *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), checkpoint_tries,
-            table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None });
+            table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None,
+            catalog_publication });
         Ok(())
     }
 }

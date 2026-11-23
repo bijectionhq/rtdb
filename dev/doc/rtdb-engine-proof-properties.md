@@ -7,7 +7,7 @@ Full-text search has its own section because its published specification is on `
 Unmarked entries restate a documented contract or express a proof obligation for it.
 **Candidate** marks a proposed extension to the contracts or a stronger claim that merits explicit agreement.
 Each entry is a verification target, and the linked sources establish its intended scope.
-The recovery study records which abstract theorems, bounded model checks, and implementation observations already exist for recovery properties S1–S7 and conditional progress. [Recovery proof status](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/dev/doc/rtdb-recovery-properties.md#proof-status)
+The recovery study records which abstract theorems, bounded model checks, and implementation observations already exist for recovery properties S1–S7 and conditional progress. [Recovery proof status](rtdb-recovery-properties.md#proof-status)
 Locally checked evidence for the engine catalog is tracked in the [engine verification record](rtdb-engine-proof-evidence.md).
 The [verification ledger](rtdb-engine-verification-ledger.md) tracks each property by its catalog ID.
 
@@ -67,7 +67,7 @@ Sources include the [query lifecycle](high-level-tour.adoc), [SQL reference](../
 
 ## 4. Scans, pruning, and distributed reads
 
-Sources include the [Rust scan and replay design](xtdb-rust-rewrite.md#4-query-and-temporal-execution), [query reference](../../rust/crates/query/README.adoc), [trie catalog](trie-cat.allium), and [multi read tiers](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/allium/rtdb-multi.allium).
+Sources include the [Rust scan and replay design](xtdb-rust-rewrite.md#4-query-and-temporal-execution), [query reference](../../rust/crates/query/README.adoc), [trie catalog](trie-cat.allium), and [multi read tiers](../../allium/rtdb-multi.allium).
 
 - **SCAN01 · Source coverage.** A snapshot scan includes the live and persisted sources needed to reconstruct the requested history, with correctly ordered event input for each IID.
 - **SCAN02 · Pruning is conservative.** Removing files, pages, or IID prefixes using metadata preserves the exact result of a scan without pruning.
@@ -117,7 +117,7 @@ Sources include the [live index specification](../../allium/live-index.allium), 
 
 Sources include [classic log and election contracts](../../allium/log-processor-lifecycle.allium), the [database processing model](db.allium), and [Kafka-backed logs](../../docs/src/content/docs/ops/config/log/kafka.md).
 LOG01–LOG10 primarily describe classic mode, and shared contracts need evidence for each implementation.
-The separate [multi-mode recovery inventory](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/dev/doc/rtdb-recovery-properties.md) covers quorum recovery, and the [multi log service](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/allium/rtdb-multi.allium) supplies the remaining journal contracts below.
+The separate [multi-mode recovery inventory](rtdb-recovery-properties.md) covers quorum recovery, and the [multi log service](../../allium/rtdb-multi.allium) supplies the remaining journal contracts below.
 
 - **LOG01 · One durable order.** A valid durable log exposes the same total order to every reader, and a successful append returns the position of its own record.
 - **LOG02 · Read progress.** A prepared read advances only on delivery, delivers in order, and reports a reached tip according to its contract.
@@ -180,7 +180,7 @@ Sources include the [compaction specification](compaction.allium), [trie catalog
 
 ## 11. Garbage collection, erasure, and maintenance
 
-Sources include [trie GC](gc.allium), [block GC](block-gc.allium), [offline maintenance contracts](db.allium), [multi erasure rules](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/allium/rtdb-multi.allium), and the [bounded S3 erasure study](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/dev/doc/rtdb-recovery-properties.md#s3-erasure-ordering).
+Sources include [trie GC](gc.allium), [block GC](block-gc.allium), [offline maintenance contracts](db.allium), [multi erasure rules](../../allium/rtdb-multi.allium), and the [bounded S3 erasure study](rtdb-recovery-properties.md#s3-erasure-ordering).
 
 - **GC01 · Reachability.** Collection preserves objects and payloads reachable through every catalog, snapshot, or retained history covered by its retention contract.
 - **GC02 · Maintenance authority.** Only the leader, reaper, or authorized maintenance actor for a cleanup class can perform that class of durable deletions and catalog updates.
@@ -195,7 +195,7 @@ Sources include [trie GC](gc.allium), [block GC](block-gc.allium), [offline main
 
 ## 12. Database membership, multi-cell placement, and lineage
 
-Sources include the [node membership specification](../../allium/database-lifecycle.allium), [multi-mode specification](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/allium/rtdb-multi.allium), [implementation plan](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/dev/doc/rtdb-multi-plan.md), and [transfer model and observations](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/dev/doc/rtdb-recovery-properties.md#transfer-protocol-study).
+Sources include the [node membership specification](../../allium/database-lifecycle.allium), [multi-mode specification](../../allium/rtdb-multi.allium), [implementation plan](rtdb-multi-plan.md), and [transfer model and observations](rtdb-recovery-properties.md#transfer-protocol-study).
 
 - **CELL01 · Membership uniqueness.** A database name resolves to at most one held entry per node, and configured, skipped, running, and tearing-down entries obey their membership rules.
 - **CELL02 · Attach and detach.** Admission, repeat instructions, durable membership replacement, teardown, and primary-database restrictions preserve the documented name-resolution state.
@@ -215,7 +215,7 @@ Sources include the [node membership specification](../../allium/database-lifecy
 
 ## 13. Object storage, caches, and hosted recovery
 
-Sources include the [storage publication contracts](../../rust/crates/storage/README.adoc), [S3](../../rust/crates/s3/README.adoc), [Azure](../../rust/crates/azure/README.adoc), and [GCS](../../rust/crates/gcs/README.adoc) adapters, the [multi object-storage contract](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/allium/rtdb-multi.allium), and the [archive restore record](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/dev/doc/rtdb-recovery-properties.md#archive-restore-and-physical-replay).
+Sources include the [storage publication contracts](../../rust/crates/storage/README.adoc), [S3](../../rust/crates/s3/README.adoc), [Azure](../../rust/crates/azure/README.adoc), and [GCS](../../rust/crates/gcs/README.adoc) adapters, the [multi object-storage contract](../../allium/rtdb-multi.allium), and the [archive restore record](rtdb-recovery-properties.md#archive-restore-and-physical-replay).
 
 - **STORE01 · Provider refinement.** Provider operations implement the supported storage contract for range reads, immutable puts, conditional publication, inventory, errors, and retry semantics.
 - **STORE02 · Range and cache agreement.** A cached or fresh range returns exactly the requested bytes of the same immutable object and generation.
@@ -249,7 +249,7 @@ Sources include the [PostgreSQL source specification](pgsrc.allium), [external d
 
 ## 15. Authorization, protocols, and foreign interfaces
 
-Sources include the [authentication crate](../../rust/crates/auth/README.adoc), [multi client and storage access](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/allium/rtdb-multi.allium), [pgwire](../../rust/crates/pgwire/README.adoc), [Flight SQL](../../rust/crates/flight-sql/README.adoc), and [native ABI](../../rust/crates/ffi/README.adoc).
+Sources include the [authentication crate](../../rust/crates/auth/README.adoc), [multi client and storage access](../../allium/rtdb-multi.allium), [pgwire](../../rust/crates/pgwire/README.adoc), [Flight SQL](../../rust/crates/flight-sql/README.adoc), and [native ABI](../../rust/crates/ffi/README.adoc).
 
 - **API01 · Authentication binding.** Each admitted request is bound to the authenticated identity and its actual session or connection.
 - **API02 · Authorization coverage.** Query, DML, catalogs, metadata, administrative actions, and external adapter paths enforce the permissions specified for their identities and targets.
@@ -264,10 +264,12 @@ Sources include the [authentication crate](../../rust/crates/auth/README.adoc), 
 - **API11 · Cancellation isolation.** Cancel, disconnect, expiration, and close release the affected work without invalidating unrelated sessions, requests, or retained results.
 - **API12 · Authentication refresh.** Revalidation and expiration enforce the applicable rules for continuing or rejecting requests without mixing identities or sessions.
 - **API13 · Cross-deployment noninterference (Candidate).** At fixed identities, grants, bases, and statement context, authorized data observations in one deployment are invariant under unrelated work in another deployment.
+- **API14 · Bounded gateway replay.** The first replayable failure sets the pending command's cutoff, and every replacement attempt shares it until the gateway takes a reply for forwarding to the client.
+  Expiration preserves the command's unknown outcome and ends gateway recovery.
 
 ## 16. Resource accounting and operational progress
 
-Sources include the [query resource notes](../../rust/crates/query/README.adoc), [server lifecycle](../../rust/crates/server/README.adoc), [Kafka resource profiles](rust-kafka-native-account.adoc), and [multi admission and progress rules](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/allium/rtdb-multi.allium).
+Sources include the [query resource notes](../../rust/crates/query/README.adoc), [server lifecycle](../../rust/crates/server/README.adoc), [Kafka resource profiles](rust-kafka-native-account.adoc), and [multi admission and progress rules](../../allium/rtdb-multi.allium).
 
 - **RES01 · Reservation ownership.** Each charge against a declared shared budget belongs to its retained resource until released or transferred exactly once.
 - **RES02 · Budget enforcement.** Within the scope of each configured resource budget, admitted work respects the accounting limit and receives the defined outcome on exhaustion.

@@ -158,6 +158,13 @@ impl DiskCache {
             }
         }
     }
+    fn cached_file(self: &Arc<Self>, key: &ObjectKey) -> Option<DiskLease> {
+        let mut state = self.state.lock();
+        let entry = state.entries.get(key).filter(|entry| entry.file.get().is_some()).cloned()?;
+        state.clock = state.clock.saturating_add(1);
+        entry.accessed.store(state.clock, Ordering::Relaxed);
+        Some(DiskLease { cache: Arc::clone(self), entry })
+    }
     fn cached_size(&self, key: &ObjectKey) -> Option<u64> { self.state.lock().entries.get(key).and_then(|entry| entry.file.get()).map(|file| file.size) }
 
     /// Concurrent readers share a load; cancellation discards its temporary file and leaves the next caller able to retry.
@@ -169,10 +176,14 @@ impl DiskCache {
         if lease.entry.file.get().is_none() {
             let object = self.cancellation.run_until_cancelled(store.head(remote_key)).await.ok_or_else(cache_closed)??;
             let mut temporary = tempfile::NamedTempFile::new_in(self.root.join(".tmp")).map_err(|error| Error::io(&self.root, error))?;
-            let chunk_size = (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1);
+            let chunk_size = if store.supports_scan_ranges(remote_key) {
+                (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1) as u64
+            } else {
+                object.size.max(1)
+            };
             let mut offset = 0;
             while offset < object.size {
-                let end = object.size.min(offset.saturating_add(chunk_size as u64));
+                let end = object.size.min(offset.saturating_add(chunk_size));
                 let length = usize::try_from(end - offset).map_err(|error| Error::Task(error.to_string()))?;
                 let reservation = ReadReservation::new(length, self.reserve(length)?);
                 let bytes = self.cancellation.run_until_cancelled(store.get_reserved_range(remote_key, offset..end, reservation)).await.ok_or_else(cache_closed)??;
@@ -283,6 +294,20 @@ impl DiskCachedStore {
 }
 #[async_trait]
 impl ObjectStore for DiskCachedStore {
+    fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
+        self.remote.index_page_lifecycle()
+    }
+    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        self.remote.retain_catalog(cut).await
+    }
+    fn defers_trie_releases(&self) -> bool { self.remote.defers_trie_releases() }
+    async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        self.remote.advance_catalog_floor(installed).await
+    }
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<()> {
+        self.remote.release_trie_files(receipt, contents).await
+    }
+
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
@@ -293,6 +318,20 @@ impl ObjectStore for DiskCachedStore {
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.head_fresh(key)).await.ok_or_else(cache_closed)?
     }
+    async fn observe_head(&self, key: &ObjectKey) -> Result<crate::ObjectObservation<StoredObject>> {
+        self.remote.observe_head(key).await
+    }
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> Result<std::collections::BTreeMap<ObjectKey, crate::ObjectObservation<StoredObject>>> {
+        self.remote.observe_heads(keys).await
+    }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<crate::ObjectObservation<Bytes>> {
+        self.remote.observe_range(key, range).await
+    }
+    async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.cache.cancellation.run_until_cancelled(self.remote.retirement_version(key)).await.ok_or_else(cache_closed)?
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         self.get_range(key, 0..self.head(key).await?.size).await
     }
@@ -300,6 +339,12 @@ impl ObjectStore for DiskCachedStore {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.get_fresh(key)).await.ok_or_else(cache_closed)?
+    }
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> { self.remote.get_fresh_exact(key, length).await }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<crate::ObjectObservation<Bytes>> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.cache.cancellation.run_until_cancelled(self.remote.observe_fresh_exact(key, length)).await.ok_or_else(cache_closed)?
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let length = usize::try_from(range.end.checked_sub(range.start).ok_or_else(|| Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: 0 })?).map_err(|error| Error::Task(error.to_string()))?;
@@ -323,6 +368,21 @@ impl ObjectStore for DiskCachedStore {
             reservation.finish(Bytes::from(bytes))
         }).await
     }
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.remote.supports_scan_ranges(key) }
+
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        let scope = self.io.admit()?;
+        let operation = self.cache.begin_operation()?.and(scope);
+        let Some(lease) = self.cache.cached_file(&self.key(key)?) else {
+            return self.cache.cancellation.run_until_cancelled(self.remote.get_reserved_scan_range(key, range, reservation))
+                .await.ok_or_else(cache_closed)?;
+        };
+        let key = key.clone();
+        IoRegion::run_admitted(operation, move || {
+            let file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
+            crate::object_store::map_range(crate::LocalFile::new(file, Some(lease)), &key, range, reservation)
+        }).await
+    }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }
     /// The lease pins the cached file, so the cache neither evicts nor counts as free what a reader still maps.
     async fn local_file(&self, key: &ObjectKey) -> Result<Option<crate::LocalFile>> {
@@ -334,11 +394,29 @@ impl ObjectStore for DiskCachedStore {
             Ok(Some(crate::LocalFile::new(file, Some(lease))))
         }).await
     }
+    async fn cached_local_file(&self, key: &ObjectKey) -> Result<Option<crate::LocalFile>> {
+        let scope = self.io.admit()?;
+        let operation = self.cache.begin_operation()?.and(scope);
+        let Some(lease) = self.cache.cached_file(&self.key(key)?) else { return Ok(None) };
+        IoRegion::run_admitted(operation, move || {
+            let file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
+            Ok(Some(crate::LocalFile::new(file, Some(lease))))
+        }).await
+    }
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.remote.put_with_publication(key, bytes).await
+    }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
+        self.put_file_with_publication(key, source).await.map(drop)
+    }
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
         let scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
-        self.remote.put_file(key, source).await?;
-        self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await
+        let written = self.remote.put_file_with_publication(key, source).await?;
+        self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await?;
+        Ok(written)
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
@@ -346,6 +424,12 @@ impl ObjectStore for DiskCachedStore {
         let _operation = self.cache.begin_operation()?;
         self.remote.delete(key).await?;
         self.cache.invalidate(&self.key(key)?)
+    }
+    async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.remote.collect_recovery_file(key).await?;
+        self.cache.invalidate(&self.key(key)?).map_err(Into::into)
     }
     async fn forget(&self, key: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; self.cache.invalidate(&self.key(key)?) }
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.copy(source, destination).await }

@@ -1,0 +1,136 @@
+{
+  "summary": "Only the current writer of an original residence with no observed history may enroll its missing key.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "ignore_writer": {
+      "defect": "A caller without the current write authority can enroll.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "current_writer && original_residence && !observed_history\n}",
+          "replace": "original_residence && !observed_history\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "function": "may_enroll",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "weaken_writer": {
+      "defect": "A caller without the current write authority can enroll.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "current_writer && original_residence && !observed_history\n}",
+          "replace": "original_residence && !observed_history\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "out <==> current_writer && original_residence && !observed_history",
+          "replace": "out <==> original_residence && !observed_history"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/key_enrollment/laws.rs",
+          "function": "a_nonwriter_cannot_enroll",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "ignore_residence": {
+      "defect": "A derived residence can enroll.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "current_writer && original_residence && !observed_history\n}",
+          "replace": "current_writer && !observed_history\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "function": "may_enroll",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "weaken_residence": {
+      "defect": "A derived residence can enroll.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "current_writer && original_residence && !observed_history\n}",
+          "replace": "current_writer && !observed_history\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "out <==> current_writer && original_residence && !observed_history",
+          "replace": "out <==> current_writer && !observed_history"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/key_enrollment/laws.rs",
+          "function": "a_derived_residence_cannot_enroll",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "ignore_history": {
+      "defect": "A residence with durable history can enroll.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "current_writer && original_residence && !observed_history\n}",
+          "replace": "current_writer && original_residence\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "function": "may_enroll",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "weaken_history": {
+      "defect": "A residence with durable history can enroll.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "current_writer && original_residence && !observed_history\n}",
+          "replace": "current_writer && original_residence\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/key_enrollment.rs",
+          "find": "out <==> current_writer && original_residence && !observed_history",
+          "replace": "out <==> current_writer && original_residence"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/key_enrollment/laws.rs",
+          "function": "an_existing_history_prevents_enrollment",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

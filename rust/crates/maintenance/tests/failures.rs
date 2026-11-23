@@ -26,7 +26,7 @@ fn denied() -> Anomaly {
 
 fn state() -> Arc<PartitionState> {
     let table = TableRef::new("public", "foo");
-    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(0)).unwrap();
+    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(0)).unwrap();
     Arc::new(PartitionState::new(PartitionValue::loaded(catalog, TableCatalog::default(), TrieConfig::default()).unwrap()))
 }
 
@@ -130,35 +130,40 @@ async fn two_databases_share_a_slot_until_cancelled_uploads_finish() {
         error: Anomaly::new(AnomalyCategory::Interrupted, "test/cancelled", "The job was cancelled"),
     });
     let second = Arc::new(FailedJob { error: denied(), calls: AtomicUsize::new(0) });
-    let (first_driver, _) = CompactionDriver::new(state(), first.clone(), Arc::new(RejectPublication), 2, 1, false).unwrap();
+    let (first_driver, _first_handle) = CompactionDriver::new(state(), first.clone(), Arc::new(RejectPublication), 2, 1, false).unwrap();
     let (second_driver, second_handle) = CompactionDriver::new(state(), second.clone(), Arc::new(RejectPublication), 2, 1, false).unwrap();
     let first_cancel = CancellationToken::new();
     let second_cancel = CancellationToken::new();
     let first_run = tokio::spawn(first_driver.with_job_slots(slots.clone()).run(first_cancel.clone()));
     let mut second_run = Box::pin(second_driver.with_job_slots(slots.clone()).run(second_cancel.clone()));
 
-    first.started.acquire().await.unwrap().forget();
-    let second_pending_before_cancel = futures::poll!(second_run.as_mut()).is_pending();
-    let calls_before_cancel = second.calls.load(Ordering::SeqCst);
-    first_cancel.cancel();
-    first.cancelling.acquire().await.unwrap().forget();
-    let second_pending_during_cancel = second_pending_before_cancel && futures::poll!(second_run.as_mut()).is_pending();
-    let calls_during_cancel = second.calls.load(Ordering::SeqCst);
+    let before_release = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        first.started.acquire().await.unwrap().forget();
+        let waiting = futures::poll!(second_run.as_mut()).is_pending();
+        let before_cancel = second.calls.load(Ordering::SeqCst);
+        first_cancel.cancel();
+        first.cancelling.acquire().await.unwrap().forget();
+        let still_waiting = waiting && futures::poll!(second_run.as_mut()).is_pending();
+        (waiting, still_waiting, before_cancel, second.calls.load(Ordering::SeqCst), slots.available_permits())
+    }).await;
 
+    first_cancel.cancel();
     first.release.add_permits(1);
     first_run.await.unwrap().unwrap();
-    assert!(second_pending_before_cancel);
-    assert_eq!(calls_before_cancel, 0);
-    assert!(second_pending_during_cancel);
-    assert_eq!(calls_during_cancel, 0);
-    let completion = tokio::select! {
-        result = second_handle.compact_all() => result,
-        result = &mut second_run => panic!("Second driver exited before replying: {result:?}"),
-    };
-    assert_eq!(completion.unwrap_err(), denied());
+    assert_eq!(before_release.unwrap(), (true, true, 0, 0, 0));
+    let mut completion = Box::pin(second_handle.compact_all());
+    assert!(futures::poll!(completion.as_mut()).is_pending());
+    assert!(futures::poll!(second_run.as_mut()).is_pending());
+    let (run, outcome) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(second_run, async {
+            let outcome = completion.await;
+            second_cancel.cancel();
+            outcome
+        })
+    }).await.unwrap();
+    run.unwrap();
+    assert_eq!(outcome.unwrap_err(), denied());
     assert_eq!(second.calls.load(Ordering::SeqCst), 1);
-    second_cancel.cancel();
-    second_run.await.unwrap();
     assert_eq!(slots.available_permits(), 1);
 }
 
@@ -280,7 +285,7 @@ async fn actual_metadata_upload_failure_preserves_storage_anomaly_and_emits_the_
         let input = TrieKey::l0(BlockIndex(0)).unwrap(); let output: TrieKey = "l01-rc-b00".parse().unwrap();
         let data_key = ObjectKey::new(slug.data_key(&output)).unwrap(); let metadata_key = ObjectKey::new(slug.metadata_key(&output)).unwrap();
         let store = Arc::new(DenyUpload { inner: MemoryStore::default(), denied: metadata_key.clone(), local, uploads: Mutex::new(Vec::new()) });
-        let rows = [StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
+        let rows = [StoredEvent { commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(1))])), recency: None }];
         let data = build_event_batch(&rows, Some(StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
         let mut metadata = MetadataBuilder::new(false, true); metadata.write_leaf(&data).unwrap();
@@ -288,7 +293,7 @@ async fn actual_metadata_upload_failure_preserves_storage_anomaly_and_emits_the_
         store.put(&ObjectKey::new(slug.data_key(&input)).unwrap(), Bytes::from(write_file(&data.schema(), &[data]).unwrap())).await.unwrap();
         store.put(&ObjectKey::new(slug.metadata_key(&input)).unwrap(), Bytes::from(metadata.write().unwrap())).await.unwrap();
         let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
-        let tries = TrieCatalog::default().with_tries(table, [CatalogTrie { key: input, data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(0)).unwrap();
+        let tries = TrieCatalog::default().with_tries(table, [CatalogTrie { key: input, data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(0)).unwrap();
         let state = Arc::new(PartitionState::new(PartitionValue::loaded(tries, tables, TrieConfig::default()).unwrap()));
         let memory = MemoryBudget::new(64 << 20);
         let executor = Arc::new(SegmentCompactor::new(store.clone(), state.clone(), memory.clone(), StorageVersion(6), StorageEpoch(0),

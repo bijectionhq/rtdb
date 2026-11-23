@@ -125,12 +125,22 @@ pub trait LogReplayTail: Send {
 
 #[async_trait]
 pub trait Log: Send + Sync {
+    /// The reopened journal retains its synced prefix, and reads expose only that durable history.
+    fn retains_synced_history(&self) -> bool { false }
+    /// The provider's fixed size limit for one append, before any provider-specific wrapping.
+    /// Absence means callers cannot admit an inline-only write using this provider.
+    fn maximum_append_bytes(&self) -> Option<usize> { None }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
     fn latest(&self) -> Result<LogOffset>;
     /// Reports a prefix floor without opening a cursor. This applies to providers where the first
     /// requested replay offset is the preceding offset plus one. An observation does not reserve records.
     async fn retained_floor(&self) -> Result<Option<LogOffset>> { Ok(None) }
+    /// Opens a replay cursor during database recovery, before the log driver starts.
+    /// Providers returning a cursor must validate its starting position at admission.
+    /// A discarded prefix reports the first requested and first retained offsets.
+    /// Providers that defer admission return None and open the cursor when the driver runs.
+    async fn recovery_tail(&self, _after: LogOffset) -> Result<Option<Box<dyn LogTail>>> { Ok(None) }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>>;
     /// Captures record starts in [from, to), bounded by the current durable tip.
     /// A missing start within the captured tip is an error; starts beyond the tip return an empty range.

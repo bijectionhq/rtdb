@@ -7,14 +7,26 @@ The behaviour is specified in link:../../../dev/doc/fts.allium[fts.allium]; link
 
 `CREATE SEARCH INDEX name ON table (column, ...)` and `DROP SEARCH INDEX name` write and delete documents in `xt.search_indexes`.
 `MATCH(column, query)` and `SEARCH_SCORE(column, query)` are scalar functions evaluated on resolved rows, with the analyzer in `rtdb-text`.
+Use `SEARCH_SCORE(column, query, documents, tokens, frequencies)` when the ranking corpus is a filtered relation.
+Supply the count of non-null documents, the sum of `SEARCH_LENGTH(column)`, and a list of per-term document counts in `SEARCH_TERMS(query)` order over the same rows.
+This score uses only those statistics and the value being scored.
+When `CREATE SEARCH INDEX IF NOT EXISTS` finds an existing definition at its ordered position, the original definition and its version are retained.
+`MATCH` can still narrow candidates if a search file covers its column.
 The node configuration's `search: {enabled, threads}` switches the lane and the scan accelerator together.
+The server option `search: {writeFormat: 14}` selects the bounded Arrow layout for newly built files.
+The server defaults to format 11.
+Upgrade all readers and maintenance lanes sharing the database before enabling Arrow writes.
 
 == Pieces
 
 `file`::
-A search file holds one Tantivy segment for a trie or an eligible partition group.
-Each document covers an entity's text run in one column and records its bitemporal visibility.
-The sidecar maps documents and row positions to the group's members.
+A search file covers a trie or an eligible partition group.
+Formats 12, 13 and 14 use Arrow IPC, and format 11 uses Tantivy.
+Its manifest maps events, text runs and data pages to the group's members and records each run's bitemporal visibility.
+The term directory locates the Arrow frequency and position batches and records score bounds for ranked search.
+The artefact format version identifies the Arrow layout.
+Format 14 follows authenticated range references from its root to term, posting, document and IID visibility pages.
+The maintenance lane builds the configured version from primary data and can repair files in any of these formats.
 
 `definitions`::
 Reads the definitions in force from `xt.search_indexes` at a snapshot.
@@ -24,10 +36,14 @@ The `search` artefact kind: a builder per database that the core artefact lane d
 
 `accelerate`::
 The scan accelerator narrows candidate IIDs, accounts for events in other sources and supplies indexed `MATCH` answers.
-The query's `SEARCH_SCORE` corpus comes from the rows visible at its snapshot.
+For eligible ranked SQL limits, the accelerator verifies the competitive candidates at the query snapshot and can use integer `_id` bounds to prune score ties.
+The two-argument SQL score uses unit weights.
+The five-argument form uses the corpus supplied by the caller.
+Held owned ranking uses the exact covered corpus at its retained snapshot.
 
 == Ownership
 
 The builder is a passive object driven by the artefact lane, which is the active object choosing among jobs, block signals and build requests.
 The accelerator is passive and completes on the scan's coroutine; the corpus registry it writes is a per-query transient read only after the scan has opened.
-A search file holds its bundle's bytes for as long as any reader of it lives.
+Arrow pages hold their storage lease for as long as any reader uses their buffers.
+The live worker publishes immutable posting coverage, and a snapshot scans the suffix outside its covered pages.

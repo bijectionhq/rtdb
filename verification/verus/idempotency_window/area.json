@@ -1,0 +1,122 @@
+{
+  "summary": "The checked helpers compute a finite endpoint, enforce the private cutoff, and recognize the recorded application guard position.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "guard_attribution"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "expire_one_microsecond_early": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "find": "submitted_at.checked_add(HOUR_MICROS)?",
+          "replace": "submitted_at.checked_add(HOUR_MICROS - 1)?"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "function": "expiration",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "admit_the_infinite_endpoint": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "find": "if expiry == i64::MAX { None } else { Some(expiry) }",
+          "replace": "Some(expiry)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "function": "expiration",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "attribute_user_assertion_after_guard": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "find": "if after_bootstrap { 1 } else { 0 }",
+          "replace": "if after_bootstrap { 1 } else { 1 }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "function": "guard_time_at",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "erase_bootstrap_offset": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "find": "if after_bootstrap { 1 } else { 0 }",
+          "replace": "0"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "function": "guard_time_at",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "admit_cutoff_equality": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "find": "if submitted_at >= not_after",
+          "replace": "if submitted_at > not_after"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "function": "replay_window",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "function": "replay_window",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "forget_cutoff_coverage": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "find": "ReplayWindow::Open(ordinary_expiry.max(not_after))",
+          "replace": "ReplayWindow::Open(ordinary_expiry)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/idempotency_window.rs",
+          "function": "replay_window",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}

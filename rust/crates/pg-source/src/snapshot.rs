@@ -1,7 +1,7 @@
 use std::{collections::{BTreeSet, VecDeque}, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef};
-use crate::{Lsn, PgTransaction, Remote, SourceConfig, config::{identifier, literal}, decoder::snapshot_row, wire::{Connection, QueryResult, protocol}};
+use crate::{ArrowPgTransaction, Lsn, Remote, SourceConfig, config::{identifier, literal}, decoder::snapshot_rows, wire::{Connection, QueryResult, protocol}};
 
 pub(crate) async fn publication_exists(remote: &Remote, config: &SourceConfig, memory: Arc<MemoryBudget>) -> Result<bool> {
     let mut connection = Connection::open(remote, false, memory).await?;
@@ -28,13 +28,13 @@ impl SnapshotReader {
         query.query(&format!("DECLARE rtdb_tables NO SCROLL CURSOR FOR SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = {} ORDER BY schemaname, tablename", literal(&config.publication_name)?)).await?;
         Ok(Self { _slot: slot, query, lsn, ignored: config.ignore_tables.clone(), tables: VecDeque::new(), table_page: None, table: None, tables_finished: false, memory })
     }
-    pub async fn next_batch(&mut self) -> Result<Option<PgTransaction>> {
+    pub async fn next_batch(&mut self) -> Result<Option<ArrowPgTransaction>> {
         loop {
             if let Some(table) = &self.table {
                 let result = self.query.query("FETCH FORWARD 1000 FROM rtdb_rows").await?;
                 if result.rows.is_empty() { self.query.query("CLOSE rtdb_rows").await?; self.table = None; continue; }
-                let operations = result.rows.iter().map(|row| snapshot_row(table, &result.columns, row, &self.memory)).collect::<Result<_>>()?;
-                return Ok(Some(PgTransaction { lsn: self.lsn, commit_time: None, operations }));
+                let changes = snapshot_rows(table, &result.columns, &result.rows, &self.memory)?;
+                return Ok(Some(ArrowPgTransaction { lsn: self.lsn, commit_time: None, batches: vec![changes] }));
             }
             if self.tables.is_empty() && !self.tables_finished {
                 let result = self.query.query("FETCH FORWARD 1000 FROM rtdb_tables").await?;

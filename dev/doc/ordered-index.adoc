@@ -11,7 +11,13 @@ For example, after priority 2 and ID 4, use `priority > 2 OR (priority = 2 AND _
 Include `_id` in the ordering to make continuation deterministic among equal values.
 Reuse both temporal points to continue the same read across SQL statements.
 The scan can reverse the index order and applies predicates before counting rows towards the limit.
-It fetches projected fields from a row's table at the same basis.
+When all predicates and result columns are covered, the seek emits Arrow result batches from the index as the caller pulls them.
+The seek evaluates predicates against posting cells and gathers only the requested output columns through plain projections.
+Tracing and EXPLAIN ANALYZE observe the same batch cursor.
+When the query needs additional fields, the scan fetches those columns by IID from the table at the same basis.
+It resolves candidates in bounded batches and evaluates any remaining predicates on those batches.
+The qualifying rows retain their original batch and row offsets through the gather.
+The seek applies offset and limit to the qualifying rows and fetches their payload once.
 
 For a ranked full-text query, a bounded seek on a structured predicate can supply an IID scope before MATCH candidates are scored.
 This uses the same captured snapshot and point instants as the text query.
@@ -20,7 +26,12 @@ The primary scan applies the remaining predicates to the resolved row and SEARCH
 `SELECT DISTINCT key ... ORDER BY key LIMIT n` can use an ordered index when the key is a stored text column and the preceding index columns are fixed by equality predicates.
 The ordered seek applies index-covered predicates before counting distinct keys.
 
-The index orders signed integers, Booleans, text, binary values, UUIDs and calendar dates.
+The index orders signed integers, Booleans, text, binary values, UUIDs, calendar dates, zoned timestamps at microsecond precision, and single- and double-precision floating-point values.
+Unsigned Arrow cells use the SQL engine's signed interpretation at the same width for seeks and ordering.
+Float keys preserve signed zero order and group NaNs at the end, as SQL sorting does.
+A zero or NaN comparison remains a row predicate. NaN rows cannot satisfy an indexed comparison to an ordinary float value.
+The index reads float results from their original rows to preserve payload bits.
+Zoned timestamp comparisons use the instant even when a bound has a different zone.
 Ascending order places nulls last and reversing the order places them first.
 The normal SQL executor covers unsupported sort directions, types, temporal intervals and query shapes.
 
@@ -38,20 +49,47 @@ It emits both retractions and insertions when a key or interval moves.
 Payload-only changes with the same projected valid-time spans share the previous root.
 The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
 The point read applies later erasures to the selected root.
-Each read or maintenance cycle owns its decoded pages and its live replay state.
+The projector reads typed Arrow cells directly from table events.
+A posting leaf stores an uncompressed Arrow IPC record batch with a compact description of its column types.
+Seeks compare cells in the leaf's Arrow buffers, and a page rewrite copies surviving cells directly into the new buffers.
+Readers support JSON and Arrow IPC references in branch pages, revision directories, and checkpoint manifests.
+Set `orderedIndexArrowReferences: true` on writers after upgrading every node that reads ordered-index objects in the installation.
+The default publishes JSON references for compatibility during the reader rollout.
+A new Arrow page can refer to an existing JSON page.
+Arrow references preserve complete key fences, entry counts, and measured subtree coefficients.
+Correction spans refer to rows of index-owned Arrow key batches.
+A correction page persists only its own spans as Arrow columns for validity endpoints and keys, with an IID and span count for each row group.
+Branch fences and the revision directory carry the remaining tree metadata.
+Each read or maintenance cycle owns its page buffers and its live replay state.
+A forward contiguous run from one leaf can share selected plain text or binary value bytes.
+Other columns gather their projected cells into independent buffers.
+Shared buffers have rebased offsets and carry the backing allocation's memory reservation.
+On a hosted read, Arrow wire encoders can borrow those buffers with the page's permit until the encoded bytes are ready.
+The encoder releases the batch before waiting for the transport.
+Hosted readers that return Arrow arrays to callers use independent result buffers.
+The scan traces how many covered rows share at least one buffer and how many gather every column.
 Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
-A missing checkpoint, missing source coverage or memory admission failure uses the normal SQL executor.
+Cold page reads carry the published size into a bounded provider fetch and validate the digest before opening Arrow buffers.
+The page admission and memory reservation stay with the provider operation through cancellation.
+A missing checkpoint, missing source coverage or memory admission failure while opening the seek uses the normal SQL executor.
+A read failure after it opens terminates the stream at its captured basis.
 
 == Maintenance
 
 The index worker packs its own immutable pages and publishes a checkpoint after its pages and revision directory are durable.
 It checks coverage against the table catalog's durable event count before publication.
-Each flushed input comes from the captured catalog's adopted L0 inventory and must match its recorded byte length.
+Each flushed file input comes from the captured catalog's adopted L0 inventory and must match its recorded byte length.
 Queries can use a complete checkpoint plus replay from the captured table events, and a reopened node can use the same files.
 Table compaction changes neither the logical roots nor the index's publication schedule.
 A damaged checkpoint can be rebuilt from retained level-zero events.
+If a source data object is missing, native local maintenance can rebuild from its synchronized epoch-zero journal from genesis through the captured checkpoint.
+The rebuild requires the exact checkpoint boundary, an unbroken block sequence, and the adopted event count for every nonempty table block.
+It reuses the flush page layout and reads the captured prefix twice, once for erase cuts and once to project the surviving events.
+The fallback requires any offloaded replica payloads in the interval and supports journals that can replay without an external source or placed lifetime authority.
 A rebuild determines the latest captured erase for each IID before it writes pages.
 It projects events from the erase onward, preserving the operation order at the erase revision.
 A maintenance cycle that incorporates an erase removes the affected IID from older roots and collects unreachable pages and manifests.
 A durable cleanup marker survives a crash after publication or during a rebuild and is cleared after collection.
 A drop makes its generation eligible for collection.
+A posting layout change gives the definition a fresh derived storage address.
+The writer publishes the new address to the storage owner, which retires the previous address under the same reader and upload fences as a dropped definition.

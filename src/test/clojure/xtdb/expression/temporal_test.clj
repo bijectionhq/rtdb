@@ -750,7 +750,10 @@
   (tcp/for-all [t1 (tcg/one-of [ldt-gen ld-gen zdt-gen])
                 default-tz zone-id-gen
                 now instant-gen]
-    (= (LocalDate/ofInstant (->inst t1 now default-tz) default-tz)
+    (= (condp instance? t1
+         LocalDate t1
+         LocalDateTime (.toLocalDate ^LocalDateTime t1)
+         (LocalDate/ofInstant (->inst t1 now default-tz) default-tz))
        (->> (tu/query-ra [:project {:projections [{'res (list 'cast '?t1 (types/->type [:date :day]))}]}
                           [:table {:rows [{}]}]]
                          {:args {:t1 t1}
@@ -761,8 +764,9 @@
   (tcp/for-all [t1 (tcg/one-of [ldt-gen lt-gen zdt-gen])
                 default-tz zone-id-gen
                 now instant-gen]
-    (= (if (instance? LocalTime t1) ; see #372
-         t1
+    (= (condp instance? t1
+         LocalTime t1
+         LocalDateTime (.toLocalTime ^LocalDateTime t1)
          (LocalTime/ofInstant (->inst t1 now default-tz) default-tz))
        (->> (tu/query-ra [:project {:projections [{'res (list 'cast '?t1 (types/->type [:time-local :micro]))}]}
                           [:table {:rows [{}]}]]

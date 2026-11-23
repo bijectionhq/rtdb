@@ -16,9 +16,169 @@
 -- The native pgwire protocol state is in rust/crates/pgwire/src/protocol.rs.
 -- Native Flight SQL handles and captured-basis execution are in rust/crates/flight-sql/src/{state,lease,execute,actions}.rs.
 -- Native embedded ADBC and Clojure adapters are in rust/crates/ffi and bindings/jvm.
+-- Embedded ADBC copies bound Arrow buffers into native allocations and releases the foreign buffers before returning.
+-- Prepared Flight SQL and embedded ADBC queries can bind an Arrow batch row by position.
+-- Scalar evaluation reads a bound parameter from its Arrow column when the expression reaches it.
+-- A prepared Flight SQL query compacts the first row of a multi-row parameter batch for the streaming cursor.
+-- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
 -- Logical relation cursors expose the root operator's pages as separate batches.
+-- Logical relation queries use Arrow vectors for semantic pages, including pages that downstream operators observe before transport batching.
+-- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- Ordinary native SQL and XTQL queries and pgwire result portals retain compatible Arrow query batches while gathering the configured number of output rows.
+-- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
+-- A pgwire portal can encode numeric coefficients and structured JSON, JSON-LD, and Transit results from their Arrow cells.
+-- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
+-- Compatible list and struct parameters stay in Arrow through that projection.
+-- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
+-- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
+-- When a bound Boolean or nullable buffer needs normalization, the projection copies selected cells within Arrow.
+-- Compatible nested fields and union legs retain their value buffers when encoding changes their declared layout.
+-- Columnar UNION ALL preserves duplicates and forwards batches in input order.
+-- A columnar sort on input fields orders batch and row positions using the SQL key comparator.
+-- The sort gathers payload columns by position and uses Arrow IPC for its spill runs.
+-- A sort can compare supported key types directly at selected Arrow positions.
+-- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
+-- A sort can combine computed keys with keys taken directly from its input columns.
+-- Its Arrow spill records retain compatible physical payload layouts.
+-- Its spill threshold accounts for Arrow buffers held by selected payloads.
+-- A materialized relation writes each page as Arrow IPC and opens an independent reader for each reference.
+-- Those spill pages retain each record's fields and preserve their original page boundaries.
+-- Computed VALUES and replayed literal pages admit their results column by column.
+-- Column tables preserve one semantic page across the input list's batches.
+-- Computed UNNEST gathers the original payload from Arrow positions and evaluates only its list operands.
+-- Query analysis measures a batch-capable operator using its emitted Arrow batches.
+-- A batch join can gather matching payload positions from selected Arrow vectors.
+-- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
+-- Its Bloom and entity ID filters use those same build-side vectors.
+-- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
+-- Supported computed keys and integer residual comparisons retain the payload positions through match selection.
+-- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
+-- Their columnar output keeps the configured transport row limit.
+-- Compatible outer equijoins select both sides by position and use null positions for unmatched rows.
+-- A single equijoin fails when more than one build row matches a probe row.
+-- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
+-- Correlated Apply retains independent Arrow payload positions and reads the cells the dependent query references.
+-- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
+-- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
+-- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
+-- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
+-- An idle native session in autocommit mode with write access can reserve an ordered present by awaiting an automatically timed, empty transaction at its submitted position.
+-- The reservation records its transaction outcome, advances the session's await token, and changes no application table.
+-- Transactions that resolve later in that database history use strictly greater system times.
+-- Typed create-only document inserts check absence over their valid-time intervals in the ordered transaction view.
+-- An overlap aborts the entire transaction.
+-- Owned native inserts resolve in the authenticated principal's versioned namespace.
+-- The owner can declare a closed scalar schema before an owned relation has stored data.
+-- An owned create or replacement enforces that schema at the ordering cut.
+-- A creation-lifetime relation declares its immutable acceptance extent before any fact exists.
+-- Its original ordered creation fixes the exclusive expiry and reserves the full identity across that expiry.
+-- A live point uses the store-issued present and reports the fact's exclusive expiry.
+-- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
+-- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its ordered system time and have no valid end.
+-- The declaration is immutable and must precede the first fact.
+-- Source encoding preserves whether an owned field was omitted or explicitly null.
+-- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
+-- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.
+-- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
+-- One grouped owned Flight commit supplies one deadline and batches for distinct relations.
+-- With no relation batches, the commit validates the deadline at its ordered position and changes no owned relation.
+-- Observations across those relations share the ordered cut, and their mutations apply atomically in group and row order.
+-- Owned create, replace, delete, and erase operations apply atomically in their listed order.
+-- Owned erase requires a verified permanent root identity and emits an all-history erase event.
+-- An erase advances the owner's retained-read fence and the identity's historical release floor.
+-- Purge floors compare complete typed handles inside protected buckets. Digest collisions share a bucket without sharing a floor.
+-- The exact floor index covers the same ordered relation erase frontier. Missing coverage refuses historical release.
+-- Owned erase refuses governed paths and another mutation of the same identity in the commit.
+-- Owned point reads compare the complete stored identity before yielding any row.
+-- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
+-- Owned point reads use the principal's namespace at a reserved present.
+-- Ordered owned mutations reserve permanent addresses using the canonical IID and deterministic collision probes.
+-- A protected registry records each locator's complete typed identity with the fact write.
+-- Point reads and ordered checks open the registry at the same cut as the fact and verify its complete stored identity.
+-- An existing relation without a complete registry refuses owned access.
+-- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
+-- A historical point uses the held catalog and the same identity registry at the requested system time.
+-- The relation journal certifies historical point coverage, and incomplete coverage refuses the read.
+-- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
+-- A declared ordered path on an empty relation validates bounds against the held schema and has exact zero cardinality before the first fact.
+-- An ordered read can extend a checkpoint with a bounded exact replay of the held relation's flushed and live events.
+-- A replay that lacks complete source coverage or exceeds its bound refuses the read.
+-- Ordered validation refuses a witnessed write when that relation's frontier changed or the witness expired or belongs to another placed epoch.
+-- Events in other owner relations leave the witness valid.
+-- An owned root mutation appends its owner relation's next dense change group in the same committed transaction.
+-- The first tracked group shares its transaction with the relation's feed floor.
+-- A held feed page seeks by exclusive system time and returns complete groups in transaction order.
+-- Its coverage ends at the last returned group when truncated or at the reserved present when exhausted.
+-- An empty relation is covered through the reserved present, and a request crossing untracked events or a missing group is refused.
+-- A held merged feed seeks the selected owner relations at one cut and groups their visible touches by ordered system time.
+-- A capped page publishes only whole visible commits, and a nonempty page resumes at its last visible commit.
+-- An owned root relation may declare a cap for each distinct fixed-length prefix of its binary fact key.
+-- A populated relation can initialize its first cap when validity always begins at acceptance and has an open end.
+-- The declaration initializes each covered counter from the transaction's final visible membership at its ordering point.
+-- A prefix already above the proposed maximum aborts the declaration and the transaction's other writes.
+-- Redeclaration can change a projection's maximum while retaining its bucket identities and coverage. Tightening checks every bucket against the transaction's final state.
+-- A hosted Root commit can declare capacity alongside catalog effects, guarded by the checked installation authority.
+-- An admitted hosted PgWire catalog transaction can submit the same capacity effect against the installed writer's exact revision. Capacity validation and catalog writes share the final ordered outcome.
+-- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
+-- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.
+-- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.
+-- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
+-- An exceeded bound aborts the entire group, including the writes and counter deltas.
+-- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.
+-- A replacement outside every current Root capacity predicate does not increase a covered count.
+-- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.
+-- A local tombstone or replacement masks the archived member with the same identity.
+-- A growth beyond the current maximum aborts the world writes and accompanying effects.
+-- A world unique claim checks final local occupancy and the exact archived occupant for its path and key.
+-- A final local shadow can withdraw an inherited occupant and transfer the unique key in the same ordered write.
+-- Acceptance-valid writes in a Held world start at the logical clock that the world publishes with them and have an open end.
+-- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
+-- When an Original replay receipt carries archived assertion positions, the governed events retain those exact positions in the destination transaction.
+-- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
+-- Each declared relation's retained floor covers both the requested and selected system coordinates.
+-- The derived hold shares the original generation and lease and admits point, valid-window, version, ordered page and count reads in its fixed root scope.
+-- Historical ordered pages and counts use a fully covered index revision at the admitted system cut and explicit valid instant.
+-- Historical index coverage includes ordered erasures, and historical pages and counts carry no commit evidence.
+
+-- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys at the authored instant.
+-- A held full-span fixed witness permits intervening relation writes only when every covered journal side lies outside its bounds.
+-- Missing exact evidence leaves relation-frontier validation in force.
+-- An admitted placed hosted writer may replace checked ordinary control rows with owned root facts in one ordered transaction.
+-- Exact control identities and expected revisions are checked at the ordered base before either set of writes.
+-- A failed control or fact operation publishes neither set of effects.
+-- A hosted Root publication may include read conditions issued by placed held worlds in the same attachment.
+-- At ordering, each condition checks its original world pin, Root purge frontier and observed local point or relation frontier.
+-- The transaction orders these conditions with Root facts and hosted controls, and the observed worlds receive no writes.
+-- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
+-- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
+-- A held position point or valid window excludes assertions from the first masked position through the end of one commit before resolving the winners.
+-- A held position read still honours live ordered erasure and returns no commit evidence.
+-- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
+-- Its ordered condition checks the original parent pin and Root purge frontier.
+-- Finite Proposal replacements can land after the Root publication advances when the transaction checks each exact start and both held timeline frontiers for each affected relation.
+-- A landing with point writes requires the original parent publication and may also contain finite replacements at distinct addresses.
+-- A Proposal overlay may append multiple fresh carriers in any generation.
+-- Each create checks its own original absence in the parent and overlay.
+-- The transaction checks a Root absence and original Proposal winner for each insert and rejects an identity with retained history or a purge floor.
+-- Fully covered range counts and completed head valid windows can issue relation-frontier evidence under the same placed lease as range pages.
+-- Held system versions seek both window edges in the relation's ordered change journal and verify its event frontier.
+-- Both directions advance past every scanned source group, including groups with no change to the requested identity.
+-- A placed read can receive a conservative relation witness after rendering the complete version page.
+-- A historical hold uses the original journal to certify version pages through its selected cut and issues no commit evidence.
+-- Each admitted version resolves the complete valid timeline at that revision on the same pinned physical catalog.
+-- An owned path declaration is maintained from the ordered owner's private catalog.
+-- An owned unique declaration starts before any relation data and admits one Binary key per row.
+-- Every ordered unique mutation commits the covered relation frontier together with its occupancy changes.
+-- A held current-valid unique lookup requires the declaration frontier to cover the captured relation.
+-- A hit proves both the full occupancy identity and the winning fact holder's complete Binary key.
+-- A covered miss or verified hit can yield one original held relation witness.
+-- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.
+-- Key conflicts expose neither the occupied key nor its holder.
+-- A held range requires an exact published covering generation for the captured frontier and serves one page directly from that path.
+-- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
+-- EPOCH_NANOS_BE(CURRENT_TIMESTAMP) encodes that instant as eight unsigned big-endian bytes without rounding.
 --
 -- == Frontend parity (the point of this spec) ==
 --
@@ -29,7 +189,14 @@
 --      pgwire parses them itself.
 --      BEGIN evaluates and validates its characteristics, then publishes the open transaction with those characteristics atomically.
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
+--      COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream') uses the connection's read basis.
+--      The connection streams Arrow IPC in CopyData frames and ends it before the CopyDone and command completion frames.
+--      COPY FROM STDIN with an Arrow format submits Arrow document batches.
+--      Without an explicit transaction, each input batch commits separately.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
+--      An implicit basis on a linearizable subscriber follows the installed replica prefix confirmed by its active loglet.
+--      A read transaction retains its captured basis across later statements.
+--      Each explicit snapshot token identifies the basis the caller selected.
 --      The gateway restores the mutable settings and token before replaying prepared statements or resuming application work.
 --      The mutable settings include the timezone, session parameters and default transaction access mode.
 --      DISCARD ALL restores the original startup settings.
@@ -54,6 +221,12 @@
 --        async/sync choice is the commit's own COMMIT SYNC / COMMIT ASYNC if it states one,
 --        else the transaction's begin-time async flag.
 -- Above: the Frontend (pgwire / ADBC / Flight SQL client) that decodes the wire protocol and feeds SQL strings and transaction API calls into the Connection.
+-- A trusted frontend may supply a private replay permit for the synchronous commit of exactly one buffered write operation.
+-- The permit names the command's effective key and exclusive submission cutoff.
+-- The initial attempt and every retry of that command carry the same permit.
+-- The guarded source record prevents a legacy resolver from applying the user's operations.
+-- A conflicting key in the transaction metadata is rejected before append.
+-- A retry that reaches marker lookup and finds the original outcome returns the original committed transaction key.
 
 ---- Given
 
@@ -178,7 +351,11 @@ value CommitOpts {
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
     --   system_time   — the system-time to record the transaction at.
+    --                   It must advance the history and must not be later than the source log's append time for the record.
+    --                   A later time aborts the transaction with rtdb/future-system-time, so history time never leads the log's clock.
     --   user_metadata — per-transaction metadata.
+    --                   An idempotency_key field names a retry identity scoped to the database and principal: a same-body retry within the receipt window is answered with the original's outcome, and a different body aborts with rtdb/idempotency-conflict.
+    --                   The source-log timestamps of admission and retry determine whether the receipt is within its window.
     --                   RTDB recognises the Boolean rtdb_ordered_system_time field as an opt-in to rejecting an explicit system time behind the source log.
     --                   The PgWire SHOW rtdb_ordered_system_time value is 1 when the server supports this guard.
     --   async         — true: commit submits without awaiting; false: execute-and-await.
@@ -221,6 +398,7 @@ enum StatementKind {
     -- How the SqlParser classifies an executable statement for access-mode resolution.
     -- A query pins a pending tx's read basis, making it Reading; a DML statement makes
     -- a Pending(Unspecified) tx Writing. (DDL that submits as tx-ops — CREATE TABLE, GRANT — classifies as dml.)
+    -- A CREATE TABLE can contribute nullable native column types to the ordered catalog even with no row writes.
     query | dml
 }
 
@@ -783,6 +961,7 @@ rule BufferDml {
     -- on. Rejected if the open tx is read-only (see DmlInReadOnlyRejected) or failed
     -- (see FailedTransactionRejectsStatements).
     -- The buffer retains the argument width supplied by the frontend.
+    -- Prepared Flight SQL updates retain compatible argument batches in Arrow through source serialization and replay, including updates submitted through GetFlightInfo.
     -- At commit, the database applies the submission and resolution rules for those SQL arguments.
     when: ExecuteStatement(frontend, connection, kind, statement)
     requires: kind = dml
@@ -951,6 +1130,12 @@ rule CommitWriting {
         -- buffered nothing still submits an empty transaction. This differs from the
         -- Reading / Pending no-op below.
 }
+
+-- In a placed deployment, COMMIT ASYNC sets the connection's await token to an opaque attempt receipt.
+-- A placed COMMIT SYNC sets it to an applied replica prefix after reading the exact attempt outcome.
+-- Before pinning an implicit read basis, an attempt receipt is redeemed and an applied token waits for its installed prefix.
+-- A supplied snapshot token still caps the history visible to the read.
+-- A frozen placed attachment confirms await tokens from its own admitted checkpoint before pinning the read basis.
 
 rule CommitNoOp {
     -- Commit of a Reading or still-Pending transaction submits nothing — there is no

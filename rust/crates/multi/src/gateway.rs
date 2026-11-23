@@ -21,6 +21,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::control::{self, Request, Response};
 
 const SSL_REQUEST: i32 = 80877103;
+const WRITER_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 const GSSENC_REQUEST: i32 = 80877104;
 const CANCEL_REQUEST: i32 = 80877102;
 const PROTOCOL_3: i32 = 196608;
@@ -113,6 +114,7 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
             accepted = listener.accept() => accepted.map_err(io)?,
         };
         let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else { continue; };
+        let _ = client.set_nodelay(true);
         let deployments = Arc::clone(&deployments);
         let frame_memory = Arc::clone(&frame_memory);
         let directory = Arc::clone(&directory);
@@ -197,14 +199,19 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     }
     startup.parameters.insert(rtdb_pgwire::GATEWAY_AWAIT_TOKEN_PARAMETER.into(), "on".into());
     startup.parameters.insert(rtdb_pgwire::GATEWAY_SETTINGS_PARAMETER.into(), "on".into());
-    startup.bytes = encode_startup(&startup.parameters);
+    let snapshot = startup.snapshot();
     let read_only = startup.read_only();
+    startup.parameters.remove(rtdb_pgwire::GATEWAY_REPLICA_READ_PARAMETER);
+    if read_only && !snapshot {
+        startup.parameters.insert(rtdb_pgwire::GATEWAY_REPLICA_READ_PARAMETER.into(), "on".into());
+    }
+    startup.bytes = encode_startup(&startup.parameters);
     let mut router = GatewayRouter {
         directory: Arc::clone(&directory), name,
         deployment: expected.map(|id| id.hyphenated().to_string()),
-        read_only, snapshot: startup.snapshot(), options: options.clone(), heartbeats, connection_index,
+        read_only, snapshot, options: options.clone(), heartbeats, connection_index,
     };
-    let route_initial = tokio::time::timeout_at(startup_deadline, router.route_with_record()).await;
+    let route_initial = tokio::time::timeout_at(startup_deadline, router.route_with_record(false)).await;
     let (server, control, epoch, deployment) = match route_initial {
         Ok(Ok(route)) => route,
         Err(_) => return refuse(&mut client, "57P03", "Timed out routing startup to the deployment's holder").await,
@@ -296,15 +303,20 @@ impl Drop for Heartbeat {
 }
 
 impl GatewayRouter {
-    async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
-        control::retry_activation(self.options.control_timeout, || route(self)).await
+    async fn route_with_record(&self, prefer_holder: bool) -> Result<(TcpStream, Option<String>, u64, String)> {
+        control::retry_activation(self.options.control_timeout, || route(self, prefer_holder)).await
     }
 }
 
 #[async_trait::async_trait]
 impl crate::session::Router for GatewayRouter {
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
-        let (stream, control, epoch, _) = self.route_with_record().await?;
+        let (stream, control, epoch, _) = self.route_with_record(false).await?;
+        Ok((stream, control, epoch))
+    }
+
+    async fn route_holder(&self) -> Result<(TcpStream, Option<String>, u64)> {
+        let (stream, control, epoch, _) = self.route_with_record(true).await?;
         Ok((stream, control, epoch))
     }
 
@@ -314,7 +326,7 @@ impl crate::session::Router for GatewayRouter {
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64, String)> {
+async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream, Option<String>, u64, String)> {
     let directory = &router.directory;
     let name = router.name.as_str();
     let options = &router.options;
@@ -329,28 +341,27 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         Lifecycle::Restoring => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/restoring", format!("{name}'s checkpoint is being restored; retry shortly"))),
         Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
     }
-    let key = control::ControlKey(options.capabilities.clone());
-    let activation = Request::Activate { name: name.into() };
-    if !router.snapshot && (!router.read_only || record.read_width <= 1)
+    if (prefer_holder || !router.snapshot && (!router.read_only || record.read_width <= 1))
         && let Some(holder) = &record.holder
         && let Some(member) = directory.member(holder).await.ok().flatten()
         && record.may_hold_on(&member, now_ms())
         && let Some(control_address) = member.control_address
-        && let Ok(Response::Held { address, epoch }) = control::call(&control_address, &activation, options.control_timeout, &key).await
+        && let Ok((Response::Held { address, epoch }, confirmed, probe)) = confirm_writer(directory.as_ref(), &record, &control_address, options).await
     {
-        return Ok((connect(&address).await?, Some(control_address), epoch, record.id));
+        return Ok((connect_serving(&address, &confirmed, probe, options).await?, Some(confirmed), epoch, record.id));
     }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
-    if router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
+    if !prefer_holder && router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
         for reader in snapshot_readers(&record, &members) {
             let Some(control_address) = &reader.control_address else { continue; };
-            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Snapshot { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
-                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
-            }
+            if let Ok((Response::Subscribed { address }, probe)) = control::call_with_pgwire_probe(control_address,
+                Request::Snapshot { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await
+                && let Ok(stream) = connect_serving(&address, control_address, probe, options).await
+            { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
         }
     }
-    if router.read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
-        let mut readers = replicas(&record, &members);
+    if !prefer_holder && router.read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
+        let mut readers = crate::deployment::read_replicas(&record, &members, now_ms());
         let count = readers.len();
         if count > 1 {
             readers.rotate_left(router.connection_index % count);
@@ -358,9 +369,11 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         }
         for replica in readers {
             let Some(control_address) = &replica.control_address else { continue; };
-            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Subscribe { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
-                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
-            }
+            let request = if record.linearizable_reads { Request::SubscribeFresh { name: name.to_owned() } } else { Request::Subscribe { name: name.to_owned() } };
+            if let Ok((Response::Subscribed { address }, probe)) = control::call_with_pgwire_probe(control_address,
+                request, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await
+                && let Ok(stream) = connect_serving(&address, control_address, probe, options).await
+            { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
         }
     }
     let mut last = None;
@@ -368,24 +381,39 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
     let mut refused = None;
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
-        match control::call(control_address, &activation, options.control_timeout, &key).await {
-            Ok(Response::Held { address, epoch }) => return Ok((connect(&address).await?, Some(control_address.clone()), epoch, record.id.clone())),
-            Ok(Response::Redirect { holder, address }) => {
-                let control = members.get(&MemberId(holder)).and_then(|member| member.control_address.clone());
-                return Ok((connect(&address).await?, control, record.epoch, record.id.clone()));
-            }
-            Ok(Response::Refused { code, message }) if control::retryable_activation(&code) => {
+        match confirm_writer(directory.as_ref(), &record, control_address, options).await {
+            Ok((Response::Held { address, epoch }, confirmed, probe)) => return Ok((connect_serving(&address, &confirmed, probe, options).await?, Some(confirmed), epoch, record.id.clone())),
+            Ok((Response::Refused { code, message }, _, _)) if control::retryable_activation(&code) => {
                 retryable = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
-            Ok(Response::Refused { code, message }) if code == control::NOT_CLAIMABLE => {
+            Ok((Response::Refused { code, message }, _, _)) if code == control::NOT_CLAIMABLE => {
                 last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
-            Ok(Response::Refused { code, message }) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
-            Ok(Response::Done | Response::Flushed { .. } | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. } | Response::FlightEndpoint { .. }) => {}
+            Ok((Response::Refused { code, message }, _, _)) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
+            Ok(_) => {}
+            Err(error) if control::unreachable_control(&error.code) => {
+                retryable.get_or_insert_with(|| Anomaly::new(AnomalyCategory::Unavailable, control::WRITER_CONTROL_UNREACHABLE,
+                    error.message.as_deref().unwrap_or("The writer's control endpoint is unreachable")));
+            }
             Err(error) => last = Some(error),
         }
     }
     Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
+}
+
+async fn confirm_writer(directory: &dyn Directory, record: &DeploymentRecord, control_address: &str, options: &GatewayOptions) -> Result<(Response, String, Option<u64>)> {
+    let key = control::ControlKey(options.capabilities.clone());
+    let request = Request::Activate { name: record.name.clone() };
+    let (response, probe) = control::call_with_pgwire_probe(control_address, request.clone(), options.control_timeout, &key).await?;
+    if let Response::Redirect { holder, .. } = &response
+        && let Some(member) = directory.member(&MemberId(holder.clone())).await?
+        && record.may_hold_on(&member, now_ms())
+        && let Some(target) = member.control_address.filter(|address| address != control_address)
+    {
+        let (response, probe) = control::call_with_pgwire_probe(&target, request, options.control_timeout, &key).await?;
+        return Ok((response, target, probe));
+    }
+    Ok((response, control_address.to_owned(), probe))
 }
 
 /// The nodes that may serve a snapshot read: every node that may take a placement, in the deployment's affinity order, the holder last, so snapshots spare the writer.
@@ -397,15 +425,6 @@ fn snapshot_readers<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberI
         .partition(|member| holder.as_ref() != Some(&member.id));
     others.extend(holders);
     others
-}
-
-/// The nodes that may serve the deployment's reads beside its holder: the ranks after the holder's, within its read width.
-fn replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
-    let now = now_ms();
-    let holder = effective_holder(record, members, now).cloned();
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| record.may_place_on(member, now)).collect();
-    rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
-        .filter(|member| holder.as_ref() != Some(&member.id)).take(record.read_width.saturating_sub(1) as usize).collect()
 }
 
 /// The holder that counts, then every node that may take a placement, in the deployment's affinity order.
@@ -425,6 +444,50 @@ async fn connect(address: &str) -> Result<TcpStream> {
     let stream = TcpStream::connect(address).await.map_err(io)?;
     stream.set_nodelay(true).map_err(io)?;
     Ok(stream)
+}
+
+fn writer_unreachable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, control::WRITER_PGWIRE_UNREACHABLE, "The writer's pgwire endpoint is unreachable")
+}
+
+async fn connect_serving(address: &str, control: &str, probe: Option<u64>, options: &GatewayOptions) -> Result<TcpStream> {
+    let timeout = options.control_timeout.min(WRITER_DIAL_TIMEOUT);
+    let key = control::ControlKey(options.capabilities.clone());
+    let direct = async {
+        let mut stream = connect(address).await?;
+        if probe.is_some() { check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_STARTUP).await?; }
+        Ok::<_, Anomaly>(stream)
+    };
+    if let Ok(Ok(stream)) = tokio::time::timeout(timeout, direct).await { return Ok(stream); }
+    let relay = async {
+        let mut stream = control::open_pgwire(control, timeout, &key).await?;
+        check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_STARTUP).await?;
+        Ok::<_, Anomaly>(stream)
+    };
+    if let Ok(Ok(stream)) = tokio::time::timeout(timeout, relay).await { return Ok(stream); }
+    if let Some(before) = probe
+        && matches!(control::ping(control, timeout, &key).await, Ok(Some(after)) if after != before)
+        && let Ok(Ok(stream)) = tokio::time::timeout(timeout, connect(address)).await
+    {
+        return Ok(stream);
+    }
+    Err(writer_unreachable())
+}
+
+async fn check_pgwire_serving(stream: &mut TcpStream, preface: [u8; 8]) -> Result<()> {
+    stream.write_all(&preface).await.map_err(io)?;
+    let mut reply = [0; rtdb_pgwire::SERVING_REPLY.len()];
+    stream.read_exact(&mut reply).await.map_err(io)?;
+    if reply == rtdb_pgwire::SERVING_REPLY { Ok(()) } else { Err(writer_unreachable()) }
+}
+
+pub(crate) async fn probe_pgwire(address: &str, timeout: Duration, serving_probe: bool) -> bool {
+    let probe = async {
+        let mut stream = connect(address).await?;
+        if serving_probe { check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_PROBE).await?; }
+        Ok::<_, Anomaly>(())
+    };
+    matches!(tokio::time::timeout(timeout, probe).await, Ok(Ok(())))
 }
 
 /// Returns None for a cancel request, which this gateway does not forward.
@@ -544,6 +607,69 @@ mod tests {
         };
         let result = crate::session::Router::route(&router).await;
         assert_eq!(result.unwrap_err().code, "rtdb.multi/install-identity");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_uses_the_new_holders_confirmed_endpoint_and_epoch() {
+        use rtdb_directory::{MemberPool, MemberRole, MemberState};
+
+        struct Answer(Response);
+
+        #[async_trait::async_trait]
+        impl control::Handler for Answer {
+            async fn handle(&self, request: Request) -> Response {
+                assert!(matches!(request, Request::Activate { name } if name == "shop"));
+                self.0.clone()
+            }
+        }
+
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let source_control = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_control = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hinted = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_control.local_addr().unwrap();
+        let member = |id: &str, control: &TcpListener| MemberRecord {
+            id: MemberId(id.into()),
+            role: MemberRole::Node,
+            address: hinted.local_addr().unwrap().to_string(),
+            control_address: Some(control.local_addr().unwrap().to_string()),
+            availability_zone: "a".into(),
+            engine_version: "0".into(),
+            lease_expires_at_ms: now_ms() + 60_000,
+            state: MemberState::Eligible,
+            drain_target_engine: None,
+            pool: MemberPool::General,
+            storage_namespaces: None,
+            version: 0,
+        };
+        let source = directory.register_member(member("source", &source_control)).await.unwrap();
+        let target = directory.register_member(member("target", &target_control)).await.unwrap();
+        let mut deployment = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        deployment.holder = Some(source.id);
+        deployment.epoch = 1;
+        let deployment = directory.create_deployment(deployment).await.unwrap();
+
+        let stop = CancellationToken::new();
+        let source = tokio::spawn(control::serve(source_control, Arc::new(Answer(Response::Redirect {
+            holder: target.id.to_string(), address: hinted.local_addr().unwrap().to_string(),
+        })), control::ControlKey::default(), stop.clone()));
+        let target = tokio::spawn(control::serve(target_control, Arc::new(Answer(Response::Held {
+            address: ready.local_addr().unwrap().to_string(), epoch: 7,
+        })), control::ControlKey::default(), stop.clone()));
+        let router = GatewayRouter {
+            directory, name: deployment.name.clone(), deployment: Some(deployment.id),
+            read_only: false, snapshot: false, options: GatewayOptions::default(),
+            heartbeats: Arc::new(Heartbeats::default()), connection_index: 0,
+        };
+        let (server, control, epoch, _) = route(&router, false).await.unwrap();
+        assert_eq!(server.peer_addr().unwrap(), ready.local_addr().unwrap());
+        assert_eq!(control.as_deref(), Some(target_address.to_string().as_str()));
+        assert_eq!(epoch, 7);
+
+        stop.cancel();
+        source.await.unwrap().unwrap();
+        target.await.unwrap().unwrap();
     }
 
     #[tokio::test]

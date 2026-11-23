@@ -13,7 +13,7 @@ use bytes::Bytes;
 use prost_types::Any;
 use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{CheckpointStage, DeploymentRecord, Directory, HostedTask, Lifecycle};
-use rtdb_format::database::proto::database_config;
+use rtdb_format::{catalog::CheckpointContents, database::proto::database_config};
 use rtdb_node::{Database, LogAccess, LogFactory, OpenedLogs, ReadFence, RemoteStorageFactory};
 use rtdb_replication::BlockDiscovery;
 use rtdb_server::{PlacedOptions, ServerDriver, config::NodeConfiguration};
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use super::{
     ArchivedObject, CapturePoint, checkpoint_objects, checkpoint_storage_root, digest, encode,
     inconsistent, read, read_object,
-    stage::{STAGED_MANIFEST, with_region},
+    stage::{STAGED_MANIFEST, StageInventory, with_region},
     unavailable,
 };
 use crate::{
@@ -40,6 +40,9 @@ use crate::{
     reference::{PrefixedStore, key},
     store::{CELL_STORAGE_TYPE, EncryptingStore, ROOT_MARKER},
 };
+
+mod owned_inventory;
+pub(crate) use owned_inventory::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, inspect_staged_owned_relations, stream_staged_owned_event_files};
 
 pub struct StagedReaderSettings {
     pub destination: Uuid,
@@ -69,11 +72,13 @@ struct Ready<'a> {
     port: u16,
 }
 
+#[derive(Clone)]
 pub(crate) struct StageSelector {
     pub destination: Uuid,
     pub operation: Uuid,
     pub manifest_sha256: String,
     pub source: Option<(Uuid, Uuid, String)>,
+    pub transfer_only: bool,
 }
 
 enum Transport {
@@ -108,6 +113,7 @@ pub async fn serve_staged_checkpoint(
         operation: settings.operation,
         manifest_sha256: settings.manifest_sha256,
         source: None,
+        transfer_only: false,
     };
     serve_stage(
         directory,
@@ -156,6 +162,41 @@ async fn serve_stage(
     stop: CancellationToken,
     transport: Transport,
 ) -> Result<()> {
+    with_stage(directory, storage, keys, selector, hosted_task, |authority, record, verified| async move {
+        Box::pin(serve_reader(&authority, &record, storage, verified.store, transport, stop)).await
+    }).await
+}
+
+pub(super) async fn admit_transfer_destination(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+) -> Result<CheckpointStage> {
+    if !selector.transfer_only || selector.source.is_none() {
+        return Err(inconsistent("Terminal transfer requires a private held target stage"));
+    }
+    with_stage(directory, storage, keys, selector, hosted_task, |authority, _, verified| async move {
+        if verified.contents != CheckpointContents::Replay {
+            return Err(inconsistent("Terminal transfer requires a complete replay checkpoint"));
+        }
+        Ok(authority.stage)
+    }).await
+}
+
+async fn with_stage<T, F, Fut>(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+    read: F,
+) -> Result<T>
+where
+    F: FnOnce(StageReadAuthority, DeploymentRecord, VerifiedStage) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     let id = selector.destination.to_string();
     let record = directory
         .deployment(&id)
@@ -177,6 +218,7 @@ async fn serve_stage(
                             && &stage.intent.org == org
                     })
                 && stage.media == media
+                && stage.transfer_only == selector.transfer_only
                 && stage.staged_manifest_sha256.as_deref()
                     == Some(selector.manifest_sha256.as_str())
         })
@@ -186,6 +228,7 @@ async fn serve_stage(
         stage: stage.clone(),
         id: id.clone(),
     };
+    let reader = authority.clone();
     with_region(
         directory.as_ref(),
         keys,
@@ -194,14 +237,10 @@ async fn serve_stage(
         hosted_task.as_ref(),
         None,
         None,
-        |current| authority.require_held(current),
-        |region| {
-            let authority = &authority;
-            let record = &record;
-            async move {
-                let store = open_inventory(storage, keys, record, &authority.stage, region).await?;
-                serve_reader(authority, record, storage, store, transport, stop).await
-            }
+        |current| authority.require_held(current).map(|_| None),
+        |record, _, region| async move {
+            let store = open_inventory(storage, keys, &record, &reader.stage, region).await?;
+            read(reader, record, store).await
         },
     )
     .await
@@ -258,13 +297,18 @@ impl ReadFence for StageReadAuthority {
     }
 }
 
+struct VerifiedStage {
+    store: Arc<dyn ObjectStore>,
+    contents: CheckpointContents,
+}
+
 async fn open_inventory(
     storage: &CellStorage,
     keys: &dyn KeyService,
     record: &DeploymentRecord,
     stage: &CheckpointStage,
     region: Arc<IoRegion>,
-) -> Result<Arc<dyn ObjectStore>> {
+) -> Result<VerifiedStage> {
     let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
     let files = PrefixedStore::new(storage.bucket(region).await?, root);
     if files.get(&key(ROOT_MARKER)?).await?.as_ref() != record.id.as_bytes() {
@@ -273,7 +317,7 @@ async fn open_inventory(
         ));
     }
     let manifest_path = key(STAGED_MANIFEST)?;
-    let manifest = read::<Vec<ArchivedObject>>(&files, &manifest_path)
+    let manifest = read::<StageInventory>(&files, &manifest_path)
         .await?
         .ok_or_else(|| unavailable("The staged checkpoint inventory is missing"))?;
     let observed_digest = digest(&encode(&manifest)?);
@@ -282,6 +326,7 @@ async fn open_inventory(
             "The staged inventory differs from its accepted digest",
         ));
     }
+    let (contents, manifest) = manifest.into_contents();
     let root_marker = key(ROOT_MARKER)?;
     let mut objects = BTreeMap::new();
     let mut bytes = 0u64;
@@ -309,7 +354,9 @@ async fn open_inventory(
         .into_iter()
         .map(|object| object.key)
         .collect::<BTreeSet<_>>();
-    if observed != expected {
+    if !expected.is_subset(&observed) || observed.difference(&expected).any(|object| {
+        !super::admits_seeded_transfer_payload(record, stage, object.as_str())
+    }) {
         return Err(inconsistent(
             "The staged storage root differs from its accepted inventory",
         ));
@@ -329,15 +376,15 @@ async fn open_inventory(
         log_epoch: stage.source_log_epoch,
         checkpoint: stage.checkpoint,
     };
-    let closure = checkpoint_objects(plaintext.as_ref(), &point).await?;
+    let closure = checkpoint_objects(plaintext.as_ref(), &point, contents).await?;
     expected.remove(&root_marker);
     expected.remove(&manifest_path);
-    if closure != expected {
+    if closure.keys().ne(expected.iter()) {
         return Err(inconsistent(
             "The staged object inventory differs from the checkpoint closure",
         ));
     }
-    Ok(plaintext)
+    Ok(VerifiedStage { store: plaintext, contents })
 }
 
 struct StageObjects {
@@ -347,6 +394,7 @@ struct StageObjects {
 
 #[async_trait::async_trait]
 impl ObjectStore for StageObjects {
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.files.supports_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         self.objects
             .get(key)
@@ -510,10 +558,12 @@ async fn serve_reader(
         )],
         read_fence: Some(Arc::new((*authority).clone())),
         scan_fragmenter: None,
+        world_constraints: None,
         compaction_relay: None,
         claim_wait: Duration::from_secs(1),
         capabilities: None,
         flight_peer: None,
+        flight_owned_worlds: None,
     };
     let auth = match &transport {
         Transport::Loopback { password, .. } => format!("password: \"{password}\""),
@@ -657,6 +707,7 @@ mod tests {
                             name: key.to_string(),
                             bytes: bytes.len() as u64,
                             sha256: digest(&bytes),
+                            frame_header_sha256: None,
                         },
                     )
                 })

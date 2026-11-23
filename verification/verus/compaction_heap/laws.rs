@@ -9,9 +9,17 @@ verus! {
 pub fn an_equal_iid_prefers_the_later_system_time(iid: u128, earlier: i64, later: i64)
     requires earlier < later,
 {
-    let chosen = precedes((iid, later), (iid, earlier));
-    let tie = precedes((iid, later), (iid, later));
+    let chosen = precedes((iid, later, 0), (iid, earlier, u32::MAX));
+    let tie = precedes((iid, later, 0), (iid, later, 0));
     assert(chosen && !tie);
+}
+
+pub fn equal_commit_times_prefer_the_later_assertion(iid: u128, time: i64, earlier: u32, later: u32)
+    requires earlier < later,
+{
+    let chosen = precedes((iid, time, later), (iid, time, earlier));
+    let reverse = precedes((iid, time, earlier), (iid, time, later));
+    assert(chosen && !reverse);
 }
 
 // LAW COMP-1-HEAP-INITIAL-HEADS.

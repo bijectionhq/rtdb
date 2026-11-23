@@ -53,10 +53,24 @@ impl ScopedS3Writes {
             sts: aws_sdk_sts::Client::new(&sdk), region, require_conditional_put })
     }
 
-    pub fn open(&self, storage: &S3Config, cell_root: &ObjectKey, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>,
+    pub async fn open(&self, storage: &S3Config, cell_root: &ObjectKey, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>,
                 io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        storage.require_cell_root(cell_root)?;
+        let terminal_namespace = if storage.terminal_scope.is_some() {
+            if !self.require_conditional_put || root == cell_root || !root.is_under(cell_root) {
+                return Err(Anomaly::incorrect("rtdb.s3/write-scope", "A terminal writer requires conditional creation below its enrolled cell root"));
+            }
+            let remotes = std::collections::BTreeMap::new();
+            storage.open_cell(cell_root, &remotes, IoRegion::new()).await?.s3_namespace().cloned()
+        } else {
+            None
+        };
         let provider = self.provider(storage, root, authorization)?;
-        Ok(storage.open_authorized(storage.object_prefix(cell_root)?, S3Authorization::Rotating { provider, region: self.region.clone() }, io, true)?)
+        let writer = storage.open_authorized(storage.object_prefix(cell_root)?, S3Authorization::Rotating { provider, region: self.region.clone() }, io, true, None)?;
+        if let Some(expected) = &terminal_namespace && writer.s3_namespace() != Some(expected) {
+            return Err(Anomaly::incorrect("rtdb.s3/write-scope", "The writer credentials resolve to a different S3 namespace"));
+        }
+        Ok(writer)
     }
 
     fn provider(&self, storage: &S3Config, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>) -> Result<SharedCredentialsProvider> {

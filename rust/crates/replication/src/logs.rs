@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, SourceMessage}, keys::oversized_key, log::proto};
+use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key, log::proto};
 use rtdb_storage::{Error as StorageError, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
-use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
+
+use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicaMetadata { pub position: ReplicaPosition, pub timestamp: Timestamp }
@@ -14,8 +16,14 @@ pub struct ReplicaRecord {
     pub metadata: ReplicaMetadata,
     pub envelope: Arc<ReplicaEnvelope>,
     reservation: Arc<MemoryReservation>,
+    pub(crate) fingerprint: Option<ReplicaFingerprint>,
 }
 impl ReplicaRecord { pub fn retained_bytes(&self) -> usize { self.reservation.bytes() } }
+
+pub(crate) enum DecodedReplica {
+    Known(ReplicaRecord),
+    Unrecognized { term: Term, sequence: Option<TermSequence> },
+}
 
 pub struct ReplicaReceipt { receipt: AppendReceipt, epoch: StorageEpoch }
 impl ReplicaReceipt {
@@ -54,6 +62,15 @@ impl PartitionLogs {
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
     pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
+    pub(crate) fn local_recovery_store(&self) -> Option<&rtdb_storage::LocalStore> {
+        if self.retains_recovery_history() { self.store.local_maintenance_store() } else { None }
+    }
+    pub(crate) fn recovery_block_store(&self, file_size_target: i64) -> Result<Arc<crate::BlockStore>> {
+        crate::BlockStore::new(Arc::clone(&self.store), Arc::clone(&self.cache), Arc::clone(&self.memory), file_size_target)
+    }
+    pub(crate) fn retains_recovery_history(&self) -> bool {
+        self.source.retains_synced_history() && self.replica.retains_synced_history() && self.store.syncs_checkpoints()
+    }
     pub fn source_position(&self, metadata: LogMetadata) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, metadata.offset.0) }
     pub fn latest_source_position(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, self.source.latest()?.0) }
     pub fn latest_replica_position(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, self.replica.latest()?.0) }
@@ -67,10 +84,23 @@ impl PartitionLogs {
     pub(crate) async fn open_replica_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Box<dyn LogTail>> {
         self.replica.tail(LogOffset(after.after_offset(self.replica_epoch))).await
     }
-    pub(crate) async fn observed_replica_gap(&self, after: ReplicaPosition) -> rtdb_storage::Result<Option<StorageError>> {
-        let Some(LogOffset(first_retained)) = self.replica.retained_floor().await? else { return Ok(None); };
-        Ok(crate::replay_floor::missing_replay_offset(after.after_offset(self.replica_epoch), first_retained)
-            .map(|requested| StorageError::UnavailableLogRange { requested, first_retained }))
+    pub(crate) async fn recovery_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Option<Box<dyn LogTail>>> {
+        let offset = after.after_offset(self.replica_epoch);
+        let tail = self.replica.recovery_tail(LogOffset(offset)).await?;
+        if tail.is_none()
+            && let Some(LogOffset(first_retained)) = self.replica.retained_floor().await?
+            && let Some(requested) = crate::replay_floor::missing_replay_offset(offset, first_retained)
+        {
+            return Err(StorageError::UnavailableLogRange { requested, first_retained });
+        }
+        Ok(tail)
+    }
+    pub(crate) fn is_recovery_prefix_gap(&self, after: ReplicaPosition, error: &StorageError) -> bool {
+        match error {
+            StorageError::UnavailableLogRange { requested, first_retained } =>
+                crate::replay_floor::missing_replay_offset(after.after_offset(self.replica_epoch), *first_retained) == Some(*requested),
+            _ => false,
+        }
     }
     pub async fn source_range(&self, from: SourcePosition, to: SourcePosition) -> Result<Box<dyn rtdb_storage::log::LogRange>> {
         let (from, to) = inspection_offsets(from.0, to.0, self.source_epoch)?;
@@ -102,10 +132,20 @@ impl PartitionLogs {
         self.source_position(metadata)
     }
     pub async fn enqueue_replica(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp) -> Result<ReplicaReceipt> {
+        self.enqueue_replica_with(envelope, block, now, true, |_| Ok(())).await
+    }
+    pub(crate) fn replica_inline_limit(&self) -> Option<usize> { self.replica.maximum_append_bytes() }
+    pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp,
+        allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
+        let has_acceptance_stage = match &envelope.message {
+            ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?.is_some(),
+            _ => false,
+        };
         let payload = EncodedPayload::encode(envelope.encoded_len(), &self.memory, || Ok(envelope.encode()))?;
+        before_enqueue(&payload)?;
         let receipt = match self.replica.enqueue(payload.clone(), now).await {
             Ok(receipt) => receipt,
-            Err(StorageError::MessageTooLarge { .. }) => {
+            Err(StorageError::MessageTooLarge { .. }) if allow_offload && !has_acceptance_stage => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
                 self.store.put(&ObjectKey::new(oversized_key(block, &payload_id)?)?, payload).await?;
                 let proxy = ReplicaEnvelope { term: envelope.term, term_sequence: envelope.term_sequence,
@@ -118,20 +158,51 @@ impl PartitionLogs {
         Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch })
     }
     pub fn decode_replica(&self, record: LogRecord) -> Result<Option<ReplicaRecord>> {
-        let reservation = self.memory.reserve(replica_decode_bound(record.payload.len())?)?;
-        self.decode_reserved_replica(record, reservation)
+        Ok(self.decode_readback(record, None, None)?.known())
     }
     pub(crate) fn decode_reserved_replica(&self, record: LogRecord, reservation: Arc<MemoryReservation>) -> Result<Option<ReplicaRecord>> {
+        Ok(self.decode_readback(record, Some(reservation), None)?.known())
+    }
+    pub(crate) fn decode_readback(&self, record: LogRecord, reservation: Option<Arc<MemoryReservation>>, own_term: Option<Term>) -> Result<DecodedReplica> {
+        let reservation = match reservation {
+            Some(reservation) => reservation,
+            None => self.memory.reserve(replica_decode_bound(record.payload.len())?)?,
+        };
         let metadata = ReplicaMetadata { position: ReplicaPosition::from_epoch_offset(self.replica_epoch, record.metadata.offset.0)?, timestamp: record.metadata.timestamp };
-        Ok(ReplicaEnvelope::decode(&record.payload)?.map(|envelope| ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation }))
+        let frame = ReplicaFrame::decode(&record.payload)?;
+        let (term, sequence) = (frame.term, frame.term_sequence);
+        let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
+        let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
+            .then(|| fingerprint(&record.payload));
+        Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint }))
     }
     /// Admission runs on the outer envelope before this fetch; a held block receives the resolved body.
     pub async fn resolve_oversized(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let lease = self.cache.get(&ObjectKey::new(key)?).await?;
-        let reservation = self.memory.reserve(replica_decode_bound(lease.as_slice().len())?)?;
-        let envelope = record.envelope.unwrap_payload(lease.as_slice())?;
-        Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation })
+        self.decode_oversized(record, lease.as_slice())
+    }
+
+    pub(crate) async fn resolve_oversized_fresh(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+        let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
+        let key = ObjectKey::new(key)?;
+        let length = usize::try_from(self.store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
+        let _payload = self.memory.reserve(length)?;
+        let payload = self.store.get_fresh_exact(&key, length).await?;
+        self.decode_oversized(record, &payload)
+    }
+
+    fn decode_oversized(&self, record: ReplicaRecord, payload: &[u8]) -> Result<ReplicaRecord> {
+        let reservation = self.memory.reserve(replica_decode_bound(payload.len())?)?;
+        let envelope = record.envelope.unwrap_payload(payload)?;
+        let fingerprint = record.fingerprint.map(|_| fingerprint(payload));
+        Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint })
+    }
+}
+
+impl DecodedReplica {
+    fn known(self) -> Option<ReplicaRecord> {
+        match self { Self::Known(record) => Some(record), Self::Unrecognized { .. } => None }
     }
 }
 

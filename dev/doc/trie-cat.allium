@@ -6,7 +6,8 @@
 -- Tries are added by block flushes (see db.allium) and compaction (see compaction.allium).
 -- Tries are read by the scan operator for query execution.
 -- Tries are garbage-collected by gc.allium once superseded by compaction output.
--- The native catalog retains adopted L0 identities and lengths for recovery after primary compaction supersedes them.
+-- The native catalog retains adopted L0 identities and lengths for recovery and ordered-index replay after primary compaction supersedes them.
+-- A retained checkpoint reset installs rebuilt primary pairs while retaining older L0 source identities that the rebuild did not use.
 --
 -- See: trie/TrieCatalog.kt, log/proto/log.proto (TrieDetails, TrieState)
 
@@ -45,6 +46,18 @@ value ArtefactRecord {
     stats: Bytes
     -- A record without one is its trie's.
     scope: ArtefactScope
+    -- Published object length. A shared group object is counted once.
+    file_size: Long?
+    -- Exact provider identity supplied by the write response or verified idempotent publication.
+    published_version: PublishedObjectVersion?
+}
+
+value PublishedObjectVersion {
+    bucket: String
+    endpoint: String?
+    region: String?
+    physical_key: String
+    version: String
 }
 
 -- trie: derived from its trie's data file alone, and stored under the trie's artefact prefix.
@@ -102,6 +115,14 @@ value TrieKey {
     --   l00-rc-b00         level 0, current, block 0
     --   l01-r20200106-b00  level 1, historical, week ending 2020-01-06
     --   l02-rc-p0-b00      level 2, current, IID partition 0, block 0
+    --   l02-rc-p0-b00-e01  the same position planned in naming epoch 1
+-- Replica publications of compaction output are admitted only in the current naming epoch.
+-- A checkpoint in a different naming epoch installs its persisted trie catalog before replay continues.
+-- A removal matches the entire trie key, including the naming epoch, in addition to the garbage state.
+-- Native compaction records an exact provider version for each file whose publication supplied one.
+-- In an enrolled terminal allocation it records the allocation, physical key and entity tag returned by the acknowledged publication or its confirmed retry.
+-- The catalog preserves those versions after the trie becomes garbage and across checkpoint and replica serialization.
+    -- Compaction outputs carry the catalog's naming epoch, persisted in each block; a compactor reset starts a new epoch, so no name is published twice.
 }
 
 ------------------------------------------------------------

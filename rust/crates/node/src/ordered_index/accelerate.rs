@@ -1,47 +1,83 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, BinaryHeap},
+    ops::Range as RowRange,
 };
 
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, GenericByteArray, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
+    types::ByteArrayType,
+};
+use arrow_buffer::{NullBuffer, OffsetBuffer};
+use arrow_schema::Schema;
 use async_trait::async_trait;
-use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
-use rtdb_query::{ScanAccelerator, ScanRequest};
-use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
+use rtdb_columnar::{
+    BatchBuilder, MemoryReservation, OwnedBatch, retain_buffer_with_owner, to_field,
+};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, UnaryOp};
+use rtdb_query::{OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
+use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, TimeUnit, Timestamp};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use super::{
-    Definition, checkpoint, definitions,
-    key::{Atom, Bucket, Family, family},
-    maintenance::{cancelled, read_root, source_frontier},
-    tree::{Cursor, Key, Tree},
+    Definition, OwnedProjection, checkpoint, definitions,
+    key::{Atom, AtomRef, Bucket, Family, family, owned_family},
+    maintenance::{cancelled, read_root, source_frontier, source_rows},
+    postings::Tuple,
+    tree::{Cursor, Hit, KeyRef, Measure, MeasureDomain, Root, Tree, cardinality_overflow},
 };
 
-const VERIFY_ROWS: usize = 128;
+const BATCH_ROWS: usize = 128;
 const MAX_CANDIDATES: usize = 16_384;
+const MAX_OWNED_REPLAY_ROWS: i64 = 4_096;
 
 pub(crate) struct OrderedIndexAccelerator;
 
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        Ok(exact(request, None)
-            .await?
-            .map(|ids| ids.into_iter().collect()))
+        let Some(OrderedScan::Payload { mut candidates, .. }) = exact(request, None, &[]).await?
+        else {
+            return Ok(None);
+        };
+        let mut selected = BTreeSet::new();
+        loop {
+            match candidates.next_iids(BATCH_ROWS).await {
+                Ok(batch) if batch.is_empty() => return Ok(Some(selected)),
+                Ok(batch) => {
+                    selected.extend(batch);
+                    if selected.len() > MAX_CANDIDATES {
+                        return Ok(None);
+                    }
+                }
+                Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                Err(_) => return Ok(None),
+            }
+        }
     }
 
-    async fn ordered_iids(
+    async fn ordered(
         &self,
         request: &ScanRequest<'_>,
-        limit: usize,
-    ) -> Result<Option<Vec<Iid>>> {
-        if limit > MAX_CANDIDATES {
+        window: RowRange<usize>,
+        projection: &[usize],
+    ) -> Result<Option<OrderedScan>> {
+        if window.end > MAX_CANDIDATES {
             return Ok(None);
         }
-        exact(request, Some(limit)).await
+        exact(request, Some(window), projection).await
     }
 }
 
-async fn exact(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<Vec<Iid>>> {
+async fn exact(
+    request: &ScanRequest<'_>,
+    window: Option<RowRange<usize>>,
+    projection: &[usize],
+) -> Result<Option<OrderedScan>> {
     let table = &request.scan.table.name.table;
     if table.schema == super::CATALOG.0
         || request.scan.iids.is_some()
@@ -51,14 +87,18 @@ async fn exact(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option
     {
         return Ok(None);
     }
-    match seek(request, limit).await {
+    match seek(request, window, projection).await {
         Err(error) if error.category == AnomalyCategory::Interrupted => Err(error),
         Err(_) => Ok(None),
         found => found,
     }
 }
 
-async fn seek(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<Vec<Iid>>> {
+async fn seek(
+    request: &ScanRequest<'_>,
+    window: Option<RowRange<usize>>,
+    projection: &[usize],
+) -> Result<Option<OrderedScan>> {
     let definitions = definitions(
         request.database,
         request.snapshot,
@@ -84,18 +124,24 @@ async fn seek(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<
             })
             .collect();
         let range = Range::bind(request, &fields).await?;
-        let top = if let Some(limit) = limit {
-            let Some((reverse, distinct_slot)) = order(request, &fields, &range) else {
+        let top = if let Some(window) = &window {
+            let Some((reverse, distinct)) = order(request, &fields, &range) else {
                 continue;
             };
-            Some(Top { limit, reverse, distinct_slot })
+            Some(Top {
+                limit: window.end,
+                offset: window.start,
+                reverse,
+                distinct,
+            })
         } else {
             if range.is_open() {
                 continue;
             }
             None
         };
-        if let Some(found) = use_index(request, definition, &fields, &range, top).await? {
+        if let Some(found) = use_index(request, definition, &fields, range, top, projection).await?
+        {
             return Ok(Some(found));
         }
     }
@@ -187,11 +233,11 @@ impl Range {
         Ok(range)
     }
 
-    fn position(&self, key: &[Atom]) -> Ordering {
+    fn position(&self, key: Tuple<'_>) -> Ordering {
         let prefix = key
             .iter()
             .zip(&self.prefix)
-            .map(|(value, bound)| value.cmp(bound))
+            .map(|(value, bound)| value.cmp(&bound.borrowed()))
             .find(|order| *order != Ordering::Equal)
             .unwrap_or(Ordering::Equal);
         if prefix != Ordering::Equal {
@@ -200,26 +246,21 @@ impl Range {
         let Some(next) = key.get(self.prefix.len()) else {
             return Ordering::Equal;
         };
-        let suffix = &key[self.prefix.len()..];
-        if self
-            .lower
-            .as_ref()
-            .is_some_and(|(lower, strict)| next < lower || (*strict && next == lower))
-            || self
-                .cursors
-                .iter()
-                .any(|bound| bound.position(suffix) == Ordering::Less)
+        if self.lower.as_ref().is_some_and(|(lower, strict)| {
+            next < lower.borrowed() || (*strict && next == lower.borrowed())
+        }) || self
+            .cursors
+            .iter()
+            .any(|bound| bound.position(key, self.prefix.len()) == Ordering::Less)
         {
             return Ordering::Less;
         }
-        if self
-            .upper
-            .as_ref()
-            .is_some_and(|(upper, strict)| next > upper || (*strict && next == upper))
-            || self
-                .cursors
-                .iter()
-                .any(|bound| bound.position(suffix) == Ordering::Greater)
+        if self.upper.as_ref().is_some_and(|(upper, strict)| {
+            next > upper.borrowed() || (*strict && next == upper.borrowed())
+        }) || self
+            .cursors
+            .iter()
+            .any(|bound| bound.position(key, self.prefix.len()) == Ordering::Greater)
         {
             return Ordering::Greater;
         }
@@ -267,11 +308,12 @@ impl CursorBound {
         }))
     }
 
-    fn position(&self, tuple: &[Atom]) -> Ordering {
+    fn position(&self, tuple: Tuple<'_>, offset: usize) -> Ordering {
         let order = tuple
             .iter()
+            .skip(offset)
             .zip(&self.key)
-            .map(|(value, bound)| value.cmp(bound))
+            .map(|(value, bound)| value.cmp(&bound.borrowed()))
             .find(|order| *order != Ordering::Equal)
             .unwrap_or(Ordering::Equal);
         match (order, self.lower, self.strict) {
@@ -394,15 +436,22 @@ fn operands<'a>(
 #[derive(Clone, Copy)]
 struct Top {
     limit: usize,
+    offset: usize,
     reverse: bool,
-    distinct_slot: Option<usize>,
+    distinct: Option<DistinctPrefix>,
+}
+
+#[derive(Clone, Copy)]
+struct DistinctPrefix {
+    start: usize,
+    end: usize,
 }
 
 fn order(
     request: &ScanRequest<'_>,
     fields: &[Option<&Field>],
     range: &Range,
-) -> Option<(bool, Option<usize>)> {
+) -> Option<(bool, Option<DistinctPrefix>)> {
     let plan = request.scan.ordered_top_k.as_ref()?;
     let order = &plan.order;
     let equal = &fields[..range.prefix.len()];
@@ -410,44 +459,37 @@ fn order(
         !matches!(&sort.expr, Expr::Column { id, .. } if equal.iter().flatten().any(|field| field.id == *id))
     }).peekable();
     let reverse = suffix.peek()?.descending;
-    for (position, sort) in suffix.enumerate() {
-        let field = fields.get(range.prefix.len() + position)?.as_ref()?;
+    let start = range.prefix.len();
+    let mut end = start;
+    for sort in suffix {
+        let field = fields.get(end)?.as_ref()?;
+        let family = family(&field.data_type)?;
         if !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id)
-            || family(&field.data_type).is_none()
-            || field.data_type.legs().into_iter().any(|leg| {
-                matches!(
-                    leg,
-                    LogicalType::Scalar(
-                        ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
-                    )
-                )
-            })
             || sort.descending != reverse
             || (sort.nulls_first != reverse && field.data_type.nullable() && field.name != "_id")
+            // SQL DISTINCT coalesces signed zeros, which can fall into
+            // different compound sort bands. Only adjacent equivalence
+            // classes may be collapsed by a prefix seek.
+            || (plan.distinct && family == Family::Float)
         {
             return None;
         }
+        end += 1;
     }
-    let distinct_slot = if plan.distinct {
-        let [sort] = order.as_slice() else { return None };
-        let slot = range.prefix.len();
-        let field = fields.get(slot)?.as_ref()?;
-        if family(&field.data_type) != Some(Family::Text)
-            || !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id)
-        {
-            return None;
-        }
-        Some(slot)
-    } else {
-        None
-    };
-    Some((reverse, distinct_slot))
+    Some((
+        reverse,
+        plan.distinct.then_some(DistinctPrefix { start, end }),
+    ))
 }
 
 #[derive(Debug)]
 enum Predicate {
     All(Box<Self>, Box<Self>),
     Either(Box<Self>, Box<Self>),
+    Null {
+        slot: usize,
+        expected: bool,
+    },
     Compare {
         slot: usize,
         op: BinaryOp,
@@ -462,6 +504,20 @@ impl Predicate {
         expression: &'a Expr,
     ) -> futures::future::BoxFuture<'a, Result<Option<Self>>> {
         Box::pin(async move {
+            if let Expr::Unary {
+                op: op @ (UnaryOp::IsNull | UnaryOp::IsNotNull),
+                expr,
+            } = expression
+                && let Expr::Column { id, .. } = expr.as_ref()
+            {
+                return Ok(fields
+                    .iter()
+                    .position(|field| field.is_some_and(|field| field.id == *id))
+                    .map(|slot| Self::Null {
+                        slot,
+                        expected: *op == UnaryOp::IsNull,
+                    }));
+            }
             let Expr::Binary { op, left, right } = expression else {
                 return Ok(None);
             };
@@ -511,13 +567,21 @@ impl Predicate {
         })
     }
 
-    fn matches(&self, tuple: &[Atom]) -> bool {
+    fn matches(&self, tuple: Tuple<'_>) -> bool {
         match self {
             Self::All(left, right) => left.matches(tuple) && right.matches(tuple),
             Self::Either(left, right) => left.matches(tuple) || right.matches(tuple),
+            Self::Null { slot, expected } => (tuple.cell(*slot) == AtomRef::Null) == *expected,
             Self::Compare { slot, op, value } => {
-                let cell = &tuple[*slot];
-                if matches!(cell, Atom::Null | Atom::Unordered) || *value == Atom::Null {
+                let cell = tuple.cell(*slot);
+                let value = value.borrowed();
+                if matches!(
+                    cell,
+                    AtomRef::Null
+                        | AtomRef::Unordered
+                        | AtomRef::FloatOrder(super::key::FLOAT_NAN_ORDER)
+                ) || value == AtomRef::Null
+                {
                     return false;
                 }
                 match op {
@@ -537,30 +601,10 @@ async fn use_index(
     request: &ScanRequest<'_>,
     definition: &Definition,
     fields: &[Option<&Field>],
-    range: &Range,
+    range: Range,
     top: Option<Top>,
-) -> Result<Option<Vec<Iid>>> {
-    if top.is_some_and(|top| top.limit == 0) {
-        return Ok(Some(Vec::new()));
-    }
-    let directory = definition.directory()?;
-    let through = source_frontier(request.snapshot, &definition.table);
-    let checkpoint = checkpoint::latest(request.storage, &directory, request.memory, through).await?;
-    let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
-    let tree = Tree::new(request.storage, &directory, request.memory, scope);
-    let system_at = request.bounds.system_time.lower();
-    let Some(root) = read_root(
-        &tree,
-        definition,
-        request.snapshot,
-        checkpoint,
-        system_at,
-        request.cancellation,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
+    projection: &[usize],
+) -> Result<Option<OrderedScan>> {
     let residuals = request
         .scan
         .ordered_top_k
@@ -577,147 +621,942 @@ async fn use_index(
             }
         }
     }
-    let distinct_slot = top.and_then(|top| top.distinct_slot);
-    if distinct_slot.is_some() && !covered {
+    let distinct = top.and_then(|top| top.distinct);
+    if distinct.is_some() && !covered {
         return Ok(None);
     }
+    let projection = if top.is_some() && covered {
+        Covered::bind(&request.scan.columns, definition, projection)?
+    } else {
+        None
+    };
+    if distinct.is_some() && projection.is_none() {
+        return Ok(None);
+    }
+    if top.is_some_and(|top| top.offset >= top.limit) {
+        return Ok(Some(if projection.is_some() {
+            OrderedScan::Covered(Box::new(CoveredSeek::empty()))
+        } else {
+            OrderedScan::Payload {
+                candidates: Box::new(PostingCandidates(None)),
+                verify: false,
+            }
+        }));
+    }
+
+    let directory = definition.directory()?;
+    let through = source_frontier(request.snapshot, &definition.table);
+    let checkpoint =
+        checkpoint::latest(request.storage, &directory, request.memory, through).await?;
+    if checkpoint.is_none() && through >= 0 {
+        return Ok(None);
+    }
+    let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
+    let tree = Tree::new(request.storage, &directory, request.memory, scope).await?;
+    let system_at = request.bounds.system_time.lower();
+    let Some(root) = read_root(
+        &tree,
+        definition,
+        request.snapshot,
+        checkpoint,
+        system_at,
+        request.cancellation,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     let reverse = top.is_some_and(|top| top.reverse);
     let buckets: Vec<_> = Bucket::at(request.bounds.valid_time.lower()).collect();
-    let mut cursors: Vec<_> = buckets
+    let cursors = buckets
         .iter()
         .map(|_| Cursor::new(root.clone(), reverse))
         .collect();
-    let _scratch = request.memory.reserve(
+    let scratch = request.memory.reserve(
         MAX_CANDIDATES
             .min(top.map_or(MAX_CANDIDATES, |top| top.limit))
             .saturating_mul(64)
             .saturating_add(16_384),
     )?;
-    let mut heap = BinaryHeap::new();
-    for (slot, cursor) in cursors.iter_mut().enumerate() {
-        if let Some(head) = next(cursor, &tree, range, buckets[slot], slot, reverse).await? {
-            heap.push(head);
+    let mut scan = PostingScan {
+        heap: BinaryHeap::new(),
+        cursors,
+        buckets,
+        advanced: None,
+        range,
+        reverse,
+        width: definition.columns.len(),
+        cancellation: request.cancellation.clone(),
+        _scratch: scratch,
+        tree,
+    };
+    for slot in 0..scan.cursors.len() {
+        scan.advance(slot).await?;
+    }
+
+    let postings = MatchingPostings {
+        scan,
+        predicates,
+        distinct,
+        last: None,
+        identity_slot: None,
+    };
+    if let (Some(projection), Some(top)) = (projection, top) {
+        let seek = CoveredSeek {
+            state: Some(CoveredState {
+                projection,
+                postings,
+                skip: top.offset,
+                remaining: top.limit - top.offset,
+            }),
+            sliced_rows: 0,
+            gathered_rows: 0,
+        };
+        return Ok(Some(OrderedScan::Covered(Box::new(seek))));
+    }
+
+    Ok(Some(OrderedScan::Payload {
+        candidates: Box::new(PostingCandidates(Some(postings))),
+        verify: !covered,
+    }))
+}
+
+async fn covered_root(
+    context: &rtdb_query::QueryContext,
+    snapshot: &rtdb_index::Snapshot,
+    storage: &Arc<rtdb_storage::cache::BufferPool>,
+    definition: &Definition,
+    present: Timestamp,
+) -> Result<(Tree, Root)> {
+    let through = source_frontier(snapshot, &definition.table);
+    let directory = definition.directory()?;
+    let checkpoint = checkpoint::latest(storage, &directory, &context.memory, through).await?;
+    let durable_rows = source_rows(snapshot, &definition.table);
+    let covered_rows = checkpoint
+        .as_ref()
+        .map_or(0, |checkpoint| checkpoint.source_rows);
+    let frontier = snapshot.relation_event_frontier(&definition.table)?;
+    if covered_rows > durable_rows || frontier - covered_rows > MAX_OWNED_REPLAY_ROWS {
+        return Err(super::uncovered_owned_range());
+    }
+    let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
+    let tree = Tree::new(storage, &directory, &context.memory, scope).await?;
+    let root = read_root(
+        &tree,
+        definition,
+        snapshot,
+        checkpoint,
+        present,
+        &context.cancellation,
+    )
+    .await?
+    .ok_or_else(super::uncovered_owned_range)?;
+    Ok((tree, root))
+}
+
+pub(super) async fn owned_page(
+    context: &rtdb_query::QueryContext,
+    snapshot: &rtdb_index::Snapshot,
+    storage: &Arc<rtdb_storage::cache::BufferPool>,
+    definition: &Definition,
+    projection: OwnedProjection,
+    bounds: RowBounds<'_>,
+    valid_at: Option<Timestamp>,
+) -> Result<super::OwnedRangePage> {
+    let OwnedProjection { fields, empty } = projection;
+    let positions: Vec<_> = (0..fields.len()).collect();
+    let covered =
+        Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
+    let (range, reverse, limit) = bounds.bind(&fields)?;
+    if !(1..=BATCH_ROWS).contains(&limit) {
+        return Err(rtdb_types::Anomaly::incorrect(
+            "rtdb.owned/range-limit",
+            "Owned range limit must be between 1 and 128",
+        ));
+    }
+
+    let present = context.current_time.as_micros()?;
+    let valid_at = valid_at.unwrap_or(present);
+    valid_at.next()?;
+    if empty {
+        return Ok(super::OwnedRangePage { schema: covered.schema, batch: None });
+    }
+    let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
+    let buckets: Vec<_> = Bucket::at(valid_at).collect();
+    let scratch = context
+        .memory
+        .reserve(limit.saturating_mul(64).saturating_add(16_384))?;
+    let cursors = buckets
+        .iter()
+        .map(|_| Cursor::new(root.clone(), reverse))
+        .collect();
+    let mut scan = PostingScan {
+        heap: BinaryHeap::new(),
+        cursors,
+        buckets,
+        advanced: None,
+        range,
+        reverse,
+        width: definition.columns.len(),
+        cancellation: context.cancellation.clone(),
+        _scratch: scratch,
+        tree,
+    };
+    for slot in 0..scan.cursors.len() {
+        scan.advance(slot).await?;
+    }
+    let schema = Arc::clone(&covered.schema);
+    let mut seek = CoveredSeek {
+        state: Some(CoveredState {
+            projection: covered,
+            postings: MatchingPostings {
+                scan,
+                predicates: Vec::new(),
+                distinct: None,
+                last: None,
+                identity_slot: Some(definition.columns.iter().position(|name| name == "_id")
+                    .ok_or_else(super::uncovered_owned_range)?),
+            },
+            skip: 0,
+            remaining: limit,
+        }),
+        sliced_rows: 0,
+        gathered_rows: 0,
+    };
+    let batch = seek.next_batch().await?;
+    Ok(super::OwnedRangePage { schema, batch })
+}
+
+pub(super) async fn owned_count(
+    context: &rtdb_query::QueryContext,
+    snapshot: &rtdb_index::Snapshot,
+    storage: &Arc<rtdb_storage::cache::BufferPool>,
+    definition: &Definition,
+    projection: OwnedProjection,
+    request: super::OwnedCountRequest<'_>,
+    lifetime: Option<i64>,
+    domain: Option<MeasureDomain>,
+) -> Result<super::OwnedRangeCount> {
+    let OwnedProjection { fields, empty } = projection;
+    let measured = domain.is_some();
+    let decimal = match domain {
+        Some(MeasureDomain::Decimal128(precision, scale)) => Some((precision, scale)),
+        _ => None,
+    };
+    let measure_position = fields.len().checked_sub(2);
+    if let Some((precision, scale)) = decimal {
+        if measure_position.and_then(|position| owned_family(&fields[position].data_type))
+            != Some(Family::Decimal128(precision, scale))
+        {
+            return Err(super::uncovered_owned_range());
         }
     }
-    let mut selected = Vec::new();
-    let mut pending = Vec::new();
-    let mut last_distinct = None::<Arc<[Atom]>>;
-    while let Some(head) = heap.pop() {
-        if request.cancellation.is_cancelled() {
+    let positions: Vec<_> = (0..fields.len())
+        .filter(|position| decimal.is_none() || Some(*position) != measure_position).collect();
+    Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
+    let mut range = Range::default();
+    compound_bound(&mut range, &fields, request.lower, true, false)?;
+    compound_bound(&mut range, &fields, request.upper, false, true)?;
+    request.valid_at.next()?;
+    let present = context.current_time.as_micros()?;
+    if lifetime.is_some() && request.valid_at != present {
+        return Err(super::uncovered_owned_range());
+    }
+    if empty {
+        return Ok(super::OwnedRangeCount {
+            count: 0,
+            sum: (domain == Some(MeasureDomain::Int64)).then_some(0),
+            decimal_sum: decimal.map(|(_, scale)| super::OwnedDecimalSum { coefficient: [0; 32], scale }),
+            present, valid_at: request.valid_at, expiry: None,
+        });
+    }
+    let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
+    let (count, measure) = rank_owned_range(
+        &tree, &root, &range, request.valid_at, &context.cancellation, measured,
+    ).await?;
+    if measured && measure.count != count {
+        return Err(super::uncovered_owned_range());
+    }
+    let (sum, decimal_sum) = match domain {
+        Some(MeasureDomain::Int64) => (
+            Some(measure.coefficient(MeasureDomain::Int64)?.to_i128().ok_or_else(cardinality_overflow)?), None,
+        ),
+        Some(expected @ MeasureDomain::Decimal128(_, scale)) => (
+            None, Some(super::OwnedDecimalSum { coefficient: measure.coefficient(expected)?.to_be_bytes(), scale }),
+        ),
+        None => (None, None),
+        _ => return Err(super::uncovered_owned_range()),
+    };
+    let expiry = if let Some(duration) = lifetime.filter(|_| count != 0) {
+        let mut live = present.0;
+        let mut expired = live.checked_add(duration).filter(|until| *until > live && *until < i64::MAX)
+            .ok_or_else(super::uncovered_owned_range)?;
+        // Every posting in this system root started at its immutable
+        // acceptance, no later than present. At present + duration all
+        // of them have expired. Probe only this root's valid-time ranks.
+        while expired - live > 1 {
+            context.check_cancelled()?;
+            let middle = live + (expired - live) / 2;
+            match rank_owned_range(&tree, &root, &range, Timestamp(middle), &context.cancellation, false).await?.0 {
+                current if current == count => live = middle,
+                current if current < count => expired = middle,
+                _ => return Err(super::uncovered_owned_range()),
+            }
+        }
+        Some(Timestamp(expired))
+    } else {
+        None
+    };
+    Ok(super::OwnedRangeCount { count, sum, decimal_sum, present, valid_at: request.valid_at, expiry })
+}
+
+async fn rank_owned_range(
+    tree: &Tree, root: &Root, range: &Range, valid_at: Timestamp,
+    cancellation: &CancellationToken, measured: bool,
+) -> Result<(u64, Measure)> {
+    let mut count = 0u64;
+    let mut measure = Measure::default();
+    for bucket in Bucket::at(valid_at) {
+        let compare = |key: KeyRef<'_>| match key {
+            KeyRef::Posting(found, tuple, _) => {
+                found.cmp(&bucket).then_with(|| range.position(tuple))
+            }
+            KeyRef::Row(_) | KeyRef::Revision(_) => Ordering::Greater,
+        };
+        let (lower, lower_measure) = tree
+            .rank_and_measure(
+                root,
+                |key| compare(key) == Ordering::Less,
+                cancellation,
+                measured,
+            )
+            .await?;
+        let (upper, upper_measure) = tree
+            .rank_and_measure(
+                root,
+                |key| compare(key) != Ordering::Greater,
+                cancellation,
+                measured,
+            )
+            .await?;
+        let bucket_count = upper
+            .checked_sub(lower)
+            .ok_or_else(|| super::format_error("Ordered count ranks are inconsistent"))?;
+        count = count
+            .checked_add(bucket_count)
+            .ok_or_else(cardinality_overflow)?;
+        measure = measure.checked_add(upper_measure.checked_sub(lower_measure)?)?;
+    }
+    Ok((count, measure))
+}
+
+pub(crate) enum RowBounds<'a> {
+    Leading {
+        lower: Option<&'a rtdb_types::Value>,
+        upper: Option<&'a rtdb_types::Value>,
+        limit: usize,
+    },
+    Compound(super::OwnedRangeRequest<'a>),
+}
+
+fn invalid_bound() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::incorrect(
+        "rtdb.owned/range-bound",
+        "Owned range bound does not match its declared path key",
+    )
+}
+
+fn bound_atom(field: &Field, value: &rtdb_types::Value) -> Result<Atom> {
+    let expected = owned_family(&field.data_type).ok_or_else(invalid_bound)?;
+    Atom::of(value)
+        .filter(|atom| {
+            atom.family() == Some(expected)
+                || (matches!(atom, Atom::Null) && field.name != "_id" && field.data_type.nullable())
+        })
+        .ok_or_else(invalid_bound)
+}
+
+fn compound_bound(
+    range: &mut Range,
+    fields: &[Field],
+    key: Option<&rtdb_types::StructFields<rtdb_types::Value>>,
+    lower: bool,
+    strict: bool,
+) -> Result<()> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    if key.len() != fields.len() {
+        return Err(invalid_bound());
+    }
+    let key = fields
+        .iter()
+        .map(|field| {
+            let value = key.get(&field.name).ok_or_else(invalid_bound)?;
+            if !field.data_type.legs().contains(&value.logical_type()) {
+                return Err(invalid_bound());
+            }
+            bound_atom(field, value)
+        })
+        .collect::<Result<_>>()?;
+    range.cursors.push(CursorBound { key, lower, strict });
+    Ok(())
+}
+
+impl<'a> RowBounds<'a> {
+    pub(super) fn identity_bound(&self) -> Option<&'a rtdb_types::Value> {
+        match self {
+            Self::Leading { .. } => None,
+            Self::Compound(request) => [request.lower, request.upper, request.after]
+                .into_iter()
+                .flatten()
+                .find_map(|key| key.get("_id")),
+        }
+    }
+
+    fn bind(self, fields: &[Field]) -> Result<(Range, bool, usize)> {
+        let mut range = Range::default();
+        match self {
+            Self::Leading {
+                lower,
+                upper,
+                limit,
+            } => {
+                let leading = fields.first().ok_or_else(invalid_bound)?;
+                range.lower = lower
+                    .map(|value| bound_atom(leading, value))
+                    .transpose()?
+                    .map(|atom| (atom, false));
+                range.upper = upper
+                    .map(|value| bound_atom(leading, value))
+                    .transpose()?
+                    .map(|atom| (atom, true));
+                Ok((range, false, limit))
+            }
+            Self::Compound(request) => {
+                for (key, lower, strict) in [
+                    (request.lower, true, false),
+                    (request.upper, false, true),
+                    (request.after, !request.descending, true),
+                ] {
+                    compound_bound(&mut range, fields, key, lower, strict)?;
+                }
+                Ok((range, request.descending, request.limit))
+            }
+        }
+    }
+}
+
+struct MatchingPostings {
+    scan: PostingScan,
+    predicates: Vec<Predicate>,
+    distinct: Option<DistinctPrefix>,
+    last: Option<Head>,
+    identity_slot: Option<usize>,
+}
+
+impl MatchingPostings {
+    async fn next(&mut self) -> Result<Option<Head>> {
+        while let Some(head) = self.scan.next().await? {
+            if let Some(slot) = self.identity_slot { head.require_identity(slot, &self.scan.tree.memory)?; }
+            if !self
+                .predicates
+                .iter()
+                .all(|predicate| predicate.matches(head.tuple()))
+            {
+                continue;
+            }
+            if let Some(prefix) = self.distinct {
+                let tuple = head.tuple();
+                if self.last.as_ref().is_some_and(|last| {
+                    let previous = last.tuple();
+                    (prefix.start..prefix.end).all(|slot| previous.cell(slot) == tuple.cell(slot))
+                }) {
+                    continue;
+                }
+                self.last = Some(head.clone());
+            }
+            return Ok(Some(head));
+        }
+        Ok(None)
+    }
+}
+
+struct PostingCandidates(Option<MatchingPostings>);
+
+#[async_trait]
+impl OrderedCandidates for PostingCandidates {
+    async fn next_iids(&mut self, maximum: usize) -> Result<Vec<Iid>> {
+        let Some(postings) = &mut self.0 else {
+            return Ok(Vec::new());
+        };
+        let capacity = maximum.min(BATCH_ROWS);
+        let mut ids = Vec::with_capacity(capacity);
+        while ids.len() < capacity {
+            let Some(head) = postings.next().await? else {
+                self.0 = None;
+                break;
+            };
+            ids.push(head.address().iid);
+        }
+        Ok(ids)
+    }
+}
+
+struct PostingScan {
+    heap: BinaryHeap<Head>,
+    cursors: Vec<Cursor>,
+    buckets: Vec<Bucket>,
+    advanced: Option<usize>,
+    range: Range,
+    reverse: bool,
+    width: usize,
+    cancellation: CancellationToken,
+    _scratch: Arc<MemoryReservation>,
+    tree: Tree,
+}
+
+impl PostingScan {
+    async fn advance(&mut self, slot: usize) -> Result<()> {
+        if self.cancellation.is_cancelled() {
             return Err(cancelled());
         }
-        if predicates
-            .iter()
-            .all(|predicate| predicate.matches(&head.tuple))
-        {
-            if covered {
-                let emit = distinct_slot.is_none_or(|slot| {
-                    last_distinct.as_ref().is_none_or(|prior| prior[slot] != head.tuple[slot])
-                });
-                if emit {
-                    selected.push(head.iid);
-                    if distinct_slot.is_some() {
-                        last_distinct = Some(Arc::clone(&head.tuple));
-                    }
-                }
-            } else {
-                pending.push(head.iid);
-                if pending.len()
-                    >= VERIFY_ROWS.min(top.map_or(VERIFY_ROWS, |top| {
-                        top.limit.saturating_sub(selected.len()).max(1)
-                    }))
-                {
-                    filter_payload(request, residuals, &mut pending, &mut selected).await?;
-                }
-            }
-            if top.is_some_and(|top| selected.len() >= top.limit) {
-                break;
-            }
-            if selected.len() > MAX_CANDIDATES {
-                return Ok(None);
-            }
-        }
-        let slot = head.slot;
         if let Some(head) = next(
-            &mut cursors[slot],
-            &tree,
-            range,
-            buckets[slot],
+            &mut self.cursors[slot],
+            &self.tree,
+            &self.range,
+            self.buckets[slot],
             slot,
-            reverse,
+            self.reverse,
         )
         .await?
         {
-            heap.push(head);
+            self.heap.push(head);
+        }
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<Head>> {
+        if let Some(slot) = self.advanced.take() {
+            self.advance(slot).await?;
+        }
+        let Some(head) = self.heap.pop() else {
+            return Ok(None);
+        };
+        self.advanced = Some(head.slot);
+        if head.tuple().len() != self.width {
+            return Err(super::format_error(
+                "Posting width differs from its index definition",
+            ));
+        }
+        Ok(Some(head))
+    }
+}
+
+struct CoveredState {
+    projection: Covered,
+    postings: MatchingPostings,
+    skip: usize,
+    remaining: usize,
+}
+
+struct CoveredSeek {
+    state: Option<CoveredState>,
+    sliced_rows: u64,
+    gathered_rows: u64,
+}
+
+impl CoveredSeek {
+    fn empty() -> Self {
+        Self {
+            state: None,
+            sliced_rows: 0,
+            gathered_rows: 0,
         }
     }
-    filter_payload(request, residuals, &mut pending, &mut selected).await?;
-    Ok(Some(selected))
+}
+
+#[async_trait]
+impl OrderedBatches for CoveredSeek {
+    async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
+        let Some(state) = &mut self.state else {
+            return Ok(None);
+        };
+        let capacity = BATCH_ROWS.min(state.remaining);
+        let mut rows = Vec::with_capacity(capacity);
+        while rows.len() < capacity {
+            let Some(head) = state.postings.next().await? else {
+                break;
+            };
+            if state.skip != 0 {
+                state.skip -= 1;
+                continue;
+            }
+            rows.push(head);
+        }
+        let batch = if rows.is_empty() {
+            None
+        } else {
+            let (batch, shared) = state.projection.batch(&state.postings.scan.tree, &rows)?;
+            if shared {
+                self.sliced_rows += rows.len() as u64;
+            } else {
+                self.gathered_rows += rows.len() as u64;
+            }
+            Some(batch)
+        };
+        state.remaining -= rows.len();
+        let done = rows.len() < capacity || state.remaining == 0;
+        drop(rows);
+        if done {
+            self.state = None;
+        }
+        Ok(batch)
+    }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        span.attribute(
+            "scan_ordered_sliced_rows",
+            rtdb_plan::TraceValue::Unsigned(self.sliced_rows),
+        );
+        span.attribute(
+            "scan_ordered_gathered_rows",
+            rtdb_plan::TraceValue::Unsigned(self.gathered_rows),
+        );
+    }
 }
 
 async fn next(
     cursor: &mut Cursor,
-    tree: &Tree<'_>,
+    tree: &Tree,
     range: &Range,
     bucket: Bucket,
     slot: usize,
     reverse: bool,
 ) -> Result<Option<Head>> {
-    let entry = cursor
+    let hit = cursor
         .next(tree, |key| match key {
-            Key::Posting {
-                bucket: candidate,
-                tuple,
-                ..
-            } => candidate.cmp(&bucket).then_with(|| range.position(tuple)),
-            Key::Row(_) | Key::Revision(_) => Ordering::Greater,
+            KeyRef::Posting(candidate, tuple, _) => {
+                candidate.cmp(&bucket).then_with(|| range.position(tuple))
+            }
+            KeyRef::Row(_) | KeyRef::Revision(_) => Ordering::Greater,
         })
         .await?;
-    match entry.map(|entry| entry.key) {
-        Some(Key::Posting { tuple, iid, .. }) => Ok(Some(Head {
-            tuple,
-            iid,
-            slot,
-            reverse,
-        })),
-        Some(Key::Row(_) | Key::Revision(_)) => Err(super::format_error(
+    let Some(hit) = hit else {
+        return Ok(None);
+    };
+    if !matches!(hit.key(), KeyRef::Posting(..)) {
+        return Err(super::format_error(
             "Ordered index seek escaped its posting prefix",
-        )),
-        None => Ok(None),
+        ));
+    }
+    Ok(Some(Head {
+        hit,
+        slot,
+        reverse,
+    }))
+}
+
+struct Covered {
+    columns: Vec<(usize, ScalarType)>,
+    schema: Arc<Schema>,
+}
+
+impl Covered {
+    fn bind(
+        scan_fields: &[Field],
+        definition: &Definition,
+        projection: &[usize],
+    ) -> Result<Option<Self>> {
+        let fields = projection
+            .iter()
+            .map(|&position| scan_fields.get(position))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| super::format_error("Covered scan position exceeds its schema"))?;
+        let mut columns = Vec::new();
+        for field in &fields {
+            let logical = match &field.data_type {
+                LogicalType::Maybe(value) => value.as_ref(),
+                logical => logical,
+            };
+            let LogicalType::Scalar(scalar) = logical else {
+                return Ok(None);
+            };
+            use ScalarType as S;
+            if !matches!(
+                scalar,
+                S::Utf8
+                    | S::Binary
+                    | S::Bool
+                    | S::Uuid
+                    | S::DateDay
+                    | S::Timestamp {
+                        unit: TimeUnit::Microsecond,
+                        timezone: Some(_)
+                    }
+                    | S::I8
+                    | S::I16
+                    | S::I32
+                    | S::I64
+                    | S::U8
+                    | S::U16
+                    | S::U32
+                    | S::U64
+            ) {
+                return Ok(None);
+            }
+            let Some(slot) = definition
+                .columns
+                .iter()
+                .position(|column| column == &field.name)
+            else {
+                return Ok(None);
+            };
+            columns.push((slot, scalar.clone()));
+        }
+        let fields = fields
+            .iter()
+            .map(|field| to_field(&field.name, &field.data_type))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Self {
+            columns,
+            schema: Arc::new(Schema::new(fields)),
+        }))
+    }
+
+    fn batch(&self, tree: &Tree, rows: &[Head]) -> Result<(OwnedBatch, bool)> {
+        let first = &rows[0].hit;
+        let contiguous = tree.shares_result_buffers()
+            && rows
+                .iter()
+                .enumerate()
+                .all(|(offset, row)| row.hit.follows(first, offset));
+        let mut shared = false;
+        let mut builder =
+            BatchBuilder::new(4096 + self.columns.len().saturating_mul(256), &tree.memory)?;
+        let mut arrays = Vec::with_capacity(self.columns.len());
+        for (slot, scalar) in &self.columns {
+            if contiguous
+                && let Some((array, start, reservation)) = first.plain_column(*slot, rows.len())
+            {
+                let range = start..start + rows.len();
+                let sliced = match scalar {
+                    ScalarType::Utf8 => array.as_any().downcast_ref::<StringArray>().map(|array| {
+                        slice_bytes(
+                            &mut builder,
+                            array,
+                            range,
+                            tree.retain_result_buffers(reservation),
+                        )
+                    }),
+                    ScalarType::Binary => {
+                        array.as_any().downcast_ref::<BinaryArray>().map(|array| {
+                            slice_bytes(
+                                &mut builder,
+                                array,
+                                range,
+                                tree.retain_result_buffers(reservation),
+                            )
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(array) = sliced {
+                    arrays.push(array?);
+                    shared = true;
+                    continue;
+                }
+            }
+            let cells = || rows.iter().map(|head| head.tuple().cell(*slot));
+            let retained = cells()
+                .map(|cell| cell.retained_bytes())
+                .fold(0usize, usize::saturating_add);
+            if retained > i32::MAX as usize {
+                return Err(super::format_error("Covered column exceeds Arrow offsets"));
+            }
+            let bound = retained
+                .saturating_mul(2)
+                .saturating_add(rows.len() * 64 + 1024);
+            arrays.push(builder.column(bound, || covered_array(scalar, retained, cells()))?);
+        }
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
+            .map_err(super::format_error)?;
+        builder.finish(batch).map(|batch| (batch, shared))
     }
 }
 
-async fn filter_payload(
-    request: &ScanRequest<'_>,
-    residuals: &[Expr],
-    pending: &mut Vec<Iid>,
-    output: &mut Vec<Iid>,
-) -> Result<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let matching: BTreeSet<_> = request
-        .verifier
-        .visible_columns(pending.iter().copied().collect(), &[], residuals)
-        .await?
-        .into_iter()
-        .map(|(iid, _)| iid)
-        .collect();
-    output.extend(pending.drain(..).filter(|iid| matching.contains(iid)));
-    Ok(())
+fn slice_bytes<T: ByteArrayType<Offset = i32>>(
+    builder: &mut BatchBuilder,
+    array: &GenericByteArray<T>,
+    rows: std::ops::Range<usize>,
+    owner: Arc<dyn Send + Sync>,
+) -> Result<ArrayRef> {
+    // Expose only the selected byte window, including at the Arrow C data boundary.
+    let offsets = &array.value_offsets()[rows.start..=rows.end];
+    let base = offsets[0];
+    let length = (offsets[offsets.len() - 1] - base) as usize;
+    let bound = length
+        .saturating_add(offsets.len().saturating_mul(16))
+        .saturating_add(1024);
+    builder.column(bound, || {
+        let values = retain_buffer_with_owner(
+            &array.values().slice_with_length(base as usize, length),
+            owner,
+        );
+        let offsets = OffsetBuffer::new(
+            offsets
+                .iter()
+                .map(|offset| offset - base)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        let nulls = array
+            .nulls()
+            .map(|_| NullBuffer::from(rows.map(|row| !array.is_null(row)).collect::<Vec<_>>()));
+        let array =
+            GenericByteArray::<T>::try_new(offsets, values, nulls).map_err(super::format_error)?;
+        Ok(Arc::new(array))
+    })
 }
 
-#[derive(PartialEq, Eq)]
+fn covered_array<'a>(
+    scalar: &ScalarType,
+    payload_bytes: usize,
+    cells: impl ExactSizeIterator<Item = AtomRef<'a>>,
+) -> Result<ArrayRef> {
+    let bad_type = || super::format_error("Posting does not have the covered field's type");
+    macro_rules! cells {
+        ($variant:ident, |$value:ident| $convert:expr) => {
+            cells.map(|cell| match cell {
+                AtomRef::$variant($value) => Ok(Some($convert)),
+                AtomRef::Null => Ok(None),
+                _ => Err(bad_type()),
+            })
+        };
+    }
+    macro_rules! integer {
+        ($array:ty, $ty:ty) => {
+            Arc::new(
+                cells!(Integer, |value| <$ty>::try_from(value)
+                    .map_err(super::format_error)?)
+                .collect::<Result<$array>>()?,
+            )
+        };
+    }
+    macro_rules! unsigned_bits {
+        ($array:ty, $signed:ty, $unsigned:ty) => {
+            Arc::new(
+                cells!(Integer, |value| <$signed>::try_from(value)
+                    .map(|value| value as $unsigned)
+                    .map_err(super::format_error)?)
+                .collect::<Result<$array>>()?,
+            )
+        };
+    }
+    use ScalarType as S;
+    Ok(match scalar {
+        S::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(cells.len(), payload_bytes);
+            for value in cells!(Text, |value| value) {
+                builder.append_option(value?);
+            }
+            Arc::new(builder.finish())
+        }
+        S::Binary => {
+            let mut builder = BinaryBuilder::with_capacity(cells.len(), payload_bytes);
+            for value in cells!(Binary, |value| value) {
+                builder.append_option(value?);
+            }
+            Arc::new(builder.finish())
+        }
+        S::Bool => Arc::new(cells!(Bool, |value| value).collect::<Result<BooleanArray>>()?),
+        S::DateDay => Arc::new(
+            cells!(Day, |value| i32::try_from(value)
+                .map_err(super::format_error)?)
+            .collect::<Result<Date32Array>>()?,
+        ),
+        S::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: Some(timezone),
+        } => Arc::new(
+            cells!(InstantMicros, |value| value)
+                .collect::<Result<TimestampMicrosecondArray>>()?
+                .with_timezone(timezone.clone()),
+        ),
+        S::I8 => integer!(Int8Array, i8),
+        S::I16 => integer!(Int16Array, i16),
+        S::I32 => integer!(Int32Array, i32),
+        S::I64 => integer!(Int64Array, i64),
+        S::U8 => unsigned_bits!(UInt8Array, i8, u8),
+        S::U16 => unsigned_bits!(UInt16Array, i16, u16),
+        S::U32 => unsigned_bits!(UInt32Array, i32, u32),
+        S::U64 => unsigned_bits!(UInt64Array, i64, u64),
+        S::Uuid => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(cells.len(), 16);
+            for cell in cells!(Uuid, |value| value) {
+                match cell? {
+                    Some(value) => builder.append_value(value).map_err(super::format_error)?,
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        _ => return Err(bad_type()),
+    })
+}
+
+#[derive(Clone)]
 struct Head {
-    tuple: Arc<[Atom]>,
-    iid: Iid,
+    hit: Hit,
     slot: usize,
     reverse: bool,
 }
 
+impl Head {
+    fn address(&self) -> super::tree::AddressRef<'_> {
+        let KeyRef::Posting(_, _, address) = self.hit.key() else {
+            unreachable!("head is a posting")
+        };
+        address
+    }
+
+    fn require_identity(&self, slot: usize, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
+        use rtdb_types::EntityId;
+        let key = self.address().key;
+        let _decode = memory.reserve(key.len().saturating_add(256))?;
+        let matches = match (EntityId::from_handle_bytes(key)?, self.tuple().cell(slot)) {
+            (EntityId::String(id), AtomRef::Text(value)) => id == value,
+            (EntityId::Integer(id), AtomRef::Integer(value)) => i128::from(id) == value,
+            (EntityId::Uuid(id), AtomRef::Uuid(value)) => id == value,
+            _ => false,
+        };
+        if !matches { return Err(super::uncovered_owned_range()); }
+        Ok(())
+    }
+
+    fn tuple(&self) -> Tuple<'_> {
+        let KeyRef::Posting(_, tuple, _) = self.hit.key() else {
+            unreachable!("head is a posting")
+        };
+        tuple
+    }
+}
+
+impl PartialEq for Head {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Head {}
+
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        let order = (&self.tuple, self.iid, self.slot).cmp(&(&other.tuple, other.iid, other.slot));
+        let order = self
+            .tuple()
+            .compare(other.tuple())
+            .then_with(|| self.address().compare(other.address()))
+            .then_with(|| self.slot.cmp(&other.slot));
         if self.reverse { order } else { order.reverse() }
     }
 }
@@ -725,5 +1564,84 @@ impl Ord for Head {
 impl PartialOrd for Head {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_types::Value;
+
+    #[test]
+    fn unsigned_postings_match_sql_order_and_preserve_covered_bits() {
+        macro_rules! check_unsigned {
+            ($scalar:ident, $value:ident, $array:ty, $raw:ty) => {{
+                let scalar = ScalarType::$scalar;
+                let field = to_field("key", &LogicalType::Scalar(scalar.clone())).unwrap();
+                let sign_bit = <$raw>::MAX / 2 + 1;
+                let input = [sign_bit, <$raw>::MAX, 0, sign_bit - 1];
+                let array = <$array>::from(input.to_vec());
+                let keys = (0..input.len())
+                    .map(|row| AtomRef::from_arrow(&field, &array, row).unwrap())
+                    .collect::<Vec<_>>();
+
+                for (&raw, key) in input.iter().zip(&keys) {
+                    assert_eq!(Some(key.owned()), Atom::of(&Value::$value(raw)));
+                }
+                for (row, pair) in keys.windows(2).enumerate() {
+                    let sql_order = rtdb_expr::ordered_compare_in_timezone(
+                        &Value::$value(input[row]),
+                        &Value::$value(input[row + 1]),
+                        false,
+                        "UTC",
+                    )
+                    .unwrap();
+                    assert_eq!(pair[0].cmp(&pair[1]), sql_order);
+                    assert!(sql_order.is_lt());
+                }
+
+                let covered = covered_array(&scalar, 0, keys.into_iter()).unwrap();
+                let covered = covered.as_any().downcast_ref::<$array>().unwrap();
+                assert_eq!(&covered.values()[..], &input);
+            }};
+        }
+        check_unsigned!(U8, U8, UInt8Array, u8);
+        check_unsigned!(U16, U16, UInt16Array, u16);
+        check_unsigned!(U32, U32, UInt32Array, u32);
+        check_unsigned!(U64, U64, UInt64Array, u64);
+    }
+
+    #[test]
+    fn contiguous_values_share_only_the_selected_byte_window() {
+        let memory = MemoryBudget::new(1 << 20);
+        let reservation = memory.reserve(64 * 1024).unwrap();
+        let permit = Arc::new(());
+        let live = Arc::downgrade(&permit);
+        let custody = Arc::new((reservation.clone(), permit));
+        let source = StringArray::from(vec![
+            Some("before"),
+            Some("alpha"),
+            None,
+            Some("omega"),
+            Some("after"),
+        ]);
+        let start = source.values().as_ptr().wrapping_add("before".len());
+        let mut builder = BatchBuilder::new(4096, &memory).unwrap();
+        let result = slice_bytes(&mut builder, &source, 1..4, custody).unwrap();
+        let result_values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result_values.values().as_slice(), b"alphaomega");
+        assert_eq!(result_values.values().as_ptr(), start);
+        assert_eq!(result_values.value_offsets(), &[0, 5, 5, 10]);
+        assert!(result_values.is_null(1));
+
+        drop(source);
+        drop(reservation);
+        drop(builder);
+        assert_eq!(memory.used_bytes(), 64 * 1024);
+        assert!(live.upgrade().is_some());
+        drop(result);
+        assert_eq!(memory.used_bytes(), 0);
+        assert!(live.upgrade().is_none());
     }
 }

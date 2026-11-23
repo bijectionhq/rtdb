@@ -574,9 +574,10 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
         "octet_length" | "length" | "cardinality" | "abs" | "log10" | "ln" | "exp" | "sqrt"
         | "floor" | "ceil" | "ceiling" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh"
         | "asin" | "acos" | "atan" | "lower_inf" | "lower" | "upper" | "upper_inf"
-        | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" => 1..=1,
+        | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" | "epoch_nanos_be" | "search_length" | "search_terms" => 1..=1,
         "array_upper" | "array_lower" | "array_length" | "mod" | "log" | "power" | "age"
-        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "match" | "search_score" | "cosine_distance" => 2..=2,
+        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "match" | "search_corpus_fingerprint" | "cosine_distance" => 2..=2,
+        "search_score" => 2..=5,
         "round" => 1..=2,
         "least" | "greatest" | "str" | "format" | "concat" => 1..=usize::MAX,
         _ => return None,

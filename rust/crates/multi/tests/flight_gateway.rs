@@ -3,7 +3,7 @@ mod common;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use arrow_flight::{FlightDescriptor, HandshakeRequest, Ticket, flight_service_client::FlightServiceClient,
+use arrow_flight::{Action, FlightDescriptor, HandshakeRequest, Ticket, flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient}};
 use futures::TryStreamExt;
 use prost::Message;
@@ -19,6 +19,101 @@ async fn channel(address: SocketAddr) -> Channel {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_present() {
+    let cell = Cell::start(1, None).await;
+    let id = uuid::Uuid::new_v4();
+    let deployment = admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let pgwire = cell.connect("shop").await;
+    pgwire.simple_query("INSERT INTO orders (_id, total) VALUES (1, 77)").await.unwrap();
+    pgwire.simple_query("SELECT total FROM orders").await.unwrap();
+    let node = cell.node(cell.holder("shop").await.unwrap()).server.node();
+    let prior = node.latest_completed_transactions().unwrap()["shop"][0].unwrap();
+    pgwire.simple_query("INSERT INTO orders (_id, total) VALUES (2, 89)").await.unwrap();
+    pgwire.simple_query("SELECT total FROM orders").await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancellation = CancellationToken::new();
+    let options = GatewayOptions { capabilities: Some(secret()), ..Default::default() };
+    let driver = tokio::spawn(flight_gateway::serve(listener, Arc::clone(&cell.directory), options, cancellation.clone()));
+    let mut flight = FlightSqlServiceClient::new(channel(address).await);
+    let selector = format!("shop@{}", id.simple());
+    flight.set_header("x-xtdb-database", &selector);
+    flight.handshake("xtdb", "cell-test").await.unwrap();
+    let route = flight.token().unwrap();
+    let action = |name: &str, body: Vec<u8>| {
+        let mut request = Request::new(Action { r#type: name.to_owned(), body: body.into() });
+        request.metadata_mut().insert("authorization", format!("Bearer {route}").parse().unwrap());
+        request.metadata_mut().insert("x-xtdb-database", selector.parse().unwrap());
+        request
+    };
+
+    let floor = node.latest_completed_transactions().unwrap()["shop"][0].unwrap();
+    let request = |history: uuid::Uuid, tx_offset: i64, ordered_at: i64, prior_at: i64| {
+        let mut body = history.as_bytes().to_vec();
+        body.push(2);
+        for (offset, time) in [(tx_offset, ordered_at), (prior.tx_id.0, prior_at)] {
+            body.extend_from_slice(&offset.to_be_bytes());
+            body.extend_from_slice(&time.to_be_bytes());
+        }
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body
+    };
+    let mut raw = FlightServiceClient::new(channel(address).await);
+    for _ in 0..2 {
+        let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let body = request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0);
+        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v4", body))
+            .await.unwrap().into_inner();
+        let result = results.message().await.unwrap().unwrap();
+        assert!(results.message().await.unwrap().is_none());
+        assert_eq!(result.body.len(), 32);
+        assert_eq!(&result.body[16..24], &floor.system_time.0.to_be_bytes());
+        assert_eq!(&result.body[24..32], &floor.tx_id.0.to_be_bytes());
+        let pinned = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let (&reader, pin) = pinned.catalog_readers.iter()
+            .find(|(reader, _)| !before.catalog_readers.contains_key(*reader)).unwrap();
+        assert!(pin.cut.is_some());
+
+        let mut scoped = result.body[..16].to_vec();
+        scoped.extend_from_slice(&1u16.to_be_bytes());
+        scoped.extend_from_slice(&6u16.to_be_bytes());
+        scoped.extend_from_slice(b"orders");
+        let error = match raw.do_action(action("rtdb.owned.OpenOwnedScopedRead.v1", scoped)).await {
+            Ok(response) => response.into_inner().message().await.unwrap_err(),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), Code::PermissionDenied);
+
+        let mut closed = raw.do_action(action("rtdb.owned.CloseRead.v1", result.body[..16].to_vec()))
+            .await.unwrap().into_inner();
+        assert!(closed.message().await.unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cell.directory.deployment(&deployment.id).await.unwrap().unwrap().catalog_readers.contains_key(&reader) {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+    }
+    assert_eq!(node.latest_completed_transactions().unwrap()["shop"][0], Some(floor));
+
+    for body in [
+        request(id, floor.tx_id.0 + 1, floor.system_time.0 + 1, prior.system_time.0),
+        request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0 - 1),
+        request(uuid::Uuid::new_v4(), floor.tx_id.0, floor.system_time.0, prior.system_time.0),
+    ] {
+        let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v4", body)).await {
+            Ok(response) => response.into_inner().message().await.unwrap_err(),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), Code::Unavailable);
+    }
+
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_session() {
     let cell = Cell::start(2, None).await;
     let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
@@ -29,7 +124,13 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     let address = listener.local_addr().unwrap();
     let cancellation = CancellationToken::new();
     let options = GatewayOptions { capabilities: Some(secret()), ..Default::default() };
-    let driver = tokio::spawn(flight_gateway::serve(listener, Arc::clone(&cell.directory), options, cancellation.clone()));
+    let driver = tokio::spawn(flight_gateway::serve(listener, Arc::clone(&cell.directory), options.clone(), cancellation.clone()));
+    let audience_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let audience_address = audience_listener.local_addr().unwrap();
+    let audience = rtdb_flight_sql::AudienceFlightConfig::parse(&format!("{installation}/1")).unwrap();
+    let audience_driver = tokio::spawn(flight_gateway::serve_audience(
+        audience_listener, Arc::clone(&cell.directory), options, audience, cancellation.clone(),
+    ));
     let mut flight = FlightSqlServiceClient::new(channel(address).await);
     flight.set_header("x-xtdb-database", &selector);
     flight.handshake("xtdb", "cell-test").await.unwrap();
@@ -50,6 +151,16 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
         request
     };
     let mut raw = FlightServiceClient::new(channel(address).await);
+    let mut audience_client = FlightServiceClient::new(channel(audience_address).await);
+    let mut ordinary_route = Request::new(Action { r#type: "CloseSession".into(), body: Default::default() });
+    ordinary_route.metadata_mut().insert("authorization", format!("Bearer {route}").parse().unwrap());
+    assert_eq!(audience_client.do_action(ordinary_route).await.unwrap_err().code(), Code::PermissionDenied);
+
+    let mut wrong_listener = Request::new(futures::stream::iter([HandshakeRequest::default()]));
+    wrong_listener.metadata_mut().insert("x-xtdb-database", selector.parse().unwrap());
+    wrong_listener.metadata_mut().insert(rtdb_flight_sql::AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().unwrap());
+    assert_eq!(raw.handshake(wrong_listener).await.unwrap_err().code(), Code::PermissionDenied);
+
     assert!(raw.do_get(request(ticket.clone(), &route, None)).await.is_ok());
     assert_eq!(raw.do_get(request(ticket.clone(), "invalid", None)).await.unwrap_err().code(), Code::Unauthenticated);
     assert_eq!(raw.do_get(request(ticket.clone(), &route, Some("another"))).await.unwrap_err().code(), Code::PermissionDenied);
@@ -83,6 +194,7 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
 
     cancellation.cancel();
     tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), audience_driver).await.unwrap().unwrap().unwrap();
     cell.stop().await;
 }
 

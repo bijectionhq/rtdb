@@ -11,14 +11,17 @@ The crate starts no tasks.
 `prepare_submission` expands literal and parameter INSERT VALUES/RECORDS and PATCH RECORDS through SQL-owned binding.
 Submission reserves temporary SQL syntax work before lexing and holds the reservation until the static plan has been consumed or discarded.
 It preserves raw SQL for data-dependent statements and distinguishes absent arguments from an explicitly empty argument batch.
+Compatible Arrow arguments retain their typed columns in the source log and through replay.
+Scalar evaluation reads and charges one argument row at a time.
 INSERT, UPDATE, and DELETE RETURNING clauses are syntax-checked and ignored by shared SQL preparation, including during static INSERT expansion.
 `tests/returning.rs` maps `ignore-returning-keys-3668` through staged mutation, parameter binding, committed reads, and static source encoding; its assertions have not run.
 Source replay decodes its recorded operations without repeating submit-time expansion.
 The source encoder builds each operation body column independently before assembling the operation union.
 The transaction result table declares its nullable Transit error column even when every written result is successful.
-Document batches own their ordered columns along with their row values.
-Source replay bounds document value construction by one row of scratch and the rows already decoded.
-Replayed puts share their ordered Arrow layout and retain present cells separately.
+Document batches retain their column order in either representation.
+Compatible Arrow puts retain their arrays through replay and staging, with transaction headers prepared independently.
+Staging can gather compatible columns directly from their arrays when a table combines Arrow puts and individual row operations.
+When replay constructs document values, it bounds scratch to one row and shares the ordered Arrow layout across puts.
 The resolver carries declared column types to the staged write, including columns whose cells are all null.
 The source encoder carries document columns in first encounter order in each table and mutation leg, and the decoder recovers that order from the Arrow field layout.
 The encoder builds one document column at a time, retains its measured Arrow buffers and releases the builder scratch before building the next column.
@@ -32,6 +35,9 @@ SQL argument payloads retain their physical Arrow fields and raw values through 
 Binding uses their signed execution field view, and parameter evaluation admits unsigned cells at the same signed width.
 Static SQL expansion applies that admission before producing logical documents.
 An invalid temporal literal leaves the mutation in SQL form so transaction resolution records the planning error and the aborted transaction.
+`TxOp::InsertDocs` checks each document's valid-time interval for absence at the transaction's ordered primary view.
+A conflict includes earlier staged transactions and writes in the same transaction and aborts the submission atomically with `rtdb.tx/exists`.
+The source record retains the create-only operation and the replica replays the resolved outcome.
 Static SQL inserts and direct document writes share the source encoder's entity ID validation before publication.
 Forbidden fields in concrete document writes abort during source-log resolution and are reported in document schema order.
 SQL mutations that read live data or depend on transaction context report forbidden projected fields as planning diagnostics during resolution.

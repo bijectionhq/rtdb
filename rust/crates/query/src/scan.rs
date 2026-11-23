@@ -1,25 +1,124 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray};
+use arrow_array::{builder::{BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder}, cast::AsArray};
+use arrow_buffer::Buffer;
+use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
-use rtdb_format::{ipc::{ArrowFile, FileLayout, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_format::{data::PutText, ipc::{PageDecoder, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
-use rtdb_storage::{ObjectKey, cache::{BufferPool, Cached, View}};
+use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
-use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
-/// A data file read whole from the buffer pool, or, where the pool no longer holds it but its layout is known, a page at a time.
-enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> }, Ranged { reader: ArrowFile, file: rtdb_format::ipc::SparseFile, _reservation: Arc<MemoryReservation> } }
-struct DataFile { storage: Arc<BufferPool>, key: ObjectKey, state: DataState }
+struct DataFile {
+    storage: Arc<BufferPool>,
+    key: ObjectKey,
+    /// The trie's metadata file, where an ordered scan finds the statistics of the leaves it comes to.
+    metadata: ObjectKey,
+    opened: Option<OpenedLayout>,
+}
+
+struct OpenedLayout {
+    layout: Arc<CachedLayout>,
+    _opening: Arc<MemoryReservation>,
+    whole: Option<CacheLease>,
+}
+
+impl DataFile {
+    async fn open(&mut self, memory: &Arc<MemoryBudget>) -> Result<&OpenedLayout> {
+        if self.opened.is_none() {
+            let whole = if self.storage.object_store().supports_scan_ranges(&self.key) {
+                None
+            } else {
+                Some(self.storage.get_or(&self.key, memory).await?)
+            };
+            let (layout, opening) = self.open_layout(whole.as_ref(), memory).await?;
+            self.opened = Some(OpenedLayout { layout, _opening: opening, whole });
+        }
+        Ok(self.opened.as_ref().expect("the data file is open"))
+    }
+
+    async fn decode_page(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        self.open(memory).await?;
+        let opened = self.opened.as_ref().expect("the data file is open");
+        let reader = &opened.layout.decoder;
+        let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
+        let mut bound = reader.page_bound(page, bytes.as_slice())?;
+        for field in reader.schema().fields() {
+            bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
+                .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
+        }
+        audience_work::decode_bytes(bound)?;
+        let charged = memory.reserve(bound)?;
+        let batch = reader.decode_page(page, page_buffer(bytes))?;
+        Ok((batch, charged))
+    }
+
+    async fn read_range(&self, whole: Option<&CacheLease>, range: std::ops::Range<u64>, memory: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        if audience_work::is_bounded() {
+            let bytes = range.end.checked_sub(range.start).and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| invalid("page-range", "Scan range exceeds addressable memory"))?;
+            audience_work::decode_bytes(bytes)?;
+        }
+        if let Some(whole) = whole {
+            let start = usize::try_from(range.start).map_err(|error| invalid("page-range", error))?;
+            let end = usize::try_from(range.end).map_err(|error| invalid("page-range", error))?;
+            return Ok(whole.slice(start..end)?);
+        }
+        Ok(self.storage.scan_range(&self.key, range, memory).await?)
+    }
+
+    async fn open_layout(&self, whole: Option<&CacheLease>, memory: &Arc<MemoryBudget>) -> Result<(Arc<CachedLayout>, Arc<MemoryReservation>)> {
+        if let Some(cached) = self.storage.view::<CachedLayout>(&self.key, View::Layout) {
+            audience_work::decode_bytes(cached._reservation.bytes())?;
+            let opening = memory.reserve(cached._reservation.bytes())?;
+            return Ok((cached, opening));
+        }
+        let size = match whole { Some(bytes) => bytes.as_slice().len() as u64, None => self.storage.scan_length(&self.key).await? };
+        let tail = size.checked_sub(10).ok_or_else(|| invalid("file-size", "Arrow file is shorter than its footer"))?;
+        let trailer = self.read_range(whole, tail..size, memory).await?;
+        let trailer = trailer.as_slice().try_into().map_err(|_| invalid("file-size", "Arrow footer trailer is truncated"))?;
+        let length = arrow_ipc::reader::read_footer_length(trailer).map_err(|error| invalid("file-size", error))?;
+        let footer = tail.checked_sub(length as u64).ok_or_else(|| invalid("file-size", "Arrow footer exceeds its file"))?;
+        let bytes = self.read_range(whole, footer..tail, memory).await?;
+        let bound = length.checked_mul(16).and_then(|bytes| bytes.checked_add(65_536))
+            .ok_or_else(|| invalid("file-layout-size", "Arrow footer allocation exceeds addressable memory"))?;
+        audience_work::decode_bytes(bound)?;
+        let opening = memory.reserve(bound)?;
+        let mut decoder = PageDecoder::from_footer(bytes.as_slice(), footer, None)?;
+        let mut dictionaries = Vec::new();
+        for index in 0..decoder.dictionary_count() {
+            let bytes = self.read_range(whole, decoder.dictionary_range(index)?, memory).await?;
+            let bound = decoder.dictionary_bound(index, bytes.as_slice())?;
+            audience_work::decode_bytes(bound)?;
+            dictionaries.push(memory.reserve(bound)?);
+            decoder.load_dictionary(index, page_buffer(bytes))?;
+        }
+        // Dictionary buffers are charged to this query. Cache only directories that do not retain those buffers.
+        if dictionaries.is_empty() && let Some(reservation) = self.storage.admit(bound) {
+            let layout = Arc::new(CachedLayout { decoder, _reservation: reservation, _dictionaries: dictionaries });
+            self.storage.insert_view(&self.key, View::Layout, Arc::clone(&layout));
+            return Ok((layout, opening));
+        }
+        let layout = Arc::new(CachedLayout { decoder, _reservation: Arc::clone(&opening), _dictionaries: dictionaries });
+        Ok((layout, opening))
+    }
+}
+
+fn page_buffer(bytes: CacheLease) -> Buffer {
+    // A cached page must release the rest of a whole object when the query is done reading it.
+    if bytes.is_partial_allocation() { Buffer::from(bytes.as_slice().to_vec()) }
+    else { Buffer::from(Bytes::from_owner(bytes)) }
+}
 
 #[derive(Default)]
 struct FileDescriptors {
@@ -40,7 +139,8 @@ impl FileDescriptors {
 }
 
 enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<LocatedRows> }, File { file: usize, page: usize } }
-struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool }
+/// `unread` names the metadata node whose statistics have not been tested yet: until they are, the page counts as matching and has no temporal bounds.
+struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool, unread: Option<usize> }
 
 #[derive(Default)]
 struct PageDescriptors {
@@ -123,12 +223,20 @@ impl ActiveRows {
 struct Head { header: EventHeader, active: usize, priority: usize, ordinal: usize }
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.system_from.cmp(&other.header.system_from))
+        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.system_position().cmp(&other.header.system_position()))
             .then_with(|| other.priority.cmp(&self.priority)).then_with(|| other.ordinal.cmp(&self.ordinal))
             .then_with(|| other.active.cmp(&self.active))
     }
 }
 impl PartialOrd for Head { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+
+#[derive(Clone)]
+struct RankProjection {
+    output: rtdb_plan::ColumnId,
+    source: String,
+    scorer: Option<Arc<rtdb_text::Scorer>>,
+    verified: Option<crate::CandidateScores>,
+}
 
 pub(crate) struct PartitionScan {
     snapshot: Snapshot,
@@ -146,10 +254,16 @@ pub(crate) struct PartitionScan {
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
-    /// The IIDs a fragment's scan is confined to; every IID, otherwise.
-    fragment: Option<(Iid, Iid)>,
+    /// The inclusive IID range the scan is confined to, by its fragment's prefix and its `_id` range predicates; every IID, otherwise.
+    confined: Option<(Iid, Iid)>,
+    /// Set where the scan's rows must leave it in the order of their IIDs; they leave page by page, otherwise.
+    order: Option<IidOrder>,
+    /// The scan's predicates as tests of a page's statistics, kept by an ordered scan for the leaves it has yet to reach.
+    page_test: Option<crate::page_metadata::PageTest>,
     /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
     matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
+    ranking: Option<RankProjection>,
+    candidate_iids: Option<crate::CandidateIids>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
     slots: Vec<Option<usize>>,
 }
@@ -157,15 +271,26 @@ pub(crate) struct PartitionScan {
 use crate::analysis::ScanCounts;
 
 /// The IIDs an `_id` predicate selects, as the reference's scan narrows to them: `_id = v`, or an OR of such, with every
-/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name one IID — `_id = 7.0` still
+/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name known IIDs — `_id = 7.0` still
 /// matches the integer ID 7 — so the scan reads every IID; the predicate itself is applied either way.
-fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::BTreeSet<Iid>> {
+fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<std::collections::BTreeSet<Iid>> {
     let id = scan.columns.iter().find(|field| field.name == "_id")?.id;
-    let eid = |expr: &Expr| -> Option<Iid> {
-        let value = match expr { Expr::Literal(value) => value, Expr::Parameter { index, .. } => parameters.get(*index)?, _ => return None };
-        value.entity_id().ok().map(|entity| entity.iid())
+    let eid = |expr: &Expr| -> Option<(Iid, Option<Iid>)> {
+        if let Some(uuid) = uuid_constant(expr, parameters) { return Some((Iid(uuid), None)); }
+        let value = match expr {
+            Expr::Literal(value) => value,
+            Expr::Parameter { index, .. } => {
+                if let Some(cell) = parameters.arrow_cell(*index) { return arrow_parameter_iids(cell); }
+                parameters.known(*index)?
+            }
+            _ => return None,
+        };
+        match value {
+            Value::Keyword(value) => Some(keyword_iids(value.as_str())),
+            _ => value.entity_id().ok().map(|entity| (entity.iid(), None)),
+        }
     };
-    let equality = |expr: &Expr| -> Option<Iid> {
+    let equality = |expr: &Expr| {
         let Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } = expr else { return None };
         match (left.as_ref(), right.as_ref()) {
             (Expr::Column { id: column, .. }, value) | (value, Expr::Column { id: column, .. }) if *column == id => eid(value),
@@ -178,11 +303,127 @@ fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::B
     scan.predicates.iter().filter(|predicate| predicate.referenced_columns() == std::collections::BTreeSet::from([id])).find_map(|predicate| {
         let mut clauses = Vec::new();
         disjuncts(predicate, &mut clauses);
-        clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
+        let mut iids = std::collections::BTreeSet::new();
+        for clause in clauses {
+            let (iid, reference) = equality(clause)?;
+            iids.insert(iid);
+            iids.extend(reference);
+        }
+        Some(iids)
     })
 }
+/// The order of a scan's rows by IID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IidOrder { Ascending, Descending }
+
+/// Whether every `_id` the snapshots hold for the table is a UUID, each then being its own IID. A plan records the type
+/// it was prepared against, and a row of another ID type may have been written since.
+fn stores_uuid_ids(table: &rtdb_types::TableRef, snapshots: &[Snapshot]) -> bool {
+    let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
+    snapshots.iter().all(|snapshot| snapshot.column_types_for(table, ["_id".to_owned()]).get("_id").is_some_and(|ty| *ty == uuid || *ty == rtdb_types::LogicalType::Nothing))
+}
+
+/// The UUID a literal or parameter is, or that the cast of a string one to UUID gives, which is how `UUID '...'` is bound.
+fn uuid_constant(expr: &Expr, parameters: rtdb_expr::Parameters<'_>) -> Option<[u8; 16]> {
+    fn constant<'v>(expr: &'v Expr, parameters: rtdb_expr::Parameters<'v>) -> Option<&'v Value> {
+        match expr { Expr::Literal(value) => Some(value), Expr::Parameter { index, .. } => parameters.known(*index), _ => None }
+    }
+    let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
+    let (operand, cast) = match expr {
+        Expr::Cast { expr, target: rtdb_plan::CastTarget::Fixed(target) } if *target == uuid => (expr.as_ref(), true),
+        _ => (expr, false),
+    };
+    if let Expr::Parameter { index, .. } = operand && let Some(cell) = parameters.arrow_cell(*index) {
+        if cell.array.is_null(cell.row) { return None; }
+        let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
+        return match (cell.field.data_type(), extension, cast) {
+            (DataType::FixedSizeBinary(16), Some("uuid"), _) => cell.array.as_fixed_size_binary().value(cell.row).try_into().ok(),
+            (DataType::Utf8, None, true) => EntityId::uuid(cell.array.as_string::<i32>().value(cell.row)).ok().map(|id| id.iid().0),
+            _ => None,
+        };
+    }
+    let value = match expr {
+        Expr::Cast { expr, target: rtdb_plan::CastTarget::Fixed(target) } if *target == uuid => match constant(expr, parameters)? {
+            text @ Value::Utf8(_) => return match rtdb_expr::cast(text, &uuid, "UTC").ok()? { Value::Uuid(bytes) => Some(bytes), _ => None },
+            value => value,
+        },
+        expr => constant(expr, parameters)?,
+    };
+    match value { Value::Uuid(bytes) => Some(*bytes), _ => None }
+}
+
+fn keyword_iids(name: &str) -> (Iid, Option<Iid>) {
+    let [native, reference] = EntityId::keyword_lookup_iids(name);
+    (native, Some(reference))
+}
+
+fn arrow_parameter_iids(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<(Iid, Option<Iid>)> {
+    if cell.array.is_null(cell.row) { return None; }
+    let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
+    match (cell.field.data_type(), extension) {
+        (DataType::Utf8, None) => Some((EntityId::string_iid(cell.array.as_string::<i32>().value(cell.row)), None)),
+        (DataType::Utf8, Some("xt/clj-keyword")) => Some(keyword_iids(cell.array.as_string::<i32>().value(cell.row))),
+        _ => cell.signed_integer().map(|value| (EntityId::Integer(value).iid(), None)),
+    }
+}
+/// The inclusive IID interval that `_id` range predicates select: the conjuncts comparing `_id` with a UUID literal or
+/// parameter by `<`, `<=`, `>`, `>=` or BETWEEN, where every `_id` of the table is a UUID. A UUID is its own IID and
+/// UUIDs order as their bytes do, so those conjuncts hold exactly for the rows whose IID lies in the interval. An ID
+/// of any other type is hashed into its IID, so a table holding one is not narrowed. `Err` where no IID satisfies
+/// the conjuncts. The predicates are applied to the rows read either way.
+fn id_interval(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> std::result::Result<Option<(Iid, Iid)>, Unsatisfiable> {
+    use rtdb_plan::BinaryOp as Op;
+    let Some(field) = scan.columns.iter().find(|field| field.name == "_id") else { return Ok(None) };
+    if field.data_type != rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid) { return Ok(None); }
+    let is_id = |expr: &Expr| matches!(expr, Expr::Column { id, .. } if *id == field.id);
+    let uuid = |expr: &Expr| uuid_constant(expr, parameters).map(u128::from_be_bytes);
+    fn conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr { Expr::Binary { op: rtdb_plan::BinaryOp::And, left, right } => { conjuncts(left, out); conjuncts(right, out); } other => out.push(other) }
+    }
+    let mut clauses = Vec::new();
+    for predicate in &scan.predicates { conjuncts(predicate, &mut clauses); }
+    let (mut lower, mut upper) = (u128::MIN, u128::MAX);
+    for clause in clauses {
+        match clause {
+            Expr::Binary { op, left, right } => {
+                let (op, bound) = if is_id(left) { (*op, uuid(right)) } else if is_id(right) {
+                    (match op { Op::Lt => Op::Gt, Op::LtEq => Op::GtEq, Op::Gt => Op::Lt, Op::GtEq => Op::LtEq, other => *other }, uuid(left))
+                } else { continue };
+                let Some(bound) = bound else { continue };
+                match op {
+                    Op::GtEq => lower = lower.max(bound),
+                    Op::Gt => lower = lower.max(bound.checked_add(1).ok_or(Unsatisfiable)?),
+                    Op::LtEq => upper = upper.min(bound),
+                    Op::Lt => upper = upper.min(bound.checked_sub(1).ok_or(Unsatisfiable)?),
+                    _ => {}
+                }
+            }
+            Expr::Between { operand, low, high, symmetric: false } if is_id(operand) => {
+                if let Some(low) = uuid(low) { lower = lower.max(low); }
+                if let Some(high) = uuid(high) { upper = upper.min(high); }
+            }
+            _ => {}
+        }
+    }
+    if lower > upper { return Err(Unsatisfiable); }
+    Ok((lower != u128::MIN || upper != u128::MAX).then(|| (Iid(lower.to_be_bytes()), Iid(upper.to_be_bytes()))))
+}
+/// No IID satisfies a scan's `_id` range predicates.
+#[derive(Debug, PartialEq, Eq)]
+struct Unsatisfiable;
+
+/// The IIDs in both inclusive ranges, where each `None` is every IID; `Err` where they share none.
+fn intersect(left: Option<(Iid, Iid)>, right: Option<(Iid, Iid)>) -> std::result::Result<Option<(Iid, Iid)>, Unsatisfiable> {
+    match (left, right) {
+        (Some((first, last)), Some((lower, upper))) => {
+            let range = (first.max(lower), last.min(upper));
+            if range.0 > range.1 { Err(Unsatisfiable) } else { Ok(Some(range)) }
+        }
+        (range, None) | (None, range) => Ok(range),
+    }
+}
 /// One source of a scan's rows: a partition this node reads, or a fragment of one that another node may read for it.
-enum Part { Local(PartitionScan), Fragment(Fragment) }
+enum Part { Local(PartitionScan), Fragment(Fragment), Resolved(Option<crate::columnar::ColumnBatch>) }
 
 /// A fragment dispatched to the node it belongs to, read here instead when that node is this one or does not answer.
 struct Fragment { request: Arc<ScanFragment>, fallback: PartitionScan, state: FragmentState }
@@ -230,12 +471,23 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
         let database = context.catalog.database(&scan.table.name.database)?;
-        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage, true).await
+        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage, true, None).await
     }
     /// A scan of the given partitions of its database, which share `storage`.
-    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool) -> Result<Self> {
+    /// With an `order`, each partition's rows leave in that order of their IIDs, and the partition is read here rather than split into fragments.
+    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>) -> Result<Self> {
+        if !execution.context.catalog.permits_table(&scan.table.name) {
+            return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
+        }
         let fixed_iids = scan.iids.is_some();
-        if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
+        let accelerate = accelerate && execution.context.catalog.owned_position_mask.is_none();
+        if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.evaluator()); }
+        let interval = if !stores_uuid_ids(&scan.table.name.table, database_partitions) { None } else {
+            match id_interval(&scan, execution.parameters.evaluator()) {
+                Ok(interval) => interval,
+                Err(Unsatisfiable) => { scan.iids = Some(Default::default()); None }
+            }
+        };
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
         let canonical_entity_iids = scan.iids.is_none()
@@ -252,21 +504,64 @@ impl ScanCursor {
             queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(text), _ => None });
         }
         let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
+        let ranking = if let Some(top) = scan.top_k.as_ref()
+            && let Some(output) = top.score
+            && let Some(source) = scan.columns.iter().find(|field| field.id == top.column)
+        {
+            let constants = crate::accelerate::ExecutionConstants(&execution);
+            let scorer = match crate::ConstantEvaluator::constant(&constants, &top.query).await? {
+                Some(Value::Utf8(query)) => Some(Arc::new(rtdb_text::Scorer::new(rtdb_text::Query::parse(&query), None))),
+                _ => None,
+            };
+            Some(RankProjection { output, source: source.name.clone(), scorer, verified: None })
+        } else { None };
         let fragmenter = execution.context.catalog.fragmenter.clone();
         let mut parts = VecDeque::new();
+        let mut verified_counts = ScanCounts::default();
         for snapshot in database_partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             let mut narrowed = scan.clone();
-            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage, canonical_entity_iids };
+            let mut ranking = ranking.clone();
+            let mut candidate_iids = None;
+            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage, canonical_entity_iids, counts: Default::default() };
             for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids) {
                 let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                     current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
-                    corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
-                if let Some(mut candidates) = accelerator.candidate_iids(&request).await? {
-                    // `path_matches` stops consulting pushdowns once `iids` is set, so they are applied to the candidates here.
-                    if let Some(filters) = &pushdowns { candidates.retain(|iid| filters.iid_matches(&scan.columns, *iid, canonical_entity_iids)); }
-                    let iids = match narrowed.iids.take() { Some(existing) => existing.intersection(&candidates).copied().collect(), None => candidates };
-                    narrowed.iids = Some(iids);
+                    verifier: &verifier, partitions: database_partitions };
+                let selection = accelerator.select_candidates(&request).await?;
+                if let Some(crate::ScanSelection { iids: mut candidates, scores }) = selection {
+                    if pushdowns.is_some() || narrowed.iids.is_some() {
+                        candidates = match candidates.retain(|iid| {
+                            pushdowns.as_ref().is_none_or(|filters| filters.iid_matches(&scan.columns, iid, canonical_entity_iids))
+                                && narrowed.iids.as_ref().is_none_or(|existing| existing.contains(&iid))
+                        }, &execution.context.memory) {
+                            Err(error) if error.code == "rtdb/memory-budget-exceeded" => continue,
+                            result => result?,
+                        };
+                    }
+                    if let Some(ranking) = &mut ranking
+                        && scores.is_some()
+                    {
+                        ranking.verified = scores;
+                    }
+                    narrowed.iids = Some(candidates.iter().collect());
+                    candidate_iids = Some(candidates);
+                }
+            }
+            verified_counts.add(*verifier.counts.lock());
+            if database_partitions.len() == 1 && bounds.valid_time.is_point() && bounds.system_time.is_point()
+                && let (Some(iids), Some(projected_rank)) = (candidate_iids.as_ref(), ranking.as_ref())
+                && let Some(scores) = projected_rank.verified.as_ref() {
+                match retained_ranked_batch(&scan, projected_rank.output, iids, scores, &execution.context.memory) {
+                    Ok(Some(batch)) => {
+                        parts.push_back(Part::Resolved(Some(batch)));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+                        if let Some(rank) = &mut ranking && let Some(scores) = &mut rank.verified { scores.release_rows(); }
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             let mut matches = Vec::with_capacity(scan.matches.len());
@@ -275,46 +570,57 @@ impl ScanCursor {
                 if let Some(query) = query {
                     let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
-                        corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
+                        verifier: &verifier, partitions: database_partitions };
                     for accelerator in execution.context.accelerators.iter().filter(|_| accelerate) {
                         if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
                     }
                 }
                 matches.push((query.as_deref().map(rtdb_text::Query::parse), answers));
             }
-            let partition = |fragment, matches| PartitionScan {
-                snapshot: snapshot.clone(), storage: Arc::clone(storage), matches,
-                slots: slots.clone(), scan: narrowed.clone(), execution: execution.clone(), bounds,
+            let mut local_scan = narrowed.clone();
+            if candidate_iids.is_some() { local_scan.iids = None; }
+            let partition = |confined, matches| PartitionScan {
+                snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, ranking: ranking.clone(), candidate_iids: candidate_iids.clone(),
+                slots: slots.clone(), scan: local_scan.clone(), execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                 tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
                 output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
-                canonical_entity_iids, fragment,
+                canonical_entity_iids, confined, order, page_test: None,
             };
             // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
             let split = match (&fragmenter, snapshot.tx_basis()) {
-                (Some(fragmenter), Some(basis)) if narrowed.iids.is_none() && narrowed.matches.is_empty() && database_partitions.len() == 1 =>
+                (Some(fragmenter), Some(basis)) if order.is_none() && narrowed.iids.is_none() && narrowed.matches.is_empty() && ranking.is_none() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
                     fragmenter.depth(&name, &scan.table.name.table, persisted_bytes(snapshot)).map(|depth| (depth, basis)),
                 _ => None,
             };
             match split {
                 Some((depth, basis)) => for prefix in depth.prefixes() {
-                    let fallback = partition(Some(prefix.range()), Vec::new());
-                    parts.push_back(Part::Fragment(Fragment { request: Arc::new(ScanFragment::of(&narrowed, prefix, basis, bounds, &execution.context.timezone)), fallback, state: FragmentState::Pending }));
+                    // A prefix holding none of the interval's IIDs has no rows to read.
+                    let Ok(confined) = intersect(Some(prefix.range()), interval) else { continue };
+                    let fallback = partition(confined, Vec::new());
+                    let residence = execution.context.catalog.fragment_residence.clone();
+                    let request = Arc::new(ScanFragment::of(&narrowed, prefix, basis, residence, bounds, &execution.context.timezone));
+                    parts.push_back(Part::Fragment(Fragment { request, fallback, state: FragmentState::Pending }));
                 },
-                None => parts.push_back(Part::Local(partition(None, matches))),
+                None => parts.push_back(Part::Local(partition(interval, matches))),
             }
         }
         let fragmenter = fragmenter.filter(|_| parts.iter().any(|part| matches!(part, Part::Fragment(_))));
-        Ok(Self { parts, fragmenter, completed: ScanCounts::default(), database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
+        Ok(Self { parts, fragmenter, completed: verified_counts, database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
     }
 }
 
 impl PartitionScan {
     #[allow(clippy::too_many_arguments)]
-    fn new(snapshot: Snapshot, storage: Arc<BufferPool>, scan: Scan, execution: Execution, bounds: TemporalBounds, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, canonical_entity_iids: bool, fragment: Option<(Iid, Iid)>) -> Self {
+    fn new(snapshot: Snapshot, storage: Arc<BufferPool>, mut scan: Scan, execution: Execution, bounds: TemporalBounds, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, canonical_entity_iids: bool, fragment: Option<(Iid, Iid)>) -> Self {
         let slots = vec![None; scan.columns.len()];
-        Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, fragment }
+        let interval = if stores_uuid_ids(&scan.table.name.table, std::slice::from_ref(&snapshot)) { id_interval(&scan, execution.parameters.evaluator()) } else { Ok(None) };
+        let confined = interval.and_then(|interval| intersect(fragment, interval)).unwrap_or_else(|Unsatisfiable| {
+            scan.iids = Some(Default::default());
+            fragment
+        });
+        Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), ranking: None, candidate_iids: None, slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
+            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None, page_test: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
     pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
@@ -329,7 +635,8 @@ impl ScanCursor {
             for part in &mut self.parts { if let Part::Fragment(fragment) = part { fragment.dispatch(&fragmenter); } }
         }
         while let Some(part) = self.parts.front_mut() {
-            let batch = match part { Part::Local(partition) => partition.next_batch().await?, Part::Fragment(fragment) => fragment.next_batch(&self.memory).await? };
+            let batch = match part { Part::Local(partition) => partition.next_batch().await?, Part::Fragment(fragment) => fragment.next_batch(&self.memory).await?,
+                Part::Resolved(batch) => batch.take() };
             if let Some(batch) = batch { return Ok(Some(batch)); }
             self.completed.add(part.counts());
             self.parts.pop_front();
@@ -340,15 +647,34 @@ impl ScanCursor {
 
 #[cfg(test)]
 impl ScanCursor {
-    fn front_partition(&self) -> Option<&PartitionScan> { self.parts.front().map(|part| match part { Part::Local(partition) => partition, Part::Fragment(fragment) => &fragment.fallback }) }
-    fn front_partition_mut(&mut self) -> Option<&mut PartitionScan> { self.parts.front_mut().map(|part| match part { Part::Local(partition) => partition, Part::Fragment(fragment) => &mut fragment.fallback }) }
+    fn front_partition(&self) -> Option<&PartitionScan> { self.parts.front().and_then(|part| match part { Part::Local(partition) => Some(partition), Part::Fragment(fragment) => Some(&fragment.fallback), Part::Resolved(_) => None }) }
+    fn front_partition_mut(&mut self) -> Option<&mut PartitionScan> { self.parts.front_mut().and_then(|part| match part { Part::Local(partition) => Some(partition), Part::Fragment(fragment) => Some(&mut fragment.fallback), Part::Resolved(_) => None }) }
 }
 
 impl Part {
-    fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts } }
+    fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts, Self::Resolved(_) => ScanCounts::default() } }
 }
 
-pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usize) -> Result<Option<crate::pages::BoxPageCursor>> {
+fn retained_ranked_batch(scan: &Scan, score: rtdb_plan::ColumnId, iids: &crate::CandidateIids,
+    scores: &crate::CandidateScores, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
+    if iids.is_empty() { return Ok(None); }
+    let Some(position) = scan.columns.iter().position(|field| field.id == score) else { return Ok(None); };
+    let Some(rows) = iids.iter().map(|iid| scores.row(iid).zip(scores.score(iid))).collect::<Option<Vec<_>>>() else { return Ok(None); };
+    let slots = (0..rows.len()).zip(rows.iter().map(|(row, _)| row.row)).collect::<Vec<_>>();
+    let sources: Vec<_> = rows.iter().map(|(row, _)| Arc::clone(&row.batch)).collect();
+    let columns: Vec<_> = (0..scan.columns.len() - 1).collect();
+    let mut output = crate::columnar::ColumnBatch::take_rows(&sources, &slots, &columns, memory)?;
+    let reservation = memory.reserve(256 + rows.len() * 8)?;
+    output.append_column(crate::columnar::Column::Arrow {
+        array: Arc::new(arrow_array::Float64Array::from_iter_values(rows.into_iter().map(|(_, score)| score))),
+        field: Arc::new(arrow_schema::Field::new("search_score", DataType::Float64, true)),
+        logical: Some(rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::F64).maybe()),
+    }, reservation, memory)?;
+    output.columns[position..].rotate_right(1);
+    Ok(Some(output))
+}
+
+async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usize>, projection: &[usize]) -> Result<Option<crate::OrderedScan>> {
     if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() {
         return Ok(None);
     }
@@ -356,29 +682,142 @@ pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usi
     let database = context.catalog.database(&scan.table.name.database)?;
     let [snapshot] = database.partitions.as_slice() else { return Ok(None); };
     let storage = &database.storage;
-    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false };
+    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false, counts: Default::default() };
     let bounds = bounds(scan, snapshot, execution).await?;
     let request = crate::ScanRequest {
         database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
         current_time: context.current_time, cancellation: &context.cancellation,
-        constants: &crate::accelerate::ExecutionConstants(execution), corpora: context.corpora.as_ref(),
+        constants: &crate::accelerate::ExecutionConstants(execution),
         verifier: &verifier, partitions: &database.partitions,
     };
     for accelerator in context.accelerators.iter() {
-        if let Some(iids) = accelerator.ordered_iids(&request, limit).await? {
-            let memory = context.memory.reserve(iids.capacity().saturating_mul(size_of::<Iid>() + 32))?;
-            let mut scan = scan.clone();
-            let width = scan.columns.len();
-            let iid_at = include_iid(&mut scan)?;
-            scan.ordered_top_k = None;
-            scan.top_k = None;
-            scan.predicates.clear();
-            return Ok(Some(Box::new(OrderedRows {
-                scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory,
-            })));
+        if let Some(output) = accelerator.ordered(&request, window.clone(), projection).await? {
+            return Ok(Some(output));
         }
     }
     Ok(None)
+}
+
+/// The scan's rows in the order its `ORDER BY _id` asks for, where every `_id` of the table is a UUID: a UUID is its
+/// own IID, so the rows are read in IID order and whoever takes them stops the read by taking no more. The scan's
+/// predicates and the residual predicates annotated on it are applied here, as an ordered index applies them, and
+/// the rows from `offset` up to `limit` leave as the columns at `positions`.
+async fn iid_ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, positions: &[usize]) -> Result<Option<crate::operators::OrderedInput>> {
+    let Some(top) = &scan.ordered_top_k else { return Ok(None) };
+    let ([key], false, true) = (top.order.as_slice(), top.distinct, scan.matches.is_empty()) else { return Ok(None) };
+    let Some(id) = scan.columns.iter().find(|field| field.name == "_id") else { return Ok(None) };
+    if id.data_type != rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid) || !matches!(&key.expr, Expr::Column { id: column, .. } if *column == id.id) { return Ok(None); }
+    let table = &scan.table.name.table;
+    if crate::inspection::is_inspection(table) || crate::system_schema::definition(table).is_some() { return Ok(None); }
+    let database = execution.context.catalog.database(&scan.table.name.database)?;
+    // Partitions are read one after another, which orders nothing across them.
+    if database.partitions.len() != 1 || !stores_uuid_ids(table, &database.partitions) { return Ok(None); }
+    let order = if key.descending { IidOrder::Descending } else { IidOrder::Ascending };
+    let schema = Schema::new(scan.columns.clone())?;
+    let predicate = scan.predicates.iter().chain(&top.residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+    let mut unordered = scan.clone();
+    unordered.ordered_top_k = None;
+    unordered.top_k = None;
+    let rows: crate::columnar::BoxBatchCursor = Box::new(ScanCursor::over(unordered, execution.clone(), None, &database.partitions, &database.storage, true, Some(order)).await?);
+    let rows = match predicate {
+        Some(predicate) => Box::new(crate::columnar::BatchFilter::new(rows, schema, predicate, execution.clone())) as crate::columnar::BoxBatchCursor,
+        None => rows,
+    };
+    let window = Box::new(OrderedWindow { input: Some(rows), counts: None, skip: offset, remaining: limit.saturating_sub(offset), memory: Arc::clone(&execution.context.memory) });
+    let all = positions.len() == scan.columns.len() && positions.iter().enumerate().all(|(index, position)| index == *position);
+    Ok(Some(crate::operators::OrderedInput::Batches(if all { window } else {
+        Box::new(crate::columnar::BatchProject::new(window, positions.to_vec(), Arc::clone(&execution.context.memory)))
+    })))
+}
+
+/// The rows of an ordered input after the first `skip`, up to `remaining` of them; the input is dropped, and so read no further, once they have left.
+struct OrderedWindow { input: Option<crate::columnar::BoxBatchCursor>, counts: Option<ScanCounts>, skip: usize, remaining: usize, memory: Arc<MemoryBudget> }
+
+#[async_trait]
+impl crate::columnar::BatchCursor for OrderedWindow {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        loop {
+            if self.remaining == 0 { self.close(); }
+            let Some(input) = &mut self.input else { return Ok(None) };
+            let Some(batch) = input.next_batch().await? else { self.close(); return Ok(None) };
+            if self.skip >= batch.len { self.skip -= batch.len; continue; }
+            let first = std::mem::take(&mut self.skip);
+            let taken = (batch.len - first).min(self.remaining);
+            self.remaining -= taken;
+            if first == 0 && taken == batch.len { return Ok(Some(batch)); }
+            let mask: Vec<bool> = (0..batch.len).map(|row| row >= first && row < first + taken).collect();
+            return batch.select(&mask, &self.memory).map(Some);
+        }
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { if let Some(input) = &self.input { input.trace_attributes(span); } }
+    fn scan_counts(&self) -> Option<ScanCounts> { self.input.as_ref().map_or(self.counts, |input| input.scan_counts()) }
+}
+impl OrderedWindow {
+    /// Drops the input, keeping what it counted.
+    fn close(&mut self) { if let Some(input) = self.input.take() { self.counts = input.scan_counts(); } }
+}
+
+pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, projection: Option<&[usize]>) -> Result<Option<crate::operators::OrderedInput>> {
+    if !execution.context.catalog.permits_table(&scan.table.name) {
+        return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
+    }
+    use crate::operators::OrderedInput;
+    let full;
+    let positions = match projection {
+        Some(positions) => positions,
+        None => { full = (0..scan.columns.len()).collect::<Vec<_>>(); &full }
+    };
+    let Some(output) = ordered(scan, execution, offset..limit, positions).await? else { return iid_ordered_input(scan, execution, limit, offset, positions).await; };
+    Ok(Some(match output {
+        crate::OrderedScan::Covered(batches) => {
+            OrderedInput::Batches(Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context) }))
+        }
+        crate::OrderedScan::Payload { candidates, verify } => {
+            let mut payload = scan.clone();
+            let predicate = verify.then(|| {
+                scan.predicates.iter().chain(scan.ordered_top_k.iter().flat_map(|top| &top.residuals))
+                    .cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right))
+            }).flatten();
+            let mut needed = predicate.as_ref().map_or_else(BTreeSet::new, Expr::referenced_columns);
+            let output = positions.iter().map(|&position| scan.columns.get(position)
+                .map(|field| field.id).ok_or_else(|| invalid("ordered-column", "Ordered projection is outside the scan schema")))
+                .collect::<Result<Vec<_>>>()?;
+            needed.extend(output.iter().copied());
+            payload.columns.retain(|field| needed.contains(&field.id));
+            let iid_at = include_iid(&mut payload)?;
+            let schema = Schema::new(payload.columns.clone())?;
+            let projection = output.into_iter().map(|id| schema.position(id)
+                .ok_or_else(|| invalid("ordered-column", "Ordered output column is missing")))
+                .collect::<Result<Vec<_>>>()?;
+            let memory = execution.context.memory.reserve(4096 + payload.columns.len().saturating_mul(512))?;
+            payload.ordered_top_k = None;
+            payload.top_k = None;
+            payload.predicates.clear();
+            OrderedInput::Batches(Box::new(OrderedPayload {
+                scan: payload, schema, execution: execution.clone(), candidates: Some(candidates), predicate, verify,
+                projection, iid_at, skip: offset, remaining: limit.saturating_sub(offset), _memory: memory,
+            }))
+        }
+    }))
+}
+
+struct CoveredBatches {
+    batches: Box<dyn crate::OrderedBatches>,
+    context: Arc<crate::QueryContext>,
+}
+
+#[async_trait]
+impl crate::columnar::BatchCursor for CoveredBatches {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        self.context.check_cancelled()?;
+        self.batches.next_batch().await?.map(crate::columnar::ColumnBatch::from_owned).transpose()
+    }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_covered", rtdb_plan::TraceValue::Unsigned(1));
+        self.batches.trace_attributes(span);
+    }
 }
 
 fn include_iid(scan: &mut Scan) -> Result<usize> {
@@ -393,156 +832,155 @@ fn include_iid(scan: &mut Scan) -> Result<usize> {
     Ok(position)
 }
 
-struct OrderedRows {
+struct OrderedPayload {
     scan: Scan,
     execution: Execution,
-    selected: std::vec::IntoIter<Iid>,
-    width: usize,
+    schema: Schema,
+    candidates: Option<Box<dyn crate::OrderedCandidates>>,
+    predicate: Option<Expr>,
+    verify: bool,
+    projection: Vec<usize>,
     iid_at: usize,
+    skip: usize,
+    remaining: usize,
     _memory: Arc<MemoryReservation>,
 }
 
 #[async_trait]
-impl PageCursor for OrderedRows {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        let ids: Vec<_> = self.selected.by_ref().take(128).collect();
-        if ids.is_empty() { return Ok(None); }
+impl crate::columnar::BatchCursor for OrderedPayload {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        use crate::columnar::{Column, ColumnBatch, predicate_mask};
+
         let memory = &self.execution.context.memory;
-        let _scratch = memory.reserve(ids.len() * 192)?;
-        let mut scan = self.scan.clone();
-        scan.iids = Some(ids.iter().copied().collect());
-        let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
-        let mut found = BTreeMap::new();
-        while let Some(mut page) = source.next_page().await? {
-            while let Some(mut row) = page.next() {
-                let Value::FixedSizeBinary(iid) = &row.values[self.iid_at] else {
-                    return Err(invalid("ordered-row-iid", "Ordered scan row has no IID"));
+        while self.remaining != 0 {
+            self.execution.context.check_cancelled()?;
+            let Some(candidates) = self.candidates.as_mut() else { return Ok(None) };
+            let ids = candidates.next_iids(self.remaining.saturating_add(self.skip)).await?;
+            if ids.is_empty() {
+                self.candidates = None;
+                return Ok(None);
+            }
+            let _scratch = memory.reserve(ids.len().saturating_mul(256))?;
+            let mut scan = self.scan.clone();
+            scan.iids = Some(ids.iter().copied().collect());
+            let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
+            let mut found = BTreeMap::new();
+            let mut batches = Vec::new();
+            while let Some(batch) = source.next_batch().await? {
+                let Column::Arrow { array, .. } = &batch.columns[self.iid_at] else {
+                    return Err(invalid("ordered-row-iid", "Ordered scan returned no IID array"));
                 };
-                let iid = Iid::from_slice(iid)?;
-                row.values.truncate(self.width);
-                if found.insert(iid, row).is_some() {
-                    return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
+                let iids = rtdb_columnar::IidView::new(array.as_ref())?;
+                let mask = match &self.predicate {
+                    Some(predicate) => Some(predicate_mask(&batch, predicate, &self.schema, &self.execution).await?),
+                    None => None,
+                };
+                for row in 0..batch.len {
+                    let iid = iids.get(row)?;
+                    let selected = mask.as_ref().is_none_or(|mask| mask[row]);
+                    let position = selected.then_some((batches.len(), row));
+                    if found.insert(iid, position).is_some() {
+                        return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
+                    }
+                }
+                batches.push(batch);
+            }
+            let mut order = Vec::with_capacity(ids.len().min(self.remaining));
+            for iid in ids {
+                match found.remove(&iid) {
+                    None if !self.verify => return Err(invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis")),
+                    None | Some(None) => continue,
+                    Some(Some(_)) if self.skip != 0 => self.skip -= 1,
+                    Some(Some(position)) => {
+                        order.push(position);
+                        if order.len() == self.remaining { break; }
+                    }
                 }
             }
+            if !order.is_empty() {
+                self.remaining -= order.len();
+                if self.remaining == 0 { self.candidates = None; }
+                return ColumnBatch::take_rows(&batches, &order, &self.projection, memory).map(Some);
+            }
         }
-        let mut output = crate::pages::PageBuilder::new(ids.len(), memory)?;
-        for iid in ids {
-            output.push(found.remove(&iid).ok_or_else(|| invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis"))?)?;
-        }
-        Ok(Some(output.finish()))
+        Ok(None)
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
         span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_payload_batches", rtdb_plan::TraceValue::Unsigned(1));
     }
 }
 
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
-struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool }
+struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool, counts: parking_lot::Mutex<ScanCounts> }
 
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
-    async fn visible(&self, iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
-        self.visible_columns(iids, &[column], &[]).await?.into_iter().map(|(iid, mut values)| {
-            Ok((iid, values.pop().ok_or_else(|| invalid("verifier-column", "Verified column is missing"))?))
-        }).collect()
+    fn permits_search_witness(&self) -> bool {
+        self.pushdowns.is_none()
     }
 
-    async fn visible_columns(&self, mut iids: std::collections::BTreeSet<Iid>, columns: &[rtdb_plan::ColumnId], residuals: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>> {
+    async fn score_visible(&self, mut iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId, ascending_id: Option<rtdb_plan::ColumnId>, scorer: &rtdb_text::Scorer) -> Result<crate::CandidateScores> {
         if let Some(pushdowns) = &self.pushdowns {
             iids.retain(|iid| pushdowns.iid_matches(&self.scan.columns, *iid, self.canonical_entity_iids));
         }
-        if iids.is_empty() { return Ok(Vec::new()); }
+        let memory = &self.execution.context.memory;
+        let mut reservation = memory.reserve(256)?;
+        let mut selected = FixedSizeBinaryBuilder::with_capacity(0, 16);
+        let mut scores = Float64Builder::with_capacity(0);
+        if iids.is_empty() { return Ok(crate::CandidateScores::new(selected.finish(), scores.finish(), reservation)); }
         let mut scan = self.scan.clone();
+        if let Some(score) = scan.top_k.as_ref().and_then(|top| top.score) {
+            scan.columns.retain(|field| field.id != score);
+        }
         scan.top_k = None;
         scan.ordered_top_k = None;
         scan.iids = Some(iids);
-        let predicate = scan.predicates.iter().chain(residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
-        let mut needed = predicate.as_ref().map(Expr::referenced_columns).unwrap_or_default();
-        needed.extend(columns.iter().copied());
-        scan.columns.retain(|field| field.name == "_iid" || needed.contains(&field.id));
         let iid_at = include_iid(&mut scan)?;
+        let position = scan.columns.iter().position(|field| field.id == column)
+            .ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"))?;
+        let id_position = ascending_id.and_then(|id| scan.columns.iter().position(|field| field.id == id));
+        let mut ranked_ids = id_position.map(|_| arrow_array::builder::Int64Builder::new());
         let schema = Schema::new(scan.columns.clone())?;
-        let projected = columns.iter().map(|id| schema.position(*id).ok_or_else(|| {
-            invalid("verifier-column", "Verified column is not projected by the scan")
-        })).collect::<Result<Vec<_>>>()?;
-        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false).await?;
-        let metadata = self.execution.scope()?;
-        let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;
-        let mut visible = Vec::new();
-        while let Some(mut page) = cursor.next_page().await? {
-            while let Some(row) = page.next() {
-                if let Some(invocation) = &invocation {
-                    let scope = self.execution.scope()?;
-                    if !rtdb_expr::is_true(&self.execution.evaluate_invocation(&scope, invocation, &row.values).await?)? { continue; }
-                }
-                let Value::FixedSizeBinary(iid) = &row.values[iid_at] else { return Err(invalid("verifier-iid", "Verified row has no IID")) };
-                visible.push((Iid::from_slice(iid)?, projected.iter().map(|column| row.values[*column].clone()).collect()));
-            }
-        }
-        Ok(visible)
-    }
-
-    async fn snapshot_corpus(
-        &self, column: &str, at: Timestamp, partitions: &[Snapshot],
-    ) -> Result<Arc<dyn crate::CorpusSource>> {
-        let point = TemporalFilter::At(Expr::Literal(Value::Timestamp {
-            value: at.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()),
-        }));
-        let scan = Scan {
-            table: self.scan.table.clone(),
-            columns: vec![rtdb_plan::Field {
-                id: rtdb_plan::ColumnId(0), name: column.into(), qualifier: None,
-                qualified_only: false, unnamed: false,
-                data_type: self.scan.table.columns.get(column).cloned().unwrap_or(rtdb_types::LogicalType::Null),
-            }],
-            valid_time: point.clone(), system_time: point, clamp_valid_time: false,
-            iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
-        };
-        let memory = &self.execution.context.memory;
-        let mut cursor = ScanCursor::over(scan, self.execution.clone(), None, partitions, self.storage, false).await?;
-        let mut corpus = rtdb_text::Corpus::default();
-        let mut retained = Vec::new();
-        while let Some(mut page) = cursor.next_page().await? {
-            while let Some(row) = page.next() {
-                let value = &row.values[0];
-                if matches!(value, Value::Null | Value::Undefined) { continue; }
-                corpus.documents += 1;
-                if let Value::Utf8(text) = value {
-                    let bytes = text.len().checked_mul(128).and_then(|bytes| bytes.checked_add(256))
-                        .ok_or_else(|| invalid("corpus-size", "Corpus tokenization exceeds addressable memory"))?;
-                    let _tokens = memory.reserve(bytes)?;
-                    let mut tokens = rtdb_text::tokens(text);
-                    corpus.tokens += u64::from(rtdb_text::stored_length(tokens.len()));
-                    tokens.sort_unstable();
-                    tokens.dedup();
-                    for term in tokens {
-                        if let Some(frequency) = corpus.frequencies.get_mut(&term) {
-                            *frequency += 1;
-                        } else {
-                            retained.push(memory.reserve(term.capacity().checked_add(128)
-                                .ok_or_else(|| invalid("corpus-size", "Corpus term exceeds addressable memory"))?)?);
-                            corpus.frequencies.insert(term, 1);
-                        }
-                    }
+        let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false, None).await?;
+        let mut selected_rows = 0usize;
+        let mut retained = BTreeMap::new();
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = Arc::new(batch);
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
+                return Err(invalid("verifier-iid", "Verified scan returned no IID array"));
+            };
+            let iids = rtdb_columnar::IidView::new(array.as_ref())?;
+            let mask = match &predicate {
+                Some(predicate) => Some(crate::columnar::predicate_mask(&batch, predicate, &schema, self.execution).await?),
+                None => None,
+            };
+            for row in 0..batch.len {
+                if mask.as_ref().is_some_and(|mask| !mask[row]) { continue; }
+                let PutText::Utf8(text) = crate::columnar::search::text(&batch.columns[position], row)? else { continue; };
+                let _scratch = memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                selected_rows += 1;
+                let lease = Arc::get_mut(&mut reservation).expect("Verification owns its output reservation");
+                lease.grow_to(256usize.saturating_add(selected_rows.saturating_mul(48)))?;
+                let iid = iids.get(row)?;
+                selected.append_value(iid.0).map_err(|error| invalid("verifier-iid", error))?;
+                retained.insert(iid, crate::SnapshotRow { batch: Arc::clone(&batch), row });
+                scores.append_value(scorer.bm25_arrow(&rtdb_text::analyze(text)));
+                if let Some((position, ids)) = id_position.zip(ranked_ids.as_mut()) {
+                    let value = batch.columns[position].value(row)?;
+                    let id = match value.entity_id() {
+                        Ok(rtdb_types::EntityId::Integer(id)) => Some(id),
+                        _ => None,
+                    };
+                    ids.append_option(id);
                 }
             }
         }
-        Ok(Arc::new(ScannedCorpus { corpus, _retained: retained }))
-    }
-}
-
-struct ScannedCorpus { corpus: rtdb_text::Corpus, _retained: Vec<Arc<MemoryReservation>> }
-
-impl crate::CorpusSource for ScannedCorpus {
-    fn corpus(&self, query: &rtdb_text::Query) -> Result<rtdb_text::Corpus> {
-        Ok(rtdb_text::Corpus {
-            documents: self.corpus.documents,
-            tokens: self.corpus.tokens,
-            frequencies: query.terms().iter().map(|term| {
-                (term.clone(), self.corpus.frequencies.get(term).copied().unwrap_or_default())
-            }).collect(),
-        })
+        if let Some(counts) = cursor.scan_counts() { self.counts.lock().add(counts); }
+        Ok(crate::CandidateScores::new(selected.finish(), scores.finish(), reservation)
+            .with_ids(ranked_ids.map(|mut ids| ids.finish())).with_rows(retained))
     }
 }
 
@@ -566,12 +1004,19 @@ impl PageCursor for ScanCursor {
 
 impl PartitionScan {
     fn pruning(&self) -> PruningOptions {
+        let iid = match &self.candidate_iids {
+            Some(iids) if iids.len() == 1 => iids.iter().next(),
+            _ => self.scan.iids.as_ref().filter(|iids| iids.len() == 1).and_then(|iids| iids.first().copied()),
+        };
         PruningOptions { bounds: self.bounds, projects_temporal_columns: self.scan.columns.iter().any(|field| matches!(field.name.as_str(), "_valid_from" | "_valid_to" | "_system_from" | "_system_to")),
-            clamp_valid_time: self.scan.clamp_valid_time, bypass_temporal_pruning: self.execution.context.options.bypass_temporal_pruning,
-            iid: self.scan.iids.as_ref().filter(|iids| iids.len() == 1).and_then(|iids| iids.first().copied()) }
+            clamp_valid_time: self.scan.clamp_valid_time,
+            bypass_temporal_pruning: self.execution.context.options.bypass_temporal_pruning
+                || self.execution.context.catalog.owned_position_mask.is_some(),
+            iid }
     }
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
-        if self.fragment.is_some_and(|(first, last)| upper < first || last < lower) { return false; }
+        if self.confined.is_some_and(|(first, last)| upper < first || last < lower) { return false; }
+        if let Some(iids) = &self.candidate_iids { return iids.intersects(lower, upper); }
         match &self.scan.iids {
             Some(iids) => iids.range(lower..=upper).next().is_some(),
             None => self.pushdowns.as_ref().is_none_or(|filters| filters.path_matches(&self.scan.columns, lower, upper, self.canonical_entity_iids)),
@@ -579,15 +1024,27 @@ impl PartitionScan {
     }
     async fn initialize(&mut self) -> Result<()> {
         self.execution.context.check_cancelled()?;
-        if self.scan.iids.as_ref().is_some_and(|iids| iids.is_empty()) || self.bounds.valid_time.is_empty() || self.bounds.system_time.is_empty() {
+        if self.candidate_iids.as_ref().is_some_and(crate::CandidateIids::is_empty)
+            || self.scan.iids.as_ref().is_some_and(BTreeSet::is_empty) || self.bounds.valid_time.is_empty() || self.bounds.system_time.is_empty() {
             self.initialized = true;
             return Ok(());
         }
         let page_test = crate::page_metadata::PageTest::for_scan(&self.scan, &self.execution).await?;
         let table = &self.scan.table.name.table;
         let catalog = self.snapshot.trie_catalog();
-        let current_tries = || catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live);
-        let trie_count = current_tries().count();
+        // A trie without rows has no temporal bounds to record, and a candidate without bounds stops the selection below
+        // from pruning any other: compaction writes such a current trie whenever every row it merges has a finite recency.
+        let candidate = |trie: &CatalogTrie| trie.state == TrieState::Live
+            && !trie.metadata.as_ref().is_some_and(|metadata| metadata.row_count == Some(0));
+        let current_tries = || catalog.iter_tries(table).filter(|trie| candidate(trie));
+        let trie_count = if audience_work::is_bounded() {
+            catalog.iter_tries(table).try_fold(0, |count, trie| -> Result<usize> {
+                audience_work::scan_items(1)?;
+                Ok(count + candidate(trie) as usize)
+            })?
+        } else {
+            current_tries().count()
+        };
         let candidate_reservation = if trie_count == 0 { None } else {
             let bytes = trie_count.checked_mul(std::mem::size_of::<&CatalogTrie>()).and_then(|bytes| bytes.checked_add(256))
                 .ok_or_else(|| invalid("scan-candidate-size", "Scan trie candidate capacity exceeds addressable memory"))?;
@@ -613,14 +1070,21 @@ impl PartitionScan {
         let mut pages = PageDescriptors::default();
         let mut live_segment_count = 0;
         for segment in self.snapshot.iter_segments(table) {
+            audience_work::scan_items(1)?;
             let priority = live_segment_count;
             live_segment_count += 1;
             segment.trie().try_visit_leaves(|leaf| {
+                audience_work::scan_items(1)?;
                 let (lower, upper) = path_range(leaf.path().as_slice())?;
                 if !self.path_matches(lower, upper) { return Ok(()); }
-                let rows = segment.located_rows(leaf)?;
+                audience_work::scan_items(leaf.len())?;
+                let rows = if audience_work::is_bounded() {
+                    segment.located_rows_in(leaf, &self.execution.context.memory)?
+                } else {
+                    segment.located_rows(leaf)?
+                };
                 let temporal = summarize_headers(rows.headers.iter().copied());
-                pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true,
+                pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true, unread: None,
                     summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)
             })?;
         }
@@ -679,12 +1143,17 @@ impl PartitionScan {
             let slug = slug.as_ref().ok_or_else(|| invalid("missing-table-slug", "Persisted trie has no recorded table registry entry"))?;
             let key = ObjectKey::new(slug.metadata_key(&trie.key))?;
             let (metadata, _reservation) = match self.storage.view::<CachedMetadata>(&key, View::File) {
-                Some(cached) => (Arc::clone(&cached.metadata), self.execution.context.memory.reserve(cached.bound)?),
+                Some(cached) => {
+                    audience_work::decode_bytes(cached.bound)?;
+                    (Arc::clone(&cached.metadata), self.execution.context.memory.reserve(cached.bound)?)
+                }
                 None => {
                     let lease = self.storage.get_or(&key, &self.execution.context.memory).await?;
+                    audience_work::decode_bytes(lease.as_slice().len())?;
                     let mut cursor = Cursor::new(lease);
                     let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
                     let bound = layout.full_allocation_bound()?;
+                    audience_work::decode_bytes(bound)?;
                     let reservation = self.execution.context.memory.reserve(bound)?;
                     let metadata = Arc::new(MetadataFile::read_reader(cursor)?);
                     if let Some(retained) = self.storage.admit(metadata.stored_bytes())
@@ -696,7 +1165,7 @@ impl PartitionScan {
             };
             files.admit(file_count, &self.execution.context.memory)?;
             let file = files.entries.len();
-            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, state: DataState::Unopened });
+            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, metadata: key.clone(), opened: None });
             let trie_recency = recency(trie.key.recency())?;
             let memory = &self.execution.context.memory;
             let mut pending = MetadataStack::default();
@@ -704,6 +1173,7 @@ impl PartitionScan {
                 pending.push(MetadataVisit { node, path: [0; MAX_IID_DEPTH], depth: 0, recency: trie_recency }, memory)?;
             }
             while let Some(visit) = pending.entries.pop() {
+                audience_work::scan_items(1)?;
                 self.execution.context.check_cancelled()?;
                 let path = visit.path.get(..visit.depth).ok_or_else(invalid_iid_path)?;
                 let (lower, upper) = path_range(path)?;
@@ -717,14 +1187,22 @@ impl PartitionScan {
                             pending.push(next, memory)?;
                         }
                     },
-                    MetadataNode::RecencyBranch(children) => for (upper, node) in children.iter().rev() {
-                        pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
-                    },
-                    MetadataNode::Leaf { data_page_index, columns } => { let columns = &*columns.values()?; pages.push(Page { lower, upper, priority: live_segment_count + index,
-                        content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
-                            && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?,
-                        source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
-                            recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)? }
+                    MetadataNode::RecencyBranch(children) => {
+                        audience_work::scan_items(children.len())?;
+                        for (upper, node) in children.iter().rev() {
+                            pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
+                        }
+                    }
+                    MetadataNode::Leaf { data_page_index, columns } => {
+                        // An ordered scan may stop after its first tasks, so it reads a leaf's statistics when it reaches the leaf's task.
+                        let (content_matches, temporal, unread) = if self.order.is_some() { (true, None, Some(visit.node)) } else {
+                            let columns = &columns.statistics()?;
+                            (self.leaf_matches(columns, &page_test)?, page_temporal(columns), None)
+                        };
+                        pages.push(Page { lower, upper, priority: live_segment_count + index, content_matches, unread,
+                            source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal,
+                                recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?
+                    }
                 }
             }
         }
@@ -732,10 +1210,41 @@ impl PartitionScan {
         drop(tries);
         drop(candidate_reservation);
         for (index, page) in pages.entries.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
-        self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),&self.execution.context.memory)?);
+        self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),self.order == Some(IidOrder::Descending),&self.execution.context.memory)?);
         self.files = files;
         self.pages = pages;
+        self.page_test = self.order.map(|_| page_test);
         self.initialized = true;
+        Ok(())
+    }
+    /// Whether a leaf's statistics leave it possible that a put of its page satisfies the scan's pushdowns and predicates.
+    fn leaf_matches(&self, columns: &rtdb_format::metadata::LeafStatistics<'_>, page_test: &crate::page_metadata::PageTest) -> Result<bool> {
+        Ok(self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
+            && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?)
+    }
+    /// Tests the statistics an ordered scan left unread for the pages of the task it has reached.
+    /// The metadata is read from the pool that `initialize` decoded it into; where the pool no longer holds a file, its
+    /// pages stay as they are, read and resolved without pruning.
+    fn read_statistics(&mut self, pages: &[usize]) -> Result<()> {
+        let Some(page_test) = &self.page_test else { return Ok(()) };
+        for index in pages {
+            let page = &self.pages.entries[*index];
+            let (Some(node), PageSource::File { file, .. }) = (page.unread, &page.source) else { continue };
+            let data = &self.files.entries[*file];
+            let read = match data.storage.view::<CachedMetadata>(&data.metadata, View::File) {
+                Some(cached) => {
+                    audience_work::decode_bytes(cached.bound)?;
+                    let _charge = self.execution.context.memory.reserve(cached.bound)?;
+                    let Some(MetadataNode::Leaf { columns, .. }) = cached.metadata.nodes().get(node) else { return Err(invalid("metadata-node", "A page's metadata node is not a leaf")) };
+                    let columns = &columns.statistics()?;
+                    Some((self.leaf_matches(columns, page_test)?, page_temporal(columns)))
+                }
+                None => None,
+            };
+            let page = &mut self.pages.entries[*index];
+            page.unread = None;
+            if let Some((content_matches, temporal)) = read { page.content_matches = content_matches; page.summary.temporal = temporal; }
+        }
         Ok(())
     }
     async fn load(&mut self, index: usize) -> Result<()> {
@@ -753,49 +1262,16 @@ impl PartitionScan {
         let rows = match (&page.source, hit) {
             (PageSource::Live { table, rows }, _) => ActiveRows::Live { table: Arc::clone(table), rows: Arc::clone(rows) },
             (PageSource::File { .. }, Some(held)) => {
+                audience_work::decode_bytes(held.bound)?;
                 charge = Some(self.execution.context.memory.reserve(held.bound)?);
                 cached = true;
                 ActiveRows::File(Arc::clone(&held.batch))
             }
             (PageSource::File { file, page: page_index }, None) => {
                 let data = &mut self.files.entries[*file];
-                if matches!(&data.state, DataState::Unopened) && let Some(cached) = data.storage.view::<CachedLayout>(&data.key, View::Layout) {
-                    let footer = cached.length.checked_sub(u64::try_from(cached.layout.footer_encoded_bytes).map_err(|_| invalid("file-size", "Arrow footer exceeds its file"))?)
-                        .ok_or_else(|| invalid("file-size", "Arrow footer exceeds its file"))?;
-                    let file = rtdb_format::ipc::SparseFile::new(cached.length);
-                    file.add(footer, Arc::new(data.storage.get_range_or(&data.key, footer..cached.length, &self.execution.context.memory).await?));
-                    let reservation = self.execution.context.memory.reserve(cached.layout.opening_allocation_bound()?)?;
-                    data.state = DataState::Ranged { reader: ArrowFile::from_inspected_reader(file.clone(), None, cached.layout.clone())?, file, _reservation: reservation };
-                }
-                if matches!(&data.state, DataState::Unopened) {
-                    let lease = data.storage.get_or(&data.key, &self.execution.context.memory).await?;
-                    let length = lease.as_slice().len() as u64;
-                    let mut cursor = Cursor::new(lease);
-                    let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
-                    if let Some(retained) = data.storage.admit(layout_bytes(&layout)?)
-                        && data.storage.insert_view(&data.key, View::Layout, Arc::new(CachedLayout { length, layout: layout.clone(), _reservation: retained })) {
-                        data.storage.evict(&data.key);
-                    }
-                    let reservation = self.execution.context.memory.reserve(layout.opening_allocation_bound()?)?;
-                    data.state = DataState::Open { reader: ArrowFile::from_inspected_reader(cursor, None, layout)?, _reservation: reservation };
-                }
-                let reader = match &mut data.state {
-                    DataState::Open { reader, .. } => reader,
-                    DataState::Ranged { reader, file, .. } => {
-                        let range = reader.page_range(*page_index)?;
-                        let bytes = data.storage.get_range_or(&data.key, range.clone(), &self.execution.context.memory).await?;
-                        file.retain_from(0);
-                        file.add(range.start, Arc::new(bytes));
-                        reader
-                    }
-                    DataState::Unopened => return Err(invalid("file-state", "Data file failed to open")),
-                };
-                let mut bound = reader.page_allocation_bound(*page_index)?;
-                for field in reader.schema().fields() {
-                    bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?).ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
-                }
-                let charged = self.execution.context.memory.reserve(bound)?;
-                let page = reader.read_page(*page_index)?;
+                let (page, charged) = data.decode_page(*page_index, &self.execution.context.memory).await?;
+                let bound = charged.bytes();
+                audience_work::scan_items(page.num_rows())?;
                 let headers = IndexBatch::header_bytes(page.num_rows())?;
                 let batch = match data.storage.admit(bound).zip(data.storage.admit(headers)) {
                     Some((reservation, headers)) => {
@@ -809,6 +1285,11 @@ impl PartitionScan {
                 ActiveRows::File(batch)
             }
         };
+        if let ActiveRows::File(batch) = &rows
+            && batch.view().has_entity_keys() != self.scan.table.name.table.is_owned_event_data()
+        {
+            return Err(invalid("owned-entity-key", "Data page has the wrong physical entity-key layout"));
+        }
         let mut previous: Option<EventHeader> = None;
         // A live page is a slice of this process's own trie, ordered as it was built; a file page is checked when first decoded.
         let validated = if matches!(rows, ActiveRows::Live { .. }) || cached { 0 } else { rows.len() };
@@ -816,8 +1297,8 @@ impl PartitionScan {
             let source = rows.row(index)?;
             let header = source.header()?;
             if header.iid < page.lower || header.iid > page.upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
-            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.system_from < header.system_from)) {
-                return Err(invalid("page-order", "Data page is not in IID and descending system-time order"));
+            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.system_position() < header.system_position())) {
+                return Err(invalid("page-order", "Data page is not in IID and descending system-position order"));
             }
             previous = Some(header);
         }
@@ -836,17 +1317,25 @@ impl PartitionScan {
             self.output_reservation = None;
             let task = self.tasks.as_mut().map(ScanTaskPlan::next).transpose()?.flatten();
             let Some(task) = task else { self.loaded.clear();return Ok(None); };
+            audience_work::scan_items(1)?;
             if self.path_matches(task.range.lower,task.range.upper) { self.buffer_task(task).await?; }
         }
     }
     async fn buffer_task(&mut self,task: ScanTask) -> Result<()> {
+        audience_work::scan_items(task.pages.len())?;
         let bound = task.pages.len().checked_mul(std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>() + std::mem::size_of::<OwnedPage>() + 256).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||invalid("scan-task-size","Scan task scratch exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bound)?;
+        self.read_statistics(&task.pages)?;
         let summaries: Vec<_> = task.pages.iter().map(|index|self.pages.entries[*index].summary.clone()).collect();
         let mut selected: Vec<_> = select_pages(&summaries,self.pruning(),|summary|self.pages.entries[summary.page_index as usize].content_matches).into_iter().map(|summary|summary.page_index as usize).collect();
         self.counts.pages_pruned = self.counts.pages_pruned.saturating_add((task.pages.len() - selected.len()) as u64);
         self.counts.pages_used = self.counts.pages_used.saturating_add(selected.len() as u64);
         selected.sort_by_key(|index| (matches!(self.pages.entries[*index].source,PageSource::Live { .. }),self.pages.entries[*index].priority,*index));
+        // The task's rows the scan is confined to; `path_matches` admitted the task, so the two ranges share an IID.
+        let (range_lower, range_upper) = match self.confined {
+            Some((first, last)) => (task.range.lower.max(first), task.range.upper.min(last)),
+            None => (task.range.lower, task.range.upper),
+        };
         let mut groups = Vec::with_capacity(selected.len());
         let mut group_reservations = Vec::with_capacity(selected.len());
         let mut heads = BinaryHeap::with_capacity(selected.len());
@@ -859,14 +1348,21 @@ impl PartitionScan {
             let (mut low, mut high) = (0, rows.len());
             while low < high {
                 let middle = (low + high) / 2;
-                if rows.header(middle)?.iid < task.range.lower { low = middle + 1; } else { high = middle; }
+                if rows.header(middle)?.iid < range_lower { low = middle + 1; } else { high = middle; }
             }
             if low < rows.len() {
                 let header = rows.header(low)?;
-                if header.iid <= task.range.upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
+                if header.iid <= range_upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
             }
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
+        let keyed = self.scan.table.name.table.is_owned_event_data();
+        let position_mask = self.execution.context.catalog.owned_position_mask;
+        let requested_key = if keyed { self.execution.context.catalog.owned_identity().map(EntityId::handle_bytes) } else { None };
+        // Every equal physical IID stays within one task. A key's events still
+        // arrive in descending system time, independently of its neighbours.
+        let mut bucket = None;
+        let mut identities = BTreeMap::<&[u8], (HistoryResolver, Arc<MemoryReservation>)>::new();
         let mut visited = 0usize;
         let active: Vec<&ActiveRows> = selected.iter().map(|index| &self.loaded[index].rows).collect();
         // Resolved rows name their batch by its place here, so a row costs no handle on its batch.
@@ -874,13 +1370,14 @@ impl PartitionScan {
         let mut handles: Vec<Vec<u32>> = vec![Vec::new(); active.len()];
         let mut next = heads.pop();
         while let Some(head) = next.take() {
+            audience_work::scan_items(1)?;
             self.execution.context.check_cancelled_at(visited)?;
             visited += 1;
             let rows = active[head.active];
             let ordinal = head.ordinal + 1;
             let following = if ordinal < rows.len() {
                 let header = rows.header(ordinal)?;
-                (header.iid <= task.range.upper).then_some(Head { header,ordinal,..head })
+                (header.iid <= range_upper).then_some(Head { header,ordinal,..head })
             } else { None };
             // A page's next row that still precedes every other page's head is taken without passing through the heap.
             next = match following {
@@ -888,15 +1385,47 @@ impl PartitionScan {
                 Some(following) => { heads.push(following); heads.pop() }
                 None => heads.pop(),
             };
-            if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
-            if self.fragment.is_some_and(|(first, last)| head.header.iid < first || last < head.header.iid) { continue; }
-            if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
+            if let Some(iids) = &self.candidate_iids {
+                if !iids.contains(head.header.iid) { continue; }
+            } else if let Some(iids) = &self.scan.iids {
+                if !iids.contains(&head.header.iid) { continue; }
+            } else if self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns, head.header.iid, self.canonical_entity_iids)) {
+                continue;
+            }
+            if position_mask.is_some_and(|(commit, from)| {
+                head.header.system_from == commit
+                    && head.header.commit_position >= from
+                    && head.header.op != EventOp::Erase
+            }) { continue; }
             let (slot, batch, row) = rows.batch(head.ordinal)?;
+            let resolver = if keyed {
+                let key = batch.view().entity_key(row as usize)?.ok_or_else(|| {
+                    invalid("owned-entity-key", "Governed data requires complete physical entity keys")
+                })?;
+                if requested_key.as_deref().is_some_and(|requested| requested != key) { continue; }
+                if bucket != Some(head.header.iid) {
+                    identities.clear();
+                    bucket = Some(head.header.iid);
+                }
+                match identities.entry(key) {
+                    std::collections::btree_map::Entry::Occupied(entry) => &mut entry.into_mut().0,
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let reservation = self.execution.context.memory.reserve(key.len().saturating_add(512))?;
+                        EntityId::from_handle_bytes(key)?;
+                        &mut entry.insert((HistoryResolver::new_in(
+                            self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory),
+                        ), reservation)).0
+                    }
+                }
+            } else {
+                &mut resolver
+            };
             let page = &mut handles[head.active];
             if page.len() <= slot { page.resize(slot + 1, u32::MAX); }
             if page[slot] == u32::MAX { batches.push(Arc::clone(batch)); page[slot] = u32::try_from(batches.len() - 1).map_err(|_| invalid("scan-row-size", "A task reads more batches than u32 names"))?; }
             let source = (page[slot], row);
-            let group: &mut Vec<_> = &mut groups[head.active];
+            // The merge visits rows in IID order across the task's pages, which one group keeps and a group per page does not.
+            let group: &mut Vec<_> = &mut groups[if self.order.is_some() { 0 } else { head.active }];
             let memory = &self.execution.context.memory;
             resolver.resolve_fragments(&head.header, |valid_time, system_time| {
                 if group.len() == group.capacity() {
@@ -909,10 +1438,18 @@ impl PartitionScan {
                 Ok(())
             })?;
         }
-        self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper);
+        if self.order == Some(IidOrder::Descending) && let Some(rows) = groups.first_mut() { rows.reverse(); }
+        // A page is kept for the tasks still to come that read it: those above this one, or below it in a descending scan.
+        if self.order == Some(IidOrder::Descending) { self.loaded.retain(|index,_| self.pages.entries[*index].lower < task.range.lower); }
+        else { self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper); }
         self.output = groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(group, rows)| {
             let page = &self.pages.entries[selected[group]].source;
             crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
+                if let Some(ranking) = &self.ranking
+                    && self.scan.columns[position].id == ranking.output
+                {
+                    return self.rank_column(ranking, rows, &batches).map(Some);
+                }
                 self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose()
             })
         }).collect::<Result<_>>()?;
@@ -922,43 +1459,79 @@ impl PartitionScan {
     }
 
     fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
-        let (Some(query), answers) = &self.matches[evaluated] else {
-            return Ok(crate::columnar::Column::Values(vec![Value::Null; rows.len()]));
-        };
+        let (query, answers) = &self.matches[evaluated];
         let page_answers = match (answers, source) {
             (Some(answers), PageSource::File { file, page }) => answers.file(&self.files.entries[*file].key).map(|matches| (matches, *page)),
             _ => None,
         };
+        let mut values = BooleanBuilder::with_capacity(rows.len());
         let name = &self.scan.matches[evaluated].column;
-        rows.iter().map(|row| {
-            let position = row.source.1 as usize;
-            if let Some((matches, page)) = page_answers {
-                if let Ok(value) = matches.value(page, position) {
-                    return Ok(value.map_or(Value::Null, Value::Bool));
-                }
-            }
-            let value = match name.as_str() {
-                "_valid_to" if row.valid_time.upper() == Timestamp::MAX => Value::Null,
-                "_system_to" if row.system_time.upper() == Timestamp::MAX => Value::Null,
-                "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => return Ok(Value::Bool(false)),
-                _ => read_match_input(&batches[row.source.0 as usize], position, name)?,
+        for row in rows {
+            let Some(query) = query else {
+                values.append_null();
+                continue;
             };
-            Ok(rtdb_expr::match_value(&value, query))
-        }).collect::<Result<_>>().map(crate::columnar::Column::Values)
+            let position = row.source.1 as usize;
+            if let Some((matches, page)) = page_answers
+                && let Ok(value) = matches.value(page, position)
+            {
+                values.append_option(value);
+                continue;
+            }
+            let text = resolved_text(name, row, batches)?;
+            values.append_option(match text {
+                PutText::Missing => None,
+                PutText::Other => Some(false),
+                PutText::Utf8(text) => {
+                    let _tokens = self.execution.context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                    Some(query.matches_arrow(&rtdb_text::analyze(text)))
+                }
+            });
+        }
+        Ok(crate::columnar::Column::Arrow {
+            array: Arc::new(values.finish()),
+            field: Arc::new(arrow_schema::Field::new(name, DataType::Boolean, true)),
+            logical: Some(rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe()),
+        })
+    }
+
+    fn rank_column(&self, ranking: &RankProjection, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
+        let mut values = Float64Builder::with_capacity(rows.len());
+        let empty = arrow_array::StringArray::from(Vec::<&str>::new());
+        for row in rows {
+            let Some(scorer) = &ranking.scorer else {
+                values.append_null();
+                continue;
+            };
+            let iid = batches[row.source.0 as usize].header(row.source.1 as usize)?.iid;
+            if let Some(score) = ranking.verified.as_ref().and_then(|verified| verified.score(iid)) {
+                values.append_value(score);
+                continue;
+            }
+            values.append_option(match resolved_text(&ranking.source, row, batches)? {
+                PutText::Missing => None,
+                PutText::Other => Some(scorer.bm25_arrow(&empty)),
+                PutText::Utf8(text) => {
+                    let _tokens = self.execution.context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                    Some(scorer.bm25_arrow(&rtdb_text::analyze(text)))
+                }
+            });
+        }
+        Ok(crate::columnar::Column::Arrow {
+            array: Arc::new(values.finish()),
+            field: Arc::new(arrow_schema::Field::new("search_score", DataType::Float64, true)),
+            logical: Some(rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::F64).maybe()),
+        })
     }
 }
 
-fn read_match_input(batch: &IndexBatch, row: usize, name: &str) -> Result<Value> {
-    let op = batch.view().operations()?;
-    let put = op.child(op.type_id(row)).as_any().downcast_ref::<StructArray>()
-        .ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
-    let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema", "Put has no struct fields")); };
-    let Some(index) = fields.iter().position(|field| field.name() == name) else { return Ok(Value::Null) };
-    let (field, array, offset) = (&fields[index], put.column(index).as_ref(), op.value_offset(row));
-    match batch.put_field_type(index) {
-        Some(logical) => rtdb_columnar::read_execution_value_as(logical, field, array, offset),
-        None => rtdb_columnar::read_execution_value(field, array, offset),
-    }
+fn resolved_text<'a>(name: &str, row: &ResolvedRow<(u32, u32)>, batches: &'a [Arc<IndexBatch>]) -> Result<PutText<'a>> {
+    Ok(match name {
+        "_valid_to" if row.valid_time.upper() == Timestamp::MAX => PutText::Missing,
+        "_system_to" if row.system_time.upper() == Timestamp::MAX => PutText::Missing,
+        "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => PutText::Other,
+        _ => batches[row.source.0 as usize].view().borrow_event(row.source.1 as usize)?.put_text(name)?,
+    })
 }
 
 async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {
@@ -1004,13 +1577,12 @@ async fn dimension(filter: &TemporalFilter, default: rtdb_types::Instant, execut
 struct CachedMetadata { metadata: Arc<MetadataFile>, bound: usize, _reservation: Arc<MemoryReservation> }
 impl Cached for CachedMetadata { fn in_use(&self) -> bool { Arc::strong_count(&self.metadata) > 1 } }
 
-/// A data file's length and inspected IPC layout, which a scan otherwise re-derives by reading the whole file.
-struct CachedLayout { length: u64, layout: FileLayout, _reservation: Arc<MemoryReservation> }
-impl Cached for CachedLayout {}
-fn layout_bytes(layout: &FileLayout) -> Result<usize> {
-    layout.page_encoded_bytes.len().checked_add(layout.page_decoding_bounds.len()).and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CachedLayout>() + 256)).ok_or_else(|| invalid("file-layout-size", "File layout exceeds addressable memory"))
+struct CachedLayout {
+    decoder: PageDecoder,
+    _reservation: Arc<MemoryReservation>,
+    _dictionaries: Vec<Arc<MemoryReservation>>,
 }
+impl Cached for CachedLayout {}
 
 /// A decoded data page, whose batch retains the pool's reservation, and the bound a query admits for it.
 struct CachedPage { batch: Arc<IndexBatch>, bound: usize }
@@ -1040,7 +1612,7 @@ fn summarize_headers(headers: impl IntoIterator<Item = EventHeader>) -> Option<T
     }
     result
 }
-fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
+fn may_satisfy_not_null(scan: &Scan, columns: &rtdb_format::metadata::LeafStatistics<'_>) -> bool {
     let [Expr::Unary { op: UnaryOp::IsNotNull, expr }] = scan.predicates.as_slice() else {
         return true;
     };
@@ -1058,23 +1630,16 @@ fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
     ) {
         return true;
     }
-    let mut matching = columns.iter().filter(|column| {
-        matches!(column.field("col-name"), Some(Value::Utf8(name)) if name == &field.name)
-            && !matches!(column.field("root-col?"), Some(Value::Bool(false)))
-    });
+    let mut matching = columns.named(&field.name).filter(|column| column.flag("root-col?") != Some(false));
     let (Some(column), None) = (matching.next(), matching.next()) else {
         return true;
     };
-    !matches!(
-        (column.field("root-col?"), column.field("count")),
-        (Some(Value::Bool(true)), Some(Value::I64(0)))
-    )
+    (column.flag("root-col?"), column.count()) != (Some(true), Some(0))
 }
 
-fn page_temporal(columns: &[Value]) -> Option<TemporalSummary> {
+fn page_temporal(columns: &rtdb_format::metadata::LeafStatistics<'_>) -> Option<TemporalSummary> {
     let bound = |name: &str, key: &str, lower: bool| -> Option<Timestamp> {
-        let column = columns.iter().find(|column| column.field("col-name") == Some(&Value::Utf8(name.to_owned())) && column.field("root-col?") == Some(&Value::Bool(true)))?;
-        let Value::F64(seconds) = column.field("date-times")?.field(key)? else { return None; };
+        let seconds = columns.root_column(name)?.bound("date-times", key)?;
         if !seconds.is_finite() { return None; }
         let epsilon = seconds.abs() * f64::EPSILON * 4.0 + 0.000001;
         let micros = (seconds + if lower { -epsilon } else { epsilon }) * 1_000_000.0;
@@ -1107,28 +1672,109 @@ mod tests {
         let equals = |value: Expr| Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), value);
         let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) };
         let iid = |value: Value| value.entity_id().unwrap().iid();
-        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::I64(7)))), &[]), Some([iid(Value::I64(7))].into()));
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::I64(7)))), rtdb_expr::Parameters::Values(&[])), Some([iid(Value::I64(7))].into()));
         let either = Expr::binary(rtdb_plan::BinaryOp::Or, equals(Expr::Literal(Value::I64(7))), Expr::binary(rtdb_plan::BinaryOp::Eq, parameter.clone(), id.expression()));
-        assert_eq!(id_selection(&scan(either.clone()), &[Value::Utf8("seven".into())]), Some([iid(Value::I64(7)), iid(Value::Utf8("seven".into()))].into()));
-        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::F64(7.0)))), &[]), None, "7.0 still matches the integer ID 7");
-        assert_eq!(id_selection(&scan(either), &[Value::Null]), None);
+        assert_eq!(id_selection(&scan(either.clone()), rtdb_expr::Parameters::Values(&[Value::Utf8("seven".into())])), Some([iid(Value::I64(7)), iid(Value::Utf8("seven".into()))].into()));
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::F64(7.0)))), rtdb_expr::Parameters::Values(&[])), None, "7.0 still matches the integer ID 7");
+        assert_eq!(id_selection(&scan(either), rtdb_expr::Parameters::Values(&[Value::Null])), None);
         let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
-        assert_eq!(id_selection(&scan(range), &[]), None);
+        assert_eq!(id_selection(&scan(range), rtdb_expr::Parameters::Values(&[])), None);
+    }
+
+    #[test]
+    fn keyword_id_equality_includes_both_persisted_digests() {
+        let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::Keyword) };
+        let literal = Expr::Literal(Value::Keyword(rtdb_types::Keyword::from_name("solo")));
+        let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
+        let scan = Scan { table, columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates: vec![Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), literal)],
+            top_k: None, ordered_top_k: None, matches: Vec::new() };
+        let canonical: Iid = "e5c907a6fac1f49cb3f8599a43a7cbf9".parse().unwrap();
+        let legacy: Iid = "cf1a1098ce21209264ea9942c920ee6a".parse().unwrap();
+        assert_eq!(id_selection(&scan, rtdb_expr::Parameters::Values(&[])), Some([canonical, legacy].into()));
+
+        let field = arrow_schema::Field::new("?_0", DataType::Utf8, false)
+            .with_metadata([(rtdb_columnar::EXTENSION_NAME_KEY.into(), "xt/clj-keyword".into())].into());
+        let array = arrow_array::StringArray::from(vec!["solo"]);
+        let cell = rtdb_expr::ArrowParameterCell { field: &field, array: &array, row: 0 };
+        assert_eq!(arrow_parameter_iids(cell), Some((legacy, Some(canonical))));
+    }
+
+    #[test]
+    fn id_range_predicates_confine_a_scan_of_uuid_ids_to_an_inclusive_iid_interval() {
+        let uuid_type = LogicalType::Scalar(ScalarType::Uuid);
+        let field = |data_type: &LogicalType| Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: data_type.clone() };
+        let other = Field { id: ColumnId(1), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+        let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
+        let scan = |id_type: &LogicalType, predicates: Vec<Expr>| Scan { table: table.clone(), columns: vec![field(id_type), other.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates, top_k: None, ordered_top_k: None, matches: Vec::new() };
+        let id = field(&uuid_type).expression();
+        let at = |value: u128| Expr::Literal(Value::Uuid(value.to_be_bytes()));
+        let compare = |op, value: u128| Expr::binary(op, id.clone(), at(value));
+        let range = |lower: u128, upper: u128| Ok(Some((Iid(lower.to_be_bytes()), Iid(upper.to_be_bytes()))));
+        let interval = |predicates: Vec<Expr>| id_interval(&scan(&uuid_type, predicates), rtdb_expr::Parameters::Values(&[]));
+        use rtdb_plan::BinaryOp::{And, Eq, Gt, GtEq, Lt, LtEq, Or};
+
+        assert_eq!(interval(vec![compare(GtEq, 10), compare(LtEq, 20)]), range(10, 20));
+        assert_eq!(interval(vec![compare(Gt, 10), compare(Lt, 20)]), range(11, 19), "strict bounds exclude the bound itself");
+        assert_eq!(interval(vec![Expr::binary(And, compare(GtEq, 10), compare(Lt, 20))]), range(10, 19), "conjuncts of one predicate");
+        assert_eq!(interval(vec![compare(GtEq, 10)]), range(10, u128::MAX));
+        assert_eq!(interval(vec![compare(Lt, 20)]), range(0, 19));
+        assert_eq!(interval(vec![Expr::binary(Lt, at(10), id.clone()), Expr::binary(GtEq, at(20), id.clone())]), range(11, 20), "the bound on the left reverses the comparison");
+        assert_eq!(interval(vec![Expr::between(id.clone(), at(10), at(20), false)]), range(10, 20));
+        assert_eq!(interval(vec![compare(GtEq, 10), compare(GtEq, 15), compare(LtEq, 30), compare(Lt, 20)]), range(15, 19), "the tightest bounds win");
+        assert_eq!(interval(vec![compare(GtEq, 10), Expr::binary(Eq, other.expression(), Expr::Literal(Value::I64(1)))]), range(10, u128::MAX), "other columns' conjuncts leave the interval alone");
+
+        let parameter = |index| Expr::Parameter { index, data_type: uuid_type.clone() };
+        let bound = scan(&uuid_type, vec![Expr::binary(GtEq, id.clone(), parameter(0)), Expr::binary(Lt, id.clone(), parameter(1))]);
+        assert_eq!(id_interval(&bound, rtdb_expr::Parameters::Values(&[Value::Uuid(10u128.to_be_bytes()), Value::Uuid(20u128.to_be_bytes())])), range(10, 19));
+        assert_eq!(id_interval(&bound, rtdb_expr::Parameters::Values(&[Value::Uuid(10u128.to_be_bytes()), Value::Null])), range(10, u128::MAX), "a bound that is no UUID confines nothing");
+        assert_eq!(id_interval(&bound, rtdb_expr::Parameters::Values(&[Value::Utf8("a".into()), Value::I64(7)])), Ok(None));
+
+        let typed = |text: &str| Expr::Cast { expr: Box::new(Expr::Literal(Value::Utf8(text.into()))), target: rtdb_plan::CastTarget::Fixed(uuid_type.clone()) };
+        assert_eq!(interval(vec![Expr::binary(GtEq, id.clone(), typed("00000000-0000-0000-0000-00000000000a")), Expr::binary(Lt, id.clone(), typed("00000000-0000-0000-0000-000000000014"))]), range(10, 19), "UUID '...' is a cast of its text");
+        assert_eq!(interval(vec![Expr::binary(GtEq, id.clone(), typed("not a uuid"))]), Ok(None));
+        assert_eq!(id_selection(&scan(&uuid_type, vec![Expr::binary(Eq, id.clone(), typed("00000000-0000-0000-0000-00000000000a"))]), rtdb_expr::Parameters::Values(&[])), Some([Iid(10u128.to_be_bytes())].into()));
+
+        assert_eq!(interval(vec![compare(GtEq, 21), compare(LtEq, 20)]), Err(Unsatisfiable));
+        assert_eq!(interval(vec![compare(GtEq, 20), compare(LtEq, 20)]), range(20, 20));
+        assert_eq!(interval(vec![compare(Gt, u128::MAX)]), Err(Unsatisfiable));
+        assert_eq!(interval(vec![compare(Lt, 0)]), Err(Unsatisfiable));
+        assert_eq!(interval(vec![compare(GtEq, 0), compare(LtEq, u128::MAX)]), Ok(None), "every IID is no confinement");
+        assert_eq!(interval(vec![Expr::binary(Or, compare(GtEq, 10), compare(LtEq, 5))]), Ok(None), "a disjunction is not an interval");
+        assert_eq!(interval(vec![Expr::between(id.clone(), at(20), at(10), true)]), Ok(None), "a symmetric BETWEEN orders its own bounds");
+        assert_eq!(interval(vec![Expr::unary(UnaryOp::Not, compare(GtEq, 10))]), Ok(None));
+
+        // An ID of any other type is hashed into its IID, so its order says nothing about the IID's.
+        for id_type in [LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(ScalarType::I64), LogicalType::join_all(&[uuid_type.clone(), LogicalType::Scalar(ScalarType::Utf8)])] {
+            let id = field(&id_type).expression();
+            assert_eq!(id_interval(&scan(&id_type, vec![Expr::binary(GtEq, id, at(10))]), rtdb_expr::Parameters::Values(&[])), Ok(None), "{id_type:?}");
+        }
+
+        assert_eq!(intersect(Some((Iid([1; 16]), Iid([5; 16]))), Some((Iid([3; 16]), Iid([9; 16])))), Ok(Some((Iid([3; 16]), Iid([5; 16])))));
+        assert_eq!(intersect(Some((Iid([1; 16]), Iid([2; 16]))), Some((Iid([3; 16]), Iid([9; 16])))), Err(Unsatisfiable));
+        assert_eq!(intersect(None, Some((Iid([3; 16]), Iid([9; 16])))), Ok(Some((Iid([3; 16]), Iid([9; 16])))));
+        assert_eq!(intersect(None, None), Ok(None));
     }
 
     fn live_table() -> (PartitionState, TableRef, Vec<StoredEvent>) {
+        live_table_with_values((1..=3).map(Value::I64))
+    }
+
+    fn live_table_with_values(values: impl IntoIterator<Item = Value>) -> (PartitionState, TableRef, Vec<StoredEvent>) {
         let state = PartitionState::empty(TrieConfig::new(1, 1).unwrap()).unwrap();
         let table = TableRef::new("public", "docs");
         let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
         let memory = MemoryBudget::new(1 << 20);
         let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
-        let events = [0x00, 0x40, 0x80].into_iter().enumerate().map(|(index, prefix)| {
-            let value = Value::I64(index as i64 + 1);
+        let events = [0x00, 0x40, 0x80].into_iter().zip(values).enumerate().map(|(index, (prefix, value))| {
             StoredEvent {
+                commit_position: 0,
+                entity_key: None,
                 iid: Iid([prefix; 16]),
                 system_from: key.system_time,
                 valid_time: Interval::ALL,
-                operation: StoredOperation::Put(StructFields::from([("_id".into(), value.clone()), ("v".into(), value)])),
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(index as i64 + 1)), ("v".into(), value)])),
                 recency: None,
             }
         }).collect::<Vec<_>>();
@@ -1155,6 +1801,84 @@ mod tests {
             outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
         };
         (scan, execution, memory)
+    }
+
+    #[tokio::test]
+    async fn owned_position_points_and_windows_hide_only_the_selected_commit_suffix() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
+        let table = relation.table("alice");
+        let id = EntityId::Integer(1);
+        let memory = MemoryBudget::new(1 << 24);
+        let store = Arc::new(MemoryStore::default());
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        for (tx_id, time, start, values) in [
+            (0, 90, 0, &[1][..]),
+            (1, 100, 10, &[2, 3][..]),
+            (2, 110, 20, &[4][..]),
+        ] {
+            let key = TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(time) };
+            let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+            if values.len() > 1 { write.retain_owned_positions().unwrap(); }
+            for &value in values {
+                write.append(table.clone(), StoredEvent {
+                    commit_position: 0,
+                    entity_key: Some(id.handle_bytes().into()),
+                    iid: id.iid(),
+                    system_from: key.system_time,
+                    valid_time: Interval::from_micros(start, 30).unwrap(),
+                    operation: StoredOperation::Put(StructFields::from([
+                        ("_id".into(), Value::I64(1)),
+                        ("v".into(), Value::I64(value)),
+                    ])),
+                    recency: None,
+                }).unwrap();
+            }
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        let snapshot = state.value().snapshot().with_system_time_cap(Some(Timestamp(110))).unwrap();
+        let database = DatabaseSnapshot { partitions: vec![snapshot], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, memory, Timestamp(110), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        for (system, valid, first_masked, expected) in [
+            (100, 15, 3, 3),
+            (100, 15, 2, 2),
+            (100, 15, 0, 1),
+            (110, 15, 2, 2),
+            (110, 25, 2, 4),
+        ] {
+            let mut result = crate::open_owned_point_with_position_mask(
+                Arc::clone(&context), "alice", &relation, &id,
+                Interval::at(Timestamp(valid)).unwrap(), Timestamp(system), (Timestamp(100), first_masked),
+            ).await.unwrap().unwrap();
+            let batch = result.next_batch().await.unwrap().unwrap();
+            let batch = batch.batch();
+            let (column, field) = batch.schema_ref().column_with_name("v").unwrap();
+            assert_eq!(rtdb_columnar::read_value(field, batch.column(column).as_ref(), 0).unwrap(), Value::I64(expected));
+            assert!(result.next_batch().await.unwrap().is_none());
+        }
+        for (system, expected) in [
+            (100, vec![(5, 10, 1), (10, 28, 2)]),
+            (110, vec![(5, 10, 1), (10, 20, 2), (20, 28, 4)]),
+        ] {
+            let mut result = crate::open_owned_valid_during_with_position_mask(
+                Arc::clone(&context), "alice", &relation, &id,
+                Interval::from_micros(5, 28).unwrap(), Timestamp(system), (Timestamp(100), 2),
+            ).await.unwrap().unwrap();
+            let mut slices = Vec::new();
+            while let Some(page) = result.next_batch().await.unwrap() {
+                let page = page.batch();
+                let timestamp = |name: &str| page.column_by_name(name).unwrap().as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+                let (column, field) = page.schema_ref().column_with_name("v").unwrap();
+                for row in 0..page.num_rows() {
+                    let Value::I64(value) = rtdb_columnar::read_value(field, page.column(column).as_ref(), row).unwrap()
+                    else { panic!("Expected the winning fact value"); };
+                    slices.push((timestamp("_valid_from").value(row), timestamp("_valid_to").value(row), value));
+                }
+            }
+            assert_eq!(slices, expected);
+        }
     }
 
     async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>, persisted: Option<usize>) {
@@ -1278,7 +2002,7 @@ mod tests {
             let partition = cursor.front_partition_mut().unwrap();
             partition.initialize().await.unwrap();
             let plan_memory = MemoryBudget::new(memory.limit_bytes());
-            let plan = ScanTaskPlan::new(partition.pages.entries.iter().map(|page| PageRange { lower: page.lower, upper: page.upper }), &plan_memory).unwrap();
+            let plan = ScanTaskPlan::new(partition.pages.entries.iter().map(|page| PageRange { lower: page.lower, upper: page.upper }), false, &plan_memory).unwrap();
             assert_eq!(memory.used_bytes(), cursor_open + file_extent + replacement_extent + plan_memory.used_bytes());
             drop(plan);
             drop(partition.tasks.take().unwrap());
@@ -1359,6 +2083,1044 @@ mod tests {
         store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
         (state, table, events, store, metadata_charge)
+    }
+
+    #[tokio::test]
+    async fn cold_sparse_projection_keeps_fixed_size_lists_in_arrow() {
+        let values = (1..=3).map(|n| Value::Struct(StructFields::from([
+            ("set".into(), Value::Set(vec![Value::I64(n)])),
+            ("pair".into(), Value::FixedSizeList(vec![Value::I64(n), Value::I64(-n)].into())),
+        ]))).collect::<Vec<_>>();
+        let (state, table, events) = live_table_with_values(values.clone());
+        let captured = state.value();
+        let table_entry = captured.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(captured.live().block_index()).unwrap();
+        let put_fields = captured.live().tables()[&table].column_types().clone();
+        let page = build_event_batch(&events, Some(put_fields), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, false);
+        metadata.write_leaf(&page).unwrap();
+        let (metadata, statistics) = metadata.finish().unwrap();
+        let data = write_file(page.schema().as_ref(), &[page]).unwrap();
+        let addition = CatalogTrie::notification(trie.clone(), data.len() as i64, Some(statistics)).unwrap();
+        let store = Arc::new(MemoryStore::default());
+        store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
+        let nascent = CatalogTrie::notification("l01-r20200101-b00".parse().unwrap(), 0, None).unwrap();
+        state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
+        let (mut scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, Arc::new(BufferPool::new(store, 1 << 20)));
+        scan.iids = Some([events[0].iid, events[2].iid].into());
+        let logical = scan.columns[0].data_type.clone();
+        let field = rtdb_columnar::to_field("v", &logical).unwrap();
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+
+        let batch = cursor.next_batch().await.unwrap().unwrap();
+        let selected = &batch.columns[0];
+        assert!(matches!(selected, crate::columnar::Column::Selected(_)));
+        let (result, _scratch) = crate::columnar::relayout_output(selected, &logical, &field, &memory).unwrap().unwrap();
+
+        assert_eq!(result.len(), 2);
+        let structs = result.as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+        assert!(structs.column(0).as_any().is::<arrow_array::ListArray>());
+        assert!(structs.column(1).as_any().is::<arrow_array::FixedSizeListArray>());
+        for (row, expected) in [&values[0], &values[2]].into_iter().enumerate() {
+            assert_eq!(rtdb_columnar::read_value(&field, result.as_ref(), row).unwrap(), *expected);
+        }
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        let counts = cursor.scan_counts().unwrap();
+        assert_eq!((counts.files_used, counts.pages_used, counts.rows_read), (1, 1, 3));
+    }
+
+    #[tokio::test]
+    async fn a_cold_point_scan_returns_arrow_after_reading_the_selected_page() {
+        use std::ops::Range;
+        use rtdb_storage::{Result as StorageResult, StoredObject};
+
+        struct ScanStore {
+            inner: Arc<MemoryStore>,
+            data: ObjectKey,
+            ranged: bool,
+            reads: std::sync::Mutex<Vec<Range<u64>>>,
+        }
+        #[async_trait]
+        impl ObjectStore for ScanStore {
+            fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { key != &self.data || self.ranged }
+            async fn head(&self, key: &ObjectKey) -> StorageResult<StoredObject> { self.inner.head(key).await }
+            async fn get(&self, key: &ObjectKey) -> StorageResult<Bytes> { self.get_range(key, 0..self.head(key).await?.size).await }
+            async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> StorageResult<Bytes> {
+                if key == &self.data { self.reads.lock().unwrap().push(range.clone()); }
+                self.inner.get_range(key, range).await
+            }
+            async fn put(&self, key: &ObjectKey, bytes: Bytes) -> StorageResult<()> { self.inner.put(key, bytes).await }
+            async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> StorageResult<()> { self.inner.put_file(key, path).await }
+            async fn list(&self, directory: Option<&ObjectKey>) -> StorageResult<Vec<StoredObject>> { self.inner.list(directory).await }
+            async fn delete(&self, key: &ObjectKey) -> StorageResult<()> { self.inner.delete(key).await }
+        }
+
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let data = store.list(None).await.unwrap().into_iter()
+            .find(|object| object.key.as_str().contains("/data/")).unwrap().key;
+        let bytes = store.get(&data).await.unwrap();
+        let tail = bytes.len() - 10;
+        let footer = tail - arrow_ipc::reader::read_footer_length(bytes[tail..].try_into().unwrap()).unwrap();
+        let decoder = PageDecoder::from_footer(&bytes[footer..tail], footer as u64, None).unwrap();
+        for ranged in [true, false] {
+            let store = Arc::new(ScanStore { inner: Arc::clone(&store), data: data.clone(), ranged, reads: Default::default() });
+            let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+            let (mut scan, execution, _) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
+            scan.iids = Some([events[1].iid].into());
+            let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+                panic!("Expected a projected Arrow column");
+            };
+            let values = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            assert_eq!(values.values().as_ref(), &[2]);
+            assert_eq!(page.len, 1);
+            assert!(cursor.next_batch().await.unwrap().is_none());
+
+            let expected = if ranged {
+                vec![tail as u64..bytes.len() as u64, footer as u64..tail as u64, decoder.page_range(1).unwrap()]
+            } else {
+                vec![0..bytes.len() as u64]
+            };
+            assert_eq!(*store.reads.lock().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn stacked_filters_and_limit_keep_cold_scan_vectors() {
+        use rtdb_plan::{BinaryOp, NamedExpr, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut output = scan.columns[0].clone();
+        let expression = output.expression();
+        output.id = ColumnId(10);
+        output.name = "payload".into();
+        let relation = Arc::new(Relation::scan(scan).unwrap());
+        let relation = Arc::new(relation.project(vec![NamedExpr { field: output.clone(), expr: expression }]).unwrap());
+        let integer = |n| Expr::Literal(Value::I64(n));
+        let relation = Arc::new(relation.filter(Expr::binary(BinaryOp::Gt, output.expression(), integer(0))).unwrap());
+        let relation = Arc::new(relation.filter(Expr::binary(BinaryOp::Lt, output.expression(), integer(4))).unwrap());
+        let relation = Arc::new(relation.limit(Some(integer(1)), Some(integer(1))).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected a batch cursor");
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+            panic!("Expected the cold scan payload to stay in Arrow");
+        };
+        let values = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[2]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn computed_sort_key_keeps_payload_columns_through_arrow_spill() {
+        use rtdb_plan::{BinaryOp, Relation, SortExpr};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let context = Arc::get_mut(&mut execution.context).unwrap();
+        context.options.sort_memory_bytes = 1;
+        context.options.batch_rows = 1;
+        let value = scan.columns[0].expression();
+        let sort_key = |expr| SortExpr { expr, descending: false, nulls_first: false };
+        let key = sort_key(Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), value.clone()));
+        let first = sort_key(Expr::binary(BinaryOp::Subtract, value.clone(), value.clone()));
+        let relation = Arc::new(Relation::scan(scan).unwrap());
+        for order in [vec![key.clone()], vec![first, key, sort_key(value)]] {
+            let relation = Arc::new(Arc::clone(&relation).sort(order).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a batch sort");
+            let mut values = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+                    panic!("Expected only the selected Arrow payload");
+                };
+                let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                values.extend(array.values().iter().copied());
+            }
+            assert_eq!(values, [3, 2, 1]);
+        }
+        assert!(execution.context.spill_peak_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn columnar_sort_limit_opens_aggregate_input_before_evaluating_fetch() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, Relation, RelationNode, Schema, SortExpr};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (mut scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        scan.valid_time = TemporalFilter::At(Expr::Literal(Value::Utf8("invalid instant".into())));
+        execution.parameters = Arc::new(BoundParameters::infer(vec![Value::Utf8("invalid fetch".into())], &memory).unwrap());
+        let field = Field { id: ColumnId(10), name: "n".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        let key = field.expression();
+        let schema = Schema::new(vec![field.clone()]).unwrap();
+        let input = Arc::new(Relation::scan(scan).unwrap());
+        let input = Arc::new(Relation::new(schema.clone(), RelationNode::Aggregate {
+            input, groups: vec![], aggregates: vec![AggregateExpr {
+                field, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![],
+            }],
+        }).unwrap());
+        let relation = Arc::new(Relation::new(schema, RelationNode::SortLimit {
+            input, order_by: vec![SortExpr { expr: key, descending: false, nulls_first: false }],
+            offset: None, fetch: Some(Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64) }),
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, execution.parameters.types(), &memory).unwrap();
+        let row = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.err().unwrap();
+        let columnar = crate::operators::build_columns(runtime, execution).await.err().unwrap();
+        assert_ne!(row.code, "xtdb/expected-number");
+        assert_eq!(columnar.code, row.code);
+    }
+
+    #[tokio::test]
+    async fn columnar_zero_fetch_with_offset_still_evaluates_the_order_key() {
+        use rtdb_plan::{BinaryOp, Relation, RelationNode, SortExpr};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let column = scan.columns[0].expression();
+        let zero = Expr::binary(BinaryOp::Subtract, column.clone(), column);
+        let key = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), zero);
+        let input = Arc::new(Relation::scan(scan).unwrap());
+        let root = Arc::new(Relation::new(input.schema().clone(), RelationNode::SortLimit {
+            input, order_by: vec![SortExpr { expr: key, descending: false, nulls_first: false }],
+            offset: Some(Expr::Literal(Value::I64(1))), fetch: Some(Expr::Literal(Value::I64(0))),
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(root, &execution.context.catalog, &[], &memory).unwrap();
+        let mut row = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columnar = crate::operators::build_columns(runtime, execution).await.unwrap().unwrap();
+        let error = row.next_page().await.err().unwrap();
+        assert_eq!(columnar.next_batch().await.err().unwrap().code, error.code);
+    }
+
+    #[tokio::test]
+    async fn multi_column_distinct_and_set_operations_select_arrow_rows() {
+        use rtdb_plan::{BinaryOp, NamedExpr, Relation, RelationNode, SetOperator};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let first = scan.columns[0].clone();
+        let mut second = first.clone();
+        second.id = ColumnId(10);
+        second.name = "again".into();
+        let project = Arc::new(Arc::new(Relation::scan(scan).unwrap()).project(vec![
+            NamedExpr { field: first.clone(), expr: first.expression() },
+            NamedExpr { field: second, expr: first.expression() },
+        ]).unwrap());
+        let set = |left: Arc<Relation>, right, operator, all| {
+            Arc::new(Relation::new(left.schema().clone(), RelationNode::Set { left, right, operator, all }).unwrap())
+        };
+        let repeated = set(Arc::clone(&project), Arc::clone(&project), SetOperator::Union, true);
+        let right = Arc::new(Arc::clone(&project).filter(Expr::binary(BinaryOp::Eq, first.expression(), Expr::Literal(Value::I64(2)))).unwrap());
+        let distinct = Arc::new(Relation::new(repeated.schema().clone(), RelationNode::Distinct { input: Arc::clone(&repeated) }).unwrap());
+        for (relation, expected) in [
+            (distinct, vec![1, 2, 3]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Union, false), vec![1, 2, 3]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Intersect, true), vec![2]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Except, true), vec![1, 3, 1, 2, 3]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Except, false), vec![1, 3]),
+        ] {
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a set batch cursor");
+            let mut actual = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                let [crate::columnar::Column::Arrow { array: first, .. }, crate::columnar::Column::Arrow { array: second, .. }] = page.columns.as_slice() else {
+                    panic!("Expected the set output to retain Arrow columns");
+                };
+                let first = first.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                let second = second.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                assert_eq!(first.values(), second.values());
+                actual.extend(first.values().iter().copied());
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn inner_equi_join_of_cold_pages_keeps_multiple_key_columns_in_arrow() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (mut left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let id = Field { id: ColumnId(1), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        left.columns.push(id);
+        let mut right = left.clone();
+        for field in &mut right.columns { field.id.0 += 10; }
+        let key = |index: usize| Expr::binary(BinaryOp::Eq, left.columns[index].expression(), right.columns[index].expression());
+        let condition = Expr::binary(BinaryOp::And, key(0), key(1));
+        let relation = Arc::new(Relation::join(Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+            JoinKind::Inner, Some(condition)).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow equijoin execution");
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+            for row in 0..batch.len {
+                rows.push(batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(rows, (1..=3).map(|value| vec![Value::I64(value); 4]).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn equijoin_spill_replays_arrow_partitions_in_the_original_order() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        for spill_limit in [8192, 1] {
+            let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+            let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
+            let context = Arc::get_mut(&mut execution.context).unwrap();
+            context.options.join_build_rows = 1;
+            context.spill = Arc::new(crate::spill::SpillRegion::new(spill_limit).unwrap());
+            let mut right = left.clone();
+            right.columns[0].id = ColumnId(10);
+            let condition = Expr::binary(BinaryOp::Eq, left.columns[0].expression(), right.columns[0].expression());
+            let relation = Arc::new(Relation::join(
+                Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+                JoinKind::Inner, Some(condition),
+            ).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            if spill_limit == 1 {
+                let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow join");
+                assert_eq!(cursor.next_batch().await.err().unwrap().code, "rtdb.query/spill-limit");
+                assert_eq!(execution.context.spill_bytes(), 0);
+                continue;
+            }
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut expected = Vec::new();
+            while let Some(page) = baseline.next_page().await.unwrap() {
+                expected.extend(page.rows().iter().map(|row| row.values.clone()));
+            }
+            drop(baseline);
+            assert_eq!(execution.context.spill_bytes(), 0);
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
+            let mut actual = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+                actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 3);
+            assert!(execution.context.spill_peak_bytes() > 0);
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn spilled_full_and_right_joins_keep_unmatched_arrow_positions() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        for kind in [JoinKind::Full, JoinKind::Right] {
+            let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+            let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
+            let context = Arc::get_mut(&mut execution.context).unwrap();
+            context.options.join_build_rows = 1;
+            let mut right = left.clone();
+            right.columns[0].id = ColumnId(10);
+            let key = Expr::binary(BinaryOp::Add, left.columns[0].expression(), Expr::Literal(Value::I64(1)));
+            let condition = Expr::binary(BinaryOp::Eq, key, right.columns[0].expression());
+            let relation = Arc::new(Relation::join(
+                Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), kind, Some(condition),
+            ).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut expected = Vec::new();
+            while let Some(page) = baseline.next_page().await.unwrap() { expected.extend(page.rows().iter().map(|row| row.values.clone())); }
+            drop(baseline);
+            let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow spill");
+            let mut actual = Vec::new();
+            while let Some(batch) = columns.next_batch().await.unwrap() {
+                assert!(execution.context.spill_bytes() > 0);
+                assert!(batch.columns.iter().any(|column| !matches!(column, crate::columnar::Column::Values(_))));
+                actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), if kind == JoinKind::Full { 4 } else { 3 });
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn computed_projection_keeps_cold_scan_payloads_and_list_children_in_arrow() {
+        use rtdb_plan::{NamedExpr, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 1;
+        let value = scan.columns[0].clone();
+        let pair = Expr::List(vec![value.expression(), value.expression()]);
+        let remainder = Expr::Call {
+            name: "mod".into(), args: vec![value.expression(), Expr::Literal(Value::I64(2))],
+            return_type: LogicalType::Scalar(ScalarType::I64),
+        };
+        assert!(!crate::columnar::projection::shaped(&remainder));
+        let named = |id, name: &str, expr: Expr| NamedExpr {
+            field: Field { id: ColumnId(id), name: name.into(), data_type: expr.data_type(), ..value.clone() },
+            expr,
+        };
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let relation = Arc::new(scan.project(vec![
+            named(1, "source", value.expression()), named(2, "pair", pair), named(3, "remainder", remainder),
+        ]).unwrap());
+        let prepared = crate::PreparedQuery::new(Arc::clone(&relation)).unwrap();
+        let mut output = prepared.execute_columns(Arc::clone(&execution.context), vec![]).await.unwrap();
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected columnar projection");
+        let mut observed = 0;
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[1] else { panic!("Expected an Arrow list"); };
+            assert!(array.as_any().is::<arrow_array::ListArray>());
+            let page = baseline.next_page().await.unwrap().unwrap();
+            assert_eq!(page.len(), batch.len);
+            for (row, expected) in page.rows().iter().enumerate() {
+                let actual = batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>();
+                assert_eq!(actual, expected.values);
+                observed += 1;
+            }
+        }
+        assert_eq!(observed, 3);
+        assert!(baseline.next_page().await.unwrap().is_none());
+        for _ in 0..observed {
+            assert_eq!(output.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+        }
+        assert!(output.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn semi_and_anti_joins_pick_probe_vectors_once_per_row() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _) = live_table_with_values(vec![
+            Value::I64(1), Value::I64(1), Value::Null,
+        ]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut right = left.clone();
+        right.columns[0].id = ColumnId(10);
+        let left_value = left.columns[0].expression();
+        let right_value = right.columns[0].expression();
+        right.predicates.push(Expr::binary(BinaryOp::Eq, right_value.clone(), Expr::Literal(Value::I64(1))));
+        let condition = Expr::binary(BinaryOp::Eq, left_value, right_value);
+        let left = Arc::new(Relation::scan(left).unwrap());
+        let right = Arc::new(Relation::scan(right).unwrap());
+        for kind in [JoinKind::Semi, JoinKind::Anti] {
+            let relation = Arc::new(Relation::join(Arc::clone(&left), Arc::clone(&right), kind, Some(condition.clone())).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut expected = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
+            let mut actual = Vec::new();
+            let mut baseline = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert!(matches!(batch.columns.as_slice(), [crate::columnar::Column::Arrow { .. } | crate::columnar::Column::Selected(_)]));
+                actual.extend((0..batch.len).map(|row| batch.columns[0].value(row).unwrap()));
+            }
+            while let Some(page) = expected.next_page().await.unwrap() {
+                baseline.extend(page.rows().iter().map(|row| row.values[0].clone()));
+            }
+            assert_eq!(actual, baseline);
+            let values = match kind { JoinKind::Semi => vec![Value::I64(1); 2], _ => vec![Value::Null] };
+            assert_eq!(actual, values);
+        }
+    }
+
+    #[tokio::test]
+    async fn computed_join_with_a_residual_expression_keeps_arrow_payloads() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(2), Value::I64(3), Value::Null]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut right = left.clone();
+        right.columns[0].id = ColumnId(10);
+        let left_value = left.columns[0].expression();
+        let right_value = right.columns[0].expression();
+        let key = Expr::binary(BinaryOp::Add, left_value.clone(), Expr::Literal(Value::I64(1)));
+        let equality = Expr::binary(BinaryOp::Eq, key, right_value.clone());
+        let residual = Expr::binary(BinaryOp::Lt,
+            Expr::binary(BinaryOp::Add, left_value, Expr::Literal(Value::I64(0))), right_value);
+        let relation = Arc::new(Relation::join(
+            Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+            JoinKind::Inner, Some(Expr::binary(BinaryOp::And, equality, residual)),
+        ).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow join");
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        while let Some(page) = rows.next_page().await.unwrap() {
+            expected.extend(page.rows().iter().map(|row| row.values.clone()));
+        }
+        while let Some(page) = columns.next_batch().await.unwrap() {
+            assert_eq!(page.columns.len(), 2);
+            assert!(page.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+            actual.extend((0..page.len).map(|row| page.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ordered_list_and_percentile_aggregates_select_arrow_positions() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, NamedExpr, PercentileFraction, PercentileKind, Relation, RelationNode, Schema, SetOperator, SortExpr};
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(3), Value::I64(2)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let expression = scan.columns[0].expression();
+        let value_field = scan.columns[0].clone();
+        let mut order = value_field.clone();
+        order.id = ColumnId(8);
+        order.name = "order_key".into();
+        order.data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().clone();
+        let tail = Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+            rows: vec![vec![Expr::Literal(Value::I64(2))], vec![Expr::Literal(Value::Null)]],
+        }).unwrap());
+        let joined = Arc::new(Relation::new(schema, RelationNode::Set { left: scan, right: tail, operator: SetOperator::Union, all: true }).unwrap());
+        let input = Arc::new(joined.project(vec![
+            NamedExpr { field: value_field.clone(), expr: expression.clone() },
+            NamedExpr { field: order.clone(), expr: Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), expression.clone()) },
+        ]).unwrap());
+        let mut field = value_field;
+        field.id = ColumnId(9);
+        field.name = "collected".into();
+        field.data_type = LogicalType::list(expression.data_type()).maybe();
+        let mut discrete = field.clone();
+        discrete.id = ColumnId(10);
+        discrete.name = "discrete".into();
+        discrete.data_type = expression.data_type().maybe();
+        let mut continuous = discrete.clone();
+        continuous.id = ColumnId(11);
+        continuous.name = "continuous".into();
+        continuous.data_type = LogicalType::Scalar(ScalarType::F64).maybe();
+        let percentile = |field: rtdb_plan::Field, kind| AggregateExpr { field, function: AggregateFunction::Percentile {
+            kind, fraction: PercentileFraction::Literal(0.75), descending: false,
+        }, argument: Some(expression.clone()), distinct: false, filter: None, order_by: vec![] };
+        let relation = Arc::new(Relation::new(Schema::new(vec![field.clone(), discrete.clone(), continuous.clone()]).unwrap(), RelationNode::Aggregate {
+            input, groups: vec![],
+            aggregates: vec![AggregateExpr {
+                field, function: AggregateFunction::ArrayAgg, argument: Some(expression.clone()),
+                distinct: true, filter: Some(Expr::binary(BinaryOp::Gt, expression.clone(), Expr::Literal(Value::I64(1)))),
+                order_by: vec![SortExpr { expr: order.expression(), descending: false, nulls_first: false }],
+            }, percentile(discrete, PercentileKind::Discrete), percentile(continuous, PercentileKind::Continuous)],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow aggregate");
+        let page = columns.next_batch().await.unwrap().unwrap();
+        assert!(page.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+        let actual = page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>();
+        assert_eq!(actual, [Value::List(vec![Value::I64(3), Value::I64(2)]), Value::I64(2), Value::F64(2.25)]);
+        assert_eq!(actual, rows.next_page().await.unwrap().unwrap().rows()[0].values);
+        assert!(columns.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn limit_zero_leaves_the_arrow_membership_build_unopened() {
+        use rtdb_plan::{BinaryOp, Relation, RelationNode, Schema, TemporalFilter};
+        let (state, table, _) = live_table_with_values([Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (probe, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut build = probe.clone();
+        build.columns[0].id = ColumnId(10);
+        build.valid_time = TemporalFilter::At(Expr::Literal(Value::Bool(true)));
+        let comparison = Expr::binary(BinaryOp::Eq, probe.columns[0].expression(), build.columns[0].expression());
+        let input = Arc::new(Relation::scan(probe).unwrap());
+        let dependent = Arc::new(Relation::scan(build).unwrap());
+        let output = rtdb_plan::Field { id: ColumnId(11), name: "member".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::Bool).maybe() };
+        let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+        let mark = Arc::new(Relation::new(schema, RelationNode::Mark { input, dependent, arguments: vec![],
+            condition: None, comparison, output }).unwrap());
+        let relation = Arc::new(mark.limit(None, Some(Expr::Literal(Value::I64(0)))).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow membership");
+        assert!(rows.next_page().await.unwrap().is_none());
+        assert!(columns.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn uuid_groups_keep_their_first_arrow_key_positions() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, NamedExpr, Relation, RelationNode, Schema};
+        let one = Value::Uuid([1; 16]);
+        let two = Value::Uuid([2; 16]);
+        let (state, table, _) = live_table_with_values([two.clone(), one.clone(), two.clone()]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let key = scan.columns[0].clone();
+        let count = rtdb_plan::Field { id: ColumnId(8), name: "count".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+        let relation = Arc::new(Relation::new(Schema::new(vec![key.clone(), count.clone()]).unwrap(), RelationNode::Aggregate {
+            input: Arc::new(Relation::scan(scan).unwrap()), groups: vec![NamedExpr { field: key.clone(), expr: key.expression() }],
+            aggregates: vec![AggregateExpr { field: count, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![] }],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut pages = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow grouping");
+        let batch = columns.next_batch().await.unwrap().unwrap();
+        assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+        let actual = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(actual, [vec![two, Value::I64(2)], vec![one, Value::I64(1)]]);
+        assert_eq!(actual, pages.next_page().await.unwrap().unwrap().rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_projected_arrow_join_fills_flight_transport_batches() {
+        use rtdb_plan::{BinaryOp, JoinKind, NamedExpr, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(1), Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 2;
+        let mut right = left.clone();
+        right.columns[0].id = ColumnId(10);
+        let field = left.columns[0].clone();
+        let equality = Expr::binary(BinaryOp::Eq, field.expression(), right.columns[0].expression());
+        let join = Arc::new(Relation::join(Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+            JoinKind::Inner, Some(equality)).unwrap());
+        let relation = Arc::new(join.project(vec![NamedExpr { expr: field.expression(), field }]).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
+        assert!(crate::operators::build_columns(runtime, execution.clone()).await.unwrap().is_some());
+        let prepared = crate::PreparedQuery::new(relation).unwrap();
+        let mut cursor = prepared.execute_columns(execution.context, vec![]).await.unwrap();
+        let mut batches = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() { batches.push(batch.batch().num_rows()); }
+        assert_eq!(batches, [2, 2, 2, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn columnar_literal_unions_fill_the_transport_batch_before_publishing_rows() {
+        use rtdb_plan::{NamedExpr, Relation, RelationNode, Schema, SetOperator};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 2;
+        let field = scan.columns[0].clone();
+        let schema = Schema::new(vec![field.clone()]).unwrap();
+        let values = |value| Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+            rows: vec![vec![Expr::Literal(Value::I64(value))]],
+        }).unwrap());
+        let union = |right| Arc::new(Relation::new(schema.clone(), RelationNode::Set {
+            left: values(7), right, operator: SetOperator::Union, all: true,
+        }).unwrap());
+        let success = crate::PreparedQuery::new(union(values(8))).unwrap();
+        let mut batches = success.execute_columns(Arc::clone(&execution.context), vec![]).await.unwrap();
+        let batch = batches.next_batch().await.unwrap().unwrap();
+        let values_out = batch.batch().column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(values_out.values().as_ref(), &[7, 8]);
+        assert!(batches.next_batch().await.unwrap().is_none());
+
+        let projection = Arc::new(values(0).project(vec![NamedExpr {
+            field: field.clone(), expr: Expr::Call {
+                name: "mod".into(), args: vec![Expr::Literal(Value::I64(5)), field.expression()],
+                return_type: field.data_type.clone(),
+            },
+        }]).unwrap());
+        let relation = union(projection);
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
+        assert!(crate::operators::build_columns(runtime, execution.clone()).await.unwrap().is_some());
+        let prepared = crate::PreparedQuery::new(relation).unwrap();
+        let mut rows = prepared.execute(Arc::clone(&execution.context), vec![]).await.unwrap();
+        let mut batches = prepared.execute_columns(execution.context, vec![]).await.unwrap();
+        let expected = rows.next_batch().await.err().expect("The second row fails before the first batch is published");
+        let actual = batches.next_batch().await.err().expect("The second row fails before the first batch is published");
+        assert_eq!(actual.code, expected.code);
+        assert!(batches.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn computed_scan_and_literal_rows_feed_a_struct_mutation_projection_as_vectors() {
+        use rtdb_plan::{NamedExpr, Relation, RelationNode, Schema};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let source = scan.columns[0].clone();
+        let named = |id, name: &str, expr: Expr| NamedExpr {
+            field: Field { id: ColumnId(id), name: name.into(), data_type: expr.data_type(), ..source.clone() },
+            expr,
+        };
+        let remainder = Expr::Call {
+            name: "mod".into(), args: vec![source.expression(), Expr::Literal(Value::I64(2))],
+            return_type: LogicalType::Scalar(ScalarType::I64),
+        };
+        let literal = Relation::new(Schema::new(vec![source.clone()]).unwrap(), RelationNode::Values {
+            rows: (1..=3).map(|value| vec![Expr::Literal(Value::I64(value))]).collect(),
+        }).unwrap();
+        for input in [Relation::scan(scan).unwrap(), literal] {
+            let projected = Arc::new(Arc::new(input).project(vec![
+                named(1, "source", source.expression()), named(2, "remainder", remainder.clone()),
+            ]).unwrap());
+            let iid = Expr::Call {
+                name: "_iid".into(), args: vec![projected.schema().fields()[0].expression()],
+                return_type: LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
+            };
+            let document = Expr::RowCopy(projected.schema().fields().to_vec());
+            let relation = Arc::new(projected.project(vec![named(3, "_iid", iid), named(4, "doc", document)]).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a columnar document projection");
+            let mut seen = 0;
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
+                let crate::columnar::Column::Arrow { array, .. } = &batch.columns[1] else { panic!("Expected an Arrow document"); };
+                let document = array.as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+                assert_eq!(document.num_columns(), 2);
+                assert!(document.columns().iter().all(|column| column.as_any().is::<arrow_array::Int64Array>()));
+                let page = baseline.next_page().await.unwrap().unwrap();
+                assert_eq!(page.len(), batch.len);
+                for (row, expected) in page.rows().iter().enumerate() {
+                    let actual = batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>();
+                    assert_eq!(actual, expected.values);
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, 3);
+            assert!(baseline.next_page().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_outer_joins_preserve_null_keys_unmatched_positions_and_empty_inputs() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(2), Value::Null]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        left.columns.push(Field { id: ColumnId(1), name: "_id".into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) });
+        let mut right = left.clone();
+        for field in &mut right.columns { field.id.0 += 10; }
+        let condition = Expr::binary(BinaryOp::Eq, left.columns[0].expression(), right.columns[0].expression());
+        left.predicates.push(Expr::binary(BinaryOp::NotEq, left.columns[1].expression(), Expr::Literal(Value::I64(2))));
+        right.predicates.push(Expr::binary(BinaryOp::NotEq, right.columns[1].expression(), Expr::Literal(Value::I64(1))));
+        for (kind, empty_side) in [
+            (JoinKind::Full, None), (JoinKind::Left, None), (JoinKind::Right, None), (JoinKind::Single, None),
+            (JoinKind::Full, Some(0)), (JoinKind::Full, Some(1)),
+        ] {
+            let (mut left, mut right) = (left.clone(), right.clone());
+            if let Some(side) = empty_side {
+                let input = if side == 0 { &mut left } else { &mut right };
+                input.predicates.push(Expr::Literal(Value::Bool(false)));
+            }
+            let plan = Arc::new(Relation::join(
+                Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), kind, Some(condition.clone()),
+            ).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
+            let mut expected = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
+            let mut actual = Vec::new();
+            let mut baseline = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+                actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+            }
+            while let Some(page) = expected.next_page().await.unwrap() {
+                baseline.extend(page.rows().iter().map(|row| row.values.clone()));
+            }
+            assert_eq!(actual, baseline, "{kind:?} with empty side {empty_side:?}");
+            assert!(!actual.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_single_join_detects_duplicate_matches_before_emitting_a_page() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut right = left.clone();
+        right.columns[0].id = ColumnId(10);
+        let condition = Expr::binary(BinaryOp::Eq, left.columns[0].expression(), right.columns[0].expression());
+        let plan = Arc::new(Relation::join(
+            Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), JoinKind::Single, Some(condition),
+        ).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected columnar join");
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, crate::cardinality_violation().code);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn outer_unnest_expands_list_positions_and_keeps_arrow_payloads() {
+        use rtdb_plan::{Relation, RelationNode, Schema};
+
+        let (state, table, _) = live_table_with_values(vec![
+            Value::List(vec![Value::I64(10), Value::I64(20)]),
+            Value::Null,
+            Value::List(vec![Value::I64(30)]),
+        ]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let expr = scan.columns[0].expression();
+        let mut element = scan.columns[0].clone();
+        element.id = ColumnId(10);
+        element.name = "element".into();
+        element.data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+        let mut ordinal = element.clone();
+        ordinal.id = ColumnId(11);
+        ordinal.name = "ordinal".into();
+        ordinal.data_type = LogicalType::Scalar(ScalarType::I32).maybe();
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().concat(&Schema::new(vec![element.clone(), ordinal.clone()]).unwrap()).unwrap();
+        let relation = Arc::new(Relation::new(schema, RelationNode::Unnest {
+            input: scan, expr, element, ordinality: Some(ordinal), outer: true,
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected a batch unnest");
+        let mut elements = Vec::new();
+        let mut ordinals = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            assert!(matches!(page.columns[1], crate::columnar::Column::Selected(_)));
+            assert!(matches!(page.columns[2], crate::columnar::Column::Arrow { .. }));
+            for row in 0..page.len {
+                elements.push(page.columns[1].value(row).unwrap());
+                ordinals.push(page.columns[2].value(row).unwrap());
+            }
+        }
+        assert_eq!(elements, [Value::I64(10), Value::I64(20), Value::Null, Value::I64(30)]);
+        assert_eq!(ordinals, [Value::I32(1), Value::I32(2), Value::Null, Value::I32(1)]);
+    }
+
+    #[tokio::test]
+    async fn row_number_and_relation_ordinality_append_vectors_to_scan_batches() {
+        use rtdb_plan::{OrdinalityScope, Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let key = scan.columns[0].expression();
+        let mut field = scan.columns[0].clone();
+        field.id = ColumnId(10);
+        field.name = "row_no".into();
+        field.data_type = LogicalType::Scalar(ScalarType::I64);
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let ordinal = Arc::new(Arc::clone(&scan).with_ordinality(field.clone(), OrdinalityScope::Relation).unwrap());
+        let schema = scan.schema().concat(&Schema::new(vec![field.clone()]).unwrap()).unwrap();
+        let window = Arc::new(Relation::new(schema, RelationNode::Window {
+            input: scan, partition_by: vec![], order_by: vec![SortExpr { expr: key, descending: true, nulls_first: false }],
+            expressions: vec![WindowExpr { field, function: WindowFunction::RowNumber }],
+        }).unwrap());
+        for (relation, expected) in [(ordinal, [1, 2, 3]), (window, [3, 2, 1])] {
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a batch cursor");
+            let mut values = Vec::new();
+            let mut ordinals = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                let [crate::columnar::Column::Arrow { array: value, .. }, crate::columnar::Column::Arrow { array: ordinal, .. }] = page.columns.as_slice() else {
+                    panic!("Expected an Arrow payload and ordinality");
+                };
+                let get = |array: &dyn arrow_array::Array| array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().values().to_vec();
+                values.extend(get(value.as_ref()));
+                ordinals.extend(get(ordinal.as_ref()));
+            }
+            assert_eq!(values, expected);
+            assert_eq!(ordinals, [1, 2, 3]);
+        }
+    }
+
+    #[tokio::test]
+    async fn materialized_cold_scan_replays_arrow_batches_for_both_references() {
+        use rtdb_plan::{BinaryOp, MaterializedBinding, NamedExpr, Relation, RelationNode, SetOperator};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().clone();
+        let binding = Arc::new(MaterializedBinding { name: "cte".into(), relation: scan });
+        let reference = Arc::new(Relation::new(schema.clone(), RelationNode::Reference { binding: Arc::clone(&binding) }).unwrap());
+        let body = Arc::new(Relation::new(schema.clone(), RelationNode::Set {
+            left: Arc::clone(&reference), right: reference, operator: SetOperator::Union, all: true,
+        }).unwrap());
+        let relation = Arc::new(Relation::new(schema, RelationNode::Let { binding, body }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
+        assert!(execution.context.spill_bytes() > 0);
+        let mut values = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow IPC output"); };
+            let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            values.extend(array.values().iter().copied());
+        }
+        assert_eq!(values, [1, 2, 3, 1, 2, 3]);
+        drop(cursor);
+        assert_eq!(execution.context.spill_bytes(), 0);
+
+        let mut field = relation.schema().fields()[0].clone();
+        let expr = Expr::binary(BinaryOp::Add, field.expression(), Expr::Literal(Value::I64(1)));
+        field.id = ColumnId(10);
+        let projected = Arc::new(relation.project(vec![NamedExpr { field, expr }]).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&projected), &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a nested Arrow CTE");
+        let mut values = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
+            values.extend((0..batch.len).map(|row| batch.columns[0].value(row).unwrap()));
+        }
+        assert_eq!(values, [2, 3, 4, 2, 3, 4].map(Value::I64));
+        drop(cursor);
+        assert_eq!(execution.context.spill_bytes(), 0);
+        let prepared = crate::PreparedQuery::new(projected).unwrap();
+        let mut cursor = prepared.execute_columns(execution.context, vec![]).await.unwrap();
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 6);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn window_shifts_gather_arrow_cells_across_sorted_batches() {
+        use rtdb_plan::{Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 1;
+        let key = scan.columns[0].expression();
+        let column = scan.columns[0].id;
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        for offset in [1, i64::MAX as u64] {
+            let expressions: Vec<_> = [
+                ("next", WindowFunction::Lead { column, offset }),
+                ("previous", WindowFunction::Lag { column, offset: 1 }),
+            ].into_iter().enumerate().map(|(index, (name, function))| {
+                let mut field = scan.schema().get(column).unwrap().clone();
+                field.id = ColumnId(10 + index as u32);
+                field.name = name.into();
+                field.data_type = field.data_type.maybe();
+                WindowExpr { field, function }
+            }).collect();
+            let suffix = Schema::new(expressions.iter().map(|expr| expr.field.clone()).collect()).unwrap();
+            let schema = scan.schema().concat(&suffix).unwrap();
+            let relation = Arc::new(Relation::new(schema, RelationNode::Window {
+                input: Arc::clone(&scan), partition_by: vec![], order_by: vec![SortExpr { expr: key.clone(), descending: true, nulls_first: false }], expressions,
+            }).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a batch cursor");
+            if offset > 1 {
+                let error = cursor.next_batch().await.err().expect("Expected an offset overflow");
+                assert!(error.code.ends_with("window-offset"));
+                assert!(cursor.next_batch().await.unwrap().is_none());
+                continue;
+            }
+            let mut rows = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                assert_eq!(page.len, 1);
+                assert!(matches!(page.columns[0], crate::columnar::Column::Arrow { .. }));
+                assert!(page.columns[1..].iter().all(|column| matches!(column, crate::columnar::Column::Selected(_))));
+                rows.push(page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>());
+            }
+            assert_eq!(rows, [
+                vec![Value::I64(3), Value::I64(2), Value::Null],
+                vec![Value::I64(2), Value::I64(1), Value::I64(3)],
+                vec![Value::I64(1), Value::Null, Value::I64(2)],
+            ]);
+        }
+    }
+
+    #[tokio::test]
+    async fn partitioned_window_keeps_arrow_values_and_shifts_inside_each_group() {
+        use rtdb_plan::{Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(2), Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 1;
+        let group = scan.columns[0].id;
+        let mut id = scan.columns[0].clone();
+        id.id = ColumnId(1);
+        id.name = "_id".into();
+        let sort = id.expression();
+        scan.columns.push(id.clone());
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let mut ordinal = id.clone();
+        ordinal.id = ColumnId(2);
+        ordinal.name = "ordinal".into();
+        let mut next = id.clone();
+        next.id = ColumnId(3);
+        next.name = "next_id".into();
+        next.data_type = next.data_type.maybe();
+        let schema = scan.schema().concat(&Schema::new(vec![ordinal.clone(), next.clone()]).unwrap()).unwrap();
+        let relation = Arc::new(Relation::new(schema, RelationNode::Window {
+            input: scan,
+            partition_by: vec![group],
+            order_by: vec![SortExpr { expr: sort, descending: true, nulls_first: false }],
+            expressions: vec![
+                WindowExpr { field: ordinal, function: WindowFunction::RowNumber },
+                WindowExpr { field: next, function: WindowFunction::Lead { column: id.id, offset: 1 } },
+            ],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(Arc::clone(&runtime), execution.clone()).await.unwrap().expect("Expected Arrow window");
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            assert_eq!(page.len, 1);
+            assert!(page.columns[..3].iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+            assert!(matches!(page.columns[3], crate::columnar::Column::Selected(_)));
+            rows.push(page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>());
+        }
+        assert_eq!(rows, [
+            vec![Value::I64(1), Value::I64(3), Value::I64(1), Value::I64(1)],
+            vec![Value::I64(1), Value::I64(1), Value::I64(2), Value::Null],
+            vec![Value::I64(2), Value::I64(2), Value::I64(1), Value::Null],
+        ]);
+        let mut pages = crate::operators::build_pages(runtime, execution).await.unwrap();
+        let reference = pages.next_page().await.unwrap().unwrap();
+        assert_eq!(rows, reference.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn grouped_reductions_keep_first_seen_keys_and_emit_counts_as_arrow() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, NamedExpr, Relation, RelationNode, Schema};
+
+        let (state, table, _) = live_table_with_values([Value::I64(2), Value::I64(1), Value::I64(2)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 1;
+        let group = NamedExpr { field: scan.columns[0].clone(), expr: scan.columns[0].expression() };
+        let mut count = group.field.clone();
+        count.id = ColumnId(3);
+        count.name = "n".into();
+        let schema = Schema::new(vec![group.field.clone(), count.clone()]).unwrap();
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let plan = Arc::new(Relation::new(schema, RelationNode::Aggregate {
+            input: scan, groups: vec![group], aggregates: vec![AggregateExpr {
+                field: count, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![],
+            }],
+        }).unwrap());
+        let prepared = crate::PreparedQuery::new(Arc::clone(&plan)).unwrap();
+        let mut output = prepared.execute_columns(Arc::clone(&execution.context), vec![]).await.unwrap();
+        let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
+        let mut arrow = crate::operators::build_columns(Arc::clone(&runtime), execution.clone()).await.unwrap().expect("Expected Arrow aggregate");
+        let batch = arrow.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.len, 2);
+        assert!(matches!(batch.columns[0], crate::columnar::Column::Selected(_)));
+        assert!(matches!(batch.columns[1], crate::columnar::Column::Arrow { .. }));
+        let rows: Vec<_> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()).collect();
+        assert_eq!(rows, [vec![Value::I64(2), Value::I64(2)], vec![Value::I64(1), Value::I64(1)]]);
+        assert!(arrow.next_batch().await.unwrap().is_none());
+        let mut pages = crate::operators::build_pages(runtime, execution).await.unwrap();
+        let data = pages.next_page().await.unwrap().unwrap();
+        assert_eq!(rows, data.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
+        for _ in &rows {
+            assert_eq!(output.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+        }
+        assert!(output.next_batch().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1492,6 +3254,8 @@ mod tests {
         let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(110) };
         let mut write = TransactionBuffer::new(snapshot, key, MemoryBudget::new(1 << 20)).unwrap();
         write.append(table.clone(), StoredEvent {
+            commit_position: 0,
+            entity_key: None,
             iid: Iid([0xc0; 16]),
             system_from: key.system_time,
             valid_time: Interval::ALL,

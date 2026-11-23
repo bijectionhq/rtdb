@@ -104,6 +104,26 @@ impl JoinInput {
         }
         Ok(output.finish())
     }
+    pub fn project_batches(&self, input: crate::columnar::BoxBatchCursor, execution: &Execution) -> crate::columnar::BoxBatchCursor {
+        if self.expressions.is_empty() { return input; }
+        let projections = self.original.fields().iter().map(Field::expression).chain(self.expressions.iter().cloned()).collect();
+        Box::new(crate::columnar::BatchExpressions::new(input, self.original.clone(), projections, execution.clone()).validating_input(true))
+    }
+
+    pub fn supports_batch_keys(&self) -> bool {
+        fn deterministic(expr: &Expr) -> bool {
+            match expr {
+                Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. } => true,
+                Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } =>
+                    deterministic(left) && deterministic(right),
+                Expr::Call { name, args, .. } if matches!(name.as_str(), "mod" | "abs") =>
+                    args.iter().all(deterministic),
+                _ => false,
+            }
+        }
+        self.expressions.iter().all(deterministic)
+    }
+
     pub fn output<'a>(&self, row: &'a OwnedRow) -> &'a [rtdb_types::Value] { &row.values[..self.original.len()] }
     pub fn key_count(&self) -> usize { self.key_positions.len() }
     pub fn key_positions(&self) -> &[usize] { &self.key_positions }

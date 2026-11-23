@@ -8,7 +8,8 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Anomaly, BlockIndex, LogicalType, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 
 use crate::generated::xtdb::{block::proto as pb, cols::proto as cpb, database::proto::DatabaseConfig};
-use crate::keys::TableSlug;
+use crate::keys::{TableSlug, TrieKey};
+use crate::log::proto::{TrieDetails, TrieState};
 
 pub const FIRST_TABLE_OID: u32 = 16_384;
 
@@ -41,6 +42,7 @@ impl TableEntry {
 #[derive(Clone, Debug)]
 pub struct BlockCatalog {
     wire: Arc<pb::Block>,
+    publication_sha256: Option<[u8; 32]>,
     charge: Option<Arc<MemoryReservation>>,
 }
 
@@ -48,7 +50,9 @@ impl PartialEq for BlockCatalog { fn eq(&self, other: &Self) -> bool { self.wire
 
 impl BlockCatalog {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        Self::from_proto(pb::Block::decode(bytes).map_err(invalid)?)
+        let mut catalog = Self::from_proto(pb::Block::decode(bytes).map_err(invalid)?)?;
+        catalog.publication_sha256 = Some(publication_digest(bytes));
+        Ok(catalog)
     }
 
     /// The reservation must cover the decoded graph and any derived values that retain its charge.
@@ -62,12 +66,27 @@ impl BlockCatalog {
 
     pub fn from_proto(wire: pb::Block) -> Result<Self> {
         if wire.block_index.unwrap_or_default() < 0 { return Err(invalid("Block index is negative")); }
-        let catalog = Self { wire: Arc::new(wire), charge: None };
-        catalog.table_entries()?;
+        let catalog = Self { wire: Arc::new(wire), charge: None, publication_sha256: None };
+        let entries = catalog.table_entries()?;
+        if let Some(manifest) = &catalog.wire.table_block_manifest {
+            let digests = &manifest.sha256_by_oid;
+            if entries.len() != digests.len()
+                || entries.iter().any(|entry| digests.get(&entry.oid).is_none_or(|digest| digest.len() != 32))
+            {
+                return Err(invalid("Table block manifest does not match the checkpoint registry"));
+            }
+        }
         Ok(catalog)
     }
 
     pub fn encode(&self) -> Vec<u8> { self.wire.encode_to_vec() }
+    /// Binds the catalog to the exact bytes that the writer will publish.
+    pub fn encode_for_publication(&mut self) -> Vec<u8> {
+        let bytes = self.encode();
+        self.publication_sha256 = Some(publication_digest(&bytes));
+        bytes
+    }
+    pub fn publication_sha256(&self) -> Option<[u8; 32]> { self.publication_sha256 }
     pub fn as_proto(&self) -> &pb::Block { &self.wire }
     pub fn block_index(&self) -> BlockIndex { BlockIndex(self.wire.block_index.unwrap_or_default()) }
     pub fn boundary_term(&self) -> Term { Term(self.wire.term_id.unwrap_or_default()) }
@@ -75,6 +94,12 @@ impl BlockCatalog {
     pub fn boundary_replica_position(&self) -> Option<ReplicaPosition> { self.wire.boundary_replica_msg_id.map(ReplicaPosition) }
     pub fn external_source_token(&self) -> Option<&[u8]> { self.wire.external_source_token.as_deref() }
     pub fn secondary_databases(&self) -> &BTreeMap<String, DatabaseConfig> { &self.wire.secondary_databases }
+    pub fn table_block_digest(&self, oid: u32) -> Option<&[u8]> {
+        self.wire.table_block_manifest.as_ref()?.sha256_by_oid.get(&oid).map(Vec::as_slice)
+    }
+    pub fn matches_table_block(&self, oid: u32, digest: &[u8; 32]) -> bool {
+        self.wire.table_block_manifest.is_none() || self.table_block_digest(oid) == Some(digest.as_slice())
+    }
 
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> {
         self.wire.latest_completed_tx.as_ref().map(|tx| TransactionKey {
@@ -86,6 +111,8 @@ impl BlockCatalog {
         self.wire.latest_processed_msg_id.map(SourcePosition)
             .or_else(|| self.latest_completed_tx().map(|tx| SourcePosition(tx.tx_id.0)))
     }
+    /// The naming epoch of compaction outputs planned from this block's catalog.
+    pub fn naming_epoch(&self) -> u64 { self.wire.naming_epoch.unwrap_or(0).max(0) as u64 }
 
     pub fn table_entries(&self) -> Result<Vec<TableEntry>> {
         let entries = if !self.wire.tables.is_empty() {
@@ -109,12 +136,31 @@ impl BlockCatalog {
     }
 }
 
+pub use crate::publication_identity::same_publication_digest;
+
+/// Digest of the encoded checkpoint root, before encryption or packing.
+pub fn publication_digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
 pub fn legacy_table_ref(name: &str) -> Result<TableRef> {
     let (schema, table) = name.split_once('/').unwrap_or(("public", name));
     if schema.is_empty() || table.is_empty() || table.contains('/') {
         return Err(invalid(format!("Invalid recorded table name: {name}")));
     }
     Ok(TableRef::new(schema, table))
+}
+
+/// The dependency set to preserve when copying a checkpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointContents {
+    /// The primary objects retained by the original archive encoding.
+    #[default]
+    Primary,
+    /// Primary objects, retained L0 inputs, and the artefacts named by usable tries.
+    Replay,
 }
 
 #[derive(Clone, Debug)]
@@ -154,10 +200,46 @@ impl TableBlock {
         Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns }), charge: None })
     }
 
+    pub fn encoded_len(&self) -> usize { self.wire.encoded_len() }
     pub fn encode(&self) -> Vec<u8> { self.wire.encode_to_vec() }
     pub fn as_proto(&self) -> &pb::TableBlock { &self.wire }
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
     pub fn partitions(&self) -> &[pb::Partition] { &self.wire.partitions }
+
+    pub fn trie_details(&self) -> impl Iterator<Item = &TrieDetails> {
+        self.wire.partitions.iter().flat_map(|partition| &partition.tries)
+            .chain(self.wire.tries.iter().filter(|_| self.wire.partitions.is_empty()))
+    }
+
+    /// Detaches the serving trie inventory from retired files and derived artefacts.
+    pub fn for_primary_repair(&self) -> Self {
+        fn retain_primary(tries: &mut Vec<TrieDetails>) {
+            tries.retain(|try_| try_.trie_state != Some(TrieState::Garbage as i32));
+            for try_ in tries { try_.artefacts.clear(); }
+        }
+        let mut wire = self.wire.as_ref().clone();
+        retain_primary(&mut wire.tries);
+        for partition in &mut wire.partitions { retain_primary(&mut partition.tries); }
+        Self { wire: Arc::new(wire), charge: self.charge.clone() }
+    }
+
+    pub fn checkpoint_trie_files(&self, slug: &TableSlug, contents: CheckpointContents) -> Result<BTreeSet<String>> {
+        let mut files = BTreeSet::new();
+        for detail in self.trie_details() {
+            let state = TrieState::try_from(detail.trie_state.unwrap_or_default())
+                .map_err(|_| invalid("Unknown trie state in checkpoint"))?;
+            let trie: TrieKey = detail.trie_key.as_deref().unwrap_or_default().parse()?;
+            if state == TrieState::Garbage && (contents == CheckpointContents::Primary || trie.level() != 0) { continue; }
+            files.insert(slug.data_key(&trie));
+            files.insert(slug.metadata_key(&trie));
+            if contents == CheckpointContents::Replay && state != TrieState::Garbage {
+                for record in &detail.artefacts {
+                    files.insert(slug.recorded_artefact_key(&trie, record)?);
+                }
+            }
+        }
+        Ok(files)
+    }
 
     pub fn column_types(&self) -> Result<StructFields<LogicalType>> {
         if !self.wire.columns.is_empty() {

@@ -30,6 +30,34 @@ fn times_use_physical_bytes_while_timestamps_use_seconds() {
 }
 
 #[test]
+fn physical_scalar_hashes_match_the_value_hash() {
+    let values = [
+        Value::Bool(true),
+        Value::U32(u32::MAX),
+        Value::F64(-0.0),
+        Value::Utf8("café".into()),
+        Value::Uri("https://example.com/a%20b".into()),
+        Value::Keyword(rtdb_types::Keyword::from_name("person/id")),
+        Value::Uuid([42; 16]),
+        Value::Transit(vec![0, 193, 34, 170]),
+        Value::DateMilli(-86_400_001),
+        Value::Time { value: 123_456, unit: TimeUnit::Millisecond, bit_width: 32 },
+        Value::Timestamp { value: -12_345, unit: TimeUnit::Nanosecond, timezone: Some("UTC".into()) },
+        Value::Duration { value: 4321, unit: TimeUnit::Microsecond },
+        Value::IntervalDayTime { days: -19, milliseconds: 42 },
+        Value::IntervalMonthDayNano { months: 2, days: -3, nanoseconds: 72 },
+        Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 8, i32::MAX, 128).unwrap()),
+    ];
+    for value in values {
+        let ty = value.logical_type().maybe();
+        let field = to_field("v", &ty).unwrap();
+        let array = rtdb_columnar::copy_array(&ty, &[value.clone(), Value::Null]).unwrap();
+        assert_eq!(hash_cell(&field, array.as_ref(), 0, 29).unwrap(), hash_value(&value, 29).unwrap(), "{value:?}");
+        assert_eq!(hash_cell(&field, array.as_ref(), 1, 29).unwrap(), 0);
+    }
+}
+
+#[test]
 fn hash_cell_uses_struct_field_order_and_ignores_names() {
     let fields = Fields::from(vec![Field::new("z", DataType::Int64, false), Field::new("a", DataType::Int64, false)]);
     let array = StructArray::try_new(fields.clone(), vec![Arc::new(Int64Array::from(vec![1])), Arc::new(Int64Array::from(vec![2]))], None).unwrap();

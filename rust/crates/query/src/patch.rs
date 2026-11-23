@@ -1,12 +1,23 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 use rtdb_plan::{ColumnId, Expr, PatchEndpoint, Schema};
 use rtdb_format::transit::{TransitValue, to_json_value};
 use rtdb_types::{Anomaly, Iid, Result, TimeUnit, Timestamp, Value};
 
-use crate::{context::Execution, cursor::OwnedRow, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, invalid};
+use crate::{columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, times},
+    context::Execution, cursor::OwnedRow, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, invalid};
 
 pub(crate) struct PatchGaps {
     input: BoxPageCursor,
+    layout: PatchLayout,
+}
+
+pub(crate) struct BatchPatchGaps {
+    input: BoxBatchCursor,
+    layout: PatchLayout,
+}
+
+struct PatchLayout {
     columns: [usize; 4],
     width: usize,
     from: Timestamp,
@@ -44,15 +55,15 @@ impl PatchIid {
     }
 }
 
-impl PatchGaps {
-    pub async fn new(input: BoxPageCursor, schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
+impl PatchLayout {
+    fn new(schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
         let scope = execution.scope()?;
         fn bound(expr: &Expr, lower: bool, execution: &Execution, scope: &rtdb_expr::EvaluationScope) -> Result<Timestamp> {
             let value = match PatchEndpoint::from_expr(expr)? {
                 PatchEndpoint::Default if !lower => return Ok(Timestamp::MAX),
                 PatchEndpoint::Default | PatchEndpoint::CurrentTime => return execution.context.current_time.as_micros(),
                 PatchEndpoint::DateTime(value) => value,
-                PatchEndpoint::Parameter(index) => execution.parameters.values().get(index).ok_or_else(|| invalid("patch-parameter", "Patch endpoint parameter is absent"))?,
+                PatchEndpoint::Parameter(index) => execution.parameters.get(index)?.ok_or_else(|| invalid("patch-parameter", "Patch endpoint parameter is absent"))?,
             };
             scope.reserve(value.retained_bytes()?.checked_add(execution.context.timezone.len()).and_then(|bytes|bytes.checked_mul(8)).and_then(|bytes|bytes.checked_add(16_384)).ok_or_else(||invalid("patch-endpoint-size", "Patch endpoint conversion exceeds addressable memory"))?)?;
             rtdb_expr::query_clock_instant(value, &execution.context.timezone)?.as_micros()
@@ -67,7 +78,7 @@ impl PatchGaps {
         }
         let columns = columns.map(|id| schema.position(id).ok_or_else(|| invalid("patch-column", "Patch column is absent")));
         let [iid, vf, vt, doc] = columns;
-        Ok(Self { input, columns: [iid?, vf?, vt?, doc?], width: schema.len(), from, to, execution })
+        Ok(Self { columns: [iid?, vf?, vt?, doc?], width: schema.len(), from, to, execution })
     }
     fn gap(&self, iid: PatchIid, from: Timestamp, to: Timestamp) -> Result<OwnedRow> {
         let bytes = self.width.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("patch-size", "Patch row allocation exceeds addressable memory"))?;
@@ -80,40 +91,166 @@ impl PatchGaps {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PatchSpan {
+    source: usize,
+    iid: PatchIid,
+    from: Timestamp,
+    to: Timestamp,
+    copy_document: bool,
+}
+
+struct PatchTimeline {
+    from: Timestamp,
+    to: Timestamp,
+    current: Option<(usize, PatchIid, Timestamp)>,
+}
+
+impl PatchTimeline {
+    fn advance(&mut self, source: usize, iid: PatchIid, from: Timestamp, to: Timestamp) -> [Option<PatchSpan>; 3] {
+        let mut cursor = self.from;
+        let mut tail = None;
+        if let Some((previous_row, previous, previous_to)) = self.current {
+            if iid.bytes() == previous.bytes() { cursor = previous_to; }
+            else if previous_to < self.to { tail = Some(Self::gap(previous_row, previous, previous_to, self.to)); }
+        }
+        self.current = Some((source, iid, to));
+        [
+            tail,
+            (from > cursor).then(|| Self::gap(source, iid, cursor, from.min(self.to))),
+            Some(PatchSpan { source, iid, from: from.max(self.from), to: to.min(self.to), copy_document: true }),
+        ]
+    }
+
+    fn finish(self) -> Option<PatchSpan> {
+        let (source, iid, from) = self.current?;
+        (from < self.to).then(|| Self::gap(source, iid, from, self.to))
+    }
+
+    fn gap(source: usize, iid: PatchIid, from: Timestamp, to: Timestamp) -> PatchSpan {
+        PatchSpan { source, iid, from, to, copy_document: false }
+    }
+}
+
+impl PatchLayout {
+    fn timeline(&self) -> PatchTimeline { PatchTimeline { from: self.from, to: self.to, current: None } }
+
+    fn read_time(&self, value: &Value, upper: bool) -> Result<Timestamp> {
+        if upper && matches!(value, Value::Null | Value::Undefined) { return Ok(Timestamp::MAX); }
+        rtdb_expr::timestamp_micros(value, &self.execution.context.timezone)
+    }
+}
+
+impl PatchGaps {
+    pub fn new(input: BoxPageCursor, schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
+        Ok(Self { input, layout: PatchLayout::new(schema, columns, from, to, execution)? })
+    }
+}
+
 #[async_trait]
 impl PageCursor for PatchGaps {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        self.execution.context.check_cancelled()?;
+        let layout = &self.layout;
+        let context = &layout.execution.context;
+        context.check_cancelled()?;
         let Some(mut page) = self.input.next_page().await? else { return Ok(None); };
-        let capacity = page.len().checked_mul(3).ok_or_else(|| invalid("patch-size", "Patch page row count exceeds addressable memory"))?;
-        let mut output = PageBuilder::new(capacity, &self.execution.context.memory)?;
-        let mut current: Option<(PatchIid, Timestamp)> = None;
+        let capacity = page.len().checked_mul(3).ok_or_else(size_error)?;
+        let mut output = PageBuilder::new(capacity, &context.memory)?;
+        let mut timeline = layout.timeline();
+        let [iid, valid_from, valid_to, _] = layout.columns;
+        let mut index = 0;
         while let Some(mut row) = page.next() {
-            self.execution.context.check_cancelled()?;
-            let iid = PatchIid::read(&row.values[self.columns[0]])?;
-            let from = rtdb_expr::timestamp_micros(&row.values[self.columns[1]], &self.execution.context.timezone)?;
-            let to = match &row.values[self.columns[2]] {
-                Value::Null | Value::Undefined => Timestamp::MAX,
-                value => rtdb_expr::timestamp_micros(value, &self.execution.context.timezone)?,
-            };
-            let mut cursor = self.from;
-            if let Some((previous, previous_to)) = current {
-                if iid.bytes() != previous.bytes() {
-                    if previous_to < self.to { output.push(self.gap(previous, previous_to, self.to)?)?; }
-                } else { cursor = previous_to; }
+            context.check_cancelled()?;
+            let id = PatchIid::read(&row.values[iid])?;
+            let from = layout.read_time(&row.values[valid_from], false)?;
+            let to = layout.read_time(&row.values[valid_to], true)?;
+            for span in timeline.advance(index, id, from, to).into_iter().flatten() {
+                if span.copy_document {
+                    let reservation = context.memory.reserve(row.bytes().checked_add(64).ok_or_else(size_error)?)?;
+                    for (index, value) in row.values.iter_mut().enumerate() { if !layout.columns.contains(&index) { *value = Value::Null; } }
+                    row.values[valid_from] = timestamp(span.from, false);
+                    row.values[valid_to] = timestamp(span.to, true);
+                    output.push(OwnedRow::with_reservation(std::mem::take(&mut row.values), reservation)?)?;
+                } else {
+                    output.push(layout.gap(span.iid, span.from, span.to)?)?;
+                }
             }
-            if from > cursor { output.push(self.gap(iid, cursor, from.min(self.to))?)?; }
-            let reservation = self.execution.context.memory.reserve(row.bytes().checked_add(64).ok_or_else(|| invalid("patch-size", "Patch row allocation exceeds addressable memory"))?)?;
-            for (index, value) in row.values.iter_mut().enumerate() { if !self.columns.contains(&index) { *value = Value::Null; } }
-            row.values[self.columns[1]] = timestamp(from.max(self.from), false);
-            row.values[self.columns[2]] = timestamp(to.min(self.to), true);
-            output.push(OwnedRow::with_reservation(std::mem::take(&mut row.values), reservation)?)?;
-            current = Some((iid, to));
+            index += 1;
         }
-        if let Some((iid, cursor)) = current { if cursor < self.to { output.push(self.gap(iid, cursor, self.to)?)?; } }
+        if let Some(span) = timeline.finish() { output.push(layout.gap(span.iid, span.from, span.to)?)?; }
         Ok(Some(output.finish()))
     }
 }
+
+impl BatchPatchGaps {
+    pub fn new(input: BoxBatchCursor, schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
+        Ok(Self { input, layout: PatchLayout::new(schema, columns, from, to, execution)? })
+    }
+}
+
+#[async_trait]
+impl BatchCursor for BatchPatchGaps {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        use arrow_array::TimestampMicrosecondArray;
+        use rtdb_types::{LogicalType, ScalarType};
+
+        let layout = &self.layout;
+        let context = &layout.execution.context;
+        context.check_cancelled()?;
+        let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
+        let [iid, valid_from, valid_to, document] = layout.columns;
+        let capacity = batch.len.checked_mul(3).ok_or_else(size_error)?;
+        let _scratch = context.memory.reserve(capacity.checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?)?;
+        let mut spans = Vec::with_capacity(capacity);
+        let mut timeline = layout.timeline();
+        let read_time = |position, row, upper| -> Result<Timestamp> {
+            let column: &Column = &batch.columns[position];
+            if let Some(Some((array, _, _, offset))) = column.arrow_cell(row)
+                && let Some(times) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                use arrow_array::Array;
+                if times.is_valid(offset) && times.timezone().is_some() { return Ok(Timestamp(times.value(offset))); }
+            }
+            layout.read_time(&column.value(row)?, upper)
+        };
+        let read_iid = |row| {
+            if let Some(Some((array, _, Some(LogicalType::Scalar(ScalarType::FixedSizeBinary(16))), offset))) = batch.columns[iid].arrow_cell(row)
+                && let Some(ids) = array.as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>() {
+                use arrow_array::Array;
+                if ids.is_valid(offset) { return Iid::from_slice(ids.value(offset)).map(PatchIid::FixedSizeBinary); }
+            }
+            PatchIid::read(&batch.columns[iid].value(row)?)
+        };
+        for row in 0..batch.len {
+            context.check_cancelled_at(row)?;
+            let id = read_iid(row)?;
+            let from = read_time(valid_from, row, false)?;
+            let to = read_time(valid_to, row, true)?;
+            spans.extend(timeline.advance(row, id, from, to).into_iter().flatten());
+        }
+        spans.extend(timeline.finish());
+        let ids = spans.iter().map(|span| Some((0, span.source))).collect::<Vec<_>>();
+        let docs = spans.iter().map(|span| span.copy_document.then_some((0, span.source))).collect::<Vec<_>>();
+        let mut reservation = context.memory.reserve(256)?;
+        let mut output = Vec::with_capacity(layout.width);
+        for position in 0..layout.width {
+            let (column, _charge) = match position {
+                index if index == iid => gather_nullable_column(|_| &batch, &ids, position, &context.memory)?,
+                index if index == document => gather_nullable_column(|_| &batch, &docs, position, &context.memory)?,
+                index if index == valid_from => (times("_valid_from", spans.iter().map(|span| span.from), false), Arc::clone(&_scratch)),
+                index if index == valid_to => (times("_valid_to", spans.iter().map(|span| span.to), true), Arc::clone(&_scratch)),
+                _ => (Column::Arrow { array: Arc::new(arrow_array::NullArray::new(spans.len())),
+                    field: Arc::new(arrow_schema::Field::new("null", arrow_schema::DataType::Null, true)),
+                    logical: Some(LogicalType::Null) }, Arc::clone(&_scratch)),
+            };
+            let lease = Arc::get_mut(&mut reservation).expect("Patch output owns its reservation");
+            lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+            output.push(column);
+        }
+        ColumnBatch::settled(output, spans.len(), reservation).map(Some)
+    }
+}
+
+fn size_error() -> Anomaly { invalid("patch-size", "Patch page allocation exceeds addressable memory") }
 
 fn timestamp(value: Timestamp, upper: bool) -> Value {
     if upper && value == Timestamp::MAX { Value::Null }

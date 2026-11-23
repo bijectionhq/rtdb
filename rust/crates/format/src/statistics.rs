@@ -55,10 +55,10 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     let count = match present_cells(field, array, mask) {
         Some(count) => i64::try_from(count).map_err(invalid)?,
         None => {
-            let reader = rtdb_columnar::ColumnReader::new(field)?;
+            let reader = rtdb_columnar::ColumnPresence::new(field)?;
             let mut count = 0i64;
             for row in 0..array.len() {
-                if mask.includes(row) && !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) { count += 1; }
+                if mask.includes(row) && reader.is_present(array, row)? { count += 1; }
             }
             count
         }
@@ -160,25 +160,17 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => "date-times",
         DataType::Time32(_) | DataType::Time64(_) => "times-of-day",
         DataType::Duration(_) => "durations",
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 | DataType::Float32 | DataType::Float64 | DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "numbers",
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 | DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "numbers",
         _ => return Err(Anomaly::unsupported("rtdb.format/metadata-flavour", format!("Unsupported column metadata type: {:?}", field.data_type()))),
     };
     let bounds = statistics.numeric.entry(group).or_insert((f64::INFINITY, f64::NEG_INFINITY));
-    if field.metadata().is_empty() && let Some(cells) = numeric_cells(array) {
-        for row in 0..array.len() {
-            if !mask.includes(row) || array.is_null(row) { continue; }
-            let value = cells(row);
-            if value.is_nan() || bounds.0.is_nan() { bounds.0 = f64::NAN; } else { bounds.0 = bounds.0.min(value); }
-            if value.is_nan() || bounds.1.is_nan() { bounds.1 = f64::NAN; } else { bounds.1 = bounds.1.max(value); }
-        }
-        return Ok(());
-    }
-    let reader = rtdb_columnar::ColumnReader::new(field)?;
+    let cells = numeric_cells(array);
     for row in 0..array.len() {
-        if !mask.includes(row) { continue; }
-        let value = reader.read(array, row)?;
-        if matches!(value, Value::Null | Value::Undefined) { continue; }
-        let value = numeric_value(&value)?;
+        if !mask.includes(row) || array.is_null(row) { continue; }
+        let value = match &cells {
+            Some(cells) => cells(row),
+            None => rtdb_columnar::decimal_cell_as_f64(field, array, row)?,
+        };
         if value.is_nan() || bounds.0.is_nan() { bounds.0 = f64::NAN; } else { bounds.0 = bounds.0.min(value); }
         if value.is_nan() || bounds.1.is_nan() { bounds.1 = f64::NAN; } else { bounds.1 = bounds.1.max(value); }
     }
@@ -189,16 +181,15 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
 fn present_cells(field: &Field, array: &dyn Array, mask: &Mask) -> Option<usize> {
     let data_type = array.data_type();
     let flat = data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_));
-    let float_list = matches!(data_type, DataType::List(item) | DataType::FixedSizeList(item, _)
-        if item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64));
-    if !(flat || float_list) || field.data_type() != data_type || !field.metadata().is_empty() { return None; }
+    let list = matches!(data_type, DataType::List(_) | DataType::FixedSizeList(_, _));
+    if !(flat || list) || field.data_type() != data_type || !field.metadata().is_empty() { return None; }
     Some(match mask {
         Mask::All => array.len() - array.null_count(),
         Mask::Selected(rows) => (0..array.len()).filter(|row| rows[*row] && array.is_valid(*row)).count(),
     })
 }
 
-/// A plain signed integer, float or temporal array's cells as `numeric_value` takes them of each cell's value, read in place.
+/// Reads numeric statistics in place, using signed execution widths and seconds for time values.
 fn numeric_cells(array: &dyn Array) -> Option<Box<dyn Fn(usize) -> f64 + '_>> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::*;
@@ -209,10 +200,19 @@ fn numeric_cells(array: &dyn Array) -> Option<Box<dyn Fn(usize) -> f64 + '_>> {
         DataType::Int16 => { let array = array.as_primitive::<Int16Type>(); Box::new(move |row| f64::from(array.value(row))) }
         DataType::Int32 => { let array = array.as_primitive::<Int32Type>(); Box::new(move |row| f64::from(array.value(row))) }
         DataType::Int64 => { let array = array.as_primitive::<Int64Type>(); Box::new(move |row| array.value(row) as f64) }
+        DataType::UInt8 => { let array = array.as_primitive::<UInt8Type>(); Box::new(move |row| f64::from(array.value(row) as i8)) }
+        DataType::UInt16 => { let array = array.as_primitive::<UInt16Type>(); Box::new(move |row| f64::from(array.value(row) as i16)) }
+        DataType::UInt32 => { let array = array.as_primitive::<UInt32Type>(); Box::new(move |row| f64::from(array.value(row) as i32)) }
+        DataType::UInt64 => { let array = array.as_primitive::<UInt64Type>(); Box::new(move |row| (array.value(row) as i64) as f64) }
+        DataType::Float16 => { let array = array.as_primitive::<Float16Type>(); Box::new(move |row| array.value(row).to_f64()) }
         DataType::Float32 => { let array = array.as_primitive::<Float32Type>(); Box::new(move |row| f64::from(array.value(row))) }
         DataType::Float64 => { let array = array.as_primitive::<Float64Type>(); Box::new(move |row| array.value(row)) }
         DataType::Date32 => { let array = array.as_primitive::<Date32Type>(); Box::new(move |row| i64::from(array.value(row)).wrapping_mul(86_400) as f64) }
         DataType::Date64 => { let array = array.as_primitive::<Date64Type>(); Box::new(move |row| (array.value(row) / 86_400_000).wrapping_mul(86_400) as f64) }
+        DataType::Time32(Unit::Second) => { let array = array.as_primitive::<Time32SecondType>(); Box::new(move |row| f64::from(array.value(row))) }
+        DataType::Time32(Unit::Millisecond) => { let array = array.as_primitive::<Time32MillisecondType>(); Box::new(move |row| f64::from(array.value(row)) / 1e3) }
+        DataType::Time64(Unit::Microsecond) => { let array = array.as_primitive::<Time64MicrosecondType>(); Box::new(move |row| array.value(row) as f64 / 1e6) }
+        DataType::Time64(Unit::Nanosecond) => { let array = array.as_primitive::<Time64NanosecondType>(); Box::new(move |row| array.value(row) as f64 / 1e9) }
         DataType::Timestamp(unit, _) => {
             let scale = per_second(unit);
             let values: Box<dyn Fn(usize) -> i64 + '_> = match unit {
@@ -237,29 +237,6 @@ fn numeric_cells(array: &dyn Array) -> Option<Box<dyn Fn(usize) -> f64 + '_>> {
     })
 }
 
-fn numeric_value(value: &Value) -> Result<f64> {
-    Ok(match value {
-        Value::I8(value) => f64::from(*value), Value::I16(value) => f64::from(*value), Value::I32(value) => f64::from(*value), Value::I64(value) => *value as f64,
-        Value::U8(value) => f64::from(*value as i8), Value::U16(value) => f64::from(*value as i16), Value::U32(value) => f64::from(*value as i32), Value::U64(value) => (*value as i64) as f64,
-        Value::F32(value) => f64::from(*value), Value::F64(value) => *value,
-        Value::DateDay(value) => i64::from(*value).wrapping_mul(86_400) as f64,
-        Value::DateMilli(value) => (value / 86_400_000).wrapping_mul(86_400) as f64,
-        Value::Time { value, unit, .. } | Value::Timestamp { value, unit, .. } | Value::Duration { value, unit } => *value as f64 / unit.units_per_second() as f64,
-        Value::Decimal(value) => {
-            let bytes = value.unscaled.as_slice();
-            let coefficient = match value.bit_width {
-                32 => i32::from_be_bytes(bytes.try_into().map_err(invalid)?).to_string(),
-                64 => i64::from_be_bytes(bytes.try_into().map_err(invalid)?).to_string(),
-                128 => i128::from_be_bytes(bytes.try_into().map_err(invalid)?).to_string(),
-                256 => arrow_buffer::i256::from_be_bytes(bytes.try_into().map_err(invalid)?).to_string(),
-                _ => return Err(invalid("Invalid decimal coefficient width")),
-            };
-            format!("{coefficient}e{}", -i64::from(value.scale)).parse().map_err(invalid)?
-        }
-        _ => return Err(invalid("Metadata numeric flavour yielded a non-numeric value")),
-    })
-}
-
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(|| invalid("Metadata array and field disagree")) }
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.format/invalid-column-metadata", error.to_string()) }
 
@@ -270,14 +247,23 @@ mod tests {
     fn decimal_statistics_handle_full_scale_without_exponent_sized_allocation() {
         for (scale, expected) in [(i32::MIN, f64::NEG_INFINITY), (i32::MAX, -0.0)] {
             let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
-            assert_eq!(numeric_value(&value).unwrap().to_bits(), expected.to_bits());
+            let field = rtdb_columnar::to_field("d", &value.logical_type()).unwrap();
+            let array = rtdb_columnar::copy_array(&value.logical_type(), &[value]).unwrap();
+            let mut columns = Vec::new();
+            column_metadata(&field, array.as_ref(), true, false, &mut columns).unwrap();
+            let Value::Struct(column) = &columns[0] else { panic!("Expected column metadata"); };
+            let Value::Struct(numbers) = &column["numbers"] else { panic!("Expected numeric statistics"); };
+            let Value::F64(min) = numbers["min"] else { panic!("Expected the minimum"); };
+            assert_eq!(min.to_bits(), expected.to_bits());
         }
     }
     #[test]
     fn date_millisecond_statistics_truncate_partial_days_before_seconds_conversion() {
-        for (millis, day) in [(-86_400_001, -1), (-86_400_000, -1), (-1, 0), (0, 0), (86_400_001, 1)] {
-            assert_eq!(numeric_value(&Value::DateMilli(millis)).unwrap(), numeric_value(&Value::DateDay(day)).unwrap());
-        }
+        let millis = arrow_array::Date64Array::from(vec![-86_400_001, -86_400_000, -1, 0, 86_400_001]);
+        let days = arrow_array::Date32Array::from(vec![-1, -1, 0, 0, 1]);
+        let millis = numeric_cells(&millis).unwrap();
+        let days = numeric_cells(&days).unwrap();
+        for row in 0..5 { assert_eq!(millis(row), days(row)); }
     }
 }
 

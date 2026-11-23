@@ -40,7 +40,7 @@ async fn cursor_with_extra(context: &Arc<QueryContext>, pages: Vec<Vec<InputRow>
     if extra { fields.push(Field { id: ColumnId(4),name: "extra".into(),qualifier: None,qualified_only: false,unnamed: false,data_type: LogicalType::Scalar(ScalarType::Utf8) }); }
     let schema = Schema::new(fields).unwrap();
     let execution = Execution { context: Arc::clone(context),parameters: Arc::new(crate::parameters::BoundParameters::infer(vec![],&context.memory).unwrap()),outer: OuterRows::empty(&context.memory).unwrap(),bindings: None,analysis: None };
-    (PatchGaps::new(input,&schema,[ColumnId(0),ColumnId(1),ColumnId(2),ColumnId(3)],&Expr::Literal(timestamp(Timestamp(from),false)),&Expr::Literal(timestamp(Timestamp(to),false)),execution).await.unwrap(),polls,dropped)
+    (PatchGaps::new(input,&schema,[ColumnId(0),ColumnId(1),ColumnId(2),ColumnId(3)],&Expr::Literal(timestamp(Timestamp(from),false)),&Expr::Literal(timestamp(Timestamp(to),false)),execution).unwrap(),polls,dropped)
 }
 
 #[tokio::test]

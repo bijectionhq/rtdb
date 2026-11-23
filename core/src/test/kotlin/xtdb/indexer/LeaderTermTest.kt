@@ -236,7 +236,9 @@ internal abstract class LeaderTermTest {
         watchers: Watchers,
         driver: (LogsDriver) -> LogsDriver = { it },
         extSource: ExternalSource? = null,
+        dbCatalog: Database.Catalog? = null,
     ): UnstartedTerm {
+        val dbName = if (dbCatalog != null) "xtdb" else "test"
         val sourceLog = InMemoryLog<SourceMessage>(InstantSource.system(), 0)
         val replicaLog = InMemoryLog<ReplicaMessage>(InstantSource.system(), 0)
         val bufferPool = mockk<BufferPool>(relaxed = true) { every { epoch } returns 0 }
@@ -246,16 +248,16 @@ internal abstract class LeaderTermTest {
         val appender = ReplicaLogAppender(logsDriver, leaderTerm = 1, NoAssertElectionDriver)
         val blockCutter =
             BlockCutter(
-                partitionStorage, partitionState, "test", 1, appender, mockk(relaxed = true),
+                partitionStorage, partitionState, dbName, 1, appender, mockk(relaxed = true),
                 dbCatalog = null, meterRegistry = null, lastUploadEpochSeconds = AtomicLong(0),
                 scope = backgroundScope, ioDispatcher = StandardTestDispatcher(testScheduler)
             )
 
         val proc = LeaderLogProcessor(
             allocator, nodeBase, partitionStorage, mockk(relaxed = true),
-            partitionState, "test", logsDriver, blockCutter, watchers, appender,
+            partitionState, dbName, logsDriver, blockCutter, watchers, appender,
             extSource,
-            skipTxs = emptySet(), dbCatalog = null,
+            skipTxs = emptySet(), dbCatalog = dbCatalog,
             leaderTerm = 1,
             flushTimeout = IndexerConfig().flushDuration,
         )

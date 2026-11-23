@@ -37,6 +37,7 @@ impl CatalogMetrics for Catalog {
 struct ClockFixture(AtomicI64);
 impl Clock for ClockFixture {
     fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) }
+    fn monotonic_micros(&self) -> i64 { self.0.load(Ordering::Relaxed) }
 }
 
 fn options(directory: &std::path::Path) -> NodeOptions {
@@ -390,4 +391,121 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
         tokio::time::timeout(Duration::from_secs(10), owner).await.unwrap().unwrap().unwrap();
     }
     reader_schedule.assert_exhausted().unwrap();
+}
+
+#[tokio::test]
+async fn a_follower_cursor_keeps_its_files_while_its_lease_lasts() {
+    follower_cursor_during_collection(false).await;
+}
+
+#[tokio::test]
+async fn a_follower_cursor_past_its_lease_is_refused_before_reading_collected_files() {
+    follower_cursor_during_collection(true).await;
+}
+
+async fn follower_cursor_during_collection(expire: bool) {
+    use rtdb_format::keys::TrieKey;
+    use rtdb_replication::Role;
+    use rtdb_storage::{Error, ObjectKey};
+
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(ClockFixture(AtomicI64::new(1_000_000)));
+    let table = TableRef::new("public", "docs");
+    let old_trie: TrieKey = "l01-rc-b00".parse().unwrap();
+    let slug = rtdb_format::keys::TableSlug::for_unrecorded_table(&table).unwrap();
+    let data = ObjectKey::new(slug.data_key(&old_trie)).unwrap();
+    let metadata = ObjectKey::new(slug.metadata_key(&old_trie)).unwrap();
+    let rules = if expire { vec![Rule {
+        owner: "xtdb/store".into(),
+        operation: Operation::Delete,
+        phase: Phase::After,
+        key: KeyMatch::Exact(metadata.as_str().to_owned()),
+        occurrence: 1,
+        action: Action::Hold("follower-trie-deleted".into()),
+    }] } else { vec![] };
+    let schedule = FaultSchedule::new(rules, 50_000).unwrap();
+    let _close = CloseSchedule(schedule.clone());
+
+    let mut writer_options = options(directory.path());
+    writer_options.compaction_threads = 1;
+    writer_options.automatic_gc = true;
+    writer_options.garbage.blocks_to_keep = 1;
+    writer_options.garbage.garbage_lifetime = Duration::ZERO;
+    let lease = writer_options.garbage.reader_lease;
+    let writer_resources = Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), true));
+    let writer_services = NodeServices {
+        resources: FaultResources::new(writer_resources, schedule.clone()),
+        ..services(clock.clone(), schedule.clone())
+    };
+    let (writer, driver) = Node::open(writer_options, writer_services).await.unwrap();
+    let writer_owner = tokio::spawn(driver.run());
+    let database = writer.catalog().database("xtdb").unwrap();
+    let mut writer_session = writer.session("xtdb", Arc::new(Identity)).unwrap();
+    let limit = Duration::from_secs(10);
+    let put = |id| vec![TxOp::Sql { sql: format!("INSERT INTO docs RECORDS {{_id: {id}}}"), args: None }];
+
+    assert!(writer_session.state_mut().execute_tx(put(1), AutonomousTxOptions::default()).await.unwrap().committed());
+    flush_and_adopt(&database).await;
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.object_store().head_fresh(&data).await.unwrap();
+
+    let mut follower_options = options(directory.path());
+    follower_options.read_only = true;
+    let follower_schedule = FaultSchedule::new(vec![], 50_000).unwrap();
+    let (follower, driver) = Node::open(follower_options, services(clock.clone(), follower_schedule)).await.unwrap();
+    let follower_owner = tokio::spawn(driver.run());
+    follower.sync_all(limit, follower.cancellation()).await.unwrap();
+    let follower_database = follower.catalog().database("xtdb").unwrap();
+    assert_eq!(follower_database.status().role, Role::Following);
+    assert_eq!(follower_database.snapshot().trie_entries(&table).iter()
+        .map(|trie| &trie.key).collect::<Vec<_>>(), [&old_trie]);
+    let mut follower_session = follower.session("xtdb", Arc::new(Identity)).unwrap();
+    let mut held = follower_session.query_sql("SELECT _id FROM docs", vec![]).await.unwrap();
+
+    assert!(writer_session.state_mut().execute_tx(put(2), AutonomousTxOptions::default()).await.unwrap().committed());
+    flush_and_adopt(&database).await;
+    database.compaction().unwrap().compact_all().await.unwrap();
+    assert!(database.trie_catalog().garbage_tries(&table, Timestamp::MAX).iter().any(|trie| trie.key == old_trie));
+
+    let resumed = if expire {
+        let deleted = schedule.wait_for_rule(0);
+        tokio::pin!(deleted);
+        for id in 3.. {
+            assert!(id < 10, "the writer must collect the superseded trie once a lease has passed");
+            clock.0.fetch_add(i64::try_from(lease.as_micros()).unwrap() * 2, Ordering::Relaxed);
+            assert!(writer_session.state_mut().execute_tx(put(id), AutonomousTxOptions::default()).await.unwrap().committed());
+            flush_and_adopt(&database).await;
+            if tokio::time::timeout(Duration::from_millis(500), &mut deleted).await.is_ok() { break; }
+        }
+        for object in [&data, &metadata] {
+            assert!(matches!(database.object_store().head_fresh(object).await, Err(Error::MissingObject(_))));
+        }
+        let resumed = tokio::time::timeout(limit, held.next_batch()).await.unwrap();
+        schedule.release("follower-trie-deleted").unwrap();
+        resumed
+    } else {
+        for id in 3..6 {
+            assert!(writer_session.state_mut().execute_tx(put(id), AutonomousTxOptions::default()).await.unwrap().committed());
+            flush_and_adopt(&database).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        database.object_store().head_fresh(&data).await.unwrap();
+        database.object_store().head_fresh(&metadata).await.unwrap();
+        tokio::time::timeout(limit, held.next_batch()).await.unwrap()
+    };
+    drop((held, follower_session, writer_session));
+    follower.shutdown();
+    writer.shutdown();
+    for owner in [follower_owner, writer_owner] {
+        tokio::time::timeout(limit, owner).await.unwrap().unwrap().unwrap();
+    }
+    schedule.assert_exhausted().unwrap();
+
+    if expire {
+        let Err(error) = resumed else { panic!("the follower cursor read past its lease") };
+        assert_eq!(error.code, "rtdb.storage/read-lease-expired", "{error}");
+    } else {
+        let batch = resumed.unwrap().expect("the follower cursor returns its admitted row");
+        assert_eq!(batch.batch().num_rows(), 1);
+    }
 }

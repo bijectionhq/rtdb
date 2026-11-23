@@ -7,6 +7,7 @@ Maintenance steps must preserve that history's observable answers and the availa
 
 See link:../dev/doc/rtdb-formal-verification-design.adoc[the full design] and link:../dev/doc/rtdb-verification.adoc[the individual studies].
 The first combined run is recorded in link:results/2026-11-21.adoc[the evidence ledger].
+The inherited-read disposal study is recorded in link:results/2026-11-22.adoc[the next evidence entry].
 The link:../dev/doc/rtdb-engine-verification-ledger.md[engine-wide catalog ledger] tracks the status of individual properties across the classic and multi-mode baselines.
 
 == Independent derivations
@@ -90,6 +91,7 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
   --apalache /path/to/apalache-mc --maude /path/to/maude \
   --mcrl2-bin /path/to/mCRL2.app/Contents/bin \
   --autohyper /path/to/AutoHyper \
+  --openjml /path/to/openjml \
   --rust-boundary --native-replay \
   --evidence /path/to/new-evidence-directory
 ----
@@ -106,6 +108,13 @@ Build the tool at that revision according to its upstream instructions and set i
 Pass the resulting executable as `--autohyper` and set `DOTNET_ROOT` for a separately installed .NET 8 runtime.
 The evidence includes the executable, assembly and tool configuration hashes.
 Omit the option to run the other studies without AutoHyper. https://github.com/AutoHyper/AutoHyper/tree/c94722d1f3c6d6f38a0967fcc580e26146c26109[AutoHyper build and setup]
+Pass `--openjml` to check the Java merge called by the production Kotlin trie.
+The recorded run used OpenJML 21.0.29 with its bundled Z3 5.1.0.
+The runner retains the baseline, tool version, and three negative controls.
+The controls select the larger head, drop an unread suffix, and replace a right-side value.
+Each control uses singleton or empty input runs as a witness.
+The head-selection control checks the affected branch through its order assertion.
+The unmodified proof checks all branches for arbitrary ordered input runs. https://www.openjml.org/tutorial/SplittingProofs[OpenJML proof splitting]
 The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
@@ -115,7 +124,11 @@ The production controls publish the root too early and stop on a missing checkpo
 The native collection replay checks that live and pending trie files remain protected until the installed checkpoint is replaced.
 Its control removes the checkpoint from collection eligibility.
 The startup replay test also covers a selected checkpoint whose first required replica offset is below the reported retained floor.
-The archived control skips the prefix check and must fail when the driver opens that suffix.
+The native recovery trace records committed directory revisions and the logkeeper's reported floors during a concurrent subscriber recovery and trim.
+The checker requires a covering published manifest and preserves each recorded replay hold.
+It checks each observed physical floor against the authorization held at that observation.
+Run `python3 verification/recovery_trace.py /path/to/rust-recovery-trace.json` to check the capture again.
+The archived controls skip cursor admission and reopen an admitted cursor.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
 The catalog clock test commits a transaction at an explicit system time, issues an attach and a refused detach, and reopens the same local log.
@@ -156,6 +169,20 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/Checkpoint.tla` separates durable object publication, lost replies, listing, and log replay across a restart.
   It checks one root and three dependencies with finite failures, including early publication, loss of an acknowledged dependency, and log trimming followed by a listing omission.
   It compares an acknowledged pending copy with a copy whose completion is checked.
+* `tla/ForkPublication.tla` compares a complete independent checkpoint copy and a coordinated publication of shared references.
+  Both variants separate child publication, reaper inventory, deletion authorization and the provider effect.
+  The controls check stale inventory, missed admission fencing, early source deletion and incomplete destination publication.
+  Apalache checks both policies and the stale-inventory control through eight transitions.
+* `tla/ResidenceReaderRetention.tla` compares a generation cutoff and exact dependency holds across independent readers and a reaper.
+  Both models separate catalog publication, release certification, a captured sweep and later deletion, and keep closed readers' provider work protected until drain.
+  `lean/ResidenceReaderRetention.lean` proves safety conditional on the retirement certificate and the captured-reader premise.
+  It proves that exact tracking permits every cutoff deletion and exhibits a dependency-independent deletion that only exact tracking permits.
+* `tla/CatalogAdmissionFloor.tla` models independent reader and floor proposals over the same versioned record.
+  TLC covers one reader, three cuts and six directory version increments.
+  Apalache checks through eight transitions, including a stale floor write control.
+  `lean/CatalogAdmissionFloor.lean` proves that every finite history of guarded atomic steps preserves held readers for any finite reader list.
+  It separately proves floor monotonicity for each step.
+  It assumes each successful update sees the authoritative ledger at its linearization point.
 * `tla/RecoveryCollection.tla` checks overlapping checkpoint generations, an active recovery reference, the required log suffix, and delayed object deletion.
   TLC explores its finite state space and Apalache independently checks the same safety conditions up to ten transitions.
 * `tla/InstalledCheckpoint.tla` models the local trie collector while compaction, checkpoint publication, checkpoint adoption, readers, and physical deletion advance separately.
@@ -163,20 +190,130 @@ It also exercises the Azure adapter against a loopback provider and separately m
   TLC explores its finite state space, and Apalache cross-checks retention through ten transitions.
 * `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
-* `tla/RecoveryReplay.tla` models a checkpoint selection check against the observed replica prefix, refresh, and subsequent tail opening.
+* `tla/CheckpointMetadataRetention.tla` models the held block lower bound, monotone publication and delayed metadata removal across independent authorities.
+  `lean/CheckpointMetadataRetention.lean` proves that a reaper plan remains valid as the head moves forward and new holds are granted.
+  Verus checks the exact metadata comparison in the Multi reaper.
+  The native cell storage test checks a named block pack, a spilled table block, and loose metadata under the same hold and verifies that physical cleanup resumes after provider drain.
+* `tla/ReplicaTrimAdmission.tla` models shared recovery admission and trim authorization separately from physical deletion.
+  `lean/ReplicaTrimAdmission.lean` proves safety for an arbitrary number of readers and finite histories.
+  Multi startup checks the directory's certified trim boundary and registers a hold for a nonempty catch-up window before admitting the provider cursor.
+  Verus checks both the recovery start and the cap on an authorized trim in exact production source.
+  The native concurrent-trim test checks the retained record, subscriber SQL results, and progress after releasing the hold, with a source control that discards the hold at trim selection.
+* `tla/ReplicaHoldLifecycle.tla` separates an ambiguous admission, cancellation, provider drain, and confirmed owner death.
+  Its controls release during drain, substitute a timeout for death evidence, and skip the closing CAS when a delayed admission has not appeared yet.
+  The reachability case permits reclamation after confirmed owner death.
+  `lean/ReplicaHoldClose.lean` proves that a close changes only its own hold and fences every already-issued admission at the old revision or earlier, including when no hold is visible.
+* `tla/PreparedReplay.tla` models admitting a replica cursor before installing an ordinary checkpoint and transferring that cursor to the driver.
+  Its controls check early installation, early refusal, and reopening an admitted cursor.
+  The reachability witnesses show a successful refresh and a separate trim after admission.
+* `tla/RecoveryReplay.tla` models the earlier checkpoint selection check against the observed replica prefix, refresh, and subsequent tail opening.
   It checks recovery with a newer checkpoint and reaches a separate loss between the probe and tail opening.
+* `tla/PublishedCheckpoint.tla` checks that a directory-admitted checkpoint and a replay retry keep the authorized journal and advance both coordinates.
+  `lean/PublishedCheckpoint.lean` proves the coordinate relationship for arbitrary retry histories.
+  `verus/checkpoint_discovery` checks the exact Rust predicate for the admitted boundary and a valid successor.
+  Native replays exercise a mismatched checkpoint, a different journal, a prefix gap and successful recovery from a later boundary.
+* `tla/CheckpointTableManifest.tla` checks publication after table writes and acceptance only when the observed bytes match the checkpoint bindings.
+  `lean/CheckpointTableManifest.lean` proves registry coverage and preservation of derived dependencies under the stated digest premise.
+  The Rust replays check exact OID coverage and refusal when valid bytes for a different table appear under the expected path.
+* `tla/CheckpointPackEvidence.tla` compares a fresh storage observation with trusting staged bytes or a cached index.
+  It also checks the difference between observing the pack and holding it through confirmation submission.
+  `verus/pack_extent` verifies the packing adapter's byte-range guard over all representable offsets and lengths.
+  The native replays cover pack observations, encrypted retries, index admission and recovered-checkpoint confirmation.
+* `tla/PackPublicationObservation.tla` checks the identity shared by pack metadata, the trailer, the index and member reads, including a fork copy.
+  `lean/PackPublicationObservation.lean` proves preservation through arbitrary finite schedules in the versioned read model.
+  The Rust replays use a versioned memory store for pack inspection and a loopback S3 provider for version evidence from a ranged response.
+* `tla/ReceiptedCheckpointStartup.tla` checks exact root selection, joint metadata and replay retention, and their handoff to a cursor.
+  `lean/ReceiptedCheckpointStartup.lean` proves preservation under arbitrary finite effect schedules and replay offsets in the abstract model.
+  Native cases exercise a directory receipt, a stored successor, an authorized trim, cancellation, packed directory serialization and the real flush path.
+* `tla/CheckpointReplayClosure.tla` checks bound table discovery, repeat observations and publication only after the replay inventory is copied.
+  `lean/CheckpointReplayClosure.lean` proves membership for retained inputs and usable artefacts over arbitrary lists of decoded trie entries.
+  The Rust cases cover shared paths, retained level-zero files, rejected table substitution, older archive manifests and independent-fork publication.
+* `tla/RepairArchiveCustody.tla` checks independent repair and destination holds through source reads, drain, and uncertain destination publications.
+  `lean/RepairArchiveCustody.lean` checks retention for arbitrary regions, archive identities, and finite schedules.
+  `verus/repair_archive_custody` checks the production membership and closed-region guard.
+  Native replays cover recapture, transfer from original repair custody, and local maintenance held across cancellation.
+* `tla/SourceRetirementSettlement.tla` compares exact-version and serialized-path reclamation when work can complete after its submitting task stops.
+* `tla/ExactRetirementRetry.tla` checks settlement with two outstanding requests for one version and up to two replacement versions.
+  `lean/ExactRetirementRetry.lean` proves idempotence and preservation of other versions for arbitrary keys and versions.
+  A loopback S3 replay checks the version-qualified request, verifies continued listing, and requires an exact negative observation before reporting success.
+* `tla/SharedReferenceRevision.tla` checks whether a referrer inventory can be authorized at its starting revision when a fork or descendant publishes during the scan.
+  `lean/SharedReferenceRevision.lean` proves cut preservation for arbitrary finite publication histories.
+  `verus/shared_reference_revision` checks the parent guard and revision arithmetic used by the directory implementations.
+  The directory contract exercises the observable revision in memory, over TCP and against a configured DynamoDB Local fixture.
+* `tla/LineageRetirementAdmission.tla` checks the next authority's preparation generation, provider-read admission, referrer transfer and settlement.
+  It separates stale fork preparation from whether the lineage currently admits publication.
+* `tla/MonotoneReferenceManifest.tla` checks a delayed manifest withdrawal, competing withdrawals, lookup during pruning, and the order of withdrawing a fallback and removing its local copy.
+  `lean/MonotoneReferenceManifest.lean` proves monotone owner-bound edits and safe pruning over arbitrary keys and sequences.
+* `tla/ReferenceReadDisposal.tla` checks whole-residence disposal with two inherited provider reads, including cancellation, owner registration, fencing, drain and copy before erasure.
+  `lean/ReferenceReadDisposal.lean` proves the same retention and handoff invariants for arbitrary reader sets. The Verus `reference_read_admission` area checks the serving admission decision and `verify_native_reference_read` replays cancellation and disposal through the local provider.
+* `tla/ReferenceDisposalPublication.tla` checks a persistent lineage close, restart, referrer inventory, stale and fresh preparation, and reopening with the disposal receipt.
+  `lean/ReferenceDisposalPublication.lean` proves generation and residence laws over arbitrary histories. The `shared_reference_revision` Verus area checks the production publication and settlement predicates, and `verify_native_reference_disposal` replays the handoff across a directory restart.
+* `tla/ExactMarkerSettlement.tla` checks late exact release-marker effects against newer marker versions and the atomic settlement of the physical owner and lineage.
+  `verify_native_exact_marker` drives the application reaper and real S3 version adapter through a loopback fixture and a durable directory restart.
+  `verus/reference_manifest` checks the production sequence allocator and cleanup threshold.
+  The Rust replays check conflicting and backfilled write slots, current-manifest lookup, owner binding, and preservation of a failed removal's release record.
+* `tla/CheckpointCopyEvidence.tla` checks the predicate admitting a body to a checkpoint copy plan.
+  `lean/CheckpointCopyEvidence.lean` proves inventory agreement and budget conservation for arbitrary finite lists.
+  `verus/checkpoint_copy_budget` checks exact sealed-byte admission and accounting in production.
+  Rust cases cover an inherited pack and loose object, repair archive custody, a changed identity with identical data, and the S3 full-body response.
+* `tla/CheckpointPhysicalOwners.tla` compares one atomic admission with acquisition separately from each physical owner.
+  It checks that every owner has admitted the copy before provider work begins and that cancellation releases partial acquisitions.
+* `tla/CheckpointSourceHandoff.tla` compares exact physical and residence-wide source holds for two roots with shared and inherited dependencies.
+  It checks delayed collection, cancellation before the provider drains and a separate durable destination handoff under declared fairness.
+  `lean/CheckpointSourceHandoff.lean` proves preservation for arbitrary exact physical dependency sets and finite schedules.
+  `lean/CheckpointMetadataRetention.lean` checks archival metadata handoff for arbitrary finite histories, and `verus/checkpoint_metadata` checks the production admission guard.
+* `tla/HostedPackRetirement.tla` checks same-version member coverage, the successor and hold guards, exact removal and later settlement of residual markers.
+  Apalache independently checks the bounded model and the incomplete-coverage control.
+  Lean proves that the greatest covered block bounds each member, and `verus/checkpoint_metadata` checks the Rust guard used inside the owner's CAS.
+  The native replay exercises hosted path fallback, incomplete coverage, an active startup hold and settlement alongside a replacement.
+  Native compile-fail cases check the local eraser's visibility and keep the simulation control restricted to in-memory stores.
+  Native capture checks a refused old root, successful transfer from a predecessor, release after copy, and reuse of a completed archive.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.
   Both runs must eventually admit the same block. The existence check reaches an intermediate difference in admission time.
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `tla/ReaderIO.tla` separates admission and in-flight I/O, with controls for clock error, expiry, overrun, release, and authority change.
+* `tla/DelegatedScan.tla` separates a worker's preliminary progress observation, actual snapshot capture, provider drain and the coordinator's fallback.
+  `lean/DelegatedScan.lean` checks the point-observation law over the shared committed history model.
+  The native scan replay checks the exact worker admission and I/O lifetime against separately weakened production source.
+* `tla/CatalogCutPublication.tla` compares a jointly captured installed catalog cut with progress inferred from replica delivery, a later sample or a transaction basis.
+  It checks the claim that an admitted snapshot can still read its dependencies when collection moves ahead.
+* `tla/RetirementPublication.tla` checks a certificate published after installation with a matching admission floor and an identity-scoped provider deletion.
+  `verus/trie_removal_receipt` checks the native decision to acknowledge a removal after installed read-back and exclusion of its trie keys.
+  The native replay checks include a control that sends the acknowledgement during application, before the prefix is published.
+  `verus/trie_retirement_intent` checks the receipt's journal and its order relative to the persisted selection cut.
+  The associated native replay checks restart on both sides of installation and after a partial release. Its controls cover durable staging, replay, receipt and floor ordering, file accounting and metadata ordering.
+* `tla/HostedTrieRelease.tla` checks the ordering from installed receipt through admission floor to queued release, with one older reader and a restart during handoff.
+  Apalache independently checks the safety conjunction and loss of the pending plan.
+  `lean/HostedTrieRelease.lean` checks release authority and complete accounting for arbitrary file plans over finite histories.
+* `tla/ReadCurrencyAnchor.tla` checks competing clock and tip observations and the replica prefix needed to confirm them.
+  `verus/read_currency` checks the two Rust decisions shared by foreground and maintenance observers.
+  `lean/ReadCurrencyAnchor.lean` proves prefix coverage and monotonicity for arbitrary finite histories in the reference model.
+  The native replay verifies early refusal of a replicated query without a current lease, with a matching omission control.
+* `tla/ResidenceComposition.tla` models snapshot admission, log trimming, exact-version retirement and whole-residence disposal in a common state.
+  Its controls test cross-domain dependencies, including a canceled query's provider read, an older recovery cursor, fork publication and transfer before erasure.
+  `tla/ResidenceCompositionReplay.tla` checks an authored event trace against the same transitions and refuses five invalid variants at their first unmatched step.
+  With `--native-replay`, it also checks copy and removal effects recorded by local disposal under a directory permit, with a separate control for removal before the relevant fork copy.
+* `tla/ResidenceRetirement.tla` composes durable intent and exact-identity deletion with a serving view, an in-flight provider request, a recovery cursor, a checkpoint, and a fork.
+  It includes three generations, one shared file, one pair of physical versions of a logical key, and one delayed deletion grant per file.
+  Its controls drop each hold or fence independently and include loss of a durable intent both before and after installation.
+  Its reachability check collects and reuses a physical key.
+* `tla/S3KeyCustody.tla` checks conditional provisioning, withdrawal, and confirmation for one S3 vault key.
+  It distinguishes a successful withdrawal from a conditional conflict and separately checks the provider's no-historical-version premise.
+* `verus/key_enrollment` checks the production decision to enroll a missing key under current writer authority in a pristine original residence.
+  Its single and joint controls cover authority, residence identity, and durable history.
+* `verus/catalog_reader_admission` checks the Rust directory's serving-owner, residence and journal predicates.
+  Each guard has a production-only and a jointly weakened contract control.
+* `tla/FragmentResidence.tla` checks routing and recipient admission when a database moves or opens a new replica journal.
+  Its controls bind the request to the latest route, trust placement at read time, and ignore the journal epoch.
   `lean/ReaderRetention.lean` proves strict lease timing and preservation of an abstract counted pin, with matching expiry and close controls.
   `lean/GenerationRetention.lean` proves that a coordinated registry keeps every object required by the current generation, open readers, and in-flight operations available across arbitrary finite histories.
   Each read completion releases exactly one reference, and an unreferenced object admits authorization followed by collection.
   The model treats reference accounting and collection authorization as atomic and requires a conclusive provider completion for the deletion step.
   Verus checks the native reader selection decision over the locally captured catalog list.
   The selected Rust maintenance and storage tests exercise the single-partition authority and the transfer of its lifetime into provider I/O.
+  `verus/read_lease` verifies the production lease deadline, admission and collection-wait decisions, and the law that an admitted request finishes before collection under bounded skew and request duration.
 * `tla/CompactionGroup.tla` checks durable, complete sibling publication for one replacement.
   `tla/CompactionOverlap.tla` compares exact sibling membership with a high-water mark across two interleaved generations.
   The Rust catalog regression checks the corresponding admission behavior.
@@ -190,6 +327,14 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
   The tiered publication area checks that all four serving siblings for the same block exist before the catalog retires the parent.
   The checkpoint discovery area checks the production retry decision and its decreasing distance from the maximum index.
+  The local repair area checks same-journal anchor advancement, protection and synchronization before collection, all digest bytes, the retained boundary match, and the exact exclusive replay endpoint in the Rust decision functions.
+  The native case repairs from the reopened anchor and rejects a build that omits the persisted boundary check.
+  The reset retirement area verifies the Rust decision that checks the adopted block, naming epoch and withdrawal of every retired trie.
+  The ResetRetirement TLC model checks restart, an installed retirement receipt and the catalog floor before release, with controls for bypassing adoption, reader drain and the floor.
+  The native reset replay rejects a build that deletes the superseded files directly while the old catalog is held.
+  The replayed reset area checks the separate filename namespace for reconstructed compacted pairs.
+  The ReplayedReset TLC model checks synchronization, current-cut admission and publication before retirement.
+  The native replayed reset test starts with a compacted archive and a missing suffix pair, then verifies in-place adoption and restart.
   The replay floor area checks the exact signed-offset rule for a required replica record below a provider's reported floor.
   The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.

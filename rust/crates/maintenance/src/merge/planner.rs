@@ -63,13 +63,13 @@ pub(super) struct RowHeap<'a> {
 impl<'a> RowHeap<'a> {
     pub fn new(streams: &'a [Vec<PageEvent>]) -> Result<Self> {
         let heads = row_heap::from_pages(streams.len(), |stream| streams[stream].len(), |head| Self::key(streams, head))
-            .ok_or_else(|| crate::invalid("Compaction page is not IID ascending and system-time descending"))?;
+            .ok_or_else(|| crate::invalid("Compaction page is not IID ascending and system-position descending"))?;
         Ok(Self { streams, heads })
     }
 
     fn key(streams: &[Vec<PageEvent>], (stream, row): row_heap::Head) -> row_heap::Key {
         let event = &streams[stream][row];
-        (u128::from_be_bytes(event.iid.0), event.system_from.0)
+        (u128::from_be_bytes(event.iid.0), event.system_from.0, event.commit_position)
     }
 
     pub fn next(&mut self) -> Option<row_heap::Head> {

@@ -119,7 +119,7 @@ async fn table_list_results_leave_maps_empty_and_keep_integer_views_owned() {
         let scope = EvaluationScope::new(&memory).unwrap();
         let parameters = [V::Map { entries: vec![(V::Utf8("key".into()),V::I64(1))], sorted: false }];
         let parameter = Expr::Parameter { index: 0,data_type: parameters[0].logical_type() };
-        let context = EvalContext { parameters: &parameters,allocation: Some(&scope),..Default::default() };
+        let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters),allocation: Some(&scope),..Default::default() };
         let schema = Schema::default();
         assert!(rtdb_expr::evaluate_list_async(&parameter,&schema,&[],&context).await.unwrap().is_empty());
         let series = ints(0,i64::from(i32::MAX),1,false);

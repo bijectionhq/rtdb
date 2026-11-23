@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fmt, sync::Arc};
 
-use arrow_array::{Array, Float32Array, Float64Array, UnionArray};
-use arrow_schema::{DataType, UnionMode};
+use arrow_array::{Array, Float32Array, Float64Array, NullArray, UnionArray, builder::{ArrayBuilder, Float32Builder, Float64Builder}};
+use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Anomaly, LogicalType, Result, ScalarType, Value};
@@ -141,7 +141,7 @@ impl ListValue {
         }
     }
 
-    pub(crate) fn retained_payload_bytes(&self) -> Result<usize> {
+    pub fn retained_payload_bytes(&self) -> Result<usize> {
         let overflow = || Anomaly::incorrect("rtdb/value-size-overflow", "Retained value memory exceeds usize");
         match &self.0 {
             Storage::Values(values) => {
@@ -197,8 +197,55 @@ impl From<Vec<Value>> for ListValue {
             Some(Value::F64(_)) if values.iter().all(|value| matches!(value, Value::F64(_) | Value::Null)) => {
                 Self::from_f64(values.iter().map(|value| if let Value::F64(value) = value { Some(*value) } else { None }).collect())
             }
-            _ => Self(Storage::Values(values)),
+            _ => Self::pack_mixed_floats(&values).unwrap_or_else(|| Self(Storage::Values(values))),
         }
+    }
+}
+
+impl ListValue {
+    fn pack_mixed_floats(values: &[Value]) -> Option<Self> {
+        if !values.iter().any(|value| matches!(value, Value::F32(_)))
+            || !values.iter().any(|value| matches!(value, Value::F64(_)))
+            || !values.iter().all(|value| matches!(value, Value::F32(_) | Value::F64(_) | Value::Null))
+        {
+            return None;
+        }
+        let mut floats = Float32Builder::new();
+        let mut doubles = Float64Builder::new();
+        let mut nulls = 0usize;
+        let mut types = Vec::with_capacity(values.len());
+        let mut offsets = Vec::with_capacity(values.len());
+        for value in values {
+            let (id, offset) = match value {
+                Value::F32(value) => {
+                    let offset = floats.len();
+                    floats.append_value(*value);
+                    (0, offset)
+                }
+                Value::F64(value) => {
+                    let offset = doubles.len();
+                    doubles.append_value(*value);
+                    (1, offset)
+                }
+                Value::Null => {
+                    let offset = nulls;
+                    nulls += 1;
+                    (2, offset)
+                }
+                _ => return None,
+            };
+            types.push(id);
+            offsets.push(i32::try_from(offset).ok()?);
+        }
+        let fields = UnionFields::try_new(0i8..3, [
+            Field::new("f32", DataType::Float32, false),
+            Field::new("f64", DataType::Float64, false),
+            Field::new("null", DataType::Null, true),
+        ]).ok()?;
+        let values = UnionArray::try_new(fields, types.into(), Some(offsets.into()), vec![
+            Arc::new(floats.finish()), Arc::new(doubles.finish()), Arc::new(NullArray::new(nulls)),
+        ]).ok()?;
+        Self::from_float_union(values)
     }
 }
 

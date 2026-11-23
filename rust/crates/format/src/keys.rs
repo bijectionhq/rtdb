@@ -6,6 +6,14 @@ use serde::Serialize;
 
 pub const CURRENT_STORAGE_VERSION: StorageVersion = StorageVersion(6);
 
+/// Retirement intents and installed receipts belong to the residence that writes them.
+pub const TRIE_RETIREMENT_DIRECTORY: &str = "~trie-retirements";
+
+pub fn is_trie_retirement_object(key: &str) -> bool {
+    key == TRIE_RETIREMENT_DIRECTORY || key.strip_prefix(TRIE_RETIREMENT_DIRECTORY)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// Independently derived ordered indexes belong to one source history.
 pub const ORDERED_INDEX_ROOT: &str = "ordered-index/v2";
 
@@ -160,6 +168,8 @@ pub struct TrieKey {
     recency: Option<CivilDate>,
     part: Vec<u8>,
     block_index: BlockIndex,
+    /// The naming epoch the trie was planned in; a compactor reset starts a new one, so no name is ever published twice.
+    epoch: u64,
 }
 
 impl TrieKey {
@@ -169,8 +179,12 @@ impl TrieKey {
         if part.iter().any(|bucket| *bucket > 3) || recency.is_some_and(|date| date.year() < 0) {
             return Err(Anomaly::incorrect("rtdb.format/invalid-trie-key", "Trie partitions use base-four buckets and recency years must be non-negative"));
         }
-        Ok(Self { level, recency, part, block_index })
+        Ok(Self { level, recency, part, block_index, epoch: 0 })
     }
+
+    /// The same position planned in `epoch`.
+    pub fn with_epoch(self, epoch: u64) -> Self { Self { epoch, ..self } }
+    pub fn epoch(&self) -> u64 { self.epoch }
 
     pub fn l0(block_index: BlockIndex) -> Result<Self> { Self::new(0, None, Vec::new(), block_index) }
     pub fn level(&self) -> i64 { self.level }
@@ -183,7 +197,7 @@ impl TrieKey {
     pub fn part_group(&self) -> Option<PartGroup> {
         let tiered = self.level >= 3 || (self.level == 2 && self.recency.is_none());
         let (_, parent) = self.part.split_last().filter(|_| tiered)?;
-        Some(PartGroup { parent: Self { level: self.level, recency: self.recency, part: parent.to_vec(), block_index: self.block_index } })
+        Some(PartGroup { parent: Self { part: parent.to_vec(), ..self.clone() } })
     }
 }
 
@@ -272,7 +286,9 @@ impl fmt::Display for TrieKey {
             output.write_str("-p")?;
             for bucket in &self.part { write!(output, "{bucket}")?; }
         }
-        write!(output, "-b{}", lex_hex(self.block_index.0 as u64))
+        write!(output, "-b{}", lex_hex(self.block_index.0 as u64))?;
+        if self.epoch != 0 { write!(output, "-e{}", lex_hex(self.epoch))?; }
+        Ok(())
     }
 }
 
@@ -280,7 +296,16 @@ impl FromStr for TrieKey {
     type Err = Anomaly;
 
     fn from_str(key: &str) -> Result<Self> {
-        let parts: Vec<_> = key.split('-').collect();
+        let mut parts: Vec<_> = key.split('-').collect();
+        let epoch = match parts.last().and_then(|last| last.strip_prefix('e')) {
+            Some(epoch) => {
+                let epoch = signed_position(epoch)?;
+                if epoch <= 0 { return Err(invalid_key(key)); }
+                parts.pop();
+                epoch as u64
+            }
+            None => 0,
+        };
         if !(parts.len() == 3 || parts.len() == 4) { return Err(invalid_key(key)); }
         let level = signed_position(parts[0].strip_prefix('l').ok_or_else(|| invalid_key(key))?)?;
         let recency = parts[1].strip_prefix('r').ok_or_else(|| invalid_key(key))?;
@@ -302,7 +327,7 @@ impl FromStr for TrieKey {
             digits.bytes().map(|c| c - b'0').collect()
         } else { Vec::new() };
         let block = signed_position(parts.last().unwrap().strip_prefix('b').ok_or_else(|| invalid_key(key))?)?;
-        Self::new(level, recency, part, BlockIndex(block))
+        Ok(Self::new(level, recency, part, BlockIndex(block))?.with_epoch(epoch))
     }
 }
 

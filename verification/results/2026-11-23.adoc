@@ -1,0 +1,151 @@
+= RTDB kernel study results, 2026-11-23
+
+== W1 · Successor trie collector and lease expiry
+
+The collector contract in link:../../dev/doc/gc.allium[gc.allium] starts a new wait after a collector restarts or takes over.
+The study covers a newly selected trie under that contract.
+It compares an observation scoped to one collector with a weaker design that permits a predecessor's observation to carry over.
+
+[cols="1,4",options="header"]
+|===
+|Evidence |Result
+
+|TLC 2026.11.19.180144
+|The baseline explored 9,792 distinct states across two terms, one file and one reader, with a time horizon of nine ticks, a four-tick lease and origins in {0, 9}.
+It checked that collection follows a full wait measured by the current collector and that an admitted provider read retains its file while in flight.
+With weak fairness of collection, a successor with an elapsed window eventually collects.
+The liveness premise requires time to reach the end of that window within the modeled horizon.
+
+|Controls and witness
+|The abstract observation reuse control violates the own-observation invariant and the I/O-retention invariant when checked separately.
+The restart-window control violates the temporal progress property.
+The reachability witness observes collection in a successor with a different clock origin.
+
+|Native Rust
+|The production collector runs twice as distinct instances over the same in-memory store and partition.
+For a 500-microsecond lease, the successor keeps the data and metadata on first observation and at 499 microseconds, then deletes both and publishes the retirement exactly at 500 microseconds.
+The progress control resets the observation window on each collection pass and fails at the final retirement assertion.
+The full maintenance crate passed all 53 cases, including 12 collection integration cases.
+|===
+
+The model assumes clocks with equal rates and arbitrary origins within the finite set.
+The reader anchor comes from a confirmed prefix that predates retirement.
+I/O finishes within the modeled two-tick bound, which equals the lease margin.
+The existing link:../verus/read_lease/laws.rs[Verus lease laws] cover the elapsed-time inequalities for bounded drift when the margin also covers provider execution.
+Provider duration, the scheduling of real elections, and reclamation through resumed intents and Multi's deferred reaper remain separate obligations.
+The native fixture exercises collector replacement with an eligible catalog and manual clocks.
+
+The maintained runner is link:../run.py[verification/run.py].
+The selected cases use link:../tla/CollectorTurnover.cfg[CollectorTurnover.cfg] and the native replay `a_replacement_collector_waits_a_whole_lease_on_its_own_clock`.
+Exact commands and logs are in `collector-turnover-tlc-wv642cbw/` and `collector-turnover-native-7y0po1n3/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+The targeted suite repeated after rebase at `4bed8fe25f` in `collector-turnover-land-d9jr3wxr/`.
+The check receipt names the revision and pinned TLC and Java executables.
+
+== W1 · Transaction catalog retention through the local ledger
+
+The external transaction fixture uses two independent local store handles on the same filesystem ledger.
+It checks that the floor stays at its previous position while the resolver owns the capture.
+The writer stages a row and opens a cursor over the transaction's overlay.
+The cursor retains the captured catalog after resolution returns, still reads the row, and releases the hold on drop.
+The next attempt advances the floor.
+A source transaction attempting to use the earlier capture then receives `rtdb.storage/catalog-not-current` from the store.
+The overlay mutation fails at the assertion that the cursor retains the hold after resolution.
+All 120 transaction crate cases passed after rebase.
+Exact commands and output are under transaction-catalog-hold-pzn3x9vi/ in the evidence directory above.
+
+The fixture exercises production transaction resolution, query capture and the local directory lock protocol.
+It uses a row in the transaction overlay and no remote provider work.
+Shared admission on stores without a catalog ledger, scheduling across real elections, and transaction-cursor cancellation while a provider call drains remain open.
+
+== W1 · Resuming a pending local retirement
+
+The local collector fixture now reopens the collector while the earlier filesystem reader ticket is still held.
+The successor retains both files and the one pending intent.
+After the ticket is released, the same collector removes both files and clears the intent without another removal publication.
+Admission at the earlier cut is then refused by the persisted floor.
+
+The retirement replay's failure-propagation control now targets the collector's call to the deferred release adapter.
+Its ordering control now targets the release ranking function used by the local and hosted adapters.
+All seven controls were rejected at their declared assertions.
+The ordering control tests the shared function with the deterministic fixture's store.
+Hosted provider settlement remains a separate check.
+
+The complete maintenance suite and the retirement mutation commands and outputs are retained under retirement-native-controls-tc3pkp0w/ in the evidence directory above.
+
+== Combined evidence for the reader-retention increments
+
+The combined model and proof run at e7c50b6b36 matched all 492 TLC cases and 70 Apalache cases.
+Lean checked 69 study baselines and rejected 199 controls.
+Verus passed the baseline in all 42 areas and rejected 231 controls at their declared functions.
+The Alloy, SMT, Maude, mCRL2, AutoHyper and OpenJML checks also matched.
+The receipt in collector-transaction-combined-e7c50b6b36/ names the source revision, executable digests and hashed inputs.
+
+A separate TLC run at 7c4ca5eb01 explored 52,254 states with a twelve-tick horizon, a six-tick lease, a three-tick I/O bound and margin, and clock origins in {0, 9, 15}.
+Both safety invariants and conditional progress held.
+The case configuration and output are retained in collector-turnover-expanded-q06v4exr/.
+
+At 7c4ca5eb01 the storage and index suites passed all 157 Rust cases.
+The separately run maintenance suite and retirement controls cover the local installed-receipt replay added after the combined formal revision.
+
+Gradle ran the full standard and property suites at 7c4ca5eb01 with the FFI library built from e7c50b6b36.
+Both revisions have the same production sources.
+There were 3,198 standard and 3,348 property passes with zero failures, errors or skips.
+All 398 JVM binding cases passed, including the native binding cases.
+The run emitted no reflection or boxed math warnings.
+The retained output is transaction-catalog-hold-pzn3x9vi/gradle-full-with-ffi.log.
+
+== W1 · Remote provider response drain
+
+The production remote adapter admits a read into a child I/O region and consumes the response body within that operation.
+The native fixture pauses the response stream, drops the caller and starts draining the parent region.
+The catalog owner remains alive and the drained region refuses new provider requests while the response is pending.
+Finishing the stream releases the owner and completes the drain.
+All 15 remote lifetime tests passed against the production adapter and a controlled in-memory provider.
+The fixture exercises the provider response stream in-process.
+
+== W1 · Idle successor and exact hosted retirement
+
+The two-node fixture uses the production replication and maintenance drivers, a shared in-memory journal and a shared filesystem catalog ledger.
+The first node remains serving while the second wins a later replica term.
+The successor compacts the trie and installs its retirement receipt while the predecessor still owns the earlier cursor.
+Both files remain readable and the cursor returns its original result.
+The cursor then closes and the successor completes the receipt with no further transaction or block.
+The native control disables the idle retry and fails at the completion assertion.
+
+The term supervisor signals native trie collection on entry and while idle when automatic collection is enabled.
+The retry period is the reader lease, bounded between 100 milliseconds and 60 seconds.
+The eight-state link:../tla/TrieGcRetry.tla[retry model] checks held-reader protection and progress for an installed receipt after the successor starts and the hold drains.
+Its liveness property assumes fair retry, collection and reaper actions.
+The controls reject release while held and the absence of an idle retry.
+A reachability case observes a completed successor retirement.
+
+The exact hosted fixture retains an actual directory catalog ticket through cancellation of the waiter.
+The collector cannot advance the floor to the receipt's installed cut until the admitted work finishes.
+The floor then advances and the serving store queues the exact publication for the production reaper.
+The versioned in-memory provider erases the target and drops the response.
+The next pass settles that same retirement and its marker.
+The fixture covers the reaper through its provider interface.
+
+At e256dbe553 the full Multi library, Node library and native Node suites passed 166, 23 and 122 cases.
+The native baseline and the idle-retry control are retained under retention-e2e-native-nekk6250/.
+The model commands and logs are under retention-e2e-tlc-izsdl7tu/.
+The full remote lifetime suite passed its 15 cases.
+
+=== Checks on the landed reader-retention revision
+
+At 10ab56c012, all 311 tests in the Multi library, Node library and native Node suites passed, and the remote-response and hosted-retirement replay commands passed independently.
+The combined formal run at that revision matched all 496 TLC and 70 Apalache cases.
+Lean checked 69 study baselines and rejected 199 controls.
+Verus passed 43 areas and rejected 240 controls at their declared functions.
+Alloy, SMT, Maude, mCRL2, AutoHyper and OpenJML also matched.
+The command, pinned executable and input receipts are under retention-e2e-combined-10ab56c012/.
+
+Gradle ran 3,198 standard and 3,348 property cases with no failures, errors or skips.
+The FFI fixture library was rebuilt from 10ab56c012 and its hash is retained alongside the logs in retention-e2e-land-l0hwk6pi/.
+The run emitted no reflection or boxed math warnings.
+
+The default local Gradle integration suite with the same revision and FFI passed 5,629 cases.
+One PostgreSQL slot-recreation case was skipped, and the XML recorded no skip reason.
+The integration run emitted no reflection or boxed math warnings.
+Its log is retention-e2e-land-l0hwk6pi/gradle-integration.log.

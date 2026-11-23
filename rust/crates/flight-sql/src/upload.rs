@@ -3,8 +3,8 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_flight::{FlightData, PutResult, sql::{Command, CommandStatementIngest, DoPutUpdateResult, TableExistsOption, TableNotExistOption}};
 use prost::Message;
-use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_read_value_bytes};
-use rtdb_tx::{ArrowDocuments, Documents, SqlArguments, TxOp};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes};
+use rtdb_tx::{ArrowDocuments, SqlArguments, TxOp};
 use rtdb_types::{TableRef, Value};
 use tonic::{Response, Status, Streaming};
 use crate::{error::{cancelled, invalid, status, unsupported}, service::{Call, Output, Service, command, result_stream}, wire};
@@ -23,11 +23,15 @@ impl Upload {
         let mut arguments: Option<SqlArguments> = None;
         while let Some(batch) = self.next().await? {
             if batch.batch().num_columns() == 0 { return Ok(None); }
-            let next = wire::arguments(batch.batch(), self.service.memory())?;
+            let next = SqlArguments::from_arrow(batch, self.service.memory()).map_err(status)?;
             match &mut arguments { Some(arguments) => arguments.append(next).map_err(status)?, None => arguments = Some(next) }
         }
         if arguments.is_none() {
-            if let Some(schema) = self.decoder.schema() { if !schema.fields().is_empty() { arguments = Some(wire::arguments(&RecordBatch::new_empty(Arc::clone(schema)), self.service.memory())?); } }
+            if let Some(schema) = self.decoder.schema().filter(|schema| !schema.fields().is_empty()) {
+                let memory = self.service.memory();
+                let batch = OwnedBatch::new(RecordBatch::new_empty(Arc::clone(schema)), memory).map_err(status)?;
+                arguments = Some(SqlArguments::from_arrow(batch, memory).map_err(status)?);
+            }
         }
         Ok(arguments)
     }
@@ -47,13 +51,11 @@ impl Service {
                 }
                 Command::CommandPreparedStatementQuery(command) => {
                     let prepared = self.prepared(&call, &command.prepared_statement_handle)?;
-                    let batch = upload.next().await?;
-                    let params = match batch {
-                        Some(batch) if batch.batch().num_columns() == 0 => None,
-                        Some(batch) => Some(batch),
-                        None => upload.decoder.schema().filter(|schema| !schema.fields().is_empty()).map(|schema| {
-                            OwnedBatch::new(RecordBatch::new_empty(Arc::clone(schema)), self.memory()).map_err(status)
-                        }).transpose()?,
+                    let params = match upload.next().await? {
+                        Some(batch) if batch.batch().num_columns() != 0 => Some(wire::BoundParameters::new(batch, self.memory())?),
+                        Some(_) => None,
+                        None => upload.decoder.schema().filter(|schema| !schema.fields().is_empty())
+                            .map(|schema| wire::BoundParameters::empty(schema, self.memory())).transpose()?,
                     };
                     *prepared.params.lock().expect("prepared parameters lock") = params; Ok(Vec::new())
                 }
@@ -69,14 +71,14 @@ impl Service {
                     let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?;
                     let mut native = connection.borrow().await?;
                     while let Some(batch) = upload.next().await? {
-                        let operation = match ArrowDocuments::try_from_owned(&batch, self.memory()).map_err(status)? {
-                            Some(documents) => TxOp::PutArrowDocs { table: table.clone(), documents, valid_from: None, valid_to: None },
+                        let documents = match ArrowDocuments::from_batch(&batch, self.memory()).map_err(status)? {
+                            Some(documents) => documents,
                             None => {
-                                let (rows, _scratch) = documents(batch.batch(), self)?;
-                                let documents = Documents::new(rows, self.memory()).map_err(status)?;
-                                TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to: None }
+                                let Some(documents) = ArrowDocuments::from_ingest_batch(&batch, self.memory()).map_err(status)? else { continue; };
+                                documents
                             }
                         };
+                        let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
                         if let Some(result) = native.state_mut().execute_operation(operation).await.map_err(status)? { if let Some(error) = result.error() { return Err(status(error.clone())); } }
                     }
                     Ok(update_ack())
@@ -98,11 +100,31 @@ fn validate_ingest(command: &CommandStatementIngest, database: &str) -> Result<(
     if command.table.contains('.') { return Err(invalid("Bulk ingest table name must not contain '.'; use the schema field")); }
     Ok(())
 }
-fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+pub(crate) fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+    decode_documents(batch, service.memory(), rtdb_columnar::read_execution_value_as)
+}
+
+pub(crate) fn domain_documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+    decode_documents(batch, service.memory(), rtdb_columnar::read_value_as)
+}
+
+pub(crate) fn owned_documents(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+    decode_documents(batch, memory, |ty, field, column, row| {
+        match ty {
+            rtdb_types::LogicalType::Nothing => Ok(Value::Undefined),
+            _ => rtdb_columnar::read_value_as(ty, field, column, row),
+        }
+    })
+}
+
+fn decode_documents(
+    batch: &RecordBatch, memory: &Arc<MemoryBudget>,
+    read: impl Fn(&rtdb_types::LogicalType, &arrow_schema::Field, &dyn arrow_array::Array, usize) -> rtdb_types::Result<Value>,
+) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
     let schema = batch.schema(); let mut bound = 8192;
     for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = wire::add(bound, wire::add(field.name().len(), estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?)?; } }
-    let scratch = service.memory().reserve(bound).map_err(status)?;
+    let scratch = memory.reserve(bound).map_err(status)?;
     let types = if batch.num_rows() == 0 { Vec::new() } else { schema.fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? };
-    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| Ok((field.name().clone(), rtdb_columnar::read_execution_value_as(ty, field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<StructFields<_>, Status>>()).collect::<Result<Vec<_>, _>>()?;
+    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| Ok((field.name().clone(), read(ty, field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<StructFields<_>, Status>>()).collect::<Result<Vec<_>, _>>()?;
     Ok((rows, scratch))
 }

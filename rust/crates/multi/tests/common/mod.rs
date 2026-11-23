@@ -11,12 +11,48 @@ use rtdb_server::config::NodeConfiguration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
+pub fn s3_storage() -> Option<CellStorage> {
+    s3_storage_in(&std::env::var("RTDB_S3_BUCKET").unwrap_or_else(|_| "rtdb-test".into()))
+}
+
+pub fn s3_archive_storage() -> Option<CellStorage> {
+    s3_storage_in(&std::env::var("RTDB_S3_ARCHIVE_BUCKET").ok()?)
+}
+
+pub fn hosted_test_owner() -> rtdb_directory::HostedTask {
+    rtdb_directory::HostedTask::new(
+        "arn:aws:ecs:us-east-1:123456789012:cluster/rtdb-proof",
+        "arn:aws:ecs:us-east-1:123456789012:task/rtdb-proof/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ).unwrap()
+}
+
+fn s3_storage_in(bucket: &str) -> Option<CellStorage> {
+    let endpoint = std::env::var("RTDB_S3_ENDPOINT").ok()?;
+    Some(CellStorage::parse(&format!("s3://{bucket}/run-{}?endpoint={endpoint}&path_style=true&region=us-east-1", uuid::Uuid::new_v4().simple())).unwrap())
+}
+
+pub async fn order_history(client: &tokio_postgres::Client) -> Vec<Vec<Option<String>>> {
+    use tokio_postgres::SimpleQueryMessage;
+
+    let history = "SELECT _id, total, _valid_from, _valid_to, _system_from, _system_to \
+                   FROM orders FOR ALL SYSTEM_TIME FOR ALL VALID_TIME";
+    let mut rows: Vec<Vec<Option<String>>> = client.simple_query(history).await.unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some((0..6).map(|index| row.get(index).map(str::to_owned)).collect()),
+            _ => None,
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agent: AgentOptions, index: usize,
                     pool: MemberPool, compaction_workers: bool, engine_version: Option<String>) -> process::RunningNode {
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
     let connections = pgwire_connections();
-    let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\n")).unwrap();
+    let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\nflightSql: {{port: 0, ownedNativeActions: true}}\n")).unwrap();
     process::start_node(Arc::clone(directory), process::NodeSettings {
         hosted_task: None,
         advertise_host: None,
@@ -74,6 +110,10 @@ impl Cell {
         Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true, |_| {}).await
     }
 
+    pub async fn start_without_log_fsync(nodes: usize) -> Self {
+        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, false, |_| {}).await
+    }
+
     pub async fn start_rate_limited(limit: NonZeroUsize) -> Self {
         Self::start_configured(None, vec![MemberPool::General], None, None, None, false, |agent| agent.activations_per_second = limit).await
     }
@@ -108,7 +148,7 @@ impl Cell {
         Self::start_configured_with_directory(directory, None, vec![MemberPool::General], None, None, None, true, |_| {}).await
     }
 
-    async fn start_configured_with_directory(directory: Arc<dyn Directory>, objects: Option<CellStorage>, pools: Vec<MemberPool>,
+    pub async fn start_configured_with_directory(directory: Arc<dyn Directory>, objects: Option<CellStorage>, pools: Vec<MemberPool>,
         park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool,
         configure: impl FnOnce(&mut AgentOptions)) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
@@ -117,6 +157,7 @@ impl Cell {
         let mut logkeepers = Vec::new();
         for index in 0..3 {
             logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
+                authority: None,
                 advertise_host: None,
                 listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("logkeeper-{index}")), fsync, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
                 availability_zone: format!("zone-{index}"), lease: lease(),
@@ -146,6 +187,7 @@ impl Cell {
     pub async fn add_logkeeper(&mut self) {
         let index = self.logkeepers.len() + 10;
         self.logkeepers.push(process::start_logkeeper(Arc::clone(&self.directory), process::LogkeeperSettings {
+            authority: None,
             advertise_host: None,
             listen: "127.0.0.1:0".parse().unwrap(), data_dir: self.data.path().join(format!("logkeeper-{index}")), fsync: true, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
             availability_zone: format!("zone-{index}"), lease: lease(),
@@ -177,10 +219,11 @@ impl Cell {
     pub fn keys(&self) -> rtdb_multi::keys::LocalKeyService { rtdb_multi::keys::LocalKeyService::new(self.data.path().join("keys")).unwrap() }
     pub fn node(&self, index: usize) -> &process::RunningNode { self.nodes[index].as_ref().unwrap() }
 
-    pub async fn stop(mut self) {
+    pub async fn stop(mut self) -> tempfile::TempDir {
         self.gateway_cancellation.cancel();
         for node in self.nodes.iter_mut().filter_map(Option::take) { node.kill().await.unwrap(); }
         for logkeeper in self.logkeepers.drain(..) { logkeeper.stop().await.unwrap(); }
+        self.data
     }
 }
 
