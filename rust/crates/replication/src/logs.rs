@@ -254,17 +254,16 @@ impl PartitionLogs {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
-        let origin = delivery.replica_objects.as_ref().map(|custody| custody.scope);
-        if origin.is_some() && !matches!(&record.envelope.message,
-            ReplicaBody::OversizedMessage(reference) if reference.payload_sha256.as_ref().is_some_and(|sha| sha.len() == 32))
-        {
-            return Err(Anomaly::fault("rtdb.replication/oversized-digest", "An installed replica payload has no exact digest"));
+        if let Some(custody) = &delivery.replica_objects {
+            if !custody.matches(delivery.metadata.offset, &key) {
+                return Err(Anomaly::fault("rtdb.replication/oversized-delivery",
+                    "The replica payload permit does not match this delivery"));
+            }
+            let payload = self.store.read_replica_payload(custody, &self.memory).await?;
+            return self.decode_oversized(record, payload.as_ref());
         }
         IoRegion::retaining(Arc::new(delivery), async {
-            let store = match origin {
-                Some(scope) => self.store.open_replica_objects(scope).await?,
-                None => Arc::clone(&self.store),
-            };
+            let store = &self.store;
             let length = usize::try_from(store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
             let allocation = store.exact_object_allocation(&key, length)?;
             let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(size_overflow)?;

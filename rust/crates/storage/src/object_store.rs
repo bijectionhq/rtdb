@@ -149,9 +149,10 @@ pub trait ObjectStore: Send + Sync {
     /// Whether returned bytes may be reused across reads without returning to this owner.
     fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
-    /// Opens the read-only objects owned by an authenticated replica delivery.
-    async fn open_replica_objects(&self, _scope: crate::log::ReplicaObjectScope) -> Result<Arc<dyn ObjectStore>> {
-        Err(Error::Task("The store has no installed replica object scope".into()))
+    /// Resolves the single payload named by an authenticated replica delivery.
+    async fn read_replica_payload(&self, _custody: &crate::log::ReplicaObjectCustody,
+        _memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<crate::log::ReplicaPayload> {
+        Err(Error::Task("The store has no installed replica payload broker".into()))
     }
     /// Published checkpoint files survive a process restart on the same storage.
     fn syncs_checkpoints(&self) -> bool { false }

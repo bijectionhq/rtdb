@@ -18,7 +18,7 @@ use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
 use rtdb_replication::{BlockDiscovery, PublishedCheckpoint};
 use rtdb_storage::{
     Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadLease,
-    log::ReplicaObjectScope,
+    log::{ReplicaObjectCustody, ReplicaObjectScope, ReplicaPayload},
     object_store::{ObjectReadAllocation, ReadReservation, RetainedBytes, StoredObject},
 };
 use rtdb_types::{
@@ -562,18 +562,15 @@ impl ObjectStore for ServingStore {
         self.writer.is_some()
     }
 
-    async fn open_replica_objects(
-        &self,
-        scope: ReplicaObjectScope,
-    ) -> rtdb_storage::Result<Arc<dyn ObjectStore>> {
-        let owner = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| Error::Task("The store has no installed replica object scope".into()))?;
-        self.with_serving_lease(owner, |deadline| {
-            owner.replica_objects.open(scope, deadline)
-        })
-        .await
+    async fn read_replica_payload(
+        &self, custody: &ReplicaObjectCustody, memory: &Arc<rtdb_columnar::MemoryBudget>,
+    ) -> rtdb_storage::Result<ReplicaPayload> {
+        let owner = self.writer.as_ref()
+            .ok_or_else(|| Error::Task("The store has no installed replica payload broker".into()))?;
+        self.with_serving_lease(owner, |deadline| async move {
+            let store = owner.replica_objects.open(custody.scope(), deadline).await?;
+            custody.read_from(store.as_ref(), memory).await
+        }).await
     }
 
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {

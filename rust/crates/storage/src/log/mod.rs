@@ -63,37 +63,8 @@ pub struct LogMetadata {
     pub timestamp: Timestamp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplicaObjectScope {
-    pub deployment: uuid::Uuid,
-    pub incarnation: uuid::Uuid,
-    pub group: uuid::Uuid,
-    pub generation: u64,
-    pub writer_epoch: u64,
-}
-
-#[derive(Clone)]
-pub struct ReplicaObjectCustody {
-    pub scope: ReplicaObjectScope,
-    _hold: Arc<dyn Send + Sync>,
-}
-
-impl ReplicaObjectCustody {
-    pub fn new(scope: ReplicaObjectScope, hold: Arc<dyn Send + Sync>) -> Self {
-        Self { scope, _hold: hold }
-    }
-}
-
-impl std::fmt::Debug for ReplicaObjectCustody {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.scope.fmt(formatter)
-    }
-}
-
-impl PartialEq for ReplicaObjectCustody {
-    fn eq(&self, other: &Self) -> bool { self.scope == other.scope }
-}
-impl Eq for ReplicaObjectCustody {}
+mod replica_objects;
+pub use replica_objects::{ReplicaObjectCustody, ReplicaObjectScope, ReplicaPayload};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {

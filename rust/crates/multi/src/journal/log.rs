@@ -548,12 +548,13 @@ impl Cursor {
             Some(reservation) => reservation.retaining_io(open).await?,
             None => open.await?,
         };
+        let replica_objects = ReplicaObjectCustody::from_delivery(
+            scope, head.metadata.offset, &payload, rtdb_format::keys::CURRENT_STORAGE_VERSION,
+            rtdb_types::StorageEpoch(0), Arc::clone(held) as Arc<dyn Send + Sync>,
+        )?;
         let record = LogRecord {
             metadata: head.metadata,
-            replica_objects: Some(ReplicaObjectCustody::new(
-                scope,
-                Arc::clone(held) as Arc<dyn Send + Sync>,
-            )),
+            replica_objects,
             payload: Bytes::from_owner(Delivery {
                 bytes: payload,
                 _held: Arc::clone(held),

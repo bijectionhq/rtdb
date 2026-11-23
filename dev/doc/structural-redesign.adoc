@@ -190,6 +190,7 @@ Enrolled terminal storage can retire loose files with a write witness and an ins
 The existing versioned S3 payload collector still waits for the known physical journals to trim. The approved contract requires brokered recovery exclusion and drain before independent payload settlement.
 Normal readers register bounded replay holds and retain delivered pointers through provider drain. Archive and transfer reads require an admitted region covering the certified pointer's position.
 The offload retirement record binds the certified sealed frame digest and original replica position to the observed physical publication.
+Installed journal delivery resolves the one payload authenticated at its replica position through the serving lease and unit-key owner. Directory-managed replay still uses its own payload path.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.
