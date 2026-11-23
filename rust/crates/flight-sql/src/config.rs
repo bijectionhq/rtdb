@@ -1,11 +1,15 @@
 use std::{collections::BTreeSet, net::{IpAddr, Ipv4Addr, SocketAddr}, sync::Arc, time::Duration};
 use rtdb_node::Database;
 use rtdb_types::{Anomaly, Result};
-use crate::audience_seat::{parse_seat_alternate, session_seat_count, session_seat_index};
+use crate::audience_seat::{session_seat_count, session_seat_index};
+
+mod seat_uuid;
+mod seat_wire;
+pub use seat_wire::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER};
+pub(crate) use seat_wire::accepts_seat_header;
+use seat_wire::parse_seat_fields;
 
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
-pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v19";
-pub const AUDIENCE_SEAT_HEADER: &str = "x-rtdb-audience-reader-seat";
 pub const AUDIENCE_H2_STREAMS: u32 = 4;
 pub const AUDIENCE_H2_STREAM_WINDOW: u32 = 128 << 10;
 pub const AUDIENCE_H2_CONNECTION_WINDOW: u32 = 512 << 10;
@@ -67,16 +71,8 @@ impl AudienceFlightConfig {
 
     pub fn parse_seat(self, value: &str) -> Result<AudienceSeat> {
         let invalid = || Anomaly::incorrect("rtdb.flight-sql/audience-seat", "Invalid audience reader seat");
-        if value.len() > 41 { return Err(invalid()); }
-        let (turn, rest) = value.split_once('/').ok_or_else(invalid)?;
-        let (alternate, attempt) = rest.split_once('/').ok_or_else(invalid)?;
-        let turn = turn.parse::<usize>().map_err(|_| invalid())?;
-        let [digit] = alternate.as_bytes() else { return Err(invalid()); };
-        let alternate = parse_seat_alternate(self.turns, turn, *digit).ok_or_else(invalid)?;
-        let attempt = uuid::Uuid::parse_str(attempt).ok().filter(|attempt| !attempt.is_nil()).ok_or_else(invalid)?;
-        let seat = AudienceSeat { turn, alternate, attempt };
-        if seat.to_string() != value { return Err(invalid()); }
-        Ok(seat)
+        let (turn, alternate, attempt) = parse_seat_fields(self.turns, value.as_bytes()).ok_or_else(invalid)?;
+        Ok(AudienceSeat { turn, alternate, attempt })
     }
 
     pub(crate) fn session_seats(self) -> usize { session_seat_count(self.turns) }
@@ -165,6 +161,24 @@ mod tests {
         }
         for position in ["2/0", "0/2", "00/0"] {
             assert!(profile.parse_seat(&format!("{position}/{attempt}")).is_err());
+        }
+    }
+
+    #[test]
+    fn flight_seat_text_has_one_spelling_and_consumes_the_entire_header() {
+        let attempt = "01234567-89ab-4def-8000-000000000001";
+        let profile = AudienceFlightConfig::parse(&format!("{attempt}/64")).unwrap();
+        let canonical = format!("63/1/{attempt}");
+        assert_eq!(profile.parse_seat(&canonical).unwrap().to_string(), canonical);
+        for value in [
+            format!("063/1/{attempt}"),
+            format!("+1/0/{attempt}"),
+            format!("63/1/{}", attempt.to_ascii_uppercase()),
+            format!("63/1/{attempt}/"),
+            format!("64/1/{attempt}"),
+            "1/0/00000000-0000-0000-0000-000000000000".into(),
+        ] {
+            assert!(profile.parse_seat(&value).is_err(), "{value}");
         }
     }
 }

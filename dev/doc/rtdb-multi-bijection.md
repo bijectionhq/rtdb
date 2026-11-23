@@ -172,6 +172,27 @@ A transfer into another journal uses the copy path with the receiving journal's 
 The model assumes valid framing, successful durable publication of the modeled writes and bases, exact entry identification, and the surrounding authority and digest-read admission checks.
 It abstracts the first frame sync and the second observation sync as separate transitions and takes filesystem recovery, clock bounds, cutoff enforcement and quorum selection as premises.
 
+#### Framing decoder evidence
+
+On 2026-11-23, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 55 items in the [framing decoder area](../../verification/verus/framing_decoders/area.json).
+All 23 mutations failed at their declared laws.
+
+The checks cover the shipped source and replica header dispatch, replica frame and envelope mapping, eligible source, replica and journal round trips, fixed retirement bytes, and canonical Flight seat text.
+The protobuf wire traversal checks field keys and lengths, progresses across the complete outer envelope, and bounds group nesting at 100.
+Recovery hold detection validates all outer fields before using the presence of a length-delimited field 8.
+The journal reader checks the declared length against the remaining extent before requesting the body, checks the checksum of the exact body, and decodes that body.
+A proper prefix of an encoded frame cannot match a complete record, even when its shorter body could otherwise decode.
+A read at a retained location also requires its whole extent to match the declared frame.
+The Flight holder admits a seat header only for an audience handshake with exactly one value, and the parser requires the prepaid turn, one alternate digit, and the canonical non-nil attempt UUID.
+
+Source inspection traced the replay iterator and retained payload lookup to the checked journal functions, and the Flight holder and gateway to the shared header names and seat parser.
+The [Prost contract](../../verification/verus/foreign_contracts/prost.md) is a premise for generated-message behavior, including full consumption, unknown fields and round trips within the supported nesting depth.
+Protobuf permits non-minimal varints, valid extra fields and equivalent serializations.
+The legacy source flush marker keeps its historical interpretation.
+The remaining premises are exact reads, byte-buffer and endian operations, CRC calculation, available encoding capacity and journal bodies that fit the u32 length field, the existing placed-attempt codec and stage validator, canonical UUID formatting and parsing, and the HTTP metadata libraries' delivery of the header values.
+Filesystem durability and the recovery decision to truncate the final segment are outside the decoder proof.
+The adapter conformance cases were authored in this session.
+
 ### Query from the application
 
 Funrun reads through the Conductor at the transaction's basis, served from the holder's tail and cache.

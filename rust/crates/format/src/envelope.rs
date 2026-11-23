@@ -2,26 +2,25 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use rtdb_types::{Anomaly, BlockIndex, PhysicalObjectVersion, PlacedAttempt, Result, S3ObjectNamespace, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
-use crate::generated::xtdb::log::proto::{ReplicaLogMessage, SourceLogMessage};
 use crate::stage_journal::{InvalidStageJournal, checked_journal_fields};
 use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
+
+mod decoder;
+mod decoder_leaves;
+mod wire;
+pub use decoder::{ReplicaEnvelope, ReplicaFrame, SourceMessage, decode_replica_outcome_attempt, encode_replica_outcome_attempt};
+use wire::{skip_wire, wire_key};
 
 const ADMITTED_OFFLOAD_STORAGE: i32 = -1;
 
 pub use crate::generated::xtdb::log::proto::replica_log_message::Message as ReplicaBody;
 pub use crate::generated::xtdb::log::proto::source_log_message::Message as SourceBody;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum SourceMessage {
-    LegacyTransaction(Vec<u8>),
-    Protobuf(SourceBody),
-}
-
 impl SourceMessage {
     /// Classifies the source envelope without allocating its transaction payload.
     /// Validates outer protobuf framing; nested message validation belongs to `decode`.
     pub fn is_transaction_encoded(bytes: &[u8]) -> Result<bool> {
-        let (&header, mut payload) = bytes.split_first().ok_or_else(|| invalid("Empty source message"))?;
+        let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty source message"))?;
         match header {
             LEGACY_TX_HEADER => return Ok(true),
             LEGACY_FLUSH_HEADER => return Ok(false),
@@ -29,13 +28,14 @@ impl SourceMessage {
             _ => return Err(invalid(format!("Unknown source message header: {header}"))),
         }
         let mut transaction = false;
-        while !payload.is_empty() {
-            let (field, wire) = wire_key(&mut payload)?;
+        let mut cursor = 0;
+        while cursor < payload.len() {
+            let (field, wire, body) = wire_key(payload, cursor).map_err(invalid)?;
             if matches!(field, 1..=4 | 6 | 7) {
                 if wire != 2 { return Err(invalid("Source message body must be length-delimited")); }
                 transaction = field == 6;
             }
-            skip_wire(&mut payload, field, wire, 0)?;
+            cursor = skip_wire(payload, field, wire, body, 0).map_err(invalid)?;
         }
         Ok(transaction)
     }
@@ -52,80 +52,12 @@ impl SourceMessage {
 
     /// Decodes the stored message before applying the source log reader's processing rules.
     pub fn decode_wire(bytes: &[u8]) -> Result<Option<Self>> {
-        let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty source message"))?;
-        match header {
-            LEGACY_TX_HEADER => Ok(Some(Self::LegacyTransaction(bytes.to_vec()))),
-            LEGACY_FLUSH_HEADER => Ok(None),
-            PROTOBUF_LOG_HEADER => {
-                let decoded = SourceLogMessage::decode(payload).map_err(|error| invalid(error.to_string()))?;
-                Ok(decoded.message.map(Self::Protobuf))
-            }
-            _ => Err(invalid(format!("Unknown source message header: {header}"))),
-        }
+        decoder::decode_source_wire(bytes)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        match self {
-            Self::LegacyTransaction(bytes) => {
-                if bytes.first() != Some(&LEGACY_TX_HEADER) {
-                    return Err(invalid("Legacy transaction is missing its 0xff header"));
-                }
-                Ok(bytes.clone())
-            }
-            Self::Protobuf(message) => Ok(headered(&SourceLogMessage { message: Some(message.clone()) })),
-        }
+        decoder::encode_source_wire(self)
     }
-}
-
-fn wire_varint(bytes: &mut &[u8]) -> Result<u64> {
-    let mut value = 0;
-    for index in 0..10 {
-        let (&byte, remaining) = bytes.split_first().ok_or_else(|| invalid("Truncated protobuf varint"))?;
-        *bytes = remaining;
-        if index == 9 && byte > 1 { return Err(invalid("Protobuf varint exceeds 64 bits")); }
-        value |= u64::from(byte & 127) << (index * 7);
-        if byte < 128 { return Ok(value); }
-    }
-    Err(invalid("Unterminated protobuf varint"))
-}
-fn wire_key(bytes: &mut &[u8]) -> Result<(u32, u8)> {
-    let key = wire_varint(bytes)?;
-    let field = u32::try_from(key >> 3).ok().filter(|field| (1..=0x1fff_ffff).contains(field)).ok_or_else(|| invalid("Invalid protobuf field number"))?;
-    Ok((field, (key & 7) as u8))
-}
-fn skip_wire(bytes: &mut &[u8], field: u32, wire: u8, depth: usize) -> Result<()> {
-    let length = match wire {
-        0 => { wire_varint(bytes)?; return Ok(()); }
-        1 => 8,
-        2 => usize::try_from(wire_varint(bytes)?).map_err(|_| invalid("Protobuf field exceeds addressable memory"))?,
-        3 => {
-            if depth >= 100 { return Err(invalid("Protobuf group nesting exceeds limit")); }
-            loop {
-                let (nested_field, nested_wire) = wire_key(bytes)?;
-                if nested_wire == 4 {
-                    return if nested_field == field { Ok(()) } else { Err(invalid("Mismatched protobuf end group")) };
-                }
-                skip_wire(bytes, nested_field, nested_wire, depth + 1)?;
-            }
-        }
-        5 => 4,
-        _ => return Err(invalid("Invalid protobuf wire type")),
-    };
-    *bytes = bytes.get(length..).ok_or_else(|| invalid("Truncated protobuf field"))?;
-    Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReplicaEnvelope {
-    pub term: Term,
-    pub term_sequence: Option<TermSequence>,
-    pub message: ReplicaBody,
-}
-
-pub struct ReplicaFrame {
-    pub term: Term,
-    pub term_sequence: Option<TermSequence>,
-    pub message: Option<ReplicaBody>,
 }
 
 pub struct AcceptanceStageWitness {
@@ -135,27 +67,6 @@ pub struct AcceptanceStageWitness {
     pub cutoff: Timestamp,
     /// The sealed original-journal cutoff and receiver clock certificate, for a physically bounded acceptance.
     pub journal: Option<rtdb_types::TimedJournalCutoff>,
-}
-
-const RETIREMENT_MARKER: &[u8] = b"rtdb/placed-receipt-retirement/v1\0";
-
-pub fn encode_replica_outcome_attempt(attempt: PlacedAttempt, retirement: bool) -> Vec<u8> {
-    let bytes = attempt.encode();
-    if !retirement { return bytes.to_vec(); }
-    let mut encoded = Vec::with_capacity(RETIREMENT_MARKER.len() + bytes.len());
-    encoded.extend_from_slice(RETIREMENT_MARKER);
-    encoded.extend_from_slice(&bytes);
-    encoded
-}
-
-pub fn decode_replica_outcome_attempt(bytes: &[u8]) -> Result<(PlacedAttempt, bool)> {
-    match PlacedAttempt::decode(bytes) {
-        Ok(attempt) => Ok((attempt, false)),
-        Err(error) => {
-            let attempt = bytes.strip_prefix(RETIREMENT_MARKER).ok_or(error)?;
-            Ok((PlacedAttempt::decode(attempt)?, true))
-        }
-    }
 }
 
 impl crate::log::proto::ResolvedTx {
@@ -192,30 +103,11 @@ impl crate::log::proto::ResolvedTx {
 
 impl ReplicaFrame {
     pub fn has_external_payload(bytes: &[u8]) -> Result<bool> {
-        let (&header, mut payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
-        if header != PROTOBUF_LOG_HEADER {
-            return Err(invalid(format!("Unknown replica message header: {header}")));
-        }
-        while !payload.is_empty() {
-            let (field, wire) = wire_key(&mut payload)?;
-            skip_wire(&mut payload, field, wire, 0)?;
-            if field == 8 && wire == 2 { return Ok(true); }
-        }
-        Ok(false)
+        decoder::has_external_payload(bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
-        if header != PROTOBUF_LOG_HEADER {
-            return Err(invalid(format!("Unknown replica message header: {header}")));
-        }
-        let wire = ReplicaLogMessage::decode(payload).map_err(|error| invalid(error.to_string()))?;
-        if let Some(ReplicaBody::ResolvedTx(tx)) = &wire.message { tx.checked_acceptance_stage()?; }
-        Ok(Self { term: Term(wire.term_id.unwrap_or_default()), term_sequence: wire.term_seq.map(TermSequence), message: wire.message })
-    }
-
-    pub fn into_envelope(self) -> Option<ReplicaEnvelope> {
-        self.message.map(|message| ReplicaEnvelope { term: self.term, term_sequence: self.term_sequence, message })
+        decoder::decode_replica_frame(bytes)
     }
 }
 
@@ -235,15 +127,11 @@ impl ReplicaEnvelope {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
-        Ok(ReplicaFrame::decode(bytes)?.into_envelope())
+        decoder::decode_replica_envelope(bytes)
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        headered(&ReplicaLogMessage {
-            message: Some(self.message.clone()),
-            term_id: Some(self.term.0),
-            term_seq: self.term_sequence.map(|sequence| sequence.0),
-        })
+        decoder::encode_replica_envelope(self)
     }
 
     pub fn with_sequence(mut self, sequence: TermSequence) -> Self {

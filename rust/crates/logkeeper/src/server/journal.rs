@@ -10,7 +10,7 @@ use super::state::{Event, Held, StreamState, Window};
 use super::store::{Slot, Store};
 use crate::history::RetainedChain;
 use crate::protocol::{Entries, Entry, before_guarded_cutoff};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use fs2::FileExt;
 use parking_lot::Mutex;
 use prost::Message;
@@ -23,6 +23,11 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
+
+#[path = "journal/codec_leaves.rs"]
+mod journal_codec_leaves;
+mod framing;
+use framing::{decode_located_record, frame, frame_record, read_record};
 
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -111,17 +116,6 @@ fn record(event: &Event) -> Kind {
         Event::Trim(through) => Kind::Trim(*through),
         Event::Drop(epoch) => Kind::Drop(*epoch),
     }
-}
-
-fn frame(stream: u64, kind: Kind, buffer: &mut BytesMut) {
-    frame_record(Record { stream, kind: Some(kind), active_ensemble: Bytes::new(), original_append: None }, buffer)
-}
-
-fn frame_record(record: Record, buffer: &mut BytesMut) {
-    let body = record.encode_to_vec();
-    buffer.put_u32(body.len() as u32);
-    buffer.put_u32(crc32fast::hash(&body));
-    buffer.put_slice(&body);
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> Anomaly {
@@ -288,20 +282,6 @@ fn current_chain(segments: &Path, remove_temporary: bool) -> Result<Vec<(u64, Pa
     }
     chain.reverse();
     Ok(chain)
-}
-
-/// Reads the next whole record of a segment of `remaining` bytes from here, with its framed length; none at the first incomplete or damaged one.
-fn read_record(reader: &mut impl std::io::Read, remaining: u64) -> std::io::Result<Option<(Record, u64)>> {
-    if remaining < 8 { return Ok(None); }
-    let mut header = [0u8; 8];
-    reader.read_exact(&mut header)?;
-    let length = u32::from_be_bytes(header[0..4].try_into().expect("four bytes")) as u64;
-    let checksum = u32::from_be_bytes(header[4..8].try_into().expect("four bytes"));
-    if remaining - 8 < length { return Ok(None); }
-    let mut body = vec![0; length as usize];
-    reader.read_exact(&mut body)?;
-    if crc32fast::hash(&body) != checksum { return Ok(None); }
-    Ok(Record::decode(Bytes::from(body)).ok().map(|record| (record, 8 + length)))
 }
 
 fn remove_before(segments: &Path, sequence: u64) -> Result<()> {
@@ -769,23 +749,10 @@ fn decode_ensemble(path: &Path, encoded: &[u8]) -> Result<Option<[u8; 32]>> {
     encoded.try_into().map(Some).map_err(|_| corrupt(path, "invalid active ensemble digest"))
 }
 
-/// Stops at the first incomplete or damaged record.
-fn next_record(bytes: &Bytes, position: &mut usize) -> Option<Record> {
-    let header = bytes.get(*position..*position + 8)?;
-    let length = u32::from_be_bytes(header[0..4].try_into().expect("four bytes")) as usize;
-    let checksum = u32::from_be_bytes(header[4..8].try_into().expect("four bytes"));
-    let start = *position + 8;
-    let body = bytes.get(start..start.checked_add(length)?)?;
-    if crc32fast::hash(body) != checksum { return None; }
-    let record = Record::decode(bytes.slice(start..start + length)).ok()?;
-    *position = start + length;
-    Some(record)
-}
-
 fn read_payload(file: &File, path: &Path, lsn: i64, location: Location) -> Result<Bytes> {
     let mut frame = vec![0; location.length as usize];
     read_exact_at(file, &mut frame, location.offset).map_err(|error| io_error(path, error))?;
-    match next_record(&Bytes::from(frame), &mut 0) {
+    match decode_located_record(&Bytes::from(frame)) {
         Some(Record { kind: Some(Kind::Append(entry)), .. }) if entry.lsn == lsn => Ok(entry.payload),
         _ => Err(corrupt(path, format!("no entry {lsn} at {}", location.offset))),
     }
@@ -1170,6 +1137,36 @@ mod tests {
         let (_, recovered, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         assert_eq!(recovered_slots(recovered)["a/b"].state.lock().promised, 5);
         assert_eq!(segment_files(directory.path()), 1);
+    }
+
+    #[test]
+    fn journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body() {
+        let mut framed = BytesMut::new();
+        frame(7, Kind::Promise(4), &mut framed);
+        let whole = framed.len();
+        for cut in 0..whole {
+            assert!(read_record(&mut &framed[..cut], cut as u64).unwrap().is_none());
+            assert!(read_record(&mut &framed[..cut], whole as u64).is_err());
+            assert!(decode_located_record(&Bytes::copy_from_slice(&framed[..cut])).is_none());
+        }
+        assert!(matches!(decode_located_record(&framed.clone().freeze()),
+            Some(Record { stream: 7, kind: Some(Kind::Promise(4)), .. })));
+
+        framed.extend_from_slice(&[0xa0, 0x06, 1]);
+        assert!(decode_located_record(&framed.clone().freeze()).is_none());
+        let length = framed.len() - 8;
+        let checksum = crc32fast::hash(&framed[8..]);
+        framed[..4].copy_from_slice(&(length as u32).to_be_bytes());
+        framed[4..8].copy_from_slice(&checksum.to_be_bytes());
+        assert!(matches!(decode_located_record(&framed.clone().freeze()),
+            Some(Record { stream: 7, kind: Some(Kind::Promise(4)), .. })));
+
+        framed.extend_from_slice(&[0xa0, 0x06]);
+        let length = framed.len() - 8;
+        let checksum = crc32fast::hash(&framed[8..]);
+        framed[..4].copy_from_slice(&(length as u32).to_be_bytes());
+        framed[4..8].copy_from_slice(&checksum.to_be_bytes());
+        assert!(decode_located_record(&framed.freeze()).is_none());
     }
 
     #[test]

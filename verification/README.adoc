@@ -143,6 +143,13 @@ It also exercises the Azure adapter against a loopback provider and separately m
   On 2026-11-23 TLC 2026.11.19.180144 exhausted 9,522 and 25,252 distinct states in the one- and two-move bounds, rejected nine mutations at their named laws, and reached the concurrent replacement witness.
   On 2026-11-23 Verus 0.2026.11.20.9da409b verified three shipped decisions in link:verus/audience_cross_holder_claim/area.json[the shared seat claim area] and rejected all six controls at their declared diagnostics.
   The production correspondence and timing premises are in link:../dev/doc/rtdb-multi-bijection.md[the Bijection integration notes].
+* link:verus/framing_decoders/area.json[Framing decoders] imports the Rust functions used for source and replica envelopes, replica retirement attempts, journal framing and Flight audience seats.
+  On 2026-11-23, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 55 items, and all 23 mutations failed at their declared laws.
+  A journal read requires a complete header and the whole declared body with its matching checksum, and a retained location requires exact consumption.
+  The protobuf wire scanner validates the suffix after an external reference, enforces the field bounds, and terminates with at most 100 nested groups.
+  Round-trip and canonical-spelling checks cover the applicable source, replica, journal, retirement and Flight decisions.
+  The link:verus/foreign_contracts/prost.md[Prost contract] supplies generated decode behavior, and its conformance cases were authored.
+  See the link:../dev/doc/rtdb-multi-bijection.md#framing-decoder-evidence[production correspondence and premises].
 * link:verus/guarded_tail_recovery/area.json[Guarded-tail recovery] imports the Rust decisions called by the Logkeeper writer.
   On 2026-11-23 Verus 0.2026.11.20.9da409b checked 12 items, and all 16 production mutations failed at their declared laws.
   The checked decisions correspond to Bijection's `recoverGuardedTail` and `decideFromSealedProbes`, with post-sync clock samples required to be strictly below the cutoff before counting an original.

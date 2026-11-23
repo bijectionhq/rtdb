@@ -100,9 +100,11 @@ def verus_errors(output, directory):
     )
 
 
-def verify_verus(args, scratch):
+def verify_verus(args, scratch, areas=None):
     for manifest in sorted((ROOT / "verification/verus").glob("*/area.json")):
         area = manifest.parent.relative_to(ROOT)
+        if areas is not None and area.name not in areas:
+            continue
         config = json.loads(manifest.read_text())
         harness = area / "proof.rs"
         paths = {path.relative_to(ROOT) for path in manifest.parent.glob("*.rs")}
@@ -5763,7 +5765,21 @@ def main():
         "rust/crates/search/src/file.rs",
         "rust/crates/search/src/lane.rs",
         "rust/crates/format/src/lib.rs",
+        "rust/crates/format/src/envelope.rs",
+        "rust/crates/format/src/envelope/decoder_leaves.rs",
+        "rust/crates/format/tests/source_classification.rs",
+        "rust/crates/format/tests/term_sequence.rs",
+        "rust/crates/types/src/placed_attempt.rs",
+        "rust/crates/logkeeper/src/server/journal.rs",
+        "rust/crates/logkeeper/src/server/journal/codec_leaves.rs",
+        "rust/crates/flight-sql/src/config.rs",
+        "rust/crates/flight-sql/src/config/seat_uuid.rs",
+        "rust/crates/flight-sql/src/service.rs",
+        "rust/crates/multi/src/flight_gateway.rs",
         "core/src/main/proto/xtdb/log/proto/log.proto",
+        "core/src/main/proto/xtdb/log/proto/replica-log.proto",
+        "rust/Cargo.lock",
+        "verification/verus/foreign_contracts/prost.md",
         "rust/crates/storage/src/object_store.rs",
         "rust/crates/storage/src/disk_cache.rs",
         "rust/crates/s3/src/lib.rs",

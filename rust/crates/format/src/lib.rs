@@ -66,6 +66,6 @@ impl log::proto::PublishedObjectVersion {
 }
 
 
-pub const PROTOBUF_LOG_HEADER: u8 = 3;
-pub const LEGACY_TX_HEADER: u8 = 0xff;
-pub const LEGACY_FLUSH_HEADER: u8 = 2;
+#[path = "envelope/log_headers.rs"]
+mod log_headers;
+pub use log_headers::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};

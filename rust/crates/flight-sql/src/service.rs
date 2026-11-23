@@ -11,6 +11,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
+use crate::config::accepts_seat_header;
 use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 use crate::audience_seat::{OccupiedSeatAction, SeatAttachment, SeatDecision, SeatState, admit_audience_seat, occupied_seat_action};
 
@@ -193,14 +194,16 @@ impl Service {
         let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
         let seat_headers = request.metadata().get_all(AUDIENCE_SEAT_HEADER);
         let mut seats = seat_headers.iter();
-        let seat = match (audience.is_some(), kind, seats.next(), seats.next()) {
-            (true, CallKind::Handshake, Some(value), None) => {
+        let (first, second) = (seats.next(), seats.next());
+        let is_handshake = matches!(kind, CallKind::Handshake);
+        let seat = match first {
+            Some(value) if accepts_seat_header(audience.is_some(), is_handshake, true, second.is_some()) => {
                 let profile = self.0.config.audience.ok_or_else(unsupported)?;
                 let seat = value.to_str().ok().and_then(|value| profile.parse_seat(value).ok())
                     .ok_or_else(|| Status::permission_denied("Invalid audience reader seat"))?;
                 Some(seat)
             }
-            (true, CallKind::Handshake, _, _) | (_, _, Some(_), _) => {
+            _ if first.is_some() || (audience.is_some() && is_handshake) => {
                 return Err(Status::permission_denied("An audience seat is fixed at its authenticated handshake"));
             }
             _ => None,

@@ -28,5 +28,17 @@
     "dependency": "parking_lot 0.12.5",
     "contract": "A lock guard grants exclusive access to the acquired value up to unlock. Reads and writes through the guard see and update that same value, and guard drop publishes the final value before the next acquire.",
     "conformance": "audience_work::foreign_contract_tests::mutex_guard_serializes_updates_to_the_same_allowance"
+  },
+  "prost-log-message": {
+    "model": "verification/verus/framing_decoders/decoder_leaves.rs",
+    "dependency": "prost 0.14.6",
+    "contract": "A source or replica message decodes against the whole supplied buffer. Valid unknown fields are consumed, malformed fields fail, and an encoder-produced message round-trips within the supported nesting depth.",
+    "conformance": "generated_source_decoding_rejects_an_incomplete_field_after_a_known_body and replica_decoding_consumes_unknown_fields_and_rejects_malformed_suffixes"
+  },
+  "prost-journal-record": {
+    "model": "verification/verus/framing_decoders/journal_leaves.rs",
+    "dependency": "prost 0.14.6",
+    "contract": "The supplied journal body is consumed as one generated Record. Successful decode of a complete encoder-produced Record gives the original fields and kind within the supported nesting depth.",
+    "conformance": "journal::tests::journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body"
   }
 }

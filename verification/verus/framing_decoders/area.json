@@ -1,0 +1,432 @@
+{
+  "summary": "Replica and source envelope decoding, protobuf wire limits, exact journal framing and Flight audience seat decoding.",
+  "flags": [
+    "--no-external-by-default"
+  ],
+  "foreign_contracts": [
+    "prost-log-message",
+    "prost-journal-record"
+  ],
+  "min_verified_functions": 55,
+  "controls": {
+    "ignore-delimited-length": {
+      "defect": "A short length-delimited field is clipped to the available bytes.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "find": "    if body > available || length > (available - body) as u64 { return None; }",
+          "replace": "    if body > available { return None; }\n    if length > (available - body) as u64 { return Some(available); }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "function": "field_end",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "stop-after-external-field": {
+      "defect": "A recognized external payload hides a malformed suffix.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "find": "        if field == 8 && wire == 2 { found = true; }",
+          "replace": "        if field == 8 && wire == 2 { return Ok((true, cursor)); }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "function": "scan_external_payload",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "drop-group-depth-check": {
+      "defect": "Nested groups can recurse past the protobuf depth ceiling.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "find": "if depth >= 100 {",
+          "replace": "if depth == usize::MAX {"
+        },
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "find": "invariant start <= cursor, depth < 100, wire == 3,",
+          "replace": "invariant start <= cursor, depth < usize::MAX, wire == 3,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "function": "skip_wire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "no-progress-in-group": {
+      "defect": "Group traversal processes the same nested field without advancing.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "find": "                cursor = skip_wire(bytes, nested_field, nested_wire, next, depth + 1)?;",
+          "replace": "                let _ = skip_wire(bytes, nested_field, nested_wire, next, depth + 1)?;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "function": "skip_wire",
+          "category": "decreases not satisfied at end of loop"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "discard-high-key-bits": {
+      "defect": "A key beyond the maximum field number can alias an in-range field.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "find": "    let field = key / 8;",
+          "replace": "    let field = (key as u32) as u64 / 8;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/wire.rs",
+          "function": "wire_key",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "ignore-located-trailing-bytes": {
+      "defect": "A single-record payload location can contain a suffix outside its declared body.",
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "find": "    if !matches_body(body_len(&body), length as usize, checksum(&body), expected_checksum) { return None; }",
+          "replace": "    if !matches_body(body_len(&body), length as usize, checksum(&body), expected_checksum) && body_len(&body) <= length as usize { return None; }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "function": "decode_located_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "decode-torn-stream-body": {
+      "defect": "A journal reader shortens the declared length and tries to decode the shorter body.",
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "find": "    let Some(end) = frame_size(remaining, length) else { return Ok(None); };",
+          "replace": "    let length = if length > 0 { length - 1 } else { 0 };\n    let Some(end) = frame_size(remaining, length) else { return Ok(None); };"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "function": "read_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "ignore-body-checksum": {
+      "defect": "A whole body can be accepted without its checksum matching the header.",
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "find": "    available == declared && actual_checksum == expected_checksum",
+          "replace": "    available == declared"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "function": "matches_body",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "write-wrong-framed-length": {
+      "defect": "The journal writer emits an off-by-one size for a nonempty protobuf body.",
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "find": "    append_frame(buffer, body_len(&body) as u32, checksum(&body), &body);",
+          "replace": "    append_frame(buffer, (body_len(&body) as u32).saturating_sub(1), checksum(&body), &body);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "function": "frame_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "discard-replica-term": {
+      "defect": "Decoding an encoded replica envelope replaces its term with a default.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "    let term = match term { Some(term) => term, None => 0 };",
+          "replace": "    let term = 0;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "decode_replica_frame",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "reverse-external-classification": {
+      "defect": "The envelope substitutes the opposite of the completed scan's answer.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "    Ok(found)\n",
+          "replace": "    Ok(!found)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "has_external_payload",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "omit-encoded-source-body": {
+      "defect": "A source protobuf encode loses the message it must round-trip.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "SourceMessage::Protobuf(body) => Ok(encode_source(body)),",
+          "replace": "SourceMessage::Protobuf(_) => Ok(join_bytes(&[], &[])),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "encode_source_wire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "drop-legacy-source-header": {
+      "defect": "The stored legacy transaction loses its original header in the decoded value.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "SourceMessage::LegacyTransaction(join_bytes(&[], bytes))",
+          "replace": "SourceMessage::LegacyTransaction(join_bytes(&[], payload))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "decode_source_wire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "bypass-replica-stage": {
+      "defect": "An invalid timed stage may enter a decoded replica frame.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "    check_stage(&message)?;\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "decode_replica_frame",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "refuse-encoded-retirement": {
+      "defect": "A canonical tagged retirement no longer round-trips.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "    let prefix: &[u8] = if retirement { RETIREMENT_MARKER } else { &[] };",
+          "replace": "    let prefix: &[u8] = if retirement { &[] } else { &[] };"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "encode_replica_outcome_attempt",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "classify-plain-as-retirement": {
+      "defect": "The exact untagged attempt is reported as a retirement.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "        Ok(attempt) => Ok((attempt, false)),",
+          "replace": "        Ok(attempt) => Ok((attempt, true)),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "decode_replica_outcome_attempt",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "change-log-version-byte": {
+      "defect": "The protobuf framing header changes its wire identity.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/log_headers.rs",
+          "find": "pub const PROTOBUF_LOG_HEADER: u8 = 3;",
+          "replace": "pub const PROTOBUF_LOG_HEADER: u8 = 4;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/log_headers.rs",
+          "function": "log_headers_keep_their_protocol_values",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "change-retirement-marker": {
+      "defect": "The fixed retirement marker changes its wire identity.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "b\"rtdb/placed-receipt-retirement/v1\\0\";",
+          "replace": "b\"rtdb/placed-receipt-retirement/v2\\0\";"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "retirement_marker_keeps_its_protocol_spelling",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "permit-seat-leading-zero": {
+      "defect": "A prepaid turn can have a second textual encoding with a leading zero.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "find": "41 if bytes[0] >= b'1' &&",
+          "replace": "41 if bytes[0] >= b'0' &&"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "function": "seat_prefix",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "ignore-uuid-spelling": {
+      "defect": "A parsed UUID alias can bypass the unique lowercase hyphenated seat spelling.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "find": "    if !canonical_attempt_text(bytes, start, &canonical) { return None; }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "function": "parse_seat_fields",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "permit-third-alternate": {
+      "defect": "Flight can select an alternate outside the two reserved session slots.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "        b'1' => Some(true),",
+          "replace": "        b'1' => Some(true),\n        b'2' => Some(false),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "parse_seat_alternate",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "accept-duplicate-seat-header": {
+      "defect": "A handshake can contain two copies of its seat header.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "find": "    audience && handshake && first && !second\n",
+          "replace": "    audience && handshake && first\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "function": "accepts_seat_header",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
+    "change-seat-header": {
+      "defect": "The reserved Flight seat header is replaced with another name.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "find": "pub const AUDIENCE_SEAT_HEADER: &str = \"x-rtdb-audience-reader-seat\";",
+          "replace": "pub const AUDIENCE_SEAT_HEADER: &str = \"x-rtdb-audience-reader-seats\";"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/config/seat_wire.rs",
+          "function": "audience_header_names_keep_their_protocol_spelling",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    }
+  }
+}

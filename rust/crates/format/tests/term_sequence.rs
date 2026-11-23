@@ -148,3 +148,39 @@ fn a_collectable_offload_binds_an_exact_provider_version() {
     assert_eq!(decoded.oversized_payload(StorageVersion(6), StorageEpoch(0)).unwrap().as_deref(), Some("oversized/b01-payload.binpb"));
     assert_eq!(decoded.unwrap_payload(&bytes).unwrap(), body);
 }
+
+#[test]
+fn replica_decoding_consumes_unknown_fields_and_rejects_malformed_suffixes() {
+    let original = ReplicaEnvelope { term: Term(7), term_sequence: Some(TermSequence(4)),
+        message: ReplicaBody::NoOp(pb::NoOp::default()) };
+    let mut stored = original.encode();
+    stored.extend([0xa0, 0x06, 0x81, 0x00]);
+    assert_eq!(ReplicaEnvelope::decode(&stored).unwrap(), Some(original));
+    stored.push(0);
+    assert!(ReplicaEnvelope::decode(&stored).is_err());
+}
+
+#[test]
+fn external_payload_detection_checks_fields_after_the_reference() {
+    use rtdb_format::{PROTOBUF_LOG_HEADER, envelope::ReplicaFrame};
+
+    let mut stored = vec![PROTOBUF_LOG_HEADER, 0x42, 0, 0x38, 7];
+    assert!(ReplicaFrame::has_external_payload(&stored).unwrap());
+    stored.push(0x38);
+    assert!(ReplicaFrame::has_external_payload(&stored).is_err());
+
+    let nested_reference = [PROTOBUF_LOG_HEADER, 0x63, 0x42, 0, 0x64];
+    assert!(!ReplicaFrame::has_external_payload(&nested_reference).unwrap());
+}
+
+#[test]
+fn replica_outer_group_traversal_caps_nesting_at_one_hundred() {
+    use rtdb_format::{PROTOBUF_LOG_HEADER, envelope::ReplicaFrame};
+
+    for depth in [100, 101] {
+        let mut stored = vec![PROTOBUF_LOG_HEADER];
+        stored.extend(vec![0x63; depth]);
+        stored.extend(vec![0x64; depth]);
+        assert_eq!(ReplicaFrame::has_external_payload(&stored).is_ok(), depth == 100);
+    }
+}

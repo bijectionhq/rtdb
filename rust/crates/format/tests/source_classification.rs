@@ -27,3 +27,13 @@ fn malformed_outer_envelopes_cannot_select_a_log_clock() {
         assert!(SourceMessage::is_transaction_encoded(bytes).is_err(), "{bytes:?}");
     }
 }
+
+#[test]
+fn generated_source_decoding_rejects_an_incomplete_field_after_a_known_body() {
+    let original = SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(0) }));
+    let mut stored = original.encode().unwrap();
+    stored.extend([0xa0, 0x06, 1]);
+    assert_eq!(SourceMessage::decode_wire(&stored).unwrap(), Some(original));
+    stored.extend([0xa2, 0x06, 2, 1]);
+    assert!(SourceMessage::decode_wire(&stored).is_err());
+}
