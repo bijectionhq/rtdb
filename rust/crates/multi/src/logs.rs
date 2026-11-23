@@ -164,7 +164,7 @@ pub(crate) fn frozen_checkpoint(
     let start = end(checkpoint.source)?;
     let intake = Arc::new(IntakeLog::new(maximum_message_bytes, start));
     Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
-        await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
+        placed_transfer: None, await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
 }
 
 pub(crate) async fn ordered_opened(
@@ -180,10 +180,17 @@ pub(crate) async fn ordered_opened(
     let opened = ordered.latest()?;
     let scope = PlacedAttemptScope::new(&record.stream("replica"), admission.grant.epoch)?;
     let replica: Arc<dyn Log> = ordered.clone();
-    let intake_cut = checkpoint.map(|block| crate::deployment::TransferIntakeCut {
+    let terminal = record.checkpoint_transfer_activation.as_ref()
+        .map(|activation| &activation.replica.bootstrap.terminal);
+    let intake_cut = terminal.map(|terminal| {
+        crate::deployment::TransferIntakeCut {
+            replica_through: terminal.replica_through, source_through: terminal.source_through,
+        }
+    }).or_else(|| checkpoint.map(|block| crate::deployment::TransferIntakeCut {
         replica_through: block.boundary, source_through: block.source,
-    });
-    let next = next_source_offset_from_cut(replica.as_ref(), epoch, intake_cut).await?;
+    }));
+    let placed_transfer = terminal.map(rtdb_directory::CheckpointTransferTerminal::placed_transfer);
+    let next = next_source_offset_from_cut(replica.as_ref(), epoch, include_placed_debt(intake_cut, placed_transfer.as_ref())?).await?;
     let intake = Arc::new(IntakeLog::new(maximum_message_bytes, next));
     let trimming = {
         let intake = Arc::clone(&intake);
@@ -198,6 +205,7 @@ pub(crate) async fn ordered_opened(
     };
     Ok(OpenedLogs {
         source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
+        placed_transfer,
         replica_read_index: Some(Box::new(OrderedReadIndex { journal: ordered, deployment: uuid::Uuid::parse_str(&record.id).ok() })),
         await_authority: AwaitAuthority::Live {
             codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
@@ -286,7 +294,8 @@ impl LogFactory for LogkeeperLogFactory {
                 placed_receipt_retirement: config.placed_receipt_retirement }
         } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &config, Arc::clone(&self.holds)).await?);
-        let mut next = next_source_offset_from_cut(replica.as_ref(), epoch, config.transfer_intake_cut).await?;
+        let intake_cut = include_placed_debt(config.transfer_intake_cut, config.placed_transfer.as_ref())?;
+        let mut next = next_source_offset_from_cut(replica.as_ref(), epoch, intake_cut).await?;
         if let Some(through) = config.transferred_source_through {
             let floor = through.checked_add(1).filter(|floor| *floor >= 0)
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/intake-floor", "Invalid transferred source offset"))?;
@@ -307,7 +316,7 @@ impl LogFactory for LogkeeperLogFactory {
             }.boxed()
         };
         Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
-            replica_read_index, await_authority, drivers: vec![trimming] })
+            replica_read_index, placed_transfer: config.placed_transfer.clone(), await_authority, drivers: vec![trimming] })
     }
 }
 
@@ -323,6 +332,19 @@ fn member_ids(servers: &[JournalEndpoint]) -> Result<Vec<rtdb_directory::MemberI
 /// Every replica record consumes at most one source position, so the newest one named, plus one per later record, bounds every position assigned before; oversized records, whose position is out of line, are covered by that count.
 pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Result<i64> {
     next_source_offset_from_cut(replica, epoch, None).await
+}
+
+fn include_placed_debt(
+    cut: Option<crate::deployment::TransferIntakeCut>,
+    transfer: Option<&rtdb_types::PlacedTransfer>,
+) -> Result<Option<crate::deployment::TransferIntakeCut>> {
+    let Some(debt) = transfer.and_then(|transfer| transfer.debt.as_ref()) else { return Ok(cut); };
+    let mut cut = cut.ok_or_else(|| Anomaly::fault(
+        "rtdb.multi/intake-floor", "Transferred receiver debt has no terminal intake cut",
+    ))?;
+    let reserved = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
+    cut.source_through = cut.source_through.max(reserved.attempt.position().offset());
+    Ok(Some(cut))
 }
 
 async fn next_source_offset_from_cut(
@@ -761,7 +783,7 @@ mod tests {
             placed_receipt_retirement: false,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
-            transfer_intake_cut: None,
+            transfer_intake_cut: None, placed_transfer: None,
             frozen_at: None,
             previous_servers: None,
         };
@@ -796,7 +818,7 @@ mod tests {
             frozen_at: None,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
-            transfer_intake_cut: None,
+            transfer_intake_cut: None, placed_transfer: None,
             write_quorum: 1,
         };
         let provider = Arc::new(MemoryLog::new(1024));
@@ -854,7 +876,7 @@ mod tests {
             servers: vec![], deployment: record.id.clone(), key_id: record.key_id(),
             replica_stream: record.stream("replica"), replica_seal_scope: record.replica_seal_scope(),
             write_quorum: 1, epoch: record.epoch, require_read_index: false, log_epoch: record.log_epoch,
-            transferred_source_through: None, transfer_intake_cut: None, frozen_at: None, previous_servers: None,
+            transferred_source_through: None, transfer_intake_cut: None, placed_transfer: None, frozen_at: None, previous_servers: None,
             placed_receipt_retirement: false,
         };
         let directory_files = tempfile::tempdir().unwrap();

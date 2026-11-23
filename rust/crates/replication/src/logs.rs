@@ -56,6 +56,7 @@ pub struct PartitionLogs {
     pub storage_version: StorageVersion, pub storage_epoch: StorageEpoch,
     store: Arc<dyn ObjectStore>, cache: Arc<BufferPool>, memory: Arc<MemoryBudget>,
     data_suspended: AtomicBool,
+    placed_transfer: Option<rtdb_types::PlacedTransfer>,
 }
 impl PartitionLogs {
     pub fn new(source: Arc<dyn Log>, replica: Arc<dyn Log>, source_epoch: StorageEpoch, replica_epoch: StorageEpoch,
@@ -63,8 +64,32 @@ impl PartitionLogs {
         if Arc::ptr_eq(&source, &replica) { return Err(Anomaly::incorrect("rtdb.replication/aliased-logs", "Source and replica logs must be distinct")); }
         SourcePosition::from_epoch_offset(source_epoch, -1)?;
         ReplicaPosition::from_epoch_offset(replica_epoch, -1)?;
-        Ok(Arc::new(Self { source, replica, source_epoch, replica_epoch, storage_version, storage_epoch, store, cache, memory, data_suspended: AtomicBool::new(false) }))
+        Ok(Arc::new(Self { source, replica, source_epoch, replica_epoch, storage_version, storage_epoch, store, cache, memory, data_suspended: AtomicBool::new(false), placed_transfer: None }))
     }
+    pub fn with_placed_transfer(mut self: Arc<Self>, transfer: Option<rtdb_types::PlacedTransfer>) -> Result<Arc<Self>> {
+        if let Some(transfer) = transfer {
+            let invalid = || Anomaly::fault("rtdb.replication/transfer-cut", "The placed transfer has another replica interval");
+            if transfer.after > transfer.through
+                || transfer.debt.as_ref().is_some_and(|debt| debt.reserved_at <= transfer.after || debt.reserved_at > transfer.through)
+            {
+                return Err(invalid());
+            }
+            ReplicaPosition::from_epoch_offset(self.replica_epoch, transfer.after)?;
+            ReplicaPosition::from_epoch_offset(self.replica_epoch, transfer.through)?;
+            Arc::get_mut(&mut self).ok_or_else(invalid)?.placed_transfer = Some(transfer);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn placed_transfer(&self) -> Option<&rtdb_types::PlacedTransfer> {
+        self.placed_transfer.as_ref()
+    }
+
+    pub(crate) fn is_copied_replica_position(&self, position: ReplicaPosition) -> bool {
+        let offset = position.after_offset(self.replica_epoch);
+        self.placed_transfer().is_some_and(|transfer| transfer.after < offset && offset <= transfer.through)
+    }
+
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
     pub(crate) fn storage(&self) -> &Arc<dyn ObjectStore> { &self.store }

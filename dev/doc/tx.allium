@@ -1227,7 +1227,9 @@ rule CommitWriting {
 -- The same decision installation gates visibility.
 -- A fenced attempt with missing evidence remains unknown unless durable evidence excludes an original timely quorum.
 -- A missing witness or exclusive receipt expiry leaves unresolved obligations charged and does not settle the effect.
--- The successor installs the authentic prefix and accepts outstanding slot obligations before opening fresh work.
+-- The Original terminal transfer receipt binds the certified replica interval and the exact unmatched receiver reservation.
+-- The destination verifies the census while held and retains the original slot through publication.
+-- The successor orders the inherited slot's fence before opening fresh receiver admission.
 -- An applied prefix remains a causal basis after receipt expiry.
 -- An ordered erasure can collect settled evidence after its retention, holds and export obligations end.
 -- Before pinning an implicit read basis, redeem the attempt and wait for its exact installed applied prefix.

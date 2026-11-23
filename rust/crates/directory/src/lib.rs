@@ -966,8 +966,19 @@ pub struct CheckpointTransferTerminal {
     pub replica_through: i64,
     pub source_through: i64,
     pub basis: rtdb_types::TransactionKey,
+    pub placed_debt: Option<rtdb_types::PlacedTransferDebt>,
     pub replica_sha256: Option<[u8; 32]>,
     pub lifetime_floors_sha256: [u8; 32],
+}
+
+impl CheckpointTransferTerminal {
+    pub fn placed_transfer(&self) -> rtdb_types::PlacedTransfer {
+        rtdb_types::PlacedTransfer {
+            after: self.fence.destination.checkpoint.boundary,
+            through: self.replica_through,
+            debt: self.placed_debt.clone(),
+        }
+    }
 }
 
 /// Target-owned durable replay input authenticated against a source receipt.
@@ -1457,6 +1468,17 @@ fn prepare_checkpoint_transfer_terminal(
         || terminal.replica_sha256.is_some() != (terminal.replica_through > stage.checkpoint.boundary)
     {
         return Err(transfer_changed());
+    }
+    if let Some(debt) = &terminal.placed_debt {
+        let slot = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
+        let epoch = rtdb_types::StorageEpoch(stage.source_log_epoch);
+        if debt.term <= 0 || debt.reserved_at <= stage.checkpoint.boundary
+            || debt.reserved_at > terminal.replica_through
+            || slot.attempt.position().epoch() != epoch
+            || slot.attempt.position().offset() <= terminal.source_through
+        {
+            return Err(transfer_changed());
+        }
     }
     if let Some(existing) = source.checkpoint_transfer_terminal.as_deref() {
         return if existing == terminal { Ok(source.clone()) } else { Err(transfer_changed()) };

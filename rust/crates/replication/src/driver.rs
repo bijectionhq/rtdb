@@ -423,6 +423,7 @@ pub struct ReplicationDriver {
 struct OrderedPlaced {
     reservation: PlacedReservation,
     term: Term,
+    reserved_at: ReplicaPosition,
 }
 impl ReplicationDriver {
     pub fn new(config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, recovered: RecoveredPartition, progress: Arc<ProgressMonitor>, resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken) -> Result<(ReplicationHandle, Self)> {
@@ -505,6 +506,7 @@ impl ReplicationDriver {
         let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
         self.historical_confirmations = history.unwrap_or_default();
         if self.cancellation.is_cancelled() { return Ok(()); }
+        self.require_transferred_debt(self.read_position)?;
         self.update_installed_prefix()?;
         self.progress.driver_initialized(self.restart.take())?;
         self.replica_tail = Some(tail);
@@ -745,6 +747,11 @@ impl ReplicationDriver {
     /// A journal that fences writer terms promotes its grant holder only after an empty read, so every record of
     /// an earlier term has been admitted before the new term's sequence-zero record can open it.
     async fn lead_after_empty_read(&mut self) -> Result<()> {
+        if self.logs.placed_transfer().is_some_and(|transfer|
+            self.read_position.after_offset(self.logs.replica_epoch) < transfer.through)
+        {
+            return Ok(());
+        }
         if !self.logs.fences_writer_terms() { return self.start_claim(); }
         if !self.config.may_lead || self.leader.is_some() || !self.logs.holds_writer_grant().await? { return Ok(()); }
         let term = self.fence.claim_term()?;
@@ -754,6 +761,11 @@ impl ReplicationDriver {
         Ok(())
     }
     fn start_claim(&mut self) -> Result<()> {
+        if self.logs.placed_transfer().is_some_and(|transfer|
+            self.read_position.after_offset(self.logs.replica_epoch) < transfer.through)
+        {
+            return Ok(());
+        }
         // Promotion waits for the next empty read instead of appending a claim.
         if self.logs.fences_writer_terms() { return Ok(()); }
         if !self.config.may_lead || self.leader.is_some() || self.claim.is_some() || self.claiming.is_some() { return Ok(()); }
@@ -926,6 +938,9 @@ impl ReplicationDriver {
                     return Err(error);
                 }
                 // The protobuf body can be omitted or too new for this reader to recognize.
+                if self.logs.is_copied_replica_position(position) {
+                    return Err(invalid("The held transfer contains an unrecognized replica frame"));
+                }
                 self.recognized_prefix = false;
                 self.read_position = position;
                 self.complete_trie_removals();
@@ -956,12 +971,27 @@ impl ReplicationDriver {
                 self.apply_admitted(record).await?;
             }
         }
+        self.require_transferred_debt(position)?;
         self.read_position = position;
         self.update_installed_prefix()?;
         self.publish_status(self.role());
         if admission.verdict == Verdict::Voided { self.start_claim()?; }
         Ok(())
     }
+    fn require_transferred_debt(&self, position: ReplicaPosition) -> Result<()> {
+        let Some(transfer) = self.logs.placed_transfer() else { return Ok(()); };
+        if position.after_offset(self.logs.replica_epoch) != transfer.through {
+            return Ok(());
+        }
+        match (self.placed_slot, transfer.debt.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(slot), Some(debt)) if debt.term == slot.term.0
+                && debt.reserved_at == slot.reserved_at.after_offset(self.logs.replica_epoch)
+                && PlacedReservation::decode(&debt.reservation)? == slot.reservation => Ok(()),
+            _ => Err(invalid("The installed transfer differs from its sealed placed debt census")),
+        }
+    }
+
     fn own_pending_tx_at(&self, term: Term, sequence: Option<TermSequence>) -> Option<&PendingWrite> {
         let leader = self.leader.as_ref().filter(|leader| leader.term == term)?;
         leader.pending_tx_at(sequence).map(|(pending, _)| pending.as_ref())
@@ -1238,7 +1268,8 @@ impl ReplicationDriver {
                         }
                         let reservation = PlacedReservation::decode(wire)?;
                         if reservation.attempt.position() <= self.progress.current().source_position
-                            || self.resolve.owned_witness_scope.is_some_and(|scope| !scope.same_history(reservation.attempt.scope()))
+                            || (!self.logs.is_copied_replica_position(record.metadata.position)
+                                && self.resolve.owned_witness_scope.is_some_and(|scope| !scope.same_history(reservation.attempt.scope())))
                         {
                             return Err(invalid("Placed receiver reservation has a foreign history or source position"));
                         }
@@ -1249,7 +1280,9 @@ impl ReplicationDriver {
                             return Err(invalid("Read-back changed the writer's original placed reservation"));
                         }
                         self.progress.reserved(reservation)?;
-                        self.placed_slot = Some(OrderedPlaced { reservation, term: record.envelope.term });
+                        self.placed_slot = Some(OrderedPlaced {
+                            reservation, term: record.envelope.term, reserved_at: record.metadata.position,
+                        });
                     } else {
                         if self.placed_slot.is_some() && message.src_msg_id.is_some() {
                             return Err(invalid("Source progress bypassed an open placed receiver slot"));

@@ -209,7 +209,7 @@ pub(super) async fn with_registered_capture_replay<T, F, Fut>(
     run: F,
 ) -> Result<T>
 where
-    F: FnOnce(Arc<QueryContext>, TransactionKey, Option<i64>) -> Fut,
+    F: FnOnce(Arc<QueryContext>, TransactionKey, Option<replica_suffix::TerminalReplayFrontier>) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     if !resources.node.owned_relations {

@@ -169,7 +169,9 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                     ).await?;
                 }
                 let snapshot = recovered.partition.snapshot();
-                if replay.finish(held_terminal.replica_through)? != held_terminal.source_through
+                let replayed = replay.finish(held_terminal.replica_through)?;
+                if replayed.source_through != held_terminal.source_through
+                    || replayed.placed_debt != held_terminal.placed_debt
                     || snapshot.tx_basis() != Some(held_terminal.basis)
                     || recovered.progress.tx_key != Some(held_terminal.basis)
                     || recovered.progress.source_position.after_offset(StorageEpoch(held_authority.stage.source_log_epoch))

@@ -479,11 +479,16 @@ pub(crate) async fn reseal_live_journal(
 
 /// Exact replay coordinates retained while the terminal interval is read in
 /// bounded segments. The recovered partition owns the application term fence.
+pub(super) struct TerminalReplayFrontier {
+    pub source_through: i64,
+    pub placed_debt: Option<rtdb_types::PlacedTransferDebt>,
+}
+
 pub(super) struct TerminalReplayProgress {
     writer_epoch: Option<u64>,
     last_offset: i64,
     replay: LogicalReplay,
-    placed: Option<(rtdb_types::Term, rtdb_types::PlacedReservation)>,
+    placed: Option<rtdb_types::PlacedTransferDebt>,
 }
 
 impl TerminalReplayProgress {
@@ -519,9 +524,11 @@ impl TerminalReplayProgress {
         match envelope.message {
             ReplicaBody::ResolvedTx(message) => {
                 let next = self.replay.transaction_source(message.src_msg_id)?;
-                match (self.placed, message.placed_slot_terminal.as_deref(), message.placed_attempt.as_deref()) {
+                match (self.placed.as_ref(), message.placed_slot_terminal.as_deref(), message.placed_attempt.as_deref()) {
                     (None, None, None) => (),
-                    (Some((term, reserved)), Some(terminal), Some(attempt)) => {
+                    (Some(debt), Some(terminal), Some(attempt)) => {
+                        let term = rtdb_types::Term(debt.term);
+                        let reserved = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
                         let terminal = rtdb_types::PlacedTerminal::decode(terminal)?;
                         let (attempt, _) = rtdb_format::envelope::decode_replica_outcome_attempt(attempt)?;
                         if attempt != reserved.attempt || terminal.commitment != reserved.commitment
@@ -547,7 +554,9 @@ impl TerminalReplayProgress {
                 if self.replay.source_offset(reserved.attempt.position().0)? <= self.replay.source {
                     return Err(suffix_unavailable());
                 }
-                self.placed = Some((envelope.term, reserved));
+                self.placed = Some(rtdb_types::PlacedTransferDebt {
+                    term: envelope.term.0, reserved_at: self.last_offset, reservation: reserved.encode(),
+                });
             }
             control => {
                 let control = ReplayControl::read(&control)?;
@@ -565,11 +574,9 @@ impl TerminalReplayProgress {
         Ok(())
     }
 
-    pub(super) fn finish(self, through: i64) -> Result<i64> {
-        if self.last_offset != through || self.placed.is_some() {
-            return Err(suffix_unavailable());
-        }
-        Ok(self.replay.source)
+    pub(super) fn finish(self, through: i64) -> Result<TerminalReplayFrontier> {
+        if self.last_offset != through { return Err(suffix_unavailable()); }
+        Ok(TerminalReplayFrontier { source_through: self.replay.source, placed_debt: self.placed })
     }
 }
 
@@ -617,7 +624,7 @@ pub(super) async fn replay_certified_terminal(
     keys: &dyn KeyService, stream: &rtdb_logkeeper::StreamConfig,
     certificate: Option<&JournalDigest>, fence: &rtdb_directory::CheckpointTransferFence, through: i64,
     recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
-) -> Result<i64> {
+) -> Result<TerminalReplayFrontier> {
     let mut progress = TerminalReplayProgress::new(fence, recovered)?;
     let first = fence.destination.checkpoint.boundary.checked_add(1).ok_or_else(suffix_unavailable)?;
     if stream.stream != source.stream("replica") {

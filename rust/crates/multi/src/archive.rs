@@ -2237,7 +2237,7 @@ pub(crate) async fn seal_checkpoint_transfer(
     let memory = rtdb_columnar::MemoryBudget::new(node.execution_memory_bytes);
     let cache = rtdb_storage::cache::CacheBudget::new(node.cache_bytes);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let (basis, source_through, lifetime_floors_sha256, replica_sha256) = replica_suffix::with_terminal_source(
+    let (basis, terminal, lifetime_floors_sha256, replica_sha256) = replica_suffix::with_terminal_source(
         directory, storage, keys, hosted_task, fence, sealed, None,
         |_, source_region, source_io| async move {
             let first = stage.checkpoint.boundary.checked_add(1)
@@ -2253,7 +2253,7 @@ pub(crate) async fn seal_checkpoint_transfer(
             let replica_sha256 = certificate.as_ref().map(|certificate|
                 certificate.digest_bytes().ok_or_else(|| inconsistent("The terminal interval has no canonical digest"))
             ).transpose()?;
-            let (basis, source_through, lifetime_floors_sha256) = read_world::with_registered_capture_replay(
+            let (basis, terminal, lifetime_floors_sha256) = read_world::with_registered_capture_replay(
                 directory, archive, keys, hosted_task,
                 read_world::CaptureSelection {
                     deployment: intent.source, capture: intent.capture,
@@ -2261,16 +2261,17 @@ pub(crate) async fn seal_checkpoint_transfer(
                 },
                 CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
                 Some(read_world::TerminalReplay { storage, source_region, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
-                |context, basis, source_through| async move {
-                    let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
-                    Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))
+                |context, basis, terminal| async move {
+                    let terminal = terminal.ok_or_else(|| inconsistent("Terminal replay produced no source census"))?;
+                    Ok((basis, terminal, archive_lifetime_floors_digest(context, basis).await?))
                 },
             ).await?;
-            Ok((basis, source_through, lifetime_floors_sha256, replica_sha256))
+            Ok((basis, terminal, lifetime_floors_sha256, replica_sha256))
         },
     ).await?;
     directory.record_checkpoint_transfer_terminal(&rtdb_directory::CheckpointTransferTerminal {
-        fence: fence.clone(), replica_through: sealed, source_through, basis,
+        fence: fence.clone(), replica_through: sealed, source_through: terminal.source_through, basis,
+        placed_debt: terminal.placed_debt,
         replica_sha256, lifetime_floors_sha256,
     }).await
 }

@@ -366,7 +366,8 @@ impl DatabaseFactory {
                 return Err(Anomaly::fault("rtdb.node/checkpoint-await-cut", "The opened checkpoint does not establish its await-token cut"));
             }
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
-                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
+                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?
+                .with_placed_transfer(opened_logs.placed_transfer)?;
             let recovered = if self.options.replication.enabled {
                 blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
             } else {

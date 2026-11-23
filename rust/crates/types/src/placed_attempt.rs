@@ -192,6 +192,24 @@ impl PlacedTerminal {
     }
 }
 
+/// The unmatched reservation in a certified Original replica suffix.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacedTransferDebt {
+    pub term: i64,
+    pub reserved_at: i64,
+    pub reservation: Vec<u8>,
+}
+
+/// The held destination's exact replica interval and Original debt census.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacedTransfer {
+    pub after: i64,
+    pub through: i64,
+    pub debt: Option<PlacedTransferDebt>,
+}
+
 /// Original disposition at the deciding receiver, before retry remapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlacedDecision {

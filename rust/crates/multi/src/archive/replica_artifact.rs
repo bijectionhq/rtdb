@@ -396,6 +396,7 @@ mod tests {
                 system_time: Timestamp(11),
             },
             replica_sha256: Some([2; 32]),
+            placed_debt: None,
             lifetime_floors_sha256: [3; 32],
         };
         let vault = tempfile::tempdir().unwrap();
