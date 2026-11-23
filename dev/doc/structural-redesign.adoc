@@ -7,7 +7,10 @@ The second review's Multi serving and custody boundaries extend that design.
 
 == Owner decisions
 
-* A client-supplied system time may not lead the source log's append time (tolerance zero).
+* A client-supplied system time may equal or follow the preceding system time and cannot lead the authenticated source-log append observation for the original request (tolerance zero).
+* An await token establishes a causal lower bound.
+  A system-time cap filters the chosen prefix, and a fresh admission can include later corrections below that cap.
+  An issued exact snapshot token identifies the same applied cut on every successful re-admission under current authorization, retention and custody.
 * A view admitted before an erasure keeps its answers until the erasure deadline; afterwards a read that needs destroyed key material fails with `rtdb/erased-under-view`.
   SNAP-1 and DUR-1 are amended accordingly.
 * An erasure reaches forks that retain shared custody of that history.
@@ -17,14 +20,26 @@ The second review's Multi serving and custody boundaries extend that design.
 
 == Coordinates
 
-Commit order uses the ordered transaction position.
-The exact append-clock reading is a separate observation.
-Temporal SQL uses a strictly increasing system-time projection, which can advance by one chronon when an append-clock reading ties or regresses.
-A client-supplied ordinary system time is bounded by the append-clock observation.
+A decision's identity and serialization order use its authenticated history, partition and position.
+Operation ordinals preserve the original order within each decision.
+Temporal SQL system time is nondecreasing and may tie.
+An automatic assignment uses the maximum of the previous system time and the original append observation, or the append observation at genesis.
+A corrected external hint retains its provenance and follows the same explicit bound if admitted as system time.
+Resolve SQL precedence inside a selected positional cut, filtering by system and valid time, and resolve equal system times by position and ordinal.
+Equal-time overwritten events remain identifiable at their positional cuts.
+A superseded equal-time event has no positive-length SQL system-time interval.
+The installed clock authority independently samples a durable monotone frontier, including while application histories are idle.
+A successor preserves its clock domain's frontier and fences the old authority.
+Live judgments require freshly certified evidence in the correct domain.
+The receiver binds its decision observation to the original predecessor, attempt, temporal terms, effects and outcome at the ordering step.
+Replay preserves that evidence.
+SQL CURRENT_TIMESTAMP uses the recorded query or decision clock.
+Physical acceptance requires certified bounds and timely original evidence from the journal's promised event.
+A copied record and a subsequent clock reading carry no original vote.
 Catalog admission uses a monotone floor recorded by the residence ledger.
 Physical reclamation requires a grant from the storage owner.
-Node-local monotonic durations only expire the holds of readers that stop renewing them.
-Receipt expiry uses the highest append-clock observation installed in the current history.
+Node-local monotonic durations expire holds of readers that stop renewing them.
+Receipt deadlines use the installed decision clock.
 Erasure starts at publication of the erasing generation and uses the custody authority's bounded grant clock.
 
 == Mechanisms
@@ -34,10 +49,21 @@ Erasure starts at publication of the erasing generation and uses the custody aut
 |Tension |Replacement |Deleted
 
 |System time as a physical clock
-|An ordinary client time is admitted only when it advances the head and does not exceed the log append time.
-An owned append witness compares against the exact log observation and uses the ordered system-time projection.
-An external source's commit time is clamped to the node clock.
-|Unbounded future client times and the resulting overflow cliff.
+|The ordered receiver validates positions and judges expiry on one certified clock observation, with equality at the deadline refusing.
+It materializes bounded acceptance-relative terms before validating the actual candidate.
+Funded service turns can bind a successful acceptance to an advertised grid reading in its half-open window.
+A missed window settles only upon original decision evidence or proven exclusion.
+|Successor smoothing, head-derived time reservations and system time as a deadline input.
+
+|Historical read re-admission
+|An issued exact token binds the stable database, history and partition roster, applied positions including empty cuts, catalog, ancestry, interpretation and authorized scope, temporal selectors, query clock and timezone.
+A reader acquires the corresponding hold before opening storage.
+Re-admission waits for that exact prefix or refuses, including if an await requirement is beyond the cut.
+A captured vector retains the consistency of its issuing read.
+The token carries no grant of access or retention.
+The original winner remains identifiable through compaction, recovery and erasure.
+Applicable custody can withhold that winner's bytes and cannot substitute an earlier winner.
+|Timestamp-vector snapshot tokens and lower-bound-plus-cap resumption.
 
 |History retention and privacy erasure
 |History collection retires data below a cut protected by the residence ledger.
@@ -88,7 +114,7 @@ Application intent lookup and labelled command comparison belong to the applicat
 For an owned publication, the deciding history orders the slot witness and guarded decision with the effects.
 Repair preserves the original position and applies current custody masks.
 A successor installs authenticated exclusion and transfer evidence before admitting inherited work.
-Receipt expiry governs readback and physical collection. Closed execution uses its independent slot fence.
+The installed decision clock governs receipt expiry, readback and physical collection. Closed execution uses its independent slot fence.
 |`public.rtdb_idempotency_keys` and its SQL guard.
 
 |Proofs versus composition

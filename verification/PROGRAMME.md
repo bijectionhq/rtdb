@@ -17,7 +17,7 @@ Every agent works in RTDB (`github.com/bijectionhq/rtdb`), not Bijection, and fo
 - **Evidence standard:** every claim needs a passing baseline, a negative control that fails at the declared function or invariant, and, for a design model, a reachability witness and stated bounds. Production proofs verify the shipped source, not a copy.
 - **Ledger:** record each result in `verification/results/2026-11-21.adoc` and update the area's row in the design doc's *Reproduction and current evidence* table. Sentence per line in docs.
 - **Tests:** run the affected crates' suites before landing; a change to indexing, compaction or GC also needs the native replays. macOS has no `timeout` command, so a `timeout N cargo …` check silently runs nothing.
-- **Landing:** conventional commits, rebased onto the latest main, pushed straight to `main`. Rebuild after every rebase before pushing: peers occasionally land commits that break compilation. When a peer has already fixed the same thing, drop your commit (`git rebase --skip`) instead of merging both.
+- **Landing:** conventional commits, rebased onto the latest main, pushed straight to `main`. Review affected source after each rebase and follow the active owner authorization for execution. When a peer has already fixed the same thing, drop your commit (`git rebase --skip`) instead of merging both.
 - **Before starting a workstream:** read the last day of `git log origin/main` for its area. Several peer sessions are active, and an obligation may already be closed.
 
 ## Owner decisions
@@ -27,11 +27,11 @@ The second review narrows the fork decision to shared custody and defines how er
 
 | Decision | Outcome |
 | --- | --- |
-| Read basis and resumption | A basis is a logical coordinate (transaction lower bound plus optional system-time cap). An admitted handle keeps its captured view for its lifetime and is never resumed; a client re-admits at the same basis, and the answer may differ only by erasures committed in between. |
+| Read basis and resumption | An await token is a causal lower bound. A time cap filters a captured prefix. SNAP-1 reopens only an authenticated exact applied cut with its original selectors and query clock, subject to current scope, retention and custody. Fresh admissions can include later corrections beneath the same cap. |
 | Reader lifetime | Readers are protected by renewable holds on the residence ledger (R4). Until R4 lands, bounded monotonic leases (default 1 h, 1 min margin) protect them. |
 | Erasure versus admitted views | A view admitted before an erasure keeps its answers until the erasure deadline (≤ 120 s); after that a read that needs destroyed key material fails with `rtdb/erased-under-view`. SNAP-1 and DUR-1 are amended accordingly. |
 | Forks | Erasure reaches shared history within its key custody domain. Independently keyed copies have their own erasure authority. |
-| Future system time | A client may not supply a system time later than the source log's append time (tolerance zero). Landed. |
+| Future system time | Explicit system time lies between the preceding SQL system time and the original source-log append observation, inclusive. SQL system time may tie. Live decisions use the independent installed clock. |
 | Retry identities | An exact transaction retry is scoped to its registered receiver, database and principal, with a body digest and a conflict outcome. An owned publication orders its separate slot witness with the guarded decision and effects. Business intent and application command comparison belong to the application boundary. |
 | Transaction metadata | Retained only for the receipt window, and erasable with its unit before then (R8). |
 | Physical erasure and non-interference | OPT-2 is in scope with the declared bound; OPT-3 only for rows and search scores of fresh views. |
@@ -130,7 +130,7 @@ Goal: every successful acknowledgement names an admitted, applied batch that rec
 3. Prove the partition publication transitions, scan coverage, and the composition from token to effect.
 4. Trace replica decoding, deferred delivery, oversized payload resolution, leader and follower apply, and recovery imports.
 5. Audit every resolver constructor for committed, staged and transaction-local views.
-6. Durable-to-resolved handoff across all providers, and which imported histories satisfy strict system-time ordering.
+6. Durable-to-resolved handoff across providers. DUR-1 preserves the original positions, append observation, decision clock and outcome through replay, including an unresolved guarded tail. Controls drop the explicit zero-lead bound, resample the clock on replay and count copied or late votes.
 
 **Done when:** stale-term and premature-acknowledgement mutations fail, and the evidence ties each acknowledgement to the same applied outcome after failover.
 
@@ -144,10 +144,12 @@ Goal: every point and range read in production agrees with the bitemporal refere
 
 **Open obligations:**
 
-1. Audit event ordering at every producer of temporal events.
+1. For TIME-1, select by original position and system-time cap, break ties by original position and ordinal, and preserve same-time steps at their positional cuts.
 2. Write end-to-end contracts for the resource and visitor shells around the verified decisions.
 3. Prove the observable decomposition of range answers into the verified point decisions.
-4. Full bitemporal preservation, including same-time conflicts and erasures, beyond the generated trace family.
+4. For TIME-2 and SNAP-1, prove preservation of the original winner or explicit erasure across suffix extension, compaction, recovery and nested forks.
+5. Exercise the 10/20/15/40 correction, tied times across a cut and expiry during idleness.
+6. Compare paired histories with independent clock samples and the same funded observation schedule. Controls use order as the clock, floor the clock only on writes, charge hidden work to public turns, reopen on cap plus await, collapse tied positions and substitute an older winner after erasure.
 
 **Done when:** the production path from stored events to returned rows refines the Lean reference, and the half-open, future-ERASE and tie mutations fail in the composed check.
 
