@@ -339,10 +339,14 @@ fn include_placed_debt(
     cut: Option<crate::deployment::TransferIntakeCut>,
     transfer: Option<&rtdb_types::PlacedTransfer>,
 ) -> Result<Option<crate::deployment::TransferIntakeCut>> {
-    let Some(debt) = transfer.and_then(|transfer| transfer.debt.as_ref()) else { return Ok(cut); };
+    let Some(transfer) = transfer else { return Ok(cut); };
+    let Some(debt) = &transfer.debt else { return Ok(cut); };
     let mut cut = cut.ok_or_else(|| Anomaly::fault(
         "rtdb.multi/intake-floor", "Transferred receiver debt has no terminal intake cut",
     ))?;
+    if transfer.through != cut.replica_through {
+        return Err(Anomaly::fault("rtdb.multi/intake-floor", "Receiver debt belongs to another terminal cut"));
+    }
     let reserved = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
     cut.source_through = cut.source_through.max(reserved.attempt.position().offset());
     Ok(Some(cut))
@@ -697,6 +701,29 @@ mod tests {
     use crate::keys::KeyService;
     use rtdb_format::log::proto;
     use rtdb_types::Term;
+
+    #[tokio::test]
+    async fn inherited_receiver_debt_keeps_its_source_position_across_fresh_intake() {
+        use rtdb_types::{PlacedReservation, PlacedTransfer, PlacedTransferDebt};
+
+        let epoch = StorageEpoch(2);
+        let position = SourcePosition::from_epoch_offset(epoch, 94).unwrap();
+        let attempt = PlacedAttemptScope::new("original", 3).unwrap().issue()
+            .identify(position, Some("sender")).unwrap();
+        let reserved = PlacedReservation::new(attempt, Timestamp(1), b"original");
+        let transfer = PlacedTransfer {
+            after: 2,
+            through: 8,
+            debt: Some(PlacedTransferDebt { term: 3, reserved_at: 7, reservation: reserved.encode() }),
+        };
+        let cut = crate::deployment::TransferIntakeCut { replica_through: 8, source_through: 10 };
+        let journal = MemoryLog::starting_at(1024, LogOffset(9));
+        let sealed = include_placed_debt(Some(cut), Some(&transfer)).unwrap();
+        assert_eq!(next_source_offset_from_cut(&journal, epoch, sealed).await.unwrap(), 95);
+
+        let stale = crate::deployment::TransferIntakeCut { replica_through: 7, source_through: 10 };
+        assert!(include_placed_debt(Some(stale), Some(&transfer)).is_err());
+    }
 
     #[tokio::test]
     async fn a_fork_materializes_only_admitted_offloaded_frames() {
