@@ -77,30 +77,52 @@ struct Confirming {
     next: Option<Arc<Round>>,
 }
 
-/// A guarded entry is the only pending entry. Only replies to its original
-/// observed appends can settle it, one per bound journal identity.
+/// A guarded entry is the only pending entry. It first needs a quorum of
+/// original observed appends, then a quorum storing that commit decision.
 struct GuardedFlight {
     lsn: i64,
-    marks: Vec<Mark>,
+    originals: Vec<Mark>,
+    witnesses: Option<Vec<Mark>>,
 }
 
+#[derive(Clone, Copy)]
+enum GuardedReply { Original(i64), Commit(i64) }
+
 impl GuardedFlight {
-    fn record_reply(&mut self, server: usize, observed: Option<i64>, ack: &Result<Ack>) {
-        if observed == Some(self.lsn) && self.marks[server] == Mark::Pending {
-            self.marks[server] = if matches!(ack, Ok(Ack::Accepted(reply)) if reply.last_lsn == self.lsn) {
-                Mark::Confirmed
-            } else {
-                Mark::Failed
-            };
+    fn record_reply(&mut self, server: usize, reply: Option<GuardedReply>, ack: &Result<Ack>) {
+        let (marks, committed) = match reply {
+            Some(GuardedReply::Original(lsn)) if lsn == self.lsn => (&mut self.originals, false),
+            Some(GuardedReply::Commit(lsn)) if lsn == self.lsn => {
+                let Some(witnesses) = &mut self.witnesses else { return };
+                (witnesses, true)
+            }
+            _ => return,
+        };
+        if marks[server] == Mark::Pending {
+            let exact = matches!(ack, Ok(Ack::Accepted(reply)) if reply.last_lsn == self.lsn
+                && (!committed || reply.commit_lsn == self.lsn));
+            marks[server] = if exact { Mark::Confirmed } else { Mark::Failed };
         }
     }
 
-    fn has_quorum(&self, quorum: usize) -> bool {
-        self.marks.iter().filter(|&&mark| mark == Mark::Confirmed).count() >= quorum
+    fn has_quorum(marks: &[Mark], quorum: usize) -> bool {
+        marks.iter().filter(|&&mark| mark == Mark::Confirmed).count() >= quorum
+    }
+
+    fn begin_commit(&mut self, quorum: usize) -> bool {
+        if self.witnesses.is_some() || !Self::has_quorum(&self.originals, quorum) { return false; }
+        self.witnesses = Some(self.originals.iter().map(|&mark| {
+            if mark == Mark::Failed { Mark::Failed } else { Mark::Pending }
+        }).collect());
+        true
+    }
+
+    fn releasable(&self, quorum: usize) -> bool {
+        self.witnesses.as_ref().is_some_and(|witnesses| Self::has_quorum(witnesses, quorum))
     }
 
     fn can_reach_quorum(&self, quorum: usize) -> bool {
-        self.marks.iter().filter(|&&mark| mark != Mark::Failed).count() >= quorum
+        self.witnesses.as_ref().unwrap_or(&self.originals).iter().filter(|&&mark| mark != Mark::Failed).count() >= quorum
     }
 }
 
@@ -542,9 +564,9 @@ impl Writer {
                 self.repair_down(pipeline);
                 return Err(Error::GuardedAppendUnavailable);
             }
-            Some(GuardedFlight { lsn, marks: pipeline.replicas.iter().map(|replica| {
+            Some(GuardedFlight { lsn, originals: pipeline.replicas.iter().map(|replica| {
                 if matches!(replica.link, Link::Live) { Mark::Pending } else { Mark::Failed }
-            }).collect() })
+            }).collect(), witnesses: None })
         } else { None };
         // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
         let payload = Bytes::copy_from_slice(&payload);
@@ -562,7 +584,7 @@ impl Writer {
         for server in 0..pipeline.replicas.len() {
             let eligible = pipeline.guarded.as_ref().map_or_else(
                 || matches!(pipeline.replicas[server].link, Link::Live),
-                |flight| flight.marks[server] == Mark::Pending,
+                |flight| flight.originals[server] == Mark::Pending,
             );
             if eligible {
                 let append = Append { stream: self.ensemble.stream(), epoch: self.epoch,
@@ -595,9 +617,15 @@ impl Writer {
         let writer = Arc::downgrade(self);
         let ensemble = Arc::clone(&self.ensemble);
         let round = pipeline.confirming.as_ref().map(|confirming| Arc::clone(&confirming.round));
-        let observed = match &body { RequestBody::AppendObserved(append) => Some(append.first_lsn), _ => None };
+        let guarded_reply = match &body {
+            RequestBody::AppendObserved(append) => Some(GuardedReply::Original(append.first_lsn)),
+            RequestBody::Commit(commit) if pipeline.guarded.as_ref().is_some_and(|flight| flight.lsn == commit.commit_lsn) => {
+                Some(GuardedReply::Commit(commit.commit_lsn))
+            }
+            _ => None,
+        };
         self.ensemble.links[server].send(body, Box::new(move |reply| {
-            if let Some(writer) = Weak::upgrade(&writer) { writer.acknowledged(server, ensemble.ack(server, reply), round, observed); }
+            if let Some(writer) = Weak::upgrade(&writer) { writer.acknowledged(server, ensemble.ack(server, reply), round, guarded_reply); }
         }));
     }
 
@@ -615,13 +643,13 @@ impl Writer {
         }));
     }
 
-    fn acknowledged(self: &Arc<Self>, server: usize, ack: Result<Ack>, round: Option<Arc<Round>>, observed: Option<i64>) {
+    fn acknowledged(self: &Arc<Self>, server: usize, ack: Result<Ack>, round: Option<Arc<Round>>, guarded_reply: Option<GuardedReply>) {
         let mut state = self.state.lock();
         if let Ok(Ack::Refused(refused)) = ack && refused.promised > self.epoch { return self.depose(&mut state, refused.promised); }
         let State::Open(pipeline) = &mut *state else { return };
         if let Some(round) = &round { self.mark(pipeline, round, server, matches!(ack, Ok(Ack::Accepted(_)))); }
         if let Some(flight) = &mut pipeline.guarded {
-            flight.record_reply(server, observed, &ack);
+            flight.record_reply(server, guarded_reply, &ack);
             if !flight.can_reach_quorum(self.ensemble.config.write_quorum)
                 && let Some(buffered) = pipeline.buffer.back_mut()
                 && let Some(receipt) = buffered.receipt.take()
@@ -646,7 +674,19 @@ impl Writer {
 
     fn advance(self: &Arc<Self>, pipeline: &mut Pipeline) {
         let write_quorum = self.ensemble.config.write_quorum;
-        if pipeline.guarded.as_ref().is_some_and(|flight| !flight.has_quorum(write_quorum)) { return; }
+        if let Some(flight) = &mut pipeline.guarded && flight.begin_commit(write_quorum) {
+            let flight = pipeline.guarded.as_ref().expect("started under the writer lock");
+            let witnesses = flight.witnesses.as_ref().expect("commit started");
+            for (server, mark) in witnesses.iter().enumerate() {
+                if *mark == Mark::Pending {
+                    self.send(pipeline, server, RequestBody::Commit(Commit {
+                        stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: flight.lsn,
+                    }));
+                }
+            }
+            return;
+        }
+        if pipeline.guarded.as_ref().is_some_and(|flight| !flight.releasable(write_quorum)) { return; }
         let mut acked: Vec<i64> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
         acked.sort_unstable_by(|left, right| right.cmp(left));
         let quorum = acked[write_quorum - 1].min(pipeline.next_lsn - 1);
@@ -662,7 +702,7 @@ impl Writer {
                 let _ = receipt.send(Ok(record(&buffered.entry).metadata));
             }
         }
-        if pipeline.commit == pipeline.next_lsn - 1 {
+        if guarded.is_none() && pipeline.commit == pipeline.next_lsn - 1 {
             for server in 0..pipeline.replicas.len() {
                 if matches!(pipeline.replicas[server].link, Link::Live) {
                     self.send(pipeline, server, RequestBody::Commit(Commit { stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: quorum }));
@@ -887,22 +927,34 @@ mod tests {
 
     #[test]
     fn guarded_quorum_requires_exact_original_replies_from_distinct_dispatched_journals() {
-        let mut flight = GuardedFlight { lsn: 12, marks: vec![Mark::Pending, Mark::Pending, Mark::Failed] };
-        let accepted = |last_lsn| Ok(Ack::Accepted(Accepted { last_lsn, commit_lsn: 11 }));
+        let marks = vec![Mark::Pending, Mark::Pending, Mark::Failed];
+        let mut flight = GuardedFlight { lsn: 12, originals: marks.clone(), witnesses: None };
+        let accepted = |last_lsn, commit_lsn| Ok(Ack::Accepted(Accepted { last_lsn, commit_lsn }));
+        let original = Some(GuardedReply::Original(12));
+        let commit = Some(GuardedReply::Commit(12));
 
-        flight.record_reply(0, Some(12), &accepted(12));
-        flight.record_reply(0, Some(12), &accepted(12));
-        flight.record_reply(1, None, &accepted(12));
-        flight.record_reply(1, Some(11), &accepted(12));
-        flight.record_reply(2, Some(12), &accepted(12));
-        assert!(!flight.has_quorum(2));
+        flight.record_reply(0, original, &accepted(12, 11));
+        flight.record_reply(0, original, &accepted(12, 11));
+        flight.record_reply(1, None, &accepted(12, 11));
+        flight.record_reply(1, commit, &accepted(12, 12));
+        flight.record_reply(1, Some(GuardedReply::Original(11)), &accepted(12, 11));
+        flight.record_reply(2, original, &accepted(12, 11));
+        assert!(!flight.begin_commit(2));
         assert!(flight.can_reach_quorum(2));
 
-        flight.record_reply(1, Some(12), &accepted(12));
-        assert!(flight.has_quorum(2));
+        flight.record_reply(1, original, &accepted(12, 11));
+        assert!(flight.begin_commit(2));
+        assert!(!flight.releasable(2));
+        flight.record_reply(0, commit, &accepted(12, 12));
+        flight.record_reply(0, commit, &accepted(12, 12));
+        flight.record_reply(1, original, &accepted(12, 12));
+        flight.record_reply(2, commit, &accepted(12, 12));
+        assert!(!flight.releasable(2));
+        flight.record_reply(1, commit, &accepted(12, 12));
+        assert!(flight.releasable(2));
 
-        let mut flight = GuardedFlight { lsn: 12, marks: vec![Mark::Confirmed, Mark::Pending, Mark::Failed] };
-        flight.record_reply(1, Some(12), &accepted(13));
+        let mut flight = GuardedFlight { lsn: 12, originals: marks, witnesses: None };
+        flight.record_reply(1, original, &accepted(13, 11));
         assert!(!flight.can_reach_quorum(2));
     }
 
