@@ -97,6 +97,9 @@ external entity KeyService {
     -- A key-management service (KMS).
     -- Wraps and unwraps data keys under a key bound to an encryption context, and destroys keys irreversibly.
     -- The regional deployment key vault is outside the payload backup and tracks destroyed identities.
+    -- A local assertion stage has its own wrapping capability, bound to the deployment, incarnation and single-use stage identity.
+    -- The broker opens a stage envelope only while that capability is live.
+    -- A retired stage stays tombstoned, including when it never held a wrapping capability.
     -- The hosted S3 vault uses the same custody entry for a first residence whether its key identity omits the initial incarnation or spells it out.
 }
 

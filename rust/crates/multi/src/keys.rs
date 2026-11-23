@@ -16,7 +16,9 @@ use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 mod archive;
+mod assertion;
 mod journal;
+pub use assertion::{AssertionEnvelope, AssertionStage};
 pub use journal::JournalKey;
 pub use archive::ArchiveKey;
 pub use crate::cipher::object::FramedObject;
@@ -187,6 +189,7 @@ impl LocalKeyService {
     }
 
     fn require_raw_key(&self, id: &str) -> Result<()> {
+        assertion::require_other_key_namespace(id)?;
         self.require_service_root()?;
         if self.is_brokered(id)? {
             return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/key-non-exportable",
@@ -196,6 +199,7 @@ impl LocalKeyService {
     }
 
     fn open_archive_key(&self, id: String, provision: bool, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        assertion::require_other_key_namespace(&id)?;
         self.require_service_root()?;
         let path = self.path(&id)?;
         let raw_lock = self.lock_key(&path)?;
@@ -366,11 +370,13 @@ impl KeyService for LocalKeyService {
     }
 
     async fn archive_key_is_operation_only(&self, id: &str) -> Result<bool> {
+        assertion::require_other_key_namespace(id)?;
         self.require_service_root()?;
         self.is_brokered(id)
     }
 
     async fn schedule_archive_key(&self, id: &str, due_at_ms: i64) -> Result<bool> {
+        assertion::require_other_key_namespace(id)?;
         let service = self.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -388,6 +394,7 @@ impl KeyService for LocalKeyService {
     }
 
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
+        assertion::require_other_key_namespace(id)?;
         let vault = self.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
