@@ -251,7 +251,7 @@ theorem live_hold_prevents_crossing_its_start (ok : Invariant s) (member : h ∈
 theorem a_fresh_reader_preserves_activation_room (s : State) (writer nonce : Nat) :
     ActivationCount {s with holdBook := hold s writer nonce false :: s.holdBook} =
       ActivationCount s := by
-  simp [ActivationCount, List.countP_cons, hold]
+  simp [ActivationCount, hold]
 
 theorem activated_slot_survives_reader_pressure (s : State) (expected cohort nonce : Nat)
     (auth : Current s cohort expected) (quorum : s.quorum = true)

@@ -168,13 +168,13 @@ def exhausted : State := ⟨1, 0, 0, .idle, true, true, true, false⟩
 
 theorem ordinary_tail_cannot_fund_its_own_activation (s : State)
     (step : Step ⟨1, 0⟩ ⟨1, 1, 1, 1⟩ exhausted s) : s.phase = .idle ∧ s.data = 1 := by
-  cases step <;> simp_all [exhausted, activate, bound, replaceWorker, upload, publish, trim] <;> omega
+  cases step <;> simp_all [exhausted] <;> omega
 
 /-- A pin on the covered data blocks trim even when the checkpoint is published.
 A caller cannot turn logical publication into physical reuse by retrying trim. -/
 theorem pinned_publication_cannot_trim (s t : State) (held : s.held = true)
     (published : s.phase = .published) (step : Step budget cost s t) : t.data ≥ s.data := by
-  cases step <;> simp_all [activate, bound, replaceWorker, upload, publish, trim] <;> omega
+  cases step <;> simp_all <;> omega
 
 #print axioms paid_physical_capacity
 #print axioms recovery_at_full_data_window
