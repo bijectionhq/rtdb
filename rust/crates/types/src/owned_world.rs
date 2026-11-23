@@ -211,7 +211,9 @@ impl OwnedWorld {
         if lineage.is_empty() {
             return if ancestor.is_none() { Ok(()) } else { Err(unavailable()) };
         }
-        if mode != WorldClockMode::Retained || lineage.last().is_none_or(|link| link.logical != inherited)
+        let admitted_mode = mode == WorldClockMode::Retained
+            || (ancestor.is_none() && mode == (WorldClockMode::Held { start: inherited }));
+        if !admitted_mode || lineage.last().is_none_or(|link| link.logical != inherited)
             || ancestor.is_some_and(|source| lineage.first().is_none_or(|link|
                 link.world != source.world || link.pin != source.pin))
         {
@@ -469,7 +471,8 @@ impl OwnedWorld {
             && self.id != next.id
             && next.id == next.pin
             && !self.dropped && !next.dropped
-            && next.mode == WorldClockMode::Retained
+            && (next.mode == WorldClockMode::Retained
+                || next.mode == (WorldClockMode::Held { start: self.inherited_clock() }))
             && next.until <= self.until
             && self.same_parent_archive(next)
     }
@@ -643,6 +646,15 @@ mod tests {
         assert!(!OwnedWorld { parent_publication: None, ..exact }.is_held_root_fork());
         assert!(source.can_retain_parent(&child));
         assert_eq!(child.initial_clock(), Timestamp(100));
+        let mut writable = OwnedWorld {
+            mode: WorldClockMode::Held { start: Timestamp(100) }, ..child.clone()
+        };
+        assert!(source.can_retain_parent(&writable));
+        writable.fork_lineage = source.retained_child_lineage(&writable, Timestamp(130))?;
+        assert_eq!(OwnedWorld::from_record(&writable.record())?, writable);
+        writable.mode = WorldClockMode::Held { start: Timestamp(101) };
+        assert!(!source.can_retain_parent(&writable));
+        assert!(OwnedWorld::from_record(&writable.record()).is_err());
         assert!(!source.can_retain_parent(&OwnedWorld { until: Timestamp(301), ..child.clone() }));
         assert!(!source.can_retain_parent(&OwnedWorld { capture: Iid([4; 16]), ..child.clone() }));
         let dropped = OwnedWorld { dropped: true, ..source };

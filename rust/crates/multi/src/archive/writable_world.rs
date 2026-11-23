@@ -673,9 +673,14 @@ pub(crate) async fn fork_checkpoint_world_selected(
         }
         opened.snapshot.check_overlay_standing(&opened.record).await?;
         let retained = opened.retained.clone();
-        let binding = CheckpointWorldRetention {
-            world: child, until, mode: WorldClockMode::Retained, ..retained.clone()
+        let mode = match fork.requested {
+            rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
+            rtdb_node::WorldClockRequest::Held { start: None } => {
+                WorldClockMode::Held { start: opened.record.inherited_clock() }
+            }
+            _ => return Err(unavailable()),
         };
+        let binding = CheckpointWorldRetention { world: child, until, mode, ..retained.clone() };
         let mut registration = world_record(child, &binding, opened.record.schemas.clone());
         if !opened.record.can_retain_parent(&registration) { return Err(unavailable()); }
         registration.fork_lineage = opened.record.retained_child_lineage(&registration, opened.registered)?;

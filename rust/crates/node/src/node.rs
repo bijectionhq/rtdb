@@ -3088,12 +3088,14 @@ impl NativeSession {
         let overlay_source = fork.cut.overlay();
         let parent_source = fork.cut.retained_parent();
         let retaining_child = root == OwnedForkRoot::None && fork.previous.is_none()
-            && fork.sibling.is_none() && requested == rtdb_types::WorldClockMode::Retained;
+            && fork.sibling.is_none();
+        let can_seed_root = matches!(fork.requested, WorldClockRequest::Retained | WorldClockRequest::Held { start: None });
         let matches_archive = match (&record.ancestor, overlay_source) {
             (None, None) => fork.cut.matches_basis(record.basis)
-                && parent_source.is_none_or(|(source, _)| retaining_child && record.id != source),
+                && parent_source.is_none_or(|(source, _)| retaining_child && can_seed_root && record.id != source),
             (Some(ancestor), Some((source, _, clock))) => record.id != source && ancestor.logical == clock
-                && retaining_child && fork.cut.admits_overlay(ancestor.basis, ancestor.system),
+                && retaining_child && requested == rtdb_types::WorldClockMode::Retained
+                && fork.cut.admits_overlay(ancestor.basis, ancestor.system),
             _ => false,
         };
         if record.id != fork.world || record.pin != fork.pin || !matches_archive

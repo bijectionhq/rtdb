@@ -3781,6 +3781,12 @@ impl Service {
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires its original hold"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Retaining a Held publication requires its physical revision"))?;
         let (child, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires a minted child"))?;
+        let (mode, body) = body.split_first().ok_or_else(|| invalid("The child has no clock mode"))?;
+        let requested = match mode {
+            0 => rtdb_node::WorldClockRequest::Retained,
+            1 => rtdb_node::WorldClockRequest::Held { start: None },
+            _ => return Err(invalid("The child has an invalid clock mode")),
+        };
         let (until, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no expiry"))?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no commit deadline"))?;
         let (attempt, body) = body.split_first_chunk::<22>().ok_or_else(|| invalid("The retained child has no attempt identity"))?;
@@ -3813,7 +3819,7 @@ impl Service {
             Uuid::nil(), None, Timestamp(i64::from_be_bytes(*until)),
             rtdb_node::OwnedWorldFork {
                 world: child, pin: child, previous: None, sibling: None, cut,
-                requested: rtdb_node::WorldClockRequest::Retained,
+                requested,
                 deadline, attempt: attempt.to_owned(), fingerprint: *fingerprint, controls, root: None,
             },
         ).await.map_err(status)?;
