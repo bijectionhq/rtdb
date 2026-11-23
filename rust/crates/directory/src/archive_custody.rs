@@ -35,6 +35,7 @@ mod tests {
         let wire = serde_json::to_vec(&local).unwrap();
         let local = serde_json::from_slice::<StorageRegion>(&wire).unwrap();
         let remote = StorageRegion::Remote {
+            archive_source: None,
             archive: Some(destination), checkpoint_suffix: None, repair_archive: Some(repair), owner: None, closed: false,
             tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
             publications: Default::default(),

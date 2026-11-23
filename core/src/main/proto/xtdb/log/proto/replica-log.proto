@@ -82,4 +82,15 @@ message OversizedMessage {
     int32 storage_epoch = 2;
     int64 block_index = 3;
     string payload_id = 4;
+    bytes payload_sha256 = 5;
+    ReplicaPayloadPublication publication = 6;
+}
+
+message ReplicaPayloadPublication {
+    int32 storage_version = 1;
+    string bucket = 2;
+    string endpoint = 3;
+    string region = 4;
+    string key = 5;
+    string version_id = 6;
 }

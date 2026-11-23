@@ -29,6 +29,8 @@ import java.nio.ByteBuffer
 import java.time.Instant
 import java.time.InstantSource
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 
@@ -62,6 +64,7 @@ class LogProcessorTest {
         electionDriver: ElectionDriver = RealElectionDriver(assertInterval = 25.milliseconds),
         val bufferPool: MemoryStorage = MemoryStorage(allocator, epoch = 0),
         logsDriver: (LogProcessor.LogsDriver) -> LogProcessor.LogsDriver = { it },
+        coroutineContext: CoroutineContext = EmptyCoroutineContext,
     ) : AutoCloseable {
         private val partition = TestPartition(
             allocator, bufferPool, sourceLog, replicaLog,
@@ -76,7 +79,7 @@ class LogProcessorTest {
 
         val partitionState get() = partition.state
         val watchers = Watchers(latestTxId = -1, latestSourceMsgId = -1)
-        val scope = CoroutineScope(SupervisorJob())
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
 
         val logProc = LogProcessor(
             allocator, nodeBase, mockk(relaxed = true),
@@ -167,6 +170,35 @@ class LogProcessorTest {
                     seeded.logOffset, replicaLog.latestSubmittedOffset(),
                     "nothing of ours reached the log"
                 )
+            }
+        }
+    }
+
+    @Test
+    fun `a fenced offload advances replica delivery without fetching its missing payload`() = runTest {
+        withFreshLogs { sourceLog, replicaLog ->
+            replicaLog.appendMessage(ReplicaMessage.NoOp(termId = 2, termSeq = 0))
+            replicaLog.appendMessage(ReplicaMessage.OversizedMessage(Storage.VERSION, 0, 0, "missing", termId = 1, termSeq = 1))
+            val admitted = replicaLog.appendMessage(ReplicaMessage.NoOp(termId = 2, termSeq = 1))
+            TestNode(sourceLog, replicaLog, readOnly = true).use { node ->
+                awaitReplicaMsg(node, admitted.msgId)
+                assertNull(node.watchers.exception)
+            }
+        }
+    }
+
+    @Test
+    fun `an admitted offload with a missing payload faults before advancing the replica position`() = runTest {
+        val failure = CompletableDeferred<Throwable>()
+        val handler = CoroutineExceptionHandler { _, error -> failure.complete(error) }
+        withFreshLogs { sourceLog, replicaLog ->
+            val before = replicaLog.appendMessage(ReplicaMessage.NoOp(termId = 2, termSeq = 0))
+            replicaLog.appendMessage(ReplicaMessage.OversizedMessage(Storage.VERSION, 0, 0, "missing", termId = 2, termSeq = 1))
+            TestNode(sourceLog, replicaLog, readOnly = true, coroutineContext = handler).use { node ->
+                val error = withContext(Dispatchers.Default) { withTimeout(5_000) { failure.await() } }
+                assertEquals(error, node.watchers.exception?.cause)
+                assertTrue(error.message?.contains("oversized/b00-missing.binpb") == true)
+                assertEquals(before.msgId, node.logProc.latestReplicaMsgId)
             }
         }
     }

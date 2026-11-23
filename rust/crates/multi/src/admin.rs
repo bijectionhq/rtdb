@@ -6,9 +6,10 @@ use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
 use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, ForkPublication, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_format::{catalog::BlockCatalog, keys::block_key};
 use rtdb_logkeeper::StreamConfig;
-use rtdb_storage::log::Log;
-use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, Result};
+use rtdb_storage::{ObjectStore, log::Log};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, JournalEndpoint, Result, StorageEpoch};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
@@ -421,6 +422,10 @@ pub async fn pin_engine(directory: &dyn Directory, name: &str, version: Option<&
     update(directory, name, |record| {
         if !record.can_fork() { return Err(Anomaly::incorrect("rtdb.multi/engine-pin", format!("{name} cannot change its engine pin in its current state"))); }
         if record.engine_pin.as_deref() == version { return Ok(()); }
+        if record.placed_receipt_retirement && (version.is_none() || record.lifecycle != Lifecycle::Live || record.holder.is_some()) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/placed-receipt-cutover",
+                "Keep a compatible engine pinned for a history using placed receipt retirement"));
+        }
         if let Some(version) = version {
             let now = now_ms();
             let serves_version = |id| members.get(id).is_some_and(|member| member.engine_version == version);
@@ -437,6 +442,21 @@ pub async fn pin_engine(directory: &dyn Directory, name: &str, version: Option<&
             }
         }
         record.engine_pin = version.map(str::to_owned);
+        Ok(())
+    }).await
+}
+
+/// Starts emitting the versioned outcome format at the next activation.
+pub async fn enable_placed_receipt_retirement(directory: &dyn Directory, name: &str) -> Result<DeploymentRecord> {
+    update(directory, name, |record| {
+        if record.placed_receipt_retirement { return Ok(()); }
+        if record.lifecycle != Lifecycle::Live || record.holder.is_some()
+            || record.move_intent.is_some() || record.active_move(now_ms()).is_some() || record.engine_pin.is_none()
+        {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/placed-receipt-cutover",
+                "Park the deployment, finish its move, and pin a compatible engine before enabling placed receipt retirement"));
+        }
+        record.placed_receipt_retirement = true;
         Ok(())
     }).await
 }
@@ -564,11 +584,34 @@ pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorag
         if now_ms() - crate::reference::written_at_ms(access.bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
             return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
         }
-        let servers = replica_servers(directory.as_ref(), source).await?;
-        let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
-        let material = fork_key(keys, source).await?;
-        let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?, &material, &source.replica_seal_scope())?;
-        let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
+        let tail = crate::archive::stage::with_region(
+            directory.as_ref(), keys, &source.id, storage, destination.hosted_task, None, None,
+            |current| {
+                if current.incarnation != source.incarnation || current.log_epoch != source.log_epoch
+                    || !current.can_fork() || current.serving_replay_capture.is_some()
+                {
+                    return Err(fork_unavailable(parent));
+                }
+                Ok(Some(crate::hosted_recovery::replay_start(current, checkpoint.boundary)?))
+            },
+            |current, _, io| async move {
+                let bucket = storage.bucket(io).await?;
+                let scope = format!("{}/{}", source.storage_prefix(), crate::archive::checkpoint_storage_root()?);
+                let store = crate::store::open_deployment_store(bucket, &scope, crate::packing::PackDiscovery::From(checkpoint.block), crate::store::wall_clock()).await?;
+                let material = fork_key(keys, &current).await?;
+                let store = crate::store::EncryptingStore::new(store, &material)?;
+                let root = crate::reference::key(&block_key(BlockIndex(checkpoint.block))?)?;
+                let catalog = BlockCatalog::decode(&store.get_fresh(&root).await?)?;
+                crate::archive::verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
+                let stream = administration_stream(directory.as_ref(), &current, maximum_message_bytes.max(4 << 20)).await?;
+                tokio::time::timeout(CONTROL_TIMEOUT, async {
+                    let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
+                    let through = reader.read_index(current.epoch).await?;
+                    let reader = crate::logs::SealedLog::new(reader, &material, &current.replica_seal_scope())?;
+                    crate::logs::transactions_until(&reader, &store, &catalog, checkpoint.boundary, through, system_time).await
+                }).await.map_err(|_| fork_unavailable(parent))?
+            },
+        ).await?;
         fork_with_tail(directory.clone(), storage, access, keys, source, destination, Some(checkpoint.block), tail, maximum_message_bytes).await
     }).await
 }
@@ -1230,6 +1273,7 @@ async fn prepare_cell_move(
         let mut staged = source.clone();
         staged.org = arrival.org;
         staged.incarnation = arrival.incarnation;
+        staged.replica_payload_trim = None;
         staged.ensemble = arrival.ensemble;
         staged.storage_generation = Some(uuid::Uuid::new_v4());
         staged.recovery_manifest_sha256 = None;
@@ -1727,7 +1771,7 @@ async fn finish_disposal_with_lock(
     deleted.disposal.map(|receipt| *receipt).ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
 }
 
-fn retirement_journals(
+pub(crate) fn retirement_journals(
     inventory: Vec<JournalEndpoint>, members: &BTreeMap<MemberId, MemberRecord>,
 ) -> Result<Vec<JournalEndpoint>> {
     let mut journals = BTreeMap::<String, JournalEndpoint>::new();
@@ -2769,5 +2813,36 @@ mod tests {
         assert_eq!(error.code, "rtdb.multi/move-in-progress");
         assert_eq!(directory.deployment(&deployment.id).await.unwrap().as_ref(), Some(&deployment));
         assert_eq!(keys.key(&deployment.key_id()).await.unwrap(), key);
+    }
+}
+
+
+#[cfg(test)]
+mod receipt_cutover_tests {
+    use super::*;
+    use rtdb_directory::MemoryDirectory;
+
+    #[tokio::test]
+    async fn receipt_format_cutover_requires_a_parked_pinned_owner() {
+        let directory = MemoryDirectory::new();
+        directory.create_deployment(DeploymentRecord::new("unpinned", "acme", vec![], 0)).await.unwrap();
+        assert_eq!(
+            enable_placed_receipt_retirement(directory.as_ref(), "unpinned").await.unwrap_err().code,
+            "rtdb.multi/placed-receipt-cutover",
+        );
+        let mut installed = DeploymentRecord::new("active", "acme", vec![], 0);
+        installed.engine_pin = Some("installed-compatible-version".into());
+        installed.holder = Some(MemberId("holder".into()));
+        directory.create_deployment(installed).await.unwrap();
+        assert_eq!(
+            enable_placed_receipt_retirement(directory.as_ref(), "active").await.unwrap_err().code,
+            "rtdb.multi/placed-receipt-cutover",
+        );
+        let mut parked = DeploymentRecord::new("parked", "acme", vec![], 0);
+        parked.engine_pin = Some("installed-compatible-version".into());
+        directory.create_deployment(parked).await.unwrap();
+        assert!(enable_placed_receipt_retirement(directory.as_ref(), "parked").await.unwrap().placed_receipt_retirement);
+        assert!(directory.deployment_by_name("parked").await.unwrap().unwrap().placed_receipt_retirement);
+        assert_eq!(pin_engine(directory.as_ref(), "parked", None).await.unwrap_err().code, "rtdb.multi/placed-receipt-cutover");
     }
 }

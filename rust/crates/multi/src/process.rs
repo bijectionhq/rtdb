@@ -25,7 +25,7 @@ use crate::deployment::LOGKEEPER_LOG_TYPE;
 use crate::lease::{LeaseOptions, MemberLease, Registration};
 use crate::logs::LogkeeperLogFactory;
 
-const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const PLACED_FLUSH_INTERVAL_LIMIT: Duration = Duration::from_secs(15 * 60);
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -79,14 +79,14 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     crate::admin::validate_engine_version(&engine_version)?;
     let scoped_writes = match (&settings.agent.s3_write_role, &settings.agent.storage) {
         (Some(role), crate::deployment::CellStorage::S3 { config }) => {
-            let issuer = rtdb_s3::ScopedS3Writes::new(&role.arn, config.region.as_deref(), role.sts_endpoint.as_deref(),
-                role.require_conditional_put).await?;
+            let issuer = Box::pin(rtdb_s3::ScopedS3Writes::new(&role.arn, config.region.as_deref(), role.sts_endpoint.as_deref(),
+                role.require_conditional_put)).await?;
             Some(Arc::new(crate::store::ScopedCellWrites::new(issuer)))
         }
         (Some(_), _) => return Err(Anomaly::incorrect("rtdb.multi/scoped-storage", "A scoped S3 write role requires S3 cell storage")),
         (None, _) => None,
     };
-    let bucket = settings.agent.storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let bucket = Box::pin(settings.agent.storage.bucket(rtdb_storage::IoRegion::new())).await?;
     let storage_namespaces = if scoped_writes.is_some() {
         let objects = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?
             .ok_or_else(|| Anomaly::incorrect("rtdb.multi/storage-namespace-missing", "Initialize the cell object namespace before starting a scoped writer"))?;
@@ -137,6 +137,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             }) as Arc<dyn rtdb_flight_sql::OwnedWorldHost>
         });
     let storage = Arc::new(crate::store::CellStoreFactory {
+        replica_payload_reclamation: settings.agent.replica_payload_reclamation,
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
         storage_namespaces,
@@ -165,7 +166,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let relay_limit = settings.configuration.server.as_ref()
         .filter(|_| settings.capabilities.is_some() && !settings.configuration.auth.uses_remote_address())
         .map(|server| server.connections);
-    let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
+    let (server, driver) = Box::pin(ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed)).await?;
     let pgwire = server.primary_pgwire().ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
     let pgwire_address = pgwire.address();
     let control = TcpListener::bind(settings.control).await.map_err(io)?;
@@ -181,7 +182,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoints, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, Arc::clone(&settings.keys), server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoints, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();

@@ -45,7 +45,8 @@ pub(crate) fn plaintext_size(key: &ObjectKey, length: u64) -> Result<u64> {
     Ok(frames / FRAME_STRIDE as u64 * FRAME_BYTES as u64 + tail)
 }
 
-pub(crate) struct FramedObject {
+#[derive(Clone, Copy)]
+pub struct FramedObject {
     length: usize,
     identity: [u8; 32],
 }
@@ -119,6 +120,7 @@ impl FramedObject {
     }
 
     pub(crate) fn open_frames(&self, cipher: &Cipher, key: &ObjectKey, frames: Range<usize>, sealed: &[u8]) -> Result<Bytes> {
+        if frames.start > frames.end || frames.end > self.frame_count() { return Err(invalid(key)); }
         let expected = self.physical_range(&frames);
         if sealed.len() as u64 != expected.end - expected.start { return Err(invalid(key)); }
         let mut plaintext = Vec::with_capacity(sealed.len() - frames.len() * SEALED_OVERHEAD);

@@ -55,26 +55,44 @@ pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
+pub(super) struct PageRows {
+    pub source_precedence: usize,
+    pub events: Vec<PageEvent>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TieOrder {
+    Legacy,
+    Scan,
+}
+
 pub(super) struct RowHeap<'a> {
-    streams: &'a [Vec<PageEvent>],
+    streams: &'a [PageRows],
     heads: Vec<row_heap::Head>,
+    tie_order: TieOrder,
 }
 
 impl<'a> RowHeap<'a> {
-    pub fn new(streams: &'a [Vec<PageEvent>]) -> Result<Self> {
-        let heads = row_heap::from_pages(streams.len(), |stream| streams[stream].len(), |head| Self::key(streams, head))
+    pub fn new(streams: &'a [PageRows], tie_order: TieOrder) -> Result<Self> {
+        let heads = row_heap::from_pages(streams.len(), |stream| streams[stream].events.len(), |head| Self::key(streams, tie_order, head))
             .ok_or_else(|| crate::invalid("Compaction page is not IID ascending and system-position descending"))?;
-        Ok(Self { streams, heads })
+        Ok(Self { streams, heads, tie_order })
     }
 
-    fn key(streams: &[Vec<PageEvent>], (stream, row): row_heap::Head) -> row_heap::Key {
-        let event = &streams[stream][row];
-        (u128::from_be_bytes(event.iid.0), event.system_from.0, event.commit_position)
+    fn key(streams: &[PageRows], tie_order: TieOrder, (stream, row): row_heap::Head) -> row_heap::Key {
+        let page = &streams[stream];
+        let event = &page.events[row];
+        let (priority, ordinal, leaf) = match tie_order {
+            TieOrder::Legacy => (0, 0, 0),
+            TieOrder::Scan => (page.source_precedence, event.page_ordinal(), stream),
+        };
+        (u128::from_be_bytes(event.iid.0), event.system_from.0, event.commit_position, priority, ordinal, leaf)
     }
 
     pub fn next(&mut self) -> Option<row_heap::Head> {
         let streams = self.streams;
+        let tie_order = self.tie_order;
         let (stream, _) = *self.heads.first()?;
-        Some(row_heap::take_minimum(&mut self.heads, streams[stream].len(), |head| Self::key(streams, head)))
+        Some(row_heap::take_minimum(&mut self.heads, streams[stream].events.len(), |head| Self::key(streams, tie_order, head)))
     }
 }

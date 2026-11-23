@@ -35,6 +35,31 @@ pub struct ScanRequest<'a> {
     pub verifier: &'a dyn CandidateVerifier,
 }
 
+impl ScanRequest<'_> {
+    pub async fn ranked_prefix_len(&self, top: &rtdb_plan::ScanTopK) -> Option<usize> {
+        let count = async |expression: &Expr| {
+            let value = self.constants.constant(expression).await.ok()??;
+            rtdb_expr::integer(&value).and_then(crate::limit_bounds::checked_row_count)
+        };
+        let offset = match &top.offset { Some(offset) => count(offset).await?, None => 0 };
+        let fetch = count(&top.limit).await?;
+        usize::try_from(crate::limit_bounds::sort_prefix_len(offset, Some(fetch))).ok()
+    }
+
+    pub fn ranked_id_is_uuid(&self, id: ColumnId) -> bool {
+        let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
+        self.scan.columns.iter().any(|field| field.id == id && field.name == "_id" && field.data_type == uuid)
+    }
+
+    pub fn permits_ranked_uuid_id(&self, id: ColumnId) -> bool {
+        let table = &self.scan.table.name.table;
+        !table.is_owned_event_data()
+            && self.ranked_id_is_uuid(id)
+            && crate::scan::stores_uuid_ids(table, self.partitions)
+            && self.snapshot.live_has_canonical_entity_iids(table)
+    }
+}
+
 #[async_trait]
 pub trait CandidateVerifier: Send + Sync {
     fn permits_search_witness(&self) -> bool { false }
