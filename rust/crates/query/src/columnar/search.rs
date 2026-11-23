@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, cast::AsArray,
@@ -9,7 +9,7 @@ use arrow_schema::{DataType as Type, Field};
 use rtdb_columnar::{TextCell, from_field, text_cell};
 use rtdb_expr::Parameters;
 use rtdb_plan::{Expr, Schema};
-use rtdb_text::{Query, Scorer, analyze, stored_length};
+use rtdb_text::{Query, Scorer, count_tokens, stored_length};
 use rtdb_types::{Anomaly, LogicalType, Result, Value, text_pair_fingerprint};
 
 use super::{Column, ColumnBatch};
@@ -34,21 +34,23 @@ impl<'a> Cell<'a> {
         })
     }
 
-    fn text(self) -> Result<TextCell<'a>> {
+    fn text(self, types: &mut TextTypes<'a>) -> Result<TextCell<'a>> {
         Ok(match self {
             Self::Null | Self::Literal(Value::Null | Value::Undefined) => TextCell::Missing,
             Self::Literal(Value::Utf8(text)) => TextCell::Utf8(text),
             Self::Literal(_) => TextCell::Other,
             Self::Arrow(array, field, logical, row) => {
-                let inferred;
-                let logical = if let Some(ty) = logical { ty } else { inferred = from_field(field)?; &inferred };
+                let logical = match logical {
+                    Some(logical) => logical,
+                    None => types.infer(field)?,
+                };
                 text_cell(logical, field, array, row)?
             }
         })
     }
 
-    fn str(self) -> Result<Option<&'a str>> {
-        Ok(match self.text()? {
+    fn str(self, types: &mut TextTypes<'a>) -> Result<Option<&'a str>> {
+        Ok(match self.text(types)? {
             TextCell::Utf8(text) => Some(text),
             TextCell::Missing | TextCell::Other => None,
         })
@@ -138,7 +140,23 @@ impl<'a> Input<'a> {
     }
 }
 
-pub(crate) fn text(column: &Column, row: usize) -> Result<TextCell<'_>> { Input::Column(column).row(row).text() }
+#[derive(Default)]
+pub(crate) struct TextTypes<'a>(HashMap<usize, (&'a Field, LogicalType)>);
+
+impl<'a> TextTypes<'a> {
+    fn infer(&mut self, field: &'a Field) -> Result<&LogicalType> {
+        use std::collections::hash_map::Entry;
+        let entry = match self.0.entry(std::ptr::from_ref(field) as usize) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert((field, from_field(field)?)),
+        };
+        Ok(&entry.1)
+    }
+
+    pub(crate) fn text(&mut self, column: &'a Column, row: usize) -> Result<TextCell<'a>> {
+        Input::Column(column).row(row).text(self)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Function {
@@ -174,6 +192,13 @@ fn operand(expr: &Expr) -> bool {
     }
 }
 
+fn invariant_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter { .. } => true,
+        Expr::List(values) => values.iter().all(invariant_operand),
+        _ => false,
+    }
+}
 
 fn input<'a>(expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, params: Parameters<'a>) -> Result<Option<Input<'a>>> {
     Ok(Some(match expr {
@@ -206,13 +231,13 @@ fn stats(query: &Query, documents: Cell<'_>, total: Cell<'_>, frequencies: Cell<
     Ok((documents, tokens, frequencies))
 }
 
-fn fingerprint(left: Cell<'_>, right: Cell<'_>) -> Result<Option<[u8; 32]>> {
+fn fingerprint<'a>(left: Cell<'a>, right: Cell<'a>, types: &mut TextTypes<'a>) -> Result<Option<[u8; 32]>> {
     let (Some(ids), Some(bodies)) = (left.list()?, right.list()?) else { return Ok(None); };
     let invalid = || Anomaly::incorrect("rtdb.expr/invalid-search-documents",
         "A search fingerprint requires equally sized arrays of text ids and bodies");
     if ids.len() != bodies.len() { return Err(invalid()); }
     text_pair_fingerprint((0..ids.len()).map(|index| {
-        Ok((ids.cell(index).str()?.ok_or_else(invalid)?, bodies.cell(index).str()?.ok_or_else(invalid)?))
+        Ok((ids.cell(index).str(types)?.ok_or_else(invalid)?, bodies.cell(index).str(types)?.ok_or_else(invalid)?))
     })).map(Some)
 }
 
@@ -251,29 +276,48 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
     let mut length = Int64Builder::new();
     let mut binary = BinaryBuilder::new();
     let mut terms = ListBuilder::new(StringBuilder::new());
+    let mut types = TextTypes::default();
+    let mut parsed = None;
+    let mut prepared = None;
+    let constant_score = args.iter().skip(1).all(invariant_operand);
     for row in 0..batch.len {
         context.check_cancelled_at(row)?;
         let cell = |index: usize| inputs[index].row(row);
         let null = inputs.iter().try_fold(false, |null, input| Ok::<_, Anomaly>(null || input.row(row).null()?))?;
-        let first = if null { None } else { cell(0).str()? };
+        let first = if null { None } else { cell(0).str(&mut types)? };
         match function {
             Function::Match | Function::Score => {
-                let query = if null { None } else { cell(1).str()? };
+                let query = if null { None } else { cell(1).str(&mut types)? };
                 let outcome = query.map(|query| {
                     let _scratch = context.memory.reserve(256usize.saturating_add(query.len().saturating_mul(32))
                         .saturating_add(first.map_or(0, |text| text.len().saturating_mul(32))))?;
-                    let query = Query::parse(query);
-                    let document = first.map_or_else(|| arrow_array::StringArray::from(Vec::<&str>::new()), analyze);
+                    let varying;
+                    let query = if matches!(inputs[1], Input::Constant(_)) {
+                        parsed.get_or_insert_with(|| Query::parse(query))
+                    } else {
+                        varying = Query::parse(query);
+                        &varying
+                    };
                     Ok::<_, Anomaly>(match function {
-                        Function::Match => (query.matches_arrow(&document), 0.0),
+                        Function::Match => (first.is_some_and(|text| query.matches_text(text)), 0.0),
                         Function::Score => {
-                            let scorer = if inputs.len() == 5 {
-                                let (documents, tokens, frequencies) = stats(&query, cell(2), cell(3), cell(4))?;
-                                Scorer::from_frequencies(query, documents, tokens, &frequencies)
-                            } else {
-                                Scorer::new(query, None)
+                            let build = || -> Result<Scorer> {
+                                Ok(if inputs.len() == 5 {
+                                    let (documents, tokens, frequencies) = stats(query, cell(2), cell(3), cell(4))?;
+                                    Scorer::from_frequencies(query.clone(), documents, tokens, &frequencies)
+                                } else {
+                                    Scorer::new(query.clone(), None)
+                                })
                             };
-                            (false, scorer.bm25_arrow(&document))
+                            let varying;
+                            let scorer = if constant_score {
+                                if prepared.is_none() { prepared = Some(build()?); }
+                                prepared.as_ref().unwrap()
+                            } else {
+                                varying = build()?;
+                                &varying
+                            };
+                            (false, scorer.bm25_text(first.unwrap_or_default()))
                         }
                         _ => unreachable!(),
                     })
@@ -287,7 +331,7 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
             Function::Length => {
                 let count = first.map(|text| {
                     let _scratch = context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
-                    Ok::<_, Anomaly>(i64::from(stored_length(analyze(text).len())))
+                    Ok::<_, Anomaly>(i64::from(stored_length(count_tokens(text).len())))
                 }).transpose()?;
                 length.append_option(count);
             }
@@ -295,12 +339,19 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
                 if let Some(text) = first {
                     let owner = Arc::get_mut(&mut retained).expect("Search projection owns its allocation");
                     owner.grow_to(owner.bytes().saturating_add(text.len().saturating_mul(16)))?;
-                    for term in Query::parse(text).terms() { terms.values().append_value(term); }
+                    let varying;
+                    let query = if matches!(inputs[0], Input::Constant(_)) {
+                        parsed.get_or_insert_with(|| Query::parse(text))
+                    } else {
+                        varying = Query::parse(text);
+                        &varying
+                    };
+                    for term in query.terms() { terms.values().append_value(term); }
                 }
                 terms.append(first.is_some());
             }
             Function::Fingerprint => {
-                let digest = if null { None } else { fingerprint(cell(0), cell(1))? };
+                let digest = if null { None } else { fingerprint(cell(0), cell(1), &mut types)? };
                 binary.append_option(digest);
             }
         }
@@ -322,7 +373,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[test]
-    fn scoring_borrows_arrow_text_and_produces_a_nullable_arrow_score() {
+    fn arrow_search_scoring_borrows_arrow_text_and_produces_a_nullable_arrow_score() {
         let memory = rtdb_columnar::MemoryBudget::new(1 << 24);
         let storage = Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20));
         let catalog = crate::CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([
@@ -337,19 +388,42 @@ mod tests {
         };
         let schema = Schema::new(vec![field.clone()]).unwrap();
         let batch = ColumnBatch::settled(vec![Column::Arrow {
-            array: Arc::new(arrow_array::StringArray::from(vec![Some("invoice paid"), None])),
-            field: Arc::new(Field::new("text", Type::Utf8, true)), logical: Some(logical),
-        }], 2, memory.reserve(2048).unwrap()).unwrap();
-        let query = Expr::Literal(Value::Utf8("invoice".into()));
+            array: Arc::new(arrow_array::StringArray::from(vec![None, Some("invoice paid"), Some("invoice invoice")])),
+            field: Arc::new(Field::new("text", Type::Utf8, true)), logical: None,
+        }], 3, memory.reserve(2048).unwrap()).unwrap();
+        let mut frequencies = ListBuilder::new(Int64Builder::new());
+        frequencies.values().append_value(4);
+        frequencies.append(true);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(arrow_array::StringArray::from(vec!["invoice"])),
+            Arc::new(arrow_array::Int64Array::from(vec![7])),
+            Arc::new(arrow_array::Int64Array::from(vec![22])),
+            Arc::new(frequencies.finish()),
+        ];
+        let fields: Vec<_> = arrays.iter().enumerate().map(|(index, array)| Field::new(index.to_string(), array.data_type().clone(), false)).collect();
+        let arguments = fields.iter().map(from_field).collect::<Result<Vec<_>>>().unwrap();
+        let record = arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays).unwrap();
+        let input = rtdb_columnar::OwnedBatch::new(record, &memory).unwrap();
+        let bound = crate::BoundParameters::from_arrow(input, 0, arguments.clone(), &memory).unwrap();
+        let params = bound.evaluator();
+        let mut types = TextTypes::default();
+        assert!(matches!(types.text(&batch.columns[0], 1).unwrap(), TextCell::Utf8("invoice paid")));
+        assert!(matches!(types.text(&batch.columns[0], 2).unwrap(), TextCell::Utf8("invoice invoice")));
+        assert_eq!(types.0.len(), 1);
         let score = Expr::Call {
-            name: "search_score".into(), args: vec![field.expression(), query],
+            name: "search_score".into(), args: std::iter::once(field.expression())
+                .chain(arguments.into_iter().enumerate().map(|(index, data_type)| Expr::Parameter { index, data_type })).collect(),
             return_type: LogicalType::Scalar(ScalarType::F64).maybe(),
         };
-        let Some(Column::Arrow { array, .. }) = column(&score, &schema, &batch, Parameters::Values(&[]), &context).unwrap() else {
+        let Some(Column::Arrow { array, .. }) = column(&score, &schema, &batch, params, &context).unwrap() else {
             panic!("Search score was not an Arrow column");
         };
         let output = array.as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
-        assert_eq!(output.value(0).to_bits(), Scorer::new(Query::parse("invoice"), None).bm25_arrow(&analyze("invoice paid")).to_bits());
-        assert!(output.is_null(1));
+        let scorer = Scorer::from_frequencies(Query::parse("invoice"), 7, 22, &[4]);
+        assert!(output.is_null(0));
+        assert!((0..4).all(|index| params.known(index).is_none()));
+        for (row, text) in ["invoice paid", "invoice invoice"].into_iter().enumerate() {
+            assert_eq!(output.value(row + 1).to_bits(), scorer.bm25_arrow(&rtdb_text::analyze(text)).to_bits());
+        }
     }
 }

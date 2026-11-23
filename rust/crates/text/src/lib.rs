@@ -96,6 +96,64 @@ pub fn analyze(text: &str) -> StringArray {
     tokens.finish()
 }
 
+#[derive(Clone, Copy)]
+pub struct TokenCount {
+    len: usize,
+    bytes: usize,
+    byte_capacity: usize,
+}
+
+impl TokenCount {
+    fn new() -> Self { Self { len: 0, bytes: 0, byte_capacity: 1024 } }
+
+    pub fn len(self) -> usize { self.len }
+
+    // Scalar evaluation charges the capacity of the Arrow token vector it used to build.
+    pub fn arrow_bytes(self) -> usize {
+        let offsets = if self.len < 1025 { 1025 } else { (self.len / 1025 + 1).next_power_of_two() * 1025 };
+        std::mem::size_of::<StringArray>() + offsets * std::mem::size_of::<i32>() + self.byte_capacity
+    }
+}
+
+impl Write for TokenCount {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.bytes += text.len();
+        if self.bytes > self.byte_capacity {
+            self.byte_capacity = self.bytes.max(self.byte_capacity * 2);
+        }
+        Ok(())
+    }
+}
+
+impl TokenOutput for &mut TokenCount {
+    fn end_token(&mut self) { self.len += 1; }
+}
+
+struct CountedTokens<'a, F> {
+    count: &'a mut TokenCount,
+    visitor: TokenVisitor<F>,
+}
+
+impl<F> Write for CountedTokens<'_, F> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.count.write_str(text)?;
+        self.visitor.write_str(text)
+    }
+}
+
+impl<F: FnMut(&str)> TokenOutput for CountedTokens<'_, F> {
+    fn end_token(&mut self) {
+        self.count.len += 1;
+        self.visitor.end_token();
+    }
+}
+
+pub fn count_tokens(text: &str) -> TokenCount {
+    let mut count = TokenCount::new();
+    tokenize(text, &mut count);
+    count
+}
+
 /// A query's distinct terms, in first-occurrence order, and its phrases: runs of terms written between double quotes.
 /// A document matches when it holds every term, and every phrase as consecutive tokens; an unclosed quote runs to the end.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -123,6 +181,36 @@ impl Query {
     pub fn matches_arrow(&self, document: &StringArray) -> bool {
         self.matches_cells(document.len(), |index| document.value(index))
     }
+
+    pub fn text_terms(&self, text: &str, match_phrases: bool) -> (TokenCount, Vec<u32>, bool) {
+        let mut count = TokenCount::new();
+        let mut frequencies = vec![0u32; self.terms.len()];
+        let mut found = vec![false; if match_phrases { self.phrases.len() } else { 0 }];
+        let longest = if match_phrases { self.phrases.iter().map(Vec::len).max().unwrap_or(0) } else { 0 };
+        let mut tail = std::collections::VecDeque::with_capacity(longest);
+        let visit = |token: &str| {
+            let term = self.terms.iter().position(|term| term == token);
+            if let Some(term) = term { frequencies[term] = frequencies[term].wrapping_add(1); }
+            if longest == 0 || found.iter().all(|&matched| matched) { return; }
+            if tail.len() == longest { tail.pop_front(); }
+            tail.push_back(term);
+            for (phrase, matched) in self.phrases.iter().zip(&mut found) {
+                if !*matched && tail.len() >= phrase.len() {
+                    *matched = tail.iter().rev().zip(phrase.iter().rev()).all(|(term, expected)| {
+                        term.is_some_and(|term| &self.terms[term] == expected)
+                    });
+                }
+            }
+        };
+        tokenize(text, CountedTokens {
+            count: &mut count,
+            visitor: TokenVisitor { token: String::new(), visit },
+        });
+        let matched = !frequencies.is_empty() && frequencies.iter().all(|&count| count != 0) && found.into_iter().all(|value| value);
+        (count, frequencies, matched)
+    }
+
+    pub fn matches_text(&self, text: &str) -> bool { self.text_terms(text, true).2 }
 
     fn matches_cells<'a>(&self, length: usize, get: impl Fn(usize) -> &'a str) -> bool {
         !self.terms.is_empty() && self.terms.iter().all(|term| (0..length).any(|index| get(index) == term))
@@ -248,6 +336,11 @@ impl Scorer {
         self.score(&frequencies, stored_length(document.len()))
     }
 
+    pub fn bm25_text(&self, text: &str) -> f64 {
+        let (count, frequencies, _) = self.query.text_terms(text, false);
+        self.score(&frequencies, stored_length(count.len()))
+    }
+
     pub fn for_ranking(self: &Arc<Self>) -> Option<RankScorer> {
         if self.idfs.iter().any(|&idf| idf != 0.0 && !(f64::EPSILON / 4096.0..=64.0).contains(&idf)) {
             return None;
@@ -281,6 +374,25 @@ pub fn bm25(query: &Query, document: &[String], corpus: Option<&Corpus>) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_search_streaming_terms_match_arrow_tokens_scores_and_allocation_charge() {
+        let query = Query::parse(r#"paid "a a b" "a b" ος"#);
+        let scorer = Scorer::from_frequencies(query.clone(), 11, 231, &[1, 3, 7, 11]);
+        let cases = [
+            String::new(), "paid a a a b ΟΣ".into(), "paid a b a ΟΣ".into(),
+            format!("paid a a b ΟΣ {}", "é".repeat(MAX_TOKEN_BYTES)),
+            "x ".repeat(1024), "x ".repeat(1025), "x ".repeat(4096),
+        ];
+        for text in cases {
+            let arrow = analyze(&text);
+            let (count, _, matched) = query.text_terms(&text, true);
+            assert_eq!(count.len(), arrow.len());
+            assert_eq!(count.arrow_bytes(), arrow.get_array_memory_size());
+            assert_eq!(matched, query.matches_arrow(&arrow));
+            assert_eq!(scorer.bm25_text(&text).to_bits(), scorer.bm25_arrow(&arrow).to_bits());
+        }
+    }
 
     #[test]
     fn tokens_split_on_non_alphanumerics_and_lowercase() {

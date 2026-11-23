@@ -27,6 +27,10 @@ The same pinned catalog determines which version is visible and where its payloa
 | `PartitionRankSource` and `ScanVerifier` | Passive objects | Partition coverage, posting readers and visibility and predicate evaluation at the pinned cut. |
 | `RankWork`, `RankOutcome`, `VerifiedRankRow`, and `QueryWinners` | Passive values | Bounded work, child tasks, verified version and score evidence, and the retained rows by partition. |
 | `RankClaim` | Passive guard | An outstanding bound through publication or cancellation. |
+| `ServingTerms` and `ServingBatch` | Passive views | The mapping from live Arrow batch positions to the captured, charged posting pages. |
+| `OwnedSelection` and `OwnedArtefactKeys` | Passive values | The admitted relation scope and the bounded set of complete keys at each batched locator. |
+| `OwnedCandidate` and `OwnedRankWindow` | Passive objects | One candidate's pending primary verification and the ranker's retained hits and running memory total. |
+| `TextTypes` and `TokenCount` | Passive values | Per-batch field inference and streaming analyzer counts with the scalar evaluator's allocation charge. |
 
 ```rust
 struct EventOrigin {
@@ -172,3 +176,12 @@ search:
 
 Protection and governed ownership still follow the held-table authorization and corpus rules.
 Legacy file formats remain readable, and unsupported scan shapes can use the complete primary resolver.
+
+## Query-time Arrow audit
+
+| Path | Typed execution |
+| --- | --- |
+| MATCH, SEARCH_SCORE, SEARCH_LENGTH, SEARCH_TERMS and corpus fingerprints | A columnar batch reuses its bound query, fixed scorer and inferred field types while document evaluation streams token counts, term frequencies and phrase matches. |
+| Resolved MATCH and score | An admitted live batch position uses its serving posting page, and a located candidate can carry the MATCH verdict of its certified version. |
+| Ranked verification | A forward witness supplies the resolved version's score while the primary gather checks the event and reads ascending identities from their Arrow legs. |
+| Owned ranking and held corpora | A projected cursor checks complete identities and revisions in batches, unambiguous revisions use posting scores, and held corpus statistics and rank-window memory accumulate incrementally. |

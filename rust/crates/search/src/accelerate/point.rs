@@ -4,9 +4,9 @@ use std::sync::Arc;
 use futures::{FutureExt, TryStreamExt};
 use rtdb_format::{entity_history::{self, HistoryRoot}, keys::TrieKey};
 use rtdb_storage::ObjectKey;
-use rtdb_index::TrieState;
+use rtdb_index::{RowSource, TrieState};
 use rtdb_query::{LocatedHistoryEvent, ResolvedSearchRow, ScanRequest, SearchRowLocation, resolve_located_point};
-use rtdb_types::{Anomaly, AnomalyCategory, EventOrigin, Iid, Result, RowVersion, TableRef};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TableRef};
 
 use super::{covers, search_cancelled, tree::RecordedTree};
 use crate::{SearchDefinition, SearchRuntime, file::PACKED_FORMAT_VERSION};
@@ -19,7 +19,33 @@ pub(super) struct PackedVisibility {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum SearchWitness { Packed(usize, u32), Live(RowVersion, Option<EventOrigin>), Logical(crate::file::TextRevision) }
+pub(super) enum SearchWitness { Packed(usize, u32), Live(usize, usize), Logical(crate::file::TextRevision) }
+
+impl SearchWitness {
+    // Older live events can share temporal coordinates without an accepted event ID.
+    pub(super) fn live(source: &RowSource) -> Self {
+        Self::Live(Arc::as_ptr(&source.batch) as usize, source.row)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn arrow_search_live_witness_distinguishes_primary_rows_with_the_same_version() {
+    use rtdb_format::data::{StoredEvent, StoredOperation};
+    use rtdb_types::{Interval, StructFields, Timestamp, Value};
+
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+    let source = |text: &str| {
+        let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]),
+            system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8(text.into()))])) };
+        RowSource { batch: rtdb_index::IndexBatch::from_events(&[event], &StructFields::new(), &memory).unwrap(), row: 0 }
+    };
+    let earlier = source("invoice");
+    let later = source("open");
+    assert_eq!(earlier.header().unwrap().version(), later.header().unwrap().version());
+    assert!(SearchWitness::live(&earlier) != SearchWitness::live(&later));
+}
 
 pub(super) struct ResolvedVersion {
     pub row: ResolvedSearchRow,
@@ -51,8 +77,8 @@ impl PackedVisibility {
             let mut persisted = BTreeMap::<TrieKey, Vec<ResolvedSearchRow>>::new();
             for row in rows {
                 match &row.location {
-                    SearchRowLocation::Live(_) => {
-                        let witness = Some(SearchWitness::Live(row.version, row.origin));
+                    SearchRowLocation::Live(source) => {
+                        let witness = Some(SearchWitness::live(source));
                         resolved.push(ResolvedVersion { row, witness });
                     }
                     SearchRowLocation::Persisted { trie, .. } if self.logical && row.origin.is_some() => {
@@ -120,8 +146,9 @@ impl PackedVisibility {
                     event_count += 1;
                     reserve_events(&mut reservation, event_count)?;
                     let origin = source.batch.view().origin(source.row)?;
+                    let witness = Some(SearchWitness::live(&source));
                     histories.entry(iid).or_default().push(LocatedHistoryEvent { header, origin, location: SearchRowLocation::Live(source),
-                        witness: Some(SearchWitness::Live(header.version(), origin)) });
+                        witness });
                 }
             }
         }

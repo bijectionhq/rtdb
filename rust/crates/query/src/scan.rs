@@ -433,6 +433,13 @@ struct RankProjection {
     source: String,
     scorer: Option<Arc<rtdb_text::Scorer>>,
     verified: Option<crate::CandidateScores>,
+    live: Option<Arc<dyn crate::LiveSearchTerms>>,
+}
+
+struct ScanMatch {
+    query: Option<Arc<rtdb_text::Query>>,
+    files: Option<crate::MatchAnswers>,
+    live: Option<Arc<dyn crate::LiveSearchTerms>>,
 }
 
 struct ResolvedScanTask {
@@ -466,7 +473,7 @@ pub(crate) struct PartitionScan {
     /// The scan's predicates as tests of a page's statistics, kept by an ordered scan for the leaves it has yet to reach.
     page_test: Option<crate::page_metadata::PageTest>,
     /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
-    matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
+    matches: Vec<ScanMatch>,
     ranking: Option<RankProjection>,
     candidate_iids: Option<crate::CandidateIids>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
@@ -768,6 +775,7 @@ impl ScanCursor {
             let constants = crate::accelerate::ExecutionConstants(&execution);
             queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(text), _ => None });
         }
+        let parsed: Vec<_> = queries.iter().map(|query| query.as_deref().map(rtdb_text::Query::parse).map(Arc::new)).collect();
         let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
         let ranking = if let Some(top) = scan.top_k.as_ref()
             && let Some(output) = top.score
@@ -778,7 +786,7 @@ impl ScanCursor {
                 Some(Value::Utf8(query)) => Some(Arc::new(rtdb_text::Scorer::new(rtdb_text::Query::parse(&query), None))),
                 _ => None,
             };
-            Some(RankProjection { output, source: source.name.clone(), scorer, verified: None })
+            Some(RankProjection { output, source: source.name.clone(), scorer, verified: None, live: None })
         } else { None };
         let fragmenter = if virtual_metadata || archive_history { None } else { execution.context.catalog.fragmenter.clone() };
         use futures::TryStreamExt;
@@ -826,8 +834,8 @@ impl ScanCursor {
             let snapshot = verifier.partition;
             let winners = winners.as_mut().map(|winners| winners.take_partition(partition));
             let ranked_here = winners.is_some();
-            let (scan, execution, pushdowns, ranking, name, queries, slots, fragmenter) =
-                (&scan, &execution, &pushdowns, &ranking, &name, &queries, &slots, &fragmenter);
+            let (scan, execution, pushdowns, ranking, name, queries, parsed, slots, fragmenter) =
+                (&scan, &execution, &pushdowns, &ranking, &name, &queries, &parsed, &slots, &fragmenter);
             let (partition, counts) = async move {
                 let mut parts = VecDeque::new();
                 let bounds = bounds(scan, snapshot, execution).await?;
@@ -918,17 +926,23 @@ impl ScanCursor {
                     narrowed.iids = candidate_iids.as_ref().map(|iids| iids.iter().collect());
                 }
                 let mut matches = Vec::with_capacity(scan.matches.len());
-                for (evaluated, query) in scan.matches.iter().zip(queries) {
+                let request = crate::ScanRequest { database: name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
+                    current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
+                    verifier, partitions: database_partitions };
+                let live_terms = |column: &str| execution.context.accelerators.iter().filter(|_| accelerate)
+                    .find_map(|accelerator| accelerator.live_search_terms(&request, column));
+                if let Some(ranking) = &mut ranking && ranking.scorer.is_some() { ranking.live = live_terms(&ranking.source); }
+                for ((evaluated, query), parsed) in scan.matches.iter().zip(queries).zip(parsed) {
                     let mut answers = None;
+                    let mut live = None;
                     if let Some(query) = query {
-                        let request = crate::ScanRequest { database: name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
-                            current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
-                            verifier, partitions: database_partitions };
+                        live = ranking.as_ref().filter(|ranking| ranking.source == evaluated.column).and_then(|ranking| ranking.live.clone())
+                            .or_else(|| live_terms(&evaluated.column));
                         for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !ranked_here) {
                             if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
                         }
                     }
-                    matches.push((query.as_deref().map(rtdb_text::Query::parse), answers));
+                    matches.push(ScanMatch { query: parsed.clone(), files: answers, live });
                 }
                 let mut local_scan = narrowed.clone();
                 if candidate_iids.is_some() { local_scan.iids = None; }
@@ -1051,6 +1065,7 @@ async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usi
     let storage = &database.storage;
     let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false, counts: Default::default() };
     let bounds = bounds(scan, snapshot, execution).await?;
+    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, bounds, canonical_entity_iids: false, shared_rank: None, counts: Default::default() };
     let request = crate::ScanRequest {
         database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
         current_time: context.current_time, cancellation: &context.cancellation,
@@ -1248,14 +1263,14 @@ impl crate::columnar::BatchCursor for OrderedPayload {
                 let keys: BTreeSet<_> = sorted.iter().copied().collect();
                 let mut scan = self.scan.clone();
                 scan.iids = Some(keys);
-                let verifier = ScanVerifier { scan: &scan, execution: &self.execution, pushdowns: None,
-                    partition: snapshot, storage: &database.storage, canonical_entity_iids: false,
-                    shared_rank: None, counts: Default::default() };
                 let bounds = match &self.source {
                     Some(source) => source.bounds,
                     None => bounds(&scan, snapshot, &self.execution).await?,
                 };
                 if bounds.valid_time.is_point() && bounds.system_time.is_point() {
+                    let verifier = ScanVerifier { scan: &scan, execution: &self.execution, pushdowns: None,
+                        partition: snapshot, storage: &database.storage, bounds, canonical_entity_iids: false,
+                        shared_rank: None, counts: Default::default() };
                     point = verifier.point_batch(&scan, bounds, &database.partitions, scan.iids.as_ref().unwrap()).await?;
                 }
             }
@@ -1398,6 +1413,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
             (resolved.version.iid, crate::SnapshotRow { batch: Arc::clone(&batch), row })
         }).collect())
     }
+
 }
 
 impl ScanVerifier<'_> {
@@ -1466,14 +1482,15 @@ impl ScanVerifier<'_> {
             None => None,
         };
         let mut verified = Vec::new();
+        let mut types = crate::columnar::search::TextTypes::default();
         for (position_in_batch, row) in rows.into_iter().enumerate() {
             self.execution.context.check_cancelled_at(position_in_batch)?;
             if mask.as_ref().is_some_and(|mask| !mask[position_in_batch]) { continue; }
-            let PutText::Utf8(text) = crate::columnar::search::text(&batch.columns[position], position_in_batch)? else { continue; };
+            let PutText::Utf8(text) = types.text(&batch.columns[position], position_in_batch)? else { continue; };
             let token_bytes = text.len().saturating_mul(32);
             audience_work::decode_bytes(token_bytes)?;
             let _scratch = memory.reserve(256usize.saturating_add(token_bytes))?;
-            let score = scorer.bm25_arrow(&rtdb_text::analyze(text));
+            let score = scorer.bm25_text(text);
             let key = match id {
                 Some(id) => match batch.columns[id].value(position_in_batch)?.entity_id() {
                     Ok(rtdb_types::EntityId::Integer(id)) => RankKey::integer(score, Some(id)),
@@ -1520,21 +1537,29 @@ impl ScanVerifier<'_> {
                 Some(predicate) => Some(crate::columnar::predicate_mask(&batch, predicate, &schema, self.execution).await?),
                 None => None,
             };
+            let mut types = crate::columnar::search::TextTypes::default();
             for row in 0..batch.len {
                 if mask.as_ref().is_some_and(|mask| !mask[row]) { continue; }
-                let PutText::Utf8(text) = crate::columnar::search::text(&batch.columns[position], row)? else { continue; };
+                let PutText::Utf8(text) = types.text(&batch.columns[position], row)? else { continue; };
                 let _scratch = memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                let score = scorer.bm25_text(text);
                 selected_rows += 1;
                 let lease = Arc::get_mut(&mut reservation).expect("Verification owns its output reservation");
                 lease.grow_to(256usize.saturating_add(selected_rows.saturating_mul(48)))?;
                 let iid = iids.get(row)?;
                 selected.append_value(iid.0).map_err(|error| invalid("verifier-iid", error))?;
-                scores.append_value(scorer.bm25_arrow(&rtdb_text::analyze(text)));
+                scores.append_value(score);
                 if let Some((position, ids)) = id_position.zip(ranked_ids.as_mut()) {
-                    let value = batch.columns[position].value(row)?;
-                    let id = match value.entity_id() {
-                        Ok(rtdb_types::EntityId::Integer(id)) => Some(id),
-                        _ => None,
+                    let column = &batch.columns[position];
+                    let id = match column.arrow_cell(row).flatten().and_then(|(array, field, _, offset)| {
+                        rtdb_columnar::read_entity_id(field, array, offset).ok()
+                    }) {
+                        Some(rtdb_columnar::EntityIdRef::Integer(id)) => Some(id),
+                        Some(_) => None,
+                        None => match column.value(row)?.entity_id() {
+                            Ok(EntityId::Integer(id)) => Some(id),
+                            _ => None,
+                        },
                     };
                     ids.append_option(id);
                 }
@@ -1612,16 +1637,25 @@ impl ScanVerifier<'_> {
         }
         let constants = crate::accelerate::ExecutionConstants(self.execution);
         let mut matches = BTreeMap::new();
+        let database = &scan.table.name.database;
+        let request = crate::ScanRequest { database, scan, snapshot: self.partition, storage: self.storage, bounds: bounds(scan, self.partition, self.execution).await?, memory,
+            current_time: self.execution.context.current_time, cancellation: &self.execution.context.cancellation,
+            constants: &constants, verifier: self, partitions: &self.execution.context.catalog.database(database)?.partitions };
         for evaluated in &scan.matches {
             let query = match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? {
                 Some(Value::Utf8(text)) => Some(rtdb_text::Query::parse(&text)),
                 _ => None,
             };
-            matches.insert(evaluated.id, (&evaluated.column, query));
+            let live = if query.is_none() { None } else {
+                self.execution.context.accelerators.iter().find_map(|accelerator| accelerator.live_search_terms(&request, &evaluated.column))
+            };
+            matches.insert(evaluated.id, (&evaluated.column, query, live));
         }
         let result = crate::columnar::gather(&resolved, &sources, &scan.columns, memory, |position| {
-            matches.get(&scan.columns[position].id).map(|(name, query)| {
-                resolved_match_column(name, query.as_ref(), None, &resolved, &sources, memory)
+            matches.get(&scan.columns[position].id).map(|(name, query, live)| {
+                resolved_match_column(name, query.as_ref(), &resolved, &sources, memory, |_, row, query| {
+                    live_match(live.as_deref(), row, &sources, query)
+                })
             }).transpose()
         })?;
         let mut counts = self.counts.lock();
@@ -2063,6 +2097,7 @@ impl PartitionScan {
         let position_mask = self.execution.context.catalog.owned_position_mask;
         let transaction_cut = self.execution.context.catalog.owned_transaction_cut;
         let requested_key = if keyed { self.execution.context.catalog.owned_identity().map(EntityId::handle_bytes) } else { None };
+        let requested_artefacts = self.execution.context.catalog.owned_artefact_keys();
         // Every equal physical IID stays within one task. A key's events still
         // arrive in descending system time, independently of its neighbours.
         let mut bucket = None;
@@ -2117,6 +2152,8 @@ impl PartitionScan {
                     invalid("owned-entity-key", "Governed data requires complete physical entity keys")
                 })?;
                 if requested_key.as_deref().is_some_and(|requested| requested != key) { continue; }
+                if requested_artefacts.is_some_and(|requested| !requested.by_iid.get(&head.header.iid)
+                    .is_some_and(|keys| keys.iter().any(|known| known.as_slice() == key))) { continue; }
                 if bucket != Some(head.header.iid) {
                     identities.clear();
                     bucket = Some(head.header.iid);
@@ -2239,33 +2276,41 @@ impl PartitionScan {
     }
 
     fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
-        let (query, answers) = &self.matches[evaluated];
-        let page_answers = match (answers, source) {
+        let ScanMatch { query, files, live } = &self.matches[evaluated];
+        let page_answers = match (files, source) {
             (Some(answers), PageSource::File { file, page, .. }) => answers.file(&self.files.entries[*file].key).map(|matches| (matches, *page)),
             _ => None,
         };
-        resolved_match_column(&self.scan.matches[evaluated].column, query.as_ref(), page_answers, rows, batches, &self.execution.context.memory)
+        resolved_match_column(&self.scan.matches[evaluated].column, query.as_deref(), rows, batches, &self.execution.context.memory, |_, row, query| {
+            page_answers.and_then(|(matches, page)| matches.value(page, row.source.1 as usize).ok())
+                .or_else(|| live_match(live.as_deref(), row, batches, query))
+        })
     }
 
     fn rank_column(&self, ranking: &RankProjection, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
         let mut values = Float64Builder::with_capacity(rows.len());
-        let empty = arrow_array::StringArray::from(Vec::<&str>::new());
         for row in rows {
             let Some(scorer) = &ranking.scorer else {
                 values.append_null();
                 continue;
             };
-            let iid = batches[row.source.0 as usize].header(row.source.1 as usize)?.iid;
+            let batch = &batches[row.source.0 as usize];
+            let position = row.source.1 as usize;
+            let iid = batch.header(position)?.iid;
             if let Some(score) = ranking.verified.as_ref().and_then(|verified| verified.score(iid)) {
+                values.append_value(score);
+                continue;
+            }
+            if let Some(score) = ranking.live.as_ref().and_then(|live| live.score(batch, position, scorer)) {
                 values.append_value(score);
                 continue;
             }
             values.append_option(match resolved_text(&ranking.source, row, batches)? {
                 PutText::Missing => None,
-                PutText::Other => Some(scorer.bm25_arrow(&empty)),
+                PutText::Other => Some(scorer.bm25_text("")),
                 PutText::Utf8(text) => {
                     let _tokens = self.execution.context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
-                    Some(scorer.bm25_arrow(&rtdb_text::analyze(text)))
+                    Some(scorer.bm25_text(text))
                 }
             });
         }
@@ -2277,18 +2322,21 @@ impl PartitionScan {
     }
 }
 
-fn resolved_match_column(name: &str, query: Option<&rtdb_text::Query>, page_answers: Option<(&Arc<dyn crate::FileMatches>, usize)>,
-    rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>], memory: &Arc<MemoryBudget>) -> Result<crate::columnar::Column> {
+fn live_match(live: Option<&dyn crate::LiveSearchTerms>, row: &ResolvedRow<(u32, u32)>, batches: &[Arc<IndexBatch>],
+    query: &rtdb_text::Query) -> Option<Option<bool>> {
+    live?.matches(&batches[row.source.0 as usize], row.source.1 as usize, query).map(Some)
+}
+
+fn resolved_match_column(name: &str, query: Option<&rtdb_text::Query>,
+    rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>], memory: &Arc<MemoryBudget>,
+    answer: impl Fn(usize, &ResolvedRow<(u32, u32)>, &rtdb_text::Query) -> Option<Option<bool>>) -> Result<crate::columnar::Column> {
     let mut values = BooleanBuilder::with_capacity(rows.len());
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         let Some(query) = query else {
             values.append_null();
             continue;
         };
-        let position = row.source.1 as usize;
-        if let Some((matches, page)) = page_answers
-            && let Ok(value) = matches.value(page, position)
-        {
+        if let Some(value) = answer(index, row, query) {
             values.append_option(value);
             continue;
         }
@@ -2298,7 +2346,7 @@ fn resolved_match_column(name: &str, query: Option<&rtdb_text::Query>, page_answ
             PutText::Other => Some(false),
             PutText::Utf8(text) => {
                 let _tokens = memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
-                Some(query.matches_arrow(&rtdb_text::analyze(text)))
+                Some(query.matches_text(text))
             }
         });
     }
@@ -2802,6 +2850,71 @@ mod tests {
         let original_view = context.with_owned_transaction_cut(original, &cancellation).unwrap();
         assert_eq!(crate::read_owned_world_clock_publication(original_view, "alice", world).await.unwrap(),
             Some((Timestamp(200), original)));
+    }
+
+    #[tokio::test]
+    async fn arrow_search_ranked_verification_scores_the_resolved_payload() {
+        use crate::CandidateVerifier;
+
+        let (state, table, _) = live_table_with_values([Value::Utf8("open invoice".into())]);
+        let snapshot = state.value().snapshot();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, execution, _) = descriptor_scan(snapshot.clone(), table.clone(), Arc::clone(&storage));
+        let query = rtdb_text::Query::parse("invoice");
+        scan.predicates.push(Expr::Call { name: "match".into(), args: vec![
+            scan.columns[0].expression(), Expr::Literal(Value::Utf8("invoice".into())),
+        ], return_type: LogicalType::Scalar(ScalarType::Bool).maybe() });
+        let bounds = bounds(&scan, &snapshot, &execution).await.unwrap();
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot, storage: &storage,
+            canonical_entity_iids: false, counts: Default::default() };
+        let source = snapshot.iter_segments(&table).next().unwrap().row(0).unwrap();
+        let version = source.header().unwrap().version();
+        let row = crate::ResolvedSearchRow { version, origin: None, location: crate::SearchRowLocation::Live(source), visibility: bounds };
+        let scorer = rtdb_text::Scorer::new(query.clone(), None);
+        let expected = scorer.bm25_arrow(&rtdb_text::analyze("open invoice"));
+        let result = verifier.verify_ranked(&BTreeSet::from([version.iid]), Some(vec![row]), ColumnId(0), None, &scorer)
+            .await.unwrap().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].version(), version);
+        assert_eq!(result[0].score().to_bits(), expected.to_bits());
+    }
+
+    #[tokio::test]
+    async fn arrow_search_owned_candidate_cursor_scopes_full_keys_at_colliding_locators() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
+        let table = relation.table("alice");
+        let memory = MemoryBudget::new(1 << 24);
+        let ids = [EntityId::Integer(1), EntityId::Integer(2), EntityId::Integer(3)];
+        let colliding = EntityId::Uuid(ids[0].iid().0);
+        let time = Timestamp(100);
+        let mut write = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: time }, Arc::clone(&memory)).unwrap();
+        for id in ids.iter().chain([&colliding]) {
+            write.append(table.clone(), StoredEvent { position: None, origin: None, commit_position: 0,
+                entity_key: Some(id.handle_bytes().into()), iid: id.iid(), system_from: time, valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([
+                    ("_id".into(), id.as_value()), ("v".into(), Value::Utf8("invoice".into())),
+                ])), recency: None }).unwrap();
+        }
+        state.apply(&write.stage().unwrap()).unwrap();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), time, "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let keys = [&ids[0], &ids[1]].map(|id| (id.iid(), arrow_buffer::Buffer::from_vec(id.handle_bytes())));
+        let mut cursor = crate::open_owned_artefact_candidates(context, "alice", &relation, Interval::from_micros(25, 26).unwrap(), "v",
+            keys).await.unwrap().unwrap();
+        let mut found = BTreeSet::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            let batch = batch.batch();
+            let (position, field) = batch.schema_ref().column_with_name("_id").unwrap();
+            for row in 0..batch.num_rows() {
+                let id = rtdb_columnar::read_entity_id(field, batch.column(position).as_ref(), row).unwrap();
+                assert_eq!(crate::owned_row_revision_for(batch, row, id, &memory).unwrap(), time);
+                found.insert(id.into_owned());
+            }
+        }
+        assert_eq!(found, BTreeSet::from([ids[0].clone(), ids[1].clone()]));
     }
 
     #[tokio::test]

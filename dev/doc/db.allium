@@ -2103,6 +2103,7 @@ surface QueryAccess {
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
+        -- Columnar text search reads compatible Arrow text and bound corpus statistics from their selected cells.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
         -- Computed Arrow projections validate decimal precision on the selected result cells, including nested decimals.

@@ -1682,6 +1682,7 @@ rule ConsumeIntake {
 -- The owner merges only the covered prefix and resolves the winning point for each ordered candidate.
 -- An exact count starts with the original Root order total and corrects membership for every bounded Held shadow, including tombstones.
 -- Text ranking reads the original Root corpus from covered search artifacts or a bounded projection at the same admitted cut.
+-- Covered text ranking verifies complete identities and revisions in projected batches of candidates at that cut.
 -- The corpus masks each replaced or withdrawn identity with its retained Held shadow before computing statistics.
 -- Live Proposal search overlays the installed writer's bounded staged changes before corpus statistics and binds the staged corpus to its continuation.
 -- A retained Held child restored from an Original archive retains the separately certified destination Root and Held overlay positions before world readmission.

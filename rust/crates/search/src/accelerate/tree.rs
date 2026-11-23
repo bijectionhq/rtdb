@@ -162,17 +162,16 @@ fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, tokens: &dyn Fn() ->
     if scope.is_some_and(|scope| !scope.contains(&header.iid)) || !may_be_visible(header.valid_time.lower().0,
         header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { return Ok(None); }
     let score = scorer.bm25_arrow(&tokens());
+    let source = segment.row(row)?;
     let key = match order {
         TreeRankOrder::Integer => {
-            let source = segment.row(row)?;
             RankKey::integer(score, crate::lane::integer_sql_id(&source.batch.view().borrow_event(source.row)?))
         }
         TreeRankOrder::Uuid => RankKey::uuid(score, header.iid.0),
         TreeRankOrder::Score => RankKey::integer(score, None),
     };
     let source = segment.row(row)?;
-    let origin = source.batch.view().origin(source.row)?;
-    Ok(Some(Nomination { key, iid: header.iid, witness: Some(SearchWitness::Live(header.version(), origin)) }))
+    Ok(Some(Nomination { key, iid: header.iid, witness: Some(SearchWitness::live(&source)) }))
 }
 
 impl SearchAccelerator {

@@ -1,8 +1,7 @@
 use crate::EvalContext;
 use crate::compare::nullish;
 use crate::numeric::integer;
-use arrow_array::{Array, StringArray};
-use rtdb_text::{Corpus, Query, Scorer, analyze, stored_length};
+use rtdb_text::{Corpus, Query, Scorer, count_tokens, stored_length};
 use rtdb_types::{Anomaly, Result, Value, text_pair_fingerprint};
 
 /// Only the UTF-8 leg of a column is indexed, so any other value matches nothing and scores nothing.
@@ -25,8 +24,9 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 ))
             }
             ("search_length", [Value::Utf8(text)]) => {
-                let tokens = document_tokens(text, context)?;
-                Ok(Value::I64(i64::from(stored_length(tokens.len()))))
+                let count = count_tokens(text);
+                context.reserve(count.arrow_bytes().saturating_add(256))?;
+                Ok(Value::I64(i64::from(stored_length(count.len()))))
             }
             ("search_corpus_fingerprint", [Value::List(ids), Value::List(bodies)]) => {
                 if ids.is_empty() || ids.len() != bodies.len() {
@@ -37,18 +37,19 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 Ok(Value::Binary(text_pair_fingerprint(pairs)?.into()))
             }
             ("match", [text, Value::Utf8(query)]) => {
-                let tokens = tokens_of(text, context)?;
-                Ok(Value::Bool(Query::parse(query).matches_arrow(&tokens)))
+                let (_, _, matched) = document_terms(&Query::parse(query), text, true, context)?;
+                Ok(Value::Bool(matched))
             }
             ("search_score", [text, Value::Utf8(query)]) => {
-                let tokens = tokens_of(text, context)?;
-                Ok(Value::F64(Scorer::new(Query::parse(query), None).bm25_arrow(&tokens)))
+                let query = Query::parse(query);
+                let (length, frequencies, _) = document_terms(&query, text, false, context)?;
+                Ok(Value::F64(Scorer::new(query, None).score(&frequencies, length)))
             }
             ("search_score", [text, Value::Utf8(query), documents, total, frequencies]) => {
                 let query = parse_query(query, context)?;
-                let tokens = tokens_of(text, context)?;
+                let (length, counts, _) = document_terms(&query, text, false, context)?;
                 let corpus = explicit_corpus(&query, documents, total, frequencies)?;
-                Ok(Value::F64(Scorer::new(query, Some(&corpus)).bm25_arrow(&tokens)))
+                Ok(Value::F64(Scorer::new(query, Some(&corpus)).score(&counts, length)))
             }
             _ => Ok(Value::Null),
         }
@@ -62,17 +63,11 @@ fn invalid_documents() -> Anomaly {
     )
 }
 
-fn tokens_of(value: &Value, context: &EvalContext<'_>) -> Result<StringArray> {
-    match value {
-        Value::Utf8(text) => document_tokens(text, context),
-        _ => Ok(StringArray::from(Vec::<&str>::new())),
-    }
-}
-
-fn document_tokens(text: &str, context: &EvalContext<'_>) -> Result<StringArray> {
-    let tokens = analyze(text);
-    context.reserve(tokens.get_array_memory_size().saturating_add(256))?;
-    Ok(tokens)
+fn document_terms(query: &Query, value: &Value, phrases: bool, context: &EvalContext<'_>) -> Result<(u32, Vec<u32>, bool)> {
+    let Value::Utf8(text) = value else { return Ok((0, vec![0; query.terms().len()], false)); };
+    let (count, frequencies, matched) = query.text_terms(text, phrases);
+    context.reserve(count.arrow_bytes().saturating_add(256))?;
+    Ok((stored_length(count.len()), frequencies, matched))
 }
 
 fn parse_query(text: &str, context: &EvalContext<'_>) -> Result<Query> {
@@ -126,6 +121,9 @@ fn explicit_corpus(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use arrow_array::Array;
+
     #[test]
     fn corpus_fingerprint_reads_packed_text() {
         use std::sync::Arc;
@@ -141,5 +139,26 @@ mod tests {
             Arc::new(StringArray::from(vec![value])),
         ).unwrap()));
         assert_eq!(crate::scalar_call("search_corpus_fingerprint", &packed, &context).unwrap(), expected);
+    }
+
+    #[test]
+    fn arrow_search_scalar_uses_the_token_vector_charge_and_exact_score() {
+        let document = "ΟΤΕ a b a b ".repeat(1030);
+        let tokens = rtdb_text::analyze(&document);
+        let charge = 4096 + 512 + tokens.get_array_memory_size();
+        let query = r#""a b" οτε"#;
+        let args = [Value::Utf8(document), Value::Utf8(query.into())];
+        for (name, expected) in [
+            ("match", Value::Bool(true)),
+            ("search_length", Value::I64(i64::from(stored_length(tokens.len())))),
+            ("search_score", Value::F64(Scorer::new(Query::parse(query), None).bm25_arrow(&tokens))),
+        ] {
+            let args = if name == "search_length" { &args[..1] } else { &args[..] };
+            let memory = rtdb_columnar::MemoryBudget::new(charge);
+            let allocation = crate::EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&allocation), ..EvalContext::default() };
+            assert_eq!(call(name, args, &context).unwrap().unwrap(), expected);
+            assert_eq!(memory.used_bytes(), charge);
+        }
     }
 }

@@ -55,7 +55,7 @@ pub struct CatalogSnapshot {
     pub(crate) databases: Arc<BTreeMap<String, DatabaseSnapshot>>,
     transaction_scoped: bool,
     archive_history: bool,
-    owned_relation: Option<(QualifiedTable, Option<rtdb_types::EntityId>)>,
+    owned_relation: Option<(QualifiedTable, OwnedSelection)>,
     pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
     pub(crate) owned_transaction_cut: Option<rtdb_types::TxId>,
     owned_read_guard: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
@@ -67,6 +67,18 @@ pub struct CatalogSnapshot {
     read_view: Arc<tokio::sync::OnceCell<Arc<rtdb_storage::HeldView>>>,
     snapshot_suffix: Option<Arc<dyn Send + Sync>>,
     resumed_storage_owner: Option<Arc<BufferPool>>,
+}
+
+#[derive(Clone)]
+pub(crate) enum OwnedSelection {
+    Relation,
+    Point(rtdb_types::EntityId),
+    Artefacts(Arc<OwnedArtefactKeys>),
+}
+
+pub(crate) struct OwnedArtefactKeys {
+    pub(crate) by_iid: BTreeMap<rtdb_types::Iid, Vec<arrow_buffer::Buffer>>,
+    pub(crate) _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
 impl CatalogSnapshot {
@@ -162,7 +174,16 @@ impl CatalogSnapshot {
         else { rtdb_columnar::execution_type(&field.data_type) }
     }
     pub(crate) fn owned_identity(&self) -> Option<&rtdb_types::EntityId> {
-        self.owned_relation.as_ref().and_then(|(_, id)| id.as_ref())
+        match self.owned_relation.as_ref() {
+            Some((_, OwnedSelection::Point(id))) => Some(id),
+            _ => None,
+        }
+    }
+    pub(crate) fn owned_artefact_keys(&self) -> Option<&OwnedArtefactKeys> {
+        match self.owned_relation.as_ref() {
+            Some((_, OwnedSelection::Artefacts(keys))) => Some(keys),
+            _ => None,
+        }
     }
     pub(crate) fn permits_table(&self, name: &QualifiedTable) -> bool {
         match &self.owned_relation {
@@ -327,9 +348,13 @@ impl QueryContext {
         self
     }
 
-    pub(crate) fn for_owned_relation(mut self: Arc<Self>, table: QualifiedTable, id: Option<rtdb_types::EntityId>) -> Arc<Self> {
+    pub(crate) fn for_owned_relation(self: Arc<Self>, table: QualifiedTable, id: Option<rtdb_types::EntityId>) -> Arc<Self> {
+        self.for_owned_selection(table, id.map_or(OwnedSelection::Relation, OwnedSelection::Point))
+    }
+
+    pub(crate) fn for_owned_selection(mut self: Arc<Self>, table: QualifiedTable, selection: OwnedSelection) -> Arc<Self> {
         let context = Arc::make_mut(&mut self);
-        context.catalog.owned_relation = Some((table, id));
+        context.catalog.owned_relation = Some((table, selection));
         context.catalog.runtime = None;
         context.catalog.fragmenter = None;
         context.accelerators = Default::default();

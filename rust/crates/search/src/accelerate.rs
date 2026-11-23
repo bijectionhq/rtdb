@@ -7,7 +7,7 @@ pub(crate) mod routing;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use arrow_array::{Array, Float64Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Float64Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
@@ -143,6 +143,10 @@ impl ScanAccelerator for SearchAccelerator {
             answers.insert(&trie.data, Arc::new(set.member(trie.member)?));
         }
         Ok((!answers.is_empty()).then_some(answers))
+    }
+
+    fn live_search_terms(&self, request: &ScanRequest<'_>, column: &str) -> Option<Arc<dyn rtdb_query::LiveSearchTerms>> {
+        self.runtime.serving_terms(request, column)
     }
 }
 
@@ -622,10 +626,11 @@ pub struct OwnedSearchHit {
     pub score: f64,
 }
 
-pub(crate) fn owned_rank_order(left: &OwnedSearchHit, right: &OwnedSearchHit) -> std::cmp::Ordering {
-    left.score.total_cmp(&right.score).reverse()
-        .then_with(|| left.id.cmp(&right.id))
-        .then_with(|| left.partition.cmp(&right.partition))
+fn owned_rank_key(left_partition: usize, left_id: EntityIdRef<'_>, left_score: f64,
+    right_partition: usize, right_id: EntityIdRef<'_>, right_score: f64) -> std::cmp::Ordering {
+    left_score.total_cmp(&right_score).reverse()
+        .then_with(|| left_id.cmp(&right_id))
+        .then_with(|| left_partition.cmp(&right_partition))
 }
 
 /// The requested rank window and the exact number of verified matches.
@@ -737,56 +742,106 @@ async fn rank_owned_artefacts(
     for (partition, (relation, covered)) in covered.iter().enumerate() {
         for (file, visible) in &covered.visible_runs {
             context.check_cancelled()?;
-            for run in file.matched_runs(&covered.column, query, covered.bounds).map_err(|_| uncovered_owned_search())?.iter() {
-                if visible.values().binary_search(&run.doc).is_err() { continue; }
-                rank.admit_candidate()?;
-                let key = file.run_identity_bytes(run)?;
-                let _key = context.memory.reserve(key.len())?;
-                let identity = file.run_identity_key(run)?;
-                let id = identity.into_owned();
-                let columns = ["_id", covered.column.as_str()];
-                let Some(mut rows) = rtdb_query::open_owned_artefact_candidate(
-                    Arc::clone(context), owner, relation, &id, Iid(run.iid), covered.bounds.valid_time, &columns,
+            let mut matches = file.matched_scores(&covered.column, &scorer, covered.bounds, Some(visible.values()))
+                .map_err(|_| uncovered_owned_search())?;
+            loop {
+                let available = OWNED_RANK_CANDIDATES - rank.total;
+                if available == 0 {
+                    if matches.next().is_some() { rank.admit_candidate()?; }
+                    break;
+                }
+                let mut pending = Vec::new();
+                for (run, score) in matches.by_ref().take(128.min(available)) {
+                    context.check_cancelled()?;
+                    rank.admit_candidate()?;
+                    let key = file.run_identity_buffer(run)?;
+                    let id = file.run_identity_key(run)?;
+                    pending.push(OwnedCandidate { run, key, id, score, verified: None });
+                }
+                if pending.is_empty() { break; }
+                let keys = pending.iter().map(|candidate| (Iid(candidate.run.iid), candidate.key.clone())).collect::<Vec<_>>();
+                let Some(mut rows) = rtdb_query::open_owned_artefact_candidates(
+                    Arc::clone(context), owner, relation, covered.bounds.valid_time, &covered.column, keys,
                 ).await? else { return Err(uncovered_owned_search()); };
-                let mut resolved_score = None;
+                let mut locators = BTreeMap::<Iid, Vec<usize>>::new();
+                for (index, candidate) in pending.iter().enumerate() {
+                    locators.entry(Iid(candidate.run.iid)).or_default().push(index);
+                }
                 while let Some(batch) = rows.next_batch().await? {
                     let batch = batch.batch();
-                    if batch.num_rows() == 0 { continue; }
-                    if resolved_score.is_some() || batch.num_rows() != 1 { return Err(uncovered_owned_search()); }
-                    let revision = rtdb_query::owned_row_revision(batch, 0, &id, &context.memory)?;
-                    let at = covered.bounds.valid_time.lower().0;
-                    let mut same_run = false;
-                    for row in file.rows_for_key(&run.iid, key) {
-                        let (row, event) = row?;
-                        if event.op == EventOp::Put && event.system_from == revision.0 && event.valid_from <= at
-                            && at < event.valid_to && file.run_of(&covered.column, row) == Some(Some(run.doc))
-                        {
-                            same_run = true;
-                            break;
-                        }
-                    }
-                    if !same_run { return Err(uncovered_owned_search()); }
-                    let (column, field) = batch.schema_ref().column_with_name(&covered.column).ok_or_else(uncovered_owned_search)?;
-                    let values = batch.column(column).as_ref();
+                    let schema = batch.schema_ref();
+                    let (column, field) = schema.column_with_name(&covered.column).ok_or_else(uncovered_owned_search)?;
+                    let (id_column, id_field) = schema.column_with_name("_id").ok_or_else(uncovered_owned_search)?;
+                    let iids = batch.column_by_name("_iid").ok_or_else(uncovered_owned_search)?;
+                    let iids = rtdb_columnar::IidView::new(iids.as_ref())?;
                     let logical = rtdb_columnar::from_field(field)?;
-                    let PutText::Utf8(text) = rtdb_columnar::text_cell(&logical, field, values, 0)? else { return Err(uncovered_owned_search()); };
-                    let _scratch = context.memory.reserve(text.len().saturating_mul(64).saturating_add(4096))?;
-                    let tokens = rtdb_text::analyze(text);
-                    if !query.matches_arrow(&tokens) || tokens.len() != file.token_length(run.doc)? as usize {
-                        return Err(uncovered_owned_search());
+                    for row in 0..batch.num_rows() {
+                        context.check_cancelled_at(row)?;
+                        let ids = batch.column(id_column).as_ref();
+                        let fallback;
+                        let id = match rtdb_columnar::read_entity_id(id_field, ids, row) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                fallback = rtdb_columnar::read_value(id_field, ids, row)?.entity_id()?;
+                                EntityIdRef::from(&fallback)
+                            }
+                        };
+                        let iid = iids.get(row)?;
+                        let Some(&index) = locators.get(&iid).and_then(|indices| indices.iter().find(|&&index| pending[index].id == id)) else {
+                            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/iid-collision", "Owned row locator resolves to a different complete identity"));
+                        };
+                        let candidate = &mut pending[index];
+                        if candidate.verified.is_some() { return Err(uncovered_owned_search()); }
+                        let revision = rtdb_query::owned_row_revision_for(batch, row, candidate.id, &context.memory)?;
+                        let at = covered.bounds.valid_time.lower().0;
+                        let mut same_run = false;
+                        let mut overlapping = 0;
+                        for entry in file.rows_for_key(&candidate.run.iid, candidate.key.as_slice()) {
+                            let (entry, event) = entry?;
+                            if event.system_from == revision.0 && event.valid_from <= at && at < event.valid_to {
+                                overlapping += 1;
+                                same_run |= event.op == EventOp::Put
+                                    && file.run_of(&covered.column, entry) == Some(Some(candidate.run.doc));
+                            }
+                        }
+                        if !same_run { return Err(uncovered_owned_search()); }
+                        let PutText::Utf8(text) = rtdb_columnar::text_cell(&logical, field, batch.column(column).as_ref(), row)?
+                            else { return Err(uncovered_owned_search()); };
+                        let score = if overlapping == 1 {
+                            candidate.score
+                        } else {
+                            let _scratch = context.memory.reserve(text.len().saturating_mul(64).saturating_add(4096))?;
+                            let (count, frequencies, matched) = query.text_terms(text, true);
+                            if !matched || count.len() != file.token_length(candidate.run.doc)? as usize {
+                                return Err(uncovered_owned_search());
+                            }
+                            scorer.score(&frequencies, rtdb_text::stored_length(count.len()))
+                        };
+                        if !score.is_finite() { return Err(uncovered_owned_search()); }
+                        candidate.verified = Some(score);
                     }
-                    let score = scorer.bm25_arrow(&tokens);
-                    if !score.is_finite() { return Err(uncovered_owned_search()); }
-                    resolved_score = Some(score);
                 }
-
-                let hit = OwnedSearchHit { partition, id, score: resolved_score.ok_or_else(uncovered_owned_search)? };
-                rank.insert(hit)?;
+                for candidate in pending {
+                    let score = candidate.verified.ok_or_else(uncovered_owned_search)?;
+                    if let Some(at) = rank.position(partition, candidate.id, score) {
+                        rank.insert_at(at, OwnedSearchHit { partition, id: candidate.id.into_owned(), score })?;
+                    }
+                }
             }
         }
     }
     Ok((scorer, rank))
 }
+
+struct OwnedCandidate<'a> {
+    run: crate::DocMatch,
+    key: arrow_buffer::Buffer,
+    id: EntityIdRef<'a>,
+    score: f64,
+    verified: Option<f64>,
+}
+
+const OWNED_RANK_CANDIDATES: usize = 100_000;
 
 pub(crate) struct OwnedRankWindow {
     hits: Vec<OwnedSearchHit>,
@@ -794,41 +849,47 @@ pub(crate) struct OwnedRankWindow {
     offset: usize,
     window: usize,
     total: usize,
+    bytes: usize,
 }
 
 impl OwnedRankWindow {
     pub(crate) fn new(memory: &Arc<rtdb_columnar::MemoryBudget>, offset: usize, limit: usize) -> Result<Self> {
         let window = offset + limit;
         let memory = memory.reserve(4096 + (window + 1) * size_of::<OwnedSearchHit>())?;
-        Ok(Self { hits: Vec::with_capacity(window + 1), memory, offset, window, total: 0 })
+        Ok(Self { hits: Vec::with_capacity(window + 1), memory, offset, window, total: 0, bytes: 4096 })
     }
 
     pub(crate) fn admit_candidate(&mut self) -> Result<()> {
         self.total += 1;
-        if self.total > 100_000 {
+        if self.total > OWNED_RANK_CANDIDATES {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
         }
         Ok(())
     }
 
-    pub(crate) fn insert(&mut self, hit: OwnedSearchHit) -> Result<()> {
-        let at = self.hits.partition_point(|previous| owned_rank_order(previous, &hit).is_lt());
-        if at < self.window {
-            self.hits.insert(at, hit);
-            self.hits.truncate(self.window);
-            let bytes = self.hits.iter().try_fold(4096usize, |bytes, hit| {
-                Ok::<_, Anomaly>(bytes.saturating_add(hit.id.as_value().retained_bytes()?).saturating_add(128))
-            })?;
-            let reservation = Arc::get_mut(&mut self.memory).expect("ranking owns its reservation");
-            reservation.grow_to(bytes.max(reservation.bytes()))?;
+    pub(crate) fn position(&self, partition: usize, id: EntityIdRef<'_>, score: f64) -> Option<usize> {
+        let at = self.hits.partition_point(|previous| {
+            owned_rank_key(previous.partition, EntityIdRef::from(&previous.id), previous.score, partition, id, score).is_lt()
+        });
+        (at < self.window).then_some(at)
+    }
+
+    pub(crate) fn insert_at(&mut self, at: usize, hit: OwnedSearchHit) -> Result<()> {
+        let added = owned_id_bytes(EntityIdRef::from(&hit.id)).saturating_add(128);
+        if self.hits.len() == self.window {
+            let evicted = self.hits.pop().expect("A full rank window has a last hit");
+            self.bytes -= owned_id_bytes(EntityIdRef::from(&evicted.id)).saturating_add(128);
         }
-        Ok(())
+        self.hits.insert(at, hit);
+        self.bytes = self.bytes.saturating_add(added);
+        let reservation = Arc::get_mut(&mut self.memory).expect("ranking owns its reservation");
+        reservation.grow_to(self.bytes.max(reservation.bytes()))
     }
 
     pub(crate) fn finish_batch(self) -> Result<OwnedSearchBatch> {
         let hits = &self.hits[self.offset.min(self.hits.len())..];
         let bound = hits.iter().try_fold(4096usize, |size, hit| {
-            size.checked_add(hit.id.as_value().retained_bytes()?.saturating_mul(4).saturating_add(128))
+            size.checked_add(owned_id_bytes(EntityIdRef::from(&hit.id)).saturating_mul(4).saturating_add(128))
                 .ok_or_else(uncovered_owned_search)
         })?;
         let reservation = self.memory.budget().reserve(bound)?;
@@ -844,6 +905,10 @@ impl OwnedRankWindow {
             .map_err(|error| Anomaly::fault("rtdb.search/ranked-output", error.to_string()))?;
         Ok(OwnedSearchBatch { hits: OwnedBatch::with_reservation(output, reservation)?, total: self.total })
     }
+}
+
+fn owned_id_bytes(id: EntityIdRef<'_>) -> usize {
+    size_of::<Value>().saturating_add(id.owned_payload_bytes())
 }
 
 fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {

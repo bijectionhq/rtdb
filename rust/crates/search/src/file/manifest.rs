@@ -143,6 +143,15 @@ impl Manifest {
         Ok(keys.value(doc))
     }
 
+    pub(super) fn run_key_buffer(&self, doc: u32) -> Result<arrow_buffer::Buffer> {
+        let keys = self.runs.column(2).as_binary::<i32>();
+        let doc = doc as usize;
+        if doc >= keys.len() || keys.is_null(doc) { return Err(corrupt("Search run omitted its full identity")); }
+        let offsets = keys.value_offsets();
+        let start = offsets[doc] as usize;
+        Ok(keys.values().slice_with_length(start, offsets[doc + 1] as usize - start))
+    }
+
     pub(super) fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ {
         let list = self.runs.column(4).as_any().downcast_ref::<LargeListArray>().expect("search rectangle layout");
         let offsets = list.value_offsets();

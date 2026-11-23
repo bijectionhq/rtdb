@@ -195,6 +195,44 @@ impl LivePostingPage {
     }
 }
 
+struct ServingTerms {
+    batches: BTreeMap<usize, ServingBatch>,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+}
+
+struct ServingBatch {
+    _batch: std::sync::Weak<rtdb_index::IndexBatch>,
+    first: u32,
+    pages: Arc<[Arc<LivePostingPage>]>,
+}
+
+impl ServingTerms {
+    fn covered(&self, batch: &rtdb_index::IndexBatch, row: usize) -> Option<(&LivePostingPage, u32)> {
+        let source = self.batches.get(&(std::ptr::from_ref(batch) as usize))?;
+        let row = source.first.checked_add(u32::try_from(row).ok()?)?;
+        let page = source.pages.get(source.pages.partition_point(|page| {
+            page.first_row + page.tokens.len() as u32 <= row
+        }))?;
+        let offset = row.checked_sub(page.first_row)? as usize;
+        page.tokens.is_valid(offset).then_some((page, row))
+    }
+}
+
+impl rtdb_query::LiveSearchTerms for ServingTerms {
+    fn matches(&self, batch: &rtdb_index::IndexBatch, row: usize, query: &rtdb_text::Query) -> Option<bool> {
+        let (page, row) = self.covered(batch, row)?;
+        let matched = !query.terms().is_empty() && query.terms().iter().all(|term| {
+            page.postings(term).is_some_and(|rows| rows.binary_search(&row).is_ok())
+        }) && (query.phrases().is_empty() || query.matches_arrow(&page.tokens(row)));
+        Some(matched)
+    }
+
+    fn score(&self, batch: &rtdb_index::IndexBatch, row: usize, scorer: &rtdb_text::Scorer) -> Option<f64> {
+        let (page, row) = self.covered(batch, row)?;
+        Some(scorer.bm25_arrow(&page.tokens(row)))
+    }
+}
+
 #[derive(Clone)]
 struct ServingColumn {
     segment: std::sync::Weak<rtdb_index::LiveTable>,
@@ -783,6 +821,30 @@ impl SearchRuntime {
             .and_then(|search| search.pages(segment, column)).unwrap_or_else(|| self.live_pages(database, segment, column))
     }
 
+    pub(crate) fn serving_terms(&self, request: &rtdb_query::ScanRequest<'_>, column: &str) -> Option<Arc<dyn rtdb_query::LiveSearchTerms>> {
+        if request.memory.is_prepaid() { return None; }
+        let serving = request.snapshot.serving_search::<ServingPostings>()?;
+        let mut reservation = request.memory.reserve(256).ok()?;
+        let mut batches = BTreeMap::new();
+        for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
+            let Some((pages, covered)) = serving.pages(segment, column) else { continue; };
+            if covered == 0 { continue; }
+            let lease = Arc::get_mut(&mut reservation).expect("Serving terms own their allocation");
+            lease.grow_to(lease.bytes().saturating_add(64 + pages.len().saturating_mul(16))).ok()?;
+            let pages: Arc<[_]> = pages.into();
+            let mut first = 0;
+            for batch in segment.batches() {
+                if first >= covered { break; }
+                lease.grow_to(lease.bytes().saturating_add(128)).ok()?;
+                batches.insert(Arc::as_ptr(batch) as usize, ServingBatch {
+                    _batch: Arc::downgrade(batch), first, pages: Arc::clone(&pages),
+                });
+                first += u32::try_from(batch.len()).ok()?;
+            }
+        }
+        (!batches.is_empty()).then(|| Arc::new(ServingTerms { batches, _reservation: reservation }) as Arc<dyn rtdb_query::LiveSearchTerms>)
+    }
+
     pub(crate) fn visit_live_matches_at(&self, snapshot: Option<&Snapshot>, database: &str, segment: &rtdb_index::LiveTable, column: &str,
         query: &rtdb_text::Query, phrases: bool, cancellation: &CancellationToken, mut visit: impl FnMut(u32, &dyn Fn() -> StringArray) -> Result<bool>,
     ) -> Result<bool> {
@@ -1017,7 +1079,8 @@ mod live_coverage_tests {
     use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, TableRef, Timestamp, Value};
 
     #[test]
-    fn live_coverages_reuse_the_prefix_across_merged_chunks_and_reject_a_divergent_suffix() {
+    fn arrow_search_live_coverages_reuse_the_prefix_across_merged_chunks_and_reject_a_divergent_suffix() {
+        use rtdb_query::LiveSearchTerms;
         let memory = MemoryBudget::new(8 << 20);
         let runtime = SearchRuntime::new(4 << 20);
         let token = CancellationToken::new();
@@ -1041,6 +1104,20 @@ mod live_coverage_tests {
         runtime.publish_live("db", &prefix, "body", &token).unwrap();
         let (initial, covered) = runtime.live_pages("db", &extended, "body");
         assert_eq!(covered, 1);
+        let batch = extended.batches().next().unwrap();
+        let terms = ServingTerms {
+            batches: BTreeMap::from([(Arc::as_ptr(batch) as usize, ServingBatch {
+                _batch: Arc::downgrade(batch), first: 0, pages: initial.clone().into(),
+            })]),
+            _reservation: memory.reserve(256).unwrap(),
+        };
+        let phrase = rtdb_text::Query::parse(r#""report paid""#);
+        let scorer = rtdb_text::Scorer::new(phrase.clone(), None);
+        assert_eq!(terms.matches(batch, 0, &phrase), Some(true));
+        assert_eq!(terms.matches(batch, 1, &phrase), None);
+        assert_eq!(terms.matches(divergent.batches().next().unwrap(), 0, &phrase), None);
+        assert_eq!(terms.score(batch, 0, &scorer).unwrap().to_bits(), scorer.bm25_text("report paid").to_bits());
+        drop(terms);
         let matching = rtdb_text::Query::parse("report");
         assert_eq!(runtime.live_rows("db", &extended, "body", &matching).unwrap().values(), &[0, 1]);
 

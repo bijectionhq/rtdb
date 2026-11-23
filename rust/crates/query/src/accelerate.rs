@@ -328,6 +328,13 @@ pub trait ScanAccelerator: Send + Sync {
     /// The values of `match(column, query)` on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
     /// Each answer must equal MATCH evaluated on the row.
     async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &str) -> Result<Option<MatchAnswers>> { Ok(None) }
+    fn live_search_terms(&self, _request: &ScanRequest<'_>, _column: &str) -> Option<Arc<dyn LiveSearchTerms>> { None }
+}
+
+/// Analyzed text from the admitted prefix of the snapshot's live Arrow batches.
+pub trait LiveSearchTerms: Send + Sync {
+    fn matches(&self, batch: &rtdb_index::IndexBatch, row: usize, query: &rtdb_text::Query) -> Option<bool>;
+    fn score(&self, batch: &rtdb_index::IndexBatch, row: usize, scorer: &rtdb_text::Scorer) -> Option<f64>;
 }
 
 /// MATCH on the rows of one data file, by page and row within the page: `None` where the column is null or absent, as MATCH is.

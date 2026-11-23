@@ -488,6 +488,8 @@ impl SearchFile {
 
     pub(crate) fn run_identity_bytes(&self, run: DocMatch) -> Result<&[u8]> { self.manifest.run_key(run.doc) }
 
+    pub(crate) fn run_identity_buffer(&self, run: DocMatch) -> Result<Buffer> { self.manifest.run_key_buffer(run.doc) }
+
     pub(crate) fn run_identity_key(&self, run: DocMatch) -> Result<rtdb_columnar::EntityIdRef<'_>> {
         rtdb_columnar::EntityIdRef::from_handle_bytes(self.run_identity_bytes(run)?)
             .map_err(|_| corrupt("Search run has an invalid complete identity"))
@@ -539,17 +541,42 @@ impl SearchFile {
     }
 
     pub(crate) fn matched_runs(&self, column: &str, query: &Query, bounds: TemporalBounds) -> Result<Matches<'_>> {
-        let matching = match self.column(column) {
-            Some(column) => {
-                let mut pages = PostingPages::new(self, column);
-                Matching::new(query, |term, positions| pages.get(term, positions))?
-            }
-            None => None,
-        };
+        let matching = self.matching(column, query)?;
         let documents = UInt32Array::from_iter_values(matching.iter().flat_map(|matching| {
             matching.documents().iter().copied().filter(|&doc| matching.includes(doc) && self.visible(doc, bounds))
         }));
         Ok(Matches { file: self, documents })
+    }
+
+    fn matching(&self, column: &str, query: &Query) -> Result<Option<Matching>> {
+        match self.column(column) {
+            Some(column) => {
+                let mut pages = PostingPages::new(self, column);
+                Matching::new(query, |term, positions| pages.get(term, positions))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn matched_scores<'a>(&'a self, column: &str, scorer: &'a Scorer, bounds: TemporalBounds, visible: Option<&'a [u32]>)
+        -> Result<impl Iterator<Item = (DocMatch, f64)> + 'a> {
+        let matching = self.matching(column, scorer.query())?;
+        let mut next = 0;
+        let mut frequencies = vec![0; scorer.query().terms().len()];
+        Ok(std::iter::from_fn(move || {
+            let matching = matching.as_ref()?;
+            while let Some(&doc) = matching.documents().get(next) {
+                next += 1;
+                if visible.is_some_and(|visible| visible.binary_search(&doc).is_err())
+                    || !self.visible(doc, bounds) || !matching.includes(doc) { continue; }
+                for (frequency, postings) in frequencies.iter_mut().zip(matching.terms()) {
+                    *frequency = postings.frequency(doc);
+                }
+                let length = stored_length(self.manifest.token_length(doc) as usize);
+                return Some((self.manifest.doc_match(doc), scorer.score(&frequencies, length)));
+            }
+            None
+        }))
     }
 
     pub fn matches(&self, column: &str, query: &Query, bounds: TemporalBounds) -> Result<Vec<DocMatch>> {
@@ -989,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn an_owned_run_round_trips_its_full_typed_identity() {
+    fn arrow_search_owned_run_keys_retain_the_arrow_buffer() {
         let columns = vec!["body".to_string()];
         let id = EntityId::String("complete-id".into());
         let row = SearchRow { position: None, identity: Some(id.clone()), iid: id.iid().0, system_from: 1, valid_from: 1, valid_to: 10,
@@ -998,6 +1025,10 @@ mod tests {
         let file = SearchFile::open(bytes, &columns).unwrap();
         let run = file.matches("body", &Query::parse("invoice"), at(2, 2)).unwrap()[0];
         assert_eq!(file.run_identity_key(run).unwrap(), rtdb_columnar::EntityIdRef::from(&id));
+        let key = file.run_identity_buffer(run).unwrap();
+        assert_eq!(key.as_ptr(), file.run_identity_bytes(run).unwrap().as_ptr());
+        drop(file);
+        assert_eq!(key.as_slice(), id.handle_bytes());
     }
 
     #[test]
@@ -1108,6 +1139,17 @@ mod tests {
         let file = open(&[SearchRow { values: vec![None, Some(long.clone())], ..row(9, 0, "", "") }]);
         let [(_, score)] = file.scored("body", &Query::parse("invoice"), &Query::parse("invoice"), None, all()).unwrap()[..] else { panic!() };
         assert_eq!(score, rtdb_text::bm25(&Query::parse("invoice"), &long, None), "a long document's stored length is rounded the same way");
+    }
+
+    #[test]
+    fn arrow_search_owned_scores_reuse_phrase_postings_in_term_order() {
+        let bodies = ["a a b", "b a", "a b b b", ""];
+        let rows: Vec<_> = bodies.iter().enumerate().map(|(id, text)| row(id as u8 + 1, 10, "", text)).collect();
+        let file = open(&rows);
+        let scorer = Scorer::from_frequencies(Query::parse(r#""a b" a"#), 7, 61, &[4, 3]);
+        let scores = file.matched_scores("body", &scorer, at(1, 11), None).unwrap()
+            .map(|(doc, score)| (doc.iid[0], score.to_bits())).collect::<Vec<_>>();
+        assert_eq!(scores, [0usize, 2].map(|id| (id as u8 + 1, scorer.bm25_arrow(&rtdb_text::analyze(bodies[id])).to_bits())));
     }
 
     #[test]

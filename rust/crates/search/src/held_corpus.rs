@@ -86,21 +86,15 @@ impl HeldTextCorpus {
             .filter(|total| *total <= MAX_TEXT_BYTES)
             .ok_or_else(corpus_limit)?;
         let _tokens = self.memory.reserve(4096 + 64 * text.len())?;
-        let tokens = rtdb_text::tokens(text);
+        let (tokens, frequencies, matched) = self.query.text_terms(text, true);
         self.corpus.documents += 1;
         self.corpus.tokens += tokens.len() as u64;
-        let frequencies = self
-            .query
-            .terms()
-            .iter()
-            .map(|term| tokens.iter().filter(|token| *token == term).count() as u32)
-            .collect::<Vec<_>>();
         for (term, &count) in self.query.terms().iter().zip(&frequencies) {
             if count > 0 {
                 *self.corpus.frequencies.entry(term.clone()).or_default() += 1;
             }
         }
-        if self.query.matches(&tokens) {
+        if matched {
             let charge = id.as_value().retained_bytes()? + 256 + 4 * frequencies.capacity();
             let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
             retained.grow_to(retained.bytes().saturating_add(charge))?;
@@ -200,11 +194,9 @@ impl HeldTextCorpus {
             if !score.is_finite() {
                 return Err(corpus_limit());
             }
-            window.insert(OwnedSearchHit {
-                partition: matched.partition,
-                id: matched.id,
-                score,
-            })?;
+            if let Some(at) = window.position(matched.partition, rtdb_columnar::EntityIdRef::from(&matched.id), score) {
+                window.insert_at(at, OwnedSearchHit { partition: matched.partition, id: matched.id, score })?;
+            }
         }
         Ok(())
     }
@@ -236,6 +228,23 @@ fn corpus_limit() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_search_held_corpus_counts_phrase_misses_and_evicts_the_last_hit() {
+        let memory = MemoryBudget::new(1 << 24);
+        let query = r#""a b""#;
+        let mut corpus = HeldTextCorpus::new(memory, query).unwrap();
+        for (id, text) in [(5, "a b"), (1, "b a"), (2, "a b"), (0, "a b a b")] {
+            corpus.shadow(0, EntityId::Integer(id), Some(text)).unwrap();
+        }
+        assert_eq!(corpus.statistics().tokens, 10);
+        assert_eq!(corpus.statistics().frequencies["a"], 4);
+        let scorer = Scorer::new(Query::parse(query), Some(corpus.statistics()));
+        let page = corpus.finish(1, 1).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.hits[0].id, EntityId::Integer(2));
+        assert_eq!(page.hits[0].score.to_bits(), scorer.bm25_arrow(&rtdb_text::analyze("a b")).to_bits());
+    }
 
     #[test]
     fn staged_shadows_replace_committed_text_before_statistics() {

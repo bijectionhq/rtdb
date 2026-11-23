@@ -17,7 +17,12 @@
 -- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
 -- Both ranking paths apply the same typed overlay shadows before computing corpus statistics.
 -- A declared optional text column with only null or absent values contributes an empty corpus.
--- Owned runs carry their full typed identity. Ranked candidates verify that identity, their winning revision, and the declared text at the held cut.
+-- Owned runs carry their full typed identity.
+-- Owned ranked candidates share a projected primary cursor in bounded batches.
+-- Each cursor retains the candidate's complete keys as slices of their posting file's Arrow buffers.
+-- The scan checks each candidate's complete Arrow identity, microsecond revision, and declared text leg at the held cut.
+-- The ranker uses posting frequencies and stored lengths when the winning revision identifies an unambiguous event in its run.
+-- Overlapping events at the same revision use the resolved text to verify the match and score.
 -- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
 -- Retained-world ranking checks for a placed world host before decoding the Flight request.
 -- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
@@ -282,6 +287,8 @@ rule RepairUnreadableSearchFile {
 -- The five-argument form computes BM25 from its document count, total stored length and document frequencies.
 -- The frequency vector follows the distinct term order returned by SEARCH_TERMS.
 -- SEARCH_LENGTH gives the stored length of a UTF-8 document for aggregation over the admitted rows and null for any other input.
+-- Each columnar expression batch prepares its constant query and fixed corpus weights once and infers each source field's text type once.
+-- Evaluation streams analyzer tokens into the length, term frequencies, and phrase matches it needs.
 -- SEARCH_CORPUS_FINGERPRINT hashes the ordered text id and body pairs passed as two arrays.
 -- Its Arrow inputs supply each pair from the selected UTF-8 positions.
 -- Each id and body is prefixed with its byte length so the input has one spelling.
@@ -370,8 +377,9 @@ rule MatchEvaluatedByTheScan {
     -- A MATCH with a constant query in a predicate the scan filters by, under NOT and IS NULL as much as bare, is a boolean column the scan evaluates on each resolved row.
     -- The text column is then read only for the rows the scan cannot answer otherwise, and projected only if something else needs it.
     -- A row of a trie takes MATCH from its search file for a definition covering the column: true where the document matches, null where the column is null or absent, and false otherwise.
-    -- A row in a trie with no readable recorded file takes it from the file the node builds, and a row in a live segment, or in a trie the node does not build, from its own value.
-    -- NOT MATCH, which no candidate set narrows, and count(*) over MATCH thus tokenise no text but the live index's.
+    -- A row in a trie with no readable recorded file can take its answer from the file the node builds.
+    -- A live row in the captured serving prefix can take its MATCH and score from the admitted postings for its physical Arrow position.
+    -- The scan evaluates the resolved value when its position has no admitted search answer.
     when: ScanWithMatch(scan, predicate)
 
     ensures:
