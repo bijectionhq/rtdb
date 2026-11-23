@@ -9,7 +9,7 @@ pub enum OwnedChangeKind {
     Put,
     Delete,
     Erase,
-    Expired,
+    Expired(Interval),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub struct OwnedChange {
 
 impl OwnedChange {
     pub fn to_value(&self) -> Value {
-        Value::Struct(StructFields::from([
+        let mut fields = StructFields::from([
             ("_id".into(), self.id.as_value()),
             (
                 "op".into(),
@@ -30,7 +30,7 @@ impl OwnedChange {
                         OwnedChangeKind::Put => "put",
                         OwnedChangeKind::Delete => "delete",
                         OwnedChangeKind::Erase => "erase",
-                        OwnedChangeKind::Expired => "expired",
+                        OwnedChangeKind::Expired(_) => "expired",
                     }
                     .into(),
                 ),
@@ -44,16 +44,18 @@ impl OwnedChange {
                     Value::I64(self.valid.upper().0)
                 },
             ),
-        ]))
+        ]);
+        if let OwnedChangeKind::Expired(lifetime) = self.kind {
+            fields.insert("created_micros".into(), Value::I64(lifetime.lower().0));
+            fields.insert("expiry_micros".into(), Value::I64(lifetime.upper().0));
+        }
+        Value::Struct(fields)
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
         let Value::Struct(fields) = value else {
             return Err(change_feed_uncovered());
         };
-        if fields.len() != 4 {
-            return Err(change_feed_uncovered());
-        }
         let id = fields
             .get("_id")
             .ok_or_else(change_feed_uncovered)?
@@ -63,7 +65,12 @@ impl OwnedChange {
             Some(Value::Utf8(op)) if op == "put" => OwnedChangeKind::Put,
             Some(Value::Utf8(op)) if op == "delete" => OwnedChangeKind::Delete,
             Some(Value::Utf8(op)) if op == "erase" => OwnedChangeKind::Erase,
-            Some(Value::Utf8(op)) if op == "expired" => OwnedChangeKind::Expired,
+            Some(Value::Utf8(op)) if op == "expired" => {
+                let (Some(Value::I64(created)), Some(Value::I64(expiry))) =
+                    (fields.get("created_micros"), fields.get("expiry_micros"))
+                else { return Err(change_feed_uncovered()); };
+                OwnedChangeKind::Expired(expired_lifetime_interval(Timestamp(*created), Timestamp(*expiry))?)
+            },
             _ => return Err(change_feed_uncovered()),
         };
         let Some(Value::I64(from)) = fields.get("valid_from_micros") else {
@@ -75,11 +82,27 @@ impl OwnedChange {
             _ => return Err(change_feed_uncovered()),
         };
         let valid = Interval::new(Timestamp(*from), to).map_err(|_| change_feed_uncovered())?;
-        if valid.is_empty() || (matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired) && valid != Interval::ALL) {
+        let shape = if matches!(kind, OwnedChangeKind::Expired(_)) {
+            fields.len() == 6
+        } else {
+            fields.len() == 4 || (fields.len() == 6
+                && ["created_micros", "expiry_micros"].iter().all(|name|
+                    matches!(fields.get(*name), Some(Value::Null | Value::Undefined))))
+        };
+        if !shape || valid.is_empty()
+            || (matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired(_)) && valid != Interval::ALL)
+        {
             return Err(change_feed_uncovered());
         }
         Ok(Self { id, kind, valid })
     }
+}
+
+pub fn expired_lifetime_interval(created: Timestamp, expiry: Timestamp) -> Result<Interval> {
+    if created.0 <= 0 || expiry <= created || expiry == Timestamp::MAX {
+        return Err(change_feed_uncovered());
+    }
+    Interval::new(created, expiry).map_err(|_| change_feed_uncovered())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
