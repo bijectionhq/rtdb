@@ -2870,7 +2870,9 @@ impl NativeSession {
                 OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
                 OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop | OwnedWorldEffect::SettleProposal => 0,
             };
-            if !worlds.insert(section.world) || (!retained_release && !terminal_proposal && !proposal_close && !(1..=128).contains(&section.checks.len()))
+            let standing = !proposal_overlay && matches!(&section.effect, OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::Clock(_));
+            if !worlds.insert(section.world)
+                || (section.checks.is_empty() && !standing && !retained_release && !terminal_proposal && !proposal_close)
                 || section.checks.len() > 128
                 || !attempts.insert(&section.attempt)
             {
@@ -2926,7 +2928,7 @@ impl NativeSession {
                 OwnedWorldEffect::Drop => (None, true, None),
                 OwnedWorldEffect::SettleProposal => (None, false, Some(section.parent_pin)),
             };
-            ops.push(TxOp::OwnedPublishWorld { world: section.world, attempt: section.attempt,
+            ops.push(TxOp::OwnedPublishWorld { world: section.world, parent_pin: section.parent_pin, attempt: section.attempt,
                 fingerprint, expected: section.expected_clock, advance_to, drop_world,
                 settlement_pin,
                 land_root: proposal_land.then_some(section.parent_pin),

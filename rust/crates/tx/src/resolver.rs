@@ -932,8 +932,8 @@ impl<'a> OpenTransaction<'a> {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 self.publish_owned_root_head().await
             }
-            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
-                self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world, *settlement_pin).await?;
+            Operation::Public(TxOp::OwnedPublishWorld { world, parent_pin, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
+                self.publish_owned_world(*world, *parent_pin, attempt, *fingerprint, *expected, *advance_to, *drop_world, *settlement_pin).await?;
                 if delete_root.is_some() || land_root.is_some() { self.publish_owned_root_head().await?; }
                 Ok(())
             },
@@ -1249,8 +1249,8 @@ impl<'a> OpenTransaction<'a> {
         }
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let publications = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, advance_to, drop_world, settlement_pin, .. }) =>
-                Some((*world, attempt, *fingerprint, *advance_to, *drop_world, *settlement_pin)),
+            Operation::Public(TxOp::OwnedPublishWorld { world, parent_pin, attempt, fingerprint, advance_to, drop_world, settlement_pin, .. }) =>
+                Some((*world, attempt, *fingerprint, *advance_to, *drop_world, *settlement_pin, *parent_pin)),
             _ => None,
         }).take(9).collect::<Vec<_>>();
         let mut root_publications = operations.iter().filter_map(|operation| match operation {
@@ -1338,6 +1338,7 @@ impl<'a> OpenTransaction<'a> {
         }
         admitted.extend(retained_release);
         admitted.extend(proposal_overlay);
+        admitted.extend(publishing_worlds);
         if proposal_overlay.is_none() && publications.iter().any(|publication| publication.5.is_some()) {
             return Err(unavailable());
         }
@@ -1355,6 +1356,11 @@ impl<'a> OpenTransaction<'a> {
                 }
                 self.owned_worlds.insert(world, record);
             }
+        }
+        if publications.iter().any(|(world, _, _, _, _, _, parent_pin)| {
+            self.owned_worlds.get(world).is_none_or(|(record, _)| record.pin != *parent_pin)
+        }) {
+            return Err(unavailable());
         }
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
@@ -1581,10 +1587,8 @@ impl<'a> OpenTransaction<'a> {
             let mut root_rows = 0usize;
             let mut scoped_checks = 0;
             let mut hosted = false;
-            let mut counts = BTreeMap::<Iid, (usize, usize)>::new();
-            if let Some((world, _, _, _, _, Some(_))) = publications.first() {
-                counts.insert(*world, (0, 0));
-            }
+            let mut counts: BTreeMap<Iid, (usize, usize)> = publications.iter()
+                .map(|(world, ..)| (*world, (0, 0))).collect();
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
                     Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
@@ -1650,9 +1654,10 @@ impl<'a> OpenTransaction<'a> {
                 }
                 attempts.insert(attempt);
             }
-            for (world, attempt, own_fingerprint, advance_to, drop_world, settlement_pin) in publications {
+            for (world, attempt, own_fingerprint, advance_to, drop_world, settlement_pin, _) in publications {
                 let (rows, witnesses) = counts.remove(&world).ok_or_else(unavailable)?;
-                if (witnesses == 0 && settlement_pin.is_none()) || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
+                if (witnesses == 0 && (drop_world || (proposal_overlay.is_some() && settlement_pin.is_none())))
+                    || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
                     || (rows == 0) != (advance_to.is_some() || drop_world || settlement_pin.is_some())
                     || drop_world && advance_to.is_some()
                 {
@@ -1784,13 +1789,13 @@ impl<'a> OpenTransaction<'a> {
     }
 
     async fn publish_owned_world(
-        &mut self, world: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
+        &mut self, world: Iid, parent_pin: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
         advance_to: Option<Timestamp>, drop_world: bool, settlement_pin: Option<Iid>,
     ) -> Result<()> {
         use rtdb_types::{OwnedRelation, OwnedWorld, WorldClockMode};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let record = &self.owned_worlds.get(&world).ok_or_else(OwnedWorld::unavailable)?.0;
-        if !record.mode.is_writable() && !drop_world {
+        if record.pin != parent_pin || (!record.mode.is_writable() && !drop_world) {
             return Err(OwnedWorld::unavailable());
         }
         let initial_clock = record.initial_clock();

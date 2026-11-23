@@ -547,8 +547,9 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             "rtdb-owned-publish-root-v1"
         }
-        Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
+        Operation::Public(TxOp::OwnedPublishWorld { world, parent_pin, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
             body.insert("world".into(), Value::Uuid(world.0));
+            body.insert("parent_pin".into(), Value::Uuid(parent_pin.0));
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             body.insert("expected".into(), expected.map_or(Value::Null, |time| Value::I64(time.0)));
@@ -1370,15 +1371,17 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => &["until"],
             "rtdb-hosted-constraint-refusal-v1" => &["version"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
+            "rtdb-owned-fork-overlay-v1" => &["registration", "previous", "attempt", "fingerprint", "overlay_world", "overlay_pin"],
             "rtdb-owned-root-retained-sibling-v1" => &["registration", "previous", "sibling", "attempt", "fingerprint"],
             "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-root-retained-advance-v1" | "rtdb-owned-root-retained-renewal-v1" | "rtdb-owned-root-proposal-hold-v1" | "rtdb-owned-root-proposal-shorten-v1" | "rtdb-owned-controls-retained-fork-v1"
             | "rtdb-owned-controls-proposal-fork-v1" | "rtdb-owned-root-proposal-fork-v1" => &["registration", "previous", "attempt", "fingerprint"],
             "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
-            "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
-            "rtdb-owned-settle-proposal-v1" | "rtdb-owned-land-proposal-v1" | "rtdb-owned-drop-with-root-delete-v1" => &["world", "attempt", "fingerprint", "expected", "pin"],
-            "rtdb-owned-publish-world-v2" => &["world", "attempt", "fingerprint", "expected", "advance_to"],
+            "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "parent_pin", "attempt", "fingerprint", "expected"],
+            "rtdb-owned-settle-proposal-v1" | "rtdb-owned-land-proposal-v1" | "rtdb-owned-drop-with-root-delete-v1" => &["world", "parent_pin", "attempt", "fingerprint", "expected", "pin"],
+            "rtdb-owned-publish-world-v2" => &["world", "parent_pin", "attempt", "fingerprint", "expected", "advance_to"],
             "rtdb-owned-check-world-purge-v3" => &["relation", "pin", "frontier", "local_frontier"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
+            "rtdb-owned-check-world-clock-v1" => &["scope", "world", "pin", "before"],
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
@@ -1454,13 +1457,13 @@ impl SourceOperationReader<'_> {
                 TxOp::OwnedPublishRoot { attempt, fingerprint }
             }
             "rtdb-owned-settle-proposal-v1" | "rtdb-owned-land-proposal-v1" | "rtdb-owned-publish-world-v1" | "rtdb-owned-publish-world-v2" | "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1" => {
-                let (Value::Uuid(world), Value::Utf8(attempt), Value::Binary(fingerprint)) =
-                    (value("world")?, value("attempt")?, value("fingerprint")?) else {
+                let (Value::Uuid(world), Value::Uuid(parent_pin), Value::Utf8(attempt), Value::Binary(fingerprint)) =
+                    (value("world")?, value("parent_pin")?, value("attempt")?, value("fingerprint")?) else {
                     return Err(invalid("Owned world publication has invalid fields"));
                 };
                 let fingerprint = fingerprint.try_into().map_err(|_| invalid("Invalid world publication fingerprint"))?;
                 TxOp::OwnedPublishWorld {
-                    world: rtdb_types::Iid(world), attempt, fingerprint,
+                    world: rtdb_types::Iid(world), parent_pin: Iid(parent_pin), attempt, fingerprint,
                     drop_world: matches!(name.as_str(), "rtdb-owned-land-proposal-v1" | "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1"),
                     land_root: if name == "rtdb-owned-land-proposal-v1" {
                         let Value::Uuid(pin) = value("pin")? else { return Err(invalid("Proposal landing has no original pin")); };
@@ -1860,6 +1863,28 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn ordered_world_clock_advance_keeps_its_parent_pin_without_point_checks() {
+        let world = Iid([4; 16]);
+        let pin = Iid([5; 16]);
+        let operation = TxOp::OwnedPublishWorld {
+            world, parent_pin: pin, attempt: "0000000000000000000000".into(),
+            fingerprint: [1; 32], expected: Some(Timestamp(17)),
+            advance_to: Some(Timestamp(22)), drop_world: false,
+            settlement_pin: None, land_root: None, delete_root: None,
+        };
+        let source = SourceTransaction::new(
+            vec![operation], SubmitOptions::default(), &budget(),
+        ).unwrap();
+        let replayed = roundtrip(&source);
+        assert!(matches!(replayed.operations.as_slice(),
+            [Operation::Public(TxOp::OwnedPublishWorld {
+                world: actual, parent_pin, expected: Some(Timestamp(17)),
+                advance_to: Some(Timestamp(22)), ..
+            })] if *actual == world && *parent_pin == pin
+        ));
     }
 
     #[test]
