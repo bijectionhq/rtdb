@@ -436,13 +436,12 @@ impl PreparedQuery {
 
 async fn measured_open<T>(context: Arc<QueryContext>, mut open: std::pin::Pin<Box<impl std::future::Future<Output = Result<T>>>>) -> Result<T> {
     let counter = context.query_cpu.clone();
-    let lease = context.catalog.read_lease();
-    let mut task = std::pin::pin!(rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, async {
+    let mut task = std::pin::pin!(context.reading(async {
         match counter {
             Some(counter) => crate::query_cpu::measure(counter, open.as_mut()).await,
             None => open.await,
         }
-    })));
+    }));
     std::future::poll_fn(|context| {
         stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || task.as_mut().poll(context))
     }).await
@@ -723,12 +722,16 @@ impl QueryCursor {
     /// Encodes one batch before returning to the transport. The encoder must
     /// return detached wire data and must not retain the borrowed Arrow buffers.
     pub async fn encode_next_batch<T>(&mut self, encode: impl FnOnce(&OwnedBatch) -> T) -> Result<Option<T>> {
-        if matches!(self.input, Some(QueryInput::Ordered(_))) {
-            return ENCODING_ORDERED_BATCH.scope((), async {
+        let answer = if matches!(self.input, Some(QueryInput::Ordered(_))) {
+            ENCODING_ORDERED_BATCH.scope((), async {
                 self.next_batch().await.map(|batch| batch.as_ref().map(encode))
-            }).await;
-        }
-        self.next_batch().await.map(|batch| batch.as_ref().map(encode))
+            }).await?
+        } else {
+            self.next_batch().await?.as_ref().map(encode)
+        };
+        self.context.catalog.check_view_lease()?;
+        self.context.check_cancelled()?;
+        Ok(answer)
     }
 
     pub async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
@@ -738,7 +741,6 @@ impl QueryCursor {
         if let Some(trace) = &mut self.trace { trace.start(); }
         let started = std::time::Instant::now();
         let retention = self.context.clone();
-        let lease = self.context.catalog.read_lease();
         let counter = self.context.query_cpu.clone();
         let pull = async {
             let mut pull = std::pin::pin!(self.pull_batch());
@@ -747,23 +749,22 @@ impl QueryCursor {
                 None => owner.run_until_cancelled(token.run_until_cancelled(pull)).await,
             }
         };
-        let result = rtdb_storage::IoRegion::retaining(retention, rtdb_storage::IoRegion::leased(lease, pull)).await.flatten().ok_or_else(cancelled);
+        let result = retention.reading(async { pull.await.flatten().ok_or_else(cancelled)? }).await;
         let result = result.and_then(|batch| {
             if let Some(id) = self.context.catalog.owned_identity() {
-                if let Ok(Some(page)) = &batch {
+                if let Some(page) = &batch {
                     for row in 0..page.batch().num_rows() {
                         crate::owned_row_revision(page.batch(), row, id, &self.context.memory)?;
                     }
                 }
             }
-            if self.context.has_owned_read_guard() || self.context.catalog.owned_identity().is_some() {
-                self.context.check_cancelled()?;
-            }
+            self.context.catalog.check_view_lease()?;
+            self.context.check_cancelled()?;
             Ok(batch)
         });
         match result {
-            Ok(Ok(batch)) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
-            Ok(Err(error)) | Err(error) => { self.input = None; self.record_error(); Err(error) }
+            Ok(batch) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
+            Err(error) => { self.input = None; self.record_error(); Err(error) }
         }
     }
     fn record_error(&self) { if let Some(observer) = &self.context.execution_observer { observer.record_error(ExecutionError::Query); } }

@@ -17,6 +17,6 @@ pub use durability::{sync_directory, sync_file};
 pub mod remote;
 
 pub use error::{Error, Result};
-pub use io_region::IoRegion;
+pub use io_region::{HeldView, IoRegion};
 pub use read_lease::ReadLease;
 pub use object_store::{LocalFile, LocalStore, MemoryStore, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, StoredObject, ObjectReadAllocation};

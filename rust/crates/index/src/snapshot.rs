@@ -8,7 +8,7 @@ use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, OwnedRelation, Re
 use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
 
 #[derive(Clone)]
-struct CatalogRead { _permit: Arc<dyn Send + Sync> }
+struct CatalogRead { permit: Arc<dyn std::any::Any + Send + Sync> }
 
 impl std::fmt::Debug for CatalogRead {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -62,13 +62,13 @@ impl Snapshot {
     /// Callers must also bind the opened database and residence before comparing cuts across nodes.
     pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
     /// Transfers the store's captured catalog registration into this snapshot and its clones.
-    pub fn with_catalog_read(mut self, permit: Arc<dyn Send + Sync>) -> Self {
-        self.catalog_read = Some(CatalogRead { _permit: permit });
+    pub fn with_catalog_read(mut self, permit: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self.catalog_read = Some(CatalogRead { permit });
         self
     }
     /// Clones the storage registration that was attached when the catalog was captured.
-    pub fn catalog_read_permit(&self) -> Option<Arc<dyn Send + Sync>> {
-        self.catalog_read.as_ref().map(|read| Arc::clone(&read._permit))
+    pub fn catalog_read_permit<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        Arc::clone(&self.catalog_read.as_ref()?.permit).downcast().ok()
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
     pub fn serving_search<T: std::any::Any>(&self) -> Option<&T> { self.durable.search.as_ref()?.get() }

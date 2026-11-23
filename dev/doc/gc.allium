@@ -24,6 +24,7 @@
 -- Pending tries remain required because a retained replica notice can complete their compaction cohort after recovery.
 -- Query and transaction snapshots register at the partition owner's state boundary.
 -- An admitted provider operation retains that registration through completion, including after caller cancellation.
+-- Query execution carries the selected storage registration through provider admission and checks its lease before returning a memory or provider answer.
 -- Compactor reset starts a new naming epoch, so a deletion authorized before it can never reach an output planned after it.
 --
 -- Query and fragment snapshots on coordinated storage register with the catalog floor before storage access.

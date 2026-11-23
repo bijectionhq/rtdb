@@ -1501,9 +1501,8 @@ impl<'a> OpenTransaction<'a> {
                     final_context
                 }
             };
-            let lease = context.catalog.read_lease();
             let check = rtdb_spatial::require_path_ready(Arc::clone(&context), owner, relation, name, columns, *encoding);
-            rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, check)).await?;
+            context.reading(check).await?;
         }
         Ok(())
     }

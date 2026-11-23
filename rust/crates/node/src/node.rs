@@ -523,10 +523,11 @@ impl Node {
                 let permit = match admission {
                     AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
                     AppliedCatalogAdmission::PrepareAudience(storage) =>
-                        storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
+                        storage.hold_catalog(Some(cut)).await?,
                     AppliedCatalogAdmission::Ordinary =>
-                        database.storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
+                        database.storage.hold_catalog(Some(cut)).await?,
                 };
+                if !permit.is_registered() { return Err(applied_catalog_unretained()); }
                 let history = match admission {
                     AppliedCatalogAdmission::Ordinary => fence.confirm_hosted(&database).await?,
                     AppliedCatalogAdmission::PrepareAudience(_) | AppliedCatalogAdmission::PreparedAudience(_) =>
@@ -2134,7 +2135,7 @@ impl OwnedReadSession {
     ) -> Result<rtdb_text::Corpus> {
         self.admit_read().await?;
         let work = rtdb_search::owned_corpus(self.relation_context(relation)?, &self.owner, relation, path, query);
-        let corpus = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
+        let corpus = self.context.reading(work).await?;
         self.check_relation(relation)?;
         Ok(corpus)
     }
@@ -2164,7 +2165,7 @@ impl OwnedReadSession {
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let work = rtdb_search::owned_ranked_with_overlay(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit, valid, overlay);
-        let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
+        let hits = self.context.reading(work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {
             for (relation, _) in partitions {
@@ -2233,9 +2234,8 @@ impl OwnedReadSession {
     pub async fn spatial_path_ready(&self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation) -> Result<bool> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let work = rtdb_spatial::path_ready(Arc::clone(&context), &self.owner, relation, path);
-        let ready = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let ready = context.reading(work).await?;
         self.check_relation(relation)?;
         Ok(ready)
     }
@@ -2263,7 +2263,6 @@ impl OwnedReadSession {
     ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let work = async {
             if let Some(prepared) = prepared {
                 rtdb_spatial::read_prepared(Arc::clone(&context), &self.owner, relation, path, prepared, request, projection).await
@@ -2271,7 +2270,7 @@ impl OwnedReadSession {
                 rtdb_spatial::read_held(Arc::clone(&context), &self.owner, relation, path, request, projection).await
             }
         };
-        let page = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let page = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))
@@ -2283,14 +2282,13 @@ impl OwnedReadSession {
     ) -> Result<(HeldSpatialNearest, rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let limit = request.limit;
         let work = async {
             let ranking = rtdb_spatial::PreparedNearest::prepare(Arc::clone(&context), &self.owner, relation, path, request, after_radius).await?;
             let page = ranking.page(Arc::clone(&context), &self.owner, None, limit, projection).await?;
             Ok::<_, Anomaly>((ranking, page))
         };
-        let (ranking, page) = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let (ranking, page) = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((HeldSpatialNearest { held_context: Arc::downgrade(&self.context), ranking }, page, witness))
@@ -2306,9 +2304,8 @@ impl OwnedReadSession {
         self.admit_read().await?;
         let relation = held.ranking.relation();
         let context = self.relation_context(relation)?;
-        let lease = context.catalog.read_lease();
         let work = held.ranking.page(Arc::clone(&context), &self.owner, Some(after), limit, projection);
-        let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let page = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))

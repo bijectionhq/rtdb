@@ -224,7 +224,29 @@ fn reserve_from(memory: &Arc<MemoryBudget>, bytes: usize) -> Result<Arc<MemoryRe
 /// What a view's entry retains beyond the view: its node, two copies of its key and its index slots.
 fn view_overhead(key: &ObjectKey) -> usize { key.as_str().len().saturating_mul(2).saturating_add(2 * std::mem::size_of::<Node>() + 256) }
 
+/// A catalog registration issued by the storage owner for one buffer-pool residence.
+pub struct HeldCatalogRead {
+    residence: Arc<()>,
+    cut: Option<rtdb_types::CatalogCut>,
+    registration: Option<Arc<dyn Send + Sync>>,
+}
+
+impl HeldCatalogRead {
+    pub fn is_registered(&self) -> bool { self.registration.is_some() }
+
+    fn covers(&self, cut: Option<rtdb_types::CatalogCut>) -> bool {
+        match (self.cut, cut) {
+            (Some(held), Some(cut)) => held.storage_version == cut.storage_version
+                && held.storage_epoch == cut.storage_epoch && held.replica_epoch == cut.replica_epoch
+                && held.through <= cut.through,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
 pub struct BufferPool {
+    residence: Arc<()>,
     store: Arc<dyn ObjectStore>,
     budget: Arc<CacheBudget>,
     memory: Arc<MemoryBudget>,
@@ -274,7 +296,7 @@ impl BufferPool {
     fn open(store: Arc<dyn ObjectStore>, budget: Arc<CacheBudget>, metadata: Option<Arc<MemoryBudget>>) -> Self {
         let id = budget.pools.fetch_add(1, Ordering::Relaxed);
         let memory = budget.memory.scope();
-        Self { store, budget, memory, id, metadata, scan_timing: ScanTiming::default() }
+        Self { residence: Arc::new(()), store, budget, memory, id, metadata, scan_timing: ScanTiming::default() }
     }
 
     /// Charges the bookkeeping of retained objects to `metadata`, and their bytes and every view to `budget`.
@@ -298,6 +320,19 @@ impl BufferPool {
     pub fn pool_retained_bytes(&self) -> usize { self.memory.used_bytes() }
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
+
+    pub async fn hold_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
+        let registration = self.store.retain_catalog(cut).await?;
+        if self.store.defers_trie_releases() && registration.is_none() {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.query/catalog-not-held",
+                "The coordinated storage provider returned no catalog hold"));
+        }
+        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration }))
+    }
+
+    pub fn holds_catalog(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>) -> bool {
+        Arc::ptr_eq(&self.residence, &held.residence) && held.covers(cut)
+    }
 
     fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
         self.budget.reserve(&self.memory, bytes)
@@ -523,6 +558,23 @@ mod fairness_tests {
     use super::*;
     use crate::MemoryStore;
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn a_held_catalog_cannot_cross_a_pool_or_cover_an_older_cut() {
+        use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, StorageVersion};
+
+        let store = Arc::new(MemoryStore::default());
+        let budget = CacheBudget::new(100);
+        let first = BufferPool::with_budget(store.clone(), budget.clone());
+        let second = BufferPool::with_budget(store, budget);
+        let cut = CatalogCut { storage_version: StorageVersion(6), storage_epoch: StorageEpoch(1),
+            replica_epoch: StorageEpoch(3), through: ReplicaPosition(10) };
+        let held = first.hold_catalog(Some(cut)).await.unwrap();
+        assert!(first.holds_catalog(&held, Some(cut)));
+        assert!(!second.holds_catalog(&held, Some(cut)));
+        assert!(!first.holds_catalog(&held, Some(CatalogCut { through: ReplicaPosition(9), ..cut })));
+        assert!(!first.holds_catalog(&held, Some(CatalogCut { storage_epoch: StorageEpoch(2), ..cut })));
+    }
 
     #[tokio::test]
     async fn one_pools_idle_entries_cannot_starve_another_pool_sharing_its_budget() {
