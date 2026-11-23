@@ -1,7 +1,7 @@
 //! Install Original world facts atomically with the held replay frontier.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::Arc,
 };
 
@@ -9,7 +9,7 @@ use arrow_array::{Array, BinaryArray};
 use rtdb_format::data::{StoredEvent, StoredOperation};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedChangeKind, OwnedRelation, OwnedWorld, Result, StructFields,
-    TableRef, Timestamp, TransactionKey, Value, WorldClockMode, WorldShadow,
+    TableRef, Timestamp, Value, WorldClockMode, WorldShadow,
 };
 
 use super::{OpenTransaction, no_owned_principal, overflow, validate_owned_schema};
@@ -232,7 +232,23 @@ impl OpenTransaction<'_> {
             }
         }
 
-        let mut identities = BTreeSet::new();
+        if !effects.omitted_shadows.is_empty() {
+            let mut omissions = Vec::with_capacity(effects.omitted_shadows.len() * 20);
+            for (position, world) in effects.omitted_shadows {
+                self.buffer.omit_archived_world_effect(position)?;
+                omissions.extend_from_slice(&position.get().to_be_bytes());
+                omissions.extend_from_slice(&world.0);
+            }
+            self.buffer.put(
+                TableRef::new("public", crate::hosted_control::RESTORE),
+                StructFields::from([
+                    ("_id".into(), Value::Utf8(replay.world_omissions_locator())),
+                    ("binding".into(), Value::Binary(omissions)),
+                ]),
+                Interval::new(Timestamp(0), Timestamp::MAX)?,
+            )?;
+        }
+        let mut identities = BTreeMap::new();
         for shadow in effects.shadows {
             let (world, _, clock) = active
                 .get(&shadow.world)
@@ -246,13 +262,12 @@ impl OpenTransaction<'_> {
             if schema.lifetime_micros().is_some()
                 || base.contains_table(&root.unique_table(owner))
                 || base.contains_table(&root.capacity_table(owner))
-                || !identities.insert((
-                    relation.clone(),
-                    shadow.id.clone(),
-                    shadow.valid.lower(),
-                    shadow.valid.upper(),
-                ))
             {
+                return Err(OwnedWorld::unavailable());
+            }
+            let identity = (relation.clone(), shadow.id.clone(), shadow.valid.lower(), shadow.valid.upper());
+            let positioned = shadow.position.is_some();
+            if identities.insert(identity, positioned).is_some_and(|prior| !prior || !positioned) {
                 return Err(OwnedWorld::unavailable());
             }
             schema.require_replayed_period(shadow.valid, *clock, rtdb_types::EventOp::Put)?;
@@ -269,20 +284,23 @@ impl OpenTransaction<'_> {
             } else {
                 (WorldShadow::Deleted, OwnedChangeKind::Delete)
             };
-            self.buffer.append_unpositioned_replay(
-                &relation.table(owner),
-                StoredEvent {
-                    origin: None,
-                    commit_position: 0,
-                    entity_key: Some(shadow.id.handle_bytes().into()),
-                    iid: shadow.id.iid(),
-                    system_from: self.tx_key().system_time,
-                    valid_time: shadow.valid,
-                    operation: StoredOperation::Put(image.record(&shadow.id)?),
-                    recency: None,
-                },
-            )?;
-            self.record_owned_change(&relation, shadow.id, change, shadow.valid, None, Ok(None))?;
+            let table = relation.table(owner);
+            let event = StoredEvent {
+                origin: None,
+                commit_position: 0,
+                entity_key: Some(shadow.id.handle_bytes().into()),
+                iid: shadow.id.iid(),
+                system_from: self.tx_key().system_time,
+                valid_time: shadow.valid,
+                operation: StoredOperation::Put(image.record(&shadow.id)?),
+                recency: None,
+            };
+            if let Some(position) = shadow.position {
+                self.buffer.append_archived_world_effect(&table, event, position)?;
+            } else {
+                self.buffer.append_unpositioned_replay(&table, event)?;
+            }
+            self.record_owned_change(&relation, shadow.id, change, shadow.valid, shadow.position, Ok(None))?;
         }
         Ok(())
     }

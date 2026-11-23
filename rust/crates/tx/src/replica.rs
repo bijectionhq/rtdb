@@ -83,7 +83,12 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
     let outcome = placed.map(|(attempt, retirement)| read_placed_outcome(&tables, attempt, retirement, key, memory)).transpose()?;
     let proof = outcome.as_ref().map(|(proof, _)| proof);
     let world_effects = proof.and_then(|proof| proof.get(worlds::WORLD_EFFECTS));
-    if owned_owner.is_some() {
+    let archive_replay = match proof.and_then(|proof| proof.get(crate::hosted_control::RESOLVED_ARCHIVE_REPLAY)) {
+        Some(Value::Bool(true)) => true,
+        None | Some(Value::Null | Value::Undefined) => false,
+        _ => return Err(invalid("Invalid resolved archive replay marker")),
+    };
+    if owned_owner.is_some() || archive_replay {
         if !result.committed() || message.db_op.is_some() {
             return Err(invalid("Resolved owned transaction mixes storage scopes"));
         }
@@ -98,8 +103,14 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                         ))
             })
             .collect();
-        match world_effects {
-            Some(Value::List(effects)) => {
+        match (archive_replay, world_effects) {
+            (true, None | Some(Value::Undefined | Value::Null)) => {
+                let proof = proof.ok_or_else(|| invalid("Resolved archive replay has no placed attempt"))?;
+                verify_hosted_controls(proof, &controls, key)?;
+                verify_archive_replay(&tables, key, memory)?;
+            }
+            (true, Some(_)) => return Err(invalid("Resolved archive replay mixes live and copied world effects")),
+            (false, Some(Value::List(effects))) => {
                 let effects = effects.scalar_values().ok_or_else(|| invalid("Resolved world effects have an invalid layout"))?;
                 let hosted = worlds::verify(&tables, effects, key, memory)?;
                 let has_controls = !controls.is_empty()
@@ -134,7 +145,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                     verify_hosted_controls(proof, &controls, key)?;
                 }
             }
-            Some(Value::Undefined | Value::Null) | None => {
+            (false, Some(Value::Undefined | Value::Null) | None) => {
                 if owned_scopes.len() != 1 {
                     return Err(invalid("Cross-scope owned effects have no placed world inventory"));
                 }
@@ -145,12 +156,85 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                     verify_hosted_controls(proof, &controls, key)?;
                 }
             }
-            Some(_) => return Err(invalid("Invalid placed world inventory carrier")),
+            (false, Some(_)) => return Err(invalid("Invalid placed world inventory carrier")),
         }
     } else if matches!(world_effects, Some(value) if !matches!(value, Value::Undefined | Value::Null)) {
         return Err(invalid("Placed world inventory has no owned effects"));
     }
     Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: placed.map(|(attempt, _)| attempt) })
+}
+
+fn verify_archive_replay(
+    tables: &BTreeMap<TableRef, TableWrite>, key: TransactionKey, memory: &Arc<MemoryBudget>,
+) -> Result<()> {
+    use crate::hosted_control::{HostedReplay, NATIVE_FRONTIER, RESTORE};
+
+    let mismatch = || invalid("Resolved archive effects differ from their held replay inventory");
+    let hold = tables.get(&TableRef::new("public", RESTORE))
+        .and_then(TableWrite::batch).ok_or_else(mismatch)?;
+    let _charge = memory.reserve(hold.arrow().get_array_memory_size().checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(mismatch)?)?;
+    let binding = |id: &str| -> Result<Option<Vec<u8>>> {
+        let iid = rtdb_types::EntityId::String(id.to_owned()).iid();
+        let mut body = None;
+        for index in 0..hold.len() {
+            if hold.header(index)?.iid != iid {
+                continue;
+            }
+            let StoredOperation::Put(row) = hold.view().read_event(index)?.operation else {
+                return Err(mismatch());
+            };
+            if !matches!(row.get("_id"), Some(Value::Utf8(key)) if key == id) {
+                continue;
+            }
+            let Some(Value::Binary(bytes)) = row.get("binding") else { return Err(mismatch()); };
+            if body.replace(bytes.to_vec()).is_some() {
+                return Err(mismatch());
+            }
+        }
+        Ok(body)
+    };
+    let frontier = binding(NATIVE_FRONTIER)?.ok_or_else(mismatch)?;
+    let replay = HostedReplay::decode_resolved(&frontier, key.system_time)?;
+    if binding(&replay.transaction_locator())?.as_deref() != Some(frontier.as_slice()) {
+        return Err(mismatch());
+    }
+    let mut positions: BTreeSet<_> = replay.commit_positions().iter().copied().collect();
+    if let Some(omissions) = binding(&replay.world_omissions_locator())? {
+        if omissions.is_empty() || omissions.len() / 20 > positions.len() {
+            return Err(mismatch());
+        }
+        let (entries, remainder) = omissions.as_chunks::<20>();
+        if !remainder.is_empty() {
+            return Err(mismatch());
+        }
+        for entry in entries {
+            let (ordinal, world) = entry.split_at(4);
+            let ordinal = u32::from_be_bytes(ordinal.try_into().map_err(|_| mismatch())?);
+            if world == [0; 16] || !positions.remove(&ordinal) {
+                return Err(mismatch());
+            }
+        }
+    }
+    for (table, write) in tables {
+        if !table.is_owned_event_data() {
+            continue;
+        }
+        if let Some(batch) = write.batch() {
+            for index in 0..batch.len() {
+                let event = batch.header(index)?;
+                if event.system_from != key.system_time
+                    || (event.commit_position != 0 && !positions.remove(&event.commit_position))
+                {
+                    return Err(mismatch());
+                }
+            }
+        }
+    }
+    if !positions.is_empty() {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 fn read_placed_outcome(
@@ -248,3 +332,58 @@ fn decode_error(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<RetainedAnom
     RetainedAnomaly::from_transit(bytes, memory)
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.tx/invalid-replica-transaction", message) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_format::data::StoredEvent;
+    use rtdb_index::{PartitionState, TransactionBuffer};
+    use rtdb_types::{EntityId, Iid, OwnedRelation};
+
+    #[test]
+    fn archive_replay_accounts_for_copied_and_omitted_world_ordinals() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let state = PartitionState::empty(Default::default())?;
+        let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(5) };
+        let receipt = serde_json::json!({
+            "binding": vec![1; 32], "archive": vec![2; 32], "original_authority": vec![3; 16],
+            "captured": {"tx_id": 3, "system_time": 4},
+            "handoff": null, "through": 4000, "previous": null,
+            "source": {"tx_id": 3, "system_time": 4}, "logical_at": 4000,
+            "fingerprint": vec![4; 32], "commit_positions": [1, 2],
+        }).to_string().into_bytes();
+        let hold = TableRef::new("public", crate::hosted_control::RESTORE);
+        let original = EntityId::String("place".into());
+        let overlay = OwnedRelation::new("locations")?.in_world(Iid([1; 16]))?.table("owner");
+
+        for (copied, omitted, valid) in [(1u32, 2u32, true), (3, 2, false), (2, 2, false)] {
+            let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
+            transaction.retain_archived_owned_positions(vec![copied])?;
+            transaction.append_archived_world_effect(&overlay, StoredEvent {
+                origin: None,
+                commit_position: 0,
+                entity_key: Some(original.handle_bytes().into()),
+                iid: original.iid(),
+                system_from: key.system_time,
+                valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), original.as_value())])),
+                recency: None,
+            }, std::num::NonZeroU32::new(copied).unwrap())?;
+            let mut omission = omitted.to_be_bytes().to_vec();
+            omission.extend_from_slice(&[2; 16]);
+            for (id, body) in [
+                (crate::hosted_control::NATIVE_FRONTIER, receipt.clone()),
+                ("native-transaction/3", receipt.clone()),
+                ("native-world-omissions/3", omission),
+            ] {
+                transaction.put(hold.clone(), StructFields::from([
+                    ("_id".into(), Value::Utf8(id.into())),
+                    ("binding".into(), Value::Binary(body)),
+                ]), Interval::new(Timestamp(0), Timestamp::MAX)?)?;
+            }
+            let staged = transaction.stage()?;
+            assert_eq!(verify_archive_replay(staged.tables(), key, &memory).is_ok(), valid);
+        }
+        Ok(())
+    }
+}

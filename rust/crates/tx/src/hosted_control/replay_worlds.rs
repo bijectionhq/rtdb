@@ -6,6 +6,7 @@ use rtdb_types::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 
 use super::WorldReadmission;
 
@@ -13,6 +14,7 @@ pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
 const MAGIC: &[u8] = b"BJWP5";
+const POSITIONED_MAGIC: &[u8] = b"BJWP6";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
@@ -20,6 +22,7 @@ pub(crate) struct ReplayWorlds {
     pub(crate) registrations: Vec<ReplayRegistration>,
     pub(crate) clocks: Vec<(Iid, Timestamp)>,
     pub(crate) shadows: Vec<ReplayShadow>,
+    pub(crate) omitted_shadows: BTreeMap<NonZeroU32, Iid>,
 }
 
 pub(crate) struct ReplayRegistration {
@@ -29,6 +32,7 @@ pub(crate) struct ReplayRegistration {
 }
 
 pub(crate) struct ReplayShadow {
+    pub(crate) position: Option<NonZeroU32>,
     pub(crate) world: Iid,
     pub(crate) relation: OwnedRelation,
     pub(crate) id: EntityId,
@@ -112,7 +116,9 @@ impl ArchivedWorld {
 
 impl ReplayWorlds {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut input = Input(bytes.strip_prefix(MAGIC).ok_or_else(invalid)?);
+        let positioned = bytes.starts_with(POSITIONED_MAGIC);
+        let magic = if positioned { POSITIONED_MAGIC } else { MAGIC };
+        let mut input = Input(bytes.strip_prefix(magic).ok_or_else(invalid)?);
         let registrations = input.count()?;
         let mut worlds = Self::default();
         let mut ids = BTreeSet::new();
@@ -139,10 +145,19 @@ impl ReplayWorlds {
         }
 
         let shadows = input.count()?;
-        if shadows + clocks + registrations > MAX_EFFECTS || shadows + clocks + registrations == 0 {
+        if shadows + clocks + registrations > MAX_EFFECTS {
             return Err(invalid());
         }
+        let mut positions = BTreeSet::new();
         for _ in 0..shadows {
+            let position = if positioned {
+                NonZeroU32::new(u32::from_be_bytes(input.fixed()?))
+            } else {
+                None
+            };
+            if position.is_some_and(|position| !positions.insert(position)) {
+                return Err(invalid());
+            }
             let world = Iid(input.fixed()?);
             let relation = OwnedRelation::new(input.text()?)?;
             let id = input.text()?;
@@ -177,12 +192,26 @@ impl ReplayWorlds {
                 Some(fields)
             };
             worlds.shadows.push(ReplayShadow {
+                position,
                 world,
                 relation,
                 id: EntityId::String(id.into()),
                 valid,
                 fields,
             });
+        }
+        let omitted = if positioned { input.count()? } else { 0 };
+        let total = registrations + clocks + shadows + omitted;
+        if total == 0 || total > MAX_EFFECTS {
+            return Err(invalid());
+        }
+        for _ in 0..omitted {
+            let position = NonZeroU32::new(u32::from_be_bytes(input.fixed()?)).ok_or_else(invalid)?;
+            let world = Iid(input.fixed()?);
+            if world.0 == [0; 16] || !positions.insert(position) {
+                return Err(invalid());
+            }
+            worlds.omitted_shadows.insert(position, world);
         }
         if !input.0.is_empty() {
             return Err(invalid());
@@ -229,4 +258,31 @@ pub(crate) fn invalid() -> Anomaly {
         "rtdb.hosted/world-replay",
         "The held replay has invalid Original world effects",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_world_inventory_refuses_duplicate_or_unqualified_omissions() {
+        let mut body = POSITIONED_MAGIC.to_vec();
+        for count in [0u32, 0, 0, 1] {
+            body.extend_from_slice(&count.to_be_bytes());
+        }
+        let ordinal = NonZeroU32::new(3).unwrap();
+        body.extend_from_slice(&ordinal.get().to_be_bytes());
+        body.extend_from_slice(&[1; 16]);
+        let replay = ReplayWorlds::decode(&body).unwrap();
+        assert_eq!(replay.omitted_shadows.get(&ordinal), Some(&Iid([1; 16])));
+
+        let omitted_count = POSITIONED_MAGIC.len() + 3 * 4;
+        body[omitted_count..omitted_count + 4].copy_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&ordinal.get().to_be_bytes());
+        body.extend_from_slice(&[2; 16]);
+        assert!(ReplayWorlds::decode(&body).is_err());
+        let second_ordinal = body.len() - 20;
+        body[second_ordinal..second_ordinal + 4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(ReplayWorlds::decode(&body).is_err());
+    }
 }

@@ -269,7 +269,7 @@ impl TxResolver {
         tx.write_result(&result, None, Some((log_time, receipt_time)))?;
         if let Some(attempt) = attempt {
             tx.retire_placed_outcomes(clock).await?;
-            tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new())?;
+            tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new(), false)?;
         }
         let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
             attempt, retirement: context.placed_receipt_retirement,
@@ -688,7 +688,8 @@ impl<'a> OpenTransaction<'a> {
             }).collect();
             let worlds = if result.committed() { crate::replica::worlds::source_inventory(selected)? } else { Vec::new() };
             self.retire_placed_outcomes(clock).await?;
-            self.write_attempt_outcome(attempt, log_time, controls, worlds)?;
+            let archive_replay = result.committed() && self.hosted_replay.is_some();
+            self.write_attempt_outcome(attempt, log_time, controls, worlds, archive_replay)?;
         }
         ResolvedTx::new(self.buffer.stage()?, result, input, None, None, self.context)
     }
@@ -804,7 +805,7 @@ impl<'a> OpenTransaction<'a> {
 
     fn write_attempt_outcome(
         &mut self, attempt: PlacedAttempt, log_time: Timestamp,
-        controls: std::collections::BTreeSet<&str>, worlds: Vec<Value>,
+        controls: std::collections::BTreeSet<&str>, worlds: Vec<Value>, archive_replay: bool,
     ) -> Result<()> {
         let key = self.tx_key();
         let mut document = StructFields::from([
@@ -818,6 +819,9 @@ impl<'a> OpenTransaction<'a> {
         }
         if !worlds.is_empty() {
             document.insert(crate::replica::worlds::WORLD_EFFECTS.into(), Value::list(worlds));
+        }
+        if archive_replay {
+            document.insert(crate::hosted_control::RESOLVED_ARCHIVE_REPLAY.into(), Value::Bool(true));
         }
         let expires = Timestamp(log_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
         self.buffer.put(TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE), document, interval(log_time, expires)?)

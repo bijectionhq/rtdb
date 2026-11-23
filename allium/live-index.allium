@@ -21,6 +21,9 @@
 --   Columnar puts retain their Arrow values alongside resolved IIDs and valid-time intervals until the events are encoded.
 --   A positioned owned append returns the ordinal it stored in the event header for use by the resolver's change journal.
 --   Rebuilding an unpositioned archive event leaves the original ordinal inventory available to positioned effects.
+--   A copied world effect consumes its explicit original ordinal independently of the Root effect sequence.
+--   A world omission consumes its original ordinal and is retained beside the archive receipt.
+--   A resolved archive replay accounts for every original ordinal exactly once, as a stored effect or a retained omission.
 --   The owned relation's routing inventory reads the applied data, change-journal and purge event frontiers under the same snapshot.
 --   A relation is exhausted when its data and purge frontiers are zero and its serving trie inventory is empty.
 --   A feed is exhausted when the relation is exhausted and its change journal also has a zero frontier and no serving tries.

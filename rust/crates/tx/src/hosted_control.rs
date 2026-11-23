@@ -10,8 +10,9 @@ pub(crate) use world_readmission::{WorldReadmission, world_readmission_control};
 
 pub(crate) const CONTROL_TABLES: &str = "hosted_control_tables";
 pub(crate) const HOSTED_CAPACITY_DECLARATIONS: &str = "hosted_capacity_declarations";
-const RESTORE: &str = "bj_rtdb_restore_hold";
-const NATIVE_FRONTIER: &str = "native-frontier.v1";
+pub(crate) const RESTORE: &str = "bj_rtdb_restore_hold";
+pub(crate) const NATIVE_FRONTIER: &str = "native-frontier.v1";
+pub(crate) const RESOLVED_ARCHIVE_REPLAY: &str = "hosted_archive_replay";
 const REPLAY_TRANSACTIONS: &str = "bj_rtdb_restore_transactions";
 const MAX_REPLAY_POSITIONS: usize = 4096;
 const MAX_REPLAY_RECEIPT_BYTES: usize = 64 * 1024;
@@ -347,6 +348,29 @@ fn control_body(control: &HostedControlWrite, max_bytes: usize) -> Option<&[u8]>
 
 impl HostedReplay {
     pub(crate) fn commit_positions(&self) -> &[u32] { &self.commit_positions }
+
+    pub(crate) fn decode_resolved(body: &[u8], ordered: Timestamp) -> Result<Self> {
+        if body.len() > MAX_REPLAY_RECEIPT_BYTES {
+            return Err(replay_invalid());
+        }
+        let replay: Self = serde_json::from_slice(body).map_err(|_| replay_invalid())?;
+        if !replay.has_original_prefix() || !replay.positions_are_ordered()
+            || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
+            || replay.logical_time() > replay.source_time()
+        {
+            return Err(replay_invalid());
+        }
+        replay.check_order(ordered)?;
+        Ok(replay)
+    }
+
+    pub(crate) fn transaction_locator(&self) -> String {
+        format!("native-transaction/{}", self.source.tx_id.0)
+    }
+
+    pub(crate) fn world_omissions_locator(&self) -> String {
+        format!("native-world-omissions/{}", self.source.tx_id.0)
+    }
 
     fn positions_are_ordered(&self) -> bool {
         self.commit_positions.len() <= MAX_REPLAY_POSITIONS
