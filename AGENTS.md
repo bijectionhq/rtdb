@@ -10,7 +10,7 @@ See developer documentation in `/dev` in this repo — @dev/CODING.adoc carries 
 For editing or adding pages to the user-facing documentation site (`docs/src/content/docs/`), see the "Writing docs" section in `docs/README.md` — it covers the Diataxis mapping, voice, changelog conventions, and a few patterns that trip agents up (properties vs mechanism, per-database scoping, theme-neutral diagrams, mining commits for context).
 
 We develop using 'tidy-first' methodology - endeavouring to separate 'equivalence' changes (changes which do not affect runtime behaviour, changes which increase our options) from changes that advance the behaviour of XT.
-For example, even when we're working on a feature branch, we will often separate a tidying change in a separate commit and cherry-pick it onto `main`, so that the resulting PR is easier to review.
+Keep tidying changes in separate commits so each change is easy to review.
 
 We take great inspiration from the principle of 'making illegal states unrepresentable' - prefer type systems, data structures, and APIs that prevent invalid states at compile time rather than requiring runtime validation.
 
@@ -52,7 +52,7 @@ Specs live in two directories, `allium/` and `dev/doc/` — glob `**/*.allium` r
 Use the `allium:tend` skill to edit a spec and `allium:weed` to check a spec against the code.
 
 A spec states the aim, and what it does not state, it excludes: an obligation named after what it is not, or prose arguing for this design over the one that was rejected, is misfiled.
-That commentary belongs in the commit body and the PR, which are read once around the change; a spec is read long after, by someone who doesn't care what it might have been.
+Put that commentary in the commit body.
 
 | Spec | Covers |
 | --- | --- |
@@ -71,7 +71,8 @@ That commentary belongs in the commit body and the PR, which are read once aroun
 
 ## Definition of Done (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below.
+Work is complete when every verified change within the requested scope is committed and pushed directly to `origin/main`.
 
 * You MUST include tests for new/changed functionality, in the same commit as the change they cover.
   A branch is reviewed commit by commit, and a commit whose tests or docs arrive later can't be agreed with on its own.
@@ -83,9 +84,9 @@ That commentary belongs in the commit body and the PR, which are read once aroun
   CI will run integration and property tests regardless, but `./gradlew test` is the minimum.
   All tests pass on `main`, so a failure is yours — see [Running tests](#running-tests) for how to handle one.
 * There MUST NOT be any reflection or boxed math warnings.
-* For show/ask changes, you MUST run a code-review pass over the diff before raising the commit/PR — see the code-review note under `== Git` in @dev/CODING.adoc (ship changes are exempt).
+* For changes classified as show or ask in @dev/CODING.adoc, you MUST run a local code-review pass over the diff before pushing (ship changes are exempt).
   That pass MUST cover the diff's comments against `chalk:code-comments`, and any spec prose against the spec-voice rules in [Allium specs](#allium-specs), not only its code.
-* Verify: all changes committed AND pushed
+* Verify that `origin/main` contains the completed commits.
 * Hand off: provide context for next session
 
 For user-visible features:
@@ -138,16 +139,22 @@ It is the single home for every XTDB-specific testing rule and mechanism — run
 Do not reconstruct any of it from memory.
 You run the test task; the agent reads what it produced, so Gradle's output never reaches your context.
 
-## Rebasing and merging
+## Landing changes
+
+You MUST push completed work directly to `origin/main` after the required review and tests pass.
+You MUST NOT create pull requests.
+Use local branches or worktrees to isolate in-progress changes.
+Preserve concurrent work on `main` and use a non-force push.
+This direct-push policy overrides the PR-based workflows described in @dev/CODING.adoc and the Git skills.
 
 Before you rebase a branch, resolve a conflict, or merge a branch back into `main`, you MUST invoke the `xtdb-git` skill.
 
-It carries why history stays linear, how to resolve a conflict without silently reverting a fix that landed on `main` after the branch forked, and the three merge patterns.
-Ship/show/ask and the code-review pass live in @dev/CODING.adoc; commit messages are `chalk:commit`'s.
+Use its conflict-resolution guidance to preserve fixes that landed on `main` after the branch forked.
+Follow `chalk:commit` for commit messages when available.
 
-## GitHub issues, PRs and the project board
+## GitHub issues and the project board
 
-Before you open an issue or PR, add a card to the board, set a milestone or a label, pick up a card, or land its work or are told it has landed, you MUST invoke the `xtdb-github` skill.
+Before you open an issue, add a card to the board, set a milestone or a label, pick up a card, or land its work or are told it has landed, you MUST invoke the `xtdb-github` skill.
 
 It is the single home for the GitHub conventions in this repo — what goes on the board and what inherits it through an issue, sub-issue parenting, the two tests a milestone has to pass, the label conventions, what to read and which edits to make when you pick a card up, the checklist to run once its work has landed, the cached project and field IDs, and how to drive all of it through chalk.
 Do not reconstruct any of it from memory, and do not guess an ID.
