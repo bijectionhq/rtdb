@@ -9,7 +9,9 @@ mod storage;
 
 use super::{
     Authority, Held, InstalledJournal, InstalledRoute, JournalLog, WriterAdmission,
+    adapter_command,
     custody::{CheckpointAuthority, CheckpointCustody, Preparation, Reservation},
+    retention_decision::{checkpoint_next_lsn, trim_target},
 };
 use crate::keys::{JournalKey, KeyService};
 use async_trait::async_trait;
@@ -742,13 +744,8 @@ impl Placement {
         let provider = self.checkpoint_custody(Arc::clone(&io), Arc::clone(keys)).await?;
         let requested = offered
             .map(|(admission, checkpoint)| {
-                let next = checkpoint
-                    .boundary
-                    .checked_add(1)
-                    .and_then(|offset| u64::try_from(offset).ok())
-                    .ok_or_else(|| {
-                        invalid("The adopted checkpoint has no ordered replica boundary")
-                    })?;
+                let next = checkpoint_next_lsn(checkpoint.boundary)
+                    .ok_or_else(|| invalid("The adopted checkpoint has no ordered replica boundary"))?;
                 Ok::<_, Anomaly>((admission, checkpoint, next))
             })
             .transpose()?;
@@ -990,15 +987,10 @@ impl Placement {
             let mut route = custodian.route().await?;
             for worker in workers {
                 let now = u64::try_from(now_ms()).unwrap_or_default();
-                if worker
-                    .eligible_at
-                    .is_some_and(|eligible| eligible <= now.max(route.time))
-                {
+                if adapter_command::disposal_is_due(worker.eligible_at, now, route.time) {
                     *pending = Some(custodian.request(
                         &route,
-                        Command::DisposeExpired {
-                            enrollment: worker.enrollment,
-                        },
+                        adapter_command::dispose_expired_command(worker.enrollment),
                     )?);
                     Self::settle_worker_disposal(custodian, &mut pending).await?;
                     route = custodian.route().await?;
@@ -1040,8 +1032,8 @@ impl Placement {
             return Ok(());
         };
         let mut route = custodian.route().await?;
-        if route.floor.next_lsn < route.checkpoint.cut.next_lsn
-            && custodian.trim(&route, route.checkpoint.cut).await.is_ok()
+        if let Some(through) = trim_target(route.floor, route.checkpoint.cut)
+            && custodian.trim(&route, through).await.is_ok()
         {
             route = custodian.route().await?;
         }

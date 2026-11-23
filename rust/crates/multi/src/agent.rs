@@ -22,7 +22,8 @@ use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTick
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
 use crate::lease::MemberLease;
 use crate::hosted_recovery::{ReplicaTrimPlan, advance_body_fence, capture_replay_start};
-use crate::journal::hosted::checkpoint_for_block;
+use crate::directory_bypass::{directory_move_park_allowed, directory_route_allowed, pressure_candidate};
+use crate::journal::{hosted::checkpoint_for_block, retention_decision::{RetentionAction, retention_actions}};
 
 enum SuffixCut<'a> {
     Tip(TransactionKey),
@@ -351,7 +352,7 @@ impl NodeAgent {
     }
 
     fn require_directory_route(&self, name: &str) -> Result<()> {
-        if self.ordered.by_name(name).is_some() {
+        if !directory_route_allowed(self.ordered.by_name(name).is_some()) {
             return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An installed journal uses its own placement decisions"));
         }
         Ok(())
@@ -1118,10 +1119,11 @@ impl NodeAgent {
     }
 
     async fn park_with_turn(&self, name: &str, moving: Option<(u64, &MoveTicket)>, flush_wait: Duration) -> Result<Response> {
-        if let Some(placement) = self.ordered.by_name(name) {
-            if moving.is_some() {
-                return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An ordered holder uses its installed journal to vacate"));
-            }
+        let installed = self.ordered.by_name(name);
+        if !directory_move_park_allowed(installed.is_some(), moving.is_some()) {
+            return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An ordered holder uses its installed journal to vacate"));
+        }
+        if let Some(placement) = installed {
             let admission = self.holdings.lock().get(name).and_then(|holding| match holding.authority {
                 HoldingAuthority::Journal(admission) => Some(admission),
                 HoldingAuthority::Directory { .. } => None,
@@ -1302,8 +1304,11 @@ impl NodeAgent {
         let budget = self.node.memory();
         let target = budget.limit_bytes() - budget.limit_bytes() / 4;
         let mut candidates: Vec<_> = self.holdings.lock().iter()
-            .filter(|(name, holding)| matches!(&holding.authority, HoldingAuthority::Directory { .. })
-                && Some(name.as_str()) != protected && holding.opened.elapsed() >= self.options.min_residency)
+            .filter(|(name, holding)| pressure_candidate(
+                matches!(&holding.authority, HoldingAuthority::Directory { .. }),
+                Some(name.as_str()) == protected,
+                holding.opened.elapsed() >= self.options.min_residency,
+            ))
             .map(|(name, holding)| (holding.last_touch, name.clone(), holding.id.clone(), holding.epoch))
             .collect();
         candidates.sort_unstable();
@@ -1586,7 +1591,7 @@ impl NodeAgent {
         let workers: Vec<&MemberRecord> = members.values().filter(|member| member.pool == rtdb_directory::MemberPool::Compaction && member.is_live(now)).collect();
         let me = self.member();
         let assigned_here = |record: &DeploymentRecord| {
-            if self.ordered.by_name(&record.name).is_some() { return false; }
+            if !directory_route_allowed(self.ordered.by_name(&record.name).is_some()) { return false; }
             if record.lifecycle != Lifecycle::Live || record.move_from.is_some() || effective_holder(record, &members, now).is_none() { return false; }
             let compatible: Vec<_> = workers.iter().copied().filter(|member| record.permits_engine(member)).collect();
             let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &compatible, |member| member.id.as_str());
@@ -1828,12 +1833,18 @@ impl NodeAgent {
             {
                 tracing::warn!(code = %error.code, "Installed erasure awaits custody evidence");
             }
-            let _ = placement.dispose_withdrawn_workers().await;
-            let _ = placement.retain_selected().await;
-            let publish = placement.publish_checkpoint(&self.keys, offered.remove(name),
-                &self.options.storage, self.node.memory(), &self.ordered_releases);
-            if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
-                let _ = placement.retain_selected().await;
+            for action in retention_actions() {
+                match action {
+                    RetentionAction::DisposeExpired => { let _ = placement.dispose_withdrawn_workers().await; }
+                    RetentionAction::RetainSelected => { let _ = placement.retain_selected().await; }
+                    RetentionAction::Publish => {
+                        let publish = placement.publish_checkpoint(&self.keys, offered.remove(name),
+                            &self.options.storage, self.node.memory(), &self.ordered_releases);
+                        if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
+                            let _ = placement.retain_selected().await;
+                        }
+                    }
+                }
             }
             let retirement = placement.retire_unheld_checkpoint(&self.keys);
             let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;

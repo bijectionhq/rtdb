@@ -15,6 +15,7 @@ mod checkpoint_retention;
 pub use rtdb_storage::sealing::cipher;
 pub mod control;
 pub mod deployment;
+mod directory_bypass;
 pub mod flight_gateway;
 pub mod fragments;
 pub mod gateway;

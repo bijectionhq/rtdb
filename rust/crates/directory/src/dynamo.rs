@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::installed_reservation::dynamo::{EXACT_VERSION, ID, INSTALLED_JOURNAL, NEW_ITEM, VERSION, reservation_fields};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
@@ -40,13 +41,10 @@ mod streams;
 type Item = HashMap<String, AttributeValue>;
 
 /// The partition key of the deployments and members tables, and the names table's pointer to its deployment.
-const ID: &str = "id";
 const NAME: &str = "name";
-const VERSION: &str = "version";
 const EPOCH: &str = "epoch";
 const HOLDER: &str = "holder";
 const RECORD: &str = "record";
-const INSTALLED_JOURNAL: &str = "installed_journal";
 const LINEAGE_VERSION: &str = "lineage_version";
 const CHECKPOINT_TRANSFER_FENCE: &str = "checkpoint_transfer_fence";
 const FORK_STAGE: &str = "fork_stage";
@@ -187,7 +185,7 @@ impl DynamoDirectory {
 
     async fn put_new(&self, table: &str, item: Item) -> Result<bool> {
         let written = self.client.put_item().table_name(table).set_item(Some(item))
-            .condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID).send().await;
+            .condition_expression(NEW_ITEM).expression_attribute_names("#id", ID).send().await;
         match written {
             Ok(_) => Ok(true),
             Err(error) if error.as_service_error().is_some_and(|service| service.is_conditional_check_failed_exception()) => Ok(false),
@@ -214,7 +212,7 @@ impl DynamoDirectory {
             }).expression_attribute_names("#n", NAME).expression_attribute_names("#stage", FORK_STAGE)
                 .expression_attribute_names("#transfer", CHECKPOINT_TRANSFER_FENCE)
                 .expression_attribute_values(":name", AttributeValue::S(name.to_owned())),
-            None => request.condition_expression("#v = :expected"),
+            None => request.condition_expression(EXACT_VERSION),
         };
         match request.send().await {
             Ok(_) => Ok(Ok(())),
@@ -436,9 +434,9 @@ impl DynamoDirectory {
         record.version = stage_version.unwrap_or(0) + 1;
         let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?));
         let deployment = match stage_version {
-            Some(expected) => deployment.condition_expression("#v = :expected").expression_attribute_names("#v", VERSION)
+            Some(expected) => deployment.condition_expression(EXACT_VERSION).expression_attribute_names("#v", VERSION)
                 .expression_attribute_values(":expected", number(expected)),
-            None => deployment.condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID),
+            None => deployment.condition_expression(NEW_ITEM).expression_attribute_names("#id", ID),
         }.build().map_err(build_fault)?;
         let name_item = Item::from([(NAME.to_owned(), AttributeValue::S(record.name.clone())), (ID.to_owned(), AttributeValue::S(record.id.clone()))]);
         let name = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(name_item))
@@ -471,7 +469,7 @@ impl DynamoDirectory {
     fn require_deployment_version(&self, id: &str, expected_parent: Version) -> Result<TransactWriteItem> {
         let condition = ConditionCheck::builder().table_name(&self.tables.deployments)
             .key(ID, AttributeValue::S(id.to_owned()))
-            .condition_expression("#v = :expected")
+            .condition_expression(EXACT_VERSION)
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(expected_parent))
             .build().map_err(build_fault)?;
@@ -485,7 +483,7 @@ impl DynamoDirectory {
     async fn write_owner_and_lineage(&self, record: DeploymentRecord, expected: Version,
         current: &LineageState, next: &LineageState, legacy: bool) -> Result<Cas<DeploymentRecord>> {
         let put = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?))
-            .condition_expression("#v = :expected").expression_attribute_names("#v", VERSION)
+            .condition_expression(EXACT_VERSION).expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(expected)).build().map_err(build_fault)?;
         let items = vec![
             TransactWriteItem::builder().put(put).build(),
@@ -528,7 +526,7 @@ impl DynamoDirectory {
         let put = if expected == 0 {
             put.condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME)
         } else {
-            put.condition_expression("#v = :expected").expression_attribute_names("#v", if legacy { VERSION } else { LINEAGE_VERSION })
+            put.condition_expression(EXACT_VERSION).expression_attribute_names("#v", if legacy { VERSION } else { LINEAGE_VERSION })
                 .expression_attribute_values(":expected", number(expected))
         };
         Ok(TransactWriteItem::builder().put(put.build().map_err(build_fault)?).build())
@@ -576,9 +574,10 @@ impl Directory for DynamoDirectory {
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
         let id = installed_journal_id(id)?;
         // The reservation occupies the deployment key without a version that could pass a deployment CAS.
+        let [key, marker] = reservation_fields();
         let reservation = Item::from([
-            (ID.to_owned(), AttributeValue::S(id.clone())),
-            (INSTALLED_JOURNAL.to_owned(), AttributeValue::Bool(true)),
+            (key.to_owned(), AttributeValue::S(id.clone())),
+            (marker.to_owned(), AttributeValue::Bool(true)),
         ]);
         let table = &self.tables.deployments;
         if self.put_new(table, reservation).await?
@@ -602,7 +601,7 @@ impl Directory for DynamoDirectory {
             let mut stage = stage_fork_record(child.clone(), &parent, &lineage, preparation)?;
             stage.version = 1;
             let insert = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&stage, self.pack_parked_records)?))
-                .condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID).build().map_err(build_fault)?;
+                .condition_expression(NEW_ITEM).expression_attribute_names("#id", ID).build().map_err(build_fault)?;
             let items = vec![TransactWriteItem::builder().put(insert).build(),
                 self.write_lineage(&parent.lineage, &lineage, lineage.version(), legacy)?];
             if self.write_retirement(items).await? { return Ok(stage); }
@@ -836,7 +835,7 @@ impl Directory for DynamoDirectory {
         for (record, expected) in [(&fenced, source.version), (&held, destination.version)] {
             let put = Put::builder().table_name(&self.tables.deployments)
                 .set_item(Some(deployment_item(record, self.pack_parked_records)?))
-                .condition_expression("#v = :expected")
+                .condition_expression(EXACT_VERSION)
                 .expression_attribute_names("#v", VERSION)
                 .expression_attribute_values(":expected", number(expected))
                 .build().map_err(build_fault)?;
@@ -853,7 +852,7 @@ impl Directory for DynamoDirectory {
         if next.version == source.version { return Ok(terminal.clone()); }
         let put = Put::builder().table_name(&self.tables.deployments)
             .set_item(Some(deployment_item(&next, self.pack_parked_records)?))
-            .condition_expression("#v = :expected")
+            .condition_expression(EXACT_VERSION)
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(source.version))
             .build().map_err(build_fault)?;
@@ -871,7 +870,7 @@ impl Directory for DynamoDirectory {
         if next.version == destination.version { return Ok(bootstrap.clone()); }
         let put = Put::builder().table_name(&self.tables.deployments)
             .set_item(Some(deployment_item(&next, self.pack_parked_records)?))
-            .condition_expression("#v = :expected")
+            .condition_expression(EXACT_VERSION)
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(destination.version))
             .build().map_err(build_fault)?;
@@ -891,7 +890,7 @@ impl Directory for DynamoDirectory {
         if next.version == destination.version { return Ok(reserved); }
         let put = Put::builder().table_name(&self.tables.deployments)
             .set_item(Some(deployment_item(&next, self.pack_parked_records)?))
-            .condition_expression("#v = :expected")
+            .condition_expression(EXACT_VERSION)
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(destination.version))
             .build().map_err(build_fault)?;
@@ -910,7 +909,7 @@ impl Directory for DynamoDirectory {
         if next.version == destination.version { return Ok(activation.clone()); }
         let put = Put::builder().table_name(&self.tables.deployments)
             .set_item(Some(deployment_item(&next, self.pack_parked_records)?))
-            .condition_expression("#v = :expected")
+            .condition_expression(EXACT_VERSION)
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(destination.version))
             .build().map_err(build_fault)?;

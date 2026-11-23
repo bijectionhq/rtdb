@@ -14,9 +14,11 @@ use ordered_logkeeper::ordered::{
     },
 };
 
+mod adapter_command;
 pub mod custody;
 pub mod hosted;
 mod prefix_retirement;
+pub(crate) mod retention_decision;
 mod log;
 pub(crate) mod replay_cursor;
 pub(crate) use log::{Held, JournalLog};
@@ -151,18 +153,13 @@ impl InstalledJournal {
     }
 
     pub fn request(&self, route: &Route, command: Command) -> Result<Request> {
-        if route.placement != self.placement {
+        if !adapter_command::placement_matches(self.placement, route.placement) {
             return Err(mismatch(
                 "The route addresses a different journal placement",
             ));
         }
         let id = RequestId::fresh(route.position, route.retry_positions).map_err(refused)?;
-        Ok(Request {
-            placement: self.placement,
-            principal: self.authority.principal(),
-            id,
-            command,
-        })
+        Ok(adapter_command::scoped_request(self.placement, self.authority.principal(), id, command))
     }
 
     pub fn nomination(&self, route: &Route) -> Result<Request> {
@@ -228,7 +225,7 @@ impl InstalledJournal {
             return Err(ReadFailure::Refused(refused(reason)));
         }
         match decision.barrier {
-            Some(proof) if proof.claim.read().id == invocation.id => Ok(proof),
+            Some(proof) if adapter_command::barrier_read_matches(invocation.id, proof.claim.read().id) => Ok(proof),
             _ => Err(ReadFailure::Uncertain(Anomaly::new(
                 AnomalyCategory::Unavailable,
                 "rtdb.multi/ordered-read-closed",
@@ -242,7 +239,7 @@ impl InstalledJournal {
     pub async fn release_read(&self, read: RequestId) -> Result<u64> {
         let route = self.route().await?;
         let decision = self
-            .execute(&self.request(&route, Command::ReleaseRead { read })?)
+            .execute(&self.request(&route, adapter_command::release_read_command(read))?)
             .await?;
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::Released => Ok(decision.receipt.position),
@@ -257,7 +254,7 @@ impl InstalledJournal {
     pub async fn lease(&self, grant: Grant) -> Result<u64> {
         let route = self.route().await?;
         let decision = self
-            .execute(&self.request(&route, Command::Lease { grant })?)
+            .execute(&self.request(&route, adapter_command::lease_command(grant))?)
             .await?;
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::Leased {

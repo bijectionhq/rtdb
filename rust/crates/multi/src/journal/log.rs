@@ -1,7 +1,7 @@
 //! RTDB storage-log projection of the installed journal's ordered grants
 //! and exact replay intervals.
 
-use super::{InstalledJournal, ReadFailure, WriterAdmission, latest, replay_cursor};
+use super::{InstalledJournal, ReadFailure, WriterAdmission, adapter_command, latest, replay_cursor};
 use crate::{cipher::SEALED_OVERHEAD, keys::{JournalKey, KeyService}};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -285,7 +285,7 @@ impl JournalLog {
             self.finish_append(&mut writer).await?;
         }
         let current = self.reads.route().await?;
-        if current.writer.grant != Some(writer.grant) || current.head != writer.head {
+        if !adapter_command::same_writer(current.writer.grant, writer.grant) || current.head != writer.head {
             return Err(deposed(writer.grant, &current));
         }
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
@@ -293,14 +293,9 @@ impl JournalLog {
         let key = JournalKey::new(current.placement, writer.grant.key_generation);
         let payload = self.reads.keys.seal_journal_payload(key, &self.reads.io, payload).await?;
         let timestamp = sample()?;
-        let command = Command::Append {
-            class,
-            grant: writer.grant,
-            expected_next: writer.head.next_lsn,
-            timestamp: timestamp.0,
-            payload,
-            references,
-        };
+        let command = adapter_command::append_command(
+            class, writer.grant, writer.head.next_lsn, timestamp.0, payload, references,
+        );
         let request = self.reads.journal.request(&current, command).map_err(storage)?;
         writer.pending = Some(PendingAppend { request, checkpoint });
         let committed = self.finish_append(&mut writer).await?;
@@ -473,7 +468,7 @@ impl ReplicaReadIndex for JournalLog {
                 return Err(reads_unsettled());
             }
             let current = self.reads.route().await?;
-            let invocation = self.reads.journal.request(&current, Command::Barrier)?;
+            let invocation = self.reads.journal.request(&current, adapter_command::barrier_command())?;
             // Record the identity first so a cancelled read is still released later.
             reads.push(invocation.id);
             match self.reads.journal.barrier(&invocation).await {

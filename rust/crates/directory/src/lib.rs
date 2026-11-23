@@ -15,6 +15,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, PhysicalObjectVersio
 use serde::{Deserialize, Serialize};
 
 mod state_file;
+mod installed_reservation;
 pub mod feed;
 pub mod policy;
 pub mod ordered_index;
@@ -1940,7 +1941,9 @@ impl MemoryDirectory {
         lineage: Option<(String, LineageState)>, stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
         if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
-        if state.installed_journals.contains(&record.id) || (stage_version.is_none() && state.deployments.contains_key(&record.id)) {
+        if !installed_reservation::memory_allows_insert(
+            state.installed_journals.contains(&record.id), stage_version.is_some(), state.deployments.contains_key(&record.id),
+        ) {
             return Err(exists("Deployment", &record.id));
         }
         if record.fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
@@ -1979,7 +1982,7 @@ impl Directory for MemoryDirectory {
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
         let id = installed_journal_id(id)?;
         let mut state = self.state()?;
-        if state.deployments.contains_key(&id) { return Err(exists("Deployment", &id)); }
+        if !installed_reservation::memory_allows_reservation(state.deployments.contains_key(&id)) { return Err(exists("Deployment", &id)); }
         if state.installed_journals.insert(id) { self.persist(&mut state)?; }
         Ok(())
     }
