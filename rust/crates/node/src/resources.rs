@@ -320,7 +320,7 @@ impl ResourceFactory for NativeResources {
                     blocks = opened.blocks;
                     checkpoint_metadata = opened.checkpoint_metadata;
                     fragment_storage = opened.fragment_storage;
-                    let storage = if factory.use_disk_cache() {
+                    let storage = if factory.use_disk_cache() && remote.permits_shared_read_cache() {
                         let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
                         let identity = factory.cache_identity(configuration)?;
                         let namespace = cache_namespace(&configuration.type_url, &identity, storage_epoch)?;

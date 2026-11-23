@@ -253,6 +253,9 @@ impl DiskCache {
     /// Its owner closes and joins that region after consumers finish; other cache scopes remain usable.
     /// The remote capability must retain any offloaded provider work in the same region.
     pub fn scope_in(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        if !remote.permits_shared_read_cache() {
+            return Err(Error::Closed("The object owner requires a fresh read for each use".into()));
+        }
         Ok(Arc::new(DiskCachedStore { cache: Arc::clone(self), namespace, remote, io }))
     }
 
@@ -304,6 +307,7 @@ impl DiskCachedStore {
 }
 #[async_trait]
 impl ObjectStore for DiskCachedStore {
+    fn permits_shared_read_cache(&self) -> bool { self.remote.permits_shared_read_cache() }
     fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
         self.remote.index_page_lifecycle()
     }

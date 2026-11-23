@@ -628,6 +628,7 @@ impl ExactStore {
 
 #[async_trait]
 impl ObjectStore for ExactStore {
+    fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         Ok(self.observe_head(key).await?.value)
     }

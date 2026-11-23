@@ -457,6 +457,12 @@ impl BufferPool {
     /// Concurrent fetches of a key share one load; cancellation releases that caller's wait.
     /// An empty entry is removed when its last fetcher fails or is cancelled.
     pub async fn get(&self, key: &ObjectKey) -> Result<CacheLease> {
+        if !self.store.permits_shared_read_cache() {
+            let size = self.store.head(key).await?.size;
+            let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
+            let allocation = self.fetch_whole(key, size, |bytes| self.reserve(bytes)).await?;
+            return Ok(CacheLease { allocation, range: 0..size });
+        }
         let mut cleanup = EmptyEntryCleanup { pool: self, key, armed: true };
         let allocation = {
             let entry = self.entry(key)?;
@@ -480,12 +486,13 @@ impl BufferPool {
     /// Reserves `bytes` from the pool's budget for a view about to be decoded, evicting idle entries to make room.
     /// None where the view would take more than an eighth of the budget, or does not fit once nothing idle is left.
     pub fn admit(&self, bytes: usize) -> Option<Arc<MemoryReservation>> {
-        if bytes > self.budget.limit_bytes() / 8 { return None; }
+        if !self.store.permits_shared_read_cache() || bytes > self.budget.limit_bytes() / 8 { return None; }
         self.reserve(bytes).ok()
     }
 
     /// Holds `value` as `view` of the object in place of any it held; false, holding nothing, where its bookkeeping does not fit.
     pub fn insert_view<T: Cached>(&self, key: &ObjectKey, view: View, value: Arc<T>) -> bool {
+        if !self.store.permits_shared_read_cache() { return false; }
         let Ok(overhead) = self.reserve(view_overhead(key)) else { return false };
         let value = Value::View { value, in_use: in_use_of::<T>, _overhead: overhead };
         let replaced = self.budget.lru.lock().insert(self.id, key, Slot::View(view), value);

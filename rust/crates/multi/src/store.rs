@@ -955,6 +955,7 @@ impl FencedStore {
 
 #[async_trait]
 impl ObjectStore for FencedStore {
+    fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_observed_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
@@ -1476,6 +1477,7 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
 
 #[async_trait]
 impl ObjectStore for GarbageStore {
+    fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
     fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
         self.inner.whole_object_allocation(key, length)
     }
@@ -2560,8 +2562,13 @@ mod tests {
         let too_small = rtdb_storage::cache::BufferPool::new(audience.store.clone(), peak - 1);
         assert!(matches!(too_small.get(&object).await, Err(Error::MemoryLimit { .. })));
         let pool = rtdb_storage::cache::BufferPool::new(audience.store.clone(), peak);
-        assert_eq!(pool.get(&object).await.unwrap().as_slice(), bytes.as_ref());
+        let lease = pool.get(&object).await.unwrap();
+        assert_eq!(lease.as_slice(), bytes.as_ref());
         assert_eq!(pool.pool_retained_bytes(), allocation.retained_bytes);
+        assert!(!pool.holds(&object));
+        assert!(pool.admit(1).is_none());
+        drop(lease);
+        assert_eq!(pool.pool_retained_bytes(), 0);
         assert!(matches!(audience.store.get(&object).await, Err(Error::Closed(_))));
 
         let unsupported = factory.wrap_stores(&configuration(Some(2)), cached.clone(), None).await.unwrap();

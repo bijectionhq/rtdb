@@ -146,6 +146,8 @@ pub trait IndexPageLifecycle: Send + Sync {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Whether returned bytes may be reused across reads without returning to this owner.
+    fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
     /// Opens the read-only objects owned by an authenticated replica delivery.
     async fn open_replica_objects(&self, _scope: crate::log::ReplicaObjectScope) -> Result<Arc<dyn ObjectStore>> {
@@ -319,6 +321,7 @@ fn checked_range(key: &ObjectKey, range: Range<u64>, length: u64) -> Result<Rang
 
 #[async_trait]
 impl ObjectStore for MemoryStore {
+    fn permits_shared_read_cache(&self) -> bool { true }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let objects = self.objects.read();
         let bytes = objects.get(key).ok_or_else(|| Error::MissingObject(key.to_string()))?;
@@ -546,6 +549,7 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 
 #[async_trait]
 impl ObjectStore for LocalStore {
+    fn permits_shared_read_cache(&self) -> bool { true }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { Some(self) }
     fn syncs_checkpoints(&self) -> bool { true }
 
