@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
-use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
@@ -13,6 +13,7 @@ use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt,
 use crate::{ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, OwnedRelativePeriod, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::bounded_retry::{BOUNDED_RETRY_METADATA_KEY, BoundedRetry};
 use crate::values::{DecodedDocumentLayout, contains_fixed_size_list};
+use crate::values::arguments::canonical_float_field;
 
 const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
 // The hosted value model admits UTC years 0001 through 9999.
@@ -1547,37 +1548,232 @@ fn own_documents(array: ArrayRef, builder: BatchBuilder, memory: &Arc<MemoryBudg
         .ok_or_else(|| invalid("Document array contains a null row"))
 }
 
-enum DocumentCell<'a> {
-    Value(&'a Value),
-    Arrow { field: &'a Field, column: &'a dyn Array, logical: &'a LogicalType, row: usize },
+pub(crate) enum DocumentCell<'a> {
+    Value(Cow<'a, Value>),
+    Arrow { cell: ArrowCell<'a>, declared: Option<&'a LogicalType> },
 }
 
 impl DocumentCell<'_> {
-    fn value(&self) -> Result<Cow<'_, Value>> {
+    pub(crate) fn value(&self) -> Result<Cow<'_, Value>> {
         Ok(match self {
-            Self::Value(value) => Cow::Borrowed(value),
-            Self::Arrow { logical, .. } if **logical == LogicalType::Nothing => Cow::Owned(Value::Undefined),
-            Self::Arrow { field, column, logical, row } => {
-                let mut value = rtdb_columnar::read_value_as(logical, field, *column, *row)?;
+            Self::Value(value) => Cow::Borrowed(value.as_ref()),
+            Self::Arrow { declared: Some(LogicalType::Nothing), .. } => Cow::Owned(Value::Undefined),
+            Self::Arrow { cell, declared } => {
+                let mut value = match declared {
+                    Some(logical) => rtdb_columnar::read_value_as(logical, cell.field, cell.array, cell.row)?,
+                    None => rtdb_columnar::read_value(cell.field, cell.array, cell.row)?,
+                };
                 value.admit_object_dates()?;
                 Cow::Owned(value)
             }
         })
     }
 
-    fn bound(&self) -> Result<usize> {
+    fn observed_type(&self, memory: &Arc<MemoryBudget>) -> Result<LogicalType> {
+        if let Self::Arrow { cell, .. } = self && canonical_float_field(cell.field) {
+            let _scratch = memory.reserve(cell.field.size().checked_mul(16).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+            return cell.observed_type();
+        }
+        let _scratch = memory.reserve(self.bound()?)?;
+        Ok(self.value()?.logical_type())
+    }
+
+    pub(crate) fn bound(&self) -> Result<usize> {
         match self {
             Self::Value(value) => value.retained_bytes(),
-            Self::Arrow { logical, .. } if **logical == LogicalType::Nothing => Ok(0),
-            Self::Arrow { field, column, row, .. } => rtdb_columnar::estimate_read_cell_bytes(field, *column, *row),
+            Self::Arrow { declared: Some(LogicalType::Nothing), .. } => Ok(0),
+            Self::Arrow { cell, .. } => rtdb_columnar::estimate_read_cell_bytes(cell.field, cell.array, cell.row),
         }
     }
 
     fn writer(&self) -> WriterCell<'_> {
         match self {
             Self::Value(value) => WriterCell::of(value),
-            Self::Arrow { field, column, row, .. } => WriterCell::arrow(field, *column, *row),
+            Self::Arrow { cell, .. } => WriterCell::arrow(cell.field, cell.array, cell.row),
         }
+    }
+}
+
+pub(crate) fn owned_projected_documents(
+    names: &[String], rows: &[Vec<DocumentCell<'_>>], memory: &Arc<MemoryBudget>,
+) -> Result<ArrowDocuments> {
+    let mut arrays = BatchBuilder::new(4096, memory)?;
+    let _inventory = memory.reserve(canonical_cells_bound(rows.len())?)?;
+    let mut schema = Vec::with_capacity(names.len());
+    let mut columns = Vec::with_capacity(names.len());
+    for (position, name) in names.iter().enumerate() {
+        let cells = rows.iter().map(|row| Some(&row[position])).collect::<Vec<_>>();
+        let mut ty = LogicalType::Nothing;
+        for cell in cells.iter().flatten() {
+            let actual = cell.observed_type(memory)?;
+            if ty != actual { ty = ty.join(&actual); }
+        }
+        let (field, column) = canonical_cells(name, ty, &cells, &mut arrays, memory)?;
+        schema.push(field);
+        columns.push(column);
+    }
+    let array = rtdb_columnar::build_struct_array(schema.into(), &columns, rows.len(), None)?;
+    own_documents(array, arrays, memory)
+}
+
+fn canonical_cells_bound(rows: usize) -> Result<usize> {
+    rows.checked_mul(std::mem::size_of::<Option<DocumentCell<'_>>>() + std::mem::size_of::<WriterCell<'_>>() + std::mem::size_of::<usize>())
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)
+}
+
+fn canonical_cells(
+    name: &str, mut ty: LogicalType, cells: &[Option<&DocumentCell<'_>>],
+    arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>,
+) -> Result<(Arc<Field>, ArrayRef)> {
+    if struct_backfill_depth(&ty) != 0 {
+        let writers = cells.iter().map(|cell| cell.map_or(WriterCell::Null, DocumentCell::writer)).collect::<Vec<_>>();
+        ty = backfilled_nullability(ty, &writers);
+    }
+    let target = to_field(name, &ty)?;
+    let (array, _writer) = match copy_document_floats(&target, &ty, cells, memory) {
+        Ok(Some(output)) => output,
+        Ok(None) | Err(_) => {
+            let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
+            rtdb_columnar::copy_evaluated_cells(&ty, cells.len(), memory,
+                |row| cells[row].map_or(Ok(0), DocumentCell::bound),
+                |row| cells[row].map_or_else(|| Ok(missing.clone()), |cell| cell.value().map(Cow::into_owned)),
+            )?
+        }
+    };
+    let column = arrays.column(array.get_array_memory_size(), || Ok(array))?;
+    Ok((Arc::new(target), column))
+}
+
+fn copy_document_floats(
+    target: &Field, ty: &LogicalType, cells: &[Option<&DocumentCell<'_>>], memory: &Arc<MemoryBudget>,
+) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
+    if !canonical_float_field(target) || !cells.iter().any(|cell| matches!(cell, Some(DocumentCell::Arrow { .. }))) {
+        return Ok(None);
+    }
+    let _inventory = memory.reserve(cells.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+    let values = cells.iter().filter_map(|cell| match cell {
+        Some(DocumentCell::Value(value)) => Some(value.as_ref()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    let (values, _rows) = rtdb_columnar::copy_evaluated_cells(ty, values.len(), memory,
+        |row| values[row].retained_bytes(), |row| Ok(values[row].clone()))?;
+    let mut next_row = 0;
+    let mut picks = Vec::with_capacity(cells.len());
+    for cell in cells {
+        picks.push(match cell {
+            None => None,
+            Some(DocumentCell::Value(_)) => {
+                let row = next_row;
+                next_row += 1;
+                Some(ArrowCell { field: target, array: values.as_ref(), row })
+            }
+            Some(DocumentCell::Arrow { cell, .. }) => {
+                if !canonical_float_field(cell.field) { return Ok(None); }
+                Some(*cell)
+            }
+        });
+    }
+    let bound = picks.iter().try_fold(4096usize, |bytes, cell| {
+        let cell_bytes = match cell {
+            Some(cell) => rtdb_columnar::estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?,
+            None => rtdb_columnar::estimate_null_copy_cell_bytes(target)?,
+        };
+        cell_bytes.checked_mul(4).and_then(|cell| bytes.checked_add(cell)).ok_or_else(overflow)
+    })?;
+    let mut charge = memory.reserve(bound)?;
+    let array = gather_float_cells(target, &picks)?;
+    Arc::get_mut(&mut charge).expect("The document column owns its reservation").shrink_to(array.get_array_memory_size())?;
+    Ok(Some((array, charge)))
+}
+
+fn gather_float_cells(target: &Field, cells: &[Option<ArrowCell<'_>>]) -> Result<ArrayRef> {
+    use arrow_array::types::{Float32Type, Float64Type};
+
+    fn visible(cell: Option<ArrowCell<'_>>) -> Result<Option<ArrowCell<'_>>> {
+        cell.map(|cell| cell.physical().and_then(|cell| Ok((!cell.is_null()?).then_some(cell))))
+            .transpose().map(Option::flatten)
+    }
+    let mismatch = || invalid("Floating-point document cells disagree with their canonical layout");
+    macro_rules! primitive {
+        ($ty:ty) => {{
+            let values = cells.iter().map(|&cell| visible(cell)?.map(|cell| {
+                if cell.field.data_type() != target.data_type() { return Err(mismatch()); }
+                Ok(cell.array.as_primitive::<$ty>().value(cell.row))
+            }).transpose()).collect::<Result<arrow_array::PrimitiveArray<$ty>>>()?;
+            Ok(Arc::new(values))
+        }};
+    }
+    match target.data_type() {
+        DataType::Float32 => primitive!(Float32Type),
+        DataType::Float64 => primitive!(Float64Type),
+        DataType::Null => {
+            for &cell in cells {
+                if visible(cell)?.is_some() { return Err(mismatch()); }
+            }
+            Ok(Arc::new(arrow_array::NullArray::new(cells.len())))
+        }
+        DataType::Union(legs, UnionMode::Dense) => {
+            let mut groups = vec![Vec::new(); legs.len()];
+            let mut tags = Vec::with_capacity(cells.len());
+            let mut offsets = Vec::with_capacity(cells.len());
+            for &cell in cells {
+                let cell = visible(cell)?;
+                let (index, (id, _)) = legs.iter().enumerate().find(|(_, (_, leg))| {
+                    match (cell.map(|cell| cell.field.data_type()), leg.data_type()) {
+                        (None, DataType::Null) => true,
+                        (Some(DataType::List(_)), DataType::List(_)) => true,
+                        (Some(DataType::FixedSizeList(_, a)), DataType::FixedSizeList(_, b)) => a == b,
+                        (Some(source), target) => source == target,
+                        _ => false,
+                    }
+                }).ok_or_else(mismatch)?;
+                tags.push(id);
+                offsets.push(i32::try_from(groups[index].len()).map_err(|_| overflow())?);
+                groups[index].push(cell);
+            }
+            let children = legs.iter().zip(&groups).map(|((_, field), cells)| gather_float_cells(field, cells)).collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(UnionArray::try_new(legs.clone(), tags.into(), Some(offsets.into()), children)
+                .map_err(|error| invalid(error.to_string()))?))
+        }
+        DataType::List(item) | DataType::FixedSizeList(item, _) => {
+            let width = match target.data_type() {
+                DataType::FixedSizeList(_, width) => Some(usize::try_from(*width).map_err(|_| mismatch())?),
+                _ => None,
+            };
+            let mut children = Vec::new();
+            let mut offsets = vec![0i32];
+            let mut valid = Vec::with_capacity(cells.len());
+            for &cell in cells {
+                let cell = visible(cell)?;
+                valid.push(cell.is_some());
+                if let Some(cell) = cell {
+                    let actual_width = match cell.field.data_type() {
+                        DataType::List(_) => None,
+                        DataType::FixedSizeList(_, width) => Some(usize::try_from(*width).map_err(|_| mismatch())?),
+                        _ => return Err(mismatch()),
+                    };
+                    if width != actual_width { return Err(mismatch()); }
+                    let (field, array, range) = cell.sequence_range().ok_or_else(mismatch)?;
+                    children.extend(range.map(|row| Some(ArrowCell { field, array, row })));
+                } else if let Some(width) = width {
+                    // The row writer can put masked union components in the first leg.
+                    if !matches!(item.data_type(), DataType::Float32 | DataType::Float64 | DataType::Null) {
+                        return Err(mismatch());
+                    }
+                    children.extend(std::iter::repeat_n(None, width));
+                }
+                if width.is_none() {
+                    offsets.push(i32::try_from(children.len()).map_err(|_| overflow())?);
+                }
+            }
+            let values = gather_float_cells(item, &children)?;
+            let layout = arrow_array::new_empty_array(target.data_type()).to_data();
+            let nulls = valid.iter().any(|valid| !valid).then(|| NullBuffer::from(valid));
+            let mut data = layout.into_builder().len(cells.len()).nulls(nulls).child_data(vec![values.to_data()]);
+            if width.is_none() { data = data.buffers(vec![ScalarBuffer::from(offsets).into_inner()]); }
+            Ok(arrow_array::make_array(data.build().map_err(|error| invalid(error.to_string()))?))
+        }
+        _ => Err(mismatch()),
     }
 }
 
@@ -1585,9 +1781,7 @@ fn canonical_document_struct(
     lists: &[SourceDocuments<'_>], length: usize, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>,
 ) -> Result<ArrayRef> {
     let names = lists.iter().flat_map(SourceDocuments::columns).collect::<OrderedSet<_>>();
-    let inventory = length.checked_mul(std::mem::size_of::<Option<DocumentCell<'_>>>() + std::mem::size_of::<WriterCell<'_>>())
-        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
-    let _inventory = memory.reserve(inventory)?;
+    let _inventory = memory.reserve(canonical_cells_bound(length)?)?;
     let mut columns = Vec::with_capacity(names.len());
     let mut schema = Vec::with_capacity(names.len());
     for name in names {
@@ -1602,7 +1796,7 @@ fn canonical_document_struct(
                         && ty != *declared {
                         ty = ty.join(declared);
                     }
-                    cells.extend(documents.rows().iter().map(|row| row.get(name).map(DocumentCell::Value)));
+                    cells.extend(documents.rows().iter().map(|row| row.get(name).map(|value| DocumentCell::Value(Cow::Borrowed(value)))));
                 }
                 SourceDocuments::Arrow(documents) | SourceDocuments::Receipt { documents, .. } => {
                     if let Some((field, array)) = document_column(documents.array(), name) {
@@ -1612,7 +1806,7 @@ fn canonical_document_struct(
                         cells.extend((0..array.len()).map(|row| {
                             if !preserve_null && !matches!(declared, LogicalType::Nothing)
                                 && matches!(WriterCell::arrow(field, array.as_ref(), row), WriterCell::Null) { return None; }
-                            Some(DocumentCell::Arrow { field, column: array.as_ref(), logical: declared, row })
+                            Some(DocumentCell::Arrow { cell: ArrowCell { field, array: array.as_ref(), row }, declared: Some(declared) })
                         }));
                     } else {
                         cells.extend(std::iter::repeat_with(|| None).take(list.len()));
@@ -1620,24 +1814,16 @@ fn canonical_document_struct(
                 }
             }
             for cell in cells[start..].iter().flatten() {
-                let _scratch = memory.reserve(cell.bound()?)?;
-                let actual = cell.value()?.logical_type();
+                let actual = cell.observed_type(memory)?;
                 if ty != actual { ty = ty.join(&actual); }
                 present = present.checked_add(1).ok_or_else(overflow)?;
             }
         }
         if present < length || present == 0 { ty = ty.maybe(); }
-        if struct_backfill_depth(&ty) != 0 {
-            let writers = cells.iter().map(|cell| cell.as_ref().map_or(WriterCell::Null, DocumentCell::writer)).collect::<Vec<_>>();
-            ty = backfilled_nullability(ty, &writers);
-        }
-        let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
-        let (array, _writer) = rtdb_columnar::copy_evaluated_cells(&ty, length, memory,
-            |row| cells[row].as_ref().map_or(Ok(0), DocumentCell::bound),
-            |row| cells[row].as_ref().map_or_else(|| Ok(missing.clone()), |cell| cell.value().map(Cow::into_owned)),
-        )?;
-        columns.push(arrays.column(array.get_array_memory_size(), || Ok(array))?);
-        schema.push(Arc::new(to_field(name, &ty)?));
+        let cells = cells.iter().map(Option::as_ref).collect::<Vec<_>>();
+        let (field, column) = canonical_cells(name, ty, &cells, arrays, memory)?;
+        schema.push(field);
+        columns.push(column);
     }
     rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))
 }
@@ -3663,6 +3849,56 @@ mod tests {
     }
 
     #[test]
+    fn receipt_float_columns_encode_the_same_ipc_as_the_row_writer() {
+        use arrow_array::{Float32Array, Int64Array};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let vector = Value::FixedSizeList(vec![Value::F32(f32::from_bits(0x7fc00001)), Value::Null, Value::F32(-0.0)].into());
+        let ty = vector.logical_type().maybe();
+        let field = to_field("vector", &ty).unwrap();
+        let values = copy_array(&ty, &[Value::Null, vector]).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), field.clone()])),
+            vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::clone(&values)],
+        ).unwrap();
+        let documents = ArrowDocuments::from_record_batch(&batch, &memory).unwrap().unwrap();
+        let cells = (0..2).map(|row| DocumentCell::Arrow {
+            cell: ArrowCell { field: &field, array: values.as_ref(), row }, declared: Some(&ty),
+        }).collect::<Vec<_>>();
+        let cells = cells.iter().map(Some).collect::<Vec<_>>();
+        let (typed, _) = copy_document_floats(&field, &ty, &cells, &memory).unwrap().unwrap();
+        let items = typed.as_fixed_size_list().values().as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(items.value(3).to_bits(), 0x7fc00001);
+        assert_eq!(items.value(5).to_bits(), (-0.0_f32).to_bits());
+        assert!(items.is_null(4));
+
+        let table = TableRef::new("public", "docs");
+        let row = SourceTransaction::from_operations(vec![Operation::Public(TxOp::PutDocs {
+            table: table.clone(), documents: documents.to_rows(true, &memory).unwrap(), valid_from: None, valid_to: None,
+        })], SubmitOptions::default(), &memory).unwrap();
+        let arrow = SourceTransaction::from_operations(vec![Operation::PutReplayArrow {
+            table, documents, iids: None, valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        assert_eq!(arrow.body_digest().unwrap(), row.body_digest().unwrap());
+    }
+
+    #[test]
+    fn missing_arrow_id_transit_context_preserves_nullable_float_components() {
+        let memory = MemoryBudget::new(1 << 24);
+        let document = StructFields::from([
+            ("_id".into(), Value::Null),
+            ("vector".into(), Value::list(vec![Value::F32(-0.0), Value::Null, Value::F64(f64::INFINITY)])),
+            ("label".into(), Value::Utf8("x".into())),
+        ]);
+        let documents = Documents::new(vec![document.clone()], &memory).unwrap();
+        let arrow = owned_row_documents(&documents, &memory).unwrap();
+        let expected = document_id(&document, &memory).unwrap_err();
+        let direct = arrow.missing_float_document_id(0, &memory).unwrap().unwrap();
+        assert_eq!(direct, expected);
+        assert_eq!(arrow.iid(0, arrow.id_reader().unwrap().as_ref(), &memory).unwrap_err(), expected);
+    }
+
+    #[test]
     fn compatible_insert_replays_arrow_documents_and_keeps_the_legacy_receipt_digest() {
         let memory = budget();
         let documents = Documents::new(vec![
@@ -3732,7 +3968,7 @@ mod tests {
     fn receipt_reader_can_charge_and_preserve_an_undefined_document_cell() {
         let array = arrow_array::NullArray::new(1);
         let field = Field::new("omitted", DataType::Null, false);
-        let cell = DocumentCell::Arrow { field: &field, column: &array, logical: &LogicalType::Nothing, row: 0 };
+        let cell = DocumentCell::Arrow { cell: ArrowCell { field: &field, array: &array, row: 0 }, declared: Some(&LogicalType::Nothing) };
         assert_eq!(cell.bound().unwrap(), 0);
         assert_eq!(*cell.value().unwrap(), Value::Undefined);
     }

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, StructArray};
-use arrow_schema::{DataType, Field as ArrowField, Fields};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field, to_field};
+use arrow_schema::{DataType, Field as ArrowField, Fields, UnionMode};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, from_field, to_field};
 use rtdb_plan::{Expr, Schema};
 use rtdb_types::{LogicalType, Result};
 
@@ -19,8 +19,24 @@ fn record(column: &Column, row: usize) -> Option<Option<Record<'_>>> {
     if array.is_null(position) || field.data_type() == &DataType::Null && field.is_nullable() {
         return Some(None);
     }
-    if !stable_read_layout(logical?, field) { return None; }
-    Some(Some(Record { array: array.as_any().downcast_ref()?, position }))
+    let logical = logical?;
+    let cell = (ArrowCell { field, array, row: position }).physical().ok()?;
+    if matches!(field.data_type(), DataType::Union(_, UnionMode::Dense)) {
+        let active_type = from_field(cell.field).ok()?;
+        // A named leg can supply the reader's logical type even when the physical field differs.
+        if let LogicalType::Union(legs) = logical
+            && let Some(named) = legs.iter().find(|leg| rtdb_columnar::leg_name(leg).is_ok_and(|name| name == *cell.field.name()))
+            && *named != active_type {
+            return None;
+        }
+        if !stable_read_layout(&active_type, cell.field) { return None; }
+    } else if !stable_read_layout(logical, field) {
+        return None;
+    }
+    if cell.is_null().ok()? {
+        return (!cell.is_undefined().ok()?).then_some(None);
+    }
+    Some(Some(Record { array: cell.array.as_any().downcast_ref()?, position: cell.row }))
 }
 
 pub(super) fn merge(
@@ -31,32 +47,38 @@ pub(super) fn merge(
     let bytes = batch.len.checked_mul(256).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
     let reservation = memory.reserve(bytes)?;
     let mut rows = Vec::with_capacity(batch.len);
-    let mut old_fields = None;
-    let mut patch_fields = None;
-    let mut groups = [Vec::new(), Vec::new()];
+    let mut layouts = HashMap::new();
+    let mut groups = Vec::new();
     let mut positions = Vec::with_capacity(batch.len);
     for row in 0..batch.len {
         let (Some(old), Some(Some(patch))) = (record(&batch.columns[old], row), record(&batch.columns[patch], row)) else { return Ok(None); };
-        if let Some(old) = old {
-            if *old_fields.get_or_insert(old.array.fields()) != old.array.fields() { return Ok(None); }
-        }
-        if *patch_fields.get_or_insert(patch.array.fields()) != patch.array.fields() { return Ok(None); }
-        let group = usize::from(old.is_some());
-        positions.push((group, groups[group].len()));
-        groups[group].push(row);
+        let fields = (old.map(|old| old.array.fields()), patch.array.fields());
+        let group = *layouts.entry(fields).or_insert_with(|| {
+            let group = groups.len();
+            groups.push((fields, Vec::new()));
+            group
+        });
+        let indices = &mut groups[group].1;
+        positions.push((group, indices.len()));
+        indices.push(row);
         rows.push((old, patch));
     }
-    let Some(patch_fields) = patch_fields else { return Ok(None); };
-    let mut sources = Vec::with_capacity(2);
-    for (group, indices) in groups.into_iter().enumerate() {
-        if indices.is_empty() {
-            sources.push(None);
-            continue;
-        }
-        let old_fields = if group == 1 { old_fields } else { None };
-        let Some(((array, field, logical), charge)) = merged_group(&rows, &indices, old_fields, patch_fields, memory)? else {
+    if groups.is_empty() { return Ok(None); }
+    let heterogeneous = groups.len() > 2
+        || groups.iter().filter(|((old, _), _)| old.is_some()).count() > 1
+        || groups.iter().any(|((_, fields), _)| *fields != groups[0].0.1);
+    let union_records = [old, patch].iter().any(|&column| {
+        (0..batch.len).any(|row| batch.columns[column].arrow_cell(row).flatten()
+            .is_some_and(|(_, field, _, _)| matches!(field.data_type(), DataType::Union(..))))
+    });
+    let mut sources = Vec::with_capacity(groups.len());
+    for ((old, patch), indices) in groups {
+        let Some(((array, field, logical), charge)) = merged_group(&rows, &indices, old, patch, memory)? else {
             return Ok(None);
         };
+        if heterogeneous || union_records {
+            rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
+        }
         if indices.len() == batch.len {
             return Ok(Some((Column::Arrow { array, field, logical }, charge)));
         }
@@ -189,4 +211,53 @@ mod tests {
         assert_eq!(column.value(0).unwrap(), expected);
         assert_eq!(column.value(1).unwrap(), patch);
     }
+    #[test]
+    fn patch_selects_vectors_from_distinct_struct_legs_without_joining_their_field_sets() {
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::UnionFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let old_a = Value::Struct(StructFields::from([
+            ("a".into(), Value::I64(1)),
+            ("vector".into(), Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into())),
+        ]));
+        let old_b = Value::Struct(StructFields::from([
+            ("b".into(), Value::I64(2)),
+            ("vector".into(), Value::list(vec![Value::F64(2.0)])),
+        ]));
+        let patch = Value::Struct(StructFields::from([("vector".into(), Value::Null), ("c".into(), Value::I64(3))]));
+        let fields = UnionFields::try_new([2, 5], [
+            to_field("first", &old_a.logical_type()).unwrap(), to_field("second", &old_b.logical_type()).unwrap(),
+        ]).unwrap();
+        let children = [old_a, old_b].into_iter().map(|cell| rtdb_columnar::copy_array(&cell.logical_type(), &[cell]).unwrap()).collect();
+        let union = arrow_array::UnionArray::try_new(fields.clone(), ScalarBuffer::from(vec![5, 2, 5]), Some(ScalarBuffer::from(vec![0, 0, 0])), children).unwrap();
+        let old = ArrowField::new("old", DataType::Union(fields, UnionMode::Dense), false);
+        let patch_field = to_field("patch", &patch.logical_type()).unwrap();
+        let patches = rtdb_columnar::copy_array(&patch.logical_type(), &[patch.clone(), patch.clone(), patch]).unwrap();
+        let schema = Schema::new([&old, &patch_field].into_iter().enumerate().map(|(id, field)| {
+            Field { id: ColumnId(id as u32), name: field.name().clone(), qualifier: None, qualified_only: false, unnamed: false,
+                data_type: from_field(field).unwrap() }
+        }).collect()).unwrap();
+        let input = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new([old, patch_field].to_vec())), vec![Arc::new(union), patches]).unwrap();
+        let input = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(input, &memory).unwrap()).unwrap();
+        let args = schema.fields().iter().map(Field::expression).collect::<Vec<_>>();
+
+        let (column, _charge) = merge(&args, &schema, &input, &memory).unwrap().unwrap();
+        assert!(matches!(column, Column::Selected(_)));
+        for (row, key) in [(0, "b"), (1, "a"), (2, "b")] {
+            let (array, field, _, row) = column.arrow_cell(row).unwrap().unwrap();
+            let cell = ArrowCell { field, array, row };
+            let fields = cell.structure().unwrap().map(|field| field.field.name().as_str()).collect::<Vec<_>>();
+            assert_eq!(fields, [key, "vector", "c"]);
+            let vector = cell.structure().unwrap().nth(1).unwrap();
+            let (components, range) = vector.float_list_span().unwrap();
+            if key == "a" {
+                assert_eq!(components.float_component(range.start).unwrap().to_bits(), (-0.0_f64).to_bits());
+                assert_eq!(components.float_component(range.start + 1), None);
+            } else {
+                assert_eq!(components.float_component(range.start), Some(2.0));
+            }
+        }
+    }
+
 }

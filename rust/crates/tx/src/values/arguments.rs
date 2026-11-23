@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema, UnionMode};
-use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, arrow_relayout_bound, copy_evaluated_cells, copy_selected_cells, estimate_copy_cell_bytes, estimate_read_cell_bytes, read_value_as, relayout_arrow_column, to_field};
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType};
+use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, arrow_relayout_bound, copy_evaluated_cells, copy_selected_cells, estimate_copy_cell_bytes, estimate_read_cell_bytes, read_value_as, relayout_arrow_column, to_field};
+use rtdb_types::{Anomaly, LogicalType, Result};
 
-use super::{ArgumentChunk, SourceArgumentLayout, SqlArguments, overflow, plain_scalar_field};
+use super::{ArgumentChunk, SourceArgumentLayout, SqlArguments, normalized_document_array, normalized_field, overflow, plain_scalar_field};
 
 impl SqlArguments {
     pub(crate) fn source_columnar_batch(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
@@ -52,14 +52,17 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
             let field = batch.schema_ref().field(position);
             let array = batch.column(position);
             let source = &types[position];
-            if (*source_layout == SourceArgumentLayout::Uploaded || plain_scalar_field(field) || dense_float_vectors(field, array.as_ref()))
-                && can_copy_argument(source) && source.join(ty) == *ty && has_valid_union_nulls(field, array.as_ref()) {
-                if field.data_type() == target.data_type() { return Ok((Arc::clone(array), None)); }
-                if let Ok(bound) = arrow_relayout_bound(array.as_ref(), field, target)
-                    && let Ok(scratch) = memory.reserve(bound)
-                    && let Ok((field, converted)) = relayout_arrow_column(Arc::clone(array), field, target)
-                    && field.data_type() == target.data_type() {
-                    return Ok((converted, Some(scratch)));
+            if (*source_layout == SourceArgumentLayout::Uploaded || canonical_argument_field(field))
+                && can_copy_argument(source) && source.join(ty) == *ty {
+                validate_argument_uris(field, array.as_ref())?;
+                if has_valid_union_nulls(field, array.as_ref()) {
+                    if let Some(output) = aligned_argument(array, field, target, memory) { return Ok(output); }
+                } else if canonical_float_field(field)
+                    && let Ok(Some(normalized)) = normalize_float_argument(array, memory) {
+                    let physical = normalized_field(field, &normalized);
+                    if let Some((output, scratch)) = aligned_argument(&normalized, &physical, target, memory) {
+                        return Ok((output, scratch));
+                    }
                 }
             }
             let (output, scratch) = copy_evaluated_cells(ty, batch.num_rows(), memory,
@@ -79,16 +82,86 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
     }
 }
 
-/// A float vector column with no absent vector or component, which the canonical cell rebuild would reproduce exactly.
-fn dense_float_vectors(field: &Field, array: &dyn Array) -> bool {
-    let (element, values) = match field.data_type() {
-        DataType::List(element) => (element, array.as_list::<i32>().values()),
-        DataType::FixedSizeList(element, _) => (element, array.as_fixed_size_list().values()),
-        _ => return false,
+fn normalize_float_argument(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<Option<ArrayRef>> {
+    let DataType::List(field) = array.data_type() else {
+        return normalized_document_array(array, memory, true);
     };
-    field.metadata().is_empty() && element.metadata().is_empty()
-        && matches!(element.data_type(), DataType::Float32 | DataType::Float64)
-        && array.null_count() == 0 && values.null_count() == 0
+    let source = array.as_list::<i32>();
+    let Some(values) = normalize_float_argument(source.values(), memory)? else { return Ok(None); };
+    let field = normalized_field(field, &values);
+    // A union supplies logical nulls through its legs, even when the list item has no validity bitmap.
+    let layout = DataType::List(Arc::new(field));
+    let data = source.to_data().into_builder().data_type(layout).child_data(vec![values.to_data()]).build();
+    Ok(data.ok().map(arrow_array::make_array))
+}
+
+fn aligned_argument(array: &ArrayRef, source: &Field, target: &Field, memory: &Arc<MemoryBudget>) -> Option<ArgumentVector> {
+    if source.data_type() == target.data_type() && source.metadata() == target.metadata() {
+        return Some((Arc::clone(array), None));
+    }
+    let scratch = memory.reserve(arrow_relayout_bound(array.as_ref(), source, target).ok()?).ok()?;
+    let (field, converted) = relayout_arrow_column(Arc::clone(array), source, target).ok()?;
+    (field.data_type() == target.data_type()).then_some((converted, Some(scratch)))
+}
+
+pub(crate) fn canonical_float_field(field: &Field) -> bool {
+    field.metadata().is_empty() && match field.data_type() {
+        DataType::List(element) | DataType::FixedSizeList(element, _) => canonical_float_field(element),
+        DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| canonical_float_field(field)) && unambiguous_union(field, fields),
+        DataType::Float32 | DataType::Float64 => true,
+        DataType::Null => field.is_nullable(),
+        _ => false,
+    }
+}
+
+fn canonical_argument_field(field: &Field) -> bool {
+    if !super::compatible_document_metadata(field) { return false; }
+    match field.data_type() {
+        DataType::List(item) | DataType::FixedSizeList(item, _) => canonical_float_field(item),
+        DataType::Struct(fields) => fields.iter().all(|field| canonical_argument_field(field)),
+        DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| canonical_argument_field(field)) && unambiguous_union(field, fields),
+        DataType::Utf8 => true,
+        _ => plain_scalar_field(field),
+    }
+}
+
+fn unambiguous_union(field: &Field, children: &arrow_schema::UnionFields) -> bool {
+    let Ok(logical) = rtdb_columnar::from_field(field) else { return false; };
+    let LogicalType::Union(legs) = logical else { return true; };
+    children.iter().all(|(_, child)| {
+        let named = legs.iter().find(|leg| rtdb_columnar::leg_name(leg).is_ok_and(|name| name == *child.name()));
+        named.is_none_or(|ty| rtdb_columnar::from_field(child).is_ok_and(|actual| actual == *ty || actual == ty.clone().maybe()))
+    })
+}
+
+fn validate_argument_uris(field: &Field, array: &dyn Array) -> Result<()> {
+    fn has_uri(field: &Field) -> bool {
+        match field.data_type() {
+            DataType::Struct(fields) => fields.iter().any(|field| has_uri(field)),
+            DataType::Union(fields, UnionMode::Dense) => fields.iter().any(|(_, field)| has_uri(field)),
+            DataType::List(field) | DataType::FixedSizeList(field, _) | DataType::Map(field, _)
+            | DataType::RunEndEncoded(_, field) => has_uri(field),
+            DataType::Utf8 => matches!(field.extension_type_name(), Some("uri")),
+            _ => false,
+        }
+    }
+    fn validate(cell: ArrowCell<'_>) -> Result<()> {
+        if !has_uri(cell.field) { return Ok(()); }
+        let cell = cell.physical()?;
+        if cell.is_null()? { return Ok(()); }
+        if let Some(fields) = cell.structure() {
+            for child in fields { validate(child)?; }
+        } else if let Some(items) = cell.sequence() {
+            for child in items { validate(child)?; }
+        } else if cell.field.data_type() == &DataType::Utf8 && has_uri(cell.field) {
+            rtdb_types::UriParts::parse(cell.array.as_string::<i32>().value(cell.row))?;
+        }
+        Ok(())
+    }
+    if has_uri(field) {
+        for row in 0..array.len() { validate(ArrowCell { field, array, row })?; }
+    }
+    Ok(())
 }
 
 fn has_valid_union_nulls(field: &Field, array: &dyn Array) -> bool {
@@ -134,7 +207,7 @@ fn has_valid_union_cell(field: &Field, array: &dyn Array, row: usize) -> bool {
 
 fn can_copy_argument(ty: &LogicalType) -> bool {
     match ty {
-        LogicalType::Nothing | LogicalType::Scalar(ScalarType::Keyword | ScalarType::Uri) => false,
+        LogicalType::Nothing => false,
         LogicalType::RunEndEncoded { value, .. } => can_copy_argument(value),
         LogicalType::Maybe(value) => can_copy_argument(value),
         LogicalType::Struct(fields) => fields.values().all(|ty| *ty == LogicalType::Nothing || can_copy_argument(ty)),
@@ -146,7 +219,7 @@ fn can_copy_argument(ty: &LogicalType) -> bool {
 
 #[test]
 fn decoding_one_argument_chunk_preserves_compatible_arrow_inputs() {
-    use rtdb_types::Value;
+    use rtdb_types::{ScalarType, Value};
     let memory = MemoryBudget::new(1 << 20);
     let binary = LogicalType::Scalar(ScalarType::Binary);
     let uri = LogicalType::Scalar(ScalarType::Uri);
@@ -199,4 +272,107 @@ fn canonical_dense_float_vectors_keep_their_buffers_and_encode_as_their_rows_wou
     };
     let from_rows = SqlArguments::from_rows(rows, &memory).unwrap().source_columnar_batch(&memory).unwrap();
     assert_eq!(bits(&canonical.source_columnar_batch(&memory).unwrap()), bits(&from_rows));
+}
+
+#[test]
+fn canonical_argument_ipc_matches_rows_with_nullable_vectors_and_extension_fields() {
+    use rtdb_types::Value;
+    let memory = MemoryBudget::new(1 << 24);
+    let null = Value::Null;
+    let f32_list = Value::FixedSizeList(vec![Value::F32(f32::from_bits(0x7fc00003)), null.clone(), Value::F32(-0.0)].into());
+    let f64_list = Value::list(vec![Value::F64(f64::from_bits(0x7ff8000000000003)), null.clone(), Value::F64(-0.0)]);
+    let keyword = Value::Keyword(rtdb_types::Keyword::from_name("ns/name"));
+    let uri = Value::Uri("https://example.com/é".into());
+    let rows = vec![
+        vec![null.clone(), f64_list.clone(), uri.clone(), keyword.clone()],
+        vec![f32_list.clone(), null.clone(), null.clone(), keyword.clone()],
+        vec![f32_list, f64_list, uri, null],
+    ];
+    let from_rows = SqlArguments::from_rows(rows.clone(), &memory).unwrap();
+    let page = |from: usize, to: usize| {
+        let mut fields = Vec::new();
+        let mut arrays = Vec::new();
+        for (column, ty) in from_rows.types().iter().enumerate() {
+            fields.push(to_field(&format!("?_{column}"), ty).unwrap());
+            let cells = rows[from..to].iter().map(|row| row[column].clone()).collect::<Vec<_>>();
+            arrays.push(rtdb_columnar::copy_array(ty, &cells).unwrap());
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+        SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+    };
+    let mut arguments = page(0, 2);
+    for (position, ty) in arguments.types().iter().enumerate() {
+        let ArgumentChunk::Arrow { batch, .. } = arguments.chunks[0].1.as_ref() else { panic!("Expected Arrow arguments"); };
+        let field = to_field(&format!("?_{position}"), ty).unwrap();
+        let (retained, scratch) = argument_vector(&arguments.chunks[0].1, position, &field, ty, &memory).unwrap();
+        assert!(scratch.is_none());
+        assert!(Arc::ptr_eq(&retained, batch.batch().column(position)));
+    }
+    arguments.append(SqlArguments::from_rows(rows[2..].to_vec(), &memory).unwrap()).unwrap();
+    let encoded = crate::source::encode_arguments(&arguments, &memory).unwrap();
+    let expected = crate::source::encode_arguments(&from_rows, &memory).unwrap();
+    assert_eq!(encoded.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn canonical_argument_ipc_remaps_a_null_in_a_dense_float_union() {
+    use arrow_array::{Float32Array, Float64Array, UnionArray};
+    use arrow_buffer::ScalarBuffer;
+    use arrow_schema::UnionFields;
+    use rtdb_types::{ListKind, ScalarType, Value};
+    let memory = MemoryBudget::new(1 << 24);
+    let f32 = LogicalType::Scalar(ScalarType::F32);
+    let f64 = LogicalType::Scalar(ScalarType::F64);
+    let fields = UnionFields::try_new([5, 3, 8], [
+        Field::new("f32", DataType::Float32, true),
+        Field::new("f64", DataType::Float64, false),
+        Field::new("null", DataType::Null, true),
+    ]).unwrap();
+    let children = UnionArray::try_new(fields, ScalarBuffer::from(vec![5, 5, 3]), Some(ScalarBuffer::from(vec![0, 1, 0])), vec![
+        Arc::new(Float32Array::from(vec![Some(-0.0), None])), Arc::new(Float64Array::from(vec![1.0])),
+        Arc::new(arrow_array::NullArray::new(0)),
+    ]).unwrap();
+    let layout = DataType::List(Arc::new(Field::new("item", children.data_type().clone(), false)));
+    let array = arrow_array::make_array(arrow_array::new_empty_array(&layout).to_data().into_builder()
+        .len(1).buffers(vec![ScalarBuffer::from(vec![0i32, 3]).into_inner()]).child_data(vec![children.to_data()]).build().unwrap());
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("vector", layout, false)])), vec![array]).unwrap();
+    let arguments = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let ty = LogicalType::List { kind: ListKind::List, element: Box::new(f32.join(&LogicalType::Null).join(&f64)) };
+    let expected = SqlArguments::new(vec![ty.clone()], vec![vec![Value::list(vec![Value::F32(-0.0), Value::Null, Value::F64(1.0)])]], &memory).unwrap();
+    let (kept, _) = argument_vector(&arguments.chunks[0].1, 0, &to_field("?_0", &ty).unwrap(), &ty, &memory).unwrap();
+    let kept = kept.as_list::<i32>().values().as_union();
+    assert_eq!(kept.logical_null_count(), 1);
+    let ArgumentChunk::Arrow { batch, .. } = arguments.chunks[0].1.as_ref() else { panic!("Expected Arrow arguments"); };
+    let original = batch.batch().column(0).as_list::<i32>().values().as_union();
+    assert_eq!(kept.child(kept.type_id(2)).to_data().buffers()[0].as_ptr(), original.child(3).to_data().buffers()[0].as_ptr());
+    let encoded = crate::source::encode_arguments(&arguments, &memory).unwrap();
+    let expected = crate::source::encode_arguments(&expected, &memory).unwrap();
+    assert_eq!(encoded.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn canonical_argument_ipc_widens_float_vector_children_when_pages_join() {
+    use rtdb_types::Value;
+    let memory = MemoryBudget::new(1 << 24);
+    let left = Value::list(vec![Value::F32(-0.0), Value::F32(1.0)]);
+    let right = Value::list(vec![Value::F64(f64::from_bits(0x7ff8000000000009)), Value::Null]);
+    let page = |value: &Value| {
+        let ty = value.logical_type();
+        let column = rtdb_columnar::copy_array(&ty, std::slice::from_ref(value)).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("vector", &ty).unwrap()])), vec![column]).unwrap();
+        SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+    };
+    let mut arguments = page(&left);
+    arguments.append(page(&right)).unwrap();
+    let ty = &arguments.types()[0];
+    let (kept, _) = argument_vector(&arguments.chunks[0].1, 0, &to_field("?_0", ty).unwrap(), ty, &memory).unwrap();
+    let child = kept.as_list::<i32>().values().as_union();
+    let ArgumentChunk::Arrow { batch, .. } = arguments.chunks[0].1.as_ref() else { panic!("Expected Arrow arguments"); };
+    let original = batch.batch().column(0).as_list::<i32>().values();
+    assert_eq!(child.child(child.type_id(0)).to_data().buffers()[0].as_ptr(), original.to_data().buffers()[0].as_ptr());
+
+    let from_rows = SqlArguments::from_rows(vec![vec![left], vec![right]], &memory).unwrap();
+    let expected = crate::source::encode_arguments(&from_rows, &memory).unwrap();
+    let actual = crate::source::encode_arguments(&arguments, &memory).unwrap();
+    assert_eq!(actual.as_slice(), expected.as_slice());
 }

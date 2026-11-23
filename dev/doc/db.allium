@@ -412,7 +412,8 @@ variant TxMessage : SourceMessage {
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
     -- The encoder transfers uniquely owned Arrow IPC payloads into their protobuf fields with their allocation reservations.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
-    -- A canonical float vector argument with no absent vector or component is gathered into source IPC from its Arrow buffers.
+    -- Canonical float vector arguments retain Arrow positions across nullable vectors, nullable components, and compatible dense unions.
+    -- Canonical argument gathering applies the row writer's layouts when combining Arrow and row arguments.
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
@@ -423,8 +424,9 @@ variant TxMessage : SourceMessage {
     -- Governed Arrow writes fill acceptance-relative binary slots in the selected columns during staging.
     -- A put record without an IID vector derives its IIDs from the document ID cells.
     -- A static INSERT from compatible positional Arrow batches projects Arrow arguments into source document vectors in upload order, including supported lists and structs.
-    -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
-    -- The projected document batch carries each row's evaluated validity bounds and keeps the original row order.
+    -- Static INSERT and PATCH retain projected floating-point Arrow arguments while evaluating scalar operands and valid-time bounds.
+    -- The projected INSERT document batch carries each row's evaluated validity bounds and keeps the original row order.
+    -- Receipt encoding gathers compatible floating-point document cells by Arrow position under the canonical field layout.
     -- A document layout retains its schema and column metadata while releasing translation scratch after construction.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
     -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
@@ -1061,7 +1063,9 @@ rule LeaderProcessesTx {
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.
+        -- Ordered runs of put documents can share an Arrow struct layout, including runs selected by a dense union.
         -- PATCH gap filling preserves the ordered valid-time pages and selects compatible document vectors.
+        -- PATCH projects independently over distinct pairs of old and patch struct layouts.
         -- The patch projection keeps existing cells when a patch cell is null and keeps the patch's field set for an uncovered interval.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.

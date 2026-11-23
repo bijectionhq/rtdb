@@ -1119,6 +1119,7 @@ rule BufferDml {
     -- (see FailedTransactionRejectsStatements).
     -- The buffer retains the argument width supplied by the frontend.
     -- Prepared Flight SQL updates retain compatible argument batches in Arrow through source serialization and replay, including updates submitted through GetFlightInfo.
+    -- A static write can project a floating-point vector from its bound Arrow row and retain that position through valid-time grouping.
     -- At commit, the database applies the submission and resolution rules for those SQL arguments.
     when: ExecuteStatement(frontend, connection, kind, statement)
     requires: kind = dml

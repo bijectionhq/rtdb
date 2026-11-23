@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use prost::Message;
-use arrow_array::{Array, RecordBatch, cast::AsArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, cast::AsArray};
 use arrow_schema::{DataType, Schema};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{AcceptanceStage, ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
@@ -1044,17 +1044,39 @@ impl<'a> OpenTransaction<'a> {
         let to = mutation_column(batch, "_valid_to")?;
         let documents = batch.column_by_name("doc")
             .ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document column"))?;
-        for row in 0..batch.num_rows() {
-            let header = EventHeader { position: None,
-                commit_position: 0,
-                iid: iids.iid(row)?, system_from: system_time,
-                valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
+        let read_header = |row| Ok(EventHeader {
+            position: None,
+            commit_position: 0,
+            iid: iids.iid(row)?, system_from: system_time,
+            valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
+        });
+        let mut start = 0;
+        while start < batch.num_rows() {
+            let Some((document, offset)) = mutation_document(documents.as_ref(), start) else {
+                read_header(start)?;
+                return Err(Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document"));
             };
-            let (document, index) = mutation_document(documents.as_ref(), row)
-                .ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document"))?;
-            let content = document.slice(index, 1);
-            let batch = rtdb_format::data::owned_put_batch(Arc::new(content), &[header], None, memory)?;
-            self.buffer.append_batch(table, batch)?;
+            let end = mutation_document_run(documents.as_ref(), start, document);
+            if end > start + 1 {
+                let staged = mutation_run_batch(documents.as_ref(), document, start..end, &read_header, memory)
+                    .and_then(|batch| batch.map(|batch| self.buffer.append_batch(table, batch)).transpose());
+                match staged {
+                    Ok(Some(())) => { start = end; continue; }
+                    Ok(None) => {}
+                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            for row in start..end {
+                let header = read_header(row)?;
+                let index = if row == start { offset } else {
+                    mutation_document(documents.as_ref(), row).expect("A document run uses one struct array").1
+                };
+                let content = document.slice(index, 1);
+                let batch = rtdb_format::data::owned_put_batch(Arc::new(content), &[header], None, memory)?;
+                self.buffer.append_batch(table, batch)?;
+            }
+            start = end;
         }
         Ok(())
     }
@@ -3707,6 +3729,40 @@ fn mutation_document(array: &dyn Array, row: usize) -> Option<(&arrow_array::Str
     mutation_document(union.child(union.type_id(row)).as_ref(), union.value_offset(row))
 }
 
+fn mutation_document_run(array: &dyn Array, start: usize, document: &arrow_array::StructArray) -> usize {
+    (start + 1..array.len()).find(|&row| {
+        !mutation_document(array, row).is_some_and(|(next, _)| std::ptr::eq(next, document))
+    }).unwrap_or(array.len())
+}
+
+fn mutation_run_batch(
+    input: &dyn Array, document: &arrow_array::StructArray, rows: std::ops::Range<usize>,
+    read_header: impl Fn(usize) -> Result<EventHeader>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<OwnedBatch>> {
+    let _headers = memory.reserve(rtdb_index::IndexBatch::header_bytes(rows.len())?)?;
+    let mut headers = Vec::with_capacity(rows.len());
+    for row in rows.clone() {
+        // Invalid later headers must be ordered against the earlier rows' admission.
+        let Ok(header) = read_header(row) else { return Ok(None); };
+        headers.push(header);
+    }
+    let offset = |row| mutation_document(input, row).expect("A document run uses one struct array").1;
+    let first = offset(rows.start);
+    let (content, _copy): (ArrayRef, _) = if rows.clone().enumerate().all(|(position, row)| offset(row) == first + position) {
+        (Arc::new(document.slice(first, rows.len())), None)
+    } else {
+        let field = arrow_schema::Field::new("doc", document.data_type().clone(), false);
+        let bound = rows.clone().try_fold(4096usize, |bytes, row| {
+            rtdb_columnar::estimate_event_copy_cell_bytes(&field, document, offset(row))?
+                .checked_mul(4).and_then(|cell| bytes.checked_add(cell)).ok_or_else(overflow)
+        })?;
+        let copy = memory.reserve(bound)?;
+        let picks = rows.map(|row| Some((0, offset(row)))).collect::<Vec<_>>();
+        (rtdb_columnar::copy_event_cells(&[document], &picks)?, Some(copy))
+    };
+    rtdb_format::data::owned_put_batch(content, &headers, None, memory).map(Some)
+}
+
 fn mutation_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<OutputColumn<'a>> {
     let schema = batch.schema_ref();
     let index = schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
@@ -4617,6 +4673,44 @@ mod tests {
             Ok(())
         }).unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    }
+
+    #[test]
+    fn mutation_runs_gather_sparse_union_offsets_with_nullable_vectors() {
+        use arrow_array::{StructArray, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Field, UnionFields};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let vector = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into());
+        let ty = vector.logical_type().maybe();
+        let data = rtdb_columnar::copy_array(&ty, &[vector.clone(), Value::Null, vector]).unwrap();
+        let source = StructArray::new(
+            vec![rtdb_columnar::to_field("vector", &ty).unwrap()].into(), vec![data], None,
+        );
+        let fields = UnionFields::try_new([3, 5], [
+            Field::new("struct", source.data_type().clone(), false), Field::new("null", DataType::Null, true),
+        ]).unwrap();
+        let input = UnionArray::try_new(fields, ScalarBuffer::from(vec![3, 3, 5, 3]), Some(ScalarBuffer::from(vec![2, 1, 0, 0])), vec![
+            Arc::new(source), Arc::new(arrow_array::NullArray::new(1)),
+        ]).unwrap();
+        let (source, _) = mutation_document(&input, 0).unwrap();
+        assert_eq!(mutation_document_run(&input, 0, source), 2);
+        assert!(mutation_document(&input, 2).is_none());
+        let read_header = |row| Ok(EventHeader {
+            position: None,
+            commit_position: 0, iid: Iid([row as u8; 16]), system_from: Timestamp(10),
+            valid_time: Interval::ALL, op: EventOp::Put,
+        });
+        let owned = mutation_run_batch(&input, source, 0..2, read_header, &memory).unwrap().unwrap();
+        let put = owned.batch().column_by_name("op").unwrap().as_union().child(2).as_struct();
+        assert_eq!(put.len(), 2);
+        assert_eq!(put.fields(), source.fields());
+        let vector = put.column(0).as_fixed_size_list();
+        assert!(vector.is_null(1));
+        let items = vector.values().as_primitive::<arrow_array::types::Float32Type>();
+        assert_eq!(items.value(0).to_bits(), (-0.0_f32).to_bits());
+        assert!(items.is_null(1));
     }
 
     #[test]

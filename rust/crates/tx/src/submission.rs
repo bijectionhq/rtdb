@@ -1,18 +1,21 @@
-use rtdb_types::StructFields;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{ArrowCell, MemoryBudget};
 use rtdb_expr::{EvalContext, evaluate};
 use rtdb_plan::{Catalog, Expr, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
+#[cfg(test)]
+use rtdb_types::StructFields;
 use rtdb_sql::StaticMutationKind;
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
-use crate::source::Operation;
+use crate::source::{DocumentCell, Operation, owned_projected_documents};
 use crate::values::{BoundArgumentRow, canonical_argument_column, plain_scalar_field};
+use crate::values::arguments::canonical_float_field;
 
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
@@ -106,22 +109,36 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     let mut pending_bounds = (None, None);
     let mut pending = Vec::with_capacity(128);
     let mut pending_charge = memory.reserve(4096)?;
-    let mut flush = |bounds, pending: &mut Vec<StructFields<Value>>, pending_charge: &mut Arc<rtdb_columnar::MemoryReservation>| -> Result<()> {
+    let mut flush = |bounds, pending: &mut Vec<Vec<DocumentCell<'_>>>, pending_charge: &mut Arc<rtdb_columnar::MemoryReservation>| -> Result<()> {
         if pending.is_empty() { return Ok(()); }
-        let mut rows = std::mem::replace(pending, Vec::with_capacity(128));
         let mut page_columns = columns.clone();
         if matches!(&plan.kind, StaticMutationKind::Put) {
-            page_columns.retain(|name| {
-                if !valid_time_column(name) || rows.iter().any(|row| row.get(name).is_some_and(|value| !matches!(value, Value::Null))) {
-                    return true;
+            for (index, name) in columns.iter().enumerate().rev() {
+                if valid_time_column(name) && pending.iter().all(|row|
+                    matches!(&row[index], DocumentCell::Value(value) if matches!(value.as_ref(), Value::Null)))
+                {
+                    page_columns.remove(index);
+                    for row in pending.iter_mut() { row.remove(index); }
                 }
-                for row in &mut rows { row.remove(name); }
-                false
-            });
+            }
         }
-        let documents = Documents::with_column_order(rows, page_columns, memory)?;
-        Arc::get_mut(pending_charge).expect("Static document buffer owns its reservation").shrink_to(4096)?;
-        let page = crate::source::owned_row_documents(&documents, memory)?;
+        let page = if pending.iter().flat_map(|row| row.iter()).any(|cell| matches!(cell, DocumentCell::Arrow { .. })) {
+            for cell in pending.iter_mut().flat_map(|row| row.iter_mut()) {
+                if let DocumentCell::Value(value) = cell { value.to_mut().admit_object_dates()?; }
+            }
+            let page = owned_projected_documents(&page_columns, pending, memory)?;
+            pending.clear();
+            Arc::get_mut(pending_charge).expect("Static document buffer owns its reservation").shrink_to(4096)?;
+            page
+        } else {
+            let rows = pending.drain(..).map(|row| page_columns.iter().cloned().zip(row).map(|(name, cell)| {
+                let DocumentCell::Value(value) = cell else { unreachable!() };
+                (name, value.into_owned())
+            }).collect()).collect();
+            let documents = Documents::with_column_order(rows, page_columns, memory)?;
+            Arc::get_mut(pending_charge).expect("Static document buffer owns its reservation").shrink_to(4096)?;
+            crate::source::owned_row_documents(&documents, memory)?
+        };
         let lease = Arc::get_mut(&mut inventory).expect("Static mutation owns its document groups");
         lease.grow_to(lease.bytes().checked_add(512).ok_or_else(overflow)?)?;
         match group_of.entry(bounds) {
@@ -134,7 +151,12 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let row_scope = scope.scratch();
         let arrow;
         let values;
-        let parameters = match parameters? {
+        let binding = parameters?;
+        let input = match &binding {
+            BoundArgumentRow::Arrow { batch, row, .. } => Some((batch.batch(), *row)),
+            BoundArgumentRow::Values { .. } => None,
+        };
+        let parameters = match binding {
             BoundArgumentRow::Arrow { batch, row, types } => {
                 arrow = rtdb_query::BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), memory)?;
                 arrow.evaluator()
@@ -157,25 +179,34 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
             TemporalFilter::FromTo { from, to } => (patch_bound_value(from, Timestamp::MIN, &context)?, patch_bound_value(to, Timestamp::MAX, &context)?),
             _ => return Err(Anomaly::incorrect("xtdb/sql-error", "Static PATCH requires ALL or FROM/TO valid time")),
         };
-        materialize(&plan.input, &context, &mut |row| {
-            let mut document: StructFields<_> = plan.input.schema().fields().iter().zip(row).map(|(field, value)| (field.name.clone(), value)).collect();
+        materialize(&plan.input, input, &context, &mut |mut document| {
             let bounds = if matches!(&plan.kind, StaticMutationKind::Patch(_)) { temporal } else {
                 for name in ["_valid_from", "_valid_to"] {
-                    if let Some(bound) = document.get_mut(name) {
-                        *bound = insert_bound(bound, &options.default_tz)?.map_or(Value::Null, |time| Value::Timestamp {
+                    if let Some(index) = columns.iter().position(|column| column == name) {
+                        let cell = &mut document[index];
+                        let value = insert_bound(cell.value()?.as_ref(), &options.default_tz)?.map_or(Value::Null, |time| Value::Timestamp {
                             value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
                         });
+                        *cell = DocumentCell::Value(std::borrow::Cow::Owned(value));
                     }
                 }
                 (None, None)
             };
-            for value in document.values_mut() { infer_document_decimals(value)?; }
+            for cell in &mut document {
+                if let DocumentCell::Value(value) = cell {
+                    infer_document_decimals(value.to_mut())?;
+                }
+            }
             if pending.len() == 128 || pending_bounds != bounds {
                 flush(pending_bounds, &mut pending, &mut pending_charge)?;
                 pending_bounds = bounds;
             }
             let lease = Arc::get_mut(&mut pending_charge).expect("Static document buffer owns its reservation");
-            lease.grow_to(lease.bytes().checked_add(Value::document_retained_bytes(&document)?).ok_or_else(overflow)?)?;
+            let bound = document.iter().try_fold(document.capacity().checked_mul(std::mem::size_of::<DocumentCell<'_>>()).ok_or_else(overflow)?, |bytes, cell| {
+                let value = match cell { DocumentCell::Value(value) => value.retained_bytes()?, DocumentCell::Arrow { .. } => 0 };
+                bytes.checked_add(value).ok_or_else(overflow)
+            })?;
+            lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(overflow)?)?;
             pending.push(document);
             Ok(())
         })?;
@@ -383,23 +414,85 @@ fn infer_document_decimals(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
-fn materialize(input: &Relation, context: &EvalContext<'_>, emit: &mut dyn FnMut(Vec<Value>) -> Result<()>) -> Result<()> {
+fn materialize<'a>(
+    input: &Relation, binding: Option<(&'a RecordBatch, usize)>, context: &EvalContext<'_>,
+    emit: &mut dyn FnMut(Vec<DocumentCell<'a>>) -> Result<()>,
+) -> Result<()> {
     match input.node() {
         RelationNode::Values { rows } => {
+            let schema = Schema::default();
             for row in rows {
-                let values = row.iter().map(|expr| evaluate(expr, &Schema::default(), &[], context)).collect::<Result<_>>()?;
-                emit(values)?;
+                let mut cells = Vec::with_capacity(row.len());
+                for expr in row { cells.push(project_static_cell(expr, binding, &schema, context)?); }
+                emit(cells)?;
             }
             Ok(())
         }
         RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
-            materialize(input, context, &mut |row| {
-                let values = expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), &row, context)).collect::<Result<_>>()?;
-                emit(values)
+            materialize(input, binding, context, &mut |row| {
+                if expressions.iter().all(|expr| matches!(expr.expr, Expr::Column { .. })) {
+                    let values = expressions.iter().map(|expression| {
+                        let Expr::Column { id, .. } = expression.expr else { unreachable!() };
+                        let cell = &row[input.schema().position(id).expect("A static rename refers to its input column")];
+                        Ok(match cell {
+                            DocumentCell::Arrow { cell, declared } => DocumentCell::Arrow { cell: *cell, declared: *declared },
+                            DocumentCell::Value(value) => {
+                                if let Some(scope) = context.allocation { scope.reserve(value.retained_bytes()?)?; }
+                                DocumentCell::Value(Cow::Owned(value.as_ref().clone()))
+                            }
+                        })
+                    }).collect::<Result<_>>()?;
+                    emit(values)
+                } else {
+                    let row = row.into_iter().map(|cell| match cell {
+                        DocumentCell::Value(value) => Ok(value.into_owned()),
+                        cell => {
+                            if let Some(scope) = context.allocation { scope.reserve(cell.bound()?)?; }
+                            cell.value().map(Cow::into_owned)
+                        }
+                    }).collect::<Result<Vec<_>>>()?;
+                    let values = expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), &row, context)
+                        .map(|value| DocumentCell::Value(Cow::Owned(value)))).collect::<Result<_>>()?;
+                    emit(values)
+                }
             })
         }
         _ => Err(Anomaly::fault("rtdb.tx/static-plan", "Static SQL source contains a data-dependent operator")),
     }
+}
+
+fn project_static_cell<'a>(
+    expr: &Expr, binding: Option<(&'a RecordBatch, usize)>, schema: &Schema, context: &EvalContext<'_>,
+) -> Result<DocumentCell<'a>> {
+    let Some((batch, row)) = binding else {
+        return evaluate(expr, schema, &[], context).map(|value| DocumentCell::Value(Cow::Owned(value)));
+    };
+    let arrow = |index: usize| Some(ArrowCell {
+        field: batch.schema_ref().fields().get(index)?,
+        array: batch.columns().get(index)?.as_ref(),
+        row,
+    });
+    let expr = if let Expr::Field { expr: record, name, .. } = expr
+        && let Expr::Struct(fields) = record.as_ref()
+        && fields.iter().all(|(_, expr)| match expr {
+            Expr::Parameter { index, .. } => arrow(*index).is_some_and(|cell| {
+                plain_scalar_field(cell.field) || canonical_float_field(cell.field)
+                    || rtdb_columnar::decimal_field_parameters(cell.field).is_ok_and(|decimal| decimal.is_some())
+            }),
+            Expr::Literal(value) => matches!(value, Value::Null | Value::Bool(_) | Value::I64(_) | Value::I32(_) | Value::Utf8(_) | Value::Decimal(_)),
+            _ => false,
+        }) {
+        let Some((_, expr)) = fields.iter().rev().find(|(field, _)| field == name) else {
+            return Ok(DocumentCell::Value(Cow::Owned(Value::Null)));
+        };
+        expr
+    } else { expr };
+    if let Expr::Parameter { index, .. } = expr
+        && let Some(cell) = arrow(*index).filter(|cell| canonical_float_field(cell.field))
+        && matches!(cell.physical()?.field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Null) {
+        return Ok(DocumentCell::Arrow { cell, declared: None });
+    }
+    evaluate(expr, schema, &[], context).map(|value| DocumentCell::Value(Cow::Owned(value)))
 }
 fn insert_bound(value: &Value, timezone: &str) -> Result<Option<Timestamp>> {
     if matches!(value, Value::Null | Value::Undefined) { Ok(None) }
@@ -755,5 +848,58 @@ mod patch_endpoint_tests {
         let source = prepare_submission(vec![TxOp::Sql { sql: "PATCH INTO docs FOR VALID_TIME FROM '1970-01-01T12:00:00' TO '1970-01-02T18:00:00' RECORDS {_id: 1}".into(),args: None }],SubmitOptions::default(),"xtdb",&memory).unwrap();
         assert_eq!(bounds(&source),(Some(Timestamp(0)),Some(Timestamp(86_400_000_000))));
         drop(source);assert_eq!(memory.used_bytes(),0);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn static_patch_and_timed_put_encode_mixed_float_bindings_as_rows_would() {
+    let memory = MemoryBudget::new(1 << 25);
+    let first = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null, Value::F32(f32::from_bits(0x7fc00001))].into());
+    let last = Value::list(vec![Value::F64(2.0), Value::Null]);
+    let start = Value::Utf8("2020-01-01T00:00:00Z".into());
+    let decimal = |coefficient: i32| Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(), 9, 2, 32).unwrap());
+    let rows = vec![vec![Value::I64(1), first, start.clone(), decimal(123)],
+        vec![Value::I64(2), Value::Null, start.clone(), decimal(456)],
+        vec![Value::I64(3), last, start, decimal(789)]];
+    let page = |rows: &[Vec<Value>]| {
+        let types = SqlArguments::from_rows(rows.to_vec(), &memory).unwrap();
+        let fields = types.types().iter().enumerate().map(|(index, ty)| rtdb_columnar::to_field(&index.to_string(), ty).unwrap()).collect::<Vec<_>>();
+        let columns = types.types().iter().enumerate().map(|(index, ty)| {
+            let values = rows.iter().map(|row| row[index].clone()).collect::<Vec<_>>();
+            rtdb_columnar::copy_array(ty, &values).unwrap()
+        }).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).unwrap();
+        SqlArguments::from_arrow(rtdb_columnar::OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+    };
+    let mut mixed = page(&rows[..2]);
+    mixed.append(SqlArguments::from_rows(rows[2..].to_vec(), &memory).unwrap()).unwrap();
+    let boxed = SqlArguments::from_rows(rows.clone(), &memory).unwrap();
+    for sql in [
+        "PATCH INTO docs FOR VALID_TIME FROM $3 RECORDS {_id: $1, embedding: $2, amount: $4}",
+        "INSERT INTO docs (_id, embedding, _valid_from, amount) VALUES ($1, $2, $3, $4)",
+    ] {
+        let submit = |args| prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }],
+            SubmitOptions::default(), "xtdb", &memory).unwrap();
+        let columnar = submit(mixed.clone());
+        let row = submit(boxed.clone());
+        assert_eq!(columnar.encode().unwrap().as_slice(), row.encode().unwrap().as_slice());
+        assert_eq!(columnar.body_digest().unwrap(), row.body_digest().unwrap());
+        let ([Operation::PutReplayArrow { documents, .. }] | [Operation::PatchArrowIids { documents, .. }]) =
+            columnar.operations.as_slice() else { panic!("Expected static Arrow documents"); };
+        assert_eq!(documents.column_type("amount"), Some(&LogicalType::Scalar(ScalarType::Decimal {
+            precision: 32, scale: 2, bit_width: 128,
+        })));
+        let plan = rtdb_sql::prepare_static(sql, &SubmissionCatalog("xtdb"),
+            &rtdb_sql::PrepareOptions { parameter_types: mixed.execution_types().enumerate().collect(), ..Default::default() }).unwrap().unwrap();
+        let (index, _) = plan.input.schema().fields().iter().enumerate().find(|(_, field)| field.name == "embedding").unwrap();
+        let BoundArgumentRow::Arrow { batch, row, types } = mixed.indexed_bound_rows().next().unwrap().unwrap().1 else { panic!("Arrow arguments"); };
+        let args = rtdb_query::BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), &memory).unwrap();
+        let context = EvalContext { parameters: args.evaluator(), ..EvalContext::default() };
+        materialize(&plan.input, Some((batch.batch(), row)), &context, &mut |projected| {
+            let DocumentCell::Arrow { cell, .. } = &projected[index] else { panic!("Expected a borrowed vector"); };
+            assert!(std::ptr::eq(cell.array, batch.batch().column(1).as_ref()));
+            Ok(())
+        }).unwrap();
     }
 }

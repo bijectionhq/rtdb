@@ -4,10 +4,10 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Fields, Schema};
-use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
+use rtdb_columnar::{ArrowCell, ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, ListKind, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
-mod arguments;
+pub(crate) mod arguments;
 mod union;
 
 #[derive(Clone, Debug)]
@@ -476,9 +476,58 @@ impl ArrowDocuments {
                 if !matches!(value, Value::Null | Value::Undefined) { return Ok(value.entity_id()?.iid()); }
             }
         }
+        if let Ok(Some(error)) = self.missing_float_document_id(row, memory) {
+            return Err(error);
+        }
         let slice = self.array.slice(row, 1);
         let rows = Documents::read_arrow(&slice, Arc::clone(&self.layout), false, memory)?;
         crate::source::document_id(&rows.rows()[0], memory).map(|id| id.iid())
+    }
+
+    pub(crate) fn missing_float_document_id(&self, row: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Anomaly>> {
+        use arrow_array::types::{Float32Type, Float64Type};
+        use rtdb_format::transit::{self, TransitValue as T};
+
+        let cells = || self.array.fields().iter().zip(self.array.columns())
+            .map(|(field, array)| ArrowCell { field, array: array.as_ref(), row });
+        if !cells().any(|cell| cell.float_list_span().is_some()) { return Ok(None); }
+        let mut scratch = memory.reserve(4096)?;
+        let mut document = Vec::new();
+        for cell in cells() {
+            let physical = cell.physical()?;
+            let read_bound = rtdb_columnar::estimate_read_cell_bytes(physical.field, physical.array, physical.row)?;
+            let lease = Arc::get_mut(&mut scratch).expect("Missing ID context owns its reservation");
+            let bound = lease.bytes().checked_add(read_bound).and_then(|bytes| bytes.checked_add(cell.field.name().len() + 512)).ok_or_else(overflow)?;
+            lease.grow_to(bound)?;
+            let value = if let Some((field, array, range)) = physical.sequence_range()
+                && physical.float_list_span().is_some() {
+                if !arguments::canonical_float_field(field) { return Ok(None); }
+                let items = range.map(|row| {
+                    let cell = (ArrowCell { field, array, row }).physical()?;
+                    Ok(if cell.is_null()? {
+                        T::Null
+                    } else if cell.field.data_type() == &DataType::Float32 {
+                        T::Float(f64::from(cell.array.as_primitive::<Float32Type>().value(cell.row)))
+                    } else {
+                        T::Float(cell.array.as_primitive::<Float64Type>().value(cell.row))
+                    })
+                }).collect::<Result<_>>()?;
+                T::Array(items)
+            } else if physical.is_null()? {
+                T::Null
+            } else {
+                if !matches!(physical.logical_type()?, LogicalType::Scalar(_)) { return Ok(None); }
+                let mut value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
+                value.admit_object_dates()?;
+                let bytes = rtdb_expr::text_allocation_bound(&value)?;
+                lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(overflow)?)?;
+                transit::value_to_transit(&value)?
+            };
+            document.push((T::String(cell.field.name().clone()), value));
+        }
+        let document = T::Map(document);
+        let _json = memory.reserve(transit::json_value_allocation_bound(&document)?)?;
+        Ok(Some(Anomaly::incorrect("missing-id", "missing '_id'").with_transit_context("doc", &document)?))
     }
 
     pub(crate) fn id_reader(&self) -> Result<Option<(usize, ColumnReader)>> {
