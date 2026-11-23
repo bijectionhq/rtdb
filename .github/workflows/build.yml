@@ -246,11 +246,13 @@ jobs:
           check_name: JUnit Native Binding Test Report
           report_paths: 'bindings/jvm/build/test-results/*test/TEST-*.xml'
 
-      - name: Test native Flight transport
+      - name: Test native Flight transport and spatial integration
         if: ${{ !cancelled() && steps.native-library.outcome == 'success' }}
         env:
           RUST_MIN_STACK: "16777216"
-        run: cargo +1.94.1 test --manifest-path rust/Cargo.toml --locked -p rtdb-flight-sql --test flight
+        run: |
+          cargo +1.94.1 test --manifest-path rust/Cargo.toml --locked -p rtdb-flight-sql --test flight
+          cargo +1.94.1 test --manifest-path rust/Cargo.toml --locked -p rtdb-node --test search spatial
 
   slt-1:
     name: SLT 1

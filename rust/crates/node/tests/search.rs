@@ -303,6 +303,15 @@ fn spatial_point(x: f64, y: f64) -> Vec<u8> {
     bytes
 }
 
+fn spatial_ids(page: &rtdb_spatial::Page) -> Vec<rtdb_types::EntityId> {
+    let Some(rows) = page.rows() else { return Vec::new(); };
+    let rows = rows.batch();
+    (0..rows.num_rows()).map(|row| {
+        rtdb_columnar::read_entity_id(rows.schema_ref().field(0), rows.column(0).as_ref(), row)
+            .unwrap().into_owned()
+    }).collect()
+}
+
 #[tokio::test]
 async fn held_spatial_reads_resolve_moved_rows_and_replaced_generations_across_compaction() {
     use rtdb_spatial::{PageOrder, Predicate, Request};
@@ -328,14 +337,14 @@ async fn held_spatial_reads_resolve_moved_rows_and_replaced_generations_across_c
         ("_id".into(), id.as_value()), ("tenant".into(), Value::Binary(vec![tenant])),
         ("location".into(), Value::Binary(spatial_point(x, 0.0))),
     ]);
-    let read_ids = |page: rtdb_spatial::Page| (page.hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>(), page.more);
+    let read_ids = |page: rtdb_spatial::Page| (spatial_ids(&page), page.more);
     let opts = AutonomousTxOptions::default;
     let created = session.state_mut().execute_tx(vec![
         TxOp::OwnedDeclareRelation { relation: relation.clone(), schema }, declare(),
     ], opts()).await.unwrap();
     assert!(created.committed(), "{:?}", created.error());
     let empty = session.open_owned_read().await.unwrap();
-    assert!(empty.spatial(&relation, &path, request(None, 1), false).await.unwrap().0.hits.is_empty());
+    assert!(spatial_ids(&empty.spatial(&relation, &path, request(None, 1), false).await.unwrap().0).is_empty());
     drop(empty);
 
     let moved = EntityId::Integer(1);
@@ -438,8 +447,7 @@ async fn unindexed_spatial_reads_decode_only_geometry_visible_at_the_held_cut() 
         valid_at: Timestamp(valid_at), page: PageOrder::Identity { after: None }, limit: 2,
     };
     let (recent, _) = held.spatial(&relation, &path, request(25), false).await.unwrap();
-    assert_eq!(recent.hits.len(), 1);
-    assert_eq!(recent.hits[0].id, EntityId::Integer(1));
+    assert_eq!(spatial_ids(&recent), [EntityId::Integer(1)]);
     let error = held.spatial(&relation, &path, request(5), false).await.err().unwrap();
     assert_eq!(error.code, "rtdb.spatial/invalid");
     drop(held);
@@ -515,7 +523,7 @@ async fn spatial_path_backfills_original_values_across_live_writes() {
         valid_at: Timestamp(25), page: PageOrder::Identity { after: None }, limit: 8,
     };
     let (page, _) = latest.spatial_projected(&relation, &path, request, false, rtdb_spatial::Projection::Documents).await.unwrap();
-    assert_eq!(page.hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(), [EntityId::Integer(1), EntityId::Integer(2)]);
+    assert_eq!(spatial_ids(&page), [EntityId::Integer(1), EntityId::Integer(2)]);
     let documents = page.documents().unwrap().batch();
     let revisions = documents.column_by_name("_system_from").unwrap().as_any()
         .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
