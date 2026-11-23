@@ -11,8 +11,6 @@ import org.apache.arrow.adbc.core.AdbcConnection;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.BulkIngestMode;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.VarCharVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -89,11 +87,8 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     }
     public void setApplicationName(String name) throws AdbcException {
         if (!abi.supports("session_set_application_name")) {
-            try (var statement = createStatement("SET application_name = ?");
-                 var arguments = VectorSchemaRoot.of(new VarCharVector("application_name", allocator))) {
-                ((VarCharVector) arguments.getVector(0)).setSafe(0, name.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                arguments.setRowCount(1);
-                statement.bind(arguments);
+            String literal = name.replace("\\", "\\\\").replace("'", "''");
+            try (var statement = createStatement("SET application_name = E'" + literal + "'")) {
                 statement.executeUpdate();
             }
             return;

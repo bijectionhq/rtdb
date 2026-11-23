@@ -290,15 +290,15 @@ pub unsafe extern "C" fn rtdb_v1_statement_schema(handle: u64, operation: u64, p
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_query(handle: u64, operation: u64, out: *mut u64, error: *mut u64) -> i32 {
-    unsafe { call(error, || {
+    unsafe { call(error, || region::with_query_stack(|| {
         let out = output(out)?; *out = 0;
         let statement = handles::statement(handle)?; let _admitted = statement.session.region.enter()?;
         *out = handles::insert(Handle::Cursor(statement.query(&handles::cancellation(operation, &statement.session)?)?))?; Ok(())
-    }) }
+    })) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_query_ra(session: u64, operation: u64, plan: *const u8, plan_length: usize, arguments: *const u8, arguments_length: usize, out: *mut u64, error: *mut u64) -> i32 {
-    unsafe { call(error, || {
+    unsafe { call(error, || region::with_query_stack(|| {
         let out = output(out)?; *out = 0;
         let session = handles::session(session)?;
         let _admitted = session.region.enter()?;
@@ -312,7 +312,7 @@ pub unsafe extern "C" fn rtdb_v1_session_query_ra(session: u64, operation: u64, 
         let cursor = session.region.run(async { session.state.lock().query_ra(source, arguments, &token).await })?;
         *out = handles::insert(Handle::Cursor(statement::CursorHandle::new(Arc::clone(&session.region), cursor, token)?))?;
         Ok(())
-    }) }
+    })) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_update(handle: u64, operation: u64, affected: *mut i64, error: *mut u64) -> i32 {

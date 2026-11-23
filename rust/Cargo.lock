@@ -4578,6 +4578,7 @@ dependencies = [
  "rtdb-types",
  "serde",
  "serde_json",
+ "stacker",
  "tokio",
  "tokio-util",
 ]
