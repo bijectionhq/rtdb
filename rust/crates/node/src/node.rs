@@ -136,7 +136,7 @@ enum AppliedCatalogAdmission<'a> {
 
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
     selected == floor
-        || (selected.tx_id > floor.tx_id && selected.system_time > floor.system_time)
+        || (selected.tx_id > floor.tx_id && selected.system_time >= floor.system_time)
 }
 
 #[derive(Clone)]
@@ -493,10 +493,7 @@ impl Node {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let snapshot = match cut {
-                CatalogReadCut::Current => {
-                    let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
-                    database.partition.open_snapshot(head)
-                }
+                CatalogReadCut::Current => database.partition.snapshot(),
                 CatalogReadCut::Reserved(reserved) => {
                     let snapshot = database.partition.snapshot();
                     if snapshot.tx_basis() != Some(reserved) {
@@ -602,7 +599,7 @@ impl Node {
             cancellation.run_until_cancelled(tokio::time::sleep(Duration::from_millis(5))).await.ok_or_else(cancelled)?;
         }
         let lease = self.catalog_read_lease(&database).await?;
-        let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
+        let snapshot = database.partition.open_snapshot(Some(fragment.basis.tx_id));
         let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
         crate::read_currency::require_current(database.name(), lease.as_deref())?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);

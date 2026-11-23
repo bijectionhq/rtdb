@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, TransactionKey, TxId};
 
 use crate::{CatalogCut, CatalogTrie, LiveIndex, ServingSearch, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
@@ -231,8 +231,10 @@ impl PartitionState {
     }
 
     /// The caller's basis barrier runs before this capture; this passive object never waits for log progress.
-    pub fn open_snapshot(&self, min_system_time: Option<Timestamp>) -> Snapshot {
-        let fresh = |live: &LiveIndex| min_system_time.is_none_or(|minimum| live.latest_completed_tx().is_some_and(|basis| basis.system_time >= minimum));
+    pub fn open_snapshot(&self, minimum: Option<TxId>) -> Snapshot {
+        let fresh = |live: &LiveIndex| minimum.is_none_or(|minimum| {
+            live.latest_completed_tx().is_some_and(|basis| basis.tx_id >= minimum)
+        });
         {
             let value = self.value.read();
             if let Some(live) = &value.live_snapshot {

@@ -46,7 +46,7 @@ impl RecoveredPartition {
         let rtdb_tx::ReplayedTransaction { writes, result, .. } =
             rtdb_tx::decode_replica(message, latest, value.live().block_index(), memory)?;
         if latest.is_some_and(|previous| result.tx_key().tx_id <= previous.tx_id
-            || result.tx_key().system_time <= previous.system_time)
+            || result.tx_key().system_time < previous.system_time)
         {
             return Err(invalid("Archived transaction regressed its basis"));
         }
