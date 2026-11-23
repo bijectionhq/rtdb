@@ -27,8 +27,8 @@ impl Service {
             _ => return Err(invalid("Invalid owned unique window mask mode")),
         };
         let (relation, request) = split_relation(request)?;
-        let (path, arrow) = split_relation(request)?;
-        let input = request_batch(call, arrow)?;
+        let (path, request_ipc) = split_relation(request)?;
+        let input = request_batch(call, request_ipc)?;
         let input = input.batch();
         if input.num_rows() != 1 || input.num_columns() != 5 {
             return Err(invalid("Owned unique window needs one selector, system cut, valid window and limit"));
