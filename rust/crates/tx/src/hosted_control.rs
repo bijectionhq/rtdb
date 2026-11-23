@@ -13,6 +13,8 @@ pub(crate) const HOSTED_CAPACITY_DECLARATIONS: &str = "hosted_capacity_declarati
 const RESTORE: &str = "bj_rtdb_restore_hold";
 const NATIVE_FRONTIER: &str = "native-frontier.v1";
 const REPLAY_TRANSACTIONS: &str = "bj_rtdb_restore_transactions";
+const MAX_REPLAY_POSITIONS: usize = 4096;
+const MAX_REPLAY_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_LIFETIMES: usize = 32;
 const MAX_REPLAY_LIFETIME_BYTES: usize = 16 * 1024;
 const MAX_REPLAY_EXPIRIES: usize = 64;
@@ -285,7 +287,7 @@ pub fn replayed_archive_cut(body: &[u8], binding: [u8; 32], archive_pin: &[u8]) 
 }
 
 fn decode_accepted_replay(body: &[u8], binding: [u8; 32], archive_pin: &[u8]) -> Result<HostedReplay> {
-    if body.len() > 4096 { return Err(replay_invalid()); }
+    if body.len() > MAX_REPLAY_RECEIPT_BYTES { return Err(replay_invalid()); }
     let replay: HostedReplay = serde_json::from_slice(body).map_err(|_| replay_invalid())?;
     let archive_matches = archive_pin.split_first_chunk::<32>().is_some_and(|(archive, cut)| {
         archive == &replay.archive && cut == replay.through.to_be_bytes().as_slice()
@@ -334,7 +336,7 @@ pub fn replayed_world_parent(
 }
 
 fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {
-    control_body(control, 4096)
+    control_body(control, MAX_REPLAY_RECEIPT_BYTES)
 }
 
 fn control_body(control: &HostedControlWrite, max_bytes: usize) -> Option<&[u8]> {
@@ -347,7 +349,7 @@ impl HostedReplay {
     pub(crate) fn commit_positions(&self) -> &[u32] { &self.commit_positions }
 
     fn positions_are_ordered(&self) -> bool {
-        self.commit_positions.len() <= 64
+        self.commit_positions.len() <= MAX_REPLAY_POSITIONS
             && self.commit_positions.first().is_none_or(|first| *first != 0)
             && self.commit_positions.windows(2).all(|pair| pair[0] < pair[1])
     }
@@ -860,6 +862,16 @@ mod replay_tests {
         assert_eq!(replay.source_time(), Timestamp(4));
         assert!(replay.check_order(Timestamp(4)).is_err());
         assert!(replay.check_order(Timestamp(5)).is_ok());
+        let positions = (u32::MAX - 1023..=u32::MAX).collect::<Vec<_>>();
+        let mut large = receipt.clone();
+        large["commit_positions"] = serde_json::json!(&positions);
+        let large = large.to_string().into_bytes();
+        controls[3] = replace(NATIVE_FRONTIER, None, &large)?;
+        controls[4] = replace("native-transaction/3", None, &large)?;
+        let replay = hosted_replay_controls(controls.iter())?.unwrap();
+        assert_eq!(replay.commit_positions(), positions.as_slice());
+        let pin = [archive.as_slice(), 4000u64.to_be_bytes().as_slice()].concat();
+        assert_eq!(decode_accepted_replay(&large, binding, &pin)?.commit_positions(), positions.as_slice());
         for (field, value) in [
             ("captured", serde_json::json!({"tx_id": 4, "system_time": 4})),
             ("original_authority", serde_json::json!(([0u8; 16]))),
