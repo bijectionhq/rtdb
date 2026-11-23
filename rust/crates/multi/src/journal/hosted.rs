@@ -423,15 +423,20 @@ impl Placement {
                 .close_checkpoint(&route, retired.checkpoint)
                 .await?;
         }
-        if let crate::deployment::CellStorage::S3 { config } = &self.archive {
-            let material = material(keys, &self.record).await?;
-            let provider = self.checkpoint_custody(IoRegion::new(), &material).await?;
-            let disposition = provider.retire_s3(config, retired.checkpoint).await?;
-            let current = custodian.route().await?;
-            custodian
-                .settle_checkpoint(&current, retired.checkpoint, disposition)
-                .await?;
-        }
+        let material = material(keys, &self.record).await?;
+        let provider = self.checkpoint_custody(IoRegion::new(), &material).await?;
+        let disposition = match &self.archive {
+            crate::deployment::CellStorage::S3 { config } => {
+                provider.retire_s3(config, retired.checkpoint).await?
+            }
+            crate::deployment::CellStorage::Local { .. } => {
+                provider.retire_local(retired.checkpoint).await?
+            }
+        };
+        let current = custodian.route().await?;
+        custodian
+            .settle_checkpoint(&current, retired.checkpoint, disposition)
+            .await?;
         Ok(())
     }
 
@@ -492,12 +497,18 @@ impl Placement {
         let bucket = self.archive.bucket(io).await?;
         let store: Arc<dyn ObjectStore> =
             Arc::new(crate::store::EncryptingStore::new(bucket, material)?);
-        Ok(CheckpointCustody::new(
+        let custody = CheckpointCustody::new(
             store,
             self.archive_prefix.clone(),
             self.worker.placement(),
             self.worker.log_epoch(),
-        ))
+        );
+        match &self.archive {
+            crate::deployment::CellStorage::S3 { .. } => Ok(custody),
+            crate::deployment::CellStorage::Local { root } => {
+                custody.on_local_volume(root, material)
+            }
+        }
     }
 
     pub(crate) async fn configuration(

@@ -1,5 +1,7 @@
 //! Provider-backed checkpoint custody for installed journals.
 
+mod local;
+
 use super::InstalledJournal;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,6 +29,7 @@ pub struct CheckpointCustody {
     placement: Placement,
     epoch: StorageEpoch,
     prefix: ObjectKey,
+    local: Option<local::LocalArchive>,
 }
 
 /// Exact space reserved by the custodian before staging any checkpoint copy.
@@ -156,12 +159,48 @@ impl CheckpointCustody {
             placement,
             epoch,
             prefix,
+            local: None,
         }
+    }
+
+    pub(crate) fn on_local_volume(mut self, path: &Path, key: &[u8]) -> Result<Self> {
+        self.local = Some(local::LocalArchive::new(path, key)?);
+        Ok(self)
+    }
+
+    async fn reader(&self, custody: Custody) -> Result<Arc<dyn ObjectStore>> {
+        let Some(local) = &self.local else {
+            return Ok(Arc::clone(&self.store));
+        };
+        let scope = self.allocation(custody);
+        let allocation = local.acquire(&scope, false).await?;
+        if allocation.closed().await?.is_some() {
+            return Err(invalid("The local checkpoint archive is closed"));
+        }
+        allocation.read_store()
+    }
+
+    async fn put(
+        &self,
+        custody: Custody,
+        key: &ObjectKey,
+        body: Bytes,
+    ) -> rtdb_storage::Result<()> {
+        let Some(local) = &self.local else {
+            return self.store.put(key, body).await;
+        };
+        let scope = self.allocation(custody);
+        let allocation = local
+            .acquire(&scope, true)
+            .await
+            .map_err(|error| Error::Task(error.to_string()))?;
+        allocation.put(key, body).await
     }
 
     pub(crate) async fn pending(&self, reservation: &Reservation) -> Result<Option<Preparation>> {
         let locator = self.intent(reservation.custody)?;
-        let Some(frame) = self.metadata(&locator).await? else {
+        let reader = self.reader(reservation.custody).await?;
+        let Some(frame) = Self::metadata(reader.as_ref(), &locator).await? else {
             return Ok(None);
         };
         let intent: Intent = serde_json::from_slice(&frame).map_err(serialization)?;
@@ -204,8 +243,11 @@ impl CheckpointCustody {
             ));
         }
         match self
-            .store
-            .put(&self.intent(reservation.custody)?, Bytes::from(frame))
+            .put(
+                reservation.custody,
+                &self.intent(reservation.custody)?,
+                Bytes::from(frame),
+            )
             .await
         {
             Ok(()) => Ok(source),
@@ -253,7 +295,10 @@ impl CheckpointCustody {
         reservation: Reservation,
         origin: Preparation,
     ) -> Result<Option<Checkpoint>> {
-        let Some(frame) = self.metadata(&self.manifest(reservation.custody)?).await? else {
+        let reader = self.reader(reservation.custody).await?;
+        let Some(frame) =
+            Self::metadata(reader.as_ref(), &self.manifest(reservation.custody)?).await?
+        else {
             return Ok(None);
         };
         let checkpoint = Checkpoint {
@@ -262,7 +307,7 @@ impl CheckpointCustody {
             manifest: fingerprint(&frame),
             custody: reservation.custody,
         };
-        self.read_manifest(checkpoint).await?;
+        self.read_manifest(reader.as_ref(), checkpoint).await?;
         Ok(Some(checkpoint))
     }
 
@@ -304,8 +349,9 @@ impl CheckpointCustody {
             let body = member.read(source).await?;
             let name = self.member(custody, &member.name)?;
             let sha256 = fingerprint(&body);
-            self.store.put(&name, body).await?;
-            let written = self.store.observe_head(&name).await?;
+            self.put(custody, &name, body).await?;
+            let reader = self.reader(custody).await?;
+            let written = reader.observe_head(&name).await?;
             if written.value.key != name || written.value.size != member.logical_bytes as u64 {
                 return Err(invalid(
                     "The copied checkpoint member has a different publication",
@@ -325,8 +371,7 @@ impl CheckpointCustody {
             return Err(invalid("The reserved checkpoint manifest is full"));
         }
         let manifest_sha256 = fingerprint(&frame);
-        self.store
-            .put(&manifest_locator, Bytes::from(frame))
+        self.put(custody, &manifest_locator, Bytes::from(frame))
             .await?;
         Ok(Checkpoint {
             cut: through,
@@ -354,10 +399,11 @@ impl CheckpointCustody {
     }
 
     pub async fn open(&self, chosen: Checkpoint) -> Result<OpenedCheckpoint> {
-        let manifest = self.read_manifest(chosen).await?;
+        let reader = self.reader(chosen.custody).await?;
+        let manifest = self.read_manifest(reader.as_ref(), chosen).await?;
         let checkpoint = manifest.checkpoint;
         let store = Arc::new(ExactStore {
-            bucket: Arc::clone(&self.store),
+            bucket: reader,
             prefix: self.allocation(chosen.custody),
             members: manifest.members,
         });
@@ -371,10 +417,13 @@ impl CheckpointCustody {
         Ok(OpenedCheckpoint { checkpoint, store })
     }
 
-    async fn read_manifest(&self, chosen: Checkpoint) -> Result<Manifest> {
+    async fn read_manifest(
+        &self,
+        reader: &dyn ObjectStore,
+        chosen: Checkpoint,
+    ) -> Result<Manifest> {
         let locator = self.manifest(chosen.custody)?;
-        let frame = self
-            .metadata(&locator)
+        let frame = Self::metadata(reader, &locator)
             .await?
             .ok_or_else(|| invalid("The exact captured checkpoint manifest is unavailable"))?;
         if fingerprint(&frame) != chosen.manifest {
@@ -397,6 +446,21 @@ impl CheckpointCustody {
         Ok(manifest)
     }
 
+    pub(crate) async fn retire_local(&self, chosen: Checkpoint) -> Result<Fingerprint> {
+        let local = self
+            .local
+            .as_ref()
+            .ok_or_else(|| invalid("The checkpoint has no local archive owner"))?;
+        let scope = self.allocation(chosen.custody);
+        let allocation = local.acquire(&scope, true).await?;
+        if !allocation.require_disposition(chosen.manifest).await? {
+            let reader = allocation.read_store()?;
+            self.read_manifest(reader.as_ref(), chosen).await?;
+        }
+        allocation.retire(chosen.manifest).await?;
+        self.disposition(chosen)
+    }
+
     /// The manifest fence is installed last. Its durable token settles a
     /// retry after the member bytes and the manifest have become unreadable.
     pub(crate) async fn retire_s3(
@@ -415,7 +479,7 @@ impl CheckpointCustody {
         let root = self.manifest(chosen.custody)?;
         let preparation = self.intent(chosen.custody)?;
         if !effects.confirms(&root, token).await? {
-            let selected = self.read_manifest(chosen).await?;
+            let selected = self.read_manifest(self.store.as_ref(), chosen).await?;
             for logical in selected.members.keys() {
                 let key = self.member(chosen.custody, &ObjectKey::new(logical.as_str())?)?;
                 effects.fence_create_only(&key, token).await?;
@@ -426,6 +490,11 @@ impl CheckpointCustody {
         if !effects.confirms(&preparation, token).await? {
             return Err(invalid("The provider has not fenced the preparation"));
         }
+        self.disposition(chosen)
+    }
+
+    fn disposition(&self, chosen: Checkpoint) -> Result<Fingerprint> {
+        let token = chosen.custody.allocation;
         let scope = serde_json::to_vec(&self.scope()).map_err(serialization)?;
         let mut attestation = ring::digest::Context::new(&SHA256);
         attestation.update(b"rtdb.multi.ordered-checkpoint-disposition/v1");
@@ -440,8 +509,8 @@ impl CheckpointCustody {
             .expect("SHA-256 is 32 bytes"))
     }
 
-    async fn metadata(&self, key: &ObjectKey) -> Result<Option<Bytes>> {
-        let info = match self.store.head_fresh(key).await {
+    async fn metadata(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Option<Bytes>> {
+        let info = match store.head_fresh(key).await {
             Ok(info) => info,
             Err(Error::MissingObject(_)) => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -450,7 +519,7 @@ impl CheckpointCustody {
             .ok()
             .filter(|bytes| *bytes <= MAX_MANIFEST_BYTES)
             .ok_or_else(|| invalid("Checkpoint metadata exceeds its reservation"))?;
-        Ok(Some(self.store.get_fresh_exact(key, length).await?))
+        Ok(Some(store.get_fresh_exact(key, length).await?))
     }
 
     fn intent(&self, id: Custody) -> rtdb_storage::Result<ObjectKey> {
