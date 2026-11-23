@@ -202,6 +202,8 @@ pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWo
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
+pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
+pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
@@ -1523,6 +1525,27 @@ impl Service {
             .ok_or_else(|| invalid("Owned versions descending must be a non-null Boolean"))?;
         let order = if descending.value(0) { OwnedVersionOrder::Descending } else { OwnedVersionOrder::Ascending };
         Ok((relation, id, OwnedVersionRequest { system, after, scan_limit, result_limit, order }, identity))
+    }
+
+    pub(crate) async fn held_world_parent_touch_images_action(
+        &self, call: &Call, body: &[u8], images: bool,
+    ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Earlier parent touch has no held handle"))?;
+        let (selected, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent touch has no selected publication"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let selected = Timestamp(i64::from_be_bytes(*selected));
+        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let [prior, accepted] = held.snapshot.parent_touch_images_at(
+            &relation, &path, &id, selected, before, group, valid, images,
+        ).await.map_err(status)?;
+        let prior = self.world_point_reply(call, prior, valid, None)?;
+        let accepted = self.world_point_reply(call, accepted, valid, None)?;
+        if wire::add(prior.encoded_len(), accepted.encoded_len())? > self.0.config.maximum_message_bytes {
+            return Err(Status::resource_exhausted("Earlier parent touch images exceed the Flight response limit"));
+        }
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(vec![Ok(prior), Ok(accepted)])
     }
 
     pub(crate) async fn held_world_parent_changes_action(

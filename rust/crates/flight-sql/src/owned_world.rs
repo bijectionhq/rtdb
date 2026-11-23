@@ -172,6 +172,10 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>,
         limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn parent_touch_images_at<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
+    ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>>;
     fn parent_changes_at<'a>(
         &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
         through: Timestamp, limit: usize, reverse: bool,

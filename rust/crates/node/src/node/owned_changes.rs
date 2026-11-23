@@ -799,6 +799,21 @@ pub async fn archived_changes_at_cut(
     Ok(page)
 }
 
+/// Certify a touched full identity and one unchanged installed path at both physical cuts.
+pub async fn archived_path_touch_at_cut(
+    context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
+    id: &EntityId, selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp,
+) -> Result<Vec<String>> {
+    if before.next()? != group || group > selected { return Err(change_feed_uncovered()); }
+    let page = archived_changes_at_cut(Arc::clone(&context), owner, relation, before, group, 1, false).await?;
+    require_path_touch(&page, relation, id, group, valid)?;
+    let prior = context.with_owned_system_cut(before, &context.cancellation)?;
+    let accepted = context.with_owned_system_cut(group, &context.cancellation)?;
+    let selected = context.with_owned_system_cut(selected, &context.cancellation)?;
+    crate::ordered_index::stable_owned_path_columns(&prior, &accepted, owner, relation, path).await?;
+    crate::ordered_index::stable_owned_path_columns(&accepted, &selected, owner, relation, path).await
+}
+
 /// Pages a single Root address in a caller-admitted, pinned archive generation.
 pub async fn archived_versions_at_cut(
     context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,

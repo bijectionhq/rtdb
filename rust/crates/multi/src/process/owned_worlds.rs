@@ -295,6 +295,18 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
+    fn parent_touch_images_at<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
+    ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>> {
+        Box::pin(async move {
+            let [prior, accepted] = HeldCheckpointWorld::parent_touch_images_at(
+                self, relation, path, id, selected, before, group, valid, images,
+            ).await?;
+            Ok([path_touch_result(before, (prior, false)), path_touch_result(group, (accepted, false))])
+        })
+    }
+
     fn parent_changes_at<'a>(
         &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
         through: Timestamp, limit: usize, reverse: bool,
