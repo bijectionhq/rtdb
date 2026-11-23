@@ -385,7 +385,7 @@ impl HeldCheckpointWorld {
             }
             let shadowed = local.is_some();
             let mut fact = match local {
-                Some(fact) => fact.into_shadow(self.open.record.id)?,
+                Some(fact) => self.open.local_fact(relation, fact).await?,
                 None => self.archive_point(relation, id, valid, None).await?,
             };
             if let Some(fact) = &mut fact {
@@ -682,7 +682,7 @@ impl HeldCheckpointWorld {
         let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
         let shadowed = local.is_some();
         let fact = match local {
-            Some(fact) => fact.into_shadow(self.open.record.id)?,
+            Some(fact) => self.open.local_fact(relation, fact).await?,
             None => self.archive_point_checked(relation, id, valid, None, Some(schema)).await?,
         };
         if let Some(fact) = &fact {
@@ -1180,7 +1180,7 @@ impl HeldCheckpointWorld {
             let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
             let shadowed = local.is_some();
             let fact = match local {
-                Some(fact) => fact.into_shadow(self.open.record.id)?,
+                Some(fact) => self.open.local_fact(relation, fact).await?,
                 None => self.archive_point(relation, id, window[0], None).await?,
             };
             if let Some(fact) = fact {
@@ -1569,9 +1569,13 @@ impl<'a> InheritedRelation<'a> {
         self.overlay.check_cancelled()?;
         if let Some(shadow) = shadow {
             if shadow.revision > self.overlay_basis { return Err(unavailable()); }
-            let fact = shadow.into_shadow(self.world)?;
-            if let Some(fact) = &fact {
+            let mut fact = shadow.into_shadow(self.world)?;
+            if let Some(fact) = &mut fact {
                 self.schema.validate_row(&fact.row)?;
+                if let Some(assertion) = &mut fact.assertion {
+                    let (_, reading) = self.accepted_group(fact.revision).await?;
+                    assertion.held_reading = Some(reading);
+                }
             }
             return Ok(Some(fact));
         }

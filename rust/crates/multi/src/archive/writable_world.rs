@@ -1171,7 +1171,7 @@ fn decode_point(
             }
             let revision = rtdb_query::owned_row_revision(batch, row, id, memory)?;
             let assertion = rtdb_query::owned_row_assertion_ordinal(batch, row)?
-                .map(|ordinal| OwnedWorldAssertion { line: None, ordinal });
+                .map(|ordinal| OwnedWorldAssertion { line: None, ordinal, held_reading: None });
             let lifetime = lifetime.map(|duration| {
                 let (created, expires) = rtdb_query::owned_row_lifetime(batch, row, revision, duration)?;
                 Interval::new(created, expires)
@@ -1228,6 +1228,19 @@ impl OpenWorld {
         parent_media(deployment, &self.retained)
     }
 
+    async fn local_fact(&self, relation: &OwnedRelation, fact: WorldFact) -> Result<Option<WorldFact>> {
+        let Some(mut fact) = fact.into_shadow(self.record.id)? else { return Ok(None); };
+        if let Some(assertion) = &mut fact.assertion
+            && matches!(self.record.mode, WorldClockMode::Held { .. })
+        {
+            let reading = self.snapshot.certify_world_accepted_scope(
+                &self.record, std::slice::from_ref(relation), fact.revision,
+            ).await?;
+            assertion.held_reading = Some(reading);
+        }
+        Ok(Some(fact))
+    }
+
     /// Outer absence allows archive fallback. A local tombstone answers absence.
     async fn read_local(
         &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, memory: &Arc<MemoryBudget>,
@@ -1237,7 +1250,7 @@ impl OpenWorld {
         let Some(fact) = decode_point(read.row.into_iter().collect(), id, memory, None)? else {
             return Ok((None, read.witness));
         };
-        let visible = fact.into_shadow(self.record.id)?;
+        let visible = self.local_fact(relation, fact).await?;
         Ok((Some(visible), read.witness))
     }
 }
@@ -1253,13 +1266,13 @@ mod tests {
         let row = WorldShadow::Present(StructFields::from([("_id".into(), id.as_value())])).record(&id)?;
         let ordinal = std::num::NonZeroU32::new(3).unwrap();
         let fact = WorldFact {
-            row, revision: Timestamp(20), assertion: Some(OwnedWorldAssertion { line: None, ordinal }),
+            row, revision: Timestamp(20), assertion: Some(OwnedWorldAssertion { line: None, ordinal, held_reading: None }),
             lifetime: None, _reservation: memory.reserve(4096)?,
         };
         let line = Iid([7; 16]);
         let fact = fact.into_shadow(line)?.unwrap();
         assert_eq!(fact.revision, Timestamp(20));
-        assert_eq!(fact.assertion, Some(OwnedWorldAssertion { line: Some(line), ordinal }));
+        assert_eq!(fact.assertion, Some(OwnedWorldAssertion { line: Some(line), ordinal, held_reading: None }));
         assert_eq!(fact.row.len(), 1);
         Ok(())
     }

@@ -1494,6 +1494,7 @@ rule ConsumeIntake {
 -- The ordered registration checks the source Held generation and binds both prepared positions to the new child.
 -- A point on the retained child reads the archived Held replacement or tombstone first and consults the pinned Root only for an unshadowed identity.
 -- When the winning event carries an assertion ordinal, the point reply carries it with the winning line and event revision.
+-- For a positioned Held winner, the point certifies the clock published with that event.
 -- Point release validates the child's registration and the current Root purge frontier.
 -- A validation carrying an exclusive clock limit checks its exact world and pin at ordering.
 -- Held validation compares the accepted Held clock, Proposal validation compares the ordered present, and retained validation compares the fixed inherited clock.

@@ -319,6 +319,7 @@ const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
 const OWNED_ASSERTION_ORDINAL: &str = "rtdb.owned.assertion_ordinal";
 const OWNED_ASSERTION_LINE: &str = "rtdb.owned.assertion_line";
+const OWNED_ASSERTION_HELD_READING: &str = "rtdb.owned.assertion_held_reading_micros";
 const OWNED_ASSERTION_ORDINALS: &str = "rtdb.owned.assertion_ordinals";
 const OWNED_CHANGE_COVERAGE: &str = "rtdb.owned.change_coverage_micros";
 
@@ -3667,6 +3668,9 @@ impl Service {
                 metadata.insert(OWNED_ASSERTION_LINE.into(),
                     Uuid::from_bytes(assertion.line.map_or([0; 16], |line| line.0)).simple().to_string());
                 metadata.insert(OWNED_ASSERTION_ORDINAL.into(), assertion.ordinal.to_string());
+                if let Some(reading) = assertion.held_reading {
+                    metadata.insert(OWNED_ASSERTION_HELD_READING.into(), reading.0.to_string());
+                }
             }
             let bytes = Value::document_retained_bytes(&row).map_err(status)?;
             let _encoding = call.reserve(wire::add(4096, wire::mul(bytes, 8)?)?)?;

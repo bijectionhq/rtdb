@@ -83,6 +83,7 @@ pub enum WorldClockMode {
 pub struct OwnedWorldAssertion {
     pub line: Option<Iid>,
     pub ordinal: NonZeroU32,
+    pub held_reading: Option<Timestamp>,
 }
 
 impl WorldClockMode {
