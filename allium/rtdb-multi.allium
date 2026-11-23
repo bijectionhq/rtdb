@@ -1354,6 +1354,7 @@ rule ConsumeIntake {
 -- The ordered registration checks the source Held generation and binds both prepared positions to the new child.
 -- A point on the retained child reads the archived Held replacement or tombstone first and consults the pinned Root only for an unshadowed identity.
 -- Point release validates the child's registration and the current Root purge frontier.
+-- A valid-time window on the child combines boundaries from both retained cuts and resolves each slice by the same point rule.
 -- Dropping the source line leaves both independently retained positions available to the child.
 -- A complete valid window includes covered absence across both sources.
 -- An authenticated placed hold can witness the completed window under its original archive pin and the selected relation's local event and Root purge frontiers.

@@ -2504,7 +2504,7 @@ impl Service {
     fn owned_world_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedWorldReadResource>, Status> {
         let entry = self.owned_world_resource(call, handle)?;
         if entry.snapshot.ancestor().is_some() {
-            return Err(Status::unimplemented("This retained world admits exact points only"));
+            return Err(Status::unimplemented("The requested read is unavailable on this retained world"));
         }
         Ok(entry)
     }
@@ -2619,7 +2619,12 @@ impl Service {
 
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = if matches!(selection, WorldHistoricalRead::Current) {
+            self.owned_world_resource(call, &handle)?
+        } else {
+            self.owned_world_read(call, &handle)?
+        };
         let (system, body) = if !matches!(selection, WorldHistoricalRead::Current) {
             let (system, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world schedule has no revision"))?;
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
