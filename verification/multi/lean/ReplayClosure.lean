@@ -42,6 +42,7 @@ structure Table where
   partitions : List (List Trie)
   legacyTries : List Trie
   searchRuns : List Nat
+  storesExpiringTransactionMetadata : Bool
   deriving DecidableEq
 
 structure Checkpoint where
@@ -75,6 +76,7 @@ inductive Body where
   | blockUploaded (storage : Storage) (index : Nat) (tries : Added)
   | triesAdded (storage : Storage) (tries : Added)
   | triesDeleted
+  | tablesRetired
   | artefactsAdded (storage : Storage) (paths : List Nat)
   | artefactsRemoved
   deriving DecidableEq
@@ -90,7 +92,7 @@ def Record.body : Record → Body
   | .oversized _ body => body
 
 structure Selection where
-  checkpoint : Checkpoint
+  checkpoint : Option Checkpoint
   storage : Storage
   catalogs : List (Nat × Checkpoint)
   suffix : List Record
@@ -112,13 +114,26 @@ theorem table_decoding_uses_either_partition_details_or_legacy_flat_details
     (table : Table) (trie : Trie) :
     trie ∈ tableTries table ↔ TableTrie table trie := by
   cases table with
-  | mk path partitions legacy runs =>
+  | mk path partitions legacy runs expires =>
     cases partitions <;> simp [tableTries, TableTrie]
+
+def Selection.firstBlock (selected : Selection) : Nat :=
+  (selected.checkpoint.map (fun checkpoint => checkpoint.root + 1)).getD 0
+
+def RetainedTableTrie (table : Table) (trie : Trie) : Prop :=
+  TableTrie table trie ∧ (table.storesExpiringTransactionMetadata = false ∨ trie.state ≠ .garbage)
+
+def replayTries (table : Table) : List Trie :=
+  (tableTries table).filter fun trie => !(table.storesExpiringTransactionMetadata && trie.state == .garbage)
+
+theorem replay_trie_selection_matches_retention (table : Table) (trie : Trie) :
+    trie ∈ replayTries table ↔ RetainedTableTrie table trie := by
+  simp [replayTries, RetainedTableTrie, table_decoding_uses_either_partition_details_or_legacy_flat_details]
 
 def BaseRead (base : Checkpoint) (key : Key) : Prop :=
   key = .root base.root ∨
     ∃ table ∈ base.tables, key = .tableBlock base.root table.path ∨
-      (∃ trie, TableTrie table trie ∧ TrieRead table.path trie key) ∨
+      (∃ trie, RetainedTableTrie table trie ∧ TrieRead table.path trie key) ∨
       ∃ run ∈ table.searchRuns, Key.searchRun table.path run = key
 
 def AddedRead (tries : Added) (key : Key) : Prop :=
@@ -127,7 +142,7 @@ def AddedRead (tries : Added) (key : Key) : Prop :=
 -- Reads and later references made by an applied body, stated per RTDB driver branch.
 def BodyRead (selected : Selection) : Body → Key → Prop
   | .blockUploaded storage index tries, key =>
-      storage = selected.storage ∧ selected.checkpoint.root < index ∧
+      storage = selected.storage ∧ selected.firstBlock ≤ index ∧
         (key = .root index ∨ (∃ catalog, selected.catalogs.lookup index = some catalog ∧ BaseRead catalog key) ∨
           AddedRead tries key)
   | .triesAdded storage tries, key => storage = selected.storage ∧ AddedRead tries key
@@ -140,7 +155,7 @@ def TailRead (selected : Selection) (key : Key) : Prop :=
       BodyRead selected record.body key
 
 def ReplayRead (selected : Selection) (key : Key) : Prop :=
-  BaseRead selected.checkpoint key ∨ TailRead selected key
+  (∃ base, selected.checkpoint = some base ∧ BaseRead base key) ∨ TailRead selected key
 
 def trieKeys (table : Nat) (trie : Trie) : List Key :=
   let files := [Key.trieData table trie.key, Key.trieMetadata table trie.key]
@@ -148,10 +163,12 @@ def trieKeys (table : Nat) (trie : Trie) : List Key :=
   | .garbage => if trie.level = 0 then files else []
   | .live | .nascent => files ++ trie.artefacts.map Key.artefact
 
+def checkpointTrieFiles (table : Table) : List Key :=
+  (replayTries table).flatMap (trieKeys table.path) ++ table.searchRuns.map (Key.searchRun table.path)
+
 def baseKeys (base : Checkpoint) : List Key :=
   .root base.root :: base.tables.flatMap (fun table =>
-    .tableBlock base.root table.path :: ((tableTries table).flatMap (trieKeys table.path) ++
-      table.searchRuns.map (Key.searchRun table.path)))
+    .tableBlock base.root table.path :: checkpointTrieFiles table)
 
 def addedKeys (tries : Added) : List Key :=
   tries.flatMap (fun added => trieKeys added.1 added.2)
@@ -163,7 +180,7 @@ def catalogKeys (selected : Selection) (index : Nat) : List Key :=
 
 def bodyKeys (selected : Selection) : Body → List Key
   | .blockUploaded storage index tries =>
-      if storage = selected.storage ∧ selected.checkpoint.root < index then
+      if storage = selected.storage ∧ selected.firstBlock ≤ index then
         .root index :: catalogKeys selected index ++ addedKeys tries
       else []
   | .triesAdded storage tries => if storage = selected.storage then addedKeys tries else []
@@ -181,7 +198,7 @@ def tailKeys (selected : Selection) : List Key :=
   selected.suffix.flatMap (recordKeys selected)
 
 def recoveryKeys (selected : Selection) : List Key :=
-  baseKeys selected.checkpoint ++ tailKeys selected
+  (selected.checkpoint.toList.flatMap baseKeys) ++ tailKeys selected
 
 theorem enumerated_trie_keys_match_the_declared_reads (table : Nat) (trie : Trie) (key : Key) :
     key ∈ trieKeys table trie ↔ TrieRead table trie key := by
@@ -195,7 +212,7 @@ theorem enumerated_trie_keys_match_the_declared_reads (table : Nat) (trie : Trie
 
 theorem checkpoint_enumeration_matches_every_typed_base_read (base : Checkpoint) (key : Key) :
     key ∈ baseKeys base ↔ BaseRead base key := by
-  simp [baseKeys, BaseRead, table_decoding_uses_either_partition_details_or_legacy_flat_details,
+  simp [baseKeys, BaseRead, checkpointTrieFiles, replay_trie_selection_matches_retention,
     enumerated_trie_keys_match_the_declared_reads]
 
 theorem added_trie_enumeration_matches_the_declared_reads (tries : Added) (key : Key) :
@@ -214,7 +231,7 @@ theorem body_enumeration_matches_each_driver_branch (selected : Selection) (body
     key ∈ bodyKeys selected body ↔ BodyRead selected body key := by
   cases body with
   | blockUploaded storage index tries =>
-    by_cases applies : storage = selected.storage ∧ selected.checkpoint.root < index
+    by_cases applies : storage = selected.storage ∧ selected.firstBlock ≤ index
     · simp [bodyKeys, BodyRead, applies, bound_catalog_enumeration_matches_its_reads,
         added_trie_enumeration_matches_the_declared_reads]
     · simp only [bodyKeys, BodyRead, ite_eq_right_of_eq_false _ _ (eq_false applies), List.not_mem_nil, false_iff]
@@ -246,7 +263,7 @@ theorem chosen_suffix_enumeration_keeps_payloads_and_decoded_bodies (selected : 
 
 theorem enumeration_covers_every_base_and_suffix_read (selected : Selection) (key : Key) :
     key ∈ recoveryKeys selected ↔ ReplayRead selected key := by
-  simp only [recoveryKeys, ReplayRead, List.mem_append, checkpoint_enumeration_matches_every_typed_base_read,
+  simp [recoveryKeys, ReplayRead, checkpoint_enumeration_matches_every_typed_base_read,
     chosen_suffix_enumeration_keeps_payloads_and_decoded_bodies]
 
 -- The replay driver after term admission. `live` is the open block, one past the installed root.
@@ -259,7 +276,7 @@ structure Replay where
   demands : List Key
 
 def Replay.start (selected : Selection) : Replay :=
-  ⟨selected.checkpoint.root + 1, false, [], [], selected.suffix, []⟩
+  ⟨selected.firstBlock, false, [], [], selected.suffix, []⟩
 
 -- Demand-producing steps carry RTDB's exact guards; skipping and holding are left unrestricted.
 inductive Step (selected : Selection) : Replay → Replay → Prop where
@@ -303,7 +320,7 @@ inductive Reaches (selected : Selection) : Replay → Prop where
 def Covered (selected : Selection) (state : Replay) : Prop :=
   (∀ body ∈ state.work ++ state.held, ∃ record ∈ selected.suffix, record.body = body) ∧
     (∀ record ∈ state.remaining, record ∈ selected.suffix) ∧
-    selected.checkpoint.root < state.live ∧
+    selected.firstBlock ≤ state.live ∧
     ∀ key ∈ state.demands, key ∈ tailKeys selected
 
 theorem payload_keys_are_tail_keys (selected : Selection) (record : Record)
@@ -393,10 +410,10 @@ theorem every_replay_read_is_in_the_typed_tail_enumeration (selected : Selection
 -- Witnesses that the previous payload-only tail enumeration missed reachable reads.
 def uploadStorage : Storage := ⟨1, 0⟩
 
-def adoptedCatalog : Checkpoint := ⟨2, [⟨7, [[⟨5, 0, .live, []⟩]], [], []⟩]⟩
+def adoptedCatalog : Checkpoint := ⟨2, [⟨7, [[⟨5, 0, .live, []⟩]], [], [], false⟩]⟩
 
 def tailWith (records : List Record) : Selection :=
-  ⟨⟨1, []⟩, uploadStorage, [(2, adoptedCatalog)], records⟩
+  ⟨some ⟨1, []⟩, uploadStorage, [(2, adoptedCatalog)], records⟩
 
 theorem an_inline_upload_reads_its_adopted_catalog_and_table_block :
     ∃ state, Reaches (tailWith [.inline (.blockBoundary 2), .inline (.blockUploaded uploadStorage 2 [])]) state ∧
@@ -424,7 +441,7 @@ theorem a_stale_decoded_body_still_needs_its_external_payload :
 -- The identifiers stand for the paths in RTDB's replay_closure fixture.
 def replayFixture : Table :=
   ⟨16384, [[⟨1, 0, .garbage, [50]⟩, ⟨2, 1, .garbage, [50]⟩, ⟨3, 2, .live, [40, 50]⟩,
-    ⟨4, 2, .nascent, [40]⟩]], [⟨2, 1, .live, [50]⟩], [60]⟩
+    ⟨4, 2, .nascent, [40]⟩]], [⟨2, 1, .live, [50]⟩], [60], false⟩
 
 theorem rtdb_replay_fixture_requires_retained_l0_nascent_group_artefacts_and_search_runs :
     baseKeys ⟨2, [replayFixture]⟩ =
@@ -433,6 +450,18 @@ theorem rtdb_replay_fixture_requires_retained_l0_nascent_group_artefacts_and_sea
       .trieData 16384 4, .trieMetadata 16384 4, .artefact 40, .searchRun 16384 60] := by
   decide
 
+theorem expiring_receipt_garbage_l0_is_outside_the_checkpoint :
+    Key.trieData 16384 1 ∉ checkpointTrieFiles { replayFixture with storesExpiringTransactionMetadata := true } := by
+  decide
+
+theorem a_suffix_without_a_checkpoint_can_adopt_block_zero :
+    let root : Checkpoint := ⟨0, []⟩
+    Key.root 0 ∈ tailKeys ⟨none, uploadStorage, [(0, root)], [.inline (.blockUploaded uploadStorage 0 [])]⟩ := by
+  decide
+
+#print axioms expiring_receipt_garbage_l0_is_outside_the_checkpoint
+#print axioms a_suffix_without_a_checkpoint_can_adopt_block_zero
+#print axioms replay_trie_selection_matches_retention
 #print axioms table_decoding_uses_either_partition_details_or_legacy_flat_details
 #print axioms enumerated_trie_keys_match_the_declared_reads
 #print axioms checkpoint_enumeration_matches_every_typed_base_read

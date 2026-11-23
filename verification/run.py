@@ -798,6 +798,23 @@ def verify_checkpoint_replay_closure_lean(args, scratch):
                       "checkpoint-replay-closure", controls, 4)
 
 
+def verify_typed_replay_closure_lean(args, scratch):
+    path = Path("verification/multi/lean/ReplayClosure.lean")
+    controls = {
+        "retain-expired-receipt-tries": (
+            "(tableTries table).filter fun trie => !(table.storesExpiringTransactionMetadata && trie.state == .garbage)",
+            "tableTries table",
+            ["expiring_receipt_garbage_l0_is_outside_the_checkpoint", "replay_trie_selection_matches_retention"],
+        ),
+        "skip-first-checkpointless-block": (
+            "(selected.checkpoint.map (fun checkpoint => checkpoint.root + 1)).getD 0",
+            "(selected.checkpoint.map (fun checkpoint => checkpoint.root + 1)).getD 1",
+            ["a_suffix_without_a_checkpoint_can_adopt_block_zero"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "typed-replay-closure", controls, 19)
+
+
 def verify_reader_reclamation_minimality(args, scratch):
     path = Path("verification/lean/ReaderReclamationMinimality.lean")
     controls = {
@@ -1995,6 +2012,7 @@ def verify_lean(args, scratch):
             verify_pack_publication_lean(args, scratch)
             verify_receipted_checkpoint_lean(args, scratch)
             verify_checkpoint_replay_closure_lean(args, scratch)
+            verify_typed_replay_closure_lean(args, scratch)
             verify_residence_reader_retention(args, scratch)
             verify_delegated_scan(args, scratch, directory)
             verify_compaction_projection(args, scratch, directory)

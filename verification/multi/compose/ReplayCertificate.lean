@@ -22,11 +22,12 @@ theorem every_base_read_has_exact_held_coverage {Failure : Type}
     (survives : PhysicalVersion → Failure → Prop) (inventory : Key → PhysicalVersion → Prop)
     (grants : Grant Key → Prop) (scope : Scope) (selected : Selection) (credible : Failure → Prop)
     (ready : Ready dependencies survives inventory grants scope selected credible)
-    (key : Key) (read : BaseRead selected.checkpoint key) (fault : Failure) (allowed : credible fault) :
+    (base : Checkpoint) (installed : selected.checkpoint = some base)
+    (key : Key) (read : BaseRead base key) (fault : Failure) (allowed : credible fault) :
     ∃ physical, inventory key physical ∧ survives physical fault ∧
       ∃ grant, grants grant ∧ Binds scope key physical grant :=
   every_application_read_has_exact_held_coverage dependencies survives inventory grants scope selected
-    credible ready key (.inl read) fault allowed
+    credible ready key (.inl ⟨base, installed, read⟩) fault allowed
 
 theorem every_reachable_replay_demand_has_exact_held_coverage {Failure : Type}
     (survives : PhysicalVersion → Failure → Prop) (inventory : Key → PhysicalVersion → Prop)
