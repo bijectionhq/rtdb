@@ -26,6 +26,10 @@ pub enum Error {
     LogReadLimit { maximum_records: usize, maximum_payload_bytes: usize },
     #[error("message has {size} bytes; maximum is {maximum}")]
     MessageTooLarge { size: usize, maximum: usize },
+    #[error("the journal writer cannot enqueue the staged record inside its guarded cutoff")]
+    GuardedAppendCutoff,
+    #[error("the journal provider does not implement guarded append")]
+    GuardedAppendUnsupported,
     #[error("cache requires {requested} bytes; limit is {limit} with {retained} retained")]
     MemoryLimit { requested: usize, limit: usize, retained: usize },
     #[error("audience read work exceeded its installed allowance")]
@@ -67,6 +71,8 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::ReadOnlyLog(path) => (Category::Incorrect, "rtdb.storage/read-only-log", serde_json::json!({"path": path})),
             Error::LogReadLimit { maximum_records, maximum_payload_bytes } => (Category::Busy, "rtdb.storage/log-read-limit", serde_json::json!({"maximum-records": maximum_records, "maximum-payload-bytes": maximum_payload_bytes})),
             Error::MessageTooLarge { size, maximum } => (Category::Incorrect, "rtdb.storage/message-too-large", serde_json::json!({"size": size, "maximum": maximum})),
+            Error::GuardedAppendCutoff => (Category::Unavailable, "rtdb.storage/guarded-append-cutoff", serde_json::json!({})),
+            Error::GuardedAppendUnsupported => (Category::Unsupported, "rtdb.storage/guarded-append-unsupported", serde_json::json!({})),
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
             Error::AudienceWorkLimit => (Category::Busy, "rtdb.storage/audience-work-limit", serde_json::json!({})),
             Error::Task(_) => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),

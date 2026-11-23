@@ -48,6 +48,8 @@ The storage engine, the ordering authority and most of the placement machinery b
 The Kafka append, the Appliers' decision, the pgwire hop to a separate XTDB process and a second fence all leave the commit path.
 The lease key in every read set that the `WorldStore` contract uses for "single writer per world" is no longer needed: the holder's epoch already fences the only writer.
 
+The `CommitHostedStaged.v3` Flight action requires a guarded replica provider.
+The provider samples under the journal writer lock after encryption and payload copying, before assigning the offset or sending a replica request.
 For a strict placed acceptance, `rtdb-multi audit-acceptance` reads one replica offset for the exact installation, incarnation and log epoch.
 It requires a matching write quorum, checks the sealed record against that quorum's digest, and exports the original staging sample, cutoff and append timestamp.
 It also reports the audit process's rounded clock immediately after establishing quorum agreement.

@@ -503,7 +503,7 @@ async fn auditing_a_pristine_deployment_does_not_allocate_its_encryption_key() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
-    use rtdb_storage::log::{Log, LogOffset};
+    use rtdb_storage::{Error, log::{GuardedAppend, Log, LogOffset}};
     use rtdb_types::{JournalEndpoint, PlacedAttemptScope, SourcePosition, Term, TermSequence, Timestamp};
 
     let cell = Cell::start(0, None).await;
@@ -531,7 +531,18 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     };
     let broadcast = rtdb_logkeeper::open_writer(stream.clone(), 1, Default::default()).await.unwrap();
     let writer = rtdb_multi::logs::SealedLog::new(broadcast, &key, &deployment.replica_seal_scope()).unwrap();
-    let durable = writer.enqueue(body.encode().into(), Timestamp(124)).await.unwrap().durable().await.unwrap();
+    let cutoff = Timestamp(150);
+    let staging = Timestamp(120);
+    assert!(writer.maximum_guarded_append_bytes().is_some());
+    for late in [118, 149, 200] {
+        let clock = || Timestamp(late);
+        let result = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff)).await;
+        assert!(matches!(result, Err(Error::GuardedAppendCutoff)));
+        assert_eq!(writer.latest().unwrap(), LogOffset(-1));
+    }
+    let clock = || Timestamp(124);
+    let durable = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff))
+        .await.unwrap().durable().await.unwrap();
     assert_eq!(durable.offset, LogOffset(0));
     drop(writer);
     assert_eq!(rtdb_logkeeper::seal_recover_committed(&stream, 2).await.unwrap(), LogOffset(0));
