@@ -1227,7 +1227,7 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         .join("~ordered")
         .join(authority.placement.generation.to_string())
         .join(incumbent.epoch.to_string())
-        .join(storage_root)
+        .join(&storage_root)
         .join("oversized");
     assert!(
         fs::read_dir(original_objects)
@@ -1235,6 +1235,19 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
             .any(|entry| entry.unwrap().path().is_file())
     );
     assert!(route(&routing).await.head.next_lsn > interrupted.head.next_lsn);
+    let generation_root = serving_root
+        .join(record.storage_prefix())
+        .join("~ordered")
+        .join(authority.placement.generation.to_string());
+    let retired_prefix = generation_root.join(incumbent.epoch.to_string());
+    assert!(retired_prefix.join(&storage_root).join("~grant").is_file());
+    // An overlapping reader of the incumbent's prefix, as a zombie process
+    // would hold it, keeps the prefix through every other piece of evidence.
+    let zombie = OpenOptions::new()
+        .read(true)
+        .open(generation_root.join(format!("{}.lifecycle", incumbent.epoch)).join("lock"))
+        .unwrap();
+    zombie.try_lock_shared().unwrap();
 
     let unavailable = installed.endpoints[0].address;
     cohort
@@ -1426,6 +1439,44 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         (marked && removed && settled).then_some(())
     })
     .await;
+
+    let covered = eventually(async || {
+        let view = route(&custodian).await;
+        (view.floor == view.checkpoint.cut && view.checkpoint.cut.next_lsn >= published.head.next_lsn)
+            .then_some(view)
+    })
+    .await;
+    assert!(covered.writer.epoch > incumbent.epoch);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        retired_prefix.join(&storage_root).join("~grant").is_file(),
+        "a held prefix is retained after the journal no longer needs it"
+    );
+    drop(zombie);
+    let lifecycle = generation_root.join(format!("{}.lifecycle", incumbent.epoch));
+    let receipt = generation_root.join("~retired").join(format!("{}.settled", incumbent.epoch));
+    eventually(async || (!retired_prefix.exists() && lifecycle.join("closed").is_file() && receipt.is_file()).then_some(())).await;
+    let settled: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(settled["intent"]["grant"]["epoch"], json!(incumbent.epoch));
+    assert_eq!(settled["intent"]["grant"]["worker"], json!(incumbent.enrollment.worker));
+    assert_eq!(settled["intent"]["inventory"], json!("local_directory"));
+    let successor = generation_root.join(elected.epoch.to_string());
+    assert!(successor.join(&storage_root).join("~grant").is_file(), "the current grant's prefix survives");
+    let late = OpenOptions::new().read(true).open(lifecycle.join("lock")).unwrap();
+    late.try_lock_shared().unwrap();
+    assert!(lifecycle.join("closed").is_file(), "a late reader finds the permanent closure");
+    drop(late);
+
+    let reopened = common::connect(&sql_address.to_string(), "shop").await;
+    assert_eq!(
+        common::values(&reopened, "SELECT total FROM orders").await,
+        ["11", "70"]
+    );
+    assert_eq!(
+        common::values(&reopened, "SELECT octet_length(body) FROM suffix_values WHERE _id = 1").await,
+        ["1310720"]
+    );
+    drop(reopened);
 
     serving.cancel();
     tokio::time::timeout(DEADLINE, sql)

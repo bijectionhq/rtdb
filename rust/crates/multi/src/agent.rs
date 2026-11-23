@@ -1611,6 +1611,8 @@ impl NodeAgent {
             }
             let retirement = placement.retire_unheld_checkpoint(self.keys.as_ref());
             let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
+            let serving = placement.retire_serving_prefixes(&self.options.storage);
+            let _ = tokio::time::timeout(self.options.activation_timeout, serving).await;
         }
     }
 

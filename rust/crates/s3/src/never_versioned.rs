@@ -502,6 +502,40 @@ mod tests {
         .unwrap();
     }
 
+    fn uploads(body: &'static str) -> Exchange<'static> {
+        Exchange { method: "GET", path: "/cell/?uploads&max-uploads=1000", conditions: &[], status: "200 OK", headers: "", body }
+    }
+
+    #[tokio::test]
+    async fn draining_an_epoch_prefix_aborts_only_its_own_uploads() {
+        const BOTH: &str = "<ListMultipartUploadsResult><Bucket>cell</Bucket><IsTruncated>false</IsTruncated>\
+            <Upload><Key>cell/prefix/1/v/pending</Key><UploadId>one</UploadId></Upload>\
+            <Upload><Key>cell/prefix/10/v/pending</Key><UploadId>ten</UploadId></Upload></ListMultipartUploadsResult>";
+        const SUCCESSOR: &str = "<ListMultipartUploadsResult><Bucket>cell</Bucket><IsTruncated>false</IsTruncated>\
+            <Upload><Key>cell/prefix/10/v/pending</Key><UploadId>ten</UploadId></Upload></ListMultipartUploadsResult>";
+        let (inventory, server) = fixture(vec![
+            uploads(BOTH),
+            Exchange { method: "DELETE", path: "/cell/cell/prefix/1/v/pending?uploadId=one", conditions: &[], status: "204 No Content", headers: "", body: "" },
+            Exchange {
+                method: "GET", path: "/cell/cell/prefix/1/v/pending?uploadId=one&max-parts=1", conditions: &[],
+                status: "404 Not Found", headers: "", body: "<Error><Code>NoSuchUpload</Code></Error>",
+            },
+            uploads(SUCCESSOR),
+            uploads(SUCCESSOR),
+            profile("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"),
+            profile(BUCKET_CHECK),
+        ])
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            inventory.drain_uploads(&ObjectKey::new("prefix/1").unwrap()).await.unwrap();
+            inventory.require_versioned().await.unwrap();
+            assert!(inventory.require_versioned().await.is_err(), "an unversioned bucket keeps no exact versions");
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     fn reserve() -> Exchange<'static> {
         Exchange {
             method: "POST",

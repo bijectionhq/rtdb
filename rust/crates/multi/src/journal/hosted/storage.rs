@@ -1,3 +1,4 @@
+use super::prefix_retirement::{DESCRIPTOR, GrantDescriptor, local_lifetime};
 use super::{Routes, genesis, invalid, material};
 use crate::deployment::CellStorage;
 use crate::journal::{
@@ -107,16 +108,17 @@ impl RemoteStorageFactory for StoreFactory {
             };
             (Some(opened.store), BlockDiscovery::AtPublished(published))
         };
-        let bucket = self.storage.bucket(Arc::clone(&io)).await?;
         let storage_prefix = placement.record.storage_prefix();
         let installed = placement.worker.placement();
+        let io = local_lifetime(&self.storage, &grant_prefix(&storage_prefix, installed.generation, grant.epoch), &io)?;
+        let bucket = self.storage.bucket(Arc::clone(&io)).await?;
         let prefix = source_prefix(&storage_prefix, installed.generation, grant.epoch, root);
         let writer = match (&self.storage, &self.scoped_writes) {
             (CellStorage::S3 { config }, Some(scoped)) => {
                 let authorization: Arc<dyn rtdb_s3::WriteAuthorization> = scope.clone();
                 Some(
                     scoped
-                        .ordered_writer(config, &prefix, authorization, io)
+                        .ordered_writer(config, &prefix, authorization, Arc::clone(&io))
                         .await?,
                 )
             }
@@ -129,6 +131,9 @@ impl RemoteStorageFactory for StoreFactory {
             crate::reference::PrefixedStore::new(Arc::clone(&bucket), prefix).with_writer(writer),
         );
         crate::store::check_root(upper.as_ref(), &placement.record.id, true).await?;
+        let descriptor = serde_json::to_vec(&GrantDescriptor::new(&placement, grant))
+            .map_err(|error| invalid(&error.to_string()))?;
+        upper.put(&ObjectKey::new(DESCRIPTOR)?, Bytes::from(descriptor)).await?;
         let upper: Arc<dyn ObjectStore> = Arc::new(EncryptingStore::new(upper, &material)?);
         let store = Arc::new(ServingStore {
             lower,
@@ -139,6 +144,8 @@ impl RemoteStorageFactory for StoreFactory {
                 storage_prefix,
                 root: root.clone(),
                 bucket,
+                storage: self.storage.clone(),
+                io,
                 material,
             }),
             _protection: Some(protection),
@@ -153,13 +160,17 @@ impl RemoteStorageFactory for StoreFactory {
     }
 }
 
+pub(super) fn grant_prefix(storage_prefix: &str, generation: u64, writer_epoch: u64) -> String {
+    format!("{storage_prefix}/~ordered/{generation}/{writer_epoch}")
+}
+
 fn source_prefix(
     storage_prefix: &str,
     generation: u64,
     writer_epoch: u64,
     root: &ObjectKey,
 ) -> String {
-    format!("{storage_prefix}/~ordered/{generation}/{writer_epoch}/{root}")
+    format!("{}/{root}", grant_prefix(storage_prefix, generation, writer_epoch))
 }
 
 pub(super) struct ReplicaObjects {
@@ -167,6 +178,8 @@ pub(super) struct ReplicaObjects {
     storage_prefix: String,
     root: ObjectKey,
     bucket: Arc<dyn ObjectStore>,
+    storage: CellStorage,
+    io: Arc<IoRegion>,
     material: Vec<u8>,
 }
 
@@ -181,7 +194,9 @@ impl ReplicaObjects {
             installed: placement.worker.placement(),
             storage_prefix: placement.record.storage_prefix(),
             root: ObjectKey::new(crate::archive::checkpoint_storage_root()?)?,
-            bucket: storage.bucket(io).await?,
+            bucket: storage.bucket(Arc::clone(&io)).await?,
+            storage: storage.clone(),
+            io,
             material: material.to_vec(),
         })
     }
@@ -210,10 +225,16 @@ impl ReplicaObjects {
             epoch,
             &self.root,
         );
-        let bucket = Arc::new(crate::reference::PrefixedStore::new(
-            Arc::clone(&self.bucket),
-            prefix,
-        ));
+        let bucket = match &self.storage {
+            CellStorage::Local { .. } => {
+                let scope = grant_prefix(&self.storage_prefix, self.installed.generation, epoch);
+                let lifetime = local_lifetime(&self.storage, &scope, &self.io)
+                    .map_err(|error| Error::Task(error.to_string()))?;
+                self.storage.bucket(lifetime).await.map_err(|error| Error::Task(error.to_string()))?
+            }
+            CellStorage::S3 { .. } => Arc::clone(&self.bucket),
+        };
+        let bucket = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix));
         let owner = self.installed.deployment.to_string();
         let marker = ObjectKey::new(crate::store::ROOT_MARKER)?;
         if bucket.get_fresh_exact(&marker, owner.len()).await?.as_ref() != owner.as_bytes() {
@@ -236,13 +257,11 @@ pub(super) async fn reopen_source(
     origin: Preparation,
 ) -> Result<Arc<dyn ObjectStore>> {
     let root = ObjectKey::new(crate::archive::checkpoint_storage_root()?)?;
-    let prefix = source_prefix(
-        &placement.record.storage_prefix(),
-        placement.worker.placement().generation,
-        origin.writer.epoch,
-        &root,
-    );
-    let bucket = storage.bucket(Arc::clone(io)).await?;
+    let storage_prefix = placement.record.storage_prefix();
+    let generation = placement.worker.placement().generation;
+    let prefix = source_prefix(&storage_prefix, generation, origin.writer.epoch, &root);
+    let io = local_lifetime(storage, &grant_prefix(&storage_prefix, generation, origin.writer.epoch), io)?;
+    let bucket = storage.bucket(io).await?;
     let upper = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix));
     crate::store::check_root(upper.as_ref(), &placement.record.id, false).await?;
     let upper = Arc::new(EncryptingStore::new(upper, key)?);

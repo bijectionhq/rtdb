@@ -1,0 +1,156 @@
+{
+  "summary": "An installed journal's serving prefix retires only for a fenced earlier grant, after the scoped write horizon, with an exact binding, an independent checkpoint trimmed to its cut, no retained record or preparation from that grant, drained provider admission and a qualified provider.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "retirement",
+    "--verify-root"
+  ],
+  "min_verified_functions": 9,
+  "controls": {
+    "retire_the_current_grant": {
+      "defect": "The prefix of the grant the journal currently names is retired.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "        Some(current) => current != retired,",
+          "replace": "        Some(_) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "superseded",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "retire_a_later_grant": {
+      "defect": "A prefix written by a grant newer than the observed route is retired.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "    retired < writer_epoch && match grant",
+          "replace": "    match grant"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "superseded",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "expire_at_the_fence": {
+      "defect": "Scoped credentials issued before the fence are still usable when the prefix is erased.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "&& now_ms >= observed_at_ms + horizon_ms\n}",
+          "replace": "&& now_ms >= observed_at_ms\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "leases_expired",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "ignore_retained_records": {
+      "defect": "Offloaded payloads of a retained record lose their bytes.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && !preparing_from_grant && drained && qualified\n}",
+          "replace": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !preparing_from_grant && drained && qualified\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "may_retire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "ignore_untrimmed_history": {
+      "defect": "Records below the selected cut, which inspection cannot see, still name the grant.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && !preparing_from_grant && drained && qualified\n}",
+          "replace": "    superseded && exact_binding && independent_checkpoint && true\n        && !retained_from_grant && !preparing_from_grant && drained && qualified\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "may_retire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "ignore_preparation": {
+      "defect": "A pending preparation copies from the erased prefix.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && !preparing_from_grant && drained && qualified\n}",
+          "replace": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && drained && qualified\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "may_retire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "ignore_drain": {
+      "defect": "A zombie writer or reader still holds the prefix.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && !preparing_from_grant && drained && qualified\n}",
+          "replace": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && !preparing_from_grant && qualified\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "may_retire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "ignore_provider": {
+      "defect": "An unqualified provider erases without exact disposition.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && !preparing_from_grant && drained && qualified\n}",
+          "replace": "    superseded && exact_binding && independent_checkpoint && trimmed_to_checkpoint\n        && !retained_from_grant && !preparing_from_grant && drained\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "function": "may_retire",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    }
+  }
+}

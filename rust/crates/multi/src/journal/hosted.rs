@@ -1,6 +1,7 @@
 //! Attachment of an installed journal to RTDB's database factories.
 
 mod discovery;
+pub(crate) mod prefix_retirement;
 mod storage;
 
 use super::{
@@ -604,6 +605,15 @@ impl Placement {
             .settle_checkpoint(&current, retired.checkpoint, disposition)
             .await?;
         Ok(())
+    }
+
+    /// Serving prefixes are separate from checkpoint archives: each belongs
+    /// to one writer grant and is retired against the journal's evidence.
+    pub(crate) async fn retire_serving_prefixes(
+        &self,
+        storage: &crate::deployment::CellStorage,
+    ) -> Result<Vec<(u64, prefix_retirement::Outcome)>> {
+        prefix_retirement::retire(self, storage).await
     }
 
     async fn pin_root(&self, source: Hold, tasks: &TaskTracker) -> Result<Arc<Held>> {

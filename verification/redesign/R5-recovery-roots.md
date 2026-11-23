@@ -489,6 +489,13 @@ If the provider reports a missing or replaced publication after terminal authori
 
 
 
+### Installed serving prefixes
+
+Each installed writer grant has its own serving prefix, separate from checkpoint archives and from Directory-managed L0 collection.
+[RTDBServingPrefixRetirement](../multi/tla/RTDBServingPrefixRetirement.tla) checks that retirement removes the prefix only after the fence, the trim to an independent checkpoint, the absence of retained records from the grant, and the drain of its writes, and that it never reaches the successor's prefix.
+Each guard has a mutation that TLC rejects; the pending-preparation guard is implied by the retained-record guard in the model and is checked by Verus instead.
+[Verus](../verus/serving_prefix_retirement/proof.rs) checks the production guards for supersession, the scoped write horizon and the combined evidence.
+
 ### Cell transfer attempts
 
 [RTDBCellTransferAttempts](../multi/tla/RTDBCellTransferAttempts.tla) checks that a transfer that meets conflicting immutable bytes moves to a fresh generation only after closing and draining its attempt, that only the selected prepared attempt and its receipt can be routed, and that disposal never reaches a selected generation.

@@ -475,6 +475,16 @@ contract LogService {
         -- The journal orders publication under the custodian before accepting trim through that cut.
         -- A live replay reservation protects its exact interval, and an independent checkpoint hold protects its original root.
 
+    @invariant InstalledServingPrefixRetirement
+        -- Each writer grant writes its blocks and offloaded payloads below its own serving prefix, named by the installation, journal group and generation, and grant epoch, and records its exact grant there when it opens.
+        -- The custodian retires the prefix of an earlier grant only when the journal names a later grant, the selected checkpoint is independent, the journal is trimmed to its cut, and no retained record or pending preparation comes from that grant.
+        -- Retirement first records an intent bound to the grant, the physical provider and its inventory kind, and the time the fence was first observed.
+        -- A local prefix retires under an exclusive lock that no reader or writer holds, records a permanent closed marker, and is then removed; later opens find the marker and are refused.
+        -- An exact-version S3 prefix retires after the scoped write horizon from the observed fence, with its uploads drained and every version and delete marker removed.
+        -- An enrolled never-versioned S3 prefix retires after the same horizon by conditional tombstones on every member, its grant record last, with its uploads drained.
+        -- An unqualified provider or a prefix without its grant record is refused.
+        -- A settled receipt records the evidence, and a retry resumes from the recorded intent.
+
     @invariant FreshJournalReadConsumesAnInvocation
         -- The chosen read result authenticates the exact placement, writer grant, invocation and applied cut.
         -- The receiving database applies the protected cut before the fresh read can proceed.

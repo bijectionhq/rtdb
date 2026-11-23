@@ -185,6 +185,26 @@ impl VersionedInventory {
         else { Err(unavailable("The version or multipart inventory changed during erasure")) }
     }
 
+    /// Aborts every multipart upload under the prefix and confirms that none
+    /// remains, so no upload begun earlier can still complete there.
+    pub async fn drain_uploads(&self, scope: &ObjectKey) -> Result<()> {
+        let prefix = self.prefix(scope);
+        self.abort_uploads(&prefix).await?;
+        if self.multipart_batch(&prefix).await?.is_empty() { Ok(()) }
+        else { Err(unavailable("A multipart upload is still listed after draining the prefix")) }
+    }
+
+    /// Exact-version retirement needs every overwrite and deletion to leave
+    /// an addressable version, which only an enabled configuration provides.
+    pub async fn require_versioned(&self) -> Result<()> {
+        let reply = self.client.get_bucket_versioning().bucket(&self.namespace.bucket).send().await
+            .map_err(|error| unavailable(format!("Checking bucket versioning failed: {error}")))?;
+        if reply.status() != Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled) || self.terminal_allocation.is_some() {
+            return Err(unavailable("The serving bucket does not retain exact object versions"));
+        }
+        Ok(())
+    }
+
     /// Observes the version and multipart inventories without modifying either.
     pub async fn is_empty(&self, deployment: &ObjectKey) -> Result<bool> {
         let prefix = self.prefix(deployment);
@@ -492,6 +512,59 @@ mod tests {
             inventory.retire_observed_version(&key, &observed).await.expect("pagination must bind the key and version together");
             server.await.unwrap();
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retiring_one_epoch_prefix_drains_and_purges_only_that_epoch() {
+        let Ok(endpoint) = std::env::var("RTDB_S3_ENDPOINT") else { return };
+        let endpoint_url = url::Url::parse(&endpoint).unwrap();
+        if !matches!(endpoint_url.host(), Some(url::Host::Ipv4(host)) if host.is_loopback()) { return; }
+        let remotes = BTreeMap::<String, S3Credentials>::new();
+        let root = ObjectKey::new("cell").unwrap();
+        let open = |bucket: &str| {
+            let mut config = S3Config::new(bucket);
+            config.endpoint = Some(endpoint.clone());
+            config.region = Some("us-east-1".into());
+            config.path_style_access_enabled = true;
+            config
+        };
+        let unversioned = format!("rtdb-epoch-plain-{}", uuid::Uuid::new_v4().simple());
+        let plain = open(&unversioned).versioned_inventory(&root, &remotes).await.unwrap();
+        plain.client.create_bucket().bucket(&unversioned).send().await.unwrap();
+        assert!(plain.require_versioned().await.is_err(), "an unversioned bucket cannot retire exact versions");
+
+        let bucket = format!("rtdb-epoch-test-{}", uuid::Uuid::new_v4().simple());
+        let config = open(&bucket);
+        let inventory = config.versioned_inventory(&root, &remotes).await.unwrap();
+        let client = &inventory.client;
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client.put_bucket_versioning().bucket(&bucket)
+            .versioning_configuration(VersioningConfiguration::builder().status(BucketVersioningStatus::Enabled).build())
+            .send().await.unwrap();
+        inventory.require_versioned().await.unwrap();
+        let physical = |key: &str| Path::from(format!("{}/{key}", inventory.root)).to_string();
+        for key in ["prefix/1/v/block", "prefix/10/v/block"] {
+            client.put_object().bucket(&bucket).key(physical(key)).body(ByteStream::from_static(b"block")).send().await.unwrap();
+        }
+        let mut uploads = Vec::new();
+        for key in ["prefix/1/v/pending", "prefix/10/v/pending"] {
+            let upload = client.create_multipart_upload().bucket(&bucket).key(physical(key)).send().await.unwrap();
+            uploads.push(upload.upload_id().unwrap().to_owned());
+        }
+        let retired = ObjectKey::new("prefix/1").unwrap();
+        let successor = ObjectKey::new("prefix/10").unwrap();
+        inventory.drain_uploads(&retired).await.unwrap();
+        let listed = client.list_multipart_uploads().bucket(&bucket).send().await.unwrap();
+        let remaining: Vec<_> = listed.uploads().iter().filter_map(|upload| upload.upload_id()).collect();
+        assert_eq!(remaining, [uploads[1].as_str()], "the successor's upload survives");
+        inventory.purge(&retired).await.unwrap();
+        assert!(inventory.is_empty(&retired).await.unwrap());
+        assert!(!inventory.is_empty(&successor).await.unwrap());
+        let survivor = client.get_object().bucket(&bucket).key(physical("prefix/10/v/block")).send().await.unwrap();
+        assert_eq!(survivor.body.collect().await.unwrap().into_bytes().as_ref(), b"block");
+        inventory.purge(&successor).await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        client.delete_bucket().bucket(&unversioned).send().await.unwrap();
     }
 
     #[tokio::test]

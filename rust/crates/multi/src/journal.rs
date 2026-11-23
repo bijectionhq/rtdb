@@ -16,6 +16,7 @@ use ordered_logkeeper::ordered::{
 
 pub mod custody;
 pub mod hosted;
+mod prefix_retirement;
 mod log;
 pub(crate) use log::{Held, JournalLog};
 use ordered_logkeeper::ordered::TrimResult;
