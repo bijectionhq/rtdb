@@ -169,6 +169,7 @@ pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_WORLD_TOUCH_AFTER_V1: &str = "rtdb.owned.ReadHeldWorldTouchAfter.v1";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
@@ -1089,6 +1090,17 @@ impl Service {
         let (id, identity) = point_identity(call, batch)?;
         let valid = history_request_endpoint(batch, "valid_micros")?;
         Ok((before, group, relation, path, id, valid, identity))
+    }
+
+    pub(crate) async fn held_world_touch_after_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World touch after-image has no held handle"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (_, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let result = held.snapshot.path_touch_after(&relation, &path, &id, group, valid).await.map_err(status)?;
+        let reply = self.world_point_reply(call, result, valid, None)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
     }
 
     pub(crate) async fn held_world_path_touch_action(

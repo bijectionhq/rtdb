@@ -184,19 +184,7 @@ impl HeldCheckpointWorld {
         let (columns, [before, after]) = self.open.snapshot.world_path_touch(
             self.open.record.id, relation, path, id, group, valid,
         ).await?;
-        let guard = self.open.snapshot.relation_release_guard([relation])?;
-        let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::PathColumns {
-            relation: relation.clone(), path: path.clone(), guard, reply,
-        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-        let parent_columns = self.cancellation.run_until_cancelled(result).await
-            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
-        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
-        if parent_columns != columns || columns.last().is_none_or(|column| column != "_id")
-            || columns[..columns.len() - 1].iter().any(|column| schema.path_column_type(column).is_none())
-        {
-            return Err(OwnedWorld::unavailable());
-        }
+        self.require_parent_path(relation, path, &columns).await?;
         let mut sides = [(None, false), (None, false)];
         for (local, side) in [before, after].into_iter().zip(&mut sides) {
             let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
@@ -221,6 +209,48 @@ impl HeldCheckpointWorld {
         }
         self.check_relation(relation)?;
         Ok(sides)
+    }
+
+    pub async fn path_touch_after(
+        &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
+        group: Timestamp, valid: Timestamp,
+    ) -> Result<WorldFact> {
+        self.check_relation(relation)?;
+        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+        if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
+            return Err(OwnedWorld::unavailable());
+        }
+        let (columns, local) = self.open.snapshot.world_path_touch_after(
+            self.open.record.id, relation, path, id, group, valid,
+        ).await?;
+        self.require_parent_path(relation, path, &columns).await?;
+        let fact = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?
+            .filter(|fact| fact.revision == group).ok_or_else(OwnedWorld::unavailable)?;
+        let WorldShadow::Present(row) = WorldShadow::from_record(fact.row)? else {
+            return Err(OwnedWorld::unavailable());
+        };
+        schema.validate_row(&row)?;
+        self.check_relation(relation)?;
+        Ok(WorldFact { row, revision: fact.revision, lifetime: None, _reservation: fact._reservation })
+    }
+
+    async fn require_parent_path(
+        &self, relation: &OwnedRelation, path: &OwnedRelation, columns: &[String],
+    ) -> Result<()> {
+        let guard = self.open.snapshot.relation_release_guard([relation])?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::PathColumns {
+            relation: relation.clone(), path: path.clone(), guard, reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let parent_columns = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+        if parent_columns != columns || columns.last().is_none_or(|column| column != "_id")
+            || columns[..columns.len() - 1].iter().any(|column| schema.path_column_type(column).is_none())
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        Ok(())
     }
 
     pub async fn parent_point(
