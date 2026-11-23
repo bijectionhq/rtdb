@@ -184,11 +184,6 @@ impl TrieCollection {
     }
 
     fn protected(&self, table: &TableRef, key: &TrieKey) -> bool {
-        // The directory's next advance reads every L0 source after its sealed prefix, and a collected one would leave a hole in it.
-        if key.level() == 0 && self.current.trie_catalog().entity_directory(table)
-            .is_some_and(|directory| key.block_index().0 > directory.through_block()) {
-            return true;
-        }
         let checkpoint_requires = self.current.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key));
         any_reference_requires(checkpoint_requires, self.readers.len(), |index| {
             self.readers[index].trie(table, key).is_some_and(|trie| trie.state == TrieState::Live)

@@ -111,26 +111,6 @@ mod tests {
     }
 
     #[test]
-    fn collection_keeps_garbage_l0_sources_the_directory_has_not_sealed() {
-        use std::collections::BTreeMap;
-
-        let table = TableRef::new("public", "docs");
-        let trie = |block| TrieKey::l0(BlockIndex(block)).unwrap();
-        let state = crate::PartitionState::empty(rtdb_trie::TrieConfig::default()).unwrap();
-        state.add_tries(&BTreeMap::from([(table.clone(),
-            (0..3).map(|block| CatalogTrie::notification(trie(block), 10, None).unwrap()).collect())]), Timestamp(1)).unwrap();
-        let sealed = EntityDirectoryRoot {
-            root: Some(RootRef { digest: PageDigest([1; 32]), length: 512, height: 0, summary: Vec::new() }.encode()),
-            through_block: Some(0), source_rows: Some(10), has_erases: Some(false), allocation: Some(vec![0; 16]),
-            writer_fence: Some(3), erase_frontier_digest: Some(vec![0; 32]),
-        };
-        state.add_artefacts_at(&table, vec![(trie(0), EntityDirectoryChange { root: Some(sealed), replaces_root: None }.to_artefact().unwrap())], Timestamp(2));
-        let compacted = CatalogTrie::notification("l01-rc-b02".parse().unwrap(), 30, None).unwrap();
-        state.add_tries(&BTreeMap::from([(table.clone(), vec![compacted])]), Timestamp(3)).unwrap();
-        assert_eq!(state.trie_collection().eligible(&table, Timestamp(i64::MAX)), vec![trie(0)]);
-    }
-
-    #[test]
     fn a_stale_directory_replacement_does_not_change_either_catalog_generation() {
         let table = TableRef::new("public", "docs");
         let trie = |block| TrieKey::l0(BlockIndex(block)).unwrap();
