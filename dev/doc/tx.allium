@@ -1427,6 +1427,10 @@ surface SqlStatements {
     @guarantee WriteOnlyWriting
         -- A Writing transaction rejects queries; a read-only transaction rejects DML.
 
+    @guarantee PgwireCancellationDuringSort
+        -- The JVM external sorter checks for cancellation while merging spilled runs.
+        -- PgWire returns SQLSTATE 57014 when a client cancellation interrupts query execution.
+
     @guarantee ConnectionScopedIdentity
         -- Every transaction this connection submits is stamped with the connection's
         -- user; it is not a per-transaction option.
