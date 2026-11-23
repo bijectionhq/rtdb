@@ -572,6 +572,7 @@ impl TransactionBuffer {
         self.owned_position = Some(0);
         Ok(())
     }
+    pub fn retains_owned_positions(&self) -> bool { self.owned_position.is_some() }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> {
         let columns: Vec<_> = columns.into_iter().collect();
         let table_bytes = table.schema.capacity().checked_add(table.table.capacity()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Declared table size overflow"))?;

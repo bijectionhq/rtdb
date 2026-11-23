@@ -1746,6 +1746,9 @@ impl<'a> OpenTransaction<'a> {
     fn reserve_bounded_period_write(
         &mut self, relation: &rtdb_types::OwnedRelation, id: rtdb_types::EntityId,
     ) -> Result<()> {
+        if relation.is_root_data() && self.buffer.retains_owned_positions() {
+            return Ok(());
+        }
         let bytes = id.as_value().retained_bytes()?.checked_mul(2)
             .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(overflow)?;
         let key = (relation.clone(), id);

@@ -647,6 +647,9 @@ Root kind 6 lands a reviewed Proposal under the original live Root and Proposal 
 Its acceptance-valid writes may replace the same complete key in order after the first checked create or replacement.
 Every write occupies a separate assertion position, and the first write binds the original Root presence or absence for that key.
 The original held Proposal supplies its final local point check for the same key.
+Fixed-period landings may assert several intervals for one complete key in the same accepted commit.
+Each distinct authored start requires a Root point check and a guarded point on the held Proposal's final timeline.
+Each written period relation also requires the held Root range and Proposal timeline frontiers.
 Root kind 7 selects one exact hosted Proposal Drop with the original Proposal handle and zero world witnesses.
 It carries the original live Root handle, a matching witnessed acceptance-valid Root delete, and checked custody replacements plus the registered receipt.
 The ordered source compares the physical pin and held overlay clock before terminal registration.
