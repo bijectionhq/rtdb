@@ -12,7 +12,10 @@ use ordered_logkeeper::ordered::{
 };
 use prost_types::Any;
 use rtdb_directory::{Checkpoint as RtdbCheckpoint, DeploymentRecord};
-use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
+use rtdb_format::{
+    database::proto::{DatabaseConfig, RemoteStorage, database_config},
+    envelope::{ReplicaBody, ReplicaEnvelope},
+};
 use rtdb_node::{LogAccess, LogFactory, OpenedLogs};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, Result};
@@ -431,6 +434,14 @@ impl Placement {
             let staged = match provider.prepared(reservation, origin).await? {
                 Some(prepared) => prepared,
                 None => {
+                    self.validate_checkpoint_boundary(
+                        custodian,
+                        published,
+                        reservation,
+                        origin,
+                        &material,
+                    )
+                    .await?;
                     let source =
                         storage::reopen_source(self, serving, &provider, &material, &io, origin)
                             .await?;
@@ -445,6 +456,54 @@ impl Placement {
                 return Ok(Some(origin.checkpoint));
             }
         }
+    }
+
+    async fn validate_checkpoint_boundary(
+        &self,
+        custodian: &InstalledJournal,
+        base: Checkpoint,
+        reservation: Reservation,
+        origin: Preparation,
+        material: &[u8],
+    ) -> Result<()> {
+        let preparation = origin.ordered(reservation)?;
+        let previous = origin
+            .through
+            .next_lsn
+            .checked_sub(1)
+            .ok_or_else(|| invalid("A checkpoint must advance the chosen data cut"))?;
+        let from = custodian.checkpoint_cut(previous).await?;
+        let maximum = crate::process::MAXIMUM_LOG_MESSAGE_BYTES as u64
+            + ordered_logkeeper::ordered::APPEND_RECORD_CHARGE_BYTES;
+        let page = custodian
+            .checkpoint_replay(preparation, base, from, maximum)
+            .await?;
+        let [boundary] = page.records.as_slice() else {
+            return Err(invalid(
+                "The prepared checkpoint has no single chosen boundary",
+            ));
+        };
+        let bytes = crate::cipher::Cipher::new(material)?
+            .open(&self.record.replica_seal_scope(), &boundary.payload)?;
+        let Some(ReplicaEnvelope {
+            message: ReplicaBody::BlockBoundary(chosen),
+            ..
+        }) = ReplicaEnvelope::decode(&bytes)?
+        else {
+            return Err(invalid(
+                "The prepared checkpoint does not end at a chosen native boundary",
+            ));
+        };
+        let source = chosen.latest_processed_msg_id.map_or(-1, |source| {
+            rtdb_types::SourcePosition(source).after_offset(self.worker.log_epoch())
+        });
+        if chosen.block_index != Some(origin.checkpoint.block) || source != origin.checkpoint.source
+        {
+            return Err(invalid(
+                "The prepared catalog differs from its chosen boundary",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn retain_selected(&self) -> Result<()> {

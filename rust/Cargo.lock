@@ -3167,7 +3167,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=7604e245835846c8dad6f00c0cf7014caab9d3c9#7604e245835846c8dad6f00c0cf7014caab9d3c9"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=1da7955405f0abaf4c4f7d06c57d21c5dbe89118#1da7955405f0abaf4c4f7d06c57d21c5dbe89118"
 dependencies = [
  "bytes",
  "crc32fast",

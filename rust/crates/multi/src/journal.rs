@@ -209,6 +209,29 @@ impl InstalledJournal {
         Ok(page)
     }
 
+    pub async fn checkpoint_replay(
+        &self,
+        preparation: CheckpointPreparation,
+        base: Checkpoint,
+        from: Cut,
+        maximum_bytes: u64,
+    ) -> Result<ReplayPage> {
+        match self
+            .call(Operation::CheckpointReplay {
+                preparation,
+                base,
+                from,
+                maximum_bytes,
+            })
+            .await?
+        {
+            Reply::Replay(page) => Ok(page),
+            _ => Err(mismatch(
+                "The peer did not return the prepared checkpoint replay",
+            )),
+        }
+    }
+
     pub async fn replay_head(&self, hold: Hold, from: Cut) -> Result<Option<ReplayHead>> {
         let reply = self.call(Operation::ReplayHead { hold, from }).await?;
         let Reply::ReplayHead(head) = reply else {
