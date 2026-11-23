@@ -292,6 +292,29 @@ impl HostedReplay {
         Ok(())
     }
 
+    pub(crate) fn requires_base_payload(&self, control: &HostedControlWrite) -> bool {
+        control.name() == RESTORE && match control.id() {
+            EntityId::String(id) => matches!(id.as_str(), "restore" | "archive")
+                || (id == NATIVE_FRONTIER && self.previous.is_some()),
+            _ => false,
+        }
+    }
+
+    fn same_original_capture(&self, other: &Self) -> bool {
+        other.binding == self.binding && other.archive == self.archive && other.through == self.through
+            && other.original_authority == self.original_authority
+            && other.captured == self.captured && other.handoff == self.handoff
+    }
+
+    pub(crate) fn matches_parent_receipt(&self, body: &[u8], parent: rtdb_types::TransactionKey) -> bool {
+        body.len() <= 4096 && serde_json::from_slice::<Self>(body).is_ok_and(|candidate| {
+            self.same_original_capture(&candidate) && candidate.has_original_prefix()
+                && candidate.source == parent && original_prefix(parent, self.source)
+        })
+    }
+
+    pub(crate) fn holds_binding(&self) -> [u8; 32] { self.binding }
+
     pub(crate) fn check_base(&self, control: &HostedControlWrite, row: Option<&arrow_array::RecordBatch>) -> Result<()> {
         use arrow_array::{Array, BinaryArray};
         if control.name() != RESTORE { return Ok(()); }
@@ -311,9 +334,7 @@ impl HostedReplay {
                 let bytes = binding()?;
                 if bytes.len() > 4096 { return Err(replay_invalid()); }
                 let previous: Self = serde_json::from_slice(bytes).map_err(|_| replay_invalid())?;
-                previous.binding == self.binding && previous.archive == self.archive && previous.through == self.through
-                    && previous.original_authority == self.original_authority
-                    && previous.captured == self.captured && previous.handoff == self.handoff
+                self.same_original_capture(&previous) && previous.has_original_prefix()
                     && Some(previous.source) == self.previous && previous.logical_at < self.logical_at
             }
             _ => true,

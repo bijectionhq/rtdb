@@ -161,7 +161,7 @@ impl OpenTransaction<'_> {
                 Arc::clone(&context),
                 table,
                 control.id(),
-                false,
+                replay.as_ref().is_some_and(|replay| replay.requires_base_payload(control)),
             )
             .await?;
             if let Some(replay) = &replay {

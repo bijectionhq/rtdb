@@ -5,14 +5,24 @@ use std::{
     sync::Arc,
 };
 
+use arrow_array::{Array, BinaryArray};
 use rtdb_format::data::{StoredEvent, StoredOperation};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedChangeKind, OwnedRelation, OwnedWorld, Result, StructFields,
-    Timestamp, Value, WorldClockMode, WorldShadow,
+    TableRef, Timestamp, TransactionKey, Value, WorldClockMode, WorldShadow,
 };
 
 use super::{OpenTransaction, no_owned_principal, overflow, validate_owned_schema};
 use crate::hosted_control::{HostedReplay, ReplayWorlds};
+
+#[derive(serde::Serialize)]
+struct ReplayedWorldParent {
+    binding: [u8; 32],
+    world: [u8; 16],
+    pin: [u8; 16],
+    original: TransactionKey,
+    destination: Timestamp,
+}
 
 impl OpenTransaction<'_> {
     pub(super) async fn restore_owned_worlds(
@@ -60,6 +70,8 @@ impl OpenTransaction<'_> {
                 }
                 _ => return Err(OwnedWorld::unavailable()),
             }
+            self.record_replayed_world_parent(replay, context, &world)
+                .await?;
             self.buffer.put(
                 OwnedRelation::world_catalog().table(owner),
                 world.record(),
@@ -161,5 +173,56 @@ impl OpenTransaction<'_> {
             self.record_owned_change(&relation, shadow.id, change, shadow.valid)?;
         }
         Ok(())
+    }
+
+    async fn record_replayed_world_parent(
+        &mut self,
+        replay: &HostedReplay,
+        context: &Arc<rtdb_query::QueryContext>,
+        world: &OwnedWorld,
+    ) -> Result<()> {
+        let table = TableRef::new("public", "bj_rtdb_restore_hold");
+        let original = EntityId::String(format!("native-transaction/{}", world.basis.tx_id.0));
+        let point = rtdb_query::read_hosted_control_point(
+            Arc::clone(context),
+            table.clone(),
+            &original,
+            true,
+        )
+        .await?;
+        let Some((row, destination)) = point.row else {
+            // A retained world may have been forked between two recorded
+            // Original publications. Its parent still needs a covering proof.
+            return Ok(());
+        };
+        let bytes = row
+            .batch()
+            .column_by_name("binding")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .filter(|column| column.is_valid(0))
+            .ok_or_else(OwnedWorld::unavailable)?;
+        if destination <= replay.source_time()
+            || destination >= self.tx_key().system_time
+            || !replay.matches_parent_receipt(bytes.value(0), world.basis)
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        let parent = ReplayedWorldParent {
+            binding: replay.holds_binding(),
+            world: world.id.0,
+            pin: world.pin.0,
+            original: world.basis,
+            destination,
+        };
+        let locator = format!("native-world-parent/{}/{}", world.id, world.pin);
+        let body = serde_json::to_vec(&parent).map_err(|_| OwnedWorld::unavailable())?;
+        self.buffer.put(
+            table,
+            StructFields::from([
+                ("_id".into(), Value::Utf8(locator)),
+                ("binding".into(), Value::Binary(body)),
+            ]),
+            Interval::new(Timestamp(0), Timestamp::MAX)?,
+        )
     }
 }
