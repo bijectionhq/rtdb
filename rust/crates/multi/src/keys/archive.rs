@@ -250,18 +250,20 @@ pub(super) trait CaptureCryptography: Send + Sync {
     }
 }
 
+struct CaptureKey<T>(T);
+
 #[async_trait::async_trait]
-impl<T: CaptureCryptography> ObjectCipher for T {
+impl<T: CaptureCryptography> ObjectCipher for CaptureKey<T> {
     async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
         match operation {
-            UnitOperation::Grant => self.grant(name).await,
-            operation => self.crypt(name.clone(), operation).await,
+            UnitOperation::Grant => self.0.grant(name).await,
+            operation => self.0.crypt(name.clone(), operation).await,
         }
     }
 }
 
 pub(super) fn tracked_archive_key(key: impl CaptureCryptography + 'static) -> Arc<dyn ArchiveKey> {
-    let key = Arc::new(key);
+    let key = Arc::new(CaptureKey(key));
     Arc::new(TrackedArchiveKey { inner: key.clone(), delivery: key })
 }
 
@@ -363,9 +365,9 @@ pub(super) fn with_archive_unit(
 }
 
 #[async_trait::async_trait]
-impl<T: CaptureCryptography> ArchiveKey for T {
+impl<T: CaptureCryptography> ArchiveKey for CaptureKey<T> {
     async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.crypt(
+        self.0.crypt(
             associated_unit(associated)?,
             UnitOperation::SealValue(associated.to_owned(), plaintext),
         )
@@ -374,7 +376,7 @@ impl<T: CaptureCryptography> ArchiveKey for T {
     }
 
     async fn open(&self, associated: &str, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.crypt(
+        self.0.crypt(
             associated_unit(associated)?,
             UnitOperation::OpenValue(associated.to_owned(), ciphertext),
         )
@@ -383,13 +385,13 @@ impl<T: CaptureCryptography> ArchiveKey for T {
     }
 
     async fn seal_object(&self, name: &ObjectKey, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.crypt(name.clone(), UnitOperation::Seal(plaintext))
+        self.0.crypt(name.clone(), UnitOperation::Seal(plaintext))
             .await?
             .bytes()
     }
 
     async fn open_object(&self, name: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.crypt(name.clone(), UnitOperation::Open(sealed))
+        self.0.crypt(name.clone(), UnitOperation::Open(sealed))
             .await?
             .bytes()
     }
@@ -399,7 +401,7 @@ impl<T: CaptureCryptography> ArchiveKey for T {
         name: &ObjectKey,
         sealed: Bytes,
     ) -> rtdb_storage::Result<FramedObject> {
-        self.crypt(name.clone(), UnitOperation::Header(sealed))
+        self.0.crypt(name.clone(), UnitOperation::Header(sealed))
             .await?
             .header()
     }
@@ -411,13 +413,13 @@ impl<T: CaptureCryptography> ArchiveKey for T {
         frames: Range<usize>,
         sealed: Bytes,
     ) -> rtdb_storage::Result<Bytes> {
-        self.crypt(name.clone(), UnitOperation::Frames(layout, frames, sealed))
+        self.0.crypt(name.clone(), UnitOperation::Frames(layout, frames, sealed))
             .await?
             .bytes()
     }
 
     async fn matches(&self, candidate: [u8; KEY_BYTES]) -> Result<bool> {
-        self.matches_authority_key(candidate).await
+        self.0.matches_authority_key(candidate).await
     }
 }
 
