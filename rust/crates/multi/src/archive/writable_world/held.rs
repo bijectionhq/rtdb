@@ -162,6 +162,7 @@ enum ArchiveRead {
         frontiers: Vec<i64>,
         query: String,
         overlay: Option<rtdb_node::HeldTextCorpus>,
+        ancestor_schemas: Option<Vec<rtdb_types::OwnedSchema>>,
         offset: usize,
         limit: usize,
         valid: Timestamp,
@@ -796,6 +797,16 @@ impl HeldCheckpointWorld {
             }).collect::<Result<Vec<_>>>()?;
             Some((system, schemas))
         } else { None };
+        let ancestor_schemas = if self.ancestor().is_some() {
+            if parent_at.is_some() || earlier.is_some() || frontiers.iter().any(|frontier| *frontier != 0) {
+                return Err(OwnedWorld::unavailable());
+            }
+            Some(partitions.iter().map(|(relation, _)| {
+                self.historical_parent_schema(relation).cloned()
+            }).collect::<Result<Vec<_>>>()?)
+        } else {
+            None
+        };
         let historical = parent_at.is_some();
         let writable = self.clock_mode().is_writable();
         let use_overlay = writable && !historical && !earlier.is_some_and(|(_, parent_only)| parent_only);
@@ -813,7 +824,7 @@ impl HeldCheckpointWorld {
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Search {
             partitions: partitions.clone(), frontiers, query: query.clone(), overlay,
-            offset, limit, valid, parent_at, guard: Arc::clone(&guard), reply,
+            ancestor_schemas, offset, limit, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -1439,7 +1450,7 @@ impl<'a> InheritedRelation<'a> {
         Ok(Self { root, overlay, owner, relation, shadow, overlay_basis: ancestor.basis.system_time, schema, memory })
     }
 
-    async fn point(&self, id: &EntityId, valid: Interval) -> Result<Option<WorldFact>> {
+    async fn shadow(&self, id: &EntityId, valid: Interval) -> Result<Option<Option<WorldFact>>> {
         let unavailable = OwnedWorld::unavailable;
         let mut shadow = None;
         if let Some(mut rows) = rtdb_query::open_owned_point(
@@ -1461,8 +1472,16 @@ impl<'a> InheritedRelation<'a> {
                     Some(WorldFact { row, revision: shadow.revision, lifetime: None, _reservation: shadow._reservation })
                 }
             };
-            return Ok(fact);
+            return Ok(Some(fact));
         }
+        Ok(None)
+    }
+
+    async fn point(&self, id: &EntityId, valid: Interval) -> Result<Option<WorldFact>> {
+        if let Some(shadow) = self.shadow(id, valid).await? {
+            return Ok(shadow);
+        }
+        let unavailable = OwnedWorld::unavailable;
         let batches = read_checkpoint_point_in_context(Arc::clone(&self.root), CheckpointPoint {
             owner: self.owner, relation: self.relation, id, valid: Some(valid),
         }, None).await?;
@@ -1532,6 +1551,40 @@ impl<'a> InheritedRelation<'a> {
             cursor = Some((through.clone(), self.memory.reserve(through.len())?));
         }
         Err(OwnedWorld::unavailable())
+    }
+
+    async fn search_shadows(
+        &self, path: &OwnedRelation, partition: usize, valid: Timestamp,
+        corpus: &mut rtdb_node::HeldTextCorpus, remaining: &mut usize,
+    ) -> Result<()> {
+        let unavailable = OwnedWorld::unavailable;
+        let column = rtdb_node::owned_text_column(
+            Arc::clone(&self.root), self.owner, self.relation, path,
+        ).await?;
+        let archived = rtdb_node::owned_text_column(
+            Arc::clone(&self.overlay), self.owner, self.relation, path,
+        ).await?;
+        if column != archived || !self.schema.path_column_logical_type(&column)
+            .is_some_and(|kind| kind.is_clear_search_text())
+        {
+            return Err(unavailable());
+        }
+        let instant = Interval::at(valid)?;
+        let mut cursor = None;
+        loop {
+            let after = cursor.as_ref().map(|(key, _): &(String, Arc<MemoryReservation>)| key.as_str());
+            let page = self.overlay_identity_page(valid, after, 128).await?;
+            *remaining = remaining.checked_sub(page.keys.len()).ok_or_else(unavailable)?;
+            for key in &page.keys {
+                let id = EntityId::String(key.clone());
+                let shadow = self.shadow(&id, instant).await?.ok_or_else(unavailable)?;
+                let text = shadow.as_ref().map(|row| search_text(row, &column)).transpose()?.flatten();
+                corpus.shadow(partition, id, text)?;
+            }
+            if !page.more { return Ok(()); }
+            let key = page.keys.last().ok_or_else(unavailable)?;
+            cursor = Some((key.clone(), self.memory.reserve(key.len())?));
+        }
     }
 
     async fn schedule(&self, id: &EntityId, valid: Interval) -> Result<Vec<(Interval, Timestamp)>> {
@@ -2086,7 +2139,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Search { partitions, frontiers, query, overlay, offset, limit, valid, parent_at, guard, mut reply } => {
+                                ArchiveRead::Search { partitions, frontiers, query, overlay, ancestor_schemas, offset, limit, valid, parent_at, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner,
@@ -2095,6 +2148,35 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let scoped = if let Some((system, schemas)) = parent_at {
                                             exact_historical_parent_context(scoped, &owner, system, &schemas).await?
                                         } else { scoped };
+                                        let overlay = if let Some(schemas) = ancestor_schemas {
+                                            let ancestor = ancestor.as_ref().ok_or_else(OwnedWorld::unavailable)?;
+                                            let media = ancestor_media(deployment, ancestor);
+                                            let corpus = with_checkpoint_context(
+                                                archive.directory.as_ref(), &archive.storage, archive.keys.as_ref(),
+                                                archive.hosted_task.as_ref(), &media,
+                                                CheckpointReadResources {
+                                                    node: &archive.options, memory, cache: Arc::clone(&ancestor_cache), cancellation: scope,
+                                                },
+                                                |overlay| {
+                                                    let overlay = overlay.with_owned_read_guard(Arc::clone(&guard));
+                                                    let (root, owner, partitions, query) = (&scoped, &owner, &partitions, &query);
+                                                    async move {
+                                                        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(memory), query)?;
+                                                        let mut remaining = 4096;
+                                                        for (index, ((relation, path), schema)) in partitions.iter().zip(schemas).enumerate() {
+                                                            let inherited = InheritedRelation::open(
+                                                                Arc::clone(root), Arc::clone(&overlay), owner, relation, ancestor, &schema, memory,
+                                                            ).await?;
+                                                            inherited.search_shadows(path, index, valid, &mut corpus, &mut remaining).await?;
+                                                        }
+                                                        Ok(corpus)
+                                                    }
+                                                },
+                                            ).await?;
+                                            Some(corpus)
+                                        } else {
+                                            overlay
+                                        };
                                         let page = rtdb_node::rank_owned_overlay_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay).await?;
                                         guard()?;
                                         Ok(page)

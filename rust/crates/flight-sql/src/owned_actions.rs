@@ -2032,7 +2032,12 @@ impl Service {
         } else { (None, request) };
         let (valid, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world search valid instant"))?;
         let valid = Timestamp(i64::from_be_bytes(*valid));
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = if matches!(mode, WorldHistoricalRead::Current) {
+            self.owned_world_resource(call, &handle)?
+        } else {
+            self.owned_world_read(call, &handle)?
+        };
         let rank = owned_rank_request(call, request)?;
         if !rank.observe {
             return Err(Status::failed_precondition("Search requires evidence for every selected world partition"));
