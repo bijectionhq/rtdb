@@ -3998,6 +3998,8 @@ async fn bounded_retries_preserve_terminal_aborts_and_do_not_reopen_after_clock_
     assert_eq!(conflict.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-conflict"));
 
     clock.0.store(cutoff, Ordering::Relaxed);
+    assert!(session.state_mut().execute_tx(vec![put(&node, 0, 0)], Default::default()).await.unwrap().committed());
+    clock.0.store(cutoff - 1, Ordering::Relaxed);
     let expired = session.state_mut().execute_tx(vec![put(&node, 3, 30)], retry_options(&node, 2)).await.unwrap();
     assert_eq!(expired.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-expired"));
     drop(session);

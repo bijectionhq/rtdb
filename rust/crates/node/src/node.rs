@@ -639,11 +639,35 @@ impl Node {
         Ok(None)
     }
 
+    async fn check_placed_receipt_window(&self, database: &str, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<()> {
+        let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let [installed] = context.catalog.database(database)?.partitions.as_slice() else {
+            return Err(bad_attempt_outcome());
+        };
+        let Some(latest) = installed.tx_basis() else { return Ok(()); };
+        if !installed.column_names(&TableRef::new("xt", "txs")).contains("receipt_time") { return Ok(()); }
+        let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::I64))]), default_timezone: context.timezone.clone(), ..Default::default() };
+        let prepared = prepare_query("SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?;
+        let mut cursor = prepared.execute(context, vec![Value::I64(latest.tx_id.0)]).await?;
+        while let Some(page) = cursor.next_batch().await? {
+            let batch = page.batch();
+            if batch.num_rows() == 0 { continue; }
+            let value = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
+            let value = match value {
+                Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => value,
+                Value::Null | Value::Undefined => return Ok(()),
+                _ => return Err(Anomaly::fault("rtdb.node/retention-clock", "The installed receipt clock has no timestamp")),
+            };
+            if value >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS) {
+                return Err(Anomaly::incorrect("rtdb/await-token-expired", "The transaction attempt receipt has expired"));
+            }
+        }
+        Ok(())
+    }
+
     async fn redeem_placed_attempt(&self, db: &Database, attempt: PlacedAttempt, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<(TransactionResult, String)> {
         let codec = db.await_authority.codec().ok_or_else(invalid_token)?;
-        if self.now().0 >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS) {
-            return Err(Anomaly::incorrect("rtdb/await-token-expired", "The transaction attempt receipt has expired"));
-        }
         let epoch = attempt.scope().writer_epoch();
         let current = codec.scope().writer_epoch();
         let through = match &db.await_authority {
@@ -665,6 +689,7 @@ impl Node {
             }
             _ => return Err(invalid_token()),
         };
+        self.check_placed_receipt_window(db.name(), submitted_at, identity, placement, cancellation).await?;
         let key = match db.progress().current().placed_outcome(attempt) {
             Some(key) => Some(key),
             None => self.placed_outcome_key(db.name(), attempt, identity, placement, cancellation).await?,
@@ -3184,8 +3209,8 @@ impl SessionService for NativeSessionService {
         let token = PlacedToken::open(token, authority, self.identity.user())?;
         if let PlacedToken::Pending { attempt, submitted_at } = token
             && attempt.scope() == authority.scope()
-            && self.node.now().0 < submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS)
         {
+            self.node.check_placed_receipt_window(database, submitted_at, self.identity.as_ref(), self.placement.as_ref(), cancellation).await?;
             // A later submission in this intake can only resolve after earlier attempts in the same epoch.
             return Ok(());
         }

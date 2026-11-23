@@ -1693,7 +1693,7 @@ async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp, positio
     let effects = Arc::clone(&fixture.driver.effects);
     let resolver = fixture.driver.leader.as_mut().unwrap().resolver_mut().unwrap();
     let verdict = super::check_db_op(effects.as_ref(), resolver, operation);
-    let staged = resolver.resolve_db_op(snapshot, position, Timestamp(100), operation.clone(), verdict, &resolve).unwrap();
+    let staged = resolver.resolve_db_op(snapshot, position, Timestamp(100), operation.clone(), verdict, &resolve).await.unwrap();
     let key = staged.result().tx_key();
     let (completion, receipt) = oneshot::channel();
     fixture.driver.enqueue_resolved(staged, Some(completion)).await.unwrap();

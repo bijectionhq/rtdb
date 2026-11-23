@@ -1,9 +1,9 @@
 use rtdb_columnar::read_value;
-use rtdb_types::{Anomaly, AnomalyCategory, Interval, PlacedAttemptScope, Result, StructFields, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttemptScope, Result, StructFields, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use sha2::{Digest, Sha256};
 
 use crate::bounded_retry::{BoundedRetry, bounded_receipts_table, duplicate};
-use crate::idempotency_window::{BoundedWindow, advance_retry_clock, bounded_window};
+use crate::idempotency_window::{BoundedWindow, bounded_window};
 use crate::{SourceTransaction, resolver::{OpenTransaction, interval, time_value}};
 
 pub(super) struct RetryScope(String);
@@ -15,8 +15,6 @@ impl RetryScope {
         });
         Self(scope)
     }
-
-    fn clock_id(&self) -> String { format!("clock/v1/{}", self.0) }
 
     fn receipt_id(&self, principal: Option<&str>, retry: BoundedRetry) -> String {
         let mut digest = Sha256::new();
@@ -34,12 +32,6 @@ impl RetryScope {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct RetryClock {
-    pub(super) observed: Timestamp,
-    pub(super) changed: bool,
-}
-
 pub(super) struct BoundedReceipt {
     id: String,
     digest: String,
@@ -47,34 +39,11 @@ pub(super) struct BoundedReceipt {
 }
 
 impl OpenTransaction<'_> {
-    pub(super) async fn bounded_retry_clock(&self, scope: &RetryScope, appended: Timestamp) -> Result<RetryClock> {
-        let table = bounded_receipts_table();
-        let mut previous = None;
-        if self.snapshot()?.contains_table(&table) {
-            let mut query = self.open_query(
-                "SELECT observed_time FROM xt.bounded_retry_receipts FOR ALL VALID_TIME WHERE _id = ?",
-                vec![Value::Utf8(scope.clock_id())],
-            ).await?;
-            while let Some(batch) = query.next_batch().await? {
-                let batch = batch.batch();
-                if batch.num_rows() == 0 { continue; }
-                let observed = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
-                let Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } = observed else {
-                    return Err(Anomaly::fault("rtdb.tx/bounded-retry-clock", "The durable retry clock has no timestamp"));
-                };
-                previous = Some(Timestamp(value));
-                break;
-            }
-        }
-        let observed = Timestamp(advance_retry_clock(previous.unwrap_or(appended).0, appended.0));
-        Ok(RetryClock { observed, changed: previous != Some(observed) })
-    }
-
     pub(super) async fn admit_bounded_retry(
-        &self, scope: &RetryScope, request: &SourceTransaction, retry: BoundedRetry, clock: RetryClock,
+        &self, scope: &RetryScope, request: &SourceTransaction, retry: BoundedRetry, observed: Timestamp,
     ) -> Result<Result<Option<BoundedReceipt>>> {
         let cutoff = retry.cutoff();
-        match bounded_window(clock.observed.0, cutoff.0) {
+        match bounded_window(observed.0, cutoff.0) {
             BoundedWindow::Expired => return Ok(Err(Anomaly::incorrect("rtdb/idempotency-expired", "The bounded retry identity reached its exclusive cutoff"))),
             BoundedWindow::TooLong => return Ok(Err(Anomaly::incorrect("rtdb/idempotency-window", "The bounded retry deadline is more than an hour after admission"))),
             BoundedWindow::Open => {}
@@ -119,11 +88,4 @@ impl OpenTransaction<'_> {
         self.buffer.put(bounded_receipts_table(), row, interval(observed, receipt.cutoff)?)
     }
 
-    pub(super) fn write_bounded_retry_clock(&mut self, scope: &RetryScope, observed: Timestamp) -> Result<()> {
-        let row = StructFields::from([
-            ("_id".into(), Value::Utf8(scope.clock_id())),
-            ("observed_time".into(), time_value(observed)),
-        ]);
-        self.buffer.put(bounded_receipts_table(), row, Interval::ALL)
-    }
 }

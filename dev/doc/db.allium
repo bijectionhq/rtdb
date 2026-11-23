@@ -2005,6 +2005,8 @@ open question "Which node-local caller failures during committed database-operat
 
 open question "How should operator-selected skipped transactions be represented in this processing model?"
     -- The pinned resolver persists the source payload under skipped-txs before staging an aborted xt.txs row carrying xtdb/skipped-tx.
+    -- Each ordered source transaction carries the raw append observation and the greatest such observation through its predecessor.
+    -- The receipt clock advances atomically with the transaction outcome in the replica record and is restored at checkpoint recovery.
     -- Its transaction ID is the source position and its system time is smoothed against the resolved head.
     -- The skip takes effect before decoding transaction operations and uses the ordinary append, read-back and apply pipeline.
 

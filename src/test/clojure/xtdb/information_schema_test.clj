@@ -137,8 +137,9 @@
                             [txs "_valid_to" 5 1184 8]
                             [txs "committed" 6 16 1]
                             [txs "error" 7 16384 -1]
-                            [txs "system_time" (if *source-log-time-column?* 9 8) 1184 8]]
-                     *source-log-time-column?* (conj [txs "source_log_time" 8 1184 8]))]
+                            [txs "system_time" (if *source-log-time-column?* 10 8) 1184 8]]
+                     *source-log-time-column?* (conj [txs "receipt_time" 8 1184 8]
+                                                [txs "source_log_time" 9 1184 8]))]
     (t/is (= (set (for [[attrelid attname attnum atttypeid attlen] attributes]
                   {:atttypmod -1,
                    :attrelid attrelid,
@@ -156,7 +157,7 @@
                               attnotnull, atttypmod, attidentity, attgenerated
                        FROM pg_catalog.pg_attribute
                        WHERE attname IN ('_id', '_valid_from', '_valid_to', '_system_from', '_system_to',
-                                         'col1', 'col2', 'error', 'source_log_time', 'system_time', 'committed')"))))))
+                                         'col1', 'col2', 'error', 'receipt_time', 'source_log_time', 'system_time', 'committed')"))))))
 
 (deftest test-pg-tables
   (xt/submit-tx tu/*node* test-data)
