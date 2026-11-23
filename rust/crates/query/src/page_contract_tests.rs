@@ -1,22 +1,24 @@
 use super::*;
+use crate::columnar::{BatchCursor, BoxBatchCursor, ColumnBatch};
+use crate::cursor::OwnedRow;
 use std::{collections::VecDeque,sync::atomic::{AtomicUsize,Ordering}};
 use rtdb_columnar::MemoryBudget;
 use rtdb_plan::{ColumnId,Field};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
 use rtdb_types::{LogicalType,ScalarType,Timestamp};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot,DatabaseSnapshot,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::{RuntimeSchema, EmittedRelation}};
+use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters};
 
 struct Input { pages: VecDeque<Vec<i64>>,polls: Arc<AtomicUsize>,failure: Option<usize>,memory: Arc<MemoryBudget> }
 #[async_trait]
-impl PageCursor for Input {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+impl BatchCursor for Input {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let poll = self.polls.fetch_add(1,Ordering::SeqCst);
         if self.failure == Some(poll) { return Err(rtdb_types::Anomaly::fault("test/page","Source page failed")); }
         let Some(rows) = self.pages.pop_front() else { return Ok(None); };
         let mut page = PageBuilder::new(rows.len(),&self.memory)?;
         for value in rows { page.push(OwnedRow::new(vec![Value::I64(value)],&self.memory)?)?; }
-        Ok(Some(page.finish()))
+        ColumnBatch::from_page(&page.finish(), &self.memory).map(Some)
     }
 }
 fn execution(batch_rows: usize) -> Execution {
@@ -25,14 +27,12 @@ fn execution(batch_rows: usize) -> Execution {
     let context = QueryContext::new(catalog,MemoryBudget::new(1 << 26),Timestamp(0),"UTC",QueryOptions { batch_rows,..Default::default() },&CancellationToken::new()).unwrap();
     Execution { parameters: Arc::new(BoundParameters::infer(vec![],&context.memory).unwrap()),outer: OuterRows::empty(&context.memory).unwrap(),context,bindings: None,analysis: None }
 }
-fn input(pages: Vec<Vec<i64>>,execution: &Execution) -> (BoxPageCursor,Arc<AtomicUsize>) {
+fn input(pages: Vec<Vec<i64>>,execution: &Execution) -> (BoxBatchCursor,Arc<AtomicUsize>) {
     let polls = Arc::new(AtomicUsize::new(0));
     (Box::new(Input { pages: pages.into(),polls: Arc::clone(&polls),failure: None,memory: Arc::clone(&execution.context.memory) }),polls)
 }
-fn values(mut page: OwnedPage) -> Vec<i64> {
-    let mut output = Vec::new();
-    while let Some(row) = page.next() { let Value::I64(value) = row.values[0] else { panic!() };output.push(value); }
-    output
+fn values(batch: ColumnBatch) -> Vec<i64> {
+    (0..batch.len).map(|row| rtdb_expr::integer(&batch.columns[0].value(row).unwrap()).unwrap() as i64).collect()
 }
 fn schema() -> Schema { Schema::new(vec![Field { id: ColumnId(0),name: "n".into(),qualifier: None,qualified_only: false,unnamed: false,data_type: LogicalType::Scalar(ScalarType::I64) }]).unwrap() }
 fn table(rows: &[i64]) -> Arc<Relation> {
@@ -45,10 +45,10 @@ async fn top_slices_source_pages_and_does_not_pull_after_its_limit() {
         let execution = execution(batch_rows);
         let (input,polls) = input(vec![vec![],vec![0,1,2],vec![3,4,5],vec![6]],&execution);
         let baseline = execution.context.memory.used_bytes();
-        let mut cursor = Limit { input: Some(input),offset: 1,remaining: Some(4),execution: execution.clone() };
-        assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),[1,2]);
-        assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),[3,4]);
-        assert!(cursor.next_page().await.unwrap().is_none());
+        let mut cursor = BatchLimit { input: Some(input),offset: 1,remaining: Some(4),context: Arc::clone(&execution.context) };
+        assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),[1,2]);
+        assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),[3,4]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
         assert_eq!(polls.load(Ordering::SeqCst),3);
         drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);
     }
@@ -58,8 +58,8 @@ async fn top_slices_source_pages_and_does_not_pull_after_its_limit() {
 async fn zero_limit_without_offset_does_not_advance_its_input() {
     let execution = execution(1);
     let (input,polls) = input(vec![vec![1]],&execution);
-    let mut cursor = Limit { input: Some(input),offset: 0,remaining: Some(0),execution };
-    assert!(cursor.next_page().await.unwrap().is_none());
+    let mut cursor = BatchLimit { input: Some(input),offset: 0,remaining: Some(0),context: Arc::clone(&execution.context) };
+    assert!(cursor.next_batch().await.unwrap().is_none());
     assert_eq!(polls.load(Ordering::SeqCst),0);
 }
 
@@ -67,8 +67,8 @@ async fn zero_limit_without_offset_does_not_advance_its_input() {
 async fn zero_limit_with_positive_offset_consumes_complete_pages_until_the_offset() {
     let execution = execution(1);
     let (input,polls) = input(vec![vec![0,1,2,3],vec![4,5,6,7],vec![8,9,10,11],vec![12]],&execution);
-    let mut cursor = Limit { input: Some(input),offset: 10,remaining: Some(0),execution };
-    assert!(cursor.next_page().await.unwrap().is_none());
+    let mut cursor = BatchLimit { input: Some(input),offset: 10,remaining: Some(0),context: Arc::clone(&execution.context) };
+    assert!(cursor.next_batch().await.unwrap().is_none());
     assert_eq!(polls.load(Ordering::SeqCst),3);
 }
 
@@ -78,8 +78,8 @@ async fn zero_limit_with_positive_offset_preserves_input_errors_before_the_offse
     let polls = Arc::new(AtomicUsize::new(0));
     let input = Box::new(Input { pages: vec![vec![0,1,2]].into(),polls: Arc::clone(&polls),failure: Some(1),memory: Arc::clone(&execution.context.memory) });
     let baseline = execution.context.memory.used_bytes();
-    let mut cursor = Limit { input: Some(input),offset: 10,remaining: Some(0),execution: execution.clone() };
-    assert_eq!(cursor.next_page().await.err().unwrap().code,"test/page");
+    let mut cursor = BatchLimit { input: Some(input),offset: 10,remaining: Some(0),context: Arc::clone(&execution.context) };
+    assert_eq!(cursor.next_batch().await.err().unwrap().code,"test/page");
     assert_eq!(polls.load(Ordering::SeqCst),2);
     drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);
 }
@@ -89,13 +89,13 @@ async fn union_and_distinct_keep_complete_nonempty_source_selections() {
     let execution = execution(1);
     let (left,_) = input(vec![vec![],vec![1,1,2],vec![2]],&execution);
     let (right,_) = input(vec![vec![],vec![2,3,4],vec![4]],&execution);
-    let runtime = RuntimeSchema::fixed(&schema(),&execution.context.memory).unwrap();
+    let runtime = RuntimeSchema::fixed(&schema(), &execution.context.memory).unwrap();
     let baseline = execution.context.memory.used_bytes();
-    let input = Box::new(Union { left: Some(left),right });
-    let mut cursor = Distinct { input,seen: SeenRows::new(&execution.context,Arc::clone(&runtime)).unwrap(),execution: execution.clone() };
-    assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),[1,2]);
-    assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),[3,4]);
-    assert!(cursor.next_page().await.unwrap().is_none());
+    let input = Box::new(BatchUnion { left: Some(left), right });
+    let mut cursor = BatchDistinct::new(input, Arc::clone(&runtime), execution.clone(), false).unwrap();
+    assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),[1,2]);
+    assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),[3,4]);
+    assert!(cursor.next_batch().await.unwrap().is_none());
     drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
@@ -113,9 +113,12 @@ async fn intersection_and_difference_preserve_left_pages_and_multiplicities() {
         let (left,_) = input(vec![vec![1,2,2,3],vec![2,4]],&execution);
         let (right,_) = input(vec![vec![],vec![1,2]],&execution);
         let baseline = execution.context.memory.used_bytes();
-        let mut cursor = SetCursor::new(left,right,operator,all,Arc::clone(&runtime),execution.clone()).unwrap();
+        let mut cursor = BatchSet {
+            left, right: Some((right, false)), built: None, operator, all, seen: crate::set_keys::BatchKeyIndex::new(&execution.context).unwrap(),
+            left_projected: false, runtime: Arc::clone(&runtime), execution: execution.clone(),
+        };
         let mut observed = Vec::new();
-        while let Some(page) = cursor.next_page().await.unwrap() { observed.push(values(page)); }
+        while let Some(page) = cursor.next_batch().await.unwrap() { observed.push(values(page)); }
         assert_eq!(observed,expected);
         drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }
@@ -126,10 +129,10 @@ async fn retained_selection_outlives_cursor_and_cancellation_prevents_the_next_p
     let execution = execution(1);
     let (input,_) = input(vec![vec![1,2],vec![3]],&execution);
     let baseline = execution.context.memory.used_bytes();
-    let mut cursor = Limit { input: Some(input),offset: 0,remaining: None,execution: execution.clone() };
-    let page = cursor.next_page().await.unwrap().unwrap();
+    let mut cursor = BatchLimit { input: Some(input),offset: 0,remaining: None,context: Arc::clone(&execution.context) };
+    let page = cursor.next_batch().await.unwrap().unwrap();
     execution.context.cancellation.cancel();
-    assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb/query-cancelled");
+    assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb/query-cancelled");
     drop(cursor);assert!(execution.context.memory.used_bytes() > baseline);
     assert_eq!(values(page),[1,2]);assert_eq!(execution.context.memory.used_bytes(),baseline);
 }
@@ -142,27 +145,41 @@ async fn production_construction_keeps_set_and_top_pages_independent_of_client_b
         let relation = Arc::new(Relation::new(schema(),RelationNode::Limit { input: set,offset: Some(Expr::Literal(Value::I64(1))),fetch: Some(Expr::Literal(Value::I64(2))) }).unwrap());
         let runtime = EmittedRelation::derive(Arc::clone(&relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
         let baseline = execution.context.memory.used_bytes();
-        let mut cursor = build_pages_constrained(Arc::clone(&runtime),execution.clone(),crate::inspection::Constraints::default(),None).await.unwrap();
-        assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),[2]);
-        assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),[3]);
-        assert!(cursor.next_page().await.unwrap().is_none());
+        let mut cursor = build_column_pages(Arc::clone(&runtime),execution.clone()).await.unwrap().unwrap();
+        assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),[2]);
+        assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),[3]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
         drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }
 }
 
 #[tokio::test]
-async fn production_sort_limit_applies_skip_after_the_complete_limited_sort_page() {
-    let execution = execution(1);
-    let relation = Arc::new(Relation::new(schema(),RelationNode::SortLimit {
-        input: table(&[5,1,4,2,3]),order_by: vec![rtdb_plan::SortExpr { expr: schema().fields()[0].expression(),descending: false,nulls_first: false }],
-        offset: Some(Expr::Literal(Value::I64(1))),fetch: Some(Expr::Literal(Value::I64(2))),
-    }).unwrap());
-    let runtime = EmittedRelation::derive(Arc::clone(&relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
-    let baseline = execution.context.memory.used_bytes();
-    let mut cursor = build_pages_constrained(Arc::clone(&runtime),execution.clone(),crate::inspection::Constraints::default(),None).await.unwrap();
-    assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),[2,3]);
-    assert!(cursor.next_page().await.unwrap().is_none());
-    drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+async fn sort_and_top_k_keep_semantic_page_boundaries_through_arrow_spills() {
+    for threshold in [1, usize::MAX] {
+        let mut execution = execution(1);
+        Arc::get_mut(&mut execution.context).unwrap().options.sort_memory_bytes = threshold;
+        let baseline = execution.context.memory.used_bytes();
+        for (offset, fetch, expected) in [
+            (None, None, vec![1, 2, 3, 4, 5]),
+            (Some(1), Some(2), vec![2, 3]),
+        ] {
+            let literal = |value| Expr::Literal(Value::I64(value));
+            let relation = Arc::new(Relation::new(schema(), RelationNode::SortLimit {
+                input: table(&[5, 1, 4, 2, 3]),
+                order_by: vec![rtdb_plan::SortExpr { expr: schema().fields()[0].expression(), descending: false, nulls_first: false }],
+                offset: offset.map(literal), fetch: fetch.map(literal),
+            }).unwrap());
+            let mut cursor = open(relation, &execution).await;
+            let batch = cursor.next_batch().await.unwrap().unwrap();
+            assert!(batch.columns[0].expression_cell(0).is_some());
+            assert_eq!(values(batch), expected);
+            assert!(cursor.next_batch().await.unwrap().is_none());
+            drop(cursor);
+            assert_eq!(execution.context.memory.used_bytes(), baseline);
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+        assert_eq!(execution.context.spill_peak_bytes() > 0, threshold == 1);
+    }
 }
 
 fn output_field(id: u32,data_type: LogicalType) -> Field { Field { id: ColumnId(id),name: format!("c{id}"),qualifier: None,qualified_only: false,unnamed: false,data_type } }
@@ -179,9 +196,9 @@ fn unnest(input: Arc<Relation>,expr: Expr) -> Arc<Relation> {
     let schema = input.schema().concat(&Schema::new(vec![element.clone(),ordinality.clone()]).unwrap()).unwrap();
     Arc::new(Relation::new(schema,RelationNode::Unnest { input,expr,element,ordinality: Some(ordinality),outer: false }).unwrap())
 }
-async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxPageCursor {
+async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxBatchCursor {
     let runtime = EmittedRelation::derive(Arc::clone(&relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
-    build_pages_constrained(Arc::clone(&runtime),execution.clone(),crate::inspection::Constraints::default(),None).await.unwrap()
+    build_column_pages(Arc::clone(&runtime),execution.clone()).await.unwrap().unwrap()
 }
 
 #[tokio::test]
@@ -196,12 +213,12 @@ async fn apply_and_unnest_expand_each_complete_independent_page() {
         let baseline = execution.context.memory.used_bytes();
         for relation in [applied,expanded] {
             let mut cursor = open(relation,&execution).await;
-            let mut first = cursor.next_page().await.unwrap().unwrap();assert_eq!(first.len(),4);
-            let mut selected = Vec::new();while let Some(row) = first.next() { selected.push(row.values[1].clone()); }
+            let first = cursor.next_batch().await.unwrap().unwrap();assert_eq!(first.len,4);
+            let selected = (0..first.len).map(|row| first.columns[1].value(row).unwrap()).collect::<Vec<_>>();
             assert_eq!(selected,[Value::I64(1),Value::I64(11),Value::I64(2),Value::I64(12)]);
-            let mut second = cursor.next_page().await.unwrap().unwrap();assert_eq!(second.len(),2);
-            assert_eq!(second.next().unwrap().values[1],Value::I64(3));assert_eq!(second.next().unwrap().values[1],Value::I64(13));
-            assert!(cursor.next_page().await.unwrap().is_none());
+            let second = cursor.next_batch().await.unwrap().unwrap();assert_eq!(second.len,2);
+            assert_eq!(second.columns[1].value(0).unwrap(),Value::I64(3));assert_eq!(second.columns[1].value(1).unwrap(),Value::I64(13));
+            assert!(cursor.next_batch().await.unwrap().is_none());
             drop(first);drop(second);drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
         }
     }
@@ -217,34 +234,32 @@ async fn downstream_limit_does_not_hide_a_later_error_in_the_same_expansion_page
     for input in [applied,expanded] {
         let relation = Arc::new(Relation::new(input.schema().clone(),RelationNode::Limit { input,offset: None,fetch: Some(Expr::Literal(Value::I64(1))) }).unwrap());
         let mut cursor = open(relation,&execution).await;
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/division-by-zero");
         drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }
 }
 
 #[tokio::test]
-async fn apply_retains_empty_input_pages_while_unnest_skips_empty_expansions() {
+async fn apply_and_unnest_do_not_evaluate_a_dependent_expression_for_empty_input() {
     let execution = execution(1);
-    let dependent = Arc::new(Relation::new(Schema::new(vec![output_field(1,LogicalType::Scalar(ScalarType::I64))]).unwrap(),RelationNode::Values { rows: vec![vec![Expr::Literal(Value::I64(1))]] }).unwrap());
-    let runtime = EmittedRelation::derive(Arc::clone(&dependent),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
-    let (input,_) = input(vec![vec![]],&execution);
-    let mut applied = Apply { input,schema: schema(),dependent: Arc::clone(&runtime),arguments: vec![],kind: ApplyKind::Inner,execution: execution.clone() };
-    assert_eq!(applied.next_page().await.unwrap().unwrap().len(),0);
-    assert!(applied.next_page().await.unwrap().is_none());
+    let input = Arc::new(Relation::new(schema(), RelationNode::LiteralPages { pages: vec![vec![]] }).unwrap());
+    let fails = Expr::binary(rtdb_plan::BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0)));
+    let mut applied = open(apply(input, vec![fails]), &execution).await;
+    assert!(applied.next_batch().await.unwrap().is_none());
     let mut expanded = open(unnest(table(&[1]),Expr::List(vec![])),&execution).await;
-    assert!(expanded.next_page().await.unwrap().is_none());
+    assert!(expanded.next_batch().await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn empty_values_have_no_callback_but_unit_has_one_zero_column_row() {
     let execution = execution(1);
     let mut empty = open(table(&[]),&execution).await;
-    assert!(empty.next_page().await.unwrap().is_none());
+    assert!(empty.next_batch().await.unwrap().is_none());
     let mut unit = open(Arc::new(Relation::unit()),&execution).await;
-    let mut page = unit.next_page().await.unwrap().unwrap();assert_eq!(page.len(),1);assert!(page.next().unwrap().values.is_empty());
-    assert!(unit.next_page().await.unwrap().is_none());
+    let page = unit.next_batch().await.unwrap().unwrap();assert_eq!(page.len,1);assert!(page.columns.is_empty());
+    assert!(unit.next_batch().await.unwrap().is_none());
     let mut applied = open(apply(table(&[]),vec![Expr::Literal(Value::I64(1))]),&execution).await;
-    assert!(applied.next_page().await.unwrap().is_none());
+    assert!(applied.next_batch().await.unwrap().is_none());
 }
 
 fn grouped_count(input: Arc<Relation>,filter: Option<Expr>,global: bool) -> Arc<Relation> {
@@ -265,8 +280,8 @@ async fn aggregate_and_window_publish_one_complete_result_page() {
         let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();
         for (relation,count) in [(grouped_count(table(&[1,2,1]),None,false),2),(row_numbers(table(&[1,2,3])),3)] {
             let mut cursor = open(relation,&execution).await;
-            let page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),count);
-            assert!(cursor.next_page().await.unwrap().is_none());
+            let page = cursor.next_batch().await.unwrap().unwrap();assert_eq!(page.len,count);
+            assert!(cursor.next_batch().await.unwrap().is_none());
             drop(cursor);drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
         }
     }
@@ -276,11 +291,11 @@ async fn aggregate_and_window_publish_one_complete_result_page() {
 async fn aggregate_and_window_empty_results_preserve_global_count_row_only() {
     let execution = execution(1);
     for relation in [grouped_count(table(&[]),None,false),row_numbers(table(&[]))] {
-        let mut cursor = open(relation,&execution).await;assert!(cursor.next_page().await.unwrap().is_none());
+        let mut cursor = open(relation,&execution).await;assert!(cursor.next_batch().await.unwrap().is_none());
     }
     let mut global = open(grouped_count(table(&[]),None,true),&execution).await;
-    let mut page = global.next_page().await.unwrap().unwrap();assert_eq!(page.len(),1);assert_eq!(page.next().unwrap().values,[Value::I64(0)]);
-    assert!(global.next_page().await.unwrap().is_none());
+    let page = global.next_batch().await.unwrap().unwrap();assert_eq!(values(page),[0]);
+    assert!(global.next_batch().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -290,7 +305,7 @@ async fn limit_cannot_hide_a_filter_error_in_a_later_aggregate_result_group() {
     let input = grouped_count(table(&[1,0]),Some(filter),false);
     let relation = Arc::new(Relation::new(input.schema().clone(),RelationNode::Limit { input,offset: None,fetch: Some(Expr::Literal(Value::I64(1))) }).unwrap());
     let mut cursor = open(relation,&execution).await;
-    assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+    assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/division-by-zero");
     drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
@@ -328,6 +343,32 @@ async fn unnesting_a_computed_list_keeps_parent_payloads_in_arrow() {
     assert!(!matches!(batch.columns[0], crate::columnar::Column::Values(_)));
     assert_eq!(batch.columns[1].value(2).unwrap(), Value::I64(3));
     assert_eq!(batch.columns[2].value(3).unwrap(), Value::I32(2));
+}
+
+#[tokio::test]
+async fn coalescing_keeps_semantic_batch_order_and_drops_partial_output_on_failure() {
+    let execution = execution(60);
+    let context = &execution.context;
+    let pages = (0..5).map(|page| (page * 60..(page + 1) * 60).collect::<Vec<i64>>()).collect::<Vec<_>>();
+    let (input, _) = input(pages.clone(), &execution);
+    let mut cursor = crate::columnar::coalesce_pages(input, Arc::clone(context));
+    for span in [0..60, 60..120, 120..240, 240..300] {
+        let batch = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(values(batch), span.collect::<Vec<_>>());
+    }
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+
+    let input = Box::new(Input {
+        pages: pages.into(), polls: Arc::new(AtomicUsize::new(0)), failure: Some(3), memory: Arc::clone(&context.memory),
+    });
+    let baseline = context.memory.used_bytes();
+    let mut cursor = crate::columnar::coalesce_pages(input, Arc::clone(context));
+    drop(cursor.next_batch().await.unwrap().unwrap());
+    drop(cursor.next_batch().await.unwrap().unwrap());
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "test/page");
+    drop(cursor);
+    assert_eq!(context.memory.used_bytes(), baseline);
 }
 
 #[tokio::test]

@@ -362,7 +362,7 @@ The public relation validator requires those inputs to be columns.
 `rtdb-sql/tests/aggregate_forms.rs` and `rtdb-plan/tests/aggregate_forms.rs` retain spelling, execution-order, empty-input, and descriptor-validation cases from SQL `visitSetFunction`/`visitOrderedSetFunction` and XTQL aggregate planning.
 
 Inner joins build their left input and semi joins build their right input before opening the probe cursor.
-`DeferredInput` is a passive probe-opening descriptor; `PushdownBuilder` is a caller-owned transient that becomes an immutable, charged `Pushdowns` value.
+`ProbeInput` is a passive probe-opening descriptor; `PushdownBuilder` is a caller-owned transient that becomes an immutable, charged `Pushdowns` value.
 `JoinLayout` and its `JoinInput` descriptors are passive immutable values retaining charged schemas and computed equality-key expressions.
 Each side projects computed key columns over complete input pages in column order; the predicate and Bloom construction read the retained cells, and result rows exclude them.
 Extracted equality clauses precede residual predicates, retaining the pinned comparator's false-only short circuit.
@@ -382,13 +382,14 @@ Empty IID sets remain descriptive and do not eliminate the probe scan.
 Normal outer and anti joins carry empty IID descriptors for probe `_id`/`_iid` keys without populating Bloom filters or IID restrictions.
 Statistics-flipped outer joins retain unmatched build rows and permit probe Bloom pushdown.
 The probe scan records the applied Bloom cardinality and IID count as Transit data for `EXPLAIN ANALYZE`.
-`BuildAccumulator` appends a complete page before comparing its row count with `QueryOptions::join_build_rows`; the default is 100,000, matching `xtdb.operator.join/*disk-join-threshold-rows*`.
+`BatchJoin` retains a complete build batch before comparing its row count with `QueryOptions::join_build_rows`; the default is 100,000, matching `xtdb.operator.join/*disk-join-threshold-rows*`.
 Crossing that threshold creates a framed spill; nonempty accumulated blocks determine the power-of-two partition count.
 Spilled joins disable their own probe filters and consume the complete probe input before publishing results.
 The disk cursor visits each build partition, then its corresponding probe partitions, then unmatched build rows.
 Each memory probe page or loaded probe partition completes before publication.
-`JoinPlan` is an immutable passive comparator/output descriptor; `JoinCursor` owns caller-driven phase state, and `BuildTable` owns rows, hashes, index and unmatched state together.
-`PartitionSpool` owns one query-scoped file and a charged span index; loading a partition preserves source block order.
+`BatchJoin` owns caller-driven phase state, and its build table owns the retained batches, ordinal index, and unmatched positions.
+Each Arrow partition spool owns a query-scoped file and a charged frame index.
+Loading a partition preserves source block order.
 
 `rtdb-sql/tests/join_pushdowns.rs` maps the pushdown examples in `xtdb.api-test/test-explain-analyze-pushdowns` and covers aliases, empty builds, threshold crossing, unmatched outer rows, unadvanced joins, and cancellation.
 `tests/scan.rs` adds persisted Bloom pruning and newer-version supersession cases.
@@ -397,10 +398,11 @@ The hash fixtures retain signed-width interpretation, IEEE byte order, null hash
 These sources have not run.
 Outer build-side selection uses Values counts and captured table-catalog row counts propagated through project, rename, filter, reference and let.
 Ties retain the normal build side; flipped outer joins use ordinary equality, while normal outer and full joins use the reference top-level null-equal key comparator.
-`src/join_page_tests.rs` and `src/join_storage.rs` retain memory/spill page order, build-statistics/null-key behavior, comparator preparation, partial-page failure and retained-resource assertions.
+`src/join_page_tests.rs`, `src/join_empty_page_tests.rs`, and `src/scan.rs` cover batch and partition order, null keys, comparator preparation, partial-batch failure, and memory custody.
 The in-memory index follows `BuildSideMap` load factor and insertion order; the partition schedule follows `BuildSide`, `Shuffle` and `DiskHashJoin`.
 Native spill serialization remains query-private; identical physical-schema ordering of structured join-key hashes requires runtime qualification.
-Shared Mark joins use the same build/shuffle owner; correlated Mark retains its dependent-page evaluation boundary.
+Shared Mark replays candidate batches in memory or from Arrow IPC.
+Correlated Mark retains its dependent-page evaluation boundary.
 The pinned JVM unary cursor wrapper forwards filter options through row-bound and window operators without a local barrier.
 Whether its optimizer prevents the corresponding top-level SQL shapes remains a Phase 2 differential characterization; native regression sources preserve the relational row-bound and window results.
 

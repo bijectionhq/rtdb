@@ -191,9 +191,8 @@ impl Pushdowns {
     }
 }
 
-/// A build key's filter, with the keys it has already admitted: a repeated key admits nothing new, so its IID is not rehashed.
 /// A build key's filters while the build side is read; its Bloom positions are buffered and added in bulk.
-struct Key { expression: Expr, probe: ColumnId, filter: ColumnFilter, pending: Pending, seen: std::collections::HashSet<rtdb_types::EntityId>, seen_reservation: Option<Arc<MemoryReservation>> }
+struct Key { expression: Expr, probe: ColumnId, filter: ColumnFilter, pending: Pending }
 const PENDING_POSITIONS: usize = 16 * 1024;
 /// Builds of more rows than this mark their Bloom positions in a dense bitmap rather than sorting them.
 const DENSE_ROWS: i64 = 16 * 1024;
@@ -233,41 +232,6 @@ impl PushdownBuilder {
         let bitmap_bound = usize::try_from(rows).ok().and_then(|rows| rows.checked_mul(160)).and_then(|bytes| bytes.checked_add(16_384)).unwrap_or(1 << 20).min(1 << 20);
         if let Some(condition) = condition { collect_keys(condition, build, probe, bitmap_bound, blooms, rows, execution, &mut keys)?; }
         Ok(Self { keys, _reservation: reservation })
-    }
-    pub async fn insert(&mut self, schema: &Schema, row: &[Value], execution: &Execution) -> Result<()> {
-        let mut evaluation = None;
-        for key in &mut self.keys {
-            if key.filter.bloom.is_none() { continue; }
-            let value = match &key.expression {
-                Expr::Column { id, .. } => {
-                    let mut value = schema.position(*id).and_then(|position| row.get(position)).cloned().ok_or_else(|| invalid("pushdown-key", "Build key column is outside its row"))?;
-                    value.admit_expression_dates()?;
-                    value
-                }
-                expression => {
-                    if evaluation.is_none() { evaluation = Some(execution.scope()?); }
-                    execution.evaluate(evaluation.as_ref().expect("the scope was just opened"), expression, schema, row).await?
-                }
-            };
-            key.add(BloomFilter::value_positions(&value)?);
-            if matches!(value, Value::Null | Value::Undefined) { continue; }
-            if key.filter.iids.is_some() && let Ok(entity) = value.entity_id() {
-                if key.seen.contains(&entity) { continue; }
-                let bytes = key.seen.len().saturating_add(1).saturating_mul(value.retained_bytes()?.saturating_add(64)).saturating_add(256);
-                match &mut key.seen_reservation {
-                    Some(reservation) if reservation.bytes() >= bytes => {}
-                    slot => *slot = Some(execution.context.memory.reserve(bytes.saturating_mul(2))?),
-                }
-                key.seen.insert(entity);
-            }
-            if let Some(iids) = &mut key.filter.iids {
-                if evaluation.is_none() { evaluation = Some(execution.scope()?); }
-                if !iids.insert(&value, evaluation.as_ref().expect("the scope was just opened"), &execution.context.memory)? {
-                    key.filter.iids = None;
-                }
-            }
-        }
-        Ok(())
     }
     pub fn insert_arrow(&mut self, schema: &Schema, batch: &ColumnBatch, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
         for key in &mut self.keys {
@@ -327,7 +291,7 @@ fn collect_keys(expr: &Expr, build: &Schema, probe: &Schema, bitmap_bound: usize
                 let pending = if !blooms { 0 } else if dense { DENSE_WORDS * std::mem::size_of::<u64>() } else { PENDING_POSITIONS * std::mem::size_of::<u32>() };
                 let reservation = execution.context.memory.reserve(if blooms { bitmap_bound.saturating_add(pending) } else { 256 })?;
                 keys.push(Key { expression: expression.clone(), probe: *id, filter: ColumnFilter { bloom: blooms.then(BloomFilter::default), iids, _reservation: reservation },
-                    pending: if dense { Pending::Dense(vec![0; DENSE_WORDS]) } else { Pending::Sorted(Vec::with_capacity(if blooms { PENDING_POSITIONS } else { 0 })) }, seen: Default::default(), seen_reservation: None });
+                    pending: if dense { Pending::Dense(vec![0; DENSE_WORDS]) } else { Pending::Sorted(Vec::with_capacity(if blooms { PENDING_POSITIONS } else { 0 })) } });
                 break;
             }
         }
@@ -370,8 +334,6 @@ mod tests {
                     _reservation: memory.reserve(1024).unwrap(),
                 },
                 pending: Pending::Sorted(Vec::new()),
-                seen: Default::default(),
-                seen_reservation: None,
             }],
             _reservation: memory.reserve(1024).unwrap(),
         };

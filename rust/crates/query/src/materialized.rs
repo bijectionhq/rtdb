@@ -6,9 +6,8 @@ use rtdb_types::{Anomaly, Result};
 use tokio::sync::Mutex;
 use crate::{
     QueryContext,
-    columnar::{BatchCursor, BatchRows, BoxBatchCursor, ColumnBatch, poll_nested_batch},
+    columnar::{BatchCursor, BoxBatchCursor, ColumnBatch, poll_nested_batch},
     invalid,
-    pages::{BoxPageCursor, OwnedPage, PageCursor},
     spill::{SpillFile, SpillReader},
 };
 
@@ -16,23 +15,11 @@ pub(crate) struct BindingScope {
     binding: Arc<ReplayBinding>, parent: Option<Arc<Self>>,
 }
 impl BindingScope {
-    pub fn new(definition: Arc<MaterializedBinding>, input: BoxPageCursor, parent: Option<Arc<Self>>, context: Arc<QueryContext>) -> Result<Arc<Self>> {
-        let schema = definition.relation.schema().clone();
-        let input = crate::columnar::batches_from_pages(input, schema.len(), Arc::clone(&context.memory));
-        Self::columns(definition, input, schema, parent, context)
-    }
-
     pub fn columns(definition: Arc<MaterializedBinding>, input: BoxBatchCursor, schema: Schema, parent: Option<Arc<Self>>, context: Arc<QueryContext>) -> Result<Arc<Self>> {
         let reservation = context.memory.reserve(4096)?;
         Ok(Arc::new(Self { binding: Arc::new(ReplayBinding {
             definition, state: Mutex::new(State::Unopened { input, schema }), context, _reservation: reservation,
         }), parent }))
-    }
-
-    pub async fn open(&self, definition: &MaterializedBinding) -> Result<BoxPageCursor> {
-        let binding = self.find(definition)?;
-        let batches = self.open_columns(definition).await?;
-        Ok(Box::new(BatchRows::new(batches, Arc::clone(&binding.context.memory))))
     }
 
     pub async fn open_columns(&self, definition: &MaterializedBinding) -> Result<BoxBatchCursor> {
@@ -186,12 +173,6 @@ impl BatchCursor for ColumnReference {
     }
 }
 
-pub(crate) struct LetCursor { pub body: BoxPageCursor, pub _binding: Arc<BindingScope> }
-#[async_trait]
-impl PageCursor for LetCursor {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> { self.body.next_page().await }
-}
-
 pub(crate) struct ColumnLetCursor { pub body: BoxBatchCursor, pub _binding: Arc<BindingScope> }
 
 #[async_trait]
@@ -216,13 +197,13 @@ mod tests {
 
     struct GateInput { emitted: bool, started: Option<oneshot::Sender<()>>, release: oneshot::Receiver<()>, closed: Arc<AtomicBool>, memory: Arc<MemoryBudget> }
     #[async_trait]
-    impl PageCursor for GateInput {
-        async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+    impl BatchCursor for GateInput {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
             if !self.emitted {
                 self.emitted = true;
                 let mut page = PageBuilder::new(1,&self.memory)?;
                 page.push(OwnedRow::new(vec![Value::I64(1)],&self.memory)?)?;
-                return Ok(Some(page.finish()));
+                return ColumnBatch::from_page(&page.finish(), &self.memory).map(Some);
             }
             if let Some(started) = self.started.take() { let _ = started.send(()); }
             let _ = (&mut self.release).await;
@@ -233,13 +214,14 @@ mod tests {
 
     struct Pages { pages: VecDeque<Vec<i64>>, polls: Arc<AtomicUsize>, memory: Arc<MemoryBudget> }
     #[async_trait]
-    impl PageCursor for Pages {
-        async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+    impl BatchCursor for Pages {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
             self.polls.fetch_add(1,Ordering::SeqCst);
             let Some(values) = self.pages.pop_front() else { return Ok(None); };
+            if values.is_empty() { return ColumnBatch::empty_with_width(1, &self.memory).map(Some); }
             let mut page = PageBuilder::new(values.len(),&self.memory)?;
             for value in values { page.push(OwnedRow::new(vec![Value::I64(value)],&self.memory)?)?; }
-            Ok(Some(page.finish()))
+            ColumnBatch::from_page(&page.finish(), &self.memory).map(Some)
         }
     }
     fn context(batch_rows: usize) -> Arc<QueryContext> {
@@ -261,25 +243,19 @@ mod tests {
             let definition = definition();
             let polls = Arc::new(AtomicUsize::new(0));
             let input = Box::new(Pages { pages: VecDeque::from([vec![1,2],vec![],vec![3]]),polls: Arc::clone(&polls),memory: Arc::clone(&context.memory) });
-            let scope = BindingScope::new(Arc::clone(&definition),input,None,Arc::clone(&context)).unwrap();
-            let mut first = scope.open(&definition).await.unwrap();
+            let scope = BindingScope::columns(Arc::clone(&definition),input,definition.relation.schema().clone(),None,Arc::clone(&context)).unwrap();
+            let mut first = scope.open_columns(&definition).await.unwrap();
             assert_eq!(polls.load(Ordering::SeqCst), 4);
             assert_eq!(context.spill_bytes() > 0, materialized_spill_rows < 3);
-            let mut second = scope.open(&definition).await.unwrap();assert_eq!(polls.load(Ordering::SeqCst),4);
-            let mut columns = scope.open_columns(&definition).await.unwrap();
-            assert_eq!(columns.next_batch().await.unwrap().unwrap().len, 2);
-            let empty = columns.next_batch().await.unwrap().unwrap();
-            assert_eq!((empty.len, empty.columns.len()), (0, 1));
-            assert_eq!(columns.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(), Value::I64(3));
-            assert!(columns.next_batch().await.unwrap().is_none());
-            drop((columns, empty));
+            let mut second = scope.open_columns(&definition).await.unwrap();assert_eq!(polls.load(Ordering::SeqCst),4);
             drop(scope);
             for cursor in [&mut first,&mut second] {
-                let mut page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),2);
-                assert_eq!(page.next().unwrap().values,[Value::I64(1)]);assert_eq!(page.next().unwrap().values,[Value::I64(2)]);
-                assert_eq!(cursor.next_page().await.unwrap().unwrap().len(),0);
-                assert_eq!(cursor.next_page().await.unwrap().unwrap().next().unwrap().values,[Value::I64(3)]);
-                assert!(cursor.next_page().await.unwrap().is_none());
+                let page = cursor.next_batch().await.unwrap().unwrap();assert_eq!(page.len,2);
+                assert_eq!(page.columns[0].value(0).unwrap(),Value::I64(1));assert_eq!(page.columns[0].value(1).unwrap(),Value::I64(2));
+                let empty = cursor.next_batch().await.unwrap().unwrap();
+                assert_eq!((empty.len, empty.columns.len()), (0, 1));
+                assert_eq!(cursor.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(),Value::I64(3));
+                assert!(cursor.next_batch().await.unwrap().is_none());
             }
             drop(first);drop(second);assert_eq!(context.spill_bytes(),0);assert_eq!(context.memory.used_bytes(),0);
         }
@@ -367,11 +343,11 @@ mod tests {
     async fn returned_replay_page_survives_cursor_and_factory_close() {
         let context = context(1);let definition = definition();
         let input = Box::new(Pages { pages: VecDeque::from([vec![1,2]]),polls: Arc::new(AtomicUsize::new(0)),memory: Arc::clone(&context.memory) });
-        let scope = BindingScope::new(Arc::clone(&definition),input,None,Arc::clone(&context)).unwrap();
-        let mut cursor = scope.open(&definition).await.unwrap();
-        let mut page = cursor.next_page().await.unwrap().unwrap();
+        let scope = BindingScope::columns(Arc::clone(&definition),input,definition.relation.schema().clone(),None,Arc::clone(&context)).unwrap();
+        let mut cursor = scope.open_columns(&definition).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
         drop(cursor);drop(scope);assert_eq!(context.spill_bytes(),0);assert!(context.memory.used_bytes() > 0);
-        assert_eq!(page.next().unwrap().values,[Value::I64(1)]);assert_eq!(page.next().unwrap().values,[Value::I64(2)]);
+        assert_eq!(page.columns[0].value(0).unwrap(),Value::I64(1));assert_eq!(page.columns[0].value(1).unwrap(),Value::I64(2));
         drop(page);assert_eq!(context.memory.used_bytes(),0);
     }
 
@@ -379,9 +355,9 @@ mod tests {
     async fn canceled_reference_rejects_the_next_page_without_retaining_a_partial_page() {
         let context = context(1);let definition = definition();
         let input = Box::new(Pages { pages: VecDeque::from([vec![1],vec![2,3]]),polls: Arc::new(AtomicUsize::new(0)),memory: Arc::clone(&context.memory) });
-        let scope = BindingScope::new(Arc::clone(&definition),input,None,Arc::clone(&context)).unwrap();
-        let mut cursor = scope.open(&definition).await.unwrap();drop(cursor.next_page().await.unwrap().unwrap());
-        context.cancellation.cancel();assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb/query-cancelled");
+        let scope = BindingScope::columns(Arc::clone(&definition),input,definition.relation.schema().clone(),None,Arc::clone(&context)).unwrap();
+        let mut cursor = scope.open_columns(&definition).await.unwrap();drop(cursor.next_batch().await.unwrap().unwrap());
+        context.cancellation.cancel();assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb/query-cancelled");
         drop(cursor);drop(scope);assert_eq!(context.spill_bytes(),0);assert_eq!(context.memory.used_bytes(),0);
     }
 
@@ -406,8 +382,8 @@ mod tests {
         let (_release, wait_release) = oneshot::channel();
         let closed = Arc::new(AtomicBool::new(false));
         let input = Box::new(GateInput { emitted: false, started: Some(started), release: wait_release, closed: Arc::clone(&closed), memory: Arc::clone(&context.memory) });
-        let scope = BindingScope::new(Arc::clone(&definition), input, None, Arc::clone(&context)).unwrap();
-        let opening = tokio::spawn(async move { scope.open(&definition).await });
+        let scope = BindingScope::columns(Arc::clone(&definition), input, definition.relation.schema().clone(), None, Arc::clone(&context)).unwrap();
+        let opening = tokio::spawn(async move { scope.open_columns(&definition).await });
         wait_started.await.unwrap();
         assert!(context.spill_bytes() > 0);
         assert!(!closed.load(Ordering::SeqCst));

@@ -2,18 +2,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget,MemoryReservation};
 use rtdb_types::Result;
-use crate::{QueryContext,cursor::OwnedRow,invalid,pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor}};
+use crate::{QueryContext, invalid};
 use crate::columnar::{BatchCursor, BoxBatchCursor, ColumnBatch, poll_nested_batch};
 
-struct LeftPages<P> { pages: Vec<P>,capacity: usize,_reservation: Arc<MemoryReservation> }
-impl<P> LeftPages<P> {
+struct LeftPages { pages: Vec<ColumnBatch>,capacity: usize,_reservation: Arc<MemoryReservation> }
+impl LeftPages {
     fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
         Ok(Self { pages: Vec::new(),capacity: 0,_reservation: memory.reserve(256)? })
     }
-    fn push(&mut self,page: P,memory: &Arc<MemoryBudget>) -> Result<()> {
+    fn push(&mut self,page: ColumnBatch,memory: &Arc<MemoryBudget>) -> Result<()> {
         if self.pages.len() == self.capacity {
             let capacity = self.capacity.checked_mul(2).map(|capacity|capacity.max(1)).ok_or_else(size_error)?;
-            let bytes = capacity.checked_mul(std::mem::size_of::<P>()).and_then(|bytes|bytes.checked_add(256)).ok_or_else(size_error)?;
+            let bytes = capacity.checked_mul(std::mem::size_of::<ColumnBatch>()).and_then(|bytes|bytes.checked_add(256)).ok_or_else(size_error)?;
             let reservation = memory.reserve(bytes)?;
             self.pages.reserve_exact(capacity - self.pages.len());
             self.capacity = capacity;
@@ -24,45 +24,28 @@ impl<P> LeftPages<P> {
     }
 }
 
-enum State<I, P> {
-    Pending { left: I,right: I },
-    Ready { left: LeftPages<P>,right: I,current: Option<P>,next_left: usize },
+enum State {
+    Pending { left: BoxBatchCursor,right: BoxBatchCursor },
+    Ready { left: LeftPages,right: BoxBatchCursor,current: Option<ColumnBatch>,next_left: usize },
     Done,
 }
 
-pub(crate) type CrossJoin = Cross<BoxPageCursor, OwnedPage>;
-pub(crate) type CrossBatchJoin = Cross<BoxBatchCursor, ColumnBatch>;
+pub(crate) struct CrossBatchJoin { state: State, context: Arc<QueryContext> }
 
-pub(crate) struct Cross<I, P> { state: State<I, P>,context: Arc<QueryContext> }
-impl<I, P> Cross<I, P> {
-    pub fn new(left: I,right: I,context: Arc<QueryContext>) -> Self {
-        Self { state: State::Pending { left,right },context }
+impl CrossBatchJoin {
+    pub fn new(left: BoxBatchCursor, right: BoxBatchCursor, context: Arc<QueryContext>) -> Self {
+        Self { state: State::Pending { left, right }, context }
     }
 }
 
 #[async_trait]
-trait CrossInput<P>: Send {
-    async fn pull(&mut self) -> Result<Option<P>>;
-}
-
-#[async_trait]
-impl CrossInput<OwnedPage> for BoxPageCursor {
-    async fn pull(&mut self) -> Result<Option<OwnedPage>> { self.next_page().await }
-}
-
-#[async_trait]
-impl CrossInput<ColumnBatch> for BoxBatchCursor {
-    async fn pull(&mut self) -> Result<Option<ColumnBatch>> { poll_nested_batch(self.as_mut()).await }
-}
-
-impl<I, P> Cross<I, P> {
-    async fn next(&mut self, combine: impl FnOnce(&P, &P, &QueryContext) -> Result<P>) -> Result<Option<P>>
-    where I: CrossInput<P> {
+impl BatchCursor for CrossBatchJoin {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         self.context.check_cancelled()?;
         if matches!(self.state,State::Pending { .. }) {
             let State::Pending { mut left,right } = std::mem::replace(&mut self.state,State::Done) else { unreachable!() };
             let mut pages = LeftPages::new(&self.context.memory)?;
-            while let Some(page) = left.pull().await? {
+            while let Some(page) = poll_nested_batch(left.as_mut()).await? {
                 self.context.check_cancelled()?;
                 pages.push(page,&self.context.memory)?;
             }
@@ -71,37 +54,13 @@ impl<I, P> Cross<I, P> {
         let State::Ready { left,right,current,next_left } = &mut self.state else { return Ok(None); };
         if current.is_none() || *next_left == left.pages.len() {
             *current = None;
-            *current = right.pull().await?;
+            *current = poll_nested_batch(right.as_mut()).await?;
             *next_left = 0;
         }
         let (Some(left),Some(right)) = (left.pages.get(*next_left),current.as_ref()) else { self.state = State::Done;return Ok(None); };
-        let output = combine(left, right, &self.context)?;
+        let output = ColumnBatch::cross(left, right, product(left.len, right.len)?, &self.context)?;
         *next_left += 1;
         Ok(Some(output))
-    }
-}
-
-#[async_trait]
-impl PageCursor for CrossJoin {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        self.next(|left, right, context| {
-            let count = product(left.len(), right.len())?;
-            let mut output = PageBuilder::new(count,&context.memory)?;
-            for left in left.rows() {
-                context.check_cancelled()?;
-                for right in right.rows() {
-                    output.push(OwnedRow::copy_parts(&[&left.values,&right.values],0,0,&context.memory)?)?;
-                }
-            }
-            Ok(output.finish())
-        }).await
-    }
-}
-
-#[async_trait]
-impl BatchCursor for CrossBatchJoin {
-    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        self.next(|left, right, context| ColumnBatch::cross(left, right, product(left.len, right.len)?, context)).await
     }
 }
 
@@ -114,6 +73,7 @@ fn size_error() -> rtdb_types::Anomaly { invalid("cross-join-size","Cross join p
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{cursor::OwnedRow, pages::PageBuilder};
     use std::{collections::{BTreeMap,VecDeque},sync::atomic::{AtomicBool,AtomicUsize,Ordering}};
     use rtdb_storage::{MemoryStore,cache::BufferPool};
     use rtdb_types::{Anomaly,Timestamp,Value};
@@ -122,14 +82,15 @@ mod tests {
 
     struct Input { pages: VecDeque<Vec<i64>>,polls: Arc<AtomicUsize>,closed: Arc<AtomicBool>,memory: Arc<MemoryBudget>,fail_at: Option<usize> }
     #[async_trait]
-    impl PageCursor for Input {
-        async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+    impl BatchCursor for Input {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
             let poll = self.polls.fetch_add(1,Ordering::SeqCst);
             if self.fail_at == Some(poll) { return Err(Anomaly::fault("test/input","Input failed")); }
             let Some(values) = self.pages.pop_front() else { return Ok(None); };
+            if values.is_empty() { return ColumnBatch::empty_with_width(1, &self.memory).map(Some); }
             let mut page = PageBuilder::new(values.len(),&self.memory)?;
             for value in values { page.push(OwnedRow::new(vec![Value::I64(value)],&self.memory)?)?; }
-            Ok(Some(page.finish()))
+            ColumnBatch::from_page(&page.finish(), &self.memory).map(Some)
         }
     }
     impl Drop for Input { fn drop(&mut self) { self.closed.store(true,Ordering::SeqCst); } }
@@ -142,8 +103,8 @@ mod tests {
         let polls = Arc::new(AtomicUsize::new(0));let closed = Arc::new(AtomicBool::new(false));
         (Input { pages: pages.into(),polls: Arc::clone(&polls),closed: Arc::clone(&closed),memory: Arc::clone(&context.memory),fail_at: None },polls,closed)
     }
-    fn values(mut page: OwnedPage) -> Vec<Vec<Value>> {
-        let mut rows = Vec::new();while let Some(row) = page.next() { rows.push(row.values); }rows
+    fn values(page: ColumnBatch) -> Vec<Vec<Value>> {
+        (0..page.len).map(|row| page.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect()
     }
 
     #[tokio::test]
@@ -152,14 +113,14 @@ mod tests {
             let context = context(batch_rows);
             let (left,left_polls,left_closed) = input(vec![vec![1,2],vec![3]],&context);
             let (right,right_polls,right_closed) = input(vec![vec![10,20],vec![30]],&context);
-            let mut cursor = CrossJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
-            assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),vec![vec![Value::I64(1),Value::I64(10)],vec![Value::I64(1),Value::I64(20)],vec![Value::I64(2),Value::I64(10)],vec![Value::I64(2),Value::I64(20)]]);
+            let mut cursor = CrossBatchJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
+            assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),vec![vec![Value::I64(1),Value::I64(10)],vec![Value::I64(1),Value::I64(20)],vec![Value::I64(2),Value::I64(10)],vec![Value::I64(2),Value::I64(20)]]);
             assert_eq!(left_polls.load(Ordering::SeqCst),3);assert!(left_closed.load(Ordering::SeqCst));assert_eq!(right_polls.load(Ordering::SeqCst),1);
-            assert_eq!(values(cursor.next_page().await.unwrap().unwrap()),vec![vec![Value::I64(3),Value::I64(10)],vec![Value::I64(3),Value::I64(20)]]);
+            assert_eq!(values(cursor.next_batch().await.unwrap().unwrap()),vec![vec![Value::I64(3),Value::I64(10)],vec![Value::I64(3),Value::I64(20)]]);
             assert_eq!(right_polls.load(Ordering::SeqCst),1);
-            assert_eq!(cursor.next_page().await.unwrap().unwrap().len(),2);
-            assert_eq!(cursor.next_page().await.unwrap().unwrap().len(),1);
-            assert!(cursor.next_page().await.unwrap().is_none());assert!(right_closed.load(Ordering::SeqCst));
+            assert_eq!(cursor.next_batch().await.unwrap().unwrap().len,2);
+            assert_eq!(cursor.next_batch().await.unwrap().unwrap().len,1);
+            assert!(cursor.next_batch().await.unwrap().is_none());assert!(right_closed.load(Ordering::SeqCst));
             drop(cursor);assert_eq!(context.memory.used_bytes(),0);
         }
     }
@@ -229,12 +190,12 @@ mod tests {
         let context = context(1);
         let (left,_,_) = input(vec![vec![],vec![1]],&context);
         let (right,_,_) = input(vec![vec![],vec![2]],&context);
-        let mut cursor = CrossJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
-        let mut sizes = Vec::new();while let Some(page) = cursor.next_page().await.unwrap() { sizes.push(page.len()); }
+        let mut cursor = CrossBatchJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
+        let mut sizes = Vec::new();while let Some(page) = cursor.next_batch().await.unwrap() { sizes.push(page.len); }
         assert_eq!(sizes,[0,0,0,1]);drop(cursor);assert_eq!(context.memory.used_bytes(),0);
         let (left,_,_) = input(vec![],&context);let (right,polls,_) = input(vec![vec![1],vec![2]],&context);
-        let mut cursor = CrossJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
-        assert!(cursor.next_page().await.unwrap().is_none());assert_eq!(polls.load(Ordering::SeqCst),1);
+        let mut cursor = CrossBatchJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
+        assert!(cursor.next_batch().await.unwrap().is_none());assert_eq!(polls.load(Ordering::SeqCst),1);
         drop(cursor);assert_eq!(context.memory.used_bytes(),0);
     }
 
@@ -242,17 +203,17 @@ mod tests {
     async fn later_left_page_failure_precedes_all_output_and_does_not_poll_right() {
         let context = context(1);let (mut left,_,left_closed) = input(vec![vec![1]],&context);left.fail_at = Some(1);
         let (right,polls,right_closed) = input(vec![vec![1]],&context);
-        let mut cursor = CrossJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"test/input");assert_eq!(polls.load(Ordering::SeqCst),0);
+        let mut cursor = CrossBatchJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"test/input");assert_eq!(polls.load(Ordering::SeqCst),0);
         assert!(left_closed.load(Ordering::SeqCst));assert!(right_closed.load(Ordering::SeqCst));assert_eq!(context.memory.used_bytes(),0);
     }
 
     #[tokio::test]
     async fn canceled_cross_cursor_releases_retained_inputs_but_returned_page_keeps_its_charge() {
         let context = context(1);let (left,_,_) = input(vec![vec![1],vec![2]],&context);let (right,_,_) = input(vec![vec![3]],&context);
-        let mut cursor = CrossJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
-        let page = cursor.next_page().await.unwrap().unwrap();context.cancellation.cancel();
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb/query-cancelled");drop(cursor);assert!(context.memory.used_bytes() > 0);
+        let mut cursor = CrossBatchJoin::new(Box::new(left),Box::new(right),Arc::clone(&context));
+        let page = cursor.next_batch().await.unwrap().unwrap();context.cancellation.cancel();
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb/query-cancelled");drop(cursor);assert!(context.memory.used_bytes() > 0);
         assert_eq!(values(page),vec![vec![Value::I64(1),Value::I64(3)]]);assert_eq!(context.memory.used_bytes(),0);
     }
 }

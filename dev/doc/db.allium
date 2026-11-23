@@ -2021,6 +2021,8 @@ surface QueryAccess {
         -- An execution spanning several databases holds one such snapshot per database.
 
     @guarantee ColumnarScanProjection
+        -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.
+        -- System catalog and inspection scans batch their produced rows at the scan boundary.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- It emits a null where every operand is null.
@@ -2048,6 +2050,7 @@ surface QueryAccess {
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
+        -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget.
         -- A shared mark can replay its candidate Arrow pages to evaluate arbitrary Boolean comparisons.
         -- Direct floating-point list comparisons in a shared mark preserve SQL unknown results across candidate pages.
         -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.

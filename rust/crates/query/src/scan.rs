@@ -19,7 +19,8 @@ use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
-use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
+use crate::columnar::BatchCursor;
+use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
 struct DataFile {
     storage: Arc<BufferPool>,
@@ -971,6 +972,10 @@ impl ScanCursor {
 
 #[cfg(test)]
 impl ScanCursor {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        self.next_batch().await?.map(|batch| batch.rows(&self.memory)).transpose()
+    }
+
     fn front_partition(&self) -> Option<&PartitionScan> { self.parts.front().and_then(|part| match part { Part::Local(partition) => Some(partition), Part::Fragment(fragment) => Some(&fragment.fallback), Part::Resolved(_) => None }) }
     fn front_partition_mut(&mut self) -> Option<&mut PartitionScan> { self.parts.front_mut().and_then(|part| match part { Part::Local(partition) => Some(partition), Part::Fragment(fragment) => Some(&mut fragment.fallback), Part::Resolved(_) => None }) }
 }
@@ -1033,7 +1038,7 @@ async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usi
 /// own IID, so the rows are read in IID order and whoever takes them stops the read by taking no more. The scan's
 /// predicates and the residual predicates annotated on it are applied here, as an ordered index applies them, and
 /// the rows from `offset` up to `limit` leave as the columns at `positions`.
-async fn iid_ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, positions: &[usize]) -> Result<Option<crate::operators::OrderedInput>> {
+async fn iid_ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, positions: &[usize]) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     let Some(top) = &scan.ordered_top_k else { return Ok(None) };
     let ([key], false, true) = (top.order.as_slice(), top.distinct, scan.matches.is_empty()) else { return Ok(None) };
     let Some(id) = scan.columns.iter().find(|field| field.name == "_id") else { return Ok(None) };
@@ -1056,9 +1061,9 @@ async fn iid_ordered_input(scan: &Scan, execution: &Execution, limit: usize, off
     };
     let window = Box::new(OrderedWindow { input: Some(rows), counts: None, skip: offset, remaining: limit.saturating_sub(offset), memory: Arc::clone(&execution.context.memory) });
     let all = positions.len() == scan.columns.len() && positions.iter().enumerate().all(|(index, position)| index == *position);
-    Ok(Some(crate::operators::OrderedInput::Batches(if all { window } else {
+    Ok(Some(if all { window } else {
         Box::new(crate::columnar::BatchProject::new(window, positions.to_vec(), Arc::clone(&execution.context.memory)))
-    })))
+    }))
 }
 
 /// The rows of an ordered input after the first `skip`, up to `remaining` of them; the input is dropped, and so read no further, once they have left.
@@ -1088,21 +1093,15 @@ impl OrderedWindow {
     fn close(&mut self) { if let Some(input) = self.input.take() { self.counts = input.scan_counts(); } }
 }
 
-pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, projection: Option<&[usize]>) -> Result<Option<crate::operators::OrderedInput>> {
+pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, positions: &[usize]) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     if !execution.context.catalog.permits_table(&scan.table.name) {
         return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
     }
     if projects_archive_history(scan) { return Ok(None); }
-    use crate::operators::OrderedInput;
-    let full;
-    let positions = match projection {
-        Some(positions) => positions,
-        None => { full = (0..scan.columns.len()).collect::<Vec<_>>(); &full }
-    };
     let Some(output) = ordered(scan, execution, offset..limit, positions).await? else { return iid_ordered_input(scan, execution, limit, offset, positions).await; };
     Ok(Some(match output {
         crate::OrderedScan::Covered(batches) => {
-            OrderedInput::Batches(Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context) }))
+            Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context) })
         }
         crate::OrderedScan::Payload { candidates, verify } => {
             let mut payload = scan.clone();
@@ -1125,10 +1124,10 @@ pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usi
             payload.ordered_top_k = None;
             payload.top_k = None;
             payload.predicates.clear();
-            OrderedInput::Batches(Box::new(OrderedPayload {
+            Box::new(OrderedPayload {
                 scan: payload, schema, execution: execution.clone(), candidates: Some(candidates), predicate, verify,
                 projection, iid_at, skip: offset, remaining: limit.saturating_sub(offset), _memory: memory,
-            }))
+            })
         }
     }))
 }
@@ -1514,11 +1513,9 @@ impl ScanVerifier<'_> {
 }
 
 #[async_trait]
-impl PageCursor for ScanCursor {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        let Some(batch) = self.next_batch().await? else { return Ok(None) };
-        batch.rows(&self.memory).map(Some)
-    }
+impl BatchCursor for ScanCursor {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> { ScanCursor::next_batch(self).await }
+
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
         let mut counts = self.completed; for part in &self.parts { counts.add(part.counts()); }
         span.attribute("scan_db", rtdb_plan::TraceValue::Text(&self.database));
@@ -2320,6 +2317,23 @@ fn page_temporal(columns: &rtdb_format::metadata::LeafStatistics<'_>) -> Option<
 
 #[cfg(test)]
 mod tests {
+    struct SemanticPages {
+        batches: crate::columnar::BoxBatchCursor,
+        memory: Arc<MemoryBudget>,
+    }
+
+    impl SemanticPages {
+        async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+            self.batches.next_batch().await?.map(|batch| batch.rows(&self.memory)).transpose()
+        }
+    }
+
+    async fn semantic_pages(runtime: Arc<crate::runtime_schema::EmittedRelation>, execution: Execution) -> Result<SemanticPages> {
+        let memory = Arc::clone(&execution.context.memory);
+        let batches = crate::operators::build_column_pages(runtime, execution).await?.expect("Expected Arrow semantic pages");
+        Ok(SemanticPages { batches, memory })
+    }
+
     use rtdb_types::StructFields;
     use super::*;
     use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::OuterRows, parameters::BoundParameters};
@@ -3226,7 +3240,7 @@ mod tests {
             offset: None, fetch: Some(Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64) }),
         }).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, execution.parameters.types(), &memory).unwrap();
-        let row = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.err().unwrap();
+        let row = semantic_pages(Arc::clone(&runtime), execution.clone()).await.err().unwrap();
         let columnar = crate::operators::build_columns(runtime, execution).await.err().unwrap();
         assert_ne!(row.code, "xtdb/expected-number");
         assert_eq!(columnar.code, row.code);
@@ -3248,9 +3262,10 @@ mod tests {
             offset: Some(Expr::Literal(Value::I64(1))), fetch: Some(Expr::Literal(Value::I64(0))),
         }).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(root, &execution.context.catalog, &[], &memory).unwrap();
-        let mut row = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut row = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
         let mut columnar = crate::operators::build_columns(runtime, execution).await.unwrap().unwrap();
         let error = row.next_page().await.err().unwrap();
+        assert_eq!(error.code, "xtdb.expression/division-by-zero");
         assert_eq!(columnar.next_batch().await.err().unwrap().code, error.code);
     }
 
@@ -3351,7 +3366,7 @@ mod tests {
                 assert_eq!(execution.context.spill_bytes(), 0);
                 continue;
             }
-            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut baseline = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
             let mut expected = Vec::new();
             while let Some(page) = baseline.next_page().await.unwrap() {
                 expected.extend(page.rows().iter().map(|row| row.values.clone()));
@@ -3366,9 +3381,76 @@ mod tests {
             }
             assert_eq!(actual, expected);
             assert_eq!(actual.len(), 3);
+            for value in 1..=3 {
+                assert!(actual.contains(&vec![Value::I64(value); 2]));
+            }
             assert!(execution.context.spill_peak_bytes() > 0);
             assert_eq!(execution.context.spill_bytes(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn vector_payloads_keep_their_arrow_children_through_join_and_sort_spills() {
+        use arrow_array::{Float32Array, Float64Array};
+        use rtdb_plan::{BinaryOp, JoinKind, Relation, RelationNode, SortExpr};
+        use rtdb_types::ListKind;
+
+        let nan32 = f32::from_bits(0x7fc0_2357);
+        let nan64 = f64::from_bits(0x7ff8_0000_0000_4321);
+        let (state, table, _) = live_table_with_values([
+            Value::FixedSizeList(vec![Value::F32(nan32), Value::F32(-0.0), Value::Null].into()),
+            Value::Null,
+            Value::list(vec![Value::F32(-0.0), Value::F64(nan64), Value::Null]),
+        ]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let options = &mut Arc::get_mut(&mut execution.context).unwrap().options;
+        options.join_build_rows = 0;
+        options.sort_memory_bytes = 1;
+        let id = Field { id: ColumnId(1), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        scan.columns.push(id.clone());
+        let right_id = Field { id: ColumnId(2), ..id.clone() };
+        let right = Arc::new(Relation::new(Schema::new(vec![right_id.clone()]).unwrap(), RelationNode::Values {
+            rows: (1..=3).rev().map(|value| vec![Expr::Literal(Value::I64(value))]).collect(),
+        }).unwrap());
+        let condition = Expr::binary(BinaryOp::Eq, id.expression(), right_id.expression());
+        let join = Arc::new(Relation::join(Arc::new(Relation::scan(scan).unwrap()), right, JoinKind::Inner, Some(condition)).unwrap());
+        let plan = Arc::new(join.sort(vec![SortExpr { expr: id.expression(), descending: false, nulls_first: false }]).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
+        let baseline = memory.used_bytes();
+        let mut output = crate::operators::build_columns(runtime.clone(), execution.clone()).await.unwrap().unwrap();
+        let mut seen = 0;
+        while let Some(batch) = output.next_batch().await.unwrap() {
+            for row in 0..batch.len {
+                seen += 1;
+                assert_eq!(batch.columns[1].value(row).unwrap(), Value::I64(seen));
+                let cell = batch.columns[0].expression_cell(row).expect("Expected a vector or a null at an Arrow position");
+                if seen == 2 {
+                    assert!(cell.is_null().unwrap());
+                    continue;
+                }
+                assert_eq!(cell.sequence_kind(), Some(if seen == 1 { ListKind::FixedSizeList(3) } else { ListKind::List }));
+                let [first, second, last] = cell.sequence().unwrap().map(|cell| cell.physical().unwrap())
+                    .collect::<Vec<_>>().try_into().unwrap_or_else(|_| panic!("Expected three vector components"));
+                let first_bits = first.array.as_any().downcast_ref::<Float32Array>().unwrap().value(first.row).to_bits();
+                if seen == 1 {
+                    assert_eq!(first_bits, nan32.to_bits());
+                    let second = second.array.as_any().downcast_ref::<Float32Array>().unwrap().value(second.row);
+                    assert_eq!(second.to_bits(), (-0.0f32).to_bits());
+                } else {
+                    assert_eq!(first_bits, (-0.0f32).to_bits());
+                    let second = second.array.as_any().downcast_ref::<Float64Array>().unwrap().value(second.row);
+                    assert_eq!(second.to_bits(), nan64.to_bits());
+                }
+                assert!(last.is_null().unwrap());
+            }
+        }
+        assert_eq!(seen, 3);
+        assert!(execution.context.spill_peak_bytes() > 0);
+        assert_eq!(execution.context.spill_bytes(), 0);
+        drop(output);
+        assert_eq!(memory.used_bytes(), baseline);
     }
 
     #[tokio::test]
@@ -3388,7 +3470,7 @@ mod tests {
                 Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), kind, Some(condition),
             ).unwrap());
             let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut baseline = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
             let mut expected = Vec::new();
             while let Some(page) = baseline.next_page().await.unwrap() { expected.extend(page.rows().iter().map(|row| row.values.clone())); }
             drop(baseline);
@@ -3401,6 +3483,12 @@ mod tests {
             }
             assert_eq!(actual, expected);
             assert_eq!(actual.len(), if kind == JoinKind::Full { 4 } else { 3 });
+            for row in [[Value::I64(1), Value::I64(2)], [Value::I64(2), Value::I64(3)], [Value::Null, Value::I64(1)]] {
+                assert!(actual.contains(&row.to_vec()));
+            }
+            if kind == JoinKind::Full {
+                assert!(actual.contains(&vec![Value::I64(3), Value::Null]));
+            }
             assert_eq!(execution.context.spill_bytes(), 0);
         }
     }
@@ -3431,7 +3519,7 @@ mod tests {
         let prepared = crate::PreparedQuery::new(Arc::clone(&relation)).unwrap();
         let mut output = prepared.execute_columns(Arc::clone(&execution.context), vec![]).await.unwrap();
         let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-        let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut baseline = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
         let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected columnar projection");
         let mut observed = 0;
         while let Some(batch) = cursor.next_batch().await.unwrap() {
@@ -3476,7 +3564,7 @@ mod tests {
         for kind in [JoinKind::Semi, JoinKind::Anti] {
             let relation = Arc::new(Relation::join(Arc::clone(&left), Arc::clone(&right), kind, Some(condition.clone())).unwrap());
             let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-            let mut expected = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut expected = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
             let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
             let mut actual = Vec::new();
             let mut baseline = Vec::new();
@@ -3513,7 +3601,7 @@ mod tests {
             JoinKind::Inner, Some(Expr::binary(BinaryOp::And, equality, residual)),
         ).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut rows = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
         let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow join");
         let mut expected = Vec::new();
         let mut actual = Vec::new();
@@ -3527,6 +3615,9 @@ mod tests {
         }
         assert_eq!(actual, expected);
         assert_eq!(actual.len(), 2);
+        for value in 1..=2 {
+            assert!(actual.contains(&vec![Value::I64(value), Value::I64(value + 1)]));
+        }
     }
 
     #[tokio::test]
@@ -3575,7 +3666,7 @@ mod tests {
             }, percentile(discrete, PercentileKind::Discrete), percentile(continuous, PercentileKind::Continuous)],
         }).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut rows = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
         let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow aggregate");
         let page = columns.next_batch().await.unwrap().unwrap();
         assert!(page.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
@@ -3604,7 +3695,7 @@ mod tests {
             condition: None, comparison, output }).unwrap());
         let relation = Arc::new(mark.limit(None, Some(Expr::Literal(Value::I64(0)))).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut rows = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
         let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow membership");
         assert!(rows.next_page().await.unwrap().is_none());
         assert!(columns.next_batch().await.unwrap().is_none());
@@ -3626,7 +3717,7 @@ mod tests {
             aggregates: vec![AggregateExpr { field: count, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![] }],
         }).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-        let mut pages = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut pages = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
         let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow grouping");
         let batch = columns.next_batch().await.unwrap().unwrap();
         assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
@@ -3730,7 +3821,7 @@ mod tests {
             let document = Expr::RowCopy(projected.schema().fields().to_vec());
             let relation = Arc::new(projected.project(vec![named(3, "_iid", iid), named(4, "doc", document)]).unwrap());
             let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut baseline = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
             let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a columnar document projection");
             let mut seen = 0;
             while let Some(batch) = cursor.next_batch().await.unwrap() {
@@ -3779,7 +3870,7 @@ mod tests {
                 Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), kind, Some(condition.clone()),
             ).unwrap());
             let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
-            let mut expected = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut expected = semantic_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
             let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
             let mut actual = Vec::new();
             let mut baseline = Vec::new();
@@ -4040,9 +4131,12 @@ mod tests {
             vec![Value::I64(1), Value::I64(1), Value::I64(2), Value::Null],
             vec![Value::I64(2), Value::I64(2), Value::I64(1), Value::Null],
         ]);
-        let mut pages = crate::operators::build_pages(runtime, execution).await.unwrap();
-        let reference = pages.next_page().await.unwrap().unwrap();
-        assert_eq!(rows, reference.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
+        let mut pages = semantic_pages(runtime, execution).await.unwrap();
+        let mut reference = Vec::new();
+        while let Some(page) = pages.next_page().await.unwrap() {
+            reference.extend(page.rows().iter().map(|row| row.values.clone()));
+        }
+        assert_eq!(rows, reference);
     }
 
     #[tokio::test]
@@ -4075,7 +4169,7 @@ mod tests {
         let rows: Vec<_> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()).collect();
         assert_eq!(rows, [vec![Value::I64(2), Value::I64(2)], vec![Value::I64(1), Value::I64(1)]]);
         assert!(arrow.next_batch().await.unwrap().is_none());
-        let mut pages = crate::operators::build_pages(runtime, execution).await.unwrap();
+        let mut pages = semantic_pages(runtime, execution).await.unwrap();
         let data = pages.next_page().await.unwrap().unwrap();
         assert_eq!(rows, data.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
         for _ in &rows {

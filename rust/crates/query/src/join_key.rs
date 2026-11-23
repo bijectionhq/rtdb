@@ -2,7 +2,7 @@ use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, Relation, RelationNode, Schema};
 use rtdb_types::Result;
-use crate::{context::Execution, cursor::OwnedRow, invalid, runtime_schema::{expression_bound, schema_bound}};
+use crate::{context::Execution, invalid, runtime_schema::{expression_bound, schema_bound}};
 
 pub(crate) struct JoinInput {
     pub original: Schema,
@@ -73,14 +73,7 @@ impl JoinLayout {
         self._reservation = reservation;
         Ok(())
     }
-    pub fn with_null_build(&mut self,build_left: bool) -> Result<()> {
-        let input = if build_left { &mut self.left } else { &mut self.right };
-        input.schema = Schema::new(input.schema.fields().iter().map(|field| {
-            let mut field = field.clone();field.data_type = field.data_type.maybe();field
-        }).collect())?;
-        self.schema = self.left.schema.concat(&self.right.schema)?;
-        Ok(())
-    }
+    pub fn into_reservation(self) -> Arc<MemoryReservation> { self._reservation }
 }
 
 impl JoinInput {
@@ -95,47 +88,14 @@ impl JoinInput {
         self.schema = Schema::new(fields)?;
         Ok(())
     }
-    pub async fn project_page(&self,page: crate::pages::OwnedPage,execution: &Execution) -> Result<crate::pages::OwnedPage> {
-        if self.expressions.is_empty() { return Ok(page); }
-        let keys = crate::pages::project(&page,&self.original,self.expressions.iter(),execution).await?;
-        let mut output = crate::pages::PageBuilder::new(page.len(),&execution.context.memory)?;
-        for (row,keys) in page.rows().iter().zip(keys.rows()) {
-            output.push(OwnedRow::copy_parts(&[&row.values,&keys.values],0,0,&execution.context.memory)?)?;
-        }
-        Ok(output.finish())
-    }
     pub fn project_batches(&self, input: crate::columnar::BoxBatchCursor, execution: &Execution) -> crate::columnar::BoxBatchCursor {
         if self.expressions.is_empty() { return input; }
         let projections = self.original.fields().iter().map(Field::expression).chain(self.expressions.iter().cloned()).collect();
         Box::new(crate::columnar::BatchExpressions::new(input, self.original.clone(), projections, execution.clone()).validating_input(true))
     }
 
-    pub fn supports_batch_keys(&self) -> bool {
-        fn deterministic(expr: &Expr) -> bool {
-            match expr {
-                Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. } => true,
-                Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } =>
-                    deterministic(left) && deterministic(right),
-                Expr::Call { name, args, .. } if matches!(name.as_str(), "mod" | "abs") =>
-                    args.iter().all(deterministic),
-                _ => false,
-            }
-        }
-        self.expressions.iter().all(deterministic)
-    }
-
-    pub fn output<'a>(&self, row: &'a OwnedRow) -> &'a [rtdb_types::Value] { &row.values[..self.original.len()] }
     pub fn key_count(&self) -> usize { self.key_positions.len() }
     pub fn key_positions(&self) -> &[usize] { &self.key_positions }
-    /// Whether every key is one of the input's own columns, so the layout adds no computed cells.
-    pub fn computes_no_keys(&self) -> bool { self.expressions.is_empty() }
-    pub fn key<'a>(&self,row: &'a OwnedRow,index: usize) -> Result<&'a rtdb_types::Value> {
-        self.key_positions.get(index).and_then(|position|row.values.get(*position)).ok_or_else(||invalid("join-key","Join key cell is absent"))
-    }
-    pub fn hash(&self, row: &OwnedRow) -> Result<u32> {
-        if self.key_positions.iter().any(|position|*position >= row.values.len()) { return Err(invalid("join-key","Join key cell is absent")); }
-        crate::join_storage::hash_values(self.key_positions.iter().map(|position|&row.values[*position]))
-    }
 }
 
 fn project_keys(condition: Expr, left: &mut InputBuilder<'_>, right: &mut InputBuilder<'_>, next_id: &mut Option<u32>) -> Result<Vec<Expr>> {

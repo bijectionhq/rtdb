@@ -2,17 +2,16 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_array::{RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_ipc::{reader::{StreamDecoder, read_record_batch}, writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter}};
-use arrow_schema::{Schema, SchemaRef};
-use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_types::{Result, Value};
+use arrow_schema::SchemaRef;
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_types::Result;
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
 use crate::{
     columnar::ColumnBatch,
-    cursor::OwnedRow,
     fragment::{FragmentBytes, decode_batches, encode_batch},
     invalid,
 };
@@ -54,29 +53,6 @@ impl SpillFile {
 pub(crate) struct SpillWriter { file: BufWriter<File>, position: u64, retained: Arc<SpillFile> }
 impl SpillWriter {
     pub fn position(&mut self) -> Result<u64> { Ok(self.position) }
-    pub fn write(&mut self, values: &[Value], memory: &Arc<MemoryBudget>) -> Result<()> {
-        let overflow = || invalid("row-size", "Spill row size overflow");
-        let metadata = values.len().checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
-        let mut builder = BatchBuilder::new(metadata, memory)?;
-        let mut fields = Vec::with_capacity(values.len());
-        let mut arrays = Vec::with_capacity(values.len());
-        for (position, value) in values.iter().enumerate() {
-            let logical = value.logical_type();
-            let field = rtdb_columnar::to_field(&position.to_string(), &logical)?;
-            let value = std::slice::from_ref(value);
-            let bound = rtdb_columnar::estimate_builder_bytes(&logical, value)?;
-            arrays.push(builder.column(bound, || rtdb_columnar::copy_array(&logical, value))?);
-            fields.push(field);
-        }
-        let options = RecordBatchOptions::new().with_row_count(Some(1));
-        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options).map_err(ipc_error)?;
-        let batch = builder.finish(batch)?;
-        let schema_bytes = batch.batch().schema_ref().fields().iter().try_fold(0usize, |bytes, field| {
-            bytes.checked_add(field.size()).ok_or_else(overflow)
-        })?;
-        self.write_arrow(&batch, schema_bytes, memory, "spill-row")
-    }
-
     pub fn write_frame(&mut self, bytes: &[u8]) -> Result<()> {
         self.write_frame_parts(&[bytes])
     }
@@ -173,27 +149,6 @@ impl SpillReader {
         Ok(())
     }
     pub fn rewind(&mut self) -> Result<()> { self.file.seek(SeekFrom::Start(0)).map_err(io_error)?; Ok(()) }
-    pub fn next(&mut self) -> Result<Option<OwnedRow>> {
-        let Some(batch) = self.read_arrow(false, "spill-row")? else { return Ok(None); };
-        let batch = batch.batch();
-        if batch.num_rows() != 1 { return Err(invalid("invalid-spill", "Spill record must contain one row")); }
-        let columns = batch.schema_ref().fields().iter().zip(batch.columns());
-        let bound = columns.clone().try_fold(4096usize, |bytes, (field, array)| {
-            let cell = if field.data_type() == &arrow_schema::DataType::Null && !field.is_nullable() {
-                std::mem::size_of::<Value>()
-            } else {
-                rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0)?
-            };
-            bytes.checked_add(cell).ok_or_else(|| invalid("row-size", "Decoded spill row size overflow"))
-        })?;
-        let reservation = self.memory.reserve(bound)?;
-        let values = columns.map(|(field, array)| {
-            if field.data_type() == &arrow_schema::DataType::Null && !field.is_nullable() { Ok(Value::Undefined) }
-            else { rtdb_columnar::read_value(field, array.as_ref(), 0) }
-        }).collect::<Result<Vec<_>>>()?;
-        OwnedRow::with_reservation(values, reservation).map(Some)
-    }
-
     pub fn read_frame(&mut self, expansion: usize) -> Result<Option<(Vec<u8>, Arc<MemoryReservation>)>> {
         let mut prefix = [0u8; 8];
         match self.file.read(&mut prefix[..1]).map_err(io_error)? { 0 => return Ok(None), _ => {} }
@@ -333,7 +288,7 @@ fn arrow_records_share_one_schema_across_spill_offsets() {
 fn spill_replays_mixed_struct_fields_as_arrow_positions() {
     use crate::columnar::{Column, ColumnBatch, pack_evaluated_column};
     use rtdb_plan::{Binder, Schema};
-    use rtdb_types::StructFields;
+    use rtdb_types::{StructFields, Value};
 
     let memory = MemoryBudget::new(1 << 23);
     let spill = Arc::new(SpillRegion::new(1 << 20).unwrap());

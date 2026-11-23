@@ -2,15 +2,10 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use rtdb_plan::{ColumnId, Expr, PatchEndpoint, Schema};
 use rtdb_format::transit::{TransitValue, to_json_value};
-use rtdb_types::{Anomaly, Iid, Result, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, Iid, Result, Timestamp, Value};
 
 use crate::{columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, times},
-    context::Execution, cursor::OwnedRow, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, invalid};
-
-pub(crate) struct PatchGaps {
-    input: BoxPageCursor,
-    layout: PatchLayout,
-}
+    context::Execution, invalid};
 
 pub(crate) struct BatchPatchGaps {
     input: BoxBatchCursor,
@@ -25,33 +20,11 @@ struct PatchLayout {
     execution: Execution,
 }
 
-#[derive(Clone, Copy)]
-enum PatchIid {
-    Binary(Iid),
-    FixedSizeBinary(Iid),
-    Uuid(Iid),
-}
-
-impl PatchIid {
-    fn read(value: &Value) -> Result<Self> {
-        match value {
-            Value::Binary(bytes) => Ok(Self::Binary(Iid::from_slice(bytes)?)),
-            Value::FixedSizeBinary(bytes) => Ok(Self::FixedSizeBinary(Iid::from_slice(bytes)?)),
-            Value::Uuid(bytes) => Ok(Self::Uuid(Iid(*bytes))),
-            _ => Err(invalid("patch-iid", "Patch input IID is not sixteen bytes")),
-        }
-    }
-
-    fn bytes(self) -> Iid {
-        match self { Self::Binary(iid) | Self::FixedSizeBinary(iid) | Self::Uuid(iid) => iid }
-    }
-
-    fn value(self) -> Value {
-        match self {
-            Self::Binary(iid) => Value::Binary(iid.0.to_vec()),
-            Self::FixedSizeBinary(iid) => Value::FixedSizeBinary(iid.0.to_vec()),
-            Self::Uuid(iid) => Value::Uuid(iid.0),
-        }
+fn read_iid(value: &Value) -> Result<Iid> {
+    match value {
+        Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => Iid::from_slice(bytes),
+        Value::Uuid(bytes) => Ok(Iid(*bytes)),
+        _ => Err(invalid("patch-iid", "Patch input IID is not sixteen bytes")),
     }
 }
 
@@ -80,21 +53,12 @@ impl PatchLayout {
         let [iid, vf, vt, doc] = columns;
         Ok(Self { columns: [iid?, vf?, vt?, doc?], width: schema.len(), from, to, execution })
     }
-    fn gap(&self, iid: PatchIid, from: Timestamp, to: Timestamp) -> Result<OwnedRow> {
-        let bytes = self.width.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("patch-size", "Patch row allocation exceeds addressable memory"))?;
-        let reservation = self.execution.context.memory.reserve(bytes)?;
-        let mut values = vec![Value::Null; self.width];
-        values[self.columns[0]] = iid.value();
-        values[self.columns[1]] = timestamp(from, false);
-        values[self.columns[2]] = timestamp(to, true);
-        OwnedRow::with_reservation(values, reservation)
-    }
+
 }
 
 #[derive(Clone, Copy)]
 struct PatchSpan {
     source: usize,
-    iid: PatchIid,
     from: Timestamp,
     to: Timestamp,
     copy_document: bool,
@@ -103,32 +67,32 @@ struct PatchSpan {
 struct PatchTimeline {
     from: Timestamp,
     to: Timestamp,
-    current: Option<(usize, PatchIid, Timestamp)>,
+    current: Option<(usize, Iid, Timestamp)>,
 }
 
 impl PatchTimeline {
-    fn advance(&mut self, source: usize, iid: PatchIid, from: Timestamp, to: Timestamp) -> [Option<PatchSpan>; 3] {
+    fn advance(&mut self, source: usize, iid: Iid, from: Timestamp, to: Timestamp) -> [Option<PatchSpan>; 3] {
         let mut cursor = self.from;
         let mut tail = None;
         if let Some((previous_row, previous, previous_to)) = self.current {
-            if iid.bytes() == previous.bytes() { cursor = previous_to; }
-            else if previous_to < self.to { tail = Some(Self::gap(previous_row, previous, previous_to, self.to)); }
+            if iid == previous { cursor = previous_to; }
+            else if previous_to < self.to { tail = Some(Self::gap(previous_row, previous_to, self.to)); }
         }
         self.current = Some((source, iid, to));
         [
             tail,
-            (from > cursor).then(|| Self::gap(source, iid, cursor, from.min(self.to))),
-            Some(PatchSpan { source, iid, from: from.max(self.from), to: to.min(self.to), copy_document: true }),
+            (from > cursor).then(|| Self::gap(source, cursor, from.min(self.to))),
+            Some(PatchSpan { source, from: from.max(self.from), to: to.min(self.to), copy_document: true }),
         ]
     }
 
     fn finish(self) -> Option<PatchSpan> {
-        let (source, iid, from) = self.current?;
-        (from < self.to).then(|| Self::gap(source, iid, from, self.to))
+        let (source, _, from) = self.current?;
+        (from < self.to).then(|| Self::gap(source, from, self.to))
     }
 
-    fn gap(source: usize, iid: PatchIid, from: Timestamp, to: Timestamp) -> PatchSpan {
-        PatchSpan { source, iid, from, to, copy_document: false }
+    fn gap(source: usize, from: Timestamp, to: Timestamp) -> PatchSpan {
+        PatchSpan { source, from, to, copy_document: false }
     }
 }
 
@@ -138,47 +102,6 @@ impl PatchLayout {
     fn read_time(&self, value: &Value, upper: bool) -> Result<Timestamp> {
         if upper && matches!(value, Value::Null | Value::Undefined) { return Ok(Timestamp::MAX); }
         rtdb_expr::timestamp_micros(value, &self.execution.context.timezone)
-    }
-}
-
-impl PatchGaps {
-    pub fn new(input: BoxPageCursor, schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
-        Ok(Self { input, layout: PatchLayout::new(schema, columns, from, to, execution)? })
-    }
-}
-
-#[async_trait]
-impl PageCursor for PatchGaps {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        let layout = &self.layout;
-        let context = &layout.execution.context;
-        context.check_cancelled()?;
-        let Some(mut page) = self.input.next_page().await? else { return Ok(None); };
-        let capacity = page.len().checked_mul(3).ok_or_else(size_error)?;
-        let mut output = PageBuilder::new(capacity, &context.memory)?;
-        let mut timeline = layout.timeline();
-        let [iid, valid_from, valid_to, _] = layout.columns;
-        let mut index = 0;
-        while let Some(mut row) = page.next() {
-            context.check_cancelled()?;
-            let id = PatchIid::read(&row.values[iid])?;
-            let from = layout.read_time(&row.values[valid_from], false)?;
-            let to = layout.read_time(&row.values[valid_to], true)?;
-            for span in timeline.advance(index, id, from, to).into_iter().flatten() {
-                if span.copy_document {
-                    let reservation = context.memory.reserve(row.bytes().checked_add(64).ok_or_else(size_error)?)?;
-                    for (index, value) in row.values.iter_mut().enumerate() { if !layout.columns.contains(&index) { *value = Value::Null; } }
-                    row.values[valid_from] = timestamp(span.from, false);
-                    row.values[valid_to] = timestamp(span.to, true);
-                    output.push(OwnedRow::with_reservation(std::mem::take(&mut row.values), reservation)?)?;
-                } else {
-                    output.push(layout.gap(span.iid, span.from, span.to)?)?;
-                }
-            }
-            index += 1;
-        }
-        if let Some(span) = timeline.finish() { output.push(layout.gap(span.iid, span.from, span.to)?)?; }
-        Ok(Some(output.finish()))
     }
 }
 
@@ -216,9 +139,9 @@ impl BatchCursor for BatchPatchGaps {
             if let Some(Some((array, _, Some(LogicalType::Scalar(ScalarType::FixedSizeBinary(16))), offset))) = batch.columns[iid].arrow_cell(row)
                 && let Some(ids) = array.as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>() {
                 use arrow_array::Array;
-                if ids.is_valid(offset) { return Iid::from_slice(ids.value(offset)).map(PatchIid::FixedSizeBinary); }
+                if ids.is_valid(offset) { return Iid::from_slice(ids.value(offset)); }
             }
-            PatchIid::read(&batch.columns[iid].value(row)?)
+            read_iid(&batch.columns[iid].value(row)?)
         };
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
@@ -251,11 +174,6 @@ impl BatchCursor for BatchPatchGaps {
 }
 
 fn size_error() -> Anomaly { invalid("patch-size", "Patch page allocation exceeds addressable memory") }
-
-fn timestamp(value: Timestamp, upper: bool) -> Value {
-    if upper && value == Timestamp::MAX { Value::Null }
-    else { Value::Timestamp { value: value.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
-}
 
 #[cfg(test)]
 #[path = "patch_tests.rs"]

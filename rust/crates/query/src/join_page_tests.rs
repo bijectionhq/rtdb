@@ -1,11 +1,12 @@
 use rtdb_types::StructFields;
 use super::*;
+use crate::columnar::{BoxBatchCursor, ColumnBatch};
 use rtdb_columnar::MemoryBudget;
 use rtdb_plan::{BinaryOp,ColumnId,Field,JoinKind,RegexForm,RegexReplacement};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
 use rtdb_types::{LogicalType,ScalarType,Timestamp};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot,DatabaseSnapshot,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
+use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
 
 fn execution(batch_rows: usize,threshold: i64) -> Execution {
     let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
@@ -33,13 +34,15 @@ fn join(left: Arc<Relation>,right: Arc<Relation>,kind: JoinKind,condition: Optio
     Arc::new(Relation::new(schema,RelationNode::Join { left,right,kind,condition }).unwrap())
 }
 fn equal(left: &Relation,right: &Relation) -> Expr { Expr::binary(BinaryOp::Eq,left.schema().fields()[0].expression(),right.schema().fields()[0].expression()) }
-async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxPageCursor {
+async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxBatchCursor {
     let runtime = EmittedRelation::derive(Arc::clone(&relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
-    build_pages(Arc::clone(&runtime),execution.clone()).await.unwrap()
+    build_column_pages(runtime,execution.clone()).await.unwrap().unwrap()
 }
-fn rows(page: OwnedPage) -> Vec<Vec<Value>> { page.rows().iter().map(|row|row.values.clone()).collect() }
-async fn collect(mut cursor: BoxPageCursor) -> Vec<Vec<Vec<Value>>> {
-    let mut pages = Vec::new();while let Some(page) = cursor.next_page().await.unwrap() { pages.push(rows(page)); }pages
+fn rows(page: ColumnBatch) -> Vec<Vec<Value>> {
+    (0..page.len).map(|row| page.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect()
+}
+async fn collect(mut cursor: BoxBatchCursor) -> Vec<Vec<Vec<Value>>> {
+    let mut pages = Vec::new();while let Some(page) = cursor.next_batch().await.unwrap() { pages.push(rows(page)); }pages
 }
 fn inverse(column: Expr) -> Expr { Expr::binary(BinaryOp::Divide,Expr::Literal(Value::I64(1)),column) }
 fn invalid_pattern() -> Expr {
@@ -86,7 +89,7 @@ async fn complete_probe_page_errors_before_limit_can_publish_its_first_match() {
         let input = join(left,right,JoinKind::Inner,Some(condition));
         let relation = Arc::new(Relation::new(input.schema().clone(),RelationNode::Limit { input,offset: None,fetch: Some(Expr::Literal(Value::I64(1))) }).unwrap());
         let mut cursor = open(relation,&execution).await;
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/division-by-zero");
         drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }
 }
@@ -99,17 +102,20 @@ async fn computed_join_keys_finish_first_column_before_preparing_second_column()
     let second_key = Expr::Coalesce(vec![invalid_pattern(),Expr::Call { name: "str".into(),args: vec![left.schema().fields()[0].expression()],return_type: LogicalType::Scalar(ScalarType::Utf8) }]);
     let second = Expr::binary(BinaryOp::Eq,second_key,right.schema().fields()[0].expression());
     let mut cursor = open(join(left,right,JoinKind::Inner,Some(Expr::binary(BinaryOp::And,first,second))),&execution).await;
-    assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+    assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/division-by-zero");
     drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
 #[tokio::test]
-async fn empty_values_probe_does_not_prepare_theta_metadata() {
-    let execution = execution(1,100);
-    let right = numbers(1,&[]);
-    let theta = Expr::binary(BinaryOp::Eq,invalid_pattern(),Expr::Literal(Value::Utf8("x".into())));
-    let mut cursor = open(join(numbers(0,&[1]),right,JoinKind::Inner,Some(theta)),&execution).await;
-    assert!(cursor.next_page().await.unwrap().is_none());
+async fn an_empty_probe_batch_prepares_residual_metadata() {
+    let execution = execution(1, 100);
+    let right = numbers(1, &[]);
+    let empty = Arc::new(Relation::new(right.schema().clone(), RelationNode::LiteralPages { pages: vec![vec![]] }).unwrap());
+    let theta = Expr::binary(BinaryOp::Eq, invalid_pattern(), Expr::Literal(Value::Utf8("x".into())));
+    let mut absent = open(join(numbers(0, &[1]), right, JoinKind::Inner, Some(theta.clone())), &execution).await;
+    assert!(absent.next_batch().await.unwrap().is_none());
+    let mut present = open(join(numbers(0, &[1]), empty, JoinKind::Inner, Some(theta)), &execution).await;
+    assert_eq!(present.next_batch().await.err().unwrap().code, "xtdb.expression/illegal-argument-exception");
 }
 
 #[tokio::test]
@@ -132,7 +138,7 @@ async fn full_join_emits_unmatched_build_rows_as_a_separate_complete_page() {
         let execution = execution(1,threshold);
         let left = numbers(0,&[1,2]);let right = numbers(1,&[1]);
         let mut cursor = open(join(Arc::clone(&left),Arc::clone(&right),JoinKind::Full,Some(equal(&left,&right))),&execution).await;
-        let mut all = Vec::new();while let Some(page) = cursor.next_page().await.unwrap() { all.extend(rows(page)); }
+        let mut all = Vec::new();while let Some(page) = cursor.next_batch().await.unwrap() { all.extend(rows(page)); }
         assert_eq!(all.len(),2);assert!(all.contains(&vec![Value::I64(1),Value::I64(1)]));assert!(all.contains(&vec![Value::I64(2),Value::Null]));
         drop(cursor);assert_eq!(execution.context.spill_bytes(),0);
     }
@@ -143,8 +149,8 @@ async fn returned_join_page_survives_cursor_drop_and_cancelled_next_pull() {
     for threshold in [0,100] {
         let execution = execution(1,threshold);let baseline = execution.context.memory.used_bytes();
         let mut cursor = open(join(numbers(0,&[1,2]),numbers(1,&[3,4]),JoinKind::Inner,None),&execution).await;
-        let page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),4);
-        execution.context.cancellation.cancel();assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb/query-cancelled");
+        let page = cursor.next_batch().await.unwrap().unwrap();assert_eq!(page.len,4);
+        execution.context.cancellation.cancel();assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb/query-cancelled");
         drop(cursor);assert_eq!(execution.context.spill_bytes(),0);assert!(execution.context.memory.used_bytes() > baseline);
         drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);
     }
@@ -179,7 +185,7 @@ fn outer_build_estimates_use_catalog_rows_and_preserve_unknown_live_only_counts(
 async fn absent_values_build_does_not_open_negative_threshold_spill() {
     let execution = execution(1,-1);let baseline = execution.context.memory.used_bytes();
     let mut cursor = open(join(numbers(0,&[]),numbers(1,&[1]),JoinKind::Inner,None),&execution).await;
-    assert!(cursor.next_page().await.unwrap().is_none());assert_eq!(execution.context.spill_peak_bytes(),0);
+    assert!(cursor.next_batch().await.unwrap().is_none());assert_eq!(execution.context.spill_peak_bytes(),0);
     drop(cursor);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 

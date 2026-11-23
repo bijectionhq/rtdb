@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use rtdb_expr::{IndexedListBatches, ListBatch};
 use rtdb_plan::OrdinalityScope;
-use rtdb_types::{Result, Value};
-use crate::{QueryContext, context::cancelled, cursor::OwnedRow, invalid, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}};
+use rtdb_types::Result;
+use crate::{QueryContext, context::cancelled, invalid};
 
 pub(crate) enum ListEvent { Opened(Option<IndexedListBatches>), Batch(ListBatch) }
 
@@ -63,60 +63,11 @@ impl crate::columnar::BatchCursor for ListCursor {
         Ok(Some(output))
     }
     fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> {
-        PageCursor::skip_complete_pages(self, rows)
-    }
-}
-
-#[async_trait]
-impl PageCursor for ListCursor {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        let Some(batch) = self.next_list_batch().await? else { return Ok(None); };
-        let mut page = PageBuilder::new(batch.values().len(), &self.context.memory)?;
-        for value in batch.values().iter() {
-            self.context.check_cancelled()?;
-            page.push(OwnedRow::copy_parts(&[std::slice::from_ref(value.as_ref())], 0, 0, &self.context.memory)?)?;
-        }
-        Ok(Some(page.finish()))
-    }
-
-    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> {
         self.context.check_cancelled()?;
         match &mut self.pages {
             ListPages::Indexed(batches) => Ok(batches.skip_complete_batches(rows)),
             ListPages::Stream(_) => Ok(0),
         }
-    }
-}
-
-pub(crate) struct Ordinality { input: BoxPageCursor, context: Arc<QueryContext>, relation_rows: Option<i64> }
-impl Ordinality {
-    pub fn new(input: BoxPageCursor, scope: OrdinalityScope, context: Arc<QueryContext>) -> Self {
-        Self { input, context, relation_rows: (scope == OrdinalityScope::Relation).then_some(0) }
-    }
-}
-#[async_trait]
-impl PageCursor for Ordinality {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        self.context.check_cancelled()?;
-        let Some(mut page) = self.input.next_page().await? else { return Ok(None); };
-        let mut output = PageBuilder::new(page.len(), &self.context.memory)?;
-        let mut ordinal = self.relation_rows.unwrap_or(0);
-        while let Some(row) = page.next() {
-            self.context.check_cancelled()?;
-            ordinal = ordinal.checked_add(1).ok_or_else(ordinality_overflow)?;
-            output.push(OwnedRow::copy_parts(&[&row.values, &[Value::I64(ordinal)]], 0, 0, &self.context.memory)?)?;
-        }
-        if let Some(rows) = &mut self.relation_rows { *rows = ordinal; }
-        Ok(Some(output.finish()))
-    }
-
-    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> {
-        let skipped = self.input.skip_complete_pages(rows)?;
-        if let Some(rows) = &mut self.relation_rows {
-            let skipped = i64::try_from(skipped).map_err(|_| ordinality_overflow())?;
-            *rows = rows.checked_add(skipped).ok_or_else(ordinality_overflow)?;
-        }
-        Ok(skipped)
     }
 }
 

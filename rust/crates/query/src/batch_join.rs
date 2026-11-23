@@ -3,7 +3,6 @@
 use std::{collections::VecDeque, ops::ControlFlow};
 use std::sync::Arc;
 
-use arrow_array::Array;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{BinaryOp, Expr, JoinKind};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
@@ -14,20 +13,17 @@ use crate::invalid;
 use crate::join_key::JoinLayout;
 use crate::join_spill::{BlockWriter, Partitions};
 use crate::join_storage::HashIndex;
-use crate::operators::{BatchOutput, DeferredInput, build_batch_input};
-use crate::pages::{BoxPageCursor, OwnedPage, PageCursor};
+use crate::operators::{BatchOutput, build_batch_input};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
 use crate::scalar_key::ScalarKey;
 use crate::set_keys::{Key, direct_key_equal};
 
-/// For each equality, whether its first operand is the build side's key; `None` where the join needs the row join.
-pub(crate) fn key_order(layout: &JoinLayout, output: BatchOutput) -> Option<Vec<bool>> {
-    if output == BatchOutput::Pages && (!layout.left.supports_batch_keys() || !layout.right.supports_batch_keys()) { return None; }
+/// For each equality, whether its first operand is the build side's key.
+pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
     layout.comparisons.iter().take(layout.left.key_count()).map(|comparison| match comparison {
         Expr::Binary { op: BinaryOp::Eq, left, right } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column { id: first, data_type: first_type }, Expr::Column { data_type: second_type, .. })
-                if output.is_arrow() || rtdb_plan::validate_equality_types(first_type, second_type).is_ok() => Some(layout.left.schema.get(*first).is_some()),
+            (Expr::Column { id: first, .. }, Expr::Column { .. }) => Some(layout.left.schema.get(*first).is_some()),
             _ => None,
         },
         _ => None,
@@ -166,7 +162,6 @@ enum State {
     Build { build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout },
     Probe { table: Table, probe: BoxBatchCursor },
     Disk(DiskJoin),
-    Rows(BoxPageCursor),
     Done,
 }
 
@@ -258,11 +253,9 @@ impl DiskJoin {
 
 pub(crate) struct BatchJoin { state: State, spec: Spec }
 
-/// What the join compares and how it reads cells, fixed for its lifetime.
-/// `unswapped` is the join's own layout where the join builds its right input, which a spill hands to the row join.
 struct Spec {
     order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind,
-    projected: [bool; 2], swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, theta: Vec<ThetaTest>, residual: Option<Residual>, execution: Execution,
+    projected: [bool; 2], swapped: bool, _original_layout_charge: Option<Arc<MemoryReservation>>, theta: Vec<ThetaTest>, residual: Option<Residual>, execution: Execution,
 }
 
 impl BatchJoin {
@@ -271,16 +264,16 @@ impl BatchJoin {
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
         Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner,
-            projected, swapped: false, unswapped: None, validate_payloads: false, theta: Vec::new(), residual: None, execution } }
+            projected, swapped: false, _original_layout_charge: None, theta: Vec::new(), residual: None, execution } }
     }
 }
 
 impl BatchJoin {
-    /// With the join's own layout, builds its right input and emits each match's left columns first, as the join's
-    /// schema orders them.
-    pub fn swapped(mut self, unswapped: Option<JoinLayout>) -> Self { self.spec.swapped = unswapped.is_some(); self.spec.unswapped = unswapped; self }
-
-    pub fn validating_payloads(mut self, validate: bool) -> Self { self.spec.validate_payloads = validate; self }
+    pub fn swapped(mut self, original_layout_charge: Option<Arc<MemoryReservation>>) -> Self {
+        self.spec.swapped = original_layout_charge.is_some();
+        self.spec._original_layout_charge = original_layout_charge;
+        self
+    }
 
     pub fn with_kind(mut self, kind: JoinKind) -> Self { self.spec.kind = kind; self }
 
@@ -311,18 +304,15 @@ impl Spec {
         let mut inventory = memory.reserve(256)?;
         while let Some(batch) = poll_nested_batch(build.as_mut()).await? {
             self.execution.context.check_cancelled()?;
-            if self.validate_payloads { batch.validate_readable(&self.execution.context)?; }
+            batch.validate_readable(&self.execution.context)?;
             rows = rows.checked_add(batch.len).ok_or_else(size_error)?;
             let bytes = batches.len().checked_add(1).and_then(|count| count.checked_mul(4 * std::mem::size_of::<ColumnBatch>()))
                 .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
             Arc::get_mut(&mut inventory).expect("The join owns its batch inventory").grow_to(bytes)?;
             batches.push(batch);
             if i64::try_from(rows).map_or(true, |rows| rows > threshold) {
-                if probe.output.is_arrow() {
-                    drop(inventory);
-                    return self.spill_arrow(batches, build, probe, &layout).await.map(State::Disk);
-                }
-                return self.spill(batches, build, probe, layout);
+                drop(inventory);
+                return self.spill_arrow(batches, build, probe, &layout).await.map(State::Disk);
             }
         }
         let mut table = self.table(batches, rows, inventory)?;
@@ -402,22 +392,8 @@ impl Spec {
         Key::for_columns(batch, row, self.projected[side], positions, &self.execution.context)
     }
 
-    /// Hands the input read so far, and the rest, to the row join, which spills a build side this large.
-    fn spill(&mut self, held: Vec<ColumnBatch>, rest: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
-        let memory = &self.execution.context.memory;
-        let pages = held.iter().map(|batch| batch.rows_admitting(memory, self.projected[0])).collect::<Result<VecDeque<_>>>()?;
-        drop(held);
-        let rest: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(rest, Arc::clone(memory)).admitting_dates(self.projected[0]));
-        let build: BoxPageCursor = Box::new(HeldThen { pages, rest });
-        let probe = DeferredInput::new(probe.runtime, probe.execution, crate::inspection::Constraints::default(), probe.pushdowns);
-        let projected = !layout.left.computes_no_keys();
-        let (layout, build_left) = match self.unswapped.take() { Some(unswapped) => (unswapped, false), None => (layout, true) };
-        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, build_left, self.kind, self.execution.clone())?
-            .with_projected_build(projected))))
-    }
-
     async fn probe_batch(&self, table: &mut Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
-        if self.validate_payloads { probe.validate_readable(&self.execution.context)?; }
+        probe.validate_readable(&self.execution.context)?;
         let residual = self.residual.as_ref().map(|predicate| predicate.prepare(&self.execution)).transpose()?;
         match self.kind {
             JoinKind::Semi | JoinKind::Anti => return self.probe_membership(table, probe, residual.as_ref()).await,
@@ -719,40 +695,6 @@ impl OuterPositions {
     }
 }
 
-fn int_layout(array: &dyn Array) -> bool {
-    use arrow_schema::DataType;
-    match array.data_type() {
-        DataType::Union(legs, arrow_schema::UnionMode::Dense) => legs.iter().all(|(_, leg)| {
-            leg.metadata().is_empty() && matches!(leg.data_type(), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Null)
-        }),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => true,
-        _ => false,
-    }
-}
-
-fn int_cell(array: &dyn Array, row: usize) -> Option<i64> {
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
-    use arrow_schema::DataType;
-
-    if array.is_null(row) { return None; }
-    Some(match array.data_type() {
-        DataType::Int8 => i64::from(array.as_primitive::<Int8Type>().value(row)),
-        DataType::Int16 => i64::from(array.as_primitive::<Int16Type>().value(row)),
-        DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
-        DataType::Int64 => array.as_primitive::<Int64Type>().value(row),
-        DataType::Union(..) => {
-            let union = array.as_union();
-            return int_cell(union.child(union.type_id(row)).as_ref(), union.value_offset(row));
-        }
-        _ => return None,
-    })
-}
-
-pub(crate) fn int_cells(array: &dyn Array) -> Option<Vec<Option<i64>>> {
-    int_layout(array).then(|| (0..array.len()).map(|row| int_cell(array, row)).collect())
-}
-
 #[async_trait::async_trait]
 impl BatchCursor for BatchJoin {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
@@ -766,12 +708,6 @@ impl BatchCursor for BatchJoin {
                     self.state = State::Probe { table, probe };
                     if let Some(output) = output { return Ok(Some(output)); }
                 }
-                State::Rows(mut rows) => {
-                    let Some(page) = rows.next_page().await? else { return Ok(None) };
-                    let batch = ColumnBatch::from_page(&page, &self.spec.execution.context.memory)?;
-                    self.state = State::Rows(rows);
-                    if batch.len > 0 { return Ok(Some(batch)); }
-                }
                 State::Disk(mut join) => {
                     let output = join.next(&self.spec).await?;
                     if output.is_some() { self.state = State::Disk(join); }
@@ -780,16 +716,6 @@ impl BatchCursor for BatchJoin {
                 State::Done => return Ok(None),
             }
         }
-    }
-}
-
-/// Pages already read from the build input, then the rest of it.
-struct HeldThen { pages: VecDeque<OwnedPage>, rest: BoxPageCursor }
-#[async_trait::async_trait]
-impl PageCursor for HeldThen {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        if let Some(page) = self.pages.pop_front() { return Ok(Some(page)); }
-        self.rest.next_page().await
     }
 }
 

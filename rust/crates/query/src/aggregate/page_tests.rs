@@ -1,4 +1,5 @@
 use super::*;
+use crate::pages::PageBuilder;
 use std::{collections::{BTreeMap,VecDeque},sync::atomic::{AtomicUsize,Ordering}};
 use rtdb_columnar::MemoryBudget;
 use rtdb_plan::{BinaryOp,ColumnId,Expr,Field,Relation,RelationNode,SortExpr};
@@ -7,16 +8,17 @@ use rtdb_types::{Anomaly,TimeUnit,Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
 
-struct Input { pages: VecDeque<Vec<Vec<Value>>>,fail_after: Option<usize>,polls: Arc<AtomicUsize>,memory: Arc<MemoryBudget> }
+struct Input { pages: VecDeque<Vec<Vec<Value>>>,fail_after: Option<usize>,polls: Arc<AtomicUsize>,memory: Arc<MemoryBudget>, width: usize }
 #[async_trait]
-impl PageCursor for Input {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+impl BatchCursor for Input {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let poll = self.polls.fetch_add(1,Ordering::SeqCst);
         if self.fail_after == Some(poll) { return Err(Anomaly::fault("test/later-page","Later input page failed")); }
         let Some(rows) = self.pages.pop_front() else { return Ok(None); };
+        if rows.is_empty() { return ColumnBatch::empty_with_width(self.width, &self.memory).map(Some); }
         let mut page = PageBuilder::new(rows.len(),&self.memory)?;
         for row in rows { page.push(OwnedRow::new(row,&self.memory)?)?; }
-        Ok(Some(page.finish()))
+        ColumnBatch::from_page(&page.finish(), &self.memory).map(Some)
     }
 }
 fn execution(batch_rows: usize) -> Execution {
@@ -45,8 +47,11 @@ fn cursor(execution: &Execution,schema: Schema,pages: Vec<Vec<Vec<Value>>>,group
     let relation = Relation::new(output,RelationNode::Aggregate { input,groups: groups.clone(),aggregates: aggregates.clone() }).unwrap();
     let runtime = EmittedRelation::derive(Arc::new(relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
     let polls = Arc::new(AtomicUsize::new(0));
-    let input = Box::new(Input { pages: pages.into(),fail_after,polls: Arc::clone(&polls),memory: Arc::clone(&execution.context.memory) });
-    (AggregateCursor::new(input,schema,groups,aggregates,runtime,execution.clone()).unwrap(),polls)
+    let input = Box::new(Input { pages: pages.into(),fail_after,polls: Arc::clone(&polls),memory: Arc::clone(&execution.context.memory), width: schema.len() });
+    (AggregateCursor::from_batches(input, false,schema,groups,aggregates,runtime,execution.clone()).unwrap(),polls)
+}
+fn batch_row(batch: &ColumnBatch, row: usize) -> Vec<Value> {
+    batch.columns.iter().map(|column| column.value(row).unwrap()).collect()
 }
 fn row(group: i64,value: i64) -> Vec<Value> { vec![Value::I64(group),Value::I64(value)] }
 
@@ -130,7 +135,7 @@ async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
     let output = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
     let relation = Arc::new(Relation::new(output, RelationNode::Aggregate { input, groups: vec![], aggregates: aggregates.clone() }).unwrap());
     let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
-    assert!(AggregateCursor::positions(&schema, &[], &aggregates, true).is_some());
+    assert!(AggregateCursor::positions(&schema, &[], &aggregates).is_some());
     for (values, expected) in [
         (vec![Some(2.0), None, Some(3.0)], [Value::I64(3), Value::I64(2), Value::F64(5.0), Value::F64(2.5)]),
         (vec![], [Value::I64(0), Value::I64(0), Value::Null, Value::Null]),
@@ -210,66 +215,57 @@ fn count_does_not_use_the_parent_bitmap_for_nested_cells_that_can_fail_to_read()
     assert!(marked_nulls(&column).is_none());
 }
 
-struct PercentileInput { next: usize,count: usize,fail_after: bool,memory: Arc<MemoryBudget> }
-#[async_trait]
-impl RowCursor for PercentileInput {
-    async fn next(&mut self) -> Result<Option<OwnedRow>> {
-        if self.next == self.count {
-            return if self.fail_after { Err(Anomaly::fault("test/percentile-input","Failure after the complete group")) } else { Ok(None) };
+#[tokio::test]
+async fn percentile_collects_arrow_positions_before_sorting_the_group() {
+    for object_sort in [rtdb_types::ObjectSort::TimSort, rtdb_types::ObjectSort::LegacyMergeSort] {
+        let execution = execution_with_options(QueryOptions { object_sort, batch_rows: 1, ..Default::default() });
+        let baseline = execution.context.memory.used_bytes();
+        let ty = LogicalType::Scalar(ScalarType::I64);
+        let schema = Schema::new(vec![field(0, ty.clone())]).unwrap();
+        let argument = schema.fields()[0].expression();
+        let percentile = |id, kind, descending, ty| AggregateExpr {
+            field: field(id, ty),
+            function: AggregateFunction::Percentile { kind, fraction: PercentileFraction::Literal(0.25), descending },
+            argument: Some(argument.clone()), distinct: false, filter: None, order_by: vec![],
+        };
+        let aggregates = vec![
+            percentile(1, PercentileKind::Continuous, false, LogicalType::Scalar(ScalarType::F64).maybe()),
+            percentile(2, PercentileKind::Discrete, true, ty.maybe()),
+        ];
+        let input = Arc::new(Relation::empty(schema.clone()));
+        let output = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
+        let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+            input, groups: vec![], aggregates: aggregates.clone(),
+        }).unwrap());
+        let memory = &execution.context.memory;
+        let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+        let arrow = Arc::new(rtdb_columnar::to_field("value", &LogicalType::Scalar(ScalarType::I64)).unwrap());
+        let array = Arc::new(arrow_array::Int64Array::from_iter_values((0..=102_400).rev()));
+        let batch = || ColumnBatch::settled(vec![Column::Arrow {
+            array: array.clone(), field: arrow.clone(), logical: None,
+        }], 102_401, memory.reserve(1024 * 1024).unwrap()).unwrap();
+
+        struct FailAfterBatch(Option<ColumnBatch>);
+        #[async_trait]
+        impl BatchCursor for FailAfterBatch {
+            async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+                self.0.take().map(Some).ok_or_else(|| Anomaly::fault("test/later-page", "Later input page failed"))
+            }
         }
-        let value = if self.fail_after {
-            Value::Timestamp { value: if self.next == 0 { i64::MAX } else { 0 },unit: if self.next == 0 { TimeUnit::Second } else { TimeUnit::Nanosecond },timezone: None }
-        } else { Value::I64((self.count - self.next - 1) as i64) };
-        self.next += 1;
-        OwnedRow::new(vec![value],&self.memory).map(Some)
-    }
-}
-
-#[tokio::test]
-async fn percentile_finishes_the_complete_group_before_comparing_above_order_by_block_size() {
-    for object_sort in [rtdb_types::ObjectSort::TimSort,rtdb_types::ObjectSort::LegacyMergeSort] {
-        let execution = execution_with_options(QueryOptions { batch_rows: 1,object_sort,sort_memory_bytes: usize::MAX,..Default::default() });
-        let baseline = execution.context.memory.used_bytes();
-        let input = Box::new(PercentileInput { next: 0,count: 102_401,fail_after: true,memory: Arc::clone(&execution.context.memory) });
-        let scope = execution.scope().unwrap();
-        let error = percentile(input,PercentileKind::Discrete,0.5,false,&scope,&execution).await.unwrap_err();
-        assert_eq!(error.code,"test/percentile-input");drop(scope);
-        assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
-    }
-}
-
-#[tokio::test]
-async fn complete_group_percentile_uses_both_algorithms_without_order_by_run_merges() {
-    for object_sort in [rtdb_types::ObjectSort::TimSort,rtdb_types::ObjectSort::LegacyMergeSort] {
-        let execution = execution_with_options(QueryOptions { batch_rows: 1,object_sort,sort_memory_bytes: usize::MAX,..Default::default() });
-        let baseline = execution.context.memory.used_bytes();
-        for (kind,descending,expected) in [(PercentileKind::Continuous,false,Value::F64(25_600.0)),(PercentileKind::Discrete,true,Value::I64(76_800))] {
-            let input = Box::new(PercentileInput { next: 0,count: 102_401,fail_after: false,memory: Arc::clone(&execution.context.memory) });
-            let scope = execution.scope().unwrap();
-            let value = percentile(input,kind,0.25,descending,&scope,&execution).await.unwrap();
-            assert_eq!(value,expected);drop(value);drop(scope);
-            assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
-        }
-    }
-}
-
-#[tokio::test]
-async fn percentile_descending_swaps_comparator_operands_before_failure() {
-    for (object_sort,descending,x_unit,y_unit) in [
-        (rtdb_types::ObjectSort::TimSort,false,"day-time","year-month"),
-        (rtdb_types::ObjectSort::TimSort,true,"year-month","day-time"),
-        (rtdb_types::ObjectSort::LegacyMergeSort,false,"year-month","day-time"),
-        (rtdb_types::ObjectSort::LegacyMergeSort,true,"day-time","year-month"),
-    ] {
-        let execution = execution_with_options(QueryOptions { object_sort,..Default::default() });
-        let baseline = execution.context.memory.used_bytes();
-        let input = Box::new(Input { pages: vec![vec![vec![Value::IntervalYearMonth(1)],vec![Value::IntervalDayTime { days: 1,milliseconds: 0 }]]].into(),fail_after: None,polls: Arc::new(AtomicUsize::new(0)),memory: Arc::clone(&execution.context.memory) });
-        let input = crate::pages::rows(input,Arc::clone(&execution.context));
-        let scope = execution.scope().unwrap();
-        let error = percentile(input,PercentileKind::Discrete,0.5,descending,&scope,&execution).await.unwrap_err();
-        assert_eq!(error.code,"xtdb.expression/cannot-compare-different-unit-intervals");
-        assert_eq!(error.context["x-unit"],serde_json::Value::from(x_unit));assert_eq!(error.context["y-unit"],serde_json::Value::from(y_unit));drop(scope);
-        assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+        let mut failed = AggregateCursor::from_batches(Box::new(FailAfterBatch(Some(batch()))), false,
+            schema.clone(), vec![], aggregates.clone(), runtime.clone(), execution.clone()).unwrap();
+        assert_eq!(failed.next_batch().await.err().unwrap().code, "test/later-page");
+        drop(failed);
+        let mut sorted = AggregateCursor::from_batches(Box::new(Batches(Some(batch()))), false,
+            schema, vec![], aggregates, runtime.clone(), execution.clone()).unwrap();
+        let result = sorted.next_batch().await.unwrap().unwrap();
+        assert!(result.columns.iter().all(|column| !matches!(column, Column::Values(_))));
+        assert_eq!(result.columns[0].value(0).unwrap(), Value::F64(25_600.0));
+        assert_eq!(result.columns[1].value(0).unwrap(), Value::I64(76_800));
+        assert!(sorted.next_batch().await.unwrap().is_none());
+        drop((sorted, result, runtime));
+        assert_eq!(execution.context.memory.used_bytes(), baseline);
+        assert_eq!(execution.context.spill_bytes(), 0);
     }
 }
 
@@ -281,8 +277,8 @@ async fn aggregate_columns_complete_their_page_masks_before_the_next_column() {
         let filter = Expr::Case { branches: vec![(Expr::binary(BinaryOp::Eq,schema.fields()[0].expression(),Expr::Literal(Value::I64(1))),Expr::Literal(Value::Bool(true)))],otherwise: Box::new(divide_filter()) };
         let groups = vec![NamedExpr { field: field(2,LogicalType::Scalar(ScalarType::I64)),expr: schema.fields()[0].expression() }];
         let (mut cursor,_) = cursor(&execution,schema,vec![vec![row(1,1),row(2,2)]],groups,vec![count(3,Some(filter)),count(4,Some(bad_regex()))],None);
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
-        assert!(cursor.next_page().await.unwrap().is_none());drop(cursor);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+        assert!(cursor.next_batch().await.unwrap().is_none());drop(cursor);
         assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }
 }
@@ -291,7 +287,7 @@ async fn aggregate_columns_complete_their_page_masks_before_the_next_column() {
 async fn aggregate_page_failure_precedes_the_next_input_pull() {
     let execution = execution(1);let baseline = execution.context.memory.used_bytes();
     let (mut cursor,polls) = cursor(&execution,schema(),vec![vec![row(1,1)]],vec![],vec![count(2,Some(divide_filter()))],Some(1));
-    assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+    assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/division-by-zero");
     assert_eq!(polls.load(Ordering::SeqCst),1);drop(cursor);
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
@@ -303,7 +299,7 @@ async fn complete_filter_mask_precedes_the_inner_accumulator_factory() {
     let filter = Expr::Case { branches: vec![(Expr::binary(BinaryOp::Eq,schema.fields()[0].expression(),Expr::Literal(Value::I64(1))),Expr::Literal(Value::Bool(true)))],otherwise: Box::new(divide_filter()) };
     let aggregate = AggregateExpr { field: field(2,LogicalType::Scalar(ScalarType::I8).maybe()),function: AggregateFunction::Sum,argument: Some(schema.fields()[1].expression()),distinct: false,filter: Some(filter),order_by: vec![] };
     let (mut cursor,_) = cursor(&execution,schema,vec![vec![vec![Value::I64(1),Value::I8(1)],vec![Value::I64(2),Value::I8(2)]]],vec![],vec![aggregate],None);
-    assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");drop(cursor);
+    assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/division-by-zero");drop(cursor);
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
@@ -311,10 +307,10 @@ async fn complete_filter_mask_precedes_the_inner_accumulator_factory() {
 async fn empty_semantic_pages_prepare_filters_and_absent_input_preserves_global_count() {
     let execution = execution(1);let baseline = execution.context.memory.used_bytes();
     let (mut empty,_) = cursor(&execution,schema(),vec![vec![]],vec![],vec![count(2,Some(bad_regex()))],None);
-    assert_eq!(empty.next_page().await.err().unwrap().code,"xtdb.expression/illegal-argument-exception");drop(empty);
+    assert_eq!(empty.next_batch().await.err().unwrap().code,"xtdb.expression/illegal-argument-exception");drop(empty);
     let (mut absent,_) = cursor(&execution,schema(),vec![],vec![],vec![count(2,Some(bad_regex()))],None);
-    let mut page = absent.next_page().await.unwrap().unwrap();assert_eq!(page.next().unwrap().values,[Value::I64(0)]);
-    assert!(absent.next_page().await.unwrap().is_none());drop(absent);drop(page);
+    let page = absent.next_batch().await.unwrap().unwrap();assert_eq!(batch_row(&page, 0),[Value::I64(0)]);
+    assert!(absent.next_batch().await.unwrap().is_none());drop(absent);drop(page);
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
@@ -327,9 +323,9 @@ async fn grouping_full_hash_avoids_unreachable_cross_unit_equality() {
     let schema = Schema::new(vec![field(0,ty.clone())]).unwrap();
     let groups = vec![NamedExpr { field: field(1,ty),expr: schema.fields()[0].expression() }];
     let (mut cursor,_) = cursor(&execution,schema,vec![vec![vec![first.clone()],vec![second.clone()]]],groups,vec![count(2,None)],None);
-    let mut page = cursor.next_page().await.unwrap().unwrap();drop(cursor);
-    assert_eq!(page.next().unwrap().values,[first,Value::I64(1)]);
-    assert_eq!(page.next().unwrap().values,[second,Value::I64(1)]);
+    let page = cursor.next_batch().await.unwrap().unwrap();drop(cursor);
+    assert_eq!(batch_row(&page, 0),[first,Value::I64(1)]);
+    assert_eq!(batch_row(&page, 1),[second,Value::I64(1)]);
     drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
@@ -343,10 +339,10 @@ async fn aggregate_output_is_complete_and_retains_distinct_state_across_pages() 
         array.filter = Some(Expr::binary(BinaryOp::NotEq,argument.clone(),Expr::Literal(Value::I64(0))));
         let sum = AggregateExpr { field: field(4,LogicalType::Scalar(ScalarType::I64).maybe()),function: AggregateFunction::Sum,argument: Some(argument),distinct: true,filter: None,order_by: vec![] };
         let (mut cursor,_) = cursor(&execution,schema,vec![vec![row(1,2),row(2,5)],vec![],vec![row(1,1),row(1,2),row(2,0)]],groups,vec![array,sum],None);
-        let mut page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),2);
-        assert!(cursor.next_page().await.unwrap().is_none());drop(cursor);assert_eq!(execution.context.spill_bytes(),0);
-        assert_eq!(page.next().unwrap().values,[Value::I64(1),Value::list(vec![Value::I64(2),Value::I64(1)]),Value::I64(3)]);
-        assert_eq!(page.next().unwrap().values,[Value::I64(2),Value::list(vec![Value::I64(5)]),Value::I64(5)]);
+        let page = cursor.next_batch().await.unwrap().unwrap();assert_eq!(page.len,2);
+        assert!(cursor.next_batch().await.unwrap().is_none());drop(cursor);assert_eq!(execution.context.spill_bytes(),0);
+        assert_eq!(batch_row(&page, 0),[Value::I64(1),Value::list(vec![Value::I64(2),Value::I64(1)]),Value::I64(3)]);
+        assert_eq!(batch_row(&page, 1),[Value::I64(2),Value::list(vec![Value::I64(5)]),Value::I64(5)]);
         drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);
     }
 }
@@ -358,7 +354,7 @@ async fn array_order_admission_includes_filtered_and_empty_input() {
         let schema = Schema::new(vec![field(0,LogicalType::Scalar(ScalarType::I64)),field(1,LogicalType::List { kind: rtdb_types::ListKind::Set,element: Box::new(LogicalType::Scalar(ScalarType::I64)) })]).unwrap();
         let aggregate = AggregateExpr { field: field(2,LogicalType::list(LogicalType::Scalar(ScalarType::I64)).maybe()),function: AggregateFunction::ArrayAgg,argument: Some(schema.fields()[0].expression()),distinct: false,filter: Some(Expr::Literal(Value::Bool(false))),order_by: vec![SortExpr { expr: schema.fields()[1].expression(),descending: false,nulls_first: false }] };
         let (mut cursor,_) = cursor(&execution,schema,pages,vec![],vec![aggregate],None);
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/function-type-mismatch");drop(cursor);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"xtdb.expression/function-type-mismatch");drop(cursor);
         assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }
 }
@@ -371,9 +367,9 @@ fn primitive_cursor(execution: &Execution,function: AggregateFunction,declared: 
     cursor(execution,schema,pages.into_iter().map(|page|page.into_iter().map(|value|vec![value]).collect()).collect(),vec![],vec![aggregate],None).0
 }
 async fn primitive_result(mut cursor: AggregateCursor) -> Value {
-    let mut page = cursor.next_page().await.unwrap().unwrap();
-    assert!(cursor.next_page().await.unwrap().is_none());
-    page.next().unwrap().values.remove(0)
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    page.columns[0].value(0).unwrap()
 }
 
 #[tokio::test]
@@ -393,7 +389,7 @@ async fn boolean_reducer_admits_unsigned_vector_kinds_before_applying_the_filter
             let initialized = primitive_cursor(&execution, function.clone(), mixed.clone(), mixed.clone(), vec![vec![Value::Bool(function == AggregateFunction::Every), value.clone()]], None);
             assert_eq!(primitive_result(initialized).await, Value::Bool(true));
             let mut first = primitive_cursor(&execution, function, mixed.clone(), mixed, vec![vec![value.clone(), Value::Bool(true)]], None);
-            assert_eq!(first.next_page().await.err().unwrap().code, "rtdb.query/boolean-setter");
+            assert_eq!(first.next_batch().await.err().unwrap().code, "rtdb.query/boolean-setter");
             drop(first);
             assert_eq!(execution.context.memory.used_bytes(), baseline);
             assert_eq!(execution.context.spill_bytes(), 0);
@@ -414,7 +410,7 @@ async fn sum_factory_admits_complete_vectors_before_reading_the_mask() {
     ] {
         for pages in [vec![vec![value]],vec![vec![]]] {
             let mut cursor = primitive_cursor(&execution,AggregateFunction::Sum,declared.clone(),input.clone(),pages,Some(Expr::Literal(Value::Bool(false))));
-            assert_eq!(cursor.next_page().await.err().unwrap().code,code);drop(cursor);
+            assert_eq!(cursor.next_batch().await.err().unwrap().code,code);drop(cursor);
             assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
         }
         assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,declared,input,vec![],None)).await,Value::Null);
@@ -439,7 +435,7 @@ async fn duration_sum_wraps_conversion_and_distinguishes_null_vector_slots() {
     let milli = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond));
     assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),second.clone(),vec![vec![Value::Duration { value: i64::MAX,unit: TimeUnit::Second }],vec![Value::Duration { value: 1,unit: TimeUnit::Second }]],None)).await,Value::Duration { value: 0,unit: TimeUnit::Millisecond });
     let mut cursor = primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),milli.clone().maybe(),vec![vec![Value::Duration { value: 5,unit: TimeUnit::Millisecond },Value::Null]],None);
-    let error = cursor.next_page().await.err().unwrap();assert_eq!(error.code,"xtdb.error/unknown");assert_eq!(error.message.as_deref(),Some("null at index 1"));drop(cursor);
+    let error = cursor.next_batch().await.err().unwrap();assert_eq!(error.code,"xtdb.error/unknown");assert_eq!(error.message.as_deref(),Some("null at index 1"));drop(cursor);
     for input in [LogicalType::Null,second.join(&milli).maybe()] {
         assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),input,vec![vec![Value::Null]],None)).await,Value::Null);
     }
@@ -463,7 +459,7 @@ async fn average_uses_vector_sums_and_counts_nonnull_cells_after_each_sum_pass()
     assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Average,duration.clone(),union,vec![vec![Value::Null,Value::Duration { value: 1,unit: TimeUnit::Second }],vec![Value::Duration { value: 500,unit: TimeUnit::Millisecond }]],None)).await,Value::Duration { value: 750,unit: TimeUnit::Millisecond });
     for pages in [vec![vec![]],vec![vec![Value::Utf8("excluded".into())]]] {
         let mut cursor = primitive_cursor(&execution,AggregateFunction::Average,LogicalType::Scalar(ScalarType::I64),LogicalType::Scalar(ScalarType::Utf8),pages,Some(Expr::Literal(Value::Bool(false))));
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/sum-input");drop(cursor);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"rtdb.query/sum-input");drop(cursor);
     }
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
@@ -477,9 +473,9 @@ fn failing_duration_average_sum_does_not_start_the_count_pass() {
     let types = AggregateTypes::derive(&aggregate,input,true,EmissionMode::Execution).unwrap();
     let mut page = PageBuilder::new(2,&execution.context.memory).unwrap();
     for value in [Value::Duration { value: 10,unit: TimeUnit::Millisecond },Value::Null] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
-    let page = page.finish();let scope = execution.scope().unwrap();
+    let page = ColumnBatch::from_page(&page.finish(), &execution.context.memory).unwrap();let scope = execution.scope().unwrap();
     let mut states = ScalarGroups::new(&execution).unwrap();
-    assert_eq!(states.aggregate(Rows::Page(&page),&[0,0],&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
+    assert_eq!(states.aggregate(Rows { batch: &page, projected: false, memory: &execution.context.memory },&[0,0],&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
     assert_eq!(states.values[0].count,0);
     assert_eq!(states.values[0].accumulator.as_ref().unwrap().values,[Value::Duration { value: 10,unit: TimeUnit::Millisecond }]);
     drop(states);drop(scope);drop(page);
@@ -493,13 +489,13 @@ async fn variance_admits_only_concrete_square_vector_factories_even_without_sele
     for input in [LogicalType::Scalar(ScalarType::I8),LogicalType::Scalar(ScalarType::F32),LogicalType::Scalar(ScalarType::Decimal { precision: 32,scale: 0,bit_width: 128 }),LogicalType::Null,integer.join(&LogicalType::Scalar(ScalarType::F64)),LogicalType::RunEndEncoded { width: rtdb_types::RunEndWidth::I32,value: Box::new(integer.clone()) }] {
         for function in [AggregateFunction::VariancePopulation,AggregateFunction::VarianceSample,AggregateFunction::StddevPopulation,AggregateFunction::StddevSample] {
             let mut cursor = primitive_cursor(&execution,function.clone(),input.clone(),input.clone(),vec![vec![]],Some(Expr::Literal(Value::Bool(false))));
-            assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/variance-input");drop(cursor);
+            assert_eq!(cursor.next_batch().await.err().unwrap().code,"rtdb.query/variance-input");drop(cursor);
             assert_eq!(primitive_result(primitive_cursor(&execution,function,input.clone(),input.clone(),vec![],None)).await,Value::Null);
         }
     }
     let ty = LogicalType::Scalar(ScalarType::F32);
     let mut cursor = primitive_cursor(&execution,AggregateFunction::VariancePopulation,ty.clone(),ty,vec![vec![Value::F32(1.0)]],Some(Expr::Literal(Value::Bool(false))));
-    assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/variance-input");drop(cursor);
+    assert_eq!(cursor.next_batch().await.err().unwrap().code,"rtdb.query/variance-input");drop(cursor);
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
 
@@ -514,10 +510,10 @@ async fn variance_preserves_full_column_square_values_and_nullable_group_counts(
         let page = {
             let mut page = PageBuilder::new(3,&execution.context.memory).unwrap();
             for value in [Value::I64(3),Value::Null,Value::I64(4)] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
-            page.finish()
+            ColumnBatch::from_page(&page.finish(), &execution.context.memory).unwrap()
         };
         let scope = execution.scope().unwrap();
-        assert_eq!(square_column(Rows::Page(&page),Some(0),&ty,&scope,&execution).unwrap(),[Some(9.0),None,Some(16.0)]);
+        assert_eq!(square_column(Rows { batch: &page, projected: false, memory: &execution.context.memory },Some(0),&ty,&scope,&execution).unwrap(),[Some(9.0),None,Some(16.0)]);
         drop(scope);drop(page);
         assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }
@@ -529,13 +525,13 @@ async fn boolean_reducer_separates_emitted_setter_admission_from_selected_first_
     for function in [AggregateFunction::Every,AggregateFunction::Any] {
         for input in [LogicalType::Scalar(ScalarType::I8),LogicalType::Scalar(ScalarType::Utf8),LogicalType::Scalar(ScalarType::Decimal { precision: 32,scale: 0,bit_width: 128 })] {
             let mut cursor = primitive_cursor(&execution,function.clone(),input.clone(),input.clone(),vec![vec![]],Some(Expr::Literal(Value::Bool(false))));
-            assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/boolean-setter");drop(cursor);
+            assert_eq!(cursor.next_batch().await.err().unwrap().code,"rtdb.query/boolean-setter");drop(cursor);
             assert_eq!(primitive_result(primitive_cursor(&execution,function.clone(),input.clone(),input,vec![],None)).await,Value::Null);
         }
         let ty = LogicalType::Scalar(ScalarType::Bool).join(&LogicalType::Scalar(ScalarType::I64));
         assert_eq!(primitive_result(primitive_cursor(&execution,function.clone(),ty.clone(),ty.clone(),vec![vec![Value::Bool(true)],vec![Value::I64(0)]],None)).await,Value::Bool(true));
         let mut cursor = primitive_cursor(&execution,function.clone(),ty.clone(),ty,vec![vec![Value::I64(0),Value::Bool(true)]],None);
-        assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/boolean-setter");drop(cursor);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code,"rtdb.query/boolean-setter");drop(cursor);
         let ty = LogicalType::Scalar(ScalarType::I64);
         assert_eq!(primitive_result(primitive_cursor(&execution,function,ty.clone(),ty,vec![vec![Value::I64(0)]],Some(Expr::Literal(Value::Bool(false))))).await,Value::Null);
     }

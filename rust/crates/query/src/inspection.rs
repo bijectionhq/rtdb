@@ -1,19 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rtdb_plan::{BinaryOp, CatalogInspection, ColumnId, Expr, InspectionRequest, NamedExpr, Scan, Schema};
+use rtdb_plan::{BinaryOp, CatalogInspection, ColumnId, Expr, InspectionRequest, Scan, Schema};
 use rtdb_types::{Anomaly, Result, TableRef, Value};
 
 use crate::{context::Execution, cursor::{OwnedRow, RowCursor}, invalid};
 
 #[derive(Clone, Default)]
-pub(crate) struct Constraints { bounds: BTreeMap<ColumnId, Vec<(BinaryOp, Expr)>>, used: Option<BTreeSet<ColumnId>> }
+pub(crate) struct Constraints { bounds: BTreeMap<ColumnId, Vec<(BinaryOp, Expr)>> }
 
 impl Constraints {
-    pub fn require(&mut self, expression: &Expr) { if let Some(used) = &mut self.used { used.extend(expression.referenced_columns()); } }
     pub fn add(&mut self, predicate: &Expr) {
-        if let Some(used) = &mut self.used { used.extend(predicate.referenced_columns()); }
         let Expr::Binary { op, left, right } = predicate else { return; };
         if *op == BinaryOp::And { self.add(left); self.add(right); return; }
         if !matches!(op, BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) { return; }
@@ -22,26 +20,6 @@ impl Constraints {
             (constant @ (Expr::Literal(_) | Expr::Parameter { .. }), Expr::Column { id, .. }) => self.bounds.entry(*id).or_default().push((flip(*op), constant.clone())),
             _ => (),
         }
-    }
-    pub fn through_project(&self, expressions: &[NamedExpr]) -> Self {
-        let mut constraints = Self::default();
-        let mut used = BTreeSet::new();
-        for expression in expressions {
-            if self.used.as_ref().is_none_or(|needed| needed.contains(&expression.field.id)) { used.extend(expression.expr.referenced_columns()); }
-            if let Expr::Column { id, .. } = &expression.expr {
-                if let Some(bounds) = self.bounds.get(&expression.field.id) { constraints.bounds.entry(*id).or_default().extend(bounds.iter().cloned()); }
-            }
-        }
-        constraints.used = Some(used);
-        constraints
-    }
-    pub fn through_extension(mut self, expressions: &[NamedExpr]) -> Self {
-        for named in expressions {
-            self.bounds.remove(&named.field.id);
-            if let Some(used) = &mut self.used { used.remove(&named.field.id); }
-            self.require(&named.expr);
-        }
-        self
     }
     async fn values(&self, scan: &Scan, name: &str, execution: &Execution, scope: &rtdb_expr::EvaluationScope) -> Result<Vec<(BinaryOp, Value)>> {
         let Some(column) = scan.columns.iter().find(|field| field.name == name) else { return Ok(Vec::new()); };
@@ -75,7 +53,7 @@ impl InspectionCursor {
             "source_log_msgs" | "replica_log_msgs" => {
                 let (from, to) = range(&constraints.values(&scan, "msg_id", &execution, &scope).await?, integer)?
                     .ok_or_else(|| Anomaly::incorrect("xtdb/missing-log-bounds", "Queries on log tables require msg_id bounds (e.g. WHERE msg_id = N or WHERE msg_id BETWEEN x AND y)"))?;
-                if scan.table.name.table.table == "source_log_msgs" { InspectionRequest::SourceLog { from, to, tx_ops: scan.columns.iter().any(|field| field.name == "tx_ops" && constraints.used.as_ref().is_none_or(|used| used.contains(&field.id))) } }
+                if scan.table.name.table.table == "source_log_msgs" { InspectionRequest::SourceLog { from, to, tx_ops: scan.columns.iter().any(|field| field.name == "tx_ops") } }
                 else { InspectionRequest::ReplicaLog { from, to } }
             }
             "block_files" => {

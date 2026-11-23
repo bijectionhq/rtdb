@@ -462,42 +462,22 @@ pub(crate) struct Execution {
 }
 
 #[derive(Clone)]
-enum OuterInput {
-    Values(Arc<crate::cursor::OwnedRow>),
-    Arrow { batch: Arc<crate::columnar::ColumnBatch>, row: usize },
-}
-
-impl OuterInput {
-    fn expression(&self) -> rtdb_expr::ExpressionRow<'_> {
-        match self {
-            Self::Values(row) => rtdb_expr::ExpressionRow::Values(&row.values),
-            Self::Arrow { .. } => rtdb_expr::ExpressionRow::Borrowed(self),
-        }
-    }
-}
+struct OuterInput { batch: Arc<crate::columnar::ColumnBatch>, row: usize }
 
 impl rtdb_expr::RowInput for OuterInput {
     fn value(&self, index: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
-        let Self::Arrow { batch, row } = self else { return Ok(None); };
-        batch.columns.get(index).map(|column| column.expression_value(*row, false, scope)).transpose()
+        self.batch.columns.get(index).map(|column| column.expression_value(self.row, false, scope)).transpose()
     }
 
     fn arrow_cell(&self, index: usize) -> Option<rtdb_columnar::ArrowCell<'_>> {
-        let Self::Arrow { batch, row } = self else { return None; };
-        batch.columns.get(index)?.expression_cell(*row)
+        self.batch.columns.get(index)?.expression_cell(self.row)
     }
 }
 
 pub(crate) struct OuterRows { rows: Vec<(rtdb_plan::Schema, OuterInput)>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl OuterRows {
     fn expression_rows(&self) -> Vec<rtdb_expr::OuterRow<'_>> {
-        self.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow {
-            schema,
-            values: match row {
-                OuterInput::Values(row) => &row.values,
-                OuterInput::Arrow { .. } => &[],
-            },
-        }).collect()
+        self.rows.iter().map(|(schema, _)| rtdb_expr::OuterRow { schema, values: &[] }).collect()
     }
 
     pub fn schemas(&self) -> impl Iterator<Item = &rtdb_plan::Schema> { self.rows.iter().map(|(schema, _)| schema) }
@@ -529,16 +509,9 @@ impl rtdb_expr::ParameterLookup for ExpressionInputs<'_> {
 }
 
 impl Execution {
-    pub async fn bind_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: Arc<crate::cursor::OwnedRow>) -> Result<Self> {
-        self.bind_outer(arguments, schema, OuterInput::Values(row)).await
-    }
-
     pub async fn bind_arrow_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema,
         batch: Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<Self> {
-        self.bind_outer(arguments, schema, OuterInput::Arrow { batch, row }).await
-    }
-
-    async fn bind_outer(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: OuterInput) -> Result<Self> {
+        let outer_input = OuterInput { batch, row };
         use crate::parameters::{ArrowBinding, OverlayValue};
         let scope = self.scope()?;
         let parameter_count = arguments.iter().try_fold(self.parameters.types().len(), |count, (index, _)| index.checked_add(1).map(|next| count.max(next)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameter index overflow")))?;
@@ -555,19 +528,18 @@ impl Execution {
         types.resize(parameter_count, rtdb_types::LogicalType::Null);
         for (index, expression) in arguments {
             types[*index] = self.expression_type(&scope, expression, schema)?;
-            if let OuterInput::Arrow { batch, row } = &row
-                && let rtdb_plan::Expr::Column { id, .. } = expression
+            if let rtdb_plan::Expr::Column { id, .. } = expression
                 && let Some(position) = schema.position(*id)
-                && let Some(binding) = ArrowBinding::new(Arc::clone(batch), position, *row, Arc::clone(&self.context.memory))
+                && let Some(binding) = ArrowBinding::new(Arc::clone(&outer_input.batch), position, outer_input.row, Arc::clone(&self.context.memory))
             {
                 parameters.push((*index, OverlayValue::Arrow(binding)));
                 continue;
             }
             let invocation = self.prepare_expression(expression, schema, &scope)?;
-            let value = self.evaluate_invocation_row(&scope, &invocation, row.expression()).await?;
+            let value = self.evaluate_invocation_row(&scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&outer_input)).await?;
             parameters.push((*index, OverlayValue::Scalar(value)));
         }
-        let outer = self.outer.prepend(schema, row, &self.context.memory)?;
+        let outer = self.outer.prepend(schema, outer_input, &self.context.memory)?;
         Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(self.parameters.overlay_sources(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
     }
     pub fn in_operator(mut self) -> Self {

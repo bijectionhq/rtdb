@@ -14,7 +14,9 @@ use rtdb_plan::Field;
 use rtdb_temporal::ResolvedRow;
 use rtdb_types::{ListKind, LogicalType, Result, Timestamp, Value};
 
-use crate::{cursor::OwnedRow, invalid, pages::{OwnedPage, PageBuilder}};
+use crate::{invalid, pages::OwnedPage};
+#[cfg(test)]
+use crate::{cursor::OwnedRow, pages::PageBuilder};
 
 /// One output field of a page.
 pub(crate) enum Column {
@@ -864,8 +866,8 @@ impl ColumnBatch {
 
     /// Materialises every row, admitting the page's rows together before any is built.
     /// Rows share the page's charge, which ends when the last of them drops.
-    pub fn rows(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> { self.rows_admitting(memory, false) }
-    pub fn rows_admitting(&self, memory: &Arc<MemoryBudget>, admit_dates: bool) -> Result<OwnedPage> {
+    #[cfg(test)]
+    pub fn rows(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> {
         let mut page = PageBuilder::new(self.len, memory)?;
         let mut bound = 0usize;
         for row in 0..self.len {
@@ -876,9 +878,7 @@ impl ColumnBatch {
         for row in 0..self.len {
             let mut values = Vec::with_capacity(self.columns.len());
             for column in &self.columns {
-                let mut value = column.value(row)?;
-                if admit_dates { value.admit_expression_dates()?; }
-                values.push(value);
+                values.push(column.value(row)?);
             }
             page.push(OwnedRow::with_reservation(values, Arc::clone(&reservation))?)?;
         }
@@ -2189,13 +2189,6 @@ pub(crate) async fn poll_nested_batch(input: &mut dyn BatchCursor) -> Result<Opt
     std::future::poll_fn(|context| stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || pull.as_mut().poll(context))).await
 }
 
-#[async_trait::async_trait]
-impl BatchCursor for crate::scan::ScanCursor {
-    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { crate::scan::ScanCursor::next_batch(self).await }
-    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { crate::pages::PageCursor::trace_attributes(self, span) }
-    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { crate::pages::PageCursor::scan_counts(self) }
-}
-
 pub(crate) fn retain_batch_state(input: BoxBatchCursor, reservation: Arc<MemoryReservation>) -> BoxBatchCursor { Box::new(RetainedBatchState { input, _reservation: reservation }) }
 /// As `pages::retain_page_state`, spending cooperative budget per batch.
 struct RetainedBatchState { input: BoxBatchCursor, _reservation: Arc<MemoryReservation> }
@@ -2264,23 +2257,6 @@ impl BatchCursor for BatchesFromPages {
             else { ColumnBatch::from_page(&page, &self.memory) }
         }).transpose()
     }
-}
-
-/// Materialises a batch source's rows for row operators.
-pub(crate) struct BatchRows { input: BoxBatchCursor, memory: Arc<MemoryBudget>, admit_dates: bool }
-impl BatchRows {
-    pub fn new(input: BoxBatchCursor, memory: Arc<MemoryBudget>) -> Self { Self { input, memory, admit_dates: false } }
-    /// Admits each cell's dates as the row projection the batches stand in for would have.
-    pub fn admitting_dates(self, admit_dates: bool) -> Self { Self { admit_dates, ..self } }
-}
-#[async_trait::async_trait]
-impl crate::pages::PageCursor for BatchRows {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
-        batch.rows_admitting(&self.memory, self.admit_dates).map(Some)
-    }
-    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
-    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
 impl ColumnBatch {
