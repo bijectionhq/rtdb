@@ -781,6 +781,54 @@ impl HeldCheckpointWorld {
     pub async fn identity_page(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<WorldIdentityPage> {
+        self.identity_page_on_cut(relation, valid, after, limit, None).await
+    }
+
+    pub async fn identity_page_at(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        system: Timestamp, parent_only: bool,
+    ) -> Result<WorldIdentityPage> {
+        self.check_relation(relation)?;
+        Interval::at(valid)?;
+        if !(1..=128).contains(&limit) || !relation.is_root_data() ||
+            self.open.record.schemas.relation(relation)
+                .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some())
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        if parent_only {
+            if system != self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+            let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+            self.require_overlay_coverage(relation, &witness).await?;
+            self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
+            let parent = self.archive_identity_candidates(relation, valid, after, limit + 1).await?;
+            for key in &parent.keys {
+                let id = EntityId::String(key.clone());
+                self.open.snapshot.check_point_purge_floor(relation, &id, system).await?;
+            }
+            return self.finish_overlay_identities(relation, parent, limit);
+        }
+        let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
+        self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
+        self.identity_page_on_cut(relation, valid, after, limit, Some(&cut)).await
+    }
+
+    async fn archive_identity_candidates(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, fetch: usize,
+    ) -> Result<rtdb_query::OwnedIdentityCandidates> {
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Identities {
+            relation: relation.clone(), at: valid, after: after.map(str::to_owned), fetch,
+            guard: self.open.snapshot.relation_release_guard([relation])?, reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?
+    }
+
+    async fn identity_page_on_cut(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        cut: Option<&rtdb_node::OwnedWorldAcceptedCut<'_>>,
+    ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         Interval::at(valid)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
@@ -792,16 +840,13 @@ impl HeldCheckpointWorld {
         let mut complete = false;
         let mut reservations = vec![self.memory.reserve(bytes)?];
         for _ in 0..32 {
-            let local = self.open.snapshot.world_identity_candidates(
-                self.open.record.id, relation, valid, cursor.as_ref().map(|(key, _)| key.as_str()), FETCH,
-            ).await?;
-            let (reply, result) = oneshot::channel();
-            self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Identities {
-                relation: relation.clone(), at: valid, after: cursor.as_ref().map(|(key, _)| key.clone()), fetch: FETCH,
-                guard: self.open.snapshot.relation_release_guard([relation])?, reply,
-            })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-            let parent = self.cancellation.run_until_cancelled(result).await
-                .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+            let after = cursor.as_ref().map(|(key, _)| key.as_str());
+            let local = if let Some(cut) = cut {
+                cut.overlay_identities(valid, after, FETCH).await?
+            } else {
+                self.open.snapshot.world_identity_candidates(self.open.record.id, relation, valid, after, FETCH).await?
+            };
+            let parent = self.archive_identity_candidates(relation, valid, after, FETCH).await?;
 
             // A full input page can have unseen keys beyond its last key.
             let through = [
@@ -811,9 +856,17 @@ impl HeldCheckpointWorld {
             let candidates: std::collections::BTreeSet<_> = parent.keys.iter().chain(&local.keys).collect();
             for key in candidates.into_iter().take_while(|key| through.is_none_or(|through| *key <= through)) {
                 let id = EntityId::String(key.clone());
-                let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
+                let shadow = if let Some(cut) = cut {
+                    let read = cut.shadow(&id, valid).await?;
+                    decode_point(read.row.into_iter().collect(), &id, &self.memory, None)?
+                        .map(|fact| WorldShadow::from_record(fact.row).map(|shadow| matches!(shadow, WorldShadow::Present(_))))
+                        .transpose()?
+                } else {
+                    self.open.read_local(relation, &id, valid, &self.memory, false).await?.0
+                        .map(|fact| fact.is_some())
+                };
                 let visible = match shadow {
-                    Some(fact) => fact.is_some(),
+                    Some(visible) => visible,
                     None => {
                         if local.keys.binary_search(key).is_ok() || parent.keys.binary_search(key).is_err() {
                             return Err(OwnedWorld::unavailable());

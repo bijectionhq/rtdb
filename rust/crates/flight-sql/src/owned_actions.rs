@@ -188,6 +188,8 @@ pub(crate) const HELD_OWNED_POSITION_VALID_DURING_V1: &str = "rtdb.owned.ReadHel
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_WORLD_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldValidDuringAt.v1";
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
+pub(crate) const HELD_WORLD_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPageAt.v1";
+pub(crate) enum WorldIdentityRead { Effective, Overlay, OverlayAt, EffectiveAt }
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
@@ -2466,12 +2468,20 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8], overlay: bool, historical: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8], mode: WorldIdentityRead) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         held.snapshot.check().map_err(status)?;
-        let (system, body) = if historical {
+        let (parent_only, body) = if matches!(mode, WorldIdentityRead::EffectiveAt) {
+            let (selector, rest) = body.split_first().ok_or_else(|| invalid("Historical world identities have no selector"))?;
+            match selector {
+                0 => (true, rest),
+                1 => (false, rest),
+                _ => return Err(invalid("Invalid historical world identity selector")),
+            }
+        } else { (false, body) };
+        let (system, body) = if matches!(mode, WorldIdentityRead::EffectiveAt | WorldIdentityRead::OverlayAt) {
             let (system, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world identities have no revision"))?;
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
         } else { (None, body) };
@@ -2490,12 +2500,16 @@ impl Service {
             .filter(|_| field.metadata().is_empty())
             .ok_or_else(|| invalid("Owned world identity bound must be nullable Utf8"))?;
         let after = (!after.is_null(0)).then(|| after.value(0));
-        let page = if let Some(system) = system {
-            held.snapshot.overlay_identities_at(&relation, valid, after, limit, system).await
-        } else if overlay {
-            held.snapshot.overlay_identities(&relation, valid, after, limit).await
-        } else {
-            held.snapshot.identity_page(&relation, valid, after, limit).await
+        let page = match (mode, system) {
+            (WorldIdentityRead::EffectiveAt, Some(system)) =>
+                held.snapshot.identity_page_at(&relation, valid, after, limit, system, parent_only).await,
+            (WorldIdentityRead::OverlayAt, Some(system)) =>
+                held.snapshot.overlay_identities_at(&relation, valid, after, limit, system).await,
+            (WorldIdentityRead::Overlay, None) =>
+                held.snapshot.overlay_identities(&relation, valid, after, limit).await,
+            (WorldIdentityRead::Effective, None) =>
+                held.snapshot.identity_page(&relation, valid, after, limit).await,
+            _ => return Err(invalid("Invalid held world identity coordinates")),
         }.map_err(status)?;
         let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
         let _copy = call.reserve(bytes)?;

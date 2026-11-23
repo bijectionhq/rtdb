@@ -130,6 +130,10 @@ pub trait OwnedWorldRead: Send + Sync {
     fn identity_page<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn identity_page_at<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        system: Timestamp, parent_only: bool,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn overlay_identities<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
