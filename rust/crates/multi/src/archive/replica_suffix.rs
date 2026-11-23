@@ -53,8 +53,10 @@ impl<'a> ServingPayloads<'a> {
         let [first, through] = proof.interval;
         if first < 0 || through < first || proof.stream != record.stream("replica")
             || proof.digest_bytes().is_none()
-            || !record.storage_regions.get(&region).is_some_and(|hold| {
-                hold.requires_replica_offset(first) && hold.requires_replica_offset(through)
+            || !record.storage_regions.get(&region).is_some_and(|hold| match hold {
+                rtdb_directory::StorageRegion::ReplicaReplay { first_required, through: end, .. } =>
+                    (0..=first).contains(first_required) && through <= *end,
+                hold => hold.first_required_replica().is_some_and(|start| (0..=first).contains(&start)),
             })
         {
             return Err(suffix_unavailable());

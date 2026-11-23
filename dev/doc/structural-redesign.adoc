@@ -183,7 +183,7 @@ Abandoned remote hold recovery, renewal, full recovery-root integration and the 
 |Multi binds checkpoint metadata and startup suffix holds.
 Coordinated native local startup retains its recovery media through checkpoint discovery and cursor admission under the same filesystem gate used by trie and metadata deletion.
 Startup and compactor reset share the primary inventory check for missing or wrong-length data and metadata files.
-Pending archive captures protect their journal interval until archive publication or expiry.
+Pending archive suffix pins protect their certified journal interval until archive publication or expiry.
 Recovery can verify members of the same pack against a shared fresh provider observation.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
 Enrolled terminal storage can retire loose files with a write witness and an installed release.

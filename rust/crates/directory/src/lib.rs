@@ -566,7 +566,8 @@ impl StorageRegion {
 
     pub fn requires_replica_offset(&self, offset: i64) -> bool {
         match self {
-            Self::ReplicaReplay { first_required, through, .. } => (*first_required..=*through).contains(&offset),
+            Self::ReplicaReplay { first_required, through, .. } =>
+                *first_required < 0 || *through < *first_required || (*first_required..=*through).contains(&offset),
             region => region.first_required_replica().is_some_and(|first| first <= offset),
         }
     }
@@ -1103,32 +1104,38 @@ impl DeploymentRecord {
     /// First replica offsets retained by open regions and captures that still need the journal.
     pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
         self.storage_regions.values().filter_map(StorageRegion::first_required_replica)
-            .chain(self.checkpoint_replica_offsets(now_ms))
+            .chain(self.capture_replica_offsets())
+            .chain(self.live_replica_suffixes(now_ms)
+                .map(|pin| self.verified_suffix_interval(pin).map_or(0, |interval| interval[0])))
     }
 
     /// Whether an eligible recovery dependency can still open this position.
     pub fn requires_replica_offset(&self, offset: i64, now_ms: i64) -> bool {
         self.storage_regions.values().any(|region| region.requires_replica_offset(offset))
-            || self.checkpoint_replica_offsets(now_ms).any(|first| first <= offset)
+            || self.capture_replica_offsets().any(|first| first <= offset)
+            || self.live_replica_suffixes(now_ms).any(|pin| {
+                self.verified_suffix_interval(pin).is_none_or(|[first, through]| (first..=through).contains(&offset))
+            })
     }
 
-    fn checkpoint_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
+    fn capture_replica_offsets(&self) -> impl Iterator<Item = i64> + '_ {
         self.checkpoint_captures.values().filter(|capture| {
             capture.world_replay.is_some() && capture.incarnation == self.incarnation
                 && capture.log_epoch == self.log_epoch && self.lifecycle != Lifecycle::Deleted
         }).map(|capture| capture.checkpoint.boundary.checked_add(1).filter(|offset| *offset >= 0).unwrap_or(0))
-            .chain(self.checkpoint_suffix_pins.values()
-                .filter(move |pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none())
-                .map(|pin| {
-                    if pin.incarnation == self.incarnation && pin.log_epoch == self.log_epoch {
-                        match pin.checkpoint.boundary.checked_add(1) {
-                            Some(first) if first >= 0 && first == pin.journal_interval[0] => first,
-                            _ => 0,
-                        }
-                    } else {
-                        0
-                    }
-                }))
+    }
+
+    fn live_replica_suffixes(&self, now_ms: i64) -> impl Iterator<Item = &CheckpointSuffixPin> + '_ {
+        self.checkpoint_suffix_pins.values()
+            .filter(move |pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none())
+    }
+
+    fn verified_suffix_interval(&self, pin: &CheckpointSuffixPin) -> Option<[i64; 2]> {
+        let first = pin.checkpoint.boundary.checked_add(1)?;
+        let through = pin.replica_through;
+        (pin.incarnation == self.incarnation && pin.log_epoch == self.log_epoch
+            && first >= 0 && through >= first && pin.journal_interval == [first, through])
+            .then_some([first, through])
     }
 
     /// Oversized replica records keep their payloads in the serving store
