@@ -136,6 +136,8 @@
 -- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
 -- Its ordered condition checks the original parent pin and Root purge frontier.
 -- A single finite Proposal replacement can land after the Root publication advances when the transaction checks both exact starts and both held timeline frontiers.
+-- A point landing may mix distinct Root inserts and replacements under the original parent publication.
+-- The transaction checks a Root absence and original Proposal winner for each insert and rejects an identity with retained history or a purge floor.
 -- Fully covered range counts and completed head valid windows can issue relation-frontier evidence under the same placed lease as range pages.
 -- Held system versions seek both window edges in the relation's ordered change journal and verify its event frontier.
 -- Both directions advance past every scanned source group, including groups with no change to the requested identity.

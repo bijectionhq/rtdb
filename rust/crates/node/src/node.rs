@@ -2409,16 +2409,14 @@ impl NativeSession {
                         let mut facts = root.writes.iter().filter(|op| !rtdb_tx::is_proposal_landing_frontier(op));
                         if let Some(fact) = facts.clone().next()
                             && facts.clone().count() == 1
-                            && (rtdb_tx::is_proposal_landing_period(fact)
-                                || matches!(fact, TxOp::OwnedInsertDocs {
-                                    relation, documents, valid_from: None, valid_to: None,
-                                } if relation.is_root_data() && documents.rows().len() == 1))
+                            && rtdb_tx::is_proposal_landing_period(fact)
                         {
                             return false;
                         }
                         let mut rows = 0usize;
                         facts.any(|op| match op {
                             TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }
+                            | TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None }
                                 if relation.is_root_data() && !documents.rows().is_empty() => {
                                     rows = rows.saturating_add(documents.rows().len());
                                     rows > rtdb_tx::MAX_PROPOSAL_LAND_ROWS

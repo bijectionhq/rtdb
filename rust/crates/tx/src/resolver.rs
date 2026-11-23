@@ -1258,9 +1258,10 @@ impl<'a> OpenTransaction<'a> {
                         (relation, documents),
                     _ => continue,
                 };
-                let document = documents.rows().first().ok_or_else(unavailable)?;
-                let id = crate::source::document_id(document, &self.context.memory)?;
-                self.require_proposal_create_absence(owner, relation, relation, &id).await?;
+                for document in documents.rows() {
+                    let id = crate::source::document_id(document, &self.context.memory)?;
+                    self.require_proposal_create_absence(owner, relation, relation, &id).await?;
+                }
             }
         } else if let Some(world) = retained_release {
             let original_pin = operations.iter().find_map(|op| match op {
