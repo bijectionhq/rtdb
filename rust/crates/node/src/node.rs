@@ -1150,6 +1150,7 @@ pub struct OwnedValidHistory<'a> {
     relation: &'a rtdb_types::OwnedRelation,
     cursor: Option<QueryCursor>,
     at_head: bool,
+    region: Option<OwnedRangeWitness>,
     complete: bool,
     failed: bool,
 }
@@ -1177,7 +1178,10 @@ impl OwnedValidHistory<'_> {
         if !self.complete || self.failed {
             return Err(Anomaly::fault("rtdb.owned/history-read", "Owned history must complete before issuing evidence"));
         }
-        if self.at_head {
+        if let Some(region) = &self.region {
+            self.held.check_relation(self.relation)?;
+            Ok(Some(region.clone()))
+        } else if self.at_head {
             self.held.relation_witness(self.relation)
         } else {
             self.held.check_relation(self.relation)?;
@@ -1989,7 +1993,7 @@ impl OwnedReadSession {
         ).await?;
         self.check_relation(relation)?;
         Ok(OwnedValidHistory {
-            held: self, relation, cursor, at_head: false, complete: false, failed: false,
+            held: self, relation, cursor, at_head: false, region: None, complete: false, failed: false,
         })
     }
 
@@ -2048,19 +2052,41 @@ impl OwnedReadSession {
         &'a self,
         relation: &'a rtdb_types::OwnedRelation,
         id: &rtdb_types::EntityId,
-        valid: rtdb_types::Interval,
+        valid: Interval,
         system: Timestamp,
+    ) -> Result<OwnedValidHistory<'a>> {
+        self.open_valid_during(relation, id, valid, system, false).await
+    }
+
+    pub async fn open_valid_during_region<'a>(
+        &'a self,
+        relation: &'a rtdb_types::OwnedRelation,
+        id: &rtdb_types::EntityId,
+        valid: Interval,
+        system: Timestamp,
+    ) -> Result<OwnedValidHistory<'a>> {
+        self.open_valid_during(relation, id, valid, system, true).await
+    }
+
+    async fn open_valid_during<'a>(
+        &'a self, relation: &'a rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        valid: Interval, system: Timestamp, exact_region: bool,
     ) -> Result<OwnedValidHistory<'a>> {
         let at_head = self.admit_root_system(relation, system).await?;
         if !at_head {
             self.check_point_purge_floor(relation, id, system).await?;
         }
+        let region = if at_head && exact_region {
+            self.entity_region_witness(relation, id, valid).await?
+        } else {
+            None
+        };
         let cursor = rtdb_query::open_owned_valid_during_at(
             self.relation_context(relation)?, &self.owner, relation, id, valid, system,
         ).await?;
         self.check_relation(relation)?;
         Ok(OwnedValidHistory {
-            held: self, relation, cursor, at_head, complete: false, failed: false,
+            held: self, relation, cursor, at_head, region, complete: false, failed: false,
         })
     }
 

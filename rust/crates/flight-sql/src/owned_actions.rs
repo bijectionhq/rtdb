@@ -215,6 +215,7 @@ pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHist
 pub(crate) const HELD_OWNED_POSITION_POINT_V1: &str = "rtdb.owned.ReadHeldPositionPoint.v1";
 pub(crate) const HELD_OWNED_POSITION_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldPositionValidDuring.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
+pub(crate) const HELD_OWNED_VALID_REGION_V1: &str = "rtdb.owned.ReadHeldValidRegion.v1";
 pub(crate) const HELD_WORLD_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldValidDuringAt.v1";
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_PARENT_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentIdentityPageAt.v1";
@@ -366,6 +367,12 @@ impl OwnedReadResource {
         });
         Ok(nonce)
     }
+}
+
+pub(crate) enum ValidHistoryMode {
+    Timeline,
+    Positioned,
+    Region,
 }
 
 enum HistoryRead<'a> {
@@ -1794,7 +1801,7 @@ impl Service {
     }
 
     pub(crate) async fn held_owned_valid_during_action(
-        &self, call: &Call, body: &[u8], positioned: bool,
+        &self, call: &Call, body: &[u8], mode: ValidHistoryMode,
     ) -> Result<ActionResult, Status> {
         use rtdb_types::Interval;
 
@@ -1806,7 +1813,7 @@ impl Service {
             if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
-        let (mask, request) = if positioned {
+        let (mask, request) = if matches!(mode, ValidHistoryMode::Positioned) {
             let (mask, remaining) = split_position_mask(request)?;
             (Some(mask), remaining)
         } else {
@@ -1827,6 +1834,8 @@ impl Service {
         let system = history_request_endpoint(batch, "system_micros")?;
         let history = match mask {
             Some(mask) => held.snapshot.open_historical_position_valid_during(&relation, &id, valid, system, mask).await,
+            None if matches!(mode, ValidHistoryMode::Region) =>
+                held.snapshot.open_valid_during_region(&relation, &id, valid, system).await,
             None => held.snapshot.open_valid_during_observed(&relation, &id, valid, system).await,
         }.map_err(status)?;
         let read = HistoryRead::Observed { read: history, held: &held, relation: &relation };

@@ -181,6 +181,7 @@
 -- The ordered check certifies every group after the held basis and refuses a write when any assertion intersects that identity and valid interval.
 -- A scoped point read whose logical clock can move holds its identity over all valid time.
 -- An explicit fixed point bounds its ordered evidence to the selected microsecond.
+-- A completed fixed-window read at held head binds the exact identity and requested valid interval, including gaps.
 -- An admitted placed hosted writer may replace checked ordinary control rows with owned root facts in one ordered transaction.
 -- Exact control identities and expected revisions are checked at the ordered base before either set of writes.
 -- A failed control or fact operation publishes neither set of effects.
