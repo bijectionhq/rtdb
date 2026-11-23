@@ -56,7 +56,7 @@ impl OwnedWorldHost for PlacedWorldHost {
                 .ok_or_else(OwnedWorld::unavailable)?;
             prepare_checkpoint_replay_parent(
                 Arc::clone(&self.directory), &self.archive, source, &agent, self.keys.as_ref(),
-                self.hosted_task.as_ref(), call.session, deployment, binding, original,
+                self.hosted_task.as_ref(), call.session, deployment, binding, original, None,
                 CheckpointReadResources {
                     node: &self.options, memory: call.node.memory(),
                     cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,

@@ -65,6 +65,10 @@ impl WorldSchemas {
     pub fn relation(&self, relation: &OwnedRelation) -> Option<&OwnedSchema> {
         self.fields.get(relation.name())
     }
+
+    pub fn includes(&self, required: &Self) -> bool {
+        required.fields.iter().all(|(name, schema)| self.fields.get(name) == Some(schema))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

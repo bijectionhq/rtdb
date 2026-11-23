@@ -5,7 +5,7 @@ use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, Host
 use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
-    Timestamp, TransactionKey, Value, WorldClockMode, WorldShadow,
+    Timestamp, TransactionKey, Value, WorldClockMode, WorldSchemas, WorldShadow,
 };
 use uuid::Uuid;
 
@@ -191,6 +191,7 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
     deployment: Uuid,
     binding: [u8; 32],
     original: Option<TransactionKey>,
+    required_schemas: Option<&WorldSchemas>,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Option<rtdb_flight_sql::PreparedReplayParent>> {
     let owner = session.state().user().filter(|owner| !owner.is_empty())
@@ -251,14 +252,19 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
     admit_session(session, &installed, &owner)?;
     let (_, manifest) = capture_receipt(&installed, archive, deployment, capture)?
         .ok_or_else(OwnedWorld::unavailable)?;
-    let (basis, schema_digest) = with_registered_capture_context(
+    let basis = with_registered_capture_context(
         directory.as_ref(), archive, keys, hosted_task,
         CaptureSelection { deployment, capture, manifest: &manifest, suffix, expected_basis: None },
         resources, |context, basis| {
             let owner = &owner;
             async move {
-                let (schemas, _charge) = rtdb_query::read_owned_parent_schemas(context, owner).await?;
-                Ok((basis, schemas.digest()))
+                if let Some(required) = required_schemas {
+                    let (schemas, _charge) = rtdb_query::read_owned_parent_schemas(context, owner).await?;
+                    if !schemas.includes(required) {
+                        return Err(OwnedWorld::unavailable());
+                    }
+                }
+                Ok(basis)
             }
         },
     ).await?;
@@ -269,7 +275,7 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
     Ok(Some(rtdb_flight_sql::PreparedReplayParent {
         capture: *capture.as_bytes(),
         suffix: suffix.map(|value| *value.as_bytes()),
-        manifest, basis, logical, schema_digest,
+        manifest, basis, logical,
     }))
 }
 
@@ -295,7 +301,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     let staged = session.open_owned_read().await?.replayed_world(binding, iid).await?;
     let parent = prepare_checkpoint_replay_parent(
         Arc::clone(&directory), archive, storage, agent, keys, hosted_task, session,
-        deployment, binding, Some(staged.world.basis), resources,
+        deployment, binding, Some(staged.world.basis), Some(&staged.world.schemas), resources,
     ).await?.ok_or_else(unavailable)?;
     let live = session.open_owned_read().await?;
     let current = live.replayed_world(binding, iid).await?;
@@ -303,7 +309,6 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     if world != staged.world || current.source_cut != staged.source_cut
         || current.destination_parent != staged.destination_parent
         || parent.basis.system_time != current.destination_parent
-        || parent.schema_digest != world.schemas.digest()
     {
         return Err(unavailable());
     }
@@ -318,7 +323,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
         owner,
         capture: Uuid::from_bytes(parent.capture),
         manifest_sha256: parent.manifest,
-        schema_digest: parent.schema_digest,
+        schema_digest: world.schemas.digest(),
         suffix: parent.suffix.map(Uuid::from_bytes),
         basis: parent.basis,
         parent_publication: Some(world.inherited_clock()),
@@ -416,7 +421,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let proposal_hold = renewal && matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal);
     let proposal_shorten = fork.shortens_proposal();
     let source_mode = if proposal_hold { WorldClockMode::Proposal } else { WorldClockMode::Retained };
-    let (capture, suffix, inherited_publication) = if renewal {
+    let (capture, suffix) = if renewal {
         let predecessor = fork.previous.ok_or_else(OwnedWorld::unavailable)?;
         let source_world = fork.sibling.unwrap_or(fork.world);
         let retained = source.checkpoint_worlds.get(&Uuid::from_bytes(predecessor.0))
@@ -427,7 +432,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         if !capture.is_nil() || suffix.is_some() {
             return Err(OwnedWorld::unavailable());
         }
-        (retained.capture, retained.suffix, Some(retained.parent_publication))
+        (retained.capture, retained.suffix)
     } else if capture.is_nil() {
         if suffix.is_some() || fork.root.is_none() || (fork.previous.is_some() && !authored_advance)
             || !(matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
@@ -440,7 +445,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
             return Err(OwnedWorld::unavailable());
         }
         if let Some(selected) = select_held_archive(&source, archive, deployment_id, &fork.cut)? {
-            (selected.0, selected.1, None)
+            selected
         } else {
             let storage = capture_source.ok_or_else(OwnedWorld::unavailable)?;
             let deadline = until.min(fork.deadline).min(fork.cut.until());
@@ -460,10 +465,10 @@ pub(crate) async fn fork_checkpoint_world_selected(
             };
             source = directory.deployment(&deployment).await?.ok_or_else(OwnedWorld::unavailable)?;
             admit_session(session, &source, &owner)?;
-            (selected.0, selected.1, None)
+            selected
         }
     } else {
-        (capture, suffix, None)
+        (capture, suffix)
     };
     require_capture_open(&source, capture)?;
     let (point, manifest) = capture_receipt(&source, archive, deployment_id, capture)?
@@ -481,6 +486,18 @@ pub(crate) async fn fork_checkpoint_world_selected(
     }
     let expected_basis = expected_basis.or(fork.cut.live());
     let live = session.open_owned_read().await?;
+    let predecessor = if let Some(pin) = fork.previous.filter(|_| renewal) {
+        let world = fork.sibling.unwrap_or(fork.world);
+        let retained = source.checkpoint_worlds.get(&Uuid::from_bytes(pin.0))
+            .ok_or_else(OwnedWorld::unavailable)?;
+        let (record, charge) = live.world_registration(world).await?.ok_or_else(OwnedWorld::unavailable)?;
+        if record.pin != pin || record.dropped || !matches_retention(&record, retained) {
+            return Err(OwnedWorld::unavailable());
+        }
+        Some((record, charge))
+    } else {
+        None
+    };
     let ((schemas, _schema_charge), parent_publication, basis) = with_registered_capture_context(
         directory.as_ref(), archive, keys, hosted_task,
         CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis },
@@ -511,8 +528,13 @@ pub(crate) async fn fork_checkpoint_world_selected(
         return Err(OwnedWorld::unavailable());
     }
     // A renewal keeps the parent already admitted at this exact archive.
-    // Its logical publication may predate the replayed physical Root head.
-    let parent_publication = inherited_publication.unwrap_or(parent_publication);
+    let (schemas, parent_publication) = match predecessor {
+        Some((prior, _charge)) if schemas.includes(&prior.schemas) => {
+            (prior.schemas, prior.parent_publication)
+        }
+        Some(_) => return Err(OwnedWorld::unavailable()),
+        None => (schemas, parent_publication),
+    };
     let inherited = parent_publication.unwrap_or(basis.system_time);
     let mode = match fork.requested {
         rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,

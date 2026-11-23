@@ -36,7 +36,6 @@ pub struct PreparedReplayParent {
     pub manifest: String,
     pub basis: TransactionKey,
     pub logical: Timestamp,
-    pub schema_digest: [u8; 32],
 }
 
 /// The Directory retention awaiting the held writer's local readmission.
