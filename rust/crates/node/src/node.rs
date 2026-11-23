@@ -1310,19 +1310,29 @@ impl OwnedReadSession {
         &'a self, world: &'a rtdb_types::OwnedWorld, relation: &'a rtdb_types::OwnedRelation,
         system: Timestamp,
     ) -> Result<OwnedWorldAcceptedCut<'a>> {
+        self.certify_world_accepted_scope(world, std::slice::from_ref(relation), system).await?;
+        Ok(OwnedWorldAcceptedCut { held: self, world: world.id, relation, system })
+    }
+
+    /// Certify the same protected publication against every explicitly selected relation.
+    pub async fn certify_world_accepted_scope(
+        &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], system: Timestamp,
+    ) -> Result<Timestamp> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         self.require_unscoped_root()?;
         self.admit_read().await?;
-        if !relation.is_root_data() || !world.mode.is_writable() || world.dropped
-            || world.schemas.relation(relation).is_none() || system <= world.basis.system_time
+        if !(1..=32).contains(&relations.len()) || !world.mode.is_writable() || world.dropped
+            || relations.iter().any(|relation| !relation.is_root_data() || world.schemas.relation(relation)
+                .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+            || system <= world.basis.system_time
             || system > self.present.system_time
         {
             return Err(unavailable());
         }
         let (current, _schema) = self.world_registration(world.id).await?.ok_or_else(unavailable)?;
         if &current != world { return Err(unavailable()); }
-        self.world_merged_changes(world.id, std::slice::from_ref(relation), system, system, 1).await?;
-        let context = self.relation_context(relation)?;
+        self.world_merged_changes(world.id, relations, system, system, 1).await?;
+        let context = self.guard_context(Arc::clone(&self.context), relations)?;
         let context = context.with_owned_system_cut(system, &context.cancellation)?;
         let (registration, _schema) = rtdb_query::read_owned_world(Arc::clone(&context), &self.owner, world.id)
             .await?.ok_or_else(unavailable)?;
@@ -1333,8 +1343,8 @@ impl OwnedReadSession {
         if &registration != world || publication != system || clock <= world.initial_clock() || clock > system {
             return Err(unavailable());
         }
-        self.check_relation(relation)?;
-        Ok(OwnedWorldAcceptedCut { held: self, world: world.id, relation, system })
+        self.check_relations(relations)?;
+        Ok(clock)
     }
 
     pub async fn world_application_clock(&self, world: rtdb_types::Iid) -> Result<Option<Timestamp>> {

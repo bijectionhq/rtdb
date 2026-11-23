@@ -41,6 +41,11 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<()>>,
     },
+    AcceptedScope {
+        schemas: Vec<(OwnedRelation, rtdb_types::OwnedSchema)>,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Point(ArchivePoint),
     PathColumns {
         relation: OwnedRelation,
@@ -242,6 +247,26 @@ impl HeldCheckpointWorld {
             return Err(OwnedWorld::unavailable());
         }
         Ok(())
+    }
+
+    pub async fn preflight_accepted_scope(&self, relations: &[OwnedRelation], system: Timestamp) -> Result<Timestamp> {
+        self.check()?;
+        let clock = self.open.snapshot.certify_world_accepted_scope(&self.open.record, relations, system).await?;
+        let guard = self.open.snapshot.relation_release_guard(relations)?;
+        let mut schemas = Vec::with_capacity(relations.len());
+        for relation in relations {
+            let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+            schemas.push((relation.clone(), schema.clone()));
+        }
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::AcceptedScope {
+            schemas, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        guard()?;
+        self.check()?;
+        Ok(clock)
     }
 
     pub async fn accepted_point(
@@ -854,6 +879,26 @@ pub(crate) async fn open_held_checkpoint_world(
                                         &context, &owner, frontiers.iter().map(|(relation, frontier)| (relation, *frontier)),
                                     ));
                                     let _ = reply.send(coverage);
+                                }
+                                ArchiveRead::AcceptedScope { schemas, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        check_archive_coverage(&context, &owner, schemas.iter().map(|(relation, _)| (relation, 0)))?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        for (relation, expected) in schemas {
+                                            let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &owner, &relation).await?;
+                                            if !actual.is_some_and(|(schema, _)| schema == expected) {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                        }
+                                        context.check_cancelled()
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
                                 }
                                 ArchiveRead::PathColumns { relation, path, expected_schema, guard, mut reply } => {
                                     let read = async {
