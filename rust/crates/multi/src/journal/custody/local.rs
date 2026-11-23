@@ -1,4 +1,4 @@
-//! Exclusive lifetime for locally staged and retired checkpoint allocations.
+//! Shared lifetimes for immutable checkpoint I/O, fenced by exclusive retirement.
 
 use crate::keys::{UnitLedger, UnitOperation};
 use bytes::Bytes;
@@ -79,6 +79,14 @@ impl LocalArchive {
             io,
         })
     }
+
+    pub(super) async fn readable<'a>(&'a self, scope: &'a str) -> Result<Allocation<'a>> {
+        let allocation = self.acquire(scope, false).await?;
+        if allocation.closed().await?.is_some() {
+            return Err(invalid("The local checkpoint archive is closed"));
+        }
+        Ok(allocation)
+    }
 }
 
 impl Allocation<'_> {
@@ -100,6 +108,12 @@ impl Allocation<'_> {
             Arc::new(raw),
             Arc::new(ledger),
         )))
+    }
+
+    pub(super) async fn sync_existing(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        LocalStore::open_in(&self.archive.root, Arc::clone(&self.io))?
+            .sync_existing(key)
+            .await
     }
 
     async fn sync_scope(&self) -> rtdb_storage::Result<()> {
@@ -147,26 +161,29 @@ impl Allocation<'_> {
         // Puts use the allocation's own scratch directory. The I/O region
         // holds the file lock through cancellation of any blocking write.
         let data = LocalStore::open_in(&self.data, Arc::clone(&self.io))?;
-        match data.get_fresh(&relative).await {
-            Ok(sealed) => {
-                let plaintext = ledger
-                    .operate(key, UnitOperation::Open(sealed))
+        let existing = match data.get_fresh(&relative).await {
+            Ok(sealed) => sealed,
+            Err(Error::MissingObject(_)) => {
+                let sealed = ledger
+                    .operate(key, UnitOperation::Seal(bytes.clone()))
                     .await?
                     .bytes()?;
-                return if plaintext == bytes {
-                    self.sync_scope().await
-                } else {
-                    Err(Error::ConflictingObject(key.to_string()))
-                };
+                match data.put(&relative, sealed).await {
+                    Ok(()) => return self.sync_scope().await,
+                    Err(Error::ConflictingObject(_)) => data.get_fresh(&relative).await?,
+                    Err(error) => return Err(error),
+                }
             }
-            Err(Error::MissingObject(_)) => {}
             Err(error) => return Err(error),
-        }
-        let sealed = ledger
-            .operate(key, UnitOperation::Seal(bytes))
+        };
+        let plaintext = ledger
+            .operate(key, UnitOperation::Open(existing))
             .await?
             .bytes()?;
-        data.put(&relative, sealed).await?;
+        if plaintext != bytes {
+            return Err(Error::ConflictingObject(key.to_string()));
+        }
+        data.sync_existing(&relative).await?;
         self.sync_scope().await
     }
 

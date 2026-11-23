@@ -232,10 +232,7 @@ impl CheckpointCustody {
             return Ok(Arc::new(self.remote_store(custody)));
         };
         let scope = self.allocation(custody);
-        let allocation = local.acquire(&scope, false).await?;
-        if allocation.closed().await?.is_some() {
-            return Err(invalid("The local checkpoint archive is closed"));
-        }
+        let allocation = local.readable(&scope).await?;
         allocation.read_store(self.ledger(custody, allocation.region()))
     }
 
@@ -252,7 +249,7 @@ impl CheckpointCustody {
         };
         let scope = self.allocation(custody);
         let allocation = local
-            .acquire(&scope, true)
+            .acquire(&scope, false)
             .await
             .map_err(|error| Error::Task(error.to_string()))?;
         let ledger = self.ledger(custody, allocation.region());
@@ -261,8 +258,7 @@ impl CheckpointCustody {
 
     pub(crate) async fn pending(&self, reservation: &Reservation) -> Result<Option<Preparation>> {
         let locator = self.intent(reservation.custody)?;
-        let reader = self.reader(reservation.custody).await?;
-        let Some(frame) = Self::metadata(reader.as_ref(), &locator).await? else {
+        let Some(frame) = self.staged_metadata(reservation.custody, &locator).await? else {
             return Ok(None);
         };
         let intent: Intent = serde_json::from_slice(&frame).map_err(serialization)?;
@@ -383,9 +379,9 @@ impl CheckpointCustody {
         reservation: Reservation,
         origin: Preparation,
     ) -> Result<Option<Checkpoint>> {
-        let reader = self.reader(reservation.custody).await?;
-        let Some(frame) =
-            Self::metadata(reader.as_ref(), &self.manifest(reservation.custody)?).await?
+        let Some(frame) = self
+            .staged_metadata(reservation.custody, &self.manifest(reservation.custody)?)
+            .await?
         else {
             return Ok(None);
         };
@@ -395,7 +391,7 @@ impl CheckpointCustody {
             manifest: fingerprint(&frame),
             custody: reservation.custody,
         };
-        let manifest = self.read_manifest(reader.as_ref(), checkpoint).await?;
+        let manifest = self.decode_manifest(checkpoint, &frame)?;
         if origin.authority != manifest.authority {
             return Err(invalid("The prepared checkpoint has different recovery authority"));
         }
@@ -529,12 +525,16 @@ impl CheckpointCustody {
         let frame = Self::metadata(reader, &locator)
             .await?
             .ok_or_else(|| invalid("The exact captured checkpoint manifest is unavailable"))?;
-        if fingerprint(&frame) != chosen.manifest {
+        self.decode_manifest(chosen, &frame)
+    }
+
+    fn decode_manifest(&self, chosen: Checkpoint, frame: &[u8]) -> Result<Manifest> {
+        if fingerprint(frame) != chosen.manifest {
             return Err(invalid(
                 "The checkpoint manifest differs from the installed receipt",
             ));
         }
-        let manifest: Manifest = serde_json::from_slice(&frame).map_err(serialization)?;
+        let manifest: Manifest = serde_json::from_slice(frame).map_err(serialization)?;
         if manifest.scope != self.scope()
             || manifest.allocation != chosen.custody.allocation
             || manifest.revision != chosen.custody.revision
@@ -617,6 +617,22 @@ impl CheckpointCustody {
             .as_ref()
             .try_into()
             .expect("SHA-256 is 32 bytes"))
+    }
+
+    async fn staged_metadata(&self, custody: Custody, key: &ObjectKey) -> Result<Option<Bytes>> {
+        self.require_provider(custody)?;
+        let Some(local) = &self.local else {
+            return Self::metadata(&self.remote_store(custody), key).await;
+        };
+        let scope = self.allocation(custody);
+        let allocation = local.readable(&scope).await?;
+        let reader = allocation.read_store(self.ledger(custody, allocation.region()))?;
+        let frame = Self::metadata(reader.as_ref(), key).await?;
+        if frame.is_some() {
+            // Another custodian can make the immutable file visible before its directory sync.
+            allocation.sync_existing(key).await?;
+        }
+        Ok(frame)
     }
 
     async fn metadata(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Option<Bytes>> {
@@ -960,5 +976,62 @@ fn read_only(key: &ObjectKey) -> Error {
     Error::PermissionDenied {
         key: key.to_string(),
         message: "A captured checkpoint is immutable".into(),
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use crate::keys::LocalKeyService;
+    use rtdb_storage::MemoryStore;
+
+    #[tokio::test]
+    async fn local_checkpoint_staging_can_overlap_another_custodian() -> Result<()> {
+        let volume = tempfile::tempdir().unwrap();
+        let keys = tempfile::tempdir().unwrap();
+        let placement = Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        };
+        let custody = Custody {
+            allocation: Uuid::new_v4(),
+            revision: 2,
+            provider: [1; 32],
+        };
+        let custodian = || -> Result<CheckpointCustody> {
+            CheckpointCustody::new(
+                Arc::new(MemoryStore::default()),
+                ObjectKey::new("checkpoints")?,
+                placement,
+                StorageEpoch(0),
+                custody.provider,
+                Arc::new(LocalKeyService::new(keys.path())?),
+                IoRegion::new(),
+            )
+            .on_local_volume(volume.path())
+        };
+        let first = custodian()?;
+        let second = custodian()?;
+        let key = first.intent(custody)?;
+        let reader = second.reader(custody).await?;
+        let body = Bytes::from_static(b"the same ordered checkpoint intent");
+        let (left, right) = tokio::join!(
+            first.put(custody, &key, body.clone()),
+            second.put(custody, &key, body.clone()),
+        );
+        left?;
+        right?;
+        assert!(matches!(
+            second.put(custody, &key, Bytes::from_static(b"another intent")).await,
+            Err(Error::ConflictingObject(_))
+        ));
+        assert_eq!(reader.get(&key).await?, body);
+        assert_eq!(second.staged_metadata(custody, &key).await?, Some(body));
+        assert!(
+            first.local.as_ref().unwrap().acquire(&first.allocation(custody), true).await.is_err()
+        );
+        Ok(())
     }
 }

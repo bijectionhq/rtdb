@@ -543,6 +543,8 @@ contract LogService {
         -- A checkpoint custodian supplies the exact immutable provider manifest for one reconstructable RTDB checkpoint and journal cut.
         -- A custodian can identify the next native checkpoint by its chosen boundary, upload and exact catalog digest independently of the writer grant.
         -- A stale inspection cannot authorize staging under a different base.
+        -- Local checkpoint staging and readers share the allocation lock until exclusive retirement.
+        -- A custodian synchronizes a reused local object and its directory entries before treating it as durable.
         -- The journal orders publication under the custodian before accepting trim through that cut.
         -- A live replay reservation protects its exact interval, and an independent checkpoint hold protects its original root.
 

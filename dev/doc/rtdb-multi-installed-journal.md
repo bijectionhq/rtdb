@@ -77,6 +77,9 @@ A changed base invalidates the scan, and staging still requires the new ordered 
 
 Progress assumes a reachable installed quorum, a live custodian and provider namespace, a funded checkpoint allocation, and eventual release or verified disposition of overlapping holds. The bounded reserve admits a finite maintenance sequence. Repeated crashed attempts that each choose further maintenance records can consume that sequence's headroom. The enrolled RTDB worker classifies the typed replica records before sealing them. Its TLS credential carries that authority.
 
+Local checkpoint staging uses the same shared allocation lock as readers and publishes each encrypted object by immutable creation.
+A custodian that reuses another custodian's object or discovers its staged metadata synchronizes the file and directory entries before using it as durability evidence.
+
 Past checkpoint archives first close in journal order. Reads and disposal verify the original physical storage identity before using or releasing that custody. Closure requires every hold and preparation referencing that archive to finish. The terminal provider replaces each archived member with a permanent conditional tombstone and fences the manifest last. A retry can recognize that final fence after the original bytes are gone. Tombstone metadata remains as provider closure evidence. A local archive uses a shared filesystem with reliable cross-process file locks and durable directory synchronization. Archive readers retain a shared lock. Retirement takes an exclusive lock, records a permanent closed marker, and removes the allocation including its private scratch directory. Serving prefixes for old writer epochs are retired separately from this archive retirement.
 
 ### Retire serving prefixes of earlier writers
