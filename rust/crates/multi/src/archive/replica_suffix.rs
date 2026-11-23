@@ -966,6 +966,7 @@ mod custody_tests {
         source.checkpoint = Some(point.checkpoint);
         source.checkpoint_captures.insert(capture, CheckpointCapture {
             archive: archive_binding(&archive)?, incarnation: source.incarnation, log_epoch: source.log_epoch,
+            key_namespace: None,
             checkpoint: point.checkpoint, automatic_fork: false, world_replay: None, media_bound: true,
             manifest_sha256: Some(manifest.clone()), remote_disposal: None,
         });
