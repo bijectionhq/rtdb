@@ -74,7 +74,7 @@ fn strictly_below(bound: Option<u64>, kth: u64) -> bool {
         Some(key) => bound_is_lower(pending, key) && bound_is_lower(unread, key),
     },
 ))]
-pub(crate) fn can_stop(kth: u64, pending: Option<u64>, unread: Option<u64>) -> bool {
+pub fn can_stop(kth: u64, pending: Option<u64>, unread: Option<u64>) -> bool {
     match rank_key(kth) {
         None => false,
         Some(key) => strictly_below(pending, key) && strictly_below(unread, key),
@@ -121,7 +121,7 @@ enum RankIdentity {
 
 #[cfg(not(verus_keep_ghost))]
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RankKey {
+pub struct RankKey {
     pub score: f64,
     id: Option<RankIdentity>,
 }

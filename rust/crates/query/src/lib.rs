@@ -1,4 +1,6 @@
 mod accelerate;
+#[doc(hidden)]
+pub mod rank_cutoff;
 mod aggregate;
 mod context;
 mod parameters;

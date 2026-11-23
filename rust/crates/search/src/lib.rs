@@ -7,7 +7,7 @@ pub mod file;
 pub mod lane;
 mod held_corpus;
 mod member_bounds;
-mod rank_cutoff;
+use rtdb_query::rank_cutoff;
 mod rank_windows;
 mod rectangle;
 mod term_directory;
