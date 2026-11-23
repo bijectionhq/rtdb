@@ -6,7 +6,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, CatalogRuntime, QualifiedTable, TableBinding};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::{invalid, spill::SpillRegion};
@@ -43,6 +43,7 @@ pub struct CatalogSnapshot {
     pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
     owned_relation: Option<(QualifiedTable, Option<rtdb_types::EntityId>)>,
+    pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
     owned_read_guard: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
@@ -59,7 +60,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, owned_relation: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
+        Ok(Self { default_database, databases, transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {

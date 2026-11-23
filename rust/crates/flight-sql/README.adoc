@@ -290,6 +290,13 @@ It uses the same point key, with null `valid_micros` selecting the requested sys
 The relation's journal must cover the system time at or before the held cut.
 The point reply carries that requested system time in `rtdb.owned.present_micros`.
 
+`rtdb.owned.ReadHeldPositionPoint.v1` adds an eight-byte signed masked commit time and a four-byte unsigned first masked position, both big-endian, between the system time and the relation prefix.
+It requires an explicit valid instant on an admitted clear Root relation with retained history and no lifetime.
+The resolver omits puts and deletes at or after the specified position in the selected commit while resolving the point at the requested system cut.
+Position zero masks all assertions in the selected commit.
+Erasure fences and erase events apply to the masked read.
+The point response has the same coordinates as the unmasked historical point.
+
 Send `rtdb.owned.CloseRead.v1` with only the 16 handle bytes to release it.
 Close success has zero Flight results.
 

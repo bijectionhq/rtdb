@@ -81,6 +81,18 @@ pub async fn open_owned_point_at_system(
     open_owned_point(context, owner, relation, id, Some(valid), None).await
 }
 
+/// Resolve one retained point with the specified suffix of one commit masked.
+#[doc(hidden)]
+pub async fn open_owned_point_with_position_mask(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Interval, system: Timestamp, mask: (Timestamp, u32),
+) -> Result<Option<QueryCursor>> {
+    if !relation.is_root_data() || valid.is_empty() { return Err(address_unavailable()); }
+    let mut context = owned_context_at_system(context, system)?;
+    Arc::make_mut(&mut context).catalog.owned_position_mask = Some(mask);
+    open_owned_point(context, owner, relation, id, Some(valid), None).await
+}
+
 fn owned_context_at_system(context: Arc<QueryContext>, system: Timestamp) -> Result<Arc<QueryContext>> {
     let held = context.current_time.as_micros()?;
     let database = context.catalog.database(context.catalog.default_database())?;

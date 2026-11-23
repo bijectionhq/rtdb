@@ -15,7 +15,7 @@ use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
-use rtdb_types::{Anomaly, EntityId, EventHeader, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
@@ -868,7 +868,9 @@ impl PageCursor for ScanCursor {
 impl PartitionScan {
     fn pruning(&self) -> PruningOptions {
         PruningOptions { bounds: self.bounds, projects_temporal_columns: self.scan.columns.iter().any(|field| matches!(field.name.as_str(), "_valid_from" | "_valid_to" | "_system_from" | "_system_to")),
-            clamp_valid_time: self.scan.clamp_valid_time, bypass_temporal_pruning: self.execution.context.options.bypass_temporal_pruning,
+            clamp_valid_time: self.scan.clamp_valid_time,
+            bypass_temporal_pruning: self.execution.context.options.bypass_temporal_pruning
+                || self.execution.context.catalog.owned_position_mask.is_some(),
             iid: self.scan.iids.as_ref().filter(|iids| iids.len() == 1).and_then(|iids| iids.first().copied()) }
     }
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
@@ -1183,6 +1185,7 @@ impl PartitionScan {
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let keyed = self.scan.table.name.table.is_owned_event_data();
+        let position_mask = self.execution.context.catalog.owned_position_mask;
         let requested_key = if keyed { self.execution.context.catalog.owned_identity().map(EntityId::handle_bytes) } else { None };
         // Every equal physical IID stays within one task. A key's events still
         // arrive in descending system time, independently of its neighbours.
@@ -1211,6 +1214,13 @@ impl PartitionScan {
             };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
+            if position_mask.is_some_and(|(commit, from)| {
+                head.header.system_from == commit
+                    && head.header.commit_position >= from
+                    && head.header.op != EventOp::Erase
+            }) {
+                continue;
+            }
             let (slot, batch, row) = rows.batch(head.ordinal)?;
             let resolver = if keyed {
                 let key = batch.view().entity_key(row as usize)?.ok_or_else(|| {
@@ -1555,6 +1565,62 @@ mod tests {
             outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
         };
         (scan, execution, memory)
+    }
+
+    #[tokio::test]
+    async fn an_owned_position_mask_hides_only_the_selected_commit_suffix() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
+        let table = relation.table("alice");
+        let id = EntityId::Integer(1);
+        let memory = MemoryBudget::new(1 << 24);
+        let store = Arc::new(MemoryStore::default());
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        for (tx_id, time, start, values) in [
+            (0, 90, 0, &[1][..]),
+            (1, 100, 10, &[2, 3][..]),
+            (2, 110, 20, &[4][..]),
+        ] {
+            let key = TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(time) };
+            let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+            if values.len() > 1 { write.retain_owned_positions().unwrap(); }
+            for &value in values {
+                write.append(table.clone(), StoredEvent {
+                    commit_position: 0,
+                    entity_key: Some(id.handle_bytes().into()),
+                    iid: id.iid(),
+                    system_from: key.system_time,
+                    valid_time: Interval::from_micros(start, 30).unwrap(),
+                    operation: StoredOperation::Put(StructFields::from([
+                        ("_id".into(), Value::I64(1)),
+                        ("v".into(), Value::I64(value)),
+                    ])),
+                    recency: None,
+                }).unwrap();
+            }
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        let snapshot = state.value().snapshot().with_system_time_cap(Some(Timestamp(110))).unwrap();
+        let database = DatabaseSnapshot { partitions: vec![snapshot], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, memory, Timestamp(110), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        for (system, valid, first_masked, expected) in [
+            (100, 15, 3, 3),
+            (100, 15, 2, 2),
+            (100, 15, 0, 1),
+            (110, 15, 2, 2),
+            (110, 25, 2, 4),
+        ] {
+            let mut result = crate::open_owned_point_with_position_mask(
+                Arc::clone(&context), "alice", &relation, &id,
+                Interval::at(Timestamp(valid)).unwrap(), Timestamp(system), (Timestamp(100), first_masked),
+            ).await.unwrap().unwrap();
+            let batch = result.next_batch().await.unwrap().unwrap();
+            let batch = batch.batch();
+            let (column, field) = batch.schema_ref().column_with_name("v").unwrap();
+            assert_eq!(rtdb_columnar::read_value(field, batch.column(column).as_ref(), 0).unwrap(), Value::I64(expected));
+            assert!(result.next_batch().await.unwrap().is_none());
+        }
     }
 
     async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>, persisted: Option<usize>) {

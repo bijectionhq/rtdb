@@ -183,6 +183,7 @@ pub(crate) const HELD_WORLD_TOUCH_IMAGES_V1: &str = "rtdb.owned.ReadHeldWorldTou
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
+pub(crate) const HELD_OWNED_POSITION_POINT_V1: &str = "rtdb.owned.ReadHeldPositionPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
@@ -1165,6 +1166,23 @@ impl Service {
         let (relation, id, valid, _identity) = point_request(call, request, PointTime::Optional)?;
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
+        let reply = self.finish_owned_point(system, valid, &id, cursor, None).await?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_position_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned position point has no handle"))?;
+        let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no system time"))?;
+        let (commit, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no masked commit"))?;
+        let (from, request) = request.split_first_chunk::<4>().ok_or_else(|| invalid("Owned position point has no mask position"))?;
+        let system = Timestamp(i64::from_be_bytes(*system));
+        let mask = (Timestamp(i64::from_be_bytes(*commit)), u32::from_be_bytes(*from));
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
+        let valid = valid.ok_or_else(|| invalid("Owned position point has no valid instant"))?;
+        let cursor = held.snapshot.open_historical_position_point(&relation, &id, system, valid, mask).await.map_err(status)?;
         let reply = self.finish_owned_point(system, valid, &id, cursor, None).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)

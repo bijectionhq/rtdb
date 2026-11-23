@@ -1637,6 +1637,28 @@ impl OwnedReadSession {
         rtdb_query::open_owned_point_at_system(self.relation_context(relation)?, &self.owner, relation, id, valid, system).await
     }
 
+    pub async fn open_historical_position_point(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        system: Timestamp, valid: Timestamp, mask: (Timestamp, u32),
+    ) -> Result<Option<QueryCursor>> {
+        self.admit_read().await?;
+        self.require_scoped_relation(relation)?;
+        if !relation.is_root_data() || system.max(mask.0) > self.present.system_time {
+            return Err(historical_owned_read::unavailable());
+        }
+        let context = self.relation_context(relation)?;
+        let (schema, _charge) = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &self.owner, relation)
+            .await?.ok_or_else(historical_owned_read::unavailable)?;
+        if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
+            return Err(historical_owned_read::unavailable());
+        }
+        self.certify_historical_cut(relation, system.min(mask.0)).await?;
+        let purge = self.point_purge_guard(relation, id, system.min(mask.0), true).await?;
+        let context = context.with_owned_read_guard(purge);
+        let valid = rtdb_types::Interval::new(valid, valid.next()?)?;
+        rtdb_query::open_owned_point_with_position_mask(context, &self.owner, relation, id, valid, system, mask).await
+    }
+
     /// Prevents returning bytes from an older archive or historical cut after an ordered erase.
     pub async fn check_point_purge_floor(
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, system: Timestamp,
