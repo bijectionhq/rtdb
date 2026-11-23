@@ -122,6 +122,10 @@ pub trait OwnedWorldRead: Send + Sync {
     fn overlay_identities<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn path_touch<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        before: Timestamp, group: Timestamp, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>>;
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;

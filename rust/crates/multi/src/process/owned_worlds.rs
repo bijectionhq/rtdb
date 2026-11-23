@@ -227,6 +227,17 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
+    fn path_touch<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        before: Timestamp, group: Timestamp, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>> {
+        Box::pin(async move {
+            if before.next()? != group { return Err(rtdb_types::OwnedWorld::unavailable()); }
+            let [prior, accepted] = HeldCheckpointWorld::path_touch(self, relation, path, id, group, valid).await?;
+            Ok([path_touch_result(before, prior), path_touch_result(group, accepted)])
+        })
+    }
+
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
     ) -> BoxFuture<'a, Result<WorldPointResult>> {
@@ -238,6 +249,14 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<WorldPointResult>> {
         Box::pin(async move { self.parent_point(relation, id, valid_at, observed).await.map(point_result) })
     }
+}
+
+fn path_touch_result(present: Timestamp, (fact, shadowed): (Option<crate::archive::WorldFact>, bool)) -> WorldPointResult {
+    let row = fact.map(|fact| {
+        let (fields, revision, reservation) = fact.into_parts();
+        WorldPointRow { fields, revision, reservation }
+    });
+    WorldPointResult { present, row, until: None, shadowed, witness: None }
 }
 
 fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {

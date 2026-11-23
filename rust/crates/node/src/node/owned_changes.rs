@@ -273,17 +273,28 @@ impl OwnedReadSession {
             return Err(change_feed_uncovered());
         }
         let page = self.merged_changes_at(std::slice::from_ref(relation), before, group, 1).await?;
-        let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
-        let [changes] = commit.changes.as_slice() else { return Err(change_feed_uncovered()); };
-        if commit.revision != group || changes.relation != *relation || !changes.touches.iter().any(|touch| {
-            touch.id == *id && touch.valid.lower() <= valid && valid < touch.valid.upper()
-                && matches!(touch.kind, rtdb_types::OwnedChangeKind::Put | rtdb_types::OwnedChangeKind::Delete)
-        }) {
-            return Err(change_feed_uncovered());
-        }
+        require_path_touch(&page, relation, id, group, valid)?;
         let prior = self.ordered_root_context(relation, before).await?;
         let accepted = self.ordered_root_context(relation, group).await?;
         crate::ordered_index::stable_owned_path_columns(&prior, &accepted, &self.owner, relation, path).await
+    }
+
+    /// Resolve local winners on both sides of one certified world commit.
+    /// Only the held archive owner can resolve their inherited parent.
+    pub async fn world_path_touch(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, path: &OwnedRelation,
+        id: &EntityId, group: Timestamp, valid: Timestamp,
+    ) -> Result<(Vec<String>, [super::OwnedWorldShadowRead; 2])> {
+        let before = Timestamp(group.0.checked_sub(1).ok_or_else(change_feed_uncovered)?);
+        let page = self.world_merged_changes(world, std::slice::from_ref(relation), before, group, 1).await?;
+        require_path_touch(&page, relation, id, group, valid)?;
+        let context = self.relation_context(relation)?;
+        let prior = context.with_owned_system_cut(before, &context.cancellation)?;
+        let accepted = context.with_owned_system_cut(group, &context.cancellation)?;
+        let columns = crate::ordered_index::stable_owned_path_columns(&prior, &accepted, &self.owner, relation, path).await?;
+        let before = self.read_world_shadow_at(world, relation, id, valid, before, false).await?;
+        let after = self.read_world_shadow_at(world, relation, id, valid, group, false).await?;
+        Ok((columns, [before, after]))
     }
 
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {
@@ -873,6 +884,20 @@ impl OwnedReadSession {
     ) -> Result<OwnedJournalHeader> {
         read_owned_journal_header(self.journal_context(relation)?, &self.owner, relation, revision).await
     }
+}
+
+fn require_path_touch(
+    page: &OwnedMergedChanges, relation: &OwnedRelation, id: &EntityId, group: Timestamp, valid: Timestamp,
+) -> Result<()> {
+    let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
+    let [changes] = commit.changes.as_slice() else { return Err(change_feed_uncovered()); };
+    if commit.revision != group || changes.relation != *relation || !changes.touches.iter().any(|touch| {
+        touch.id == *id && touch.valid.lower() <= valid && valid < touch.valid.upper()
+            && matches!(touch.kind, rtdb_types::OwnedChangeKind::Put | rtdb_types::OwnedChangeKind::Delete)
+    }) {
+        return Err(change_feed_uncovered());
+    }
+    Ok(())
 }
 
 impl Journal<'_> {

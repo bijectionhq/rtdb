@@ -1,4 +1,5 @@
 mod ordered_index;
+pub use ordered_index::path_columns_at_cut;
 pub use ordered_index::{OwnedCountRequest, OwnedDecimalSum, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, owned_count as count_owned_cut, measure_owned_cut, range_owned_cut};
 mod session;
 mod resources;

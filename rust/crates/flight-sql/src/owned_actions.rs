@@ -150,6 +150,7 @@ pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
@@ -1053,15 +1054,12 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_path_touch_action(
-        &self, call: &Call, body: &[u8],
-    ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned path touch has no held read handle"))?;
+    fn path_touch_request(
+        &self, call: &Call, request: &[u8],
+    ) -> Result<(Timestamp, Timestamp, OwnedRelation, OwnedRelation, EntityId, Timestamp, Arc<MemoryReservation>), Status> {
         let (group, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned path touch has no group time"))?;
         let group = Timestamp(i64::from_be_bytes(*group));
         let before = Timestamp(group.0.checked_sub(1).ok_or_else(|| invalid("Owned path touch has no preceding cut"))?);
-        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, request) = split_relation(request)?;
         let (path, arrow_bytes) = split_relation(request)?;
         let batch = request_batch(call, arrow_bytes)?;
@@ -1069,8 +1067,34 @@ impl Service {
         if batch.num_columns() != 2 || batch.num_rows() != 1 {
             return Err(invalid("Owned path touch requires one identity and valid instant"));
         }
-        let (id, _identity) = point_identity(call, batch)?;
+        let (id, identity) = point_identity(call, batch)?;
         let valid = history_request_endpoint(batch, "valid_micros")?;
+        Ok((before, group, relation, path, id, valid, identity))
+    }
+
+    pub(crate) async fn held_world_path_touch_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World path touch has no held handle"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let [prior, accepted] = held.snapshot.path_touch(&relation, &path, &id, before, group, valid).await.map_err(status)?;
+        let replies = vec![
+            Ok(self.world_point_reply(call, prior, valid, None)?),
+            Ok(self.world_point_reply(call, accepted, valid, None)?),
+        ];
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(replies)
+    }
+
+    pub(crate) async fn held_owned_path_touch_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned path touch has no held read handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
         let columns = held.snapshot.path_touch_columns(&relation, &path, &id, before, group, valid).await.map_err(status)?;
         let mut replies = Vec::with_capacity(2);
         for system in [before, group] {
