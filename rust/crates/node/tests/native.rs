@@ -2167,9 +2167,13 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         settings.garbage.reader_lease = Duration::from_secs(1);
         settings.garbage.reader_lease_margin = Duration::from_millis(200);
         let (node, driver) = running(settings, fresh_local_services(&runtime_services)).await;
+        let database = node.catalog().database("xtdb").unwrap();
+        let mut status = database.watch_status();
+        tokio::time::timeout(Duration::from_secs(10), status.wait_for(|state| {
+            state.installed.is_some() && state.adopted_block.as_ref().is_some_and(|block| block.block_index() >= published)
+        })).await.unwrap().unwrap();
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
-        let database = node.catalog().database("xtdb").unwrap();
         assert_eq!(database.snapshot().trie_catalog().naming_epoch(), 1, "the reset's block carries the new naming epoch through restart");
         for key in &compacted { assert!(storage_root.join(key.as_str()).is_file()); }
         drop(old_reader);
