@@ -51,6 +51,7 @@ impl OpenTransaction<'_> {
             return Err(unavailable());
         }
         let validating_world = !self.owned_worlds.is_empty();
+        let hosted_world_reads = validating_world && crate::hosted_control::hosted_root_world_reads(operations);
         if let Some(replay) = &replay {
             replay.check_order(self.tx_key().system_time)?;
             if validating_world || operations.iter().any(|operation| !matches!(operation,
@@ -64,28 +65,31 @@ impl OpenTransaction<'_> {
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations).is_some();
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations).is_some();
         if validating_world && (
-            (!retained_release && !proposal_overlay && !proposal_land && controls.clone().any(|control| !control.is_check()))
+            (!retained_release && !proposal_overlay && !proposal_land && !hosted_world_reads
+                && controls.clone().any(|control| !control.is_check()))
             || !operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })))
         ) {
             return Err(unavailable());
         }
         let mut has_fact_write = false;
         for operation in operations {
-            if validating_world {
-                if !matches!(operation, Operation::Public(
-                    TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckWorldScope { .. }
-                        | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::HostedControl(_)
-                )) && !(publishing_world && matches!(operation,
-                    Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }
-                        | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedDelete { .. })
-                        | Operation::OwnedWriteIids { .. }
-                )) {
+            if !hosted_world_reads {
+                if validating_world {
+                    if !matches!(operation, Operation::Public(
+                        TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckWorldScope { .. }
+                            | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::HostedControl(_)
+                    )) && !(publishing_world && matches!(operation,
+                        Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }
+                            | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedDelete { .. })
+                            | Operation::OwnedWriteIids { .. }
+                    )) {
+                        return Err(unavailable());
+                    }
+                } else if !permits(operation) || operation.owned_relation().is_some_and(|relation|
+                    relation.world().is_some() || relation.is_world_catalog()
+                ) {
                     return Err(unavailable());
                 }
-            } else if !permits(operation) || operation.owned_relation().is_some_and(|relation|
-                relation.world().is_some() || relation.is_world_catalog()
-            ) {
-                return Err(unavailable());
             }
             has_fact_write |= match operation {
                 Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. }) => true,

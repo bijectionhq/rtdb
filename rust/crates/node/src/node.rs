@@ -2219,6 +2219,31 @@ impl NativeSession {
         self.state.execute_tx(ops, Default::default()).await
     }
 
+    pub fn append_hosted_world_read_checks(
+        &self, ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldWitness>,
+    ) -> Result<()> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let Some(TxOp::OwnedDeadline { until }) = ops.first_mut() else {
+            return Err(unavailable());
+        };
+        let scope = self.placed_history()?.ok_or_else(unavailable)?;
+        let now = self.service.node.now();
+        let mut worlds = std::collections::BTreeSet::new();
+        for check in &checks {
+            if check.scope != scope || check.relation.world() != Some(check.world) {
+                return Err(unavailable());
+            }
+            worlds.insert(check.world);
+            *until = (*until).min(check.until);
+        }
+        if !(1..=8).contains(&worlds.len()) || checks.len() > 8 * 128 || now >= *until {
+            return Err(unavailable());
+        }
+        ops.push(TxOp::OwnedCheckWorldScope { scope });
+        Self::append_world_checks(ops, checks);
+        Ok(())
+    }
+
     fn append_world_checks(ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldWitness>) {
         for check in checks {
             let local_frontier = match &check.observation {

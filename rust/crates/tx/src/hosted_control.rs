@@ -134,6 +134,48 @@ pub(crate) fn admits_name(name: &str) -> bool {
     name.starts_with("bj_") && !name.contains('-') && OwnedRelation::new(name).is_ok()
 }
 
+pub(crate) fn hosted_root_world_reads(operations: &[crate::source::Operation]) -> bool {
+    use crate::{TxOp, source::Operation};
+
+    let mut scopes = 0;
+    let mut guards = 0;
+    let mut hosted = false;
+    let mut preceding_guard = None;
+    for operation in operations {
+        let guard = match operation {
+            Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. })
+                if relation.world().is_some() =>
+            {
+                guards += 1;
+                Some(relation)
+            },
+            Operation::Public(TxOp::OwnedCheckWorldScope { .. }) => {
+                scopes += 1;
+                None
+            },
+            Operation::Public(TxOp::HostedControl(_)) => {
+                hosted = true;
+                None
+            },
+            Operation::Public(TxOp::OwnedDeadline { .. }) => None,
+            Operation::Public(TxOp::OwnedCheck { relation, .. }) if relation.world().is_some() => {
+                if preceding_guard != Some(relation) {
+                    return false;
+                }
+                None
+            },
+            Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
+                | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
+                | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedDelete { relation, .. })
+            | Operation::OwnedWriteIids { relation, .. }
+                if relation.world().is_none() && !relation.is_world_catalog() => None,
+            _ => return false,
+        };
+        preceding_guard = guard;
+    }
+    hosted && scopes == 1 && guards > 0
+}
+
 /// A retained drop can settle a bounded set of existing owner rows.
 pub fn retained_release_controls<'a>(
     controls: impl IntoIterator<Item = &'a HostedControlWrite>,
@@ -312,6 +354,47 @@ impl HostedControlWrite {
 
 fn invalid() -> Anomaly {
     Anomaly::incorrect("rtdb.hosted/control", "Invalid hosted control replacement")
+}
+
+#[cfg(test)]
+mod world_read_tests {
+    use super::*;
+    use crate::{TxOp, source::Operation};
+    use rtdb_types::Iid;
+
+    #[test]
+    fn hosted_world_reads_admit_root_writes_with_guarded_world_points() -> Result<()> {
+        let scope = PlacedAttemptScope::new("hosted-child-read", 1)?;
+        let root = OwnedRelation::new("facts")?;
+        let branch = root.in_world(Iid([1; 16]))?;
+        let id = EntityId::String("entity".into());
+        let controls = OwnedRelation::new("bj_owner")?;
+        let value = StructFields::from([("_id".into(), Value::Utf8("installed".into()))]);
+        let owner = HostedControlWrite::check(controls, scope, Some(Timestamp(1)), value)?;
+        let point = TxOp::OwnedCheck {
+            relation: branch.clone(), id: id.clone(), valid_at: Timestamp(4), expected: None,
+        };
+        let purge = TxOp::OwnedCheckWorldPurge {
+            relation: branch.clone(), pin: Iid([2; 16]), frontier: 0, local_frontier: None,
+        };
+        let mut operations = [
+            TxOp::OwnedDeadline { until: Timestamp(8) },
+            TxOp::HostedControl(owner),
+            TxOp::OwnedDelete { relation: root, id: id.clone(), valid_from: None, valid_to: None },
+            TxOp::OwnedCheckWorldScope { scope },
+            purge,
+            point,
+        ].into_iter().map(Operation::Public).collect::<Vec<_>>();
+        assert!(hosted_root_world_reads(&operations));
+        operations.swap(4, 5);
+        assert!(!hosted_root_world_reads(&operations));
+        operations.swap(4, 5);
+        operations[2] = Operation::Public(TxOp::OwnedDelete {
+            relation: branch, id, valid_from: None, valid_to: None,
+        });
+        assert!(!hosted_root_world_reads(&operations));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

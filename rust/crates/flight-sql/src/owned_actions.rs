@@ -42,6 +42,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V1: &str = "rtdb.owned.CommitHostedCounted.v1";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
+pub(crate) const COMMIT_HOSTED_WORLD_READS_V1: &str = "rtdb.owned.CommitHostedWorldReads.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
@@ -359,6 +360,12 @@ impl OwnedWorldReadResource {
     }
 }
 
+struct HostedWorldRead {
+    held: Arc<OwnedWorldReadResource>,
+    witnesses: Vec<OwnedWorldWitness>,
+    _reservation: Arc<MemoryReservation>,
+}
+
 struct OwnedRankRequest<'a> {
     partitions: Vec<(OwnedRelation, OwnedRelation)>,
     frame_len: usize,
@@ -605,6 +612,46 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8], counted: bool) -> Result<ActionResult, Status> {
+        self.commit_hosted_with_reads(call, body, counted, Vec::new()).await
+    }
+
+    pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        if self.0.config.owned_world_host.is_none() {
+            return Err(unsupported());
+        }
+        let ([kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing hosted root commit kind"))?;
+        let counted = match kind {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Invalid hosted root commit kind")),
+        };
+        let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing held world count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=8).contains(&count) {
+            return Err(invalid("A hosted commit requires one to eight held worlds"));
+        }
+        let mut handles = BTreeSet::new();
+        let mut worlds = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (handle, tail) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world handle"))?;
+            let (count, tail) = tail.split_first_chunk::<2>().ok_or_else(|| invalid("Missing held world witness count"))?;
+            let count = usize::from(u16::from_be_bytes(*count));
+            if !handles.insert(*handle) || !(1..=MAX_WORLD_WITNESSES).contains(&count) {
+                return Err(invalid("Invalid or repeated hosted world read"));
+            }
+            let (nonces, tail) = tail.split_at_checked(count * 16).ok_or_else(|| invalid("Truncated held world witnesses"))?;
+            let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+            let (witnesses, reservation) = held.conditions(call, held.world, nonces)?;
+            worlds.push(HostedWorldRead { held, witnesses, _reservation: reservation });
+            body = tail;
+        }
+        self.commit_hosted_with_reads(call, body, counted, worlds).await
+    }
+
+    async fn commit_hosted_with_reads(
+        &self, call: &Call, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
+    ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (condition, body, _condition_charge) = if counted {
             let (condition, body, reservation) = owned_count_condition(call, body)?;
@@ -629,15 +676,20 @@ impl Service {
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
 
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
+        let world_checks = worlds.iter().map(|read| read.witnesses.len()).sum::<usize>();
+        let world_ops = world_checks * 2 + usize::from(world_checks != 0);
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops)
+            .ok_or_else(|| invalid("Hosted world checks exceed the commit limit"))?;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
         writes.extend(condition);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
-        if replay && counted { return Err(invalid("Native replay admits an original effect batch")); }
+        if replay && (counted || !worlds.is_empty()) {
+            return Err(invalid("Native replay admits an original effect batch"));
+        }
         let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, replay)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
-        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
+        self.owned_write_reply_with_reads(call, writes, witnesses, worlds).await
     }
 
     fn decode_hosted_control_groups(
@@ -784,7 +836,14 @@ impl Service {
     }
 
     async fn owned_write_reply_with_witnesses(
+        &self, call: &Call, operations: Vec<TxOp>, witnesses: Witnesses,
+    ) -> Result<ActionResult, Status> {
+        self.owned_write_reply_with_reads(call, operations, witnesses, Vec::new()).await
+    }
+
+    async fn owned_write_reply_with_reads(
         &self, call: &Call, mut operations: Vec<TxOp>, witnesses: Witnesses,
+        worlds: Vec<HostedWorldRead>,
     ) -> Result<ActionResult, Status> {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
@@ -801,7 +860,18 @@ impl Service {
                 operations.push(evidence.clone().operation());
             }
         }
+        let mut holds = Vec::new();
+        if !worlds.is_empty() {
+            let mut checks = Vec::new();
+            for read in worlds {
+                read.held.snapshot.check().map_err(status)?;
+                checks.extend(read.witnesses);
+                holds.push((read.held, read._reservation));
+            }
+            native.append_hosted_world_read_checks(&mut operations, checks).map_err(status)?;
+        }
         let outcome = native.state_mut().execute_tx(operations, Default::default()).await.map_err(status)?;
+        drop(holds);
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
         self.owned_tx_reply(outcome.tx_key())

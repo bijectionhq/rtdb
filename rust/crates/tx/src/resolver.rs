@@ -991,6 +991,7 @@ impl<'a> OpenTransaction<'a> {
             return Err(unavailable());
         }
         let world_batch = publications.len() > 1 || root_publication.is_some();
+        let hosted_world_reads = crate::hosted_control::hosted_root_world_reads(operations);
         let root_conditions = !publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }) =>
                 relation.world().is_none() && !relation.is_world_catalog(),
@@ -1009,11 +1010,12 @@ impl<'a> OpenTransaction<'a> {
         if let Some(first) = scoped.next() {
             if first.is_world_catalog() { return Err(unavailable()); }
             let world = first.world();
-            if world_batch || root_conditions {
+            if world_batch || root_conditions || hosted_world_reads {
                 for relation in std::iter::once(first).chain(scoped) {
                     match relation.world() {
                         Some(world) => { admitted.insert(world); }
-                        None if (root_conditions || root_publication.is_some()) && !relation.is_world_catalog() => (),
+                        None if (hosted_world_reads || root_conditions || root_publication.is_some())
+                            && !relation.is_world_catalog() => (),
                         None => return Err(unavailable()),
                     }
                     if admitted.len() > 8 { return Err(unavailable()); }

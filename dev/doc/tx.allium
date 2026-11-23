@@ -128,6 +128,9 @@
 -- An admitted placed hosted writer may replace checked ordinary control rows with owned root facts in one ordered transaction.
 -- Exact control identities and expected revisions are checked at the ordered base before either set of writes.
 -- A failed control or fact operation publishes neither set of effects.
+-- A hosted Root publication may include read conditions issued by placed held worlds in the same attachment.
+-- At ordering, each condition checks its original world pin, Root purge frontier and observed local point or relation frontier.
+-- The transaction orders these conditions with Root facts and hosted controls, and the observed worlds receive no writes.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- Fully covered range counts and completed head valid windows can issue relation-frontier evidence under the same placed lease as range pages.
