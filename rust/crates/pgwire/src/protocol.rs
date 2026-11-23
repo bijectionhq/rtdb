@@ -603,13 +603,26 @@ impl ProtocolSession {
                     }
                 }
                 let grant = query.cursor.delivery_grant().await?;
-                grant.deliver(writer.row_body(&body.bytes)).await.map_err(crate::wire::delivery_error)
+                grant.deliver(async {
+                    writer.row_body(&body.bytes).await?;
+                    if grant.is_bounded() { writer.flush().await?; }
+                    Ok(())
+                }).await.map_err(crate::wire::delivery_error)
             }.await;
             if let Err(error) = consumption { query.cursor.record_consumer_error(); return Err(error); }
             query.row += 1; query.sent = query.sent.checked_add(1).ok_or_else(|| protocol("Result row count overflow"))?; emitted += 1;
         }
-        if limit != 0 && emitted == limit { writer.empty(b's').await?; writer.flush().await }
-        else { writer.string(b'C', &format!("{} {}", head(source), query.sent)).await }
+        let grant = query.cursor.delivery_grant().await?;
+        grant.deliver(async {
+            if limit != 0 && emitted == limit {
+                writer.empty(b's').await?;
+                writer.flush().await
+            } else {
+                writer.string(b'C', &format!("{} {}", head(source), query.sent)).await?;
+                if grant.is_bounded() { writer.flush().await?; }
+                Ok(())
+            }
+        }).await.map_err(crate::wire::delivery_error)
     }
 
     async fn simple<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {

@@ -131,6 +131,10 @@ impl PlaintextDelivery {
         self
     }
 
+    pub fn is_bounded(&self) -> bool {
+        self.deadline.is_some() || self.view.as_ref().is_some_and(|(_, lease)| lease.is_some())
+    }
+
     pub fn check(&self) -> rtdb_types::Result<()> {
         if let Some((_, Some(lease))) = &self.view { lease.check()?; }
         if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) { return Err(expired()); }

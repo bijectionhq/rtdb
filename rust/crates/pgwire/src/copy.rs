@@ -54,9 +54,14 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
         }).await.map_err(crate::wire::delivery_error)?;
     }
     encoder.finish().map_err(arrow_output_error)?;
-    wire.send(b'd', encoder.get_ref()).await?;
-    wire.empty(b'c').await?;
-    wire.string(b'C', &format!("COPY {count}")).await
+    let grant = cursor.delivery_grant().await?;
+    grant.deliver(async {
+        wire.send(b'd', encoder.get_ref()).await?;
+        wire.empty(b'c').await?;
+        wire.string(b'C', &format!("COPY {count}")).await?;
+        if grant.is_bounded() { wire.flush().await?; }
+        Ok(())
+    }).await.map_err(crate::wire::delivery_error)
 }
 
 fn arrow_output_error(error: arrow_schema::ArrowError) -> Anomaly {
