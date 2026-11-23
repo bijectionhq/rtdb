@@ -110,18 +110,19 @@ impl CellStorage {
 
     /// The cell's objects as one store, keyed relative to the cell's storage root.
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
-        match self {
-            CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
-            CellStorage::S3 { config } => Ok(Self::s3_bucket(config, io).await?),
-        }
+        self.open_bucket(io, false).await
     }
 
-    pub(crate) async fn s3_bucket(
-        config: &rtdb_s3::S3Config,
-        io: std::sync::Arc<rtdb_storage::IoRegion>,
-    ) -> rtdb_types::Result<std::sync::Arc<rtdb_storage::remote::RemoteStore>> {
-        let root = config.cell_root()?;
-        config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
+    pub(crate) async fn open_bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>, audience: bool) -> rtdb_types::Result<crate::reference::Bucket> {
+        match self {
+            CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
+            CellStorage::S3 { config } => {
+                let root = config.cell_root()?;
+                let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
+                if audience { Ok(config.open_audience_cell(&root, &remotes, io).await?) }
+                else { Ok(config.open_cell(&root, &remotes, io).await?) }
+            }
+        }
     }
 
     pub(crate) async fn s3_inventory(

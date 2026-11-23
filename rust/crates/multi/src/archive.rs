@@ -227,6 +227,7 @@ impl ArchivedCheckpoint {
         keys: &dyn KeyService,
         owner: Uuid,
         region: Arc<IoRegion>,
+        audience: bool,
     ) -> Result<Option<Self>> {
         let Some(source) = serving_archive(record)? else { return Ok(None); };
         let operation = source.point.operation;
@@ -235,8 +236,8 @@ impl ArchivedCheckpoint {
         }
         let archive: CellStorage = serde_json::from_str(source.archive)
             .map_err(|_| inconsistent("Invalid retained archive binding"))?;
-        let audience_transport = matches!(&archive, CellStorage::S3 { .. });
-        let bucket = archive.bucket(region).await?;
+        let audience_transport = audience && matches!(&archive, CellStorage::S3 { .. });
+        let bucket = archive.open_bucket(region, audience_transport).await?;
         let prefix = format!("checkpoint-captures/{}/{operation}", record.id);
         let scope = PrefixedStore::new(bucket.clone(), prefix.clone());
         let capture = read::<Capture>(&scope, &key("capture.json")?)
@@ -355,7 +356,7 @@ pub(crate) async fn materialize_serving_archive(
             Ok(None)
         },
         |record, owner, io| async move {
-            let repair = ArchivedCheckpoint::load(&record, keys, owner, io).await?
+            let repair = ArchivedCheckpoint::load(&record, keys, owner, io, false).await?
                 .ok_or_else(|| inconsistent("The source lost its admitted repair"))?;
             repair.materialize(target, destination).await
         },
@@ -1374,7 +1375,7 @@ async fn capture_registered(
         .ok_or_else(|| unavailable("The source key is unavailable"))?;
     let archive_material = keys.key(&archive_key_id(&point)).await?;
     let archive_cipher = Cipher::new(&archive_material)?;
-    let recovery = ArchivedCheckpoint::load(record, keys, region, io.clone()).await?;
+    let recovery = ArchivedCheckpoint::load(record, keys, region, io.clone(), false).await?;
     // A local sweep and this source read share the maintenance witness. The
     // provider keeps its clone during a read even if this copy is cancelled.
     let maintenance = storage.try_local_maintenance()?;

@@ -270,7 +270,7 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v14` on the audience gateway during its handshake.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v15` on the audience gateway during its handshake.
 The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
 The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
 The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
@@ -278,7 +278,8 @@ Before serving, the holder reserves 16 MiB of execution memory and 16 MiB of cac
 Each session uses its own buffer pool on the audience cache budget from initial preparation through applied confirmation.
 Audience queries use local scans. The holder requires an uncached view of the live writer's exact S3 storage attachment for the installed source.
 That view shares the attachment's object mapping, custody and serving key and bypasses the ordinary SSD cache and its fill queue.
-Provider object reads use a distinct S3 HTTP client, including when retained I/O outlives its caller. A remote store without that client refuses the scoped read.
+Provider object reads use a distinct S3 HTTP client and credential cache, including when retained I/O outlives its caller.
+The configured source and its attached archive open that client with their own credential provider. A remote store without the client refuses the scoped read.
 Whole objects read into the buffer pool must match the reserved length. The pool funds the retained bytes and the temporary ciphertext and archive buffers before fetching the body.
 The reservations remain held while admitted provider work drains after cancellation. The read view refuses bodies requested outside a whole-object reservation.
 The holder refuses the handshake if the opened residence needs per-read registration for a legacy object reference or serves a retained archive from a local volume. An admitted S3 archive uses the custody hold acquired when the attachment opened.

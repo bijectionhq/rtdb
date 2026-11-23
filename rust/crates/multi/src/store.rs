@@ -213,14 +213,14 @@ impl RemoteStorageFactory for CellStoreFactory {
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
         let (opened, audience_reads) = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
             let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
-                crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone()).await?
+                crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone(), audience_writer).await?
             } else {
                 None
             };
             if record.storage_namespaces.is_some() {
                 crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
             }
-            let bucket = config.storage.bucket(Arc::clone(&region)).await?;
+            let bucket = config.storage.open_bucket(Arc::clone(&region), audience_writer).await?;
             let store = format!("{}/{}", config.prefix, storage_root.as_str());
             let writer = match (&self.scoped_writes, &config.storage) {
                 (Some(scoped), crate::deployment::CellStorage::S3 { config: storage }) if config.writer_epoch.is_some() || config.compactor => {

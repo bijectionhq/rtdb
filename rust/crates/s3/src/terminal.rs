@@ -89,7 +89,7 @@ impl S3Config {
         let physical_root = self.object_prefix(&root)?;
         let inventory = self.open_inventory(&root, remotes).await?;
         authenticate(&evidence, inventory.namespace(), &physical_root, scope)?;
-        let store = self.open_store(&root, remotes, IoRegion::new(), true).await?;
+        let store = self.open_store(&root, remotes, IoRegion::new(), true, false).await?;
         if store.s3_namespace() != Some(inventory.namespace()) {
             return Err(invalid("The store and inventory resolve to different S3 namespaces"));
         }
@@ -218,7 +218,7 @@ mod tests {
             let root = config.cell_root().unwrap();
             let inventory = config.open_inventory(&root, &remotes).await.unwrap();
             let evidence = sign(&config, inventory.namespace(), &key);
-            let raw = config.open_store(&root, &remotes, IoRegion::new(), true).await.unwrap();
+            let raw = config.open_store(&root, &remotes, IoRegion::new(), true, false).await.unwrap();
             if matches!(case, "resume" | "dirty-resume") {
                 raw.put(&qualification, evidence.clone()).await.unwrap();
             }
