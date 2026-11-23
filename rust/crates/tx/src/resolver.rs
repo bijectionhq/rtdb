@@ -1799,7 +1799,7 @@ impl<'a> OpenTransaction<'a> {
                             }
                             let base = self.buffer.base_snapshot();
                             let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-                            let (source, registered, _charge) = rtdb_query::read_owned_world_with_revision(context, owner, *source_id)
+                            let (source, registered, _charge) = rtdb_query::read_owned_world_with_revision(Arc::clone(&context), owner, *source_id)
                                 .await?.ok_or_else(unavailable)?;
                             let admits_child = if world.ancestor.is_some() {
                                 source.can_retain_overlay(&world)
@@ -1811,6 +1811,19 @@ impl<'a> OpenTransaction<'a> {
                                 || world.fork_lineage != source.retained_child_lineage(&world, registered)?
                             {
                                 return Err(unavailable());
+                            }
+                            // The live writer can independently certify the actual local
+                            // publication. A retained alias owns its original archive
+                            // through the directory even after the writer's live history is gone.
+                            if let Some(ancestor) = &world.ancestor
+                                && matches!(source.mode, WorldClockMode::Held { .. })
+                            {
+                                let (original, reading, _charge) = rtdb_query::read_held_world_publication(
+                                    &context, owner, source.id, ancestor.system,
+                                ).await?;
+                                if original != source || reading != ancestor.logical {
+                                    return Err(unavailable());
+                                }
                             }
                         } else if world.ancestor.is_some()
                             || (previous.is_none() && !world.fork_lineage.is_empty())

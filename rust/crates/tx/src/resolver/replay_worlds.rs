@@ -98,11 +98,16 @@ impl OpenTransaction<'_> {
             {
                 return Err(unavailable());
             }
-            let selected = context.with_owned_system_cut(ancestor.system, &context.cancellation)?;
-            let clock = rtdb_query::read_owned_world_clock_revision(
-                selected, owner, Iid(ancestor.world),
+            let selected = admission.ancestor.as_ref().ok_or_else(unavailable)?.selected;
+            let locator = format!("native-transaction/{}", selected.tx_id.0);
+            let (receipt, selected_destination) = replay_control(context, &locator).await?;
+            replayed_parent_logical_time(&receipt, admission.binding, &archive, selected)?;
+            let (source, clock, _charge) = rtdb_query::read_held_world_publication(
+                context, owner, Iid(ancestor.world), ancestor.system,
             ).await?;
-            if clock != Some((ancestor.logical, ancestor.system)) {
+            if selected_destination != ancestor.system || clock != ancestor.logical
+                || source.pin.0 != ancestor.pin || source.basis != ancestor.source_root
+            {
                 return Err(unavailable());
             }
         }

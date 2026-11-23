@@ -1,7 +1,7 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, TransactionKey, Value};
 
 use crate::{PreparedQuery, QueryContext, QueryCursor};
 
@@ -961,7 +961,8 @@ pub async fn read_owned_world_clock_revision(
 pub struct ArchivedHeldClock {
     world: Iid,
     pin: Iid,
-    media_end: Timestamp,
+    media_end: TransactionKey,
+    source_root: TransactionKey,
     system: Timestamp,
     reading: Timestamp,
 }
@@ -971,7 +972,8 @@ impl ArchivedHeldClock {
         &self, ancestor: &rtdb_types::OwnedWorldAncestor, system: Timestamp,
     ) -> Result<Timestamp> {
         if self.world.0 != ancestor.world || self.pin.0 != ancestor.pin
-            || self.media_end != ancestor.basis.system_time || self.system != system
+            || self.media_end != ancestor.basis || self.source_root != ancestor.source_root
+            || self.system != system
             || !ancestor.covers(system, self.reading)
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
@@ -984,9 +986,26 @@ pub async fn read_archived_held_clock(
     context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
 ) -> Result<ArchivedHeldClock> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
-    let media_end = context.current_time.as_micros()?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
+    let media_end = snapshot.tx_basis().filter(|end| snapshot.system_time_cap() == Some(end.system_time))
+        .ok_or_else(unavailable)?;
+    if media_end.system_time != context.current_time.as_micros()? {
+        return Err(unavailable());
+    }
+    let (source, reading, _charge) = read_held_world_publication(context, owner, world, system).await?;
+    Ok(ArchivedHeldClock {
+        world, pin: source.pin, media_end, source_root: source.basis, system, reading,
+    })
+}
+
+/// Open the source registration and the actual clock event at the selected publication.
+pub async fn read_held_world_publication(
+    context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
+) -> Result<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)> {
+    let unavailable = rtdb_types::OwnedWorld::unavailable;
     let at = context.with_owned_system_cut(system, &context.cancellation)?;
-    let (source, _) = read_owned_world(Arc::clone(&at), owner, world).await?
+    let (source, charge) = read_owned_world(Arc::clone(&at), owner, world).await?
         .filter(|(source, _)| !source.dropped && source.ancestor.is_none()
             && matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
             && source.basis.system_time < system)
@@ -994,7 +1013,7 @@ pub async fn read_archived_held_clock(
     let (reading, _) = read_owned_world_clock_revision(at, owner, world).await?
         .filter(|(reading, revision)| *revision == system && source.admits_clock_publication(*reading, *revision))
         .ok_or_else(unavailable)?;
-    Ok(ArchivedHeldClock { world, pin: source.pin, media_end, system, reading })
+    Ok((source, reading, charge))
 }
 
 /// Select an accepted Held or Proposal reading within a certified physical prefix.
