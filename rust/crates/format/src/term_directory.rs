@@ -4,7 +4,11 @@ use sha2::{Digest, Sha256};
 use crate::{cow_tree::RootRef, keys::TableSlug, log::proto::{ArtefactRecord, SearchRun, SearchRunChange, TermDirectoryRoot}, search_manifest::RECORD_KIND};
 use rtdb_types::{Anomaly, Result};
 
-pub fn page_prefix(slug: &TableSlug) -> String { format!("{}/term-directory", slug.table_prefix()) }
+const PAGE_OWNER: &str = "term-directory";
+
+pub fn page_prefix(slug: &TableSlug) -> String { format!("{}/{PAGE_OWNER}", slug.table_prefix()) }
+
+pub fn page_digest(key: &str) -> Option<crate::cow_tree::PageDigest> { crate::cow_tree::table_page_digest(key, PAGE_OWNER) }
 
 impl TermDirectoryRoot {
     pub fn page_root(&self) -> Result<Option<RootRef>> {

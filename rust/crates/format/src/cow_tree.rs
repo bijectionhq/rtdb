@@ -319,6 +319,21 @@ fn digest(bytes: &[u8]) -> PageDigest {
     PageDigest(Sha256::digest(bytes).into())
 }
 
+/// The digest of a page stored under a table's `owner` tree, as `page_key` names it.
+pub fn table_page_digest(key: &str, owner: &str) -> Option<PageDigest> {
+    let (slug, file) = key.strip_prefix("tables/")?.split_once(&format!("/{owner}/pages/"))?;
+    crate::keys::TableSlug::recorded(slug).ok()?;
+    let hex = file.strip_suffix(".arrow")?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return None;
+    }
+    let mut hash = [0; 32];
+    for (i, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(PageDigest(hash))
+}
+
 pub fn page_key(prefix: &str, digest: PageDigest) -> String {
     use std::fmt::Write;
     let mut key = format!("{prefix}/pages/");

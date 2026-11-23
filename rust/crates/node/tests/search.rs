@@ -2067,3 +2067,68 @@ async fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking(
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+struct NarrowingProbe { search: Arc<rtdb_search::SearchAccelerator>, narrowed: AtomicUsize, declined: AtomicUsize }
+
+#[async_trait]
+impl rtdb_query::ScanAccelerator for NarrowingProbe {
+    async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<std::collections::BTreeSet<rtdb_types::Iid>>> {
+        let candidates = self.search.candidate_iids(request).await?;
+        let counter = if candidates.is_some() { &self.narrowed } else { &self.declined };
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok(candidates)
+    }
+}
+
+#[tokio::test]
+async fn gap_nomination_charges_only_uncovered_directory_rows() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+    use tokio_util::sync::CancellationToken;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| Some(directory.path().join(name).to_string_lossy().into_owned());
+    let mut settings = options();
+    settings.automatic_artefacts = false;
+    settings.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: path("store"), epoch: Some(0) })),
+            ..Default::default()
+        },
+        skipped: Default::default(),
+    };
+    let template = services();
+    let runtime = rtdb_search::SearchRuntime::with_logical_search(64 << 20);
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_local_log_clock(Arc::clone(&template.clock), false)),
+        artefact_kinds: vec![runtime.artefacts()],
+        scan_accelerators: vec![runtime.accelerator()],
+        ..template.clone()
+    };
+    let (node, driver) = Node::open(settings, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let stop = CancellationToken::new();
+    node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let filler = (0..300).map(|id| format!("{{_id: {id}, body: 'filler text'}}")).collect::<Vec<_>>().join(", ");
+    assert!(session.state_mut().execute_tx(vec![sql(&format!("INSERT INTO docs RECORDS {filler}"))], AutonomousTxOptions::default()).await.unwrap().committed());
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+    database.build_artefacts().await.unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("INSERT INTO docs RECORDS {_id: 1000, body: 'audit'}")], AutonomousTxOptions::default()).await.unwrap().committed());
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+
+    let mut search = rtdb_search::SearchAccelerator::with_runtime(Arc::clone(&runtime));
+    search.max_candidates = 4;
+    let probe = Arc::new(NarrowingProbe { search: Arc::new(search), narrowed: Default::default(), declined: Default::default() });
+    let query = "SELECT _id FROM docs WHERE MATCH(body, 'audit')";
+    let partitions = [database.snapshot()];
+    assert_eq!(partition_search(&partitions, database.storage(), query, Some(probe.clone())).await, vec![vec![Value::I64(1000)]]);
+    assert_eq!((probe.narrowed.load(Ordering::Relaxed), probe.declined.load(Ordering::Relaxed)), (1, 0),
+        "three hundred covered rows stay outside a budget of four candidates");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

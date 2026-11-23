@@ -350,6 +350,8 @@ rule GarbageCollectTries {
     -- After its reader lease, a retired root can release its unmarked pages.
     -- Hosted fork and archive holds continue to protect the pages in their checkpoint closures.
     -- A replay checkpoint holds every page reached by each active entity directory.
+    -- Garbage L0 tries after the active entity directory's sealed block stay uncollected, since its next advance reads them.
+    -- Term-directory pages have no retirement ledger: collection releases a stored page that no current, checkpointed or captured root reaches, once the reader lease has passed since it was first seen unreachable.
     -- Tables are processed concurrently up to `tableParallelism`, with DELETE
     -- operations bounded across the cycle by `deleteParallelism`. Both bounds
     -- are out-of-spec implementation parameters (see TrieGarbageCollector.kt).

@@ -20,25 +20,7 @@ pub fn prefix(slug: &TableSlug) -> String {
     format!("{}/{RECORD_KIND}", slug.table_prefix())
 }
 
-pub fn page_digest(key: &str) -> Option<PageDigest> {
-    let (slug, file) = key
-        .strip_prefix("tables/")?
-        .split_once("/entity-directory/pages/")?;
-    TableSlug::recorded(slug).ok()?;
-    let hex = file.strip_suffix(".arrow")?;
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    let mut hash = [0; 32];
-    for (i, byte) in hash.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(PageDigest(hash))
-}
+pub fn page_digest(key: &str) -> Option<PageDigest> { crate::cow_tree::table_page_digest(key, RECORD_KIND) }
 
 impl EntityDirectoryRoot {
     pub fn encoded_size(&self) -> usize {

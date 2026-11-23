@@ -349,10 +349,11 @@ pub(crate) async fn nominate(
     let mut inspected = 0usize;
     let mut complete = true;
     visit_rows(&read, &entry.slug, &receipt.reference()?, scope, |event| {
+        if covered.contains(&event.origin.source_block()) {
+            return Ok(true);
+        }
         inspected = inspected.saturating_add(1);
-        complete = inspected <= limit
-            && (covered.contains(&event.origin.source_block())
-                || visit(event.header, event.origin)?);
+        complete = inspected <= limit && visit(event.header, event.origin)?;
         Ok(complete)
     })
     .await?;

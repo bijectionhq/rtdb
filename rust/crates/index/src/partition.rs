@@ -61,6 +61,7 @@ struct CheckpointTries {
     tries: BTreeMap<TableRef, BTreeSet<TrieKey>>,
     search: BTreeMap<TableRef, BTreeSet<[u8; 32]>>,
     entity_directories: BTreeMap<TableRef, rtdb_format::log::proto::EntityDirectoryRoot>,
+    term_directories: BTreeMap<TableRef, Vec<rtdb_format::log::proto::TermDirectoryRoot>>,
 }
 
 impl CheckpointTries {
@@ -75,7 +76,8 @@ impl CheckpointTries {
             (table.clone(), catalog.search_runs(table).filter_map(|run| run.identity().ok()).collect())
         }).collect();
         let entity_directories = catalog.tables().filter_map(|table| Some((table.clone(), catalog.entity_directory(table)?.clone()))).collect();
-        Self { tries, search, entity_directories }
+        let term_directories = catalog.tables().map(|table| (table.clone(), catalog.term_directories(table).cloned().collect())).collect();
+        Self { tries, search, entity_directories, term_directories }
     }
 
     fn requires(&self, table: &TableRef, key: &TrieKey) -> bool {
@@ -175,7 +177,18 @@ impl TrieCollection {
             .chain(self.readers.iter().filter_map(move |reader| reader.entity_directory(table)))
     }
 
+    pub fn held_term_directories<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a rtdb_format::log::proto::TermDirectoryRoot> + 'a {
+        self.current.trie_catalog().term_directories(table)
+            .chain(self.current.checkpoint_tries.as_ref().and_then(|checkpoint| checkpoint.term_directories.get(table)).into_iter().flatten())
+            .chain(self.readers.iter().flat_map(move |reader| reader.term_directories(table)))
+    }
+
     fn protected(&self, table: &TableRef, key: &TrieKey) -> bool {
+        // The directory's next advance reads every L0 source after its sealed prefix, and a collected one would leave a hole in it.
+        if key.level() == 0 && self.current.trie_catalog().entity_directory(table)
+            .is_some_and(|directory| key.block_index().0 > directory.through_block()) {
+            return true;
+        }
         let checkpoint_requires = self.current.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key));
         any_reference_requires(checkpoint_requires, self.readers.len(), |index| {
             self.readers[index].trie(table, key).is_some_and(|trie| trie.state == TrieState::Live)

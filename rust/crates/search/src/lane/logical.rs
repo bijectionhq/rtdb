@@ -307,7 +307,12 @@ impl SearchBuilder {
         self.store.put(&intent, staged.encode()?.into()).await?;
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
         let key = ObjectKey::new(run.object_key(slug)?)?;
+        // A provider can commit a failed request; leave its intent for the collector to settle after the writer drains.
         run.publication = self.store.put_file_with_publication(&key, output).await?.map(Into::into);
+        if self.store.releases_exact_search_runs() && run.publication.is_none() {
+            run.publication = self.store.retirement_publication(&key).await?.map(Into::into);
+            if run.publication.is_none() { return Err(fault("Search upload returned no immutable provider publication")); }
+        }
         Ok(run)
     }
 
@@ -634,9 +639,19 @@ impl SearchBuilder {
                         let (mut contents, charge, source_rows) = self.read_l0_contents(&entry.slug, &blocks, &definition.columns, true, cancellation).await?;
                         if source_rows != target.source_rows() { return Err(fault("Search repair covers a different number of source events")); }
                         for run in index.records(&snapshot).into_iter().filter(|run| run.has_erases() && run.digest() != target.digest()) {
-                            let (restored, _charge, rows) = self.read_l0_contents(&entry.slug, &run.blocks, &[], false, cancellation).await?;
-                            if rows != run.source_rows() { return Err(fault("Search erase replay covers a different number of source events")); }
-                            scrub_documents(&mut contents.documents, &restored.erases);
+                            let erases = async {
+                                let file = self.runtime.logical_file(&self.storage, &entry.slug, run, &definition.columns).await?;
+                                file.erases(&self.memory).await
+                            }.await;
+                            match erases {
+                                Ok((erases, _charge)) => scrub_documents(&mut contents.documents, &erases),
+                                Err(error) if super::is_search_gap(&error, cancellation) => {
+                                    let (restored, _charge, rows) = self.read_l0_contents(&entry.slug, &run.blocks, &[], false, cancellation).await?;
+                                    if rows != run.source_rows() { return Err(fault("Search erase replay covers a different number of source events")); }
+                                    scrub_documents(&mut contents.documents, &restored.erases)
+                                }
+                                Err(error) => return Err(error),
+                            };
                         }
                         (contents, charge, source_rows, target.source_receipt.clone())
                     }

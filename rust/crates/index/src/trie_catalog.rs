@@ -310,6 +310,10 @@ impl TrieCatalog {
         self.tables.get(table)?.search.term_directory(id, version)
     }
 
+    pub fn term_directories(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::TermDirectoryRoot> {
+        self.tables.get(table).into_iter().flat_map(|state| state.search.term_directories())
+    }
+
     pub fn with_term_directories(&self, table: &TableRef, block: TableBlock) -> TableBlock {
         block.with_term_directories(self.tables.get(table).into_iter()
             .flat_map(|state| state.search.term_directories()).cloned().collect())
@@ -325,7 +329,7 @@ impl TrieCatalog {
         change.abandon() || run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some()))
     }
 
-    fn accepts_search_source(&self, table: &TableRef, change: &log_pb::SearchRunChange) -> bool {
+    pub(crate) fn accepts_search_source(&self, table: &TableRef, change: &log_pb::SearchRunChange) -> bool {
         let Some(receipt) = change.run.as_ref().and_then(|run| run.source_receipt.as_ref()) else { return true; };
         if receipt.table() != table.schema_and_table() { return false; }
         if change.retire_only() || receipt.directory_root.is_none() { return true; }
