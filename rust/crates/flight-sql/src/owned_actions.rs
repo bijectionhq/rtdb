@@ -230,6 +230,7 @@ pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtecte
 pub(crate) const HELD_ROW_CARRIER_EXISTS_V1: &str = "rtdb.owned.ReadHeldRowCarrierExists.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
+pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
 pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V3: &str = "rtdb.owned.PrepareHeldWorldOverlay.v3";
@@ -1804,6 +1805,42 @@ impl Service {
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
         let reply = self.owned_point_reply(&schema, Some(&rows), system, valid, None)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
+    /// Identities current at the held system cut across all valid time,
+    /// for a period table's bounded index build turns.
+    pub(crate) async fn held_owned_identities_all_valid_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Owned identity page has no held read handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 3 || batch.num_rows() != 1 {
+            return Err(invalid("An all-valid identity page requires one row with a cut, a limit and a bound"));
+        }
+        let system = history_request_endpoint(batch, "system_micros")?;
+        let limit = usize::try_from(history_request_integer(batch, "limit")?)
+            .map_err(|_| invalid("Owned identity limit is out of range"))?;
+        let (column, field) = batch.schema_ref().column_with_name("after")
+            .ok_or_else(|| invalid("Owned identity page requires an exclusive bound"))?;
+        let after = batch.column(column).as_any().downcast_ref::<StringArray>()
+            .filter(|_| field.metadata().is_empty())
+            .ok_or_else(|| invalid("Owned identity bound must be nullable Utf8"))?;
+        let after = (!after.is_null(0)).then(|| after.value(0));
+        let page = held.snapshot.identity_page_all_valid(&relation, system, after, limit).await.map_err(status)?;
+        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
+        let _copy = call.reserve(bytes)?;
+        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
+        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let schema = rows.schema_ref().as_ref().clone().with_metadata(
+            [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
+        );
+        // The reply's valid coordinate is the system cut it enumerated.
+        let reply = self.owned_point_reply(&schema, Some(&rows), system, system, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }

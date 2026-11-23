@@ -146,6 +146,77 @@ impl OwnedReadSession {
         self.identity_page_in_prefix(relation, system, valid, after, limit, None).await
     }
 
+    /// Root identities with any assertion current at `system`, across all
+    /// valid time, in key order. Adjacent valid slices of one key collapse;
+    /// a saturated fetch reports more, since repeats consumed it.
+    pub async fn identity_page_all_valid(
+        &self, relation: &OwnedRelation, system: Timestamp, after: Option<&str>, limit: usize,
+    ) -> Result<OwnedIdentityPage> {
+        if !(1..=MAX_PAGE_ROWS).contains(&limit) {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/identity-page",
+                "An identity page must request between 1 and 128 keys",
+            ));
+        }
+        let at_head = self.admit_root_system(relation, system).await?;
+        let context = self.relation_context(relation)?;
+        let fetch = (limit + 1) * 4;
+        let mut charges = vec![self.context.memory.reserve(fetch * 128)?];
+        let mut keys: Vec<String> = Vec::with_capacity(limit + 1);
+        let mut remaining = MAX_PAGE_BYTES;
+        let mut more = false;
+        let mut fetched = 0usize;
+        if let Some(mut cursor) = rtdb_query::open_owned_identity_page_all_valid(
+            Arc::clone(&context), &self.owner, relation, system, after, fetch as i64,
+        ).await? {
+            'page: while let Some(batch) = cursor.next_batch().await? {
+                let batch = batch.batch();
+                let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(invalid_page)?;
+                let array = batch.column(column).as_ref();
+                for row in 0..batch.num_rows() {
+                    fetched += 1;
+                    let Value::Utf8(key) = read_execution_value(field, array, row)? else {
+                        return Err(invalid_page());
+                    };
+                    let previous = keys.last().map(String::as_str).or(after);
+                    if previous.is_some_and(|previous| previous == key.as_str()) && !keys.is_empty() {
+                        continue;
+                    }
+                    if previous.is_some_and(|previous| previous >= key.as_str()) {
+                        return Err(invalid_page());
+                    }
+                    if keys.len() == limit {
+                        more = true;
+                        break 'page;
+                    }
+                    let bytes = estimate_read_value_bytes(field, array, row)?;
+                    let Some(rest) = remaining.checked_sub(bytes) else {
+                        if keys.is_empty() {
+                            return Err(Anomaly::new(
+                                AnomalyCategory::Busy,
+                                "rtdb.owned/identity-size",
+                                "An identity exceeds the page's retained byte bound",
+                            ));
+                        }
+                        more = true;
+                        break 'page;
+                    };
+                    remaining = rest;
+                    charges.push(self.context.memory.reserve(bytes)?);
+                    if !at_head {
+                        self.check_point_purge_floor(relation, &EntityId::String(key.clone()), system).await?;
+                    }
+                    keys.push(key);
+                }
+            }
+        }
+        if fetched >= fetch {
+            more = true;
+        }
+        context.check_cancelled()?;
+        Ok(OwnedIdentityPage { keys, more, _charges: charges })
+    }
+
     async fn identity_page_in_prefix(
         &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: Option<&str>,
         limit: usize, prefix: Option<&str>,

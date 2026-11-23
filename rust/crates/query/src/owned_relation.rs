@@ -210,6 +210,47 @@ pub async fn open_owned_identity_page(
     open_owned_identity_candidates(context, owner, relation, system, valid, after, None, fetch).await
 }
 
+/// Read root identities with any assertion current at `system` across all
+/// valid time, in key order. A key repeats once per current valid slice; the
+/// caller collapses adjacent repeats.
+pub async fn open_owned_identity_page_all_valid(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
+    after: Option<&str>, fetch: i64,
+) -> Result<Option<QueryCursor>> {
+    if relation.world().is_some() || relation.is_world_catalog() {
+        return Err(address_unavailable());
+    }
+    let context = owned_context_at_system(context, system)?;
+    if owner.is_empty() { return Err(address_unavailable()); }
+    let name = QualifiedTable {
+        database: context.catalog.default_database().to_owned(),
+        table: relation.table(owner),
+    };
+    let context = context.for_owned_relation(name.clone(), None);
+    let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
+    let id = Field {
+        id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false,
+        unnamed: false, data_type: table.scan_column_type("_id"),
+    };
+    let order = id.expression();
+    let predicates: Vec<_> = after.map(|after| Expr::binary(
+        BinaryOp::Gt, order.clone(), Expr::Literal(Value::Utf8(after.into())),
+    )).into_iter().collect();
+    let scan = Arc::new(Relation::scan(Scan {
+        table,
+        columns: vec![id],
+        valid_time: TemporalFilter::All,
+        system_time: TemporalFilter::Default,
+        clamp_valid_time: false,
+        iids: None, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
+    })?);
+    let sorted = Arc::new(scan.sort(vec![SortExpr {
+        expr: order, descending: false, nulls_first: false,
+    }])?);
+    let page = Arc::new(sorted.limit(None, Some(Expr::Literal(Value::I64(fetch))))?);
+    PreparedQuery::new_in(page, &context.memory)?.execute(context, Vec::new()).await.map(Some)
+}
+
 /// Read complete keys only within the installed protected carrier prefix.
 pub async fn open_owned_identity_prefix(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,

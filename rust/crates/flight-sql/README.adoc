@@ -546,6 +546,8 @@ The response echoes both time coordinates and carries visible UTF-8 identities f
 The limit is 1–128. Schema metadata `rtdb.owned.identity_more` is 1 when the next page can resume after the last returned identity, including when the response reaches its byte bound.
 Historical cuts require certified coverage and honor ordered erasure floors.
 
+`rtdb.owned.ReadHeldIdentityPageAllValid.v1` takes the same held handle and relation prefix with one row of `system_micros`, `limit` and a nullable `after`. It returns the Root identities with any assertion current at that system cut across all valid time, in key order, each once; its reply names the system cut as both coordinates. A period table's bounded index build enumerates rows valid only in the past or future with it.
+
 === Working in a hosted checkpoint world
 
 The placed Multi host enables world actions on a listener configured for owned native actions.

@@ -116,6 +116,7 @@ impl Service {
                 crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V1 => Ok(vec![Ok(self.held_row_carrier_exists_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 => Ok(vec![Ok(self.held_protected_carriers_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_IDENTITIES_ALL_VALID_V1 => Ok(vec![Ok(self.held_owned_identities_all_valid_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
                 crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V3 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
