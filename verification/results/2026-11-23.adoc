@@ -121,7 +121,7 @@ The controls reject release while held and the absence of an idle retry.
 A reachability case observes a completed successor retirement.
 
 The exact hosted fixture retains an actual directory catalog ticket through cancellation of the waiter.
-The installed receipt stays below the collection floor until the admitted work finishes.
+The collector cannot advance the floor to the receipt's installed cut until the admitted work finishes.
 The floor then advances and the serving store queues the exact publication for the production reaper.
 The versioned in-memory provider erases the target and drops the response.
 The next pass settles that same retirement and its marker.
@@ -131,3 +131,21 @@ At e256dbe553 the full Multi library, Node library and native Node suites passed
 The native baseline and the idle-retry control are retained under retention-e2e-native-nekk6250/.
 The model commands and logs are under retention-e2e-tlc-izsdl7tu/.
 The full remote lifetime suite passed its 15 cases.
+
+=== Checks on the landed reader-retention revision
+
+At 10ab56c012, all 311 tests in the Multi library, Node library and native Node suites passed, and the remote-response and hosted-retirement replay commands passed independently.
+The combined formal run at that revision matched all 496 TLC and 70 Apalache cases.
+Lean checked 69 study baselines and rejected 199 controls.
+Verus passed 43 areas and rejected 240 controls at their declared functions.
+Alloy, SMT, Maude, mCRL2, AutoHyper and OpenJML also matched.
+The command, pinned executable and input receipts are under retention-e2e-combined-10ab56c012/.
+
+Gradle ran 3,198 standard and 3,348 property cases with no failures, errors or skips.
+The FFI fixture library was rebuilt from 10ab56c012 and its hash is retained alongside the logs in retention-e2e-land-l0hwk6pi/.
+The run emitted no reflection or boxed math warnings.
+
+The default local Gradle integration suite with the same revision and FFI passed 5,629 cases.
+One PostgreSQL slot-recreation case was skipped, and the XML recorded no skip reason.
+The integration run emitted no reflection or boxed math warnings.
+Its log is retention-e2e-land-l0hwk6pi/gradle-integration.log.
