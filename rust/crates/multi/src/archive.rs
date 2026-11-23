@@ -1242,9 +1242,9 @@ pub(crate) async fn recovery_manifest_sha256(
 /// The exact body observation expected for a logical source member. A packed
 /// member names its containing publication, and a repaired member names its
 /// archived ciphertext. The observation does not confer retirement authority.
-struct CheckpointCopySource {
-    name: ObjectKey,
-    logical_bytes: usize,
+pub(crate) struct CheckpointCopySource {
+    pub(crate) name: ObjectKey,
+    pub(crate) logical_bytes: usize,
     version: Option<PhysicalObjectVersion>,
     metadata_digest: Option<[u8; 32]>,
 }
@@ -1266,7 +1266,7 @@ impl CheckpointCopySource {
         Ok(Self { name, logical_bytes, version: observed.version, metadata_digest })
     }
 
-    async fn read(&self, store: &dyn ObjectStore) -> Result<Bytes> {
+    pub(crate) async fn read(&self, store: &dyn ObjectStore) -> Result<Bytes> {
         let observed = store.observe_fresh_exact(&self.name, self.logical_bytes).await?;
         if observed.version != self.version {
             return Err(inconsistent("Checkpoint source publication changed during copying"));
@@ -1277,6 +1277,19 @@ impl CheckpointCopySource {
         require_bound_metadata(self.metadata_digest, &observed.value)?;
         Ok(observed.value)
     }
+}
+
+pub(crate) async fn ordered_checkpoint_sources(
+    store: &dyn ObjectStore,
+    checkpoint: Checkpoint,
+    epoch: StorageEpoch,
+    reserved: u64,
+) -> Result<Vec<CheckpointCopySource>> {
+    let root = key(&block_key(BlockIndex(checkpoint.block))?)?;
+    let catalog = BlockCatalog::decode(&store.get_fresh(&root).await?)?;
+    verify_cut(&catalog, checkpoint, epoch)?;
+    let closure = catalog_objects(store, &catalog, CheckpointContents::Replay).await?;
+    plan_checkpoint_copy(store, closure, Some(reserved)).await
 }
 
 async fn plan_checkpoint_copy(

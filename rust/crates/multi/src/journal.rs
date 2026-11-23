@@ -14,6 +14,7 @@ use ordered_logkeeper::ordered::{
     },
 };
 
+pub mod custody;
 mod log;
 pub(crate) use log::JournalLog;
 use rtdb_directory::DeploymentRecord;
