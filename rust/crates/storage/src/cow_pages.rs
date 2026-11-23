@@ -37,8 +37,11 @@ impl PageStore for ObjectPageStore {
 
     async fn put(&self, digest: PageDigest, bytes: Bytes) -> Result<()> {
         let key = ObjectKey::new(page_key(&self.prefix, digest))?;
-        self.store.put(&key, bytes).await?;
-        Ok(())
+        // A store that frames objects compares encodings, and two encodings of one content-addressed page differ.
+        match self.store.put(&key, bytes.clone()).await {
+            Err(crate::Error::ConflictingObject(_)) if self.store.get(&key).await? == bytes => Ok(()),
+            result => Ok(result?),
+        }
     }
 }
 

@@ -739,7 +739,7 @@ impl ScanCursor {
             scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition, storage, canonical_entity_iids, counts: Default::default(),
         }).collect();
         let constants = crate::accelerate::ExecutionConstants(&execution);
-        let query_winners = async {
+        let query_winners = Box::pin(async {
             let Some(top) = scan.top_k.as_ref() else { return Ok(None); };
             if !accelerate || order.is_some() || execution.context.accelerators.is_empty() { return Ok(None); }
             let Some(snapshot) = database_partitions.first() else { return Ok(None); };
@@ -751,7 +751,7 @@ impl ScanCursor {
             let ranking = crate::QueryRanking::new(limit, database_partitions.len(), &context.memory)?;
             let mut workers = futures::stream::FuturesOrdered::new();
             for (partition, verifier) in verifiers.iter().enumerate() {
-                workers.push_back(crate::run_rank_partition(&ranking, partition, async move {
+                workers.push_back(Box::pin(crate::run_rank_partition(&ranking, partition, async move {
                     let snapshot = verifier.partition;
                     let bounds = bounds(request.scan, snapshot, verifier.execution).await?;
                     if !bounds.valid_time.is_point() || !bounds.system_time.is_point() { return Ok(None); }
@@ -760,14 +760,14 @@ impl ScanCursor {
                         if let Some(source) = accelerator.rank_source(request).await? { return Ok(Some(source)); }
                     }
                     Ok(None)
-                }, &context.cancellation));
+                }, &context.cancellation)));
             }
             while let Some(source) = workers.try_next().await? {
                 if source.is_none() { return Ok(None); }
             }
             drop(workers);
             Ok::<_, Anomaly>(ranking.winners())
-        }.await;
+        }).await;
         let mut winners = match query_winners {
             Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit") => None,
             result => result?,
