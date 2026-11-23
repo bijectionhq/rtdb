@@ -10,6 +10,8 @@ mod replay_floor;
 mod driver;
 mod fact_history;
 mod logs;
+mod maintenance_class;
+mod promotion;
 mod progress;
 mod readback_identity;
 mod recovery_promotion;
@@ -24,7 +26,7 @@ mod state;
 mod table_replay;
 
 pub use rtdb_tx::project_held_replica;
-pub use admission::{Admission, TermFence, TermPosition, Verdict};
+pub use admission_step::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint, RecoveredPartition};
 pub use driver::{CommittedErasure, ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, RecoverableExternalToken, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};

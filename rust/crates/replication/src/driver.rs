@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::promotion::{initial_term_sequence, replica_read_is_empty, should_start_claim};
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedPrimaryReset, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
@@ -586,13 +587,19 @@ impl ReplicationDriver {
             match event {
                 Event::ReplicaBatch(tail, records) => {
                     self.replica_poll = None; self.replica_tail = Some(tail);
-                    match records? {
-                        TailPoll::Prepared(Some(head)) => self.replica_head = Some(head),
-                        TailPoll::Legacy(records) if !records.is_empty() => self.replica_batch.extend(records),
-                        TailPoll::Prepared(None) | TailPoll::Legacy(_) => {
-                            if !self.cancellation.is_cancelled() { self.lead_after_empty_read().await?; }
+                    let record_count = match records? {
+                        TailPoll::Prepared(head) => {
+                            let count = usize::from(head.is_some());
+                            self.replica_head = head;
+                            count
                         }
-                    }
+                        TailPoll::Legacy(records) => {
+                            let count = records.len();
+                            self.replica_batch.extend(records);
+                            count
+                        }
+                    };
+                    self.lead_after_empty_read(record_count).await?;
                 }
                 Event::Replica => if let Some(head) = self.replica_head {
                     let tail = self.replica_tail.as_deref_mut().ok_or_else(|| invalid("Prepared replica head has no tail"))?;
@@ -775,7 +782,8 @@ impl ReplicationDriver {
     }
     /// A journal that fences writer terms promotes its grant holder only after an empty read, so every record of
     /// an earlier term has been admitted before the new term's sequence-zero record can open it.
-    async fn lead_after_empty_read(&mut self) -> Result<()> {
+    async fn lead_after_empty_read(&mut self, record_count: usize) -> Result<()> {
+        if !replica_read_is_empty(record_count) || self.cancellation.is_cancelled() { return Ok(()); }
         if self.logs.placed_transfer().is_some_and(|transfer|
             self.read_position.after_offset(self.logs.replica_epoch) < transfer.through)
         {
@@ -799,8 +807,11 @@ impl ReplicationDriver {
             return Ok(());
         }
         // Promotion waits for the next empty read instead of appending a claim.
-        if self.logs.fences_writer_terms() { return Ok(()); }
-        if !self.config.may_lead || self.leader.is_some() || self.claim.is_some() || self.claiming.is_some() { return Ok(()); }
+        if !should_start_claim(self.logs.fences_writer_terms(), self.config.may_lead, self.leader.is_some(),
+            self.claim.is_some() || self.claiming.is_some())
+        {
+            return Ok(());
+        }
         let term = self.fence.claim_term()?;
         let envelope = ReplicaEnvelope { term, term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
         let logs = Arc::clone(&self.logs);
@@ -846,7 +857,7 @@ impl ReplicationDriver {
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         // Without a claim, the term's first appended record opens it.
-        let pump = if self.logs.fences_writer_terms() { pump.starting_at(TermSequence(0)) } else { pump };
+        let pump = pump.starting_at(TermSequence(initial_term_sequence(self.logs.fences_writer_terms())));
         let pump = match self.resolve.execution_observer.clone() {
             Some(observer) => pump.with_durable_commit_observer(move |basis, lag| match basis {
                 CommitLagBasis::Ordered => observer.record_durable_commit_lag(lag),

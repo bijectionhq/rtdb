@@ -13,7 +13,7 @@ macro_rules! position {
 }
 
 position!(SourcePosition: i64, ReplicaPosition: i64, TxId: i64, BlockIndex: i64,
-    Term: i64, TermSequence: i64, StorageEpoch: i32, StorageVersion: i32);
+    StorageEpoch: i32, StorageVersion: i32);
 
 /// The installed replica prefix captured with a physical catalog.
 /// The journal epoch is explicit because its empty prefix is encoded as epoch base minus one.
@@ -172,14 +172,6 @@ macro_rules! message_position {
 }
 
 message_position!(SourcePosition, ReplicaPosition);
-
-impl TermSequence {
-    pub const CLAIM: Self = Self(0);
-    pub fn next(self) -> Result<Self> {
-        self.0.checked_add(1).map(Self)
-            .ok_or_else(|| Anomaly::fault("xtdb/term-sequence-overflow", "Term sequence exhausted"))
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionKey { pub tx_id: TxId, pub system_time: Timestamp }

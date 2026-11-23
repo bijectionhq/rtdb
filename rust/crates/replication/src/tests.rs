@@ -3000,7 +3000,7 @@ async fn a_journal_fenced_term_opens_without_a_claim_or_maintenance_record_acros
         assert!(handle.progress().fault().is_none());
         terms.push(term);
     }
-    assert!(terms.windows(2).all(|pair| pair[0] < pair[1]), "each replacement opens a later term: {terms:?}");
+    assert_eq!(terms, (1..=6).map(Term).collect::<Vec<_>>());
     assert_eq!(fenced.maintenance.load(std::sync::atomic::Ordering::SeqCst), 0,
         "replacements without block progress charge nothing to the maintenance lane");
 
@@ -3031,4 +3031,19 @@ async fn a_worker_without_the_current_grant_never_leads_a_journal_fenced_term() 
     handle.shutdown();
     tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap().unwrap();
     assert_eq!(fenced.maintenance.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fenced_appends_charge_only_boundaries_and_uploads_to_maintenance() {
+    let (fixture, fenced) = fenced_term_fixture(true).await;
+    let cases = [
+        (TermSequence(0), ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }), 0),
+        (TermSequence(1), boundary(0, -1), 1),
+        (TermSequence(2), upload(0, -1), 2),
+    ];
+    for (sequence, message, maintenance) in cases {
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(sequence), message };
+        fixture.driver.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        assert_eq!(fenced.maintenance.load(std::sync::atomic::Ordering::SeqCst), maintenance);
+    }
 }

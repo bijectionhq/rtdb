@@ -6,6 +6,7 @@ use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceM
 use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendCapacity, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
+use crate::maintenance_class::is_maintenance;
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
 pub(crate) const APPEND_CAPACITY: &str = "rtdb.storage/append-capacity";
@@ -239,18 +240,16 @@ impl PartitionLogs {
             return Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch });
         }
         let now = clock();
-        // Claims, checkpoint closure and inherited receiver fences use reserved journal space.
-        // Keep that class when a large block upload is represented by an offload reference.
-        // A journal that fences writer terms has no claims, so its sequence-zero no-op is ordinary data.
-        let maintenance = match &envelope.message {
-            ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,
-            ReplicaBody::NoOp(message) => !self.fences_writer_terms()
-                && envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none()
-                && message.placed_slot_reservation.is_none(),
+        // An offload reference is charged for the body it replaces.
+        let fenced = matches!(&envelope.message, ReplicaBody::NoOp(_)) && self.fences_writer_terms();
+        let fenced_terminal = match &envelope.message {
             ReplicaBody::ResolvedTx(tx) => tx.placed_slot_terminal.as_deref()
                 .map(rtdb_types::PlacedTerminal::decode).transpose()?.is_some_and(|terminal| terminal.fenced),
             _ => false,
         };
+        let maintenance = is_maintenance(
+            &envelope.message, envelope.term_sequence.map(|sequence| sequence.0), fenced, fenced_terminal,
+        );
         let enqueue = |payload| async move {
             if maintenance { self.replica.enqueue_maintenance(payload, now).await }
             else { self.replica.enqueue(payload, now).await }
