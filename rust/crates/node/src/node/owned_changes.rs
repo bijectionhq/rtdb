@@ -73,6 +73,8 @@ pub struct ExpiryCandidatePage {
     pub candidates: Vec<ExpiryCandidate>,
     pub through: Timestamp,
     pub diagnostic_cutoff: Timestamp,
+    pub state: &'static str,
+    pub next_eligible: Option<Timestamp>,
     _charges: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
@@ -124,54 +126,66 @@ impl OwnedReadSession {
         }
         let policy = self.lifetime_point_policy(relation).await?.ok_or_else(change_feed_uncovered)?;
         let cutoff = rtdb_types::OwnedLifetimeFloor::expiry_replay_cutoff(self.present.system_time);
-        let page = self.changes(relation, after, groups).await?;
         let context = self.journal_context(relation)?;
         let mut candidates = Vec::new();
         let mut charges = Vec::new();
         let mut through = after;
-        for group in &page.groups {
-            let expiry = Timestamp(group.system_time.0.checked_add(policy.duration).ok_or_else(change_feed_uncovered)?);
-            let mut puts = 0usize;
-            for touch in &group.touches {
+        let mut state = "bounded";
+        let mut next_eligible = None;
+        for _ in 0..groups {
+            // Decode one accepted group. Its successors are unnecessary
+            // while it still has a candidate or needs a later held present.
+            let page = self.merged_change_journals(
+                std::slice::from_ref(relation), through, 1, through == Timestamp::MIN,
+            ).await?;
+            let Some(group) = page.commits.first() else {
+                through = page.covered_through(self.present.system_time)?;
+                state = "quiescent";
+                break;
+            };
+            let [change] = group.changes.as_slice() else { return Err(change_feed_uncovered()); };
+            let expiry = Timestamp(group.revision.0.checked_add(policy.duration).ok_or_else(change_feed_uncovered)?);
+            let valid = Interval::new(group.revision, expiry)?;
+            for touch in &change.touches {
                 match touch.kind {
-                    rtdb_types::OwnedChangeKind::Put => {
-                        if touch.valid != Interval::new(group.system_time, expiry)? {
-                            return Err(change_feed_uncovered());
-                        }
-                        puts += 1;
-                    }
+                    rtdb_types::OwnedChangeKind::Put if touch.valid == valid => (),
                     rtdb_types::OwnedChangeKind::Expired => (),
                     _ => return Err(change_feed_uncovered()),
                 }
             }
-            if puts != 0 && expiry > cutoff {
-                // Fixed duration and acceptance-only creates make every
-                // following creation too recent on this same held cut.
-                break;
-            }
-            if candidates.len().saturating_add(puts) > MAX_CANDIDATES {
-                if through == after { return Err(change_feed_uncovered()); }
-                break;
-            }
-            for touch in group.touches.iter().filter(|touch| touch.kind == rtdb_types::OwnedChangeKind::Put) {
+            for touch in change.touches.iter().filter(|touch| touch.kind == rtdb_types::OwnedChangeKind::Put) {
                 if rtdb_query::owned_purge_floor(Arc::clone(&context), &self.owner, relation, &touch.id).await?.is_some() {
                     continue;
                 }
+                if expiry > cutoff {
+                    state = "waiting";
+                    next_eligible = rtdb_types::OwnedLifetimeFloor::expiry_replay_eligible_present(expiry);
+                    break;
+                }
                 let (nomination, created, expires) = self.nominate_expired_identity(relation, &touch.id, scope).await?;
-                if created != group.system_time || expires != expiry {
+                if created != group.revision || expires != expiry {
                     return Err(change_feed_uncovered());
                 }
                 let bytes = touch.id.as_value().retained_bytes()?.saturating_mul(2).saturating_add(512);
                 charges.push(context.memory.reserve(bytes)?);
                 candidates.push(ExpiryCandidate { identity: touch.id.handle_bytes(), nomination, created, expiry });
+                state = "pending";
+                if candidates.len() == MAX_CANDIDATES { break; }
             }
-            through = group.system_time;
-        }
-        if page.groups.last().is_none_or(|group| group.system_time == through) {
-            through = page.covered_through;
+            if state != "bounded" {
+                // A nomination is not proof of erasure. On the next hold
+                // revisit this entire group and skip only durable purges.
+                break;
+            }
+            through = group.revision;
+            if page.complete {
+                through = page.covered_through(self.present.system_time)?;
+                state = "quiescent";
+                break;
+            }
         }
         self.check_live_change_relations(std::slice::from_ref(relation))?;
-        Ok(ExpiryCandidatePage { candidates, through, diagnostic_cutoff: cutoff, _charges: charges })
+        Ok(ExpiryCandidatePage { candidates, through, diagnostic_cutoff: cutoff, state, next_eligible, _charges: charges })
     }
 
     /// Reads exact local overlay commits. The archived parent is immutable;
@@ -199,7 +213,7 @@ impl OwnedReadSession {
             }
             relation.in_world(world)
         }).collect::<Result<Vec<_>>>()?;
-        let mut page = self.merged_change_journals(&scoped, after, limit).await?;
+        let mut page = self.merged_change_journals(&scoped, after, limit, false).await?;
         for commit in &mut page.commits {
             for group in &mut commit.changes {
                 group.relation = group.relation.root_relation().ok_or_else(change_feed_uncovered)?;
@@ -219,7 +233,7 @@ impl OwnedReadSession {
         if relations.iter().any(|relation| relation.world().is_some() || relation.is_world_catalog()) {
             return Err(change_feed_uncovered());
         }
-        self.merged_change_journals(relations, after, limit).await
+        self.merged_change_journals(relations, after, limit, false).await
     }
 
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {
@@ -227,7 +241,7 @@ impl OwnedReadSession {
     }
 
     async fn merged_change_journals(
-        &self, relations: &[OwnedRelation], after: Timestamp, limit: usize,
+        &self, relations: &[OwnedRelation], after: Timestamp, limit: usize, from_retained_start: bool,
     ) -> Result<OwnedMergedChanges> {
         if !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
             || !(1..=OWNED_MERGED_CHANGE_RELATIONS).contains(&relations.len())
@@ -263,7 +277,7 @@ impl OwnedReadSession {
         let mut journals = Vec::with_capacity(relations.len());
         for relation in names {
             guarded.check_cancelled()?;
-            if let Some(journal) = self.seek_changes(snapshot, relation, after).await? {
+            if let Some(journal) = self.seek_changes(snapshot, relation, after, from_retained_start).await? {
                 journals.push(journal);
             }
         }
@@ -659,16 +673,23 @@ impl OwnedReadSession {
         snapshot: &Snapshot,
         relation: &'a OwnedRelation,
         after: Timestamp,
+        from_retained_start: bool,
     ) -> Result<Option<Journal<'a>>> {
         let Some(CoveredJournal {
             floor,
             first,
             head,
             head_revision,
-        }) = self.covered_journal(snapshot, relation, after).await?
+        }) = self.covered_journal(snapshot, relation, if from_retained_start { self.present.system_time } else { after }).await?
         else {
             return Ok(None);
         };
+        if from_retained_start {
+            return Ok(Some(Journal {
+                relation, revision: 1, head: head_revision, head_through: head.through_events,
+                previous_through: floor.through_events, next: first,
+            }));
+        }
         if after >= head.committed_at {
             self.require_journal_head(relation, head_revision, head)
                 .await?;

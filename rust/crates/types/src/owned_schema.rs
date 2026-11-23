@@ -20,6 +20,10 @@ impl OwnedLifetimeFloor {
         crate::Timestamp(ordered_present.0.saturating_sub(Self::REPLAY_WINDOW_MICROS))
     }
 
+    pub fn expiry_replay_eligible_present(expiry: crate::Timestamp) -> Option<crate::Timestamp> {
+        expiry.0.checked_add(Self::REPLAY_WINDOW_MICROS).map(crate::Timestamp)
+    }
+
     pub fn at(duration: i64, present: crate::Timestamp) -> Result<Self> {
         if !(1..=3_155_760_000_000_000).contains(&duration) {
             return Err(invalid("Invalid owned creation lifetime"));
