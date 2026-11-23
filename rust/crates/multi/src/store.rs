@@ -205,11 +205,12 @@ impl RemoteStorageFactory for CellStoreFactory {
         {
             return Err(Anomaly::incorrect("rtdb.multi/terminal-storage", "A terminal cell writer requires a scoped S3 role"));
         }
+        let audience_transport = matches!(&config.storage, CellStorage::S3 { .. });
         let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
         let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
-        let opened = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
+        let (opened, audience_reads) = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
             let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
                 crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone()).await?
             } else {
@@ -251,7 +252,7 @@ impl RemoteStorageFactory for CellStoreFactory {
                 if matches!(config.storage, CellStorage::Local { .. }) { ReplayCustody::Local }
                 else { ReplayCustody::Hosted { owner: self.hosted_task.clone() } },
             );
-            let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery, custody).await?;
+            let (mut opened, audience_reads) = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery, custody).await?;
             if let Some(expected) = record.recovery_manifest_sha256 {
                 let checkpoint = record.checkpoint.ok_or_else(|| storage_region_error("A recovery manifest has no checkpoint"))?;
                 let material = self.keys.existing_key(&record.key_id()).await?
@@ -266,9 +267,11 @@ impl RemoteStorageFactory for CellStoreFactory {
             serving.catalog_readers = Some(CatalogReaders::new(
                 self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
-            Ok::<_, Anomaly>(opened)
+            Ok::<_, Anomaly>((opened, audience_reads))
         }).await?;
-        Ok(OpenedRecoveryStore { store: opened, blocks, checkpoint_metadata: Some(checkpoint_metadata), fragment_storage: Some(fragment_storage) })
+        let store: Arc<dyn ObjectStore> = opened;
+        let audience = (audience_reads && audience_transport).then(|| Arc::clone(&store));
+        Ok(OpenedRecoveryStore { store, audience, blocks, checkpoint_metadata: Some(checkpoint_metadata), fragment_storage: Some(fragment_storage) })
     }
 
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {
@@ -278,7 +281,7 @@ impl RemoteStorageFactory for CellStoreFactory {
     }
 
     /// Both views use the key of the same admitted storage residence. The ordinary disk cache holds ciphertext.
-    async fn wrap_stores(&self, configuration: &Any, cached: Arc<dyn ObjectStore>, uncached: Arc<dyn ObjectStore>) -> Result<OpenedServingStores> {
+    async fn wrap_stores(&self, configuration: &Any, cached: Arc<dyn ObjectStore>, audience: Option<Arc<dyn ObjectStore>>) -> Result<OpenedServingStores> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let record = self.directory.deployment(&config.deployment).await?
@@ -290,16 +293,14 @@ impl RemoteStorageFactory for CellStoreFactory {
             None => self.enroll_serving_key(&config, &id).await?,
         };
         let ordinary = Arc::new(EncryptingStore::new(cached, &material)?);
-        let audience = if matches!(config.storage, CellStorage::S3 { .. }) && config.writer_epoch == Some(record.epoch)
+        let audience = audience.filter(|_| config.writer_epoch == Some(record.epoch)
             && record.holder.is_some() && record.linearizable_reads && record.lifecycle == Lifecycle::Live
-            && !config.compactor && config.snapshot_block.is_none()
-        {
-            Uuid::parse_str(&record.id).ok().filter(|source| !source.is_nil()).map(|source| {
-                Ok::<_, Anomaly>(AudienceReadStorage { source, store: Arc::new(AudienceObjectStore(EncryptingStore::new(uncached, &material)?)) })
-            }).transpose()?
-        } else {
-            None
-        };
+            && !config.compactor && config.snapshot_block.is_none());
+        let source = Uuid::parse_str(&record.id).ok().filter(|source| !source.is_nil());
+        let audience = audience.zip(source).map(|(store, source)| {
+            let store = Arc::new(AudienceObjectStore(EncryptingStore::new(store, &material)?));
+            Ok::<_, Anomaly>(AudienceReadStorage { source, store })
+        }).transpose()?;
         Ok(OpenedServingStores { ordinary, audience })
     }
 }
@@ -826,7 +827,7 @@ async fn open_cell_store(
     clock: Clock,
     recovery: Option<crate::archive::ArchivedCheckpoint>,
     custody: ReferenceReads,
-) -> Result<Arc<GarbageStore>> {
+) -> Result<(Arc<GarbageStore>, bool)> {
     let discovery = record.checkpoint.map_or(crate::packing::PackDiscovery::List, |checkpoint| {
         crate::packing::PackDiscovery::From(checkpoint.block)
     });
@@ -835,7 +836,11 @@ async fn open_cell_store(
     } else {
         crate::reference::Base::load(bucket.as_ref(), store).await?
     };
-    open_with_base(bucket, local, base, discovery, clock, recovery, Some(custody)).await
+    // A legacy reference opens its own custody record at read time. A serving archive has
+    // already been retained by this attachment and only needs its dedicated object transport.
+    let audience_reads = base.objects.is_empty() && recovery.as_ref().is_none_or(|archive| archive.supports_audience_reads());
+    let store = open_with_base(bucket, local, base, discovery, clock, recovery, Some(custody)).await?;
+    Ok((store, audience_reads))
 }
 
 async fn open_with_base(
@@ -2075,20 +2080,20 @@ mod tests {
         }).unwrap() };
         let cached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         for writer_epoch in [None, Some(1)] {
-            let result = factory.wrap_stores(&configuration(writer_epoch), cached.clone(), cached.clone()).await;
+            let result = factory.wrap_stores(&configuration(writer_epoch), cached.clone(), None).await;
             assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
         }
         assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
-        factory.wrap_stores(&configuration(Some(2)), cached.clone(), cached.clone()).await.unwrap();
+        factory.wrap_stores(&configuration(Some(2)), cached.clone(), None).await.unwrap();
         assert!(keys.existing_key(&record.key_id()).await.unwrap().is_some());
-        factory.wrap_stores(&configuration(None), cached.clone(), cached.clone()).await.unwrap();
+        factory.wrap_stores(&configuration(None), cached.clone(), None).await.unwrap();
 
         std::fs::remove_file(root.path().join("keys").join(format!("{}.key", record.key_id()))).unwrap();
         crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
             record.replica_journals.insert("replica".into());
             Ok(())
         }).await.unwrap();
-        let result = factory.wrap_stores(&configuration(Some(2)), cached.clone(), cached).await;
+        let result = factory.wrap_stores(&configuration(Some(2)), cached, None).await;
         assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
         assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
     }
@@ -2120,7 +2125,7 @@ mod tests {
         }).unwrap() };
         let cached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         let uncached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
-        let stores = factory.wrap_stores(&configuration(Some(2)), cached.clone(), uncached.clone()).await.unwrap();
+        let stores = factory.wrap_stores(&configuration(Some(2)), cached.clone(), Some(uncached.clone())).await.unwrap();
         let audience = stores.audience.unwrap();
         assert_eq!(audience.source, Uuid::parse_str(&record.id).unwrap());
         let material = keys.existing_key(&record.key_id()).await.unwrap().unwrap();
@@ -2131,7 +2136,9 @@ mod tests {
         assert_eq!(audience.store.get_reserved_object(&object, ReadReservation::new(bytes.len(), ())).await.unwrap().as_slice(), bytes.as_ref());
         assert!(audience.store.get_reserved_object(&object, ReadReservation::new(bytes.len() - 1, ())).await.is_err());
 
-        let stale = factory.wrap_stores(&configuration(Some(1)), cached, uncached).await.unwrap();
+        let unsupported = factory.wrap_stores(&configuration(Some(2)), cached.clone(), None).await.unwrap();
+        assert!(unsupported.audience.is_none());
+        let stale = factory.wrap_stores(&configuration(Some(1)), cached, Some(uncached)).await.unwrap();
         assert!(stale.audience.is_none());
     }
 
@@ -2831,6 +2838,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_attachment_with_legacy_references_cannot_admit_audience_reads() {
+        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+        let parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let mut child = DeploymentRecord::new("preview", "acme", vec![], 0);
+        child.parent = Some(parent.id.clone());
+        let parent_store = format!("{}/v06", parent.storage_prefix());
+        let child_store = format!("{}/v06", child.storage_prefix());
+        bucket.put(&key(&format!("{parent_store}/objects/body")), Bytes::from_static(b"parent")).await.unwrap();
+        crate::reference::fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+
+        let local = Arc::new(crate::reference::PrefixedStore::new(bucket.clone(), &child_store));
+        let files = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
+        let custody = ReferenceReads::new(rtdb_directory::MemoryDirectory::new(), keys, TaskTracker::new(), &child,
+            "v06", rtdb_directory::StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] }, ReplayCustody::Local);
+        let (_, audience_reads) = open_cell_store(bucket, &child_store, local, &child, wall_clock(), None, custody).await.unwrap();
+        assert!(!audience_reads);
+    }
+
+    #[tokio::test]
     async fn a_checkpointed_root_recovers_the_latest_block_after_reaping_with_listing_disabled() {
         let raw = Arc::new(StoreFaults { inner: MemoryStore::default(), fail: false.into(), deny_list: false.into() });
         let bucket: crate::reference::Bucket = raw.clone();
@@ -2851,7 +2878,8 @@ mod tests {
         let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
         let custody = ReferenceReads::new(rtdb_directory::MemoryDirectory::new(), keys, TaskTracker::new(), &record,
             "v06", rtdb_directory::StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] }, ReplayCustody::Local);
-        let cold = open_cell_store(bucket, &store, local, &record, wall_clock(), None, custody).await.unwrap();
+        let (cold, audience_reads) = open_cell_store(bucket, &store, local, &record, wall_clock(), None, custody).await.unwrap();
+        assert!(audience_reads, "the cold checkpoint uses its own immutable storage");
         assert_eq!(cold.get(&key("tables/t/data/l00-rc-b02.arrow")).await.unwrap().as_ref(), b"rows 2", "a block after a fully released one is found from the checkpoint");
     }
 

@@ -169,6 +169,7 @@ async fn observe_archive_object(
 /// Other reads continue through the current serving store.
 pub(crate) struct ArchivedCheckpoint {
     files: PrefixedStore,
+    audience_transport: bool,
     objects: BTreeMap<ObjectKey, ArchivedObject>,
     archive_cipher: Cipher,
     serving_cipher: Cipher,
@@ -234,6 +235,7 @@ impl ArchivedCheckpoint {
         }
         let archive: CellStorage = serde_json::from_str(source.archive)
             .map_err(|_| inconsistent("Invalid retained archive binding"))?;
+        let audience_transport = matches!(&archive, CellStorage::S3 { .. });
         let bucket = archive.bucket(region).await?;
         let prefix = format!("checkpoint-captures/{}/{operation}", record.id);
         let scope = PrefixedStore::new(bucket.clone(), prefix.clone());
@@ -254,12 +256,15 @@ impl ArchivedCheckpoint {
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Some(Self {
             files: PrefixedStore::new(bucket, format!("{prefix}/objects")),
+            audience_transport,
             objects,
             archive_cipher: Cipher::new(&archive_key(keys, &capture.point).await?)?,
             serving_cipher: Cipher::new(&keys.existing_key(&record.key_id()).await?
                 .ok_or_else(|| unavailable("The current installation key is unavailable"))?)?,
         }))
     }
+
+    pub(crate) fn supports_audience_reads(&self) -> bool { self.audience_transport }
 
     async fn read_plaintext(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
         let ciphertext = read_object(&self.files, name, object).await?;
@@ -2207,6 +2212,7 @@ mod tests {
         files.put(&name, ciphertext.clone()).await?;
         let archive = ArchivedCheckpoint {
             files,
+            audience_transport: false,
             objects: BTreeMap::from([(name.clone(), ArchivedObject {
                 name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext),
             })]),
@@ -2371,6 +2377,7 @@ mod tests {
         serving.put(&newer, Bytes::from_static(b"current tail")).await?;
         let archived = ArchivedCheckpoint {
             files,
+            audience_transport: false,
             objects: [(covered.clone(), ArchivedObject {
                 name: covered.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext),
             })].into(),

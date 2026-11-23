@@ -217,6 +217,11 @@ impl Service {
             {
                 return Err(Status::permission_denied("An audience session requires the installed hosted principal"));
             }
+            if let Some(source) = audience_source {
+                if placement.as_ref().is_none_or(|database| !database.serves_audience_storage(source)) {
+                    return Err(Status::failed_precondition("The attachment has no eligible audience storage for this source"));
+                }
+            }
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
             let memory = audience.map_or(self.memory(), |audience| &audience.memory);
             let audience_slot = audience.zip(audience_source).map(|(audience, source)| {

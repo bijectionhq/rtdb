@@ -57,6 +57,9 @@ pub struct Database {
 }
 
 impl Database {
+    pub fn serves_audience_storage(&self, source: uuid::Uuid) -> bool {
+        self.audience_storage.as_ref().is_some_and(|storage| storage.source == source)
+    }
     pub fn name(&self) -> &str { &self.name }
     pub fn configuration(&self) -> &DatabaseConfig { &self.configuration }
     /// The immutable receipt authority of this live writer attachment.
