@@ -58,6 +58,13 @@ pub struct Database {
 impl Database {
     pub fn name(&self) -> &str { &self.name }
     pub fn configuration(&self) -> &DatabaseConfig { &self.configuration }
+    /// The immutable receipt authority of this live writer attachment.
+    pub fn placed_writer_scope(&self) -> Option<rtdb_types::PlacedAttemptScope> {
+        match &self.await_authority {
+            crate::AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
+            _ => None,
+        }
+    }
     pub fn read_only(&self) -> bool { self.read_only }
     pub fn fragment_residence(&self) -> Option<&rtdb_query::FragmentResidence> { self.fragment_residence.as_ref() }
     pub fn is_critical(&self) -> bool { self.name == "xtdb" || self.configuration.critical.unwrap_or(false) }

@@ -249,6 +249,11 @@ impl rtdb_node::ReadFence for FenceSlot {
         let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
         agent.confirm_hosted_read(database).await
     }
+
+    async fn confirm_audience(&self, database: &rtdb_node::Database, require_quorum: bool) -> Result<String> {
+        let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
+        agent.confirm_audience_read(database, require_quorum).await
+    }
 }
 
 fn stopped_agent() -> Anomaly {

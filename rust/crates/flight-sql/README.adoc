@@ -270,14 +270,18 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v5` on the audience gateway during its handshake.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v6` on the audience gateway during its handshake.
 The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
 The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
 The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
 Before serving, the holder reserves 16 MiB of execution memory per permit. The reservation is deducted before the ordinary allocation splits between cache and execution. It refuses startup if the node cannot fund the pool.
 Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
 A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
-The audience handshake and subsequent actions use the reserved admission. Routing still depends on directory and placement service. Network scheduling, object storage and execution scheduling are separate capacity obligations.
+The audience handshake and subsequent actions use the reserved admission.
+The gateway resolves the placement at handshake, then forwards authenticated session actions to the sealed holder address.
+For each audience data action the holder checks the live member, current deployment and epoch, recovered checkpoint and exact attached database.
+Applied acquisition and confirmation also confirm journal leadership on that holder. Closing a local hold or session only releases resources.
+The directory, journal quorum, network, object storage, and scheduler still have service obligations.
 
 Before its first open, a reserved session must call `rtdb.owned.PrepareAppliedRead.v1`. The body is the same source and exact transaction floor as an applied open, without the generation. The action returns an empty stream after registering the captured catalog in the directory.
 The registration is session-bound and expires after 180 monotonic seconds. A read or confirmation shares it only for a catalog at or after the registered cut in the same attachment, storage version, storage epoch and replica epoch.

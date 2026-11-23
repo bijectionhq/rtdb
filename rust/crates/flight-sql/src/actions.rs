@@ -11,14 +11,23 @@ use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Lea
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V1, READ_HELD_HOSTED_CONTROL_V2};
-        if call.session.audience_source().is_some() && !matches!(action.r#type.as_str(),
-            PREPARE_APPLIED_READ_V1 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 | HELD_OWNED_POINT_V2
-                | HELD_OWNED_HISTORICAL_POINT_V1 | READ_HELD_HOSTED_CONTROL_V2 | CLOSE_OWNED_READ_V1 | "CloseSession"
-        ) {
-            return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
-        }
         let work = async {
-            match action.r#type.as_str() {
+            let action_type = action.r#type.as_str();
+            if let Some(source) = call.session.audience_source() {
+                match action_type {
+                    // Catalog acquisition checks the placement and quorum at the captured cut.
+                    PREPARE_APPLIED_READ_V1 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_HISTORICAL_POINT_V1 | READ_HELD_HOSTED_CONTROL_V2 => {
+                        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+                        let attachment = attachment.ok_or_else(unsupported)?;
+                        self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
+                    }
+                    // These actions only relinquish resources under the authenticated local session.
+                    CLOSE_OWNED_READ_V1 | "CloseSession" => {}
+                    _ => return Err(Status::permission_denied("The reserved Flight session only admits audience observations")),
+                }
+            }
+            match action_type {
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),

@@ -173,7 +173,8 @@ impl Router {
     async fn first_target(&self, selector: &str) -> std::result::Result<Target, Status> {
         let (name, installation) = database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?;
         let record = self.directory.deployment_by_name(name).await.map_err(directory_error)?
-            .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id))
+            .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id)
+                && self.audience.is_none_or(|profile| Uuid::parse_str(&record.id).ok() == Some(profile.source())))
             .ok_or_else(|| Status::not_found("No matching local Flight SQL deployment"))?;
         if record.writer_pool().is_none() { return Err(moved()); }
         let holder = admin::ensure_held(self.directory.as_ref(), name, &self.control).await
@@ -244,7 +245,8 @@ impl Router {
                             return Err(Status::permission_denied("This Flight SQL session belongs to another deployment"));
                         }
                     }
-                    self.validate(&route.target).await?;
+                    // An audience route locates a socket. Serving authority is checked on the holder.
+                    if self.audience.is_none() { self.validate(&route.target).await?; }
                     Ok((route.target, Some(route.session)))
                 }
                 None => self.first_target(selector.expect("a new session has a selector")).await.map(|target| (target, None)),
