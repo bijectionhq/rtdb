@@ -198,9 +198,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn close(&self) { HeldCheckpointWorld::close(self); }
 
     fn changes<'a>(
-        &'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
+        &'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize, descending: bool,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedMergedChanges>> {
-        Box::pin(HeldCheckpointWorld::changes(self, relations, after, through, limit))
+        Box::pin(HeldCheckpointWorld::changes(self, relations, after, through, limit, descending))
     }
 
     fn valid_during<'a>(
@@ -224,6 +224,16 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         Box::pin(async move {
             let page = HeldCheckpointWorld::overlay_identities(self, relation, valid, after, limit).await?;
             Ok(WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations })
+        })
+    }
+
+    fn path_touch_after<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        group: Timestamp, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>> {
+        Box::pin(async move {
+            let fact = HeldCheckpointWorld::path_touch_after(self, relation, path, id, group, valid).await?;
+            Ok(path_touch_result(group, (Some(fact), true)))
         })
     }
 

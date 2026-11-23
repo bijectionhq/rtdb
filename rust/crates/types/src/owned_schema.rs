@@ -267,6 +267,10 @@ impl OwnedSchema {
     }
 
     /// Only declared clear fields may contribute to an ordered or derived path.
+    pub fn has_opaque_columns(&self) -> bool {
+        self.0.fields.iter().any(|field| matches!(field.kind, Kind::OpaqueBinary {}))
+    }
+
     pub fn path_column_type(&self, name: &str) -> Option<ScalarType> {
         self.path_field(name).map(|field| field.kind.scalar())
     }

@@ -170,6 +170,7 @@ pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V1: &str = "rtdb.owned.OpenAppliedRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_WORLD_TOUCH_AFTER_V1: &str = "rtdb.owned.ReadHeldWorldTouchAfter.v1";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
@@ -214,6 +215,7 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
+pub(crate) const READ_HELD_WORLD_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldWorldChangesDescending.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V3: &str = "rtdb.owned.ReadHeldWorldChanges.v3";
 pub(crate) const HELD_OWNED_STORAGE_USAGE_V1: &str = "rtdb.owned.ReadHeldStorageUsage.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v1";
@@ -1117,6 +1119,17 @@ impl Service {
         Ok((before, group, relation, path, id, valid, identity))
     }
 
+    pub(crate) async fn held_world_touch_after_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World touch after-image has no held handle"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (_, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let result = held.snapshot.path_touch_after(&relation, &path, &id, group, valid).await.map_err(status)?;
+        let reply = self.world_point_reply(call, result, valid, None)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
     pub(crate) async fn held_world_path_touch_action(
         &self, call: &Call, body: &[u8],
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
@@ -1899,13 +1912,13 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_changes_action(&self, call: &Call, body: &[u8], descending: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World changes require a held world handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = held.snapshot.changes(&relations, after, through, limit).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), false)?;
+        let page = held.snapshot.changes(&relations, after, through, limit, descending).await.map_err(status)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }

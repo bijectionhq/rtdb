@@ -111,7 +111,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn check_parent_point(&self, relation: &OwnedRelation, until: Option<Timestamp>) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);
-    fn changes<'a>(&'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize)
+    fn changes<'a>(&'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize, descending: bool)
         -> BoxFuture<'a, Result<rtdb_node::OwnedMergedChanges>>;
     fn valid_during<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval, parent_only: bool,
@@ -122,6 +122,10 @@ pub trait OwnedWorldRead: Send + Sync {
     fn overlay_identities<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn path_touch_after<'a>(
+        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
+        group: Timestamp, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn path_touch<'a>(
         &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
         before: Timestamp, group: Timestamp, valid: Timestamp,

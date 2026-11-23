@@ -203,6 +203,13 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relations: &[OwnedRelation],
         after: Timestamp, through: Timestamp, limit: usize,
     ) -> Result<OwnedMergedChanges> {
+        self.world_merged_changes_ordered(world, relations, after, through, limit, false).await
+    }
+
+    pub async fn world_merged_changes_ordered(
+        &self, world: rtdb_types::Iid, relations: &[OwnedRelation],
+        after: Timestamp, through: Timestamp, limit: usize, descending: bool,
+    ) -> Result<OwnedMergedChanges> {
         let (record, _charge) = self.world_registration(world).await?
             .filter(|(record, _)| !record.dropped && self.present.system_time < record.until)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
@@ -224,7 +231,8 @@ impl OwnedReadSession {
             }
             relation.in_world(world)
         }).collect::<Result<Vec<_>>>()?;
-        let mut page = self.merged_change_journals(&scoped, after, through, limit, ChangeScan::Forward).await?;
+        let scan = if descending { ChangeScan::Reverse } else { ChangeScan::Forward };
+        let mut page = self.merged_change_journals(&scoped, after, through, limit, scan).await?;
         for commit in &mut page.commits {
             for group in &mut commit.changes {
                 group.relation = group.relation.root_relation().ok_or_else(change_feed_uncovered)?;
@@ -273,7 +281,7 @@ impl OwnedReadSession {
             return Err(change_feed_uncovered());
         }
         let page = self.merged_changes_at(std::slice::from_ref(relation), before, group, 1).await?;
-        require_path_touch(&page, relation, id, group, valid)?;
+        require_path_touch(&page, relation, id, group, valid, false)?;
         let prior = self.ordered_root_context(relation, before).await?;
         let accepted = self.ordered_root_context(relation, group).await?;
         crate::ordered_index::stable_owned_path_columns(&prior, &accepted, &self.owner, relation, path).await
@@ -285,16 +293,34 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, path: &OwnedRelation,
         id: &EntityId, group: Timestamp, valid: Timestamp,
     ) -> Result<(Vec<String>, [super::OwnedWorldShadowRead; 2])> {
+        let (before, columns) = self.certify_world_path_touch(world, relation, path, id, group, valid, false).await?;
+        let before = self.read_world_shadow_at(world, relation, id, valid, before, false).await?;
+        let after = self.read_world_shadow_at(world, relation, id, valid, group, false).await?;
+        Ok((columns, [before, after]))
+    }
+
+    /// Reads only the accepted local image of a certified ordinary Put.
+    pub async fn world_path_touch_after(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, path: &OwnedRelation,
+        id: &EntityId, group: Timestamp, valid: Timestamp,
+    ) -> Result<(Vec<String>, super::OwnedWorldShadowRead)> {
+        let (_, columns) = self.certify_world_path_touch(world, relation, path, id, group, valid, true).await?;
+        let after = self.read_world_shadow_at(world, relation, id, valid, group, false).await?;
+        Ok((columns, after))
+    }
+
+    async fn certify_world_path_touch(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, path: &OwnedRelation,
+        id: &EntityId, group: Timestamp, valid: Timestamp, require_put: bool,
+    ) -> Result<(Timestamp, Vec<String>)> {
         let before = Timestamp(group.0.checked_sub(1).ok_or_else(change_feed_uncovered)?);
         let page = self.world_merged_changes(world, std::slice::from_ref(relation), before, group, 1).await?;
-        require_path_touch(&page, relation, id, group, valid)?;
+        require_path_touch(&page, relation, id, group, valid, require_put)?;
         let context = self.relation_context(relation)?;
         let prior = context.with_owned_system_cut(before, &context.cancellation)?;
         let accepted = context.with_owned_system_cut(group, &context.cancellation)?;
         let columns = crate::ordered_index::stable_owned_path_columns(&prior, &accepted, &self.owner, relation, path).await?;
-        let before = self.read_world_shadow_at(world, relation, id, valid, before, false).await?;
-        let after = self.read_world_shadow_at(world, relation, id, valid, group, false).await?;
-        Ok((columns, [before, after]))
+        Ok((before, columns))
     }
 
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {
@@ -887,13 +913,14 @@ impl OwnedReadSession {
 }
 
 fn require_path_touch(
-    page: &OwnedMergedChanges, relation: &OwnedRelation, id: &EntityId, group: Timestamp, valid: Timestamp,
+    page: &OwnedMergedChanges, relation: &OwnedRelation, id: &EntityId, group: Timestamp, valid: Timestamp, require_put: bool,
 ) -> Result<()> {
     let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
     let [changes] = commit.changes.as_slice() else { return Err(change_feed_uncovered()); };
     if commit.revision != group || changes.relation != *relation || !changes.touches.iter().any(|touch| {
         touch.id == *id && touch.valid.lower() <= valid && valid < touch.valid.upper()
-            && matches!(touch.kind, rtdb_types::OwnedChangeKind::Put | rtdb_types::OwnedChangeKind::Delete)
+            && (touch.kind == rtdb_types::OwnedChangeKind::Put
+                || (!require_put && touch.kind == rtdb_types::OwnedChangeKind::Delete))
     }) {
         return Err(change_feed_uncovered());
     }
