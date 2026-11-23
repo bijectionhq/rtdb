@@ -273,6 +273,103 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
     }))
 }
 
+/// Bind a provisional world to the destination's independently retained
+/// parent using the pin identity already ordered by the Original history.
+pub(crate) async fn retain_replayed_checkpoint_world(
+    directory: Arc<dyn Directory>,
+    archive: &CellStorage,
+    storage: &CellStorage,
+    agent: &crate::agent::NodeAgent,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    session: &mut NativeSession,
+    deployment: Uuid,
+    binding: [u8; 32],
+    id: Uuid,
+    resources: CheckpointReadResources<'_>,
+) -> Result<rtdb_flight_sql::RetainedReplayWorld> {
+    let unavailable = OwnedWorld::unavailable;
+    let owner = session.state().user().filter(|owner| !owner.is_empty())
+        .ok_or_else(unavailable)?.to_owned();
+    let iid = Iid(*id.as_bytes());
+    let staged = session.open_owned_read().await?.replayed_world(binding, iid).await?;
+    let parent = prepare_checkpoint_replay_parent(
+        Arc::clone(&directory), archive, storage, agent, keys, hosted_task, session,
+        deployment, binding, Some(staged.world.basis), resources,
+    ).await?.ok_or_else(unavailable)?;
+    let live = session.open_owned_read().await?;
+    let current = live.replayed_world(binding, iid).await?;
+    let world = current.world;
+    if world != staged.world || current.source_cut != staged.source_cut
+        || current.destination_parent != staged.destination_parent
+        || parent.basis.system_time != current.destination_parent
+        || parent.schema_digest != world.schemas.digest()
+    {
+        return Err(unavailable());
+    }
+    let duration = world.until.0.checked_sub(current.source_cut.0)
+        .filter(|duration| *duration > 0).ok_or_else(unavailable)?;
+    let until = Timestamp(live.present().system_time.max(now()).0
+        .checked_add(duration).filter(|until| *until < i64::MAX).ok_or_else(unavailable)?);
+    live.check()?;
+    let pin = Uuid::from_bytes(world.pin.0);
+    let retained = CheckpointWorldRetention {
+        world: id,
+        owner,
+        capture: Uuid::from_bytes(parent.capture),
+        manifest_sha256: parent.manifest,
+        schema_digest: parent.schema_digest,
+        suffix: parent.suffix.map(Uuid::from_bytes),
+        basis: parent.basis,
+        parent_publication: Some(world.inherited_clock()),
+        mode: world.mode,
+        until,
+    };
+    let scope = session.placed_history()?;
+    let database = session.state().database().to_owned();
+    let installed = update_installation(directory.as_ref(), &deployment.to_string(), |record| {
+        let eligible = PlacedAttemptScope::new(&record.stream("replica"), record.epoch)
+            .map_err(|_| unavailable())?;
+        if record.name != database || record.writer_pool().is_none() || scope != Some(eligible) {
+            return Err(unavailable());
+        }
+        let now = now();
+        record.checkpoint_worlds.retain(|_, world| world.until > now);
+        let selected = if let Some(existing) = record.checkpoint_worlds.get(&pin) {
+            if existing.world != id || existing.owner != retained.owner
+                || existing.schema_digest != retained.schema_digest || existing.basis != retained.basis
+                || existing.parent_publication != retained.parent_publication || existing.mode != retained.mode
+            {
+                return Err(unavailable());
+            }
+            existing
+        } else {
+            if until <= now || record.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS {
+                return Err(unavailable());
+            }
+            &retained
+        };
+        admit_capture(record, archive, &CheckpointReadWorld {
+            deployment,
+            capture: selected.capture,
+            manifest_sha256: selected.manifest_sha256.clone(),
+            suffix: selected.suffix,
+            basis: selected.basis,
+        })?;
+        record.checkpoint_worlds.entry(pin).or_insert_with(|| retained.clone());
+        Ok(())
+    }).await?;
+    let retained = installed.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
+    Ok(rtdb_flight_sql::RetainedReplayWorld {
+        pin: *pin.as_bytes(),
+        capture: *retained.capture.as_bytes(),
+        suffix: retained.suffix.map(|suffix| *suffix.as_bytes()),
+        manifest: retained.manifest_sha256.clone(),
+        basis: retained.basis,
+        until: retained.until,
+    })
+}
+
 fn world_record(
     pin: Uuid,
     retained: &CheckpointWorldRetention,

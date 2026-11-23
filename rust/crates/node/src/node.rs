@@ -994,6 +994,13 @@ pub struct OwnedReadSession {
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
+pub struct OwnedReplayWorld {
+    pub world: rtdb_types::OwnedWorld,
+    pub source_cut: Timestamp,
+    pub destination_parent: Timestamp,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+}
+
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
 
@@ -1093,6 +1100,26 @@ impl OwnedReadSession {
         cut.live = None;
         cut.publication = true;
         Ok((cut, logical))
+    }
+
+    /// Read a provisional world and its co-ordered parent proof under the
+    /// same held restore binding.
+    pub async fn replayed_world(
+        &self, binding: [u8; 32], id: rtdb_types::Iid,
+    ) -> Result<OwnedReplayWorld> {
+        let archive = self.replay_parent_hold(binding, false).await?;
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let (frontier, _) = self.replay_parent_control("native-frontier.v1").await?
+            .ok_or_else(unavailable)?;
+        let source_cut = rtdb_tx::replayed_archive_cut(&frontier, binding, &archive)?;
+        let (world, reservation) = self.world_registration(id).await?
+            .filter(|(world, _)| world.id == id && !world.dropped && source_cut < world.until)
+            .ok_or_else(unavailable)?;
+        let proof = rtdb_tx::replayed_world_parent_locator(&world);
+        let (body, _) = self.replay_parent_control(&proof).await?.ok_or_else(unavailable)?;
+        let destination_parent = rtdb_tx::replayed_world_parent(&body, binding, &world)?;
+        self.check()?;
+        Ok(OwnedReplayWorld { world, source_cut, destination_parent, _reservation: reservation })
     }
 
     async fn replay_parent_control(&self, id: &str) -> Result<Option<(Vec<u8>, Timestamp)>> {

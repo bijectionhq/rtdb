@@ -80,6 +80,7 @@ pub(crate) use replica_suffix::{MAX_SUFFIX_BYTES, MAX_SUFFIX_ENTRIES, capture as
 mod read_world;
 mod writable_world;
 pub(crate) use writable_world::prepare_checkpoint_replay_parent;
+pub(crate) use writable_world::retain_replayed_checkpoint_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::WorldPoint;
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};

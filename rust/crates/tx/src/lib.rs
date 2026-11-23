@@ -22,5 +22,8 @@ pub use replay_submission::{ReplaySubmission, private_replay_original};
 
 mod hosted_control;
 pub use hosted_control::{HostedControlWrite, MAX_PROPOSAL_LAND_ROWS, proposal_close_controls, proposal_land_controls, proposal_overlay_controls, retained_delete_controls, retained_release_controls};
-pub use hosted_control::{hosted_replay_controls, replayed_parent_logical_time};
+pub use hosted_control::{
+    hosted_replay_controls, replayed_archive_cut, replayed_parent_logical_time,
+    replayed_world_parent, replayed_world_parent_locator,
+};
 pub use hosted_control::{is_proposal_landing_frontier, is_proposal_landing_period};

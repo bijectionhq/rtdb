@@ -13,16 +13,7 @@ use rtdb_types::{
 };
 
 use super::{OpenTransaction, no_owned_principal, overflow, validate_owned_schema};
-use crate::hosted_control::{HostedReplay, ReplayWorlds};
-
-#[derive(serde::Serialize)]
-struct ReplayedWorldParent {
-    binding: [u8; 32],
-    world: [u8; 16],
-    pin: [u8; 16],
-    original: TransactionKey,
-    destination: Timestamp,
-}
+use crate::hosted_control::{HostedReplay, ReplayWorlds, ReplayedWorldParent};
 
 impl OpenTransaction<'_> {
     pub(super) async fn restore_owned_worlds(
@@ -214,7 +205,7 @@ impl OpenTransaction<'_> {
             original: world.basis,
             destination,
         };
-        let locator = format!("native-world-parent/{}/{}", world.id, world.pin);
+        let locator = ReplayedWorldParent::locator(world.id, world.pin);
         let body = serde_json::to_vec(&parent).map_err(|_| OwnedWorld::unavailable())?;
         self.buffer.put(
             table,

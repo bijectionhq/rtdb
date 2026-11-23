@@ -69,6 +69,7 @@ impl Service {
                     Ok(Vec::new())
                 }
                 crate::owned_actions::PREPARE_REPLAY_PARENT_V1 => Ok(vec![Ok(self.prepare_replay_parent_action(&call, &action.body).await?)]),
+                crate::owned_actions::RETAIN_REPLAYED_WORLD_V1 => Ok(vec![Ok(self.retain_replayed_world_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_WORLD_READ_V4 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_POINT_V2 => Ok(vec![Ok(self.held_world_point_action(&call, &action.body).await?)]),
                 crate::owned_actions::CLOSE_WORLD_READ_V1 => {

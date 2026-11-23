@@ -247,18 +247,63 @@ fn original_prefix(event: rtdb_types::TransactionKey, captured: rtdb_types::Tran
 pub fn replayed_parent_logical_time(
     body: &[u8], binding: [u8; 32], archive_pin: &[u8], original: rtdb_types::TransactionKey,
 ) -> Result<Timestamp> {
+    let replay = decode_accepted_replay(body, binding, archive_pin)?;
+    if replay.source != original {
+        return Err(replay_invalid());
+    }
+    Ok(replay.logical_time())
+}
+
+pub fn replayed_archive_cut(body: &[u8], binding: [u8; 32], archive_pin: &[u8]) -> Result<Timestamp> {
+    Ok(decode_accepted_replay(body, binding, archive_pin)?.captured.system_time)
+}
+
+fn decode_accepted_replay(body: &[u8], binding: [u8; 32], archive_pin: &[u8]) -> Result<HostedReplay> {
     if body.len() > 4096 { return Err(replay_invalid()); }
     let replay: HostedReplay = serde_json::from_slice(body).map_err(|_| replay_invalid())?;
     let archive_matches = archive_pin.split_first_chunk::<32>().is_some_and(|(archive, cut)| {
         archive == &replay.archive && cut == replay.through.to_be_bytes().as_slice()
     });
     if replay.binding != binding || !archive_matches || !replay.has_original_prefix()
-        || replay.source != original || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
-        || replay.logical_time() > original.system_time
+        || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
+        || replay.logical_time() > replay.source.system_time
     {
         return Err(replay_invalid());
     }
-    Ok(replay.logical_time())
+    Ok(replay)
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplayedWorldParent {
+    pub(crate) binding: [u8; 32],
+    pub(crate) world: [u8; 16],
+    pub(crate) pin: [u8; 16],
+    pub(crate) original: rtdb_types::TransactionKey,
+    pub(crate) destination: Timestamp,
+}
+
+impl ReplayedWorldParent {
+    pub(crate) fn locator(world: rtdb_types::Iid, pin: rtdb_types::Iid) -> String {
+        format!("native-world-parent/{world}/{pin}")
+    }
+}
+
+pub fn replayed_world_parent_locator(world: &rtdb_types::OwnedWorld) -> String {
+    ReplayedWorldParent::locator(world.id, world.pin)
+}
+
+pub fn replayed_world_parent(
+    body: &[u8], binding: [u8; 32], world: &rtdb_types::OwnedWorld,
+) -> Result<Timestamp> {
+    if body.len() > 4096 { return Err(replay_invalid()); }
+    let parent: ReplayedWorldParent = serde_json::from_slice(body).map_err(|_| replay_invalid())?;
+    if parent.binding != binding || parent.world != world.id.0 || parent.pin != world.pin.0
+        || parent.original != world.basis || parent.destination <= world.basis.system_time
+    {
+        return Err(replay_invalid());
+    }
+    Ok(parent.destination)
 }
 
 fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {

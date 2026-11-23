@@ -160,6 +160,7 @@ pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPa
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParent.v1";
+pub(crate) const RETAIN_REPLAYED_WORLD_V1: &str = "rtdb.owned.RetainReplayedWorld.v1";
 pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
@@ -1844,6 +1845,26 @@ impl Service {
             *binding, original,
         ).await.map_err(status)?;
         let body = serde_json::to_vec(&parent).map_err(|_| Status::internal("Could not encode replay parent"))?;
+        Ok(ActionResult { body: wire::retain(body, charge) })
+    }
+
+    pub(crate) async fn retain_replayed_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (binding, world) = body.split_first_chunk::<32>()
+            .and_then(|(binding, tail)| <[u8; 16]>::try_from(tail).ok().map(|world| (binding, world)))
+            .ok_or_else(|| invalid("Replay world retention requires a hold binding and world UUID"))?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let charge = call.reserve(4096)?;
+        let retained = host.retain_replayed_world(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            *binding, Uuid::from_bytes(world),
+        ).await.map_err(status)?;
+        let body = serde_json::to_vec(&retained).map_err(|_| Status::internal("Could not encode replay world retention"))?;
         Ok(ActionResult { body: wire::retain(body, charge) })
     }
 
