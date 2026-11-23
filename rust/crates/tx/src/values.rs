@@ -1173,7 +1173,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     HostedConstraintRefusal,
     OwnedDeadline { until: Timestamp, recheck_at_staging: bool },
-    OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope },
+    OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope, clock: Option<rtdb_types::WorldClockLimit> },
     OwnedForkWorld {
         record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,
         overlay_source: Option<(rtdb_types::Iid, rtdb_types::Iid)>,

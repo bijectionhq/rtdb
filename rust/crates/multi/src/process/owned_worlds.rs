@@ -144,10 +144,10 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>> {
+    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
-            validate_checkpoint_world(self.directory.as_ref(), &self.archive, call.session, deployment, world, checks, controls, deadline).await
+            validate_checkpoint_world(self.directory.as_ref(), &self.archive, call.session, deployment, world, checks, controls, deadline, clock).await
         })
     }
 

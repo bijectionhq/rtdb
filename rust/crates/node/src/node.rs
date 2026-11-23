@@ -2719,12 +2719,13 @@ impl NativeSession {
 
     pub async fn validate_owned_world(
         &mut self, record: &rtdb_types::OwnedWorld, checks: Vec<OwnedWorldWitness>,
-        controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
+        controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>,
     ) -> Result<TransactionResult> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let count = controls.len().saturating_add(checks.len().saturating_mul(2)).saturating_add(2);
-        if !(1..=128).contains(&checks.len()) || controls.is_empty() || count > 4096
+        if checks.len() > 128 || (checks.is_empty() && clock.is_none()) || controls.is_empty() || count > 4096
             || controls.iter().any(|control| !control.is_check())
+            || clock.is_some_and(|clock| clock.world != record.id || clock.pin != record.pin)
         {
             return Err(unavailable());
         }
@@ -2743,7 +2744,7 @@ impl NativeSession {
         let _operations = self.service.node.memory().reserve(count * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(count);
         ops.push(TxOp::owned_deadline(until));
-        ops.push(TxOp::OwnedCheckWorldScope { scope });
+        ops.push(TxOp::OwnedCheckWorldScope { scope, clock });
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
         Self::append_world_checks(&mut ops, checks);
         self.state.execute_tx(ops, Default::default()).await
@@ -2865,7 +2866,7 @@ impl NativeSession {
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
         ops.push(TxOp::owned_deadline(until));
-        ops.push(TxOp::OwnedCheckWorldScope { scope });
+        ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
         ops.extend(root.checks);
         if let Some(root) = root.publication {
@@ -2914,7 +2915,7 @@ impl NativeSession {
         if !(1..=8).contains(&worlds.len()) || checks.len() > 8 * 128 || now >= *until {
             return Err(unavailable());
         }
-        ops.push(TxOp::OwnedCheckWorldScope { scope });
+        ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
         Self::append_world_checks(ops, checks);
         Ok(())
     }
