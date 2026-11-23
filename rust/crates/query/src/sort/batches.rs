@@ -326,14 +326,14 @@ impl BatchCursor for BatchSort {
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        span.attribute("sort_columnar", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("sort_columnar", rtdb_plan::TraceValue::Boolean(true));
         span.attribute(
             "sort_arrow_keys",
-            rtdb_plan::TraceValue::Unsigned(u64::from(self.used_native)),
+            rtdb_plan::TraceValue::Boolean(self.used_native),
         );
         span.attribute(
             "sort_columnar_spill",
-            rtdb_plan::TraceValue::Unsigned(u64::from(self.spilled)),
+            rtdb_plan::TraceValue::Boolean(self.spilled),
         );
     }
 }

@@ -130,3 +130,15 @@ A case-insensitive `true` enables exclusive SQL GENERATE_SERIES endpoints; all o
 RANGE remains exclusive.
 The captured policy reaches prepared SQL, direct queries, static transaction expansion and transaction-time SQL resolution.
 `tests/series_setting.rs` contains the environment decoding and shared node-options regression source.
+
+=== Query execution diagnostics
+
+Native `EXPLAIN ANALYZE` reports the peak accounted memory for each operator in `peak_memory_bytes` and the whole query's peak in `query_peak_memory_bytes`.
+Operator scopes share the query limit, so their individual peaks can occur at different times.
+The report includes optimized Arrow operators, and operator spans carry the same `cursor.peak_memory_bytes` measurements.
+Query spans opened through pgwire, Flight SQL, and the embedded API carry the session's `application.name`.
+Flight SQL defaults to `XTDB Flight SQL`, and Clojure queries opened on a native database default to `XTDB Clojure API`.
+The OTLP exporter emits numeric and Boolean attributes with their corresponding wire types.
+
+Native materialized CTEs reuse small results in memory.
+When the result grows beyond the row threshold or its memory allowance, the binding writes one spill file, which counts against the query spill limit.

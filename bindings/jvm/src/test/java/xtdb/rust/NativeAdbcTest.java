@@ -25,6 +25,21 @@ final class NativeAdbcTest {
     private static final String YAML = "server: null\nflightSql: null\nnodeId: jvm-binding-test\n";
     private static NativeDatabase open(RootAllocator allocator) throws Exception { return NativeDatabase.open(allocator, YAML, 512L * 1024 * 1024); }
 
+    @Test void setsTheEmbeddedApplicationName() throws Exception {
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
+            assertEquals("XTDB", applicationName(connection));
+            connection.setApplicationName("météo's importer");
+            assertEquals("météo's importer", applicationName(connection));
+        }
+    }
+
+    private static String applicationName(NativeConnection connection) throws Exception {
+        try (var show = connection.createStatement("SHOW application_name"); var result = show.executeQuery()) {
+            assertTrue(result.getReader().loadNextBatch());
+            return result.getReader().getVectorSchemaRoot().getVector(0).getObject(0).toString();
+        }
+    }
+
     @Test void explicitObjectSorterSelectionOpensIndependentNativeRuntimes() throws Exception {
         for (boolean legacy : new boolean[] {false, true}) {
             try (var allocator = new RootAllocator(); var database = NativeDatabase.open(allocator, YAML, 512L * 1024 * 1024, legacy); var connection = database.connect(); var statement = connection.createStatement("SELECT n FROM (VALUES (3), (1), (2), (1)) AS t(n) ORDER BY n")) {

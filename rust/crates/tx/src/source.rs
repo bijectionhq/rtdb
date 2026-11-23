@@ -1174,7 +1174,7 @@ impl DocumentCell<'_> {
             Self::Arrow { logical, .. } if **logical == LogicalType::Nothing => Cow::Owned(Value::Undefined),
             Self::Arrow { field, column, logical, row } => {
                 let mut value = rtdb_columnar::read_value_as(logical, field, *column, *row)?;
-                value.admit_object_dates();
+                value.admit_object_dates()?;
                 Cow::Owned(value)
             }
         })

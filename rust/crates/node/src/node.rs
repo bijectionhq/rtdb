@@ -3132,7 +3132,7 @@ impl NativeSession {
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
-        Ok(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))
+        Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?))
     }
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;

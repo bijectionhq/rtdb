@@ -42,7 +42,18 @@
 -- A sort can combine computed keys with keys taken directly from its input columns.
 -- Its Arrow spill records retain compatible physical payload layouts.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
--- A materialized relation writes each page as Arrow IPC and opens an independent reader for each reference.
+-- A materialized relation evaluates on its first reached reference and preserves the order of its pages.
+-- Native execution holds its pages within the materialization row and memory bounds.
+-- When either bound is crossed it replays all pages through one query-scoped spill file, using the column spill format.
+-- Every reference has its own replay position and every outstanding page retains its own memory.
+-- Measured operators reserve against sibling scopes of the same query budget.
+-- Each operator can report its own retained-allocation peak and the query reports the peak across all operators.
+-- EXPLAIN ANALYZE measures the opened Arrow operators when the query uses Arrow execution.
+-- A direct Arrow parameter projection charges its own operator scope when traced.
+-- Native query spans use the application name of their connection.
+-- Pgwire uses the application name supplied at startup or by SET.
+-- Flight SQL connections default to XTDB Flight SQL and embedded connections default to XTDB.
+-- The application name survives DISCARD ALL.
 -- Those spill pages retain each record's fields and preserve their original page boundaries.
 -- Computed VALUES and replayed literal pages admit their results column by column.
 -- Column tables preserve one semantic page across the input list's batches.

@@ -206,7 +206,7 @@ fn numeric_cells(array: &dyn Array) -> Option<Box<dyn Fn(usize) -> f64 + '_>> {
         DataType::Float32 => { let array = array.as_primitive::<Float32Type>(); Box::new(move |row| f64::from(array.value(row))) }
         DataType::Float64 => { let array = array.as_primitive::<Float64Type>(); Box::new(move |row| array.value(row)) }
         DataType::Date32 => { let array = array.as_primitive::<Date32Type>(); Box::new(move |row| i64::from(array.value(row)).wrapping_mul(86_400) as f64) }
-        DataType::Date64 => { let array = array.as_primitive::<Date64Type>(); Box::new(move |row| (array.value(row) / 86_400_000).wrapping_mul(86_400) as f64) }
+        DataType::Date64 => { let array = array.as_primitive::<Date64Type>(); Box::new(move |row| (array.value(row).div_euclid(rtdb_types::java_date::MILLIS_PER_DAY) * 86_400) as f64) }
         DataType::Time32(Unit::Second) => { let array = array.as_primitive::<Time32SecondType>(); Box::new(move |row| f64::from(array.value(row))) }
         DataType::Time32(Unit::Millisecond) => { let array = array.as_primitive::<Time32MillisecondType>(); Box::new(move |row| f64::from(array.value(row)) / 1e3) }
         DataType::Time64(Unit::Microsecond) => { let array = array.as_primitive::<Time64MicrosecondType>(); Box::new(move |row| array.value(row) as f64 / 1e6) }
@@ -256,9 +256,9 @@ mod tests {
         }
     }
     #[test]
-    fn date_millisecond_statistics_truncate_partial_days_before_seconds_conversion() {
+    fn date_millisecond_statistics_floor_to_the_containing_day() {
         let millis = arrow_array::Date64Array::from(vec![-86_400_001, -86_400_000, -1, 0, 86_400_001]);
-        let days = arrow_array::Date32Array::from(vec![-1, -1, 0, 0, 1]);
+        let days = arrow_array::Date32Array::from(vec![-2, -1, -1, 0, 1]);
         let millis = numeric_cells(&millis).unwrap();
         let days = numeric_cells(&days).unwrap();
         for row in 0..5 { assert_eq!(millis(row), days(row)); }
