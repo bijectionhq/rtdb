@@ -150,6 +150,12 @@ impl AppliedReadFloor {
     }
 }
 
+/// The held read's covered position and its own receiver observation.
+pub struct AppliedReadConfirmation {
+    pub covered: TransactionKey,
+    pub observed_at: Timestamp,
+}
+
 fn unavailable() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Unavailable,
@@ -301,7 +307,7 @@ impl OwnedReadSession {
         until: Timestamp,
         controls: &[HostedControlWrite],
         point: Option<&AppliedOwnedPoint>,
-    ) -> Result<Option<TransactionKey>> {
+    ) -> Result<Option<AppliedReadConfirmation>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.applied_scope != Some(scope)
@@ -355,8 +361,7 @@ impl OwnedReadSession {
         let [captured] = database.partitions.as_slice() else {
             return Err(unavailable());
         };
-        let head = captured.tx_basis().filter(|head| head.system_time < until)
-            .ok_or_else(unavailable)?;
+        let head = captured.tx_basis().ok_or_else(unavailable)?;
         floor.require_transactions(&current, head, Some(self.present)).await?;
         let mut matches = compare_controls(&self.context, &current, controls).await?;
         if let Some(point) = point {
@@ -379,10 +384,11 @@ impl OwnedReadSession {
         }
         self.check()?;
         current.check_cancelled()?;
-        if self.node.now() >= until {
+        let observed_at = self.node.now();
+        if observed_at >= until {
             return Err(unavailable());
         }
-        Ok(matches.then_some(head))
+        Ok(matches.then_some(AppliedReadConfirmation { covered: head, observed_at }))
     }
 }
 
@@ -422,7 +428,9 @@ mod tests {
         assert_eq!(confirmation_floor(original, original).unwrap(), original);
         assert_eq!(confirmation_floor(original, later).unwrap(), later);
         assert_eq!(confirmation_floor(later, original).unwrap(), later);
-        for divergent in [cut(3, 8), cut(4, 5), cut(4, 2)] {
+        let tied = cut(4, 5);
+        assert_eq!(confirmation_floor(original, tied).unwrap(), tied);
+        for divergent in [cut(3, 8), cut(4, 2)] {
             assert!(confirmation_floor(original, divergent).is_err());
         }
     }

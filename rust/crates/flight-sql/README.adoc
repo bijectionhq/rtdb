@@ -327,7 +327,7 @@ Holder confirmation, exact transaction checks, and session generations still app
 The reservation admits preparation, applied open and confirmation, held point and historical point reads, hosted control reads, and closure of the hold or session.
 The gateway routes only action RPCs on a reserved session.
 
-`rtdb.owned.ConfirmAppliedHosted.v5` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
+`rtdb.owned.ConfirmAppliedHosted.v6` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
 The point option is one zero byte for a control-only read or one byte of value one followed by the ordinary relation prefix, a big-endian u16 UTF-8 key length and key, and a signed big-endian i64 valid instant in microseconds.
 An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision.
 The original handle must come from `rtdb.owned.OpenAppliedRead.v4`.
@@ -335,7 +335,7 @@ Every control must be a check from the placed attachment's installed allowlist.
 The point must be an ordinary Root point at the original held valid instant.
 The node proves the supplied floor and the original transaction on one newly pinned applied catalog.
 It checks the supplied control and point revisions and absences on the original and newly pinned catalogs.
-Success returns the newly captured transaction ID and time as two signed big-endian i64 values.
+Success returns three signed big-endian i64 values: the captured transaction ID, its SQL system time, and the receiver clock observation that satisfied the cutoff.
 A changed control or point returns one zero byte.
 The node refuses unproven cuts and checks the physical clock again before returning.
 This action appends no transaction and authorizes no write.

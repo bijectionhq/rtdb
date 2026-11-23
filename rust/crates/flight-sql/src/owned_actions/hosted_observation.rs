@@ -3,7 +3,7 @@ use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
 pub(crate) const PREPARE_APPLIED_READ_V3: &str = "rtdb.owned.PrepareAppliedRead.v3";
-pub(crate) const CONFIRM_APPLIED_HOSTED_V5: &str = "rtdb.owned.ConfirmAppliedHosted.v5";
+pub(crate) const CONFIRM_APPLIED_HOSTED_V6: &str = "rtdb.owned.ConfirmAppliedHosted.v6";
 
 pub(super) fn applied_read_floor(body: &[u8]) -> Result<(rtdb_node::AppliedReadFloor, &[u8]), Status> {
     let (history, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Applied read requires a history"))?;
@@ -113,15 +113,16 @@ impl Service {
         let covered = held.snapshot.confirm_applied_hosted_read(scope, &floor, until, &controls, point.as_ref())
             .await.map_err(status)?;
         let bytes = match covered {
-            Some(covered) => {
-                let mut bytes = Vec::with_capacity(16);
-                bytes.extend_from_slice(&covered.tx_id.0.to_be_bytes());
-                bytes.extend_from_slice(&covered.system_time.0.to_be_bytes());
+            Some(confirmation) => {
+                let mut bytes = Vec::with_capacity(24);
+                bytes.extend_from_slice(&confirmation.covered.tx_id.0.to_be_bytes());
+                bytes.extend_from_slice(&confirmation.covered.system_time.0.to_be_bytes());
+                bytes.extend_from_slice(&confirmation.observed_at.0.to_be_bytes());
                 Bytes::from(bytes)
             }
             None => Bytes::from_static(&[0]),
         };
-        Ok(ActionResult { body: wire::retain(bytes, call.reserve(16)?) })
+        Ok(ActionResult { body: wire::retain(bytes, call.reserve(24)?) })
     }
 
     pub(crate) async fn observe_held_hosted_action(

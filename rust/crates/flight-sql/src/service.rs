@@ -525,7 +525,7 @@ mod tests {
         for action in [
             crate::owned_actions::PREPARE_APPLIED_READ_V3,
             crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4,
-            crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5,
+            crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6,
             "closesession",
         ] {
             assert!(matches!(CallKind::action(true, action), CallKind::Action));

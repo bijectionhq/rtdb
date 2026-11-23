@@ -3,7 +3,7 @@ mod hosted_observation;
 mod unique;
 
 pub(crate) use hosted_control::READ_HELD_HOSTED_CONTROL_V2;
-pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V5, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
+pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V6, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
 pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
@@ -1758,7 +1758,7 @@ impl Service {
                     return Err(Status::permission_denied("The relation is outside the prepared audience projection"));
                 }
             },
-            READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V5 => &held.audience_work,
+            READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V6 => &held.audience_work,
             _ => return Err(unsupported()),
         };
         work.clone().ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))

@@ -1,7 +1,7 @@
 mod historical_owned_read;
 mod hosted_control;
 mod hosted_observation;
-pub use hosted_observation::{AppliedOwnedPoint, AppliedReadFloor};
+pub use hosted_observation::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
 use hosted_observation::PreparedAppliedCatalog;
 mod owned_changes;
 mod owned_usage;
