@@ -324,11 +324,12 @@ impl Leased for OwnedWorldReadResource {
 
 struct RetainedWorldWitness {
     evidence: OwnedWorldWitness,
+    absent_in_parent_and_overlay: bool,
     _reservation: Arc<MemoryReservation>,
 }
 
 impl OwnedWorldReadResource {
-    fn remember(&self, call: &Call, evidence: OwnedWorldWitness) -> Result<Uuid, Status> {
+    fn remember(&self, call: &Call, evidence: OwnedWorldWitness, absent_in_parent_and_overlay: bool) -> Result<Uuid, Status> {
         self.snapshot.check().map_err(status)?;
         let mut conditions = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
         if conditions.len() >= MAX_WORLD_WITNESSES {
@@ -339,7 +340,7 @@ impl OwnedWorldReadResource {
             return Err(Status::unavailable("Could not issue an owned world point witness"));
         }
         let charge = call.reserve(evidence.allocation_bound())?;
-        conditions.insert(nonce, RetainedWorldWitness { evidence, _reservation: charge });
+        conditions.insert(nonce, RetainedWorldWitness { evidence, absent_in_parent_and_overlay, _reservation: charge });
         Ok(nonce)
     }
 
@@ -358,6 +359,17 @@ impl OwnedWorldReadResource {
             Ok(condition.evidence.clone())
         }).collect::<Result<_, _>>()?;
         Ok((conditions, charge))
+    }
+
+    fn require_create_absence(&self, nonces: &[u8], write: &rtdb_node::OwnedWorldWrite) -> Result<(), Status> {
+        let stored = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
+        if nonces.chunks_exact(16).filter_map(|bytes| Uuid::from_slice(bytes).ok()).any(|nonce| {
+            stored.get(&nonce).is_some_and(|condition| condition.absent_in_parent_and_overlay
+                && condition.evidence.is_absent_point(&write.relation, &write.id))
+        }) {
+            return Ok(());
+        }
+        Err(Status::failed_precondition("A create-only Proposal effect requires original absence in the parent and overlay"))
     }
 }
 
@@ -1430,7 +1442,7 @@ impl Service {
             (page.schema, page.batch, witness, None)
         };
         let _charge = call.reserve(wire::add(wire::schema_bound(&schema)?, 256)?)?;
-        let nonce = held.remember(call, witness)?;
+        let nonce = held.remember(call, witness, false)?;
         let mut metadata = schema.metadata().clone();
         metadata.insert(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string());
         let schema = schema.as_ref().clone().with_metadata(metadata);
@@ -1533,7 +1545,7 @@ impl Service {
         let (page, witnesses) = held.snapshot.ranked_search(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid)
             .await.map_err(status)?;
         if witnesses.len() != relations.len() { return Err(Status::internal("Incomplete retained search evidence")); }
-        let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness)).collect::<Result<Vec<_>, _>>()?;
+        let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness, false)).collect::<Result<Vec<_>, _>>()?;
         let reply = self.owned_rank_reply(call, page, scope, nonces, held.snapshot.present(), valid)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
@@ -1850,7 +1862,8 @@ impl Service {
             return Err(Status::internal("Owned world point changed its held present"));
         }
         let until = result.until;
-        let nonce = result.witness.take().map(|evidence| held.remember(call, evidence)).transpose()?;
+        let absent = result.row.is_none() && !result.shadowed;
+        let nonce = result.witness.take().map(|evidence| held.remember(call, evidence, absent)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
         if matches!(*mode, 2 | 3) {
             held.snapshot.check_parent_point(&relation, until).map_err(status)?;
@@ -1885,7 +1898,7 @@ impl Service {
             (OWNED_VALID_TO.into(), to.0.to_string()),
         ]);
         if let Some(witness) = witness {
-            metadata.insert(WORLD_RANGE_WITNESS.into(), held.remember(call, witness)?.simple().to_string());
+            metadata.insert(WORLD_RANGE_WITNESS.into(), held.remember(call, witness, false)?.simple().to_string());
         }
         let schema = Arc::new(Schema::new(vec![
             Field::new("valid_from_micros", DataType::Int64, false),
@@ -2237,7 +2250,6 @@ impl Service {
             {
                 return Err(Status::failed_precondition("The world clock mode does not admit this effect"));
             }
-            held.push(resource);
             let (effect, rest) = match *kind {
                 0 => {
                     let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world overlay length"))?;
@@ -2246,6 +2258,12 @@ impl Service {
                     let mut writes = Vec::new();
                     self.decode_world_writes(call, owned_groups(overlay, true, false)?, &mut rows_left, &mut writes, &mut reservations)?;
                     if writes.is_empty() { return Err(invalid("The world overlay has no writes")); }
+                    if let Some(write) = writes.iter().find(|write| write.create_only) {
+                        if writes.len() != 1 || mode != rtdb_types::WorldClockMode::Proposal {
+                            return Err(invalid("Only one create-only Proposal effect can be ordered"));
+                        }
+                        resource.require_create_absence(nonces, write)?;
+                    }
                     (rtdb_node::OwnedWorldEffect::Overlay(writes), rest)
                 }
                 1 => {
@@ -2256,6 +2274,7 @@ impl Service {
                 3 => (rtdb_node::OwnedWorldEffect::SettleProposal, rest),
                 _ => return Err(invalid("Unknown world publication effect")),
             };
+            held.push(resource);
             body = rest;
             sections.push(rtdb_node::OwnedWorldSection {
                 world: rtdb_types::Iid(*world.as_bytes()), parent_pin, parent_basis, checks, expected_clock,
@@ -2470,9 +2489,13 @@ impl Service {
                     }
                     _ => return Err(invalid("Owned world write has only one valid endpoint")),
                 };
+                let create_only = operation == "insert";
+                if create_only && valid.is_some() {
+                    return Err(invalid("A create-only Proposal effect uses acceptance validity"));
+                }
                 let shadow = match (operation.as_str(), payload) {
                     ("delete", Value::Null) => WorldShadow::Deleted,
-                    ("replace", Value::Struct(mut fields)) => {
+                    ("replace" | "insert", Value::Struct(mut fields)) => {
                         strip_owned_absence(&mut fields)?;
                         if fields.keys().any(|name| name.starts_with('_')) {
                             return Err(invalid("Owned world fact contains a reserved field"));
@@ -2481,9 +2504,9 @@ impl Service {
                         fact.extend(fields);
                         WorldShadow::Present(fact)
                     }
-                    _ => return Err(invalid("Owned world write requires replace with a fact or delete with a null fact")),
+                    _ => return Err(invalid("Owned world writes require a complete fact or a null deletion")),
                 };
-                writes.push(OwnedWorldWrite { relation: relation.clone(), id, shadow, valid });
+                writes.push(OwnedWorldWrite { relation: relation.clone(), id, shadow, valid, create_only });
             }
         }
         Ok(())
