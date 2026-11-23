@@ -519,22 +519,48 @@ pub async fn owned_ranked_with_overlay(
         return Err(Anomaly::incorrect("rtdb.owned/search-relations", "An owned search relation must be selected once"));
     }
     let query = Query::parse(text);
+    if let Some(overlay) = &overlay { overlay.require_query(&query)?; }
+    match rank_owned_artefacts(&context, owner, partitions, &query, offset, limit, valid_at, overlay.as_ref()).await {
+        Ok((scorer, mut rank)) => {
+            if let Some(overlay) = overlay { overlay.rank(&scorer, &mut rank)?; }
+            context.check_cancelled()?;
+            Ok(rank.finish())
+        }
+        Err(error) if error.code == "rtdb.owned/search-uncovered" => {
+            let mut corpus = match overlay {
+                Some(overlay) => overlay,
+                None => crate::HeldTextCorpus::new(Arc::clone(&context.memory), text)?,
+            };
+            let valid = valid_at.unwrap_or(context.current_time.as_micros()?);
+            for (partition, (relation, path)) in partitions.iter().enumerate() {
+                corpus.read_root_partition(&context, owner, relation, path, partition, valid).await?;
+            }
+            context.check_cancelled()?;
+            corpus.finish(offset, limit)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn rank_owned_artefacts(
+    context: &Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], query: &Query,
+    offset: usize, limit: usize, valid_at: Option<Timestamp>, overlay: Option<&crate::HeldTextCorpus>,
+) -> Result<(rtdb_text::Scorer, OwnedRankWindow)> {
     let mut corpus = rtdb_text::Corpus::default();
     let mut covered = Vec::with_capacity(partitions.len());
     for (partition, (relation, path)) in partitions.iter().enumerate() {
-        let shadowed = overlay.as_ref().and_then(|part| part.shadowed(partition));
-        let part = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, valid_at, true, shadowed).await?;
+        let shadowed = overlay.and_then(|part| part.shadowed(partition));
+        let part = covered_owned_corpus(Arc::clone(context), owner, relation, path, query, valid_at, true, shadowed).await?;
         corpus.add(&part.corpus);
         covered.push((relation, part));
     }
-    if let Some(overlay) = &overlay { corpus.add(overlay.statistics()); }
+    if let Some(overlay) = overlay { corpus.add(overlay.statistics()); }
     let scorer = rtdb_text::Scorer::new(query.clone(), Some(&corpus));
     let mut rank = OwnedRankWindow::new(&context.memory, offset, limit)?;
-    if let Some(overlay) = overlay { overlay.rank(&scorer, &mut rank)?; }
     for (partition, (relation, covered)) in covered.iter().enumerate() {
         for (file, visible) in &covered.visible_runs {
             context.check_cancelled()?;
-            for run in file.matches(&covered.column, &query, covered.bounds)? {
+            for run in file.matches(&covered.column, query, covered.bounds)? {
                 if !visible.contains(&run.doc) { continue; }
                 rank.admit_candidate()?;
                 let key = file.run_identity_bytes(run)?;
@@ -542,7 +568,7 @@ pub async fn owned_ranked_with_overlay(
                 let id = file.run_identity(run)?;
                 let columns = ["_id", covered.column.as_str()];
                 let Some(mut rows) = rtdb_query::open_owned_artefact_candidate(
-                    Arc::clone(&context), owner, relation, &id, Iid(run.iid), covered.bounds.valid_time, &columns,
+                    Arc::clone(context), owner, relation, &id, Iid(run.iid), covered.bounds.valid_time, &columns,
                 ).await? else { return Err(uncovered_owned_search()); };
                 let mut resolved_score = None;
                 while let Some(batch) = rows.next_batch().await? {
@@ -581,8 +607,7 @@ pub async fn owned_ranked_with_overlay(
             }
         }
     }
-    context.check_cancelled()?;
-    Ok(rank.finish())
+    Ok((scorer, rank))
 }
 
 pub(crate) struct OwnedRankWindow {

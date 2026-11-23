@@ -146,7 +146,7 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
 
 #[tokio::test]
 async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() {
-    use rtdb_types::{OwnedRelation, StructFields};
+    use rtdb_types::{EntityId, OwnedRelation, StructFields};
 
     let mut options = options();
     options.owned_relations = true;
@@ -178,6 +178,20 @@ async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() 
     assert!(session.state_mut().execute_tx(vec![replace], AutonomousTxOptions::default()).await.unwrap().committed());
     let uncovered = session.open_owned_read().await.unwrap();
     assert_eq!(uncovered.search_corpus(&relation, &path, "invoice paid").await.unwrap_err().code, "rtdb.owned/search-uncovered");
+    let partitions = [(relation.clone(), path.clone())];
+    let staged = || {
+        let mut stage = rtdb_node::HeldTextCorpus::new(Arc::clone(node.memory()), "invoice").unwrap();
+        stage.shadow(0, EntityId::Integer(1), None).unwrap();
+        stage.shadow(0, EntityId::Integer(2), Some("paid")).unwrap();
+        stage.shadow(0, EntityId::String("1".into()), Some("an invoice")).unwrap();
+        stage
+    };
+    let (uncovered_rank, _) = uncovered.ranked_search_with_overlay(
+        &partitions, "invoice", 0, 2, false, None, Some(staged()),
+    ).await.unwrap();
+    assert_eq!(uncovered_rank.total, 18);
+    assert_eq!(uncovered_rank.hits[0].id, EntityId::String("1".into()));
+    assert_eq!(uncovered_rank.hits[1].id, EntityId::Integer(3));
     drop(uncovered);
     let private_catalog = OwnedRelation::search_catalog("xtdb");
     let direct = format!("SELECT _id FROM {}.\"{}\"", private_catalog.schema, private_catalog.table);
@@ -202,7 +216,11 @@ async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() 
     assert_eq!(corpus.tokens, 39);
     assert_eq!(corpus.frequencies["invoice"], 19);
     assert_eq!(corpus.frequencies["paid"], 1);
-    let partitions = [(relation, path)];
+    let (covered_rank, _) = held.ranked_search_with_overlay(
+        &partitions, "invoice", 0, 2, false, None, Some(staged()),
+    ).await.unwrap();
+    assert_eq!(covered_rank.total, uncovered_rank.total);
+    assert_eq!(covered_rank.hits, uncovered_rank.hits);
     let (hits, _) = held.ranked_search(&partitions, "invoice", 2, false).await.unwrap();
     assert_eq!(hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
         [rtdb_types::EntityId::Integer(1), rtdb_types::EntityId::Integer(2)]);

@@ -1359,7 +1359,8 @@ rule ConsumeIntake {
 -- The child seeks both retained orders for a declared path only when its definition agrees across the two cuts.
 -- The owner merges only the covered prefix and resolves the winning point for each ordered candidate.
 -- An exact count starts with the original Root order total and corrects membership for every bounded Held shadow, including tombstones.
--- Text ranking uses the original Root search artifacts and masks each replaced or withdrawn identity with its retained Held shadow before computing corpus statistics.
+-- Text ranking reads the original Root corpus from covered search artifacts or a bounded projection at the same admitted cut.
+-- The corpus masks each replaced or withdrawn identity with its retained Held shadow before computing statistics.
 -- Live Proposal search overlays the installed writer's bounded staged changes before corpus statistics and binds the staged corpus to its continuation.
 -- A retained Held child restored from an Original archive retains the separately certified destination Root and Held overlay positions before world readmission.
 -- The Held overlay archive keeps its original world, pin, logical publication and source Root coordinate even when the source Held world is dropped or its Root pin is relocated.
