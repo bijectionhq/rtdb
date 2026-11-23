@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::archive::read_world::{CheckpointPoint, read_checkpoint_point_in_context, require_relation_purge_history, with_checkpoint_context};
+use crate::archive::read_world::{ArchiveLifetimeRead, CheckpointPoint, read_checkpoint_point_in_context, require_relation_purge_history, with_checkpoint_context};
 
 #[derive(Clone)]
 pub(crate) struct WorldArchive {
@@ -29,7 +29,7 @@ struct ArchivePoint {
     relation: OwnedRelation,
     id: EntityId,
     valid: Interval,
-    lifetime: Option<i64>,
+    lifetime: Option<ArchiveLifetimeRead>,
     guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     reply: oneshot::Sender<Result<Option<WorldFact>>>,
 }
@@ -173,7 +173,7 @@ impl HeldCheckpointWorld {
     pub async fn parent_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
         self.check()?;
         let policy = self.open.snapshot.lifetime_point_policy(relation).await?;
-        let lifetime = policy.map(|floor| floor.duration);
+        let lifetime = policy.map(|policy| ArchiveLifetimeRead { policy, present: self.present().system_time });
         let basis = self.parent_basis().system_time;
         if lifetime.is_some() && (self.clock_mode() != WorldClockMode::Retained || valid_at != basis) {
             return Err(OwnedWorld::unavailable());
@@ -204,7 +204,7 @@ impl HeldCheckpointWorld {
         Ok(())
     }
 
-    async fn archive_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, lifetime: Option<i64>) -> Result<Option<WorldFact>> {
+    async fn archive_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, lifetime: Option<ArchiveLifetimeRead>) -> Result<Option<WorldFact>> {
         let valid = Interval::at(valid_at)?;
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, self.open.retained.basis.system_time).await?;
         let (reply, result) = oneshot::channel();
@@ -662,7 +662,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let batches = read_checkpoint_point_in_context(Arc::clone(&context).with_owned_read_guard(guard), CheckpointPoint {
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }, lifetime).await?;
-                                        decode_point(batches.unwrap_or_default(), &id, memory, lifetime)
+                                        decode_point(batches.unwrap_or_default(), &id, memory, lifetime.map(|live| live.policy.duration))
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

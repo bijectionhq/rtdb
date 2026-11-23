@@ -985,8 +985,11 @@ pub enum TxOp {
     },
     OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<Timestamp> },
     OwnedErase { relation: rtdb_types::OwnedRelation, id: EntityId },
-    /// Trusted native maintenance only. Preserve every replay present at or above `replay_floor`.
-    OwnedSweepExpired { relation: rtdb_types::OwnedRelation, id: EntityId, created: Timestamp, replay_floor: Timestamp },
+    /// Apply one live nomination within an already ordered same-relation replay floor.
+    OwnedSweepExpired {
+        relation: rtdb_types::OwnedRelation, id: EntityId, created: Timestamp,
+        expiry: Timestamp, scope: rtdb_types::PlacedAttemptScope,
+    },
     OwnedDelete { relation: rtdb_types::OwnedRelation, id: EntityId, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedReplaceDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedInsertDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },

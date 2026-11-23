@@ -16,7 +16,7 @@ use rtdb_storage::{
 };
 use rtdb_types::{
     BlockIndex, EntityId, Interval, OwnedRelation, ReplicaPosition, Result, SourcePosition,
-    StorageEpoch, TransactionKey,
+    OwnedLifetimeFloor, StorageEpoch, Timestamp, TransactionKey,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -86,8 +86,16 @@ pub(super) fn require_relation_purge_history(context: &QueryContext, owner: &str
     Ok(())
 }
 
+/// The original placed live hold supplies the replay present even when the
+/// archived system and business-valid coordinates are older.
+#[derive(Clone, Copy)]
+pub(super) struct ArchiveLifetimeRead {
+    pub policy: OwnedLifetimeFloor,
+    pub present: Timestamp,
+}
+
 pub(super) async fn read_checkpoint_point_in_context(
-    context: Arc<QueryContext>, point: CheckpointPoint<'_>, lifetime: Option<i64>,
+    context: Arc<QueryContext>, point: CheckpointPoint<'_>, lifetime: Option<ArchiveLifetimeRead>,
 ) -> Result<Option<Vec<OwnedBatch>>> {
     require_relation_purge_history(&context, point.owner)?;
     let database = context.catalog.database(context.catalog.default_database())?;
@@ -99,7 +107,12 @@ pub(super) async fn read_checkpoint_point_in_context(
     if governed != lifetime.is_some() {
         return Err(unavailable("The held lifetime does not match the archived relation"));
     }
-    if let Some(duration) = lifetime {
+    if let Some(live) = lifetime {
+        let duration = live.policy.duration;
+        live.policy.admit_recorded_present(live.present)?;
+        if live.present < context.current_time.as_micros()? {
+            return Err(unavailable("The live lifetime present precedes the archived basis"));
+        }
         let archived = rtdb_query::read_owned_relation_schema(Arc::clone(&context), point.owner, point.relation)
             .await?.and_then(|(schema, _)| schema.lifetime_micros());
         if archived != Some(duration) {
@@ -107,6 +120,7 @@ pub(super) async fn read_checkpoint_point_in_context(
         }
         let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), point.owner, point.relation).await?;
         floor.check(duration, context.current_time.as_micros()?)?;
+        floor.admit_recorded_present(live.present)?;
     }
     let memory = Arc::clone(&context.memory);
     let cursor = if lifetime.is_some() {

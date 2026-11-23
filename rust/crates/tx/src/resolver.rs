@@ -721,8 +721,8 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id, rtdb_types::OwnedChangeKind::Erase).await,
-            Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, replay_floor }) =>
-                self.sweep_owned_expiry(relation, id, *created, *replay_floor).await,
+            Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, expiry, .. }) =>
+                self.sweep_owned_expiry(relation, id, *created, *expiry).await,
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
@@ -950,9 +950,12 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
-        if operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedSweepExpired { .. }))) {
+        if let Some(scope) = operations.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedSweepExpired { scope, .. }) => Some(*scope),
+            _ => None,
+        }) {
             self.context.authorization.check_role_membership(&self.context.database, self.options.user.as_deref())?;
-            if operations.len() != 2 || deadline.is_none() {
+            if operations.len() != 2 || deadline.is_none() || source_scope != Some(scope) {
                 return Err(lifetime_uncovered());
             }
         }
@@ -1501,19 +1504,26 @@ impl<'a> OpenTransaction<'a> {
 
     async fn sweep_owned_expiry(
         &mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
-        created: Timestamp, replay_floor: Timestamp,
+        created: Timestamp, nominated_expiry: Timestamp,
     ) -> Result<()> {
         use rtdb_types::OwnedChangeKind;
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let ordered = self.tx_key().system_time;
-        if !relation.is_root_data() || replay_floor >= ordered { return Err(lifetime_uncovered()); }
+        if !relation.is_root_data() { return Err(lifetime_uncovered()); }
         let lifetime = self.read_owned_schema(owner, relation).await?
             .and_then(|(schema, _)| schema.lifetime_micros()).ok_or_else(lifetime_uncovered)?;
         let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
-        if expires > replay_floor { return Err(lifetime_uncovered()); }
-        let context = self.context.query_context(self.snapshot()?, ordered, &self.options.default_tz, self.trace_parent)?;
+        if expires != nominated_expiry { return Err(lifetime_uncovered()); }
+        let snapshot = self.snapshot()?;
+        if snapshot.contains_table(&relation.fixed_range_table(owner)) {
+            return Err(purge_path_uncovered());
+        }
+        let context = self.context.query_context(snapshot, ordered, &self.options.default_tz, self.trace_parent)?;
         let mut floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
         floor.check(lifetime, ordered)?;
+        if floor.swept_present_through == Timestamp::MIN || expires > floor.swept_present_through {
+            return Err(lifetime_uncovered());
+        }
         if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, id).await?.is_some() {
             return Ok(());
         }
@@ -1533,7 +1543,6 @@ impl<'a> OpenTransaction<'a> {
             return Err(lifetime_uncovered());
         }
         floor.expired_created_through = rtdb_types::OwnedLifetimeFloor::at(lifetime, ordered)?.expired_created_through;
-        floor.swept_present_through = floor.swept_present_through.max(replay_floor);
         self.erase_owned(relation, id, OwnedChangeKind::Expired).await?;
         self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
         Ok(())

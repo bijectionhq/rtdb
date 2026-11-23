@@ -190,6 +190,7 @@ pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldChanges.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
+pub(crate) const APPLY_HELD_EXPIRY_V1: &str = "rtdb.owned.ApplyHeldExpiry.v1";
 pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
 pub(crate) const HELD_OWNED_CHANGES_V2: &str = "rtdb.owned.ReadHeldChanges.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
@@ -1622,6 +1623,28 @@ impl Service {
         let reply = self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)?;
         held.snapshot.check_live_point_relation(&relation).map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn apply_held_expiry_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry apply needs the original held handle"))?;
+        let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Expiry apply needs a deadline"))?;
+        let (length, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Expiry apply needs a nomination length"))?;
+        let length = usize::from(u16::from_be_bytes(*length));
+        if !(1..=208).contains(&length) { return Err(invalid("Expiry nomination exceeds its bound")); }
+        let (nomination, request) = rest.split_at_checked(length).ok_or_else(|| invalid("Expiry apply nomination is truncated"))?;
+        let nomination = std::str::from_utf8(nomination).map_err(|_| invalid("Expiry nomination is not UTF-8"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let committed = session.sweep_owned_expired(
+            &held.snapshot, relation, id, nomination, Timestamp(i64::from_be_bytes(*deadline)),
+        ).await.map_err(status)?;
+        if let Some(error) = committed.error() { return Err(status(error.clone())); }
+        if !committed.committed() { return Err(Status::aborted("Owned expiry did not commit")); }
+        self.owned_tx_reply(committed.tx_key())
     }
 
     pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

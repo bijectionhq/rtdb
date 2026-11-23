@@ -39,6 +39,14 @@ impl OwnedLifetimeFloor {
         Ok(Self { duration: *duration, expired_created_through: crate::Timestamp(*floor), swept_present_through: crate::Timestamp(*swept) })
     }
 
+    pub fn admit_recorded_present(self, present: crate::Timestamp) -> Result<()> {
+        if present < self.swept_present_through {
+            return Err(Anomaly::new(crate::AnomalyCategory::Unavailable, "rtdb.owned/lifetime-collected",
+                "The recorded present is outside retained lifetime replay"));
+        }
+        Ok(())
+    }
+
     pub fn check(self, duration: i64, present: crate::Timestamp) -> Result<()> {
         let allowed = Self::at(duration, present)?;
         if self.duration != duration || self.expired_created_through > allowed.expired_created_through || self.swept_present_through > present {

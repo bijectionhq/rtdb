@@ -1157,7 +1157,8 @@ impl OwnedReadSession {
             }
             let table = logical.purge_table(&self.owner);
             let expected = snapshot.relation_event_frontier(&table)?;
-            Ok((table, expected, lifetime, governed))
+            let lifetime_frontier = governed.then(|| snapshot.relation_event_frontier(&lifetime)).transpose()?;
+            Ok((table, expected, lifetime, lifetime_frontier))
         }).collect::<Result<Vec<_>>>()?;
         let charge = self.context.memory.reserve(frontiers.len() * 512)?;
         let node = self.node.clone();
@@ -1171,9 +1172,15 @@ impl OwnedReadSession {
             if current.contains_table(&obsolete) {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native held reads"));
             }
-            for (table, expected, lifetime, governed) in &frontiers {
-                if current.contains_table(lifetime) != *governed {
+            for (table, expected, lifetime, lifetime_frontier) in &frontiers {
+                if current.contains_table(lifetime) != lifetime_frontier.is_some() {
                     return Err(lifetime_read_unavailable());
+                }
+                if let Some(frontier) = lifetime_frontier
+                    && current.relation_event_frontier(lifetime)? != *frontier
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/lifetime-collected",
+                        "The held relation's lifetime replay admission changed"));
                 }
                 if current.relation_event_frontier(table)? != *expected {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The held relation was revoked by an ordered erase"));
@@ -1265,6 +1272,7 @@ impl OwnedReadSession {
             .await?.and_then(|(schema, _)| schema.lifetime_micros())
             .ok_or_else(lifetime_read_unavailable)?;
         let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&self.context), &self.owner, relation).await?;
+        floor.admit_recorded_present(self.present.system_time)?;
         floor.check(schema, self.present.system_time)?;
         Ok(Some(floor))
     }
@@ -1275,7 +1283,6 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<(String, Timestamp, Timestamp)> {
-        use sha2::{Digest, Sha256};
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || !relation.is_root_data() || self.node.now() >= self.witness_until {
             return Err(lifetime_read_unavailable());
@@ -1304,23 +1311,54 @@ impl OwnedReadSession {
         let expiry = Timestamp(created.0.checked_add(floor.duration).ok_or_else(lifetime_read_unavailable)?);
         if expiry > self.present.system_time { return Err(lifetime_read_unavailable()); }
 
-        let handle = id.handle_bytes();
-        let mut digest = Sha256::new();
-        digest.update(b"rtdb.expiry-nomination.v1\0");
-        digest.update(scope.encode());
-        for input in [self.owner.as_bytes(), relation.name().as_bytes(), handle.as_slice()] {
-            digest.update((input.len() as u64).to_be_bytes());
-            digest.update(input);
-        }
         let mut nomination = Vec::with_capacity(73);
         nomination.push(0xe1);
-        nomination.extend_from_slice(&digest.finalize());
+        nomination.extend_from_slice(&expiry_nomination_digest(scope, &self.owner, relation, id));
         for coordinate in [created.0, expiry.0, self.present.tx_id.0, self.present.system_time.0, self.witness_until.0] {
             nomination.extend_from_slice(&coordinate.to_be_bytes());
         }
         context.check_cancelled()?;
         if self.node.now() >= self.witness_until { return Err(lifetime_read_unavailable()); }
         Ok((format!("rtdblife1.{}", codec.seal(&nomination)?), created, expiry))
+    }
+
+    async fn resolve_expiry_nomination(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, nomination: &str,
+        scope: rtdb_types::PlacedAttemptScope, deadline: Timestamp,
+    ) -> Result<(Timestamp, Timestamp)> {
+        self.admit_read().await?;
+        let now = self.node.now();
+        if self.historical.is_some() || self.witness_scope != Some(scope) || !relation.is_root_data()
+            || deadline <= now || deadline > self.witness_until
+        {
+            return Err(lifetime_read_unavailable());
+        }
+        let token = nomination.strip_prefix("rtdblife1.").filter(|token| !token.is_empty() && token.len() <= 192)
+            .ok_or_else(lifetime_read_unavailable)?;
+        let database = self.node.attached_database(&self.database, Some(&self.attachment))?;
+        let AwaitAuthority::Live { codec, .. } = &database.await_authority else {
+            return Err(lifetime_read_unavailable());
+        };
+        if codec.scope() != scope { return Err(lifetime_read_unavailable()); }
+        let decoded = codec.open(token).map_err(|_| lifetime_read_unavailable())?;
+        let bytes: &[u8; 73] = decoded.as_slice().try_into().map_err(|_| lifetime_read_unavailable())?;
+        let coordinate = |index: usize| i64::from_be_bytes(bytes[index..index + 8].try_into().expect("fixed nomination coordinate"));
+        let created = Timestamp(coordinate(33));
+        let expiry = Timestamp(coordinate(41));
+        if bytes[0] != 0xe1 || bytes[1..33] != expiry_nomination_digest(scope, &self.owner, relation, id)
+            || coordinate(49) != self.present.tx_id.0 || coordinate(57) != self.present.system_time.0
+            || coordinate(65) != self.witness_until.0 || expiry > self.present.system_time
+        {
+            return Err(lifetime_read_unavailable());
+        }
+        let floor = self.lifetime_point_policy(relation).await?.ok_or_else(lifetime_read_unavailable)?;
+        if floor.swept_present_through == Timestamp::MIN || expiry > floor.swept_present_through
+            || created.0.checked_add(floor.duration) != Some(expiry.0)
+        {
+            return Err(lifetime_read_unavailable());
+        }
+        self.check_live_point_relation(relation)?;
+        Ok((created, expiry))
     }
 
     pub fn check_live_point_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
@@ -1918,6 +1956,22 @@ pub struct OwnedWorldWrite {
     pub valid: Option<rtdb_types::Interval>,
 }
 
+fn expiry_nomination_digest(
+    scope: rtdb_types::PlacedAttemptScope, owner: &str,
+    relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let handle = id.handle_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb.expiry-nomination.v1\0");
+    digest.update(scope.encode());
+    for input in [owner.as_bytes(), relation.name().as_bytes(), handle.as_slice()] {
+        digest.update((input.len() as u64).to_be_bytes());
+        digest.update(input);
+    }
+    digest.finalize().into()
+}
+
 pub struct NativeSession { pub(crate) state: Session, pub(crate) service: Arc<NativeSessionService> }
 impl NativeSession {
     pub fn track_replica_read_session(&self) -> Result<impl Send + use<>> {
@@ -1930,15 +1984,22 @@ impl NativeSession {
         Ok(self.service.database()?.await_authority.codec().map(|codec| codec.scope()))
     }
 
-    /// Trusted maintenance entry. The maintenance owner supplies a replay
-    /// floor certified by its retention authority, never a guest coordinate.
+    /// Apply a hosted nomination against the original held identity and the
+    /// protected replay frontier already ordered for that relation.
     pub async fn sweep_owned_expired(
-        &mut self, relation: rtdb_types::OwnedRelation, id: rtdb_types::EntityId,
-        created: Timestamp, replay_floor: Timestamp, deadline: Timestamp,
+        &mut self, held: &OwnedReadSession, relation: rtdb_types::OwnedRelation,
+        id: rtdb_types::EntityId, nomination: &str, deadline: Timestamp,
     ) -> Result<TransactionResult> {
+        let scope = self.placed_history()?.ok_or_else(lifetime_read_unavailable)?;
+        if self.state.user() != Some(held.owner.as_str())
+            || !held.attachment.ptr_eq(&Arc::downgrade(&self.service.database()?))
+        {
+            return Err(lifetime_read_unavailable());
+        }
+        let (created, expiry) = held.resolve_expiry_nomination(&relation, &id, nomination, scope, deadline).await?;
         self.state.execute_tx(vec![
             TxOp::OwnedDeadline { until: deadline },
-            TxOp::OwnedSweepExpired { relation, id, created, replay_floor },
+            TxOp::OwnedSweepExpired { relation, id, created, expiry, scope },
         ], Default::default()).await
     }
 
