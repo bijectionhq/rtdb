@@ -37,6 +37,29 @@ impl Kind {
 }
 
 impl AvroResolution {
+    fn packed_array_target(
+        &self, action: usize, kind: super::datum::NumericKind, branches: Option<(u32, u32)>,
+    ) -> Option<(super::datum::NumericKind, Option<(u32, u32)>, usize)> {
+        match (branches, self.actions.get(action)?) {
+            (None, Action::Scalar { writer, reader, .. }) if writer.numeric() == Some(kind) =>
+                Some((reader.numeric()?, None, 0)),
+            (Some(branches), Action::WriterUnion { equivalent: true, .. }) => Some((kind, Some(branches), 0)),
+            (Some((null, present)), Action::WriterUnion { branches, equivalent: false }) => {
+                let Action::ReaderUnion { index: reader_null, child: null_action } =
+                    self.actions.get(*branches.get(null as usize)?)? else { return None; };
+                let Action::ReaderUnion { index: reader_present, child: present_action } =
+                    self.actions.get(*branches.get(present as usize)?)? else { return None; };
+                if !matches!(self.actions.get(*null_action)?, Action::Scalar { writer: Kind::Null, reader: Kind::Null, .. }) {
+                    return None;
+                }
+                let Action::Scalar { writer, reader, .. } = self.actions.get(*present_action)? else { return None; };
+                if writer.numeric() != Some(kind) { return None; }
+                Some((reader.numeric()?, Some((*reader_null, *reader_present)), 1))
+            }
+            _ => None,
+        }
+    }
+
     pub fn compile(writer: &Arc<AvroDatumPlan>, reader: &Arc<AvroDatumPlan>, context: &mut ConversionContext) -> Result<Self> {
         writer.retain_source(context)?;
         reader.retain_source(context)?;

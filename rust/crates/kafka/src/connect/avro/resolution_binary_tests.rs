@@ -192,3 +192,22 @@ fn reader_resolution_promotes_numeric_array_items_without_losing_double_bits() {
         assert_eq!(array.value(1).to_bits(), (-0.0_f64).to_bits());
     }
 }
+
+#[test]
+fn resolution_handles_reordered_nullable_numeric_arrays_in_typed_buffers() {
+    use arrow_array::{Array, Float64Array};
+    let writer = plan(r#"{"type":"array","items":["int","null"]}"#);
+    let reader = plan(r#"{"type":"array","items":["null","double"]}"#);
+    let mut context = context();
+    let resolution = AvroResolution::compile(&writer, &reader, &mut context).unwrap();
+    let bytes = [4, 0, 14, 2, 0];
+    let binary = resolution.decode_datum(&bytes, &mut context).unwrap();
+    let memory = resolution.resolve(writer.decode_datum(&bytes, &mut context).unwrap(), &mut context).unwrap();
+    for datum in [binary, memory] {
+        let Avro::PackedArray(packed) = datum.value else { panic!("expected promoted nullable array"); };
+        assert_eq!(packed.branches, Some((0, 1)));
+        let array = packed.values.array().unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(array.value(0), 7.0);
+        assert!(array.is_null(1));
+    }
+}

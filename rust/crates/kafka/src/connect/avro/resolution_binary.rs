@@ -88,16 +88,12 @@ impl AvroResolution {
             }
             Action::Array(child) => {
                 let Schema::Array(array) = schema else { return Err(invalid()); };
-                if let Some((writer, branches)) = datum::PackedArray::layout(&array.items) {
-                    let action = &self.actions[*child];
-                    let packed_reader = match (branches, action) {
-                        (Some(_), Action::WriterUnion { equivalent: true, .. }) => Some(writer),
-                        (None, Action::Scalar { reader, .. }) => reader.numeric(),
-                        _ => None,
-                    };
-                    if let Some(kind) = packed_reader {
-                        return Ok(Avro::PackedArray(datum::PackedArray::read(writer, kind, branches, reader, depth + 1)?));
-                    }
+                if let Some((writer, branches)) = datum::PackedArray::layout(&array.items)
+                    && let Some((kind, output_branches, _)) = self.packed_array_target(*child, writer, branches)
+                {
+                    let mut packed = datum::PackedArray::read(writer, kind, branches, reader, depth + 1)?;
+                    packed.branches = output_branches;
+                    return Ok(Avro::PackedArray(packed));
                 }
                 let mut values = Vec::new();
                 loop {

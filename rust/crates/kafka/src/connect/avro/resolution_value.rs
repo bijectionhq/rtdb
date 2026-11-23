@@ -12,8 +12,8 @@ impl AvroResolution {
                 value_bound(value, depth)
             }
             (Action::Array(child), Avro::PackedArray(values)) => {
-                if packed_reader(&self.actions[*child], values).is_some() {
-                    packed_bound(values, depth)
+                if let Some((_, _, extra_resolution_level)) = self.packed_array_target(*child, values.kind, values.branches) {
+                    packed_bound(values, depth, extra_resolution_level)
                 } else {
                     self.bound(id, &Avro::Array(values.clone().into_physical_values()), depth)
                 }
@@ -40,8 +40,10 @@ impl AvroResolution {
             (Action::Error(message), _) => Err(error("avro-resolution", message)),
             (Action::Scalar { reader, .. }, value) => promote(value, *reader),
             (Action::Array(child), Avro::PackedArray(values)) => {
-                if let Some(reader) = packed_reader(&self.actions[*child], &values) {
-                    Ok(Avro::PackedArray(values.promote(reader)))
+                if let Some((reader, branches, _)) = self.packed_array_target(*child, values.kind, values.branches) {
+                    let mut values = values.promote(reader);
+                    values.branches = branches;
+                    Ok(Avro::PackedArray(values))
                 } else {
                     self.apply(id, Avro::Array(values.into_physical_values()), depth)
                 }
@@ -72,7 +74,7 @@ pub(in crate::connect::avro) fn value_bound(value: &Avro, depth: usize) -> Resul
         Avro::String(value) => sum(4096, value.len().checked_mul(4).ok_or_else(overflow)?),
         Avro::Utf8(value) | Avro::Bytes(value) | Avro::Fixed(_, value) => sum(4096, value.len().checked_mul(4).ok_or_else(overflow)?),
         Avro::Enum(_, value) => sum(4096, value.len()),
-        Avro::PackedArray(values) => packed_bound(values, depth),
+        Avro::PackedArray(values) => packed_bound(values, depth, 0),
         Avro::Array(values) => values.iter().try_fold(4096usize, |bytes, value| sum(bytes, value_bound(value, depth + 1)?)),
         Avro::Map(values) => values.iter().try_fold(4096usize, |bytes, (key, value)| sum(sum(bytes, key.len().checked_mul(8).ok_or_else(overflow)?)?, value_bound(value, depth + 1)?)),
         Avro::Record(values) => values.iter().try_fold(4096usize, |bytes, (key, value)| sum(sum(bytes, key.len())?, value_bound(value, depth + 1)?)),
@@ -80,16 +82,8 @@ pub(in crate::connect::avro) fn value_bound(value: &Avro, depth: usize) -> Resul
         Avro::Null | Avro::Boolean(_) | Avro::Int(_) | Avro::Long(_) | Avro::Float(_) | Avro::Double(_) => Ok(4096),
     }
 }
-fn packed_reader(action: &Action, values: &super::super::datum::PackedArray) -> Option<super::super::datum::NumericKind> {
-    match (values.branches, action) {
-        (None, Action::Scalar { writer, reader, .. }) if writer.numeric() == Some(values.kind) => reader.numeric(),
-        (Some(_), Action::WriterUnion { equivalent: true, .. }) => Some(values.kind),
-        _ => None,
-    }
-}
-
-fn packed_bound(values: &super::super::datum::PackedArray, depth: usize) -> Result<usize> {
-    let child_levels = 1 + usize::from(values.branches.is_some());
+fn packed_bound(values: &super::super::datum::PackedArray, depth: usize, extra_resolution_level: usize) -> Result<usize> {
+    let child_levels = 1 + usize::from(values.branches.is_some()) + extra_resolution_level;
     if !values.values.is_empty() { nesting(depth + child_levels)?; }
     values.values.len().checked_mul(4096 * child_levels).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)
 }
