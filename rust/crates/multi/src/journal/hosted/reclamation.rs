@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rtdb_format::{keys::is_receipt_trie_file, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES}};
+use rtdb_format::{keys::is_receipt_trie_file, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES, RetirementFile}};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, Result};
 use rtdb_types::{CatalogCut, PhysicalObjectVersion};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{Placement, genesis, prefix_retirement::GrantDescriptor};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
-use crate::store::{EncryptingStore, exact_retirement::{InstalledVersionDeletionGrant, installed_object_withdrawal}};
+use crate::store::{EncryptingStore, exact_retirement::{InstalledPublication, InstalledPublicationDeletionGrant}};
 use crate::reference::{Bucket, PrefixedStore};
 
 pub(super) fn queue_prefix(grant_prefix: &str) -> String {
@@ -35,7 +35,17 @@ struct ReceiptCandidate {
     key: String,
     receipt: String,
     cut: CatalogCut,
-    version: PhysicalObjectVersion,
+    publication: InstalledPublication,
+}
+
+impl ReceiptCandidate {
+    fn publication(file: &RetirementFile) -> Option<InstalledPublication> {
+        match (&file.version, &file.terminal_publication) {
+            (None, Some(terminal)) => Some(InstalledPublication::Terminal { terminal: terminal.clone() }),
+            (Some(version), None) if file.matches_publication => Some(InstalledPublication::Version { version: version.clone() }),
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct ReclamationQueue {
@@ -65,8 +75,9 @@ impl ReclamationQueue {
 
     pub(super) async fn enqueue_receipt(
         &self, upper: &dyn ObjectStore, lower: Option<&dyn ObjectStore>,
-        key: &ObjectKey, receipt: &ObjectKey, cut: CatalogCut, version: &PhysicalObjectVersion,
+        key: &ObjectKey, receipt: &ObjectKey, cut: CatalogCut, file: &RetirementFile,
     ) -> Result<()> {
+        let Some(publication) = ReceiptCandidate::publication(file) else { return Ok(()); };
         if let Some(lower) = lower {
             match lower.head_fresh(key).await {
                 Ok(_) => return Ok(()),
@@ -74,10 +85,8 @@ impl ReclamationQueue {
                 Err(error) => return Err(error),
             }
         }
-        match upper.observe_head(key).await {
-            Ok(observed) if observed.version.as_ref() == Some(version) => (),
-            Ok(_) | Err(Error::MissingObject(_)) => return Ok(()),
-            Err(error) => return Err(error),
+        if !upper.retirement_publication(key).await?.is_some_and(|observed| publication.matches(&observed)) {
+            return Ok(());
         }
         let bytes = serde_json::to_vec(&ReceiptCandidate {
             grant: self.grant.clone(),
@@ -85,7 +94,7 @@ impl ReclamationQueue {
             key: key.to_string(),
             receipt: receipt.to_string(),
             cut,
-            version: version.clone(),
+            publication,
         }).map_err(|error| Error::Task(error.to_string()))?;
         self.put_candidate(receipt_candidate_key(&bytes)?, bytes).await
     }
@@ -139,10 +148,11 @@ impl ReclamationQueue {
 fn candidate_digest(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    digest.as_ref().iter().fold(String::with_capacity(64), |mut hex, byte| {
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_ref() {
         write!(hex, "{byte:02x}").expect("write to String");
-        hex
-    })
+    }
+    hex
 }
 
 fn receipt_candidate_key(bytes: &[u8]) -> Result<ObjectKey> {
@@ -155,7 +165,6 @@ pub(super) async fn settle_receipts(
     let (Some(custodian), CellStorage::S3 { config }) = (placement.custodian.as_ref(), storage) else {
         return Ok(());
     };
-    if config.terminal_scope.is_some() { return Ok(()); }
     let route = custodian.route().await?;
     let Some(active) = route.writer.grant.filter(|_| !genesis(route.checkpoint)) else { return Ok(()); };
     let root = ObjectKey::new(crate::archive::checkpoint_storage_root()?)?;
@@ -169,7 +178,7 @@ pub(super) async fn settle_receipts(
     if entries.is_empty() { return Ok(()); }
 
     let inventory = CellStorage::s3_inventory(config).await?;
-    inventory.require_versioned().await?;
+    if config.terminal_scope.is_none() { inventory.require_versioned().await?; }
     let checkpoint = placement.checkpoint_custody(Arc::clone(&io), Arc::clone(keys)).await?;
     checkpoint.open(route.checkpoint).await?;
     let provider = storage.custody_namespace()?;
@@ -196,11 +205,7 @@ pub(super) async fn settle_receipts(
         }
         let key = ObjectKey::new(candidate.key.as_str())?;
         let target = ObjectKey::new(format!("{source}/{key}"))?;
-        if !inventory.owns_publication(&target, &candidate.version)
-            || !inventory.exact_retirement_available(&target, &candidate.version).await?
-        {
-            continue;
-        }
+        if !candidate.publication.available(&target, &inventory).await? { continue; }
         let receipt = ObjectKey::new(candidate.receipt.as_str())?;
         let size = match sealed.head_fresh(&receipt).await {
             Ok(head) if head.size <= MAXIMUM_RECEIPT_BYTES as u64 => head.size as usize,
@@ -210,19 +215,21 @@ pub(super) async fn settle_receipts(
         let body = sealed.get_fresh_exact(&receipt, size).await?;
         let installed = InstalledRetirement::decode(receipt.as_str(), &body)?;
         if installed.cut() != candidate.cut || !installed.files().iter().any(|file| {
-            file.key == candidate.key && file.matches_publication && file.version.as_ref() == Some(&candidate.version)
+            file.key == candidate.key && ReceiptCandidate::publication(file).is_some_and(|publication| publication == candidate.publication)
         }) {
             continue;
         }
-        match raw.observe_head(&key).await {
-            Ok(current) if current.version.as_ref() == Some(&candidate.version) => (),
-            Ok(_) => continue,
-            Err(Error::MissingObject(_)) => (),
-            Err(error) => return Err(error.into()),
+        match raw.retirement_publication(&key).await? {
+            Some(observed) if candidate.publication.matches(&observed) => (),
+            Some(_) => continue,
+            None => match raw.head_fresh(&key).await {
+                Err(Error::MissingObject(_)) => (),
+                Ok(_) => continue,
+                Err(error) => return Err(error.into()),
+            },
         }
-        let withdrawal = installed_object_withdrawal(&candidate.version)?;
-        let Some(fence) = custodian.withdraw_object(&route, withdrawal).await? else { continue; };
-        let grant = InstalledVersionDeletionGrant::from_journal(&target, &candidate.version, fence)?;
+        let Some(fence) = custodian.withdraw_object(&route, candidate.publication.withdrawal()?).await? else { continue; };
+        let grant = InstalledPublicationDeletionGrant::from_journal(&target, &candidate.publication, fence)?;
         ledger.withdraw(&key).await?;
         grant.settle(&inventory).await?;
     }

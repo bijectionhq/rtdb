@@ -156,10 +156,10 @@ Other Classic providers lack this version-bound settlement.
 
 Maintenance on an active installed grant records receipt L0 publication identities and sends files from its installed trie-removal receipt to the existing reclamation queue.
 An inherited member remains the responsibility of its original grant.
-For S3 versions, the consumer authenticates the installed removal and successor and asks the installed journal to fence that exact publication. Only an ordered fence permits withdrawing its key slot and settling the version. The journal refuses while roots, suffixes or preparations are opaque or retain the object.
+For versioned and enrolled terminal S3, the consumer authenticates the installed removal and successor and asks the installed journal to fence that exact publication. Only an ordered fence permits withdrawing its key slot and settling the recorded version or conditional terminal identity. The journal refuses while roots, suffixes or preparations are opaque or retain the object.
 
 The v3 suffix cutover resets installed data. V2 suffixes are outside the reader contract.
-M1 remains open for unbound Classic remote objects, installed providers without a version witness, incomplete installed journal reference publication, and untracked media snapshots.
+M1 remains open for unbound Classic remote objects, installed providers without an exact publication witness, incomplete installed journal reference publication, and untracked media snapshots.
 Closure needs exact custodian settlement after the successor and its references are released.
 A captured archive's existing whole-capture settlement can run after release of its last entitlement.
 Held-world suffixes verify the original certified journal interval and all placed transaction witnesses before materializing the business projection.

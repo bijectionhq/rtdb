@@ -269,40 +269,86 @@ async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvi
     Ok(())
 }
 
-/// The canonical journal name identifies one physical path in its provider
-/// namespace. The version is bound separately so a competing withdrawal cannot
-/// authorize a different publication under the same fenced name.
-pub(crate) fn installed_object_withdrawal(version: &PhysicalObjectVersion) -> Result<ordered_logkeeper::ordered::ObjectWithdrawal> {
-    use ring::digest::{SHA256, digest};
-
-    let exact = serde_json::to_vec(version).map_err(|error| Error::Task(error.to_string()))?;
-    let identity = serde_json::to_vec(&(&version.namespace, &version.key)).map_err(|error| Error::Task(error.to_string()))?;
-    let sealed = |bytes: &[u8]| digest(&SHA256, bytes).as_ref().try_into().expect("SHA-256 width");
-    Ok(ordered_logkeeper::ordered::ObjectWithdrawal { name: sealed(&identity), version: sealed(&exact) })
+#[derive(PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "publication", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum InstalledPublication {
+    Version { version: PhysicalObjectVersion },
+    Terminal { terminal: TerminalObjectPublication },
 }
 
-pub(crate) struct InstalledVersionDeletionGrant<'a> {
+impl InstalledPublication {
+    pub(crate) fn matches(&self, observed: &rtdb_types::PhysicalObjectPublication) -> bool {
+        use rtdb_types::PhysicalObjectPublication;
+        match (self, observed) {
+            (Self::Version { version }, PhysicalObjectPublication::Version(observed)) => version == observed,
+            (Self::Terminal { terminal }, PhysicalObjectPublication::Terminal(observed)) => terminal == observed,
+            _ => false,
+        }
+    }
+
+    /// One physical provider path has one journal name. The exact publication
+    /// is bound separately so a competing grant cannot retire another version.
+    pub(crate) fn withdrawal(&self) -> Result<ordered_logkeeper::ordered::ObjectWithdrawal> {
+        use ring::digest::{SHA256, digest};
+
+        let position = match self {
+            Self::Version { version } => (&version.namespace, &version.key),
+            Self::Terminal { terminal } => (&terminal.namespace, &terminal.key),
+        };
+        let exact = serde_json::to_vec(self).map_err(|error| Error::Task(error.to_string()))?;
+        let name = serde_json::to_vec(&position).map_err(|error| Error::Task(error.to_string()))?;
+        let hashed = |bytes: &[u8]| digest(&SHA256, bytes).as_ref().try_into().expect("SHA-256 width");
+        Ok(ordered_logkeeper::ordered::ObjectWithdrawal { name: hashed(&name), version: hashed(&exact) })
+    }
+
+    pub(crate) async fn available(&self, key: &ObjectKey, provider: &rtdb_s3::VersionedInventory) -> Result<bool> {
+        match self {
+            Self::Version { version } => {
+                if !provider.owns_publication(key, version) { return Ok(false); }
+                provider.exact_retirement_available(key, version).await
+            }
+            Self::Terminal { terminal } => {
+                let Some(provider) = provider.enrolled_terminal_retirement().await? else { return Ok(false); };
+                provider.publication_fence_available(key, terminal, installed_publication_token(self.withdrawal()?)).await
+            }
+        }
+    }
+}
+
+fn installed_publication_token(withdrawal: ordered_logkeeper::ordered::ObjectWithdrawal) -> Uuid {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&withdrawal.version[..16]);
+    uuid::Builder::from_random_bytes(bytes).into_uuid()
+}
+
+pub(crate) struct InstalledPublicationDeletionGrant<'a> {
     key: &'a ObjectKey,
-    version: &'a PhysicalObjectVersion,
+    publication: &'a InstalledPublication,
     fence: ordered_logkeeper::ordered::ObjectFence,
 }
 
-impl<'a> InstalledVersionDeletionGrant<'a> {
+impl<'a> InstalledPublicationDeletionGrant<'a> {
     pub(crate) fn from_journal(
-        key: &'a ObjectKey, version: &'a PhysicalObjectVersion, fence: ordered_logkeeper::ordered::ObjectFence,
+        key: &'a ObjectKey, publication: &'a InstalledPublication, fence: ordered_logkeeper::ordered::ObjectFence,
     ) -> Result<Self> {
-        if installed_object_withdrawal(version)? != fence.object { return Err(changed()); }
-        Ok(Self { key, version, fence })
+        if publication.withdrawal()? != fence.object { return Err(changed()); }
+        Ok(Self { key, publication, fence })
     }
 
     pub(crate) async fn settle(self, provider: &rtdb_s3::VersionedInventory) -> Result<()> {
         let observed = || serde_json::json!({
             "position": self.fence.position, "name": self.fence.object.name,
-            "key": self.key.as_str(), "publication": self.version,
+            "key": self.key.as_str(), "publication": self.publication,
         });
-        crate::residence_trace::record("authorize-installed-version", observed);
-        provider.retire_observed_version(self.key, self.version).await?;
-        crate::residence_trace::record("remove-installed-version", observed);
+        crate::residence_trace::record("authorize-installed-publication", observed);
+        match self.publication {
+            InstalledPublication::Version { version } => provider.retire_observed_version(self.key, version).await?,
+            InstalledPublication::Terminal { terminal } => {
+                let provider = provider.enrolled_terminal_retirement().await?.ok_or_else(changed)?;
+                provider.fence_create_only_publication(self.key, terminal, installed_publication_token(self.fence.object)).await?;
+            }
+        }
+        crate::residence_trace::record("remove-installed-publication", observed);
         Ok(())
     }
 }

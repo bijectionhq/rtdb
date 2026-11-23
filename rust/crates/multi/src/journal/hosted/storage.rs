@@ -554,12 +554,9 @@ impl ObjectStore for ServingStore {
         for file in files {
             let key = ObjectKey::new(&file.key)?;
             if rtdb_format::keys::is_receipt_trie_file(key.as_str()) {
-                let version = file.version.as_ref().filter(|_| file.matches_publication);
-                if let Some(version) = version {
-                    writer.reclamation.enqueue_receipt(
-                        self.upper.as_ref(), self.lower.as_deref(), &key, receipt, installed.cut(), version,
-                    ).await?;
-                }
+                writer.reclamation.enqueue_receipt(
+                    self.upper.as_ref(), self.lower.as_deref(), &key, receipt, installed.cut(), file,
+                ).await?;
             } else {
                 writer.reclamation.enqueue(self.upper.as_ref(), self.lower.as_deref(), &key).await?;
             }
