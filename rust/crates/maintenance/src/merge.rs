@@ -563,8 +563,14 @@ mod tests {
         };
         let erased_header = erased.header();
         let [later, earlier] = assertions;
-        let (surviving, _charges) = resolve_same_time(&page(&[erased, later, earlier]), &memory).unwrap();
-        assert_eq!(surviving.iter().map(EncodedEvent::header).collect::<Vec<_>>(), [erased_header]);
+        let colliding = StoredEvent {
+            entity_key: Some(Arc::from(b"colliding-entity".as_slice())),
+            system_from: Timestamp(99),
+            ..earlier.clone()
+        };
+        let colliding_header = colliding.header();
+        let (surviving, _charges) = resolve_same_time(&page(&[erased, later, earlier, colliding]), &memory).unwrap();
+        assert_eq!(surviving.iter().map(EncodedEvent::header).collect::<Vec<_>>(), [erased_header, colliding_header]);
     }
 
     #[test]
