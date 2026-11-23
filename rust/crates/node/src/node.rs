@@ -1352,9 +1352,7 @@ impl OwnedReadSession {
             return Err(lifetime_read_unavailable());
         }
         let floor = self.lifetime_point_policy(relation).await?.ok_or_else(lifetime_read_unavailable)?;
-        if floor.swept_present_through == Timestamp::MIN || expiry > floor.swept_present_through
-            || created.0.checked_add(floor.duration) != Some(expiry.0)
-        {
+        if created.0.checked_add(floor.duration) != Some(expiry.0) {
             return Err(lifetime_read_unavailable());
         }
         self.check_live_point_relation(relation)?;
@@ -2005,8 +2003,8 @@ impl NativeSession {
         Ok(self.service.database()?.await_authority.codec().map(|codec| codec.scope()))
     }
 
-    /// Apply a hosted nomination against the original held identity and the
-    /// protected replay frontier already ordered for that relation.
+    /// Apply a hosted nomination against the original held identity. The
+    /// resolver decides eligibility and orders the relation replay floor.
     pub async fn sweep_owned_expired(
         &mut self, held: &OwnedReadSession, relation: rtdb_types::OwnedRelation,
         id: rtdb_types::EntityId, nomination: &str, deadline: Timestamp,

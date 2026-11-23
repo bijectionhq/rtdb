@@ -13,6 +13,17 @@ pub struct OwnedLifetimeFloor {
 }
 
 impl OwnedLifetimeFloor {
+    /// The immutable hosted expiry replay policy.
+    const REPLAY_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+
+    pub fn expiry_replay_cutoff(ordered_present: crate::Timestamp) -> crate::Timestamp {
+        crate::Timestamp(ordered_present.0.saturating_sub(Self::REPLAY_WINDOW_MICROS))
+    }
+
+    pub fn expiry_replay_eligible_present(expiry: crate::Timestamp) -> Option<crate::Timestamp> {
+        expiry.0.checked_add(Self::REPLAY_WINDOW_MICROS).map(crate::Timestamp)
+    }
+
     pub fn at(duration: i64, present: crate::Timestamp) -> Result<Self> {
         if !(1..=3_155_760_000_000_000).contains(&duration) {
             return Err(invalid("Invalid owned creation lifetime"));

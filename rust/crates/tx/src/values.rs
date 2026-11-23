@@ -985,7 +985,7 @@ pub enum TxOp {
     },
     OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<Timestamp> },
     OwnedErase { relation: rtdb_types::OwnedRelation, id: EntityId },
-    /// Apply one live nomination within an already ordered same-relation replay floor.
+    /// Apply one live nomination and order the same relation's replay floor.
     OwnedSweepExpired {
         relation: rtdb_types::OwnedRelation, id: EntityId, created: Timestamp,
         expiry: Timestamp, scope: rtdb_types::PlacedAttemptScope,
