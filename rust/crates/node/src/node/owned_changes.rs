@@ -237,8 +237,9 @@ impl OwnedReadSession {
             .filter(|(record, _)| !record.dropped && self.present.system_time < record.until)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
         self.require_change_bounds(after, through)?;
-        if after < record.basis.system_time {
-            return Err(historical_owned_read::below_floor(record.basis.system_time));
+        let fork = record.inherited_basis().system_time;
+        if after < fork {
+            return Err(historical_owned_read::below_floor(fork));
         }
         if !(1..=OWNED_MERGED_CHANGE_RELATIONS).contains(&relations.len()) {
             return Err(change_feed_uncovered());
