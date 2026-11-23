@@ -125,6 +125,10 @@ impl HeldTextCorpus {
         Ok(())
     }
 
+    pub fn contains_shadow(&self, partition: usize, id: &EntityId) -> bool {
+        self.shadows.get(&partition).is_some_and(|ids| ids.contains(id))
+    }
+
     pub(crate) fn shadowed(&self, partition: usize) -> Option<&BTreeSet<EntityId>> {
         self.shadows.get(&partition)
     }
@@ -169,4 +173,30 @@ fn corpus_limit() -> Anomaly {
         "rtdb.owned/search-held-corpus-limit",
         "The exact held world search corpus exceeds its supported bounds",
     )
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_shadows_replace_committed_text_before_statistics() {
+        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), "apples").unwrap();
+        let replaced = EntityId::String("replaced".into());
+        let deleted = EntityId::String("deleted".into());
+        let unchanged = EntityId::String("unchanged".into());
+        corpus.shadow(0, replaced.clone(), Some("pears")).unwrap();
+        corpus.shadow(0, deleted.clone(), None).unwrap();
+        assert!(!corpus.contains_shadow(1, &replaced));
+        for id in [replaced, deleted, unchanged.clone()] {
+            if !corpus.contains_shadow(0, &id) {
+                corpus.shadow(0, id, Some("apples")).unwrap();
+            }
+        }
+        assert_eq!(corpus.statistics().documents, 2);
+        let page = corpus.finish(0, 10).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].id, unchanged);
+    }
 }
