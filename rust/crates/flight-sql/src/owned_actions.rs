@@ -1331,6 +1331,16 @@ impl Service {
             });
             return Ok(true);
         }
+        if operation == "retire-relation" && matches!(effects, CommitEffects::HostedRoot) {
+            let EntityIdRef::String(name) = id else { return Err(invalid("A relation retirement names its relation")); };
+            if source.num_columns() != 3 || name != relation.name() {
+                return Err(invalid("A relation retirement carries only its relation and retention"));
+            }
+            let retain_micros = cell("retain_micros").and_then(ArrowCell::int64)
+                .ok_or_else(|| invalid("A relation retirement needs a signed microsecond retention"))?;
+            writes.push(TxOp::OwnedRetireRelation { relation: relation.clone(), retain_micros });
+            return Ok(true);
+        }
         let optional = |name| cell(name).map(optional_bound).transpose().map(Option::flatten);
         let signed = |name| -> Result<Option<Timestamp>, Status> {
             optional(name)?.map(|cell| cell.int64().map(Timestamp)

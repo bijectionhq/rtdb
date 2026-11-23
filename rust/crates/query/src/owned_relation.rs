@@ -584,6 +584,82 @@ pub async fn read_owned_relation_schema(
     Ok(declaration)
 }
 
+/// Reads a Root relation's retirement, if one fenced it at the caller's admitted cut.
+pub async fn read_owned_retirement(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+) -> Result<Option<rtdb_types::OwnedRetirement>> {
+    if owner.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
+    }
+    let id = EntityId::String(relation.name().into());
+    let Some(cursor) = open_owned_table_point(
+        context, OwnedRelation::retired_catalog(owner), id.iid(), Some(&id), None,
+        Some(&["_id", "retired_at", "retain_micros"]), false,
+    ).await? else { return Ok(None); };
+    let mut retired = read_retirements(cursor).await?;
+    match retired.pop() {
+        None => Ok(None),
+        Some((name, retirement)) if retired.is_empty() && &name == relation => Ok(Some(retirement)),
+        Some(_) => Err(Anomaly::fault("rtdb.owned/retired-catalog", "Invalid stored owned retirement")),
+    }
+}
+
+/// Reads every current retirement in one principal's retired catalog, for collection.
+pub async fn read_owned_retirements(
+    context: Arc<QueryContext>, catalog: TableRef,
+) -> Result<Vec<(OwnedRelation, rtdb_types::OwnedRetirement)>> {
+    if !catalog.is_owned_retired_catalog() {
+        return Err(Anomaly::incorrect("rtdb.owned/retired-catalog", "Expected an owned retired catalog"));
+    }
+    let Some(cursor) = open_private_catalog(context, catalog, &["_id", "retired_at", "retain_micros"], None).await? else {
+        return Ok(Vec::new());
+    };
+    read_retirements(cursor).await
+}
+
+async fn read_retirements(mut cursor: QueryCursor) -> Result<Vec<(OwnedRelation, rtdb_types::OwnedRetirement)>> {
+    let malformed = || Anomaly::fault("rtdb.owned/retired-catalog", "Invalid stored owned retirement");
+    let mut retired = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        for row in 0..batch.num_rows() {
+            let mut record = rtdb_types::StructFields::new();
+            for name in ["_id", "retired_at", "retain_micros"] {
+                let (index, field) = batch.schema_ref().column_with_name(name).ok_or_else(malformed)?;
+                record.insert(name.into(), rtdb_columnar::read_value(field, batch.column(index).as_ref(), row)?);
+            }
+            retired.push(rtdb_types::OwnedRetirement::decode(&record).map_err(|_| malformed())?);
+        }
+    }
+    Ok(retired)
+}
+
+/// Reads every current registration in one principal's world catalog, for collection.
+pub async fn read_owned_worlds(context: Arc<QueryContext>, catalog: TableRef) -> Result<Vec<rtdb_types::OwnedWorld>> {
+    use rtdb_types::{OwnedWorld, StructFields};
+
+    if catalog.owned_world_catalog().as_ref() != Some(&catalog) { return Err(OwnedWorld::unavailable()); }
+    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor"];
+    let memory = Arc::clone(&context.memory);
+    let Some(mut cursor) = open_private_catalog(context, catalog, &names, None).await? else { return Ok(Vec::new()); };
+    let mut worlds = Vec::new();
+    let mut reservations = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        for row in 0..batch.num_rows() {
+            let mut fields = StructFields::new();
+            for name in names {
+                let (index, field) = batch.schema_ref().column_with_name(name).ok_or_else(OwnedWorld::unavailable)?;
+                let values = batch.column(index).as_ref();
+                reservations.push(memory.reserve(rtdb_columnar::estimate_read_value_bytes(field, values, row)?)?);
+                fields.insert(name.into(), rtdb_columnar::read_value(field, values, row)?);
+            }
+            worlds.push(OwnedWorld::from_record(&fields)?);
+        }
+    }
+    Ok(worlds)
+}
+
 pub(crate) async fn open_owned_table_point(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
     valid: Option<Interval>, columns: Option<&[&str]>, history: bool,

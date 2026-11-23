@@ -36,7 +36,7 @@ impl Operation {
     pub(crate) fn owned_relation(&self) -> Option<&rtdb_types::OwnedRelation> {
         match self {
             Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. } | TxOp::OwnedDeclareSpatialPath { relation, .. } | TxOp::OwnedDeclareEncodedSpatialPath { relation, .. } | TxOp::OwnedRequireSpatialPath { relation, .. } | TxOp::OwnedDropSpatialPath { relation, .. }
-                | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
+                | TxOp::OwnedRetireRelation { relation, .. } | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
                 | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckWorldPurge { relation, .. }
                 | TxOp::OwnedErase { relation, .. } | TxOp::OwnedSweepExpired { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
                 | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. }) | Self::OwnedWriteIids { relation, .. } | Self::OwnedArrowIids { relation, .. } => Some(relation),
@@ -129,6 +129,7 @@ impl SourceTransaction {
                     (capacity_condition_bytes(relation, column.capacity(), when.capacity())?, None, 0),
                 Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
                     (relation.name().len() + name.name().len(), None, 0),
+                Operation::Public(TxOp::OwnedRetireRelation { relation, .. }) => (relation.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns } | TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, .. } | TxOp::OwnedRequireSpatialPath { relation, name, columns, .. }) =>
@@ -414,6 +415,7 @@ impl SourceTransaction {
                     capacity_condition_bytes(relation, column.capacity(), when.capacity())?,
                 Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
                     relation.name().len() + name.name().len(),
+                Operation::Public(TxOp::OwnedRetireRelation { relation, .. }) => relation.name().len(),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns } | TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, .. } | TxOp::OwnedRequireSpatialPath { relation, name, columns, .. }) =>
@@ -607,6 +609,11 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("schema".into(), Value::Binary(schema.to_json()?));
             "rtdb-owned-relation-v1"
+        }
+        Operation::Public(TxOp::OwnedRetireRelation { relation, retain_micros }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("retain_micros".into(), Value::I64(*retain_micros));
+            "rtdb-owned-retire-relation-v1"
         }
         Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns }) => {
             let tag = if matches!(operation, Operation::Public(TxOp::OwnedDeclareSpatialPath { .. })) {
@@ -1646,6 +1653,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-search-path-v1" | "rtdb-owned-unique-path-v1" => &["relation", "name", "column"],
             "rtdb-owned-drop-spatial-path-v1" => &["relation", "name"],
             "rtdb-owned-relation-v1" => &["relation", "schema"],
+            "rtdb-owned-retire-relation-v1" => &["relation", "retain_micros"],
             "rtdb-owned-capacity-v1" => &["relation", "column", "prefix_bytes", "cap"],
             "rtdb-owned-check-capacity-v1" => &["relation", "column", "prefix", "at_most"],
             "rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1" => &["relation", "name", "columns"],
@@ -1818,6 +1826,12 @@ impl SourceOperationReader<'_> {
                     relation: rtdb_types::OwnedRelation::new(relation)?,
                     schema: rtdb_types::OwnedSchema::from_json(&schema)?,
                 }
+            }
+            "rtdb-owned-retire-relation-v1" => {
+                let (Value::Utf8(relation), Value::I64(retain_micros)) = (value("relation")?, value("retain_micros")?)
+                    else { return Err(invalid("Owned relation retirement has invalid fields")); };
+                rtdb_types::OwnedRetirement::at(Timestamp(0), retain_micros)?;
+                TxOp::OwnedRetireRelation { relation: rtdb_types::OwnedRelation::new(relation)?, retain_micros }
             }
             "rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1" | "rtdb-owned-spatial-path-v2" | "rtdb-owned-require-spatial-path-v1" | "rtdb-owned-drop-spatial-path-v1" => {
                 let cell = |key| {
@@ -2399,6 +2413,19 @@ mod tests {
         assert!(matches!(replayed.operations.as_slice(), [Operation::Public(TxOp::OwnedRequireSpatialPath {
             relation: actual, name, columns: actual_columns, encoding: rtdb_types::SpatialGeometryEncoding::BijectionPosition,
         })] if actual == &relation && name == &path && actual_columns == &columns));
+    }
+
+    #[test]
+    fn a_relation_retirement_replays_with_its_retention() {
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new("orders").unwrap();
+        let source = SourceTransaction::new(vec![TxOp::OwnedRetireRelation {
+            relation: relation.clone(), retain_micros: 86_400_000_000,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let replayed = roundtrip(&source);
+        assert!(matches!(replayed.operations.as_slice(), [Operation::Public(TxOp::OwnedRetireRelation {
+            relation: actual, retain_micros: 86_400_000_000,
+        })] if actual == &relation));
     }
 
     #[test]

@@ -202,6 +202,7 @@ const OWNED_PATH_CATALOG: &str = ".ordered-paths";
 const OWNED_SEARCH_CATALOG: &str = ".search-paths";
 const OWNED_SPATIAL_CATALOG: &str = ".spatial-paths";
 const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
+const OWNED_RETIRED_CATALOG: &str = ".retired-relations";
 pub const OWNED_ATTEMPT_RELATION: &str = "fact_attempts";
 pub const OWNED_ROOT_PUBLICATION_RELATION: &str = "fact_publications";
 pub const HOSTED_ROOT_RECEIPTS_TABLE: &str = "bj_fact_root_receipts";
@@ -265,6 +266,27 @@ impl OwnedRelation {
     pub fn spatial_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_SPATIAL_CATALOG) }
 
     pub fn relation_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RELATION_CATALOG) }
+
+    /// The principal's retired relations, each fenced against later writes and declarations.
+    pub fn retired_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RETIRED_CATALOG) }
+
+    /// Every physical table this Root relation owns in the namespace of `namespace`, an owned table of the same principal.
+    /// World overlays and their journals stay outside: a world's own retirement reclaims them.
+    pub fn physical_tables(&self, namespace: &TableRef) -> Option<Vec<TableRef>> {
+        if !self.is_root_data() || !namespace.supported_owned_name() { return None; }
+        let (owner, _) = namespace.table.split_once('-')?;
+        let name = self.name();
+        Some([
+            name.to_owned(),
+            format!("{OWNED_CHANGE_PREFIX}{name}"),
+            format!("{OWNED_UNIQUE_PREFIX}{name}"),
+            format!("{OWNED_CAPACITY_PREFIX}{name}"),
+            format!("{OWNED_FIXED_RANGE_PREFIX}{name}"),
+            format!("{OWNED_PURGE_PREFIX}{name}"),
+            format!("{OWNED_PURGE_FLOOR_PREFIX}{name}"),
+            format!("{OWNED_LIFETIME_PREFIX}{name}"),
+        ].into_iter().map(|table| TableRef::new(OWNED_SCHEMA_V1, format!("{owner}-{table}"))).collect())
+    }
 
     pub fn world_clock_table(owner: &str) -> TableRef { owned_table(owner, OWNED_WORLD_CLOCKS) }
 
@@ -389,6 +411,17 @@ impl TableRef {
         self.owned_storage_name() == Some(OWNED_RELATION_CATALOG)
     }
 
+    pub fn is_owned_retired_catalog(&self) -> bool {
+        self.owned_storage_name() == Some(OWNED_RETIRED_CATALOG)
+    }
+
+    /// The world catalog in the same owner namespace as this owned table.
+    pub fn owned_world_catalog(&self) -> Option<Self> {
+        self.owned_storage_name()?;
+        let (namespace, _) = self.table.split_once('-')?;
+        Some(Self::new(OWNED_SCHEMA_V1, format!("{namespace}-{OWNED_WORLD_CATALOG}")))
+    }
+
     /// Identifies derived Root writes with the same owner and source relation.
     pub fn owned_root_constraint_relation(&self) -> Option<&str> {
         let name = self.owned_storage_name()?;
@@ -426,7 +459,7 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_SPATIAL_CATALOG | OWNED_RELATION_CATALOG | OWNED_WORLD_CLOCKS)
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_SPATIAL_CATALOG | OWNED_RELATION_CATALOG | OWNED_RETIRED_CATALOG | OWNED_WORLD_CLOCKS)
                         || name.strip_prefix(OWNED_LIFETIME_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())

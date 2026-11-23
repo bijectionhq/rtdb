@@ -1004,6 +1004,8 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, OwnedPathKind::Ordered).await,
             Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
                 self.drop_owned_spatial_path(relation, name).await,
+            Operation::Public(TxOp::OwnedRetireRelation { relation, retain_micros }) =>
+                self.retire_owned_relation(relation, *retain_micros).await,
             Operation::Public(TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
                 self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial(rtdb_types::SpatialGeometryEncoding::TaggedWkb)).await,
             Operation::Public(TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, encoding }) =>
@@ -1217,6 +1219,78 @@ impl<'a> OpenTransaction<'a> {
         Ok(())
     }
 
+    /// Fences the relation at this transaction: its declaration and paths leave the current catalogs, so their system-time history alone resolves them.
+    /// Collection reclaims its tables once the retention has passed (gc.allium).
+    async fn retire_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, retain_micros: i64) -> Result<()> {
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if !relation.is_root_data() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        let retirement = rtdb_types::OwnedRetirement::at(self.tx_key().system_time, retain_micros)?;
+        let retired = rtdb_types::OwnedRelation::retired_catalog(owner);
+        let snapshot = self.snapshot()?;
+        let context = self.context.query_context(snapshot.clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        if snapshot.contains_table(&retired)
+            && let Some(existing) = rtdb_query::read_owned_retirement(Arc::clone(&context), owner, relation).await?
+        {
+            return if existing.retain_micros == retain_micros { Ok(()) } else {
+                Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-retired", "The owned relation is already retired with another retention"))
+            };
+        }
+        let id = |name: &str| rtdb_types::EntityId::String(name.into());
+        if self.read_owned_schema(owner, relation).await?.is_some() {
+            self.buffer.delete(rtdb_types::OwnedRelation::relation_catalog(owner), &id(relation.name()), Interval::ALL)?;
+        }
+        let target = relation.table(owner);
+        for catalog in [
+            rtdb_types::OwnedRelation::path_catalog(owner),
+            rtdb_types::OwnedRelation::search_catalog(owner),
+            rtdb_types::OwnedRelation::spatial_catalog(owner),
+        ] {
+            if !snapshot.contains_table(&catalog) { continue; }
+            let Some(mut cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, None).await? else { continue; };
+            let mut paths = Vec::new();
+            while let Some(batch) = cursor.next_batch().await? {
+                let batch = batch.batch();
+                for row in 0..batch.num_rows() {
+                    let text = |field| ArrowCell::named(batch, field, row).and_then(ArrowCell::utf8);
+                    if text("schema_name") == Some(target.schema.as_str()) && text("table_name") == Some(target.table.as_str())
+                        && let Some(path) = text("_id")
+                    {
+                        paths.push(path.to_owned());
+                    }
+                }
+            }
+            for path in paths { self.buffer.delete(catalog.clone(), &id(&path), Interval::ALL)?; }
+        }
+        self.buffer.put(retired, retirement.record(relation), Interval::ALL)
+    }
+
+    /// No write or declaration reaches a relation this transaction or an earlier one retired.
+    async fn check_unretired(&self, owner: &str, operations: &[Operation]) -> Result<()> {
+        let retiring: BTreeSet<&str> = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedRetireRelation { relation, .. }) => Some(relation.name()),
+            _ => None,
+        }).collect();
+        let mut touched = BTreeSet::new();
+        for operation in operations {
+            if matches!(operation, Operation::Public(TxOp::OwnedRetireRelation { .. })) { continue; }
+            let Some(relation) = operation.owned_relation() else { continue; };
+            let root = relation.root_relation();
+            let target = root.as_ref().unwrap_or(relation);
+            if !target.is_root_data() { continue; }
+            if retiring.contains(target.name()) { return Err(relation_retired()); }
+            touched.insert(target.clone());
+        }
+        let snapshot = self.buffer.base_snapshot();
+        if touched.is_empty() || !snapshot.contains_table(&rtdb_types::OwnedRelation::retired_catalog(owner)) { return Ok(()); }
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        for relation in touched {
+            if rtdb_query::read_owned_retirement(Arc::clone(&context), owner, &relation).await?.is_some() {
+                return Err(relation_retired());
+            }
+        }
+        Ok(())
+    }
+
     async fn declare_owned_path(
         &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation,
         columns: &[String], kind: OwnedPathKind,
@@ -1379,6 +1453,7 @@ impl<'a> OpenTransaction<'a> {
                 return Err(lifetime_uncovered());
             }
         }
+        self.check_unretired(owner, operations).await?;
         let base = self.buffer.base_snapshot();
         let new_lifetimes: BTreeSet<_> = operations.iter().filter_map(|operation| match operation {
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) if schema.lifetime_micros().is_some() => Some(relation),
@@ -1393,7 +1468,7 @@ impl<'a> OpenTransaction<'a> {
                     Operation::Public(TxOp::OwnedErase { .. }) if replay.is_some() && root.is_none() => (),
                     Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedDeclarePath { .. }
                         | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. }
-                        | TxOp::OwnedSweepExpired { .. } | TxOp::OwnedRequireSpatialPath { .. })
+                        | TxOp::OwnedSweepExpired { .. } | TxOp::OwnedRequireSpatialPath { .. } | TxOp::OwnedRetireRelation { .. })
                     | Operation::Public(TxOp::OwnedArrowDocs { create_only: true, .. })
                     | Operation::OwnedArrowIids { create_only: true, .. }
                     | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
@@ -3088,6 +3163,10 @@ fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Va
 
 fn purge_path_uncovered() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/purge-path-uncovered", "Owned erase is unsupported while the relation has a search or final-state constraint path")
+}
+
+fn relation_retired() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-retired", "The owned relation is retired and accepts no write or declaration")
 }
 
 fn no_owned_principal() -> Anomaly {

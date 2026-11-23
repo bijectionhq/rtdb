@@ -935,6 +935,53 @@ async fn owned_acceptance_validity_rejects_scheduled_writes_at_ordering() {
 }
 
 #[tokio::test]
+async fn a_retired_owned_relation_refuses_writes_and_declarations() {
+    use rtdb_types::{OwnedRelation, OwnedSchema};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("retiring").unwrap();
+    let path = OwnedRelation::new("by-rank").unwrap();
+    let schema = OwnedSchema::from_json(
+        br#"{"fields":[{"name":"rank","type":{"kind":"i64"},"optional":false,"nullable":false}]}"#,
+    ).unwrap();
+    let declare = || TxOp::OwnedDeclareRelation { relation: relation.clone(), schema: schema.clone() };
+    let declare_path = || TxOp::OwnedDeclarePath {
+        relation: relation.clone(), name: path.clone(), columns: vec!["rank".into(), "_id".into()],
+    };
+    let insert = |id: i64| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(id)), ("rank".into(), Value::I64(id)),
+        ])], node.memory()).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let retire = |retain_micros| TxOp::OwnedRetireRelation { relation: relation.clone(), retain_micros };
+    for operation in [declare(), insert(1), declare_path()] {
+        let written = writer.state_mut().execute_tx(vec![operation], AutonomousTxOptions::default()).await.unwrap();
+        assert!(written.committed(), "{:?}", written.error());
+    }
+    let together = writer.state_mut().execute_tx(vec![retire(0), insert(2)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(together.error().unwrap().code, "rtdb.owned/relation-retired");
+
+    let retired = writer.state_mut().execute_tx(vec![retire(0)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(retired.committed(), "{:?}", retired.error());
+    for operation in [insert(3), declare(), declare_path()] {
+        let refused = writer.state_mut().execute_tx(vec![operation], AutonomousTxOptions::default()).await.unwrap();
+        assert_eq!(refused.error().unwrap().code, "rtdb.owned/relation-retired");
+    }
+    let again = writer.state_mut().execute_tx(vec![retire(0)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(again.committed(), "{:?}", again.error());
+    let other = writer.state_mut().execute_tx(vec![retire(1)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(other.error().unwrap().code, "rtdb.owned/relation-retired");
+
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     use rtdb_types::OwnedRelation;
 

@@ -67,6 +67,47 @@ impl OwnedLifetimeFloor {
     }
 }
 
+/// A Root relation's retirement: the transaction that fenced it and how long its history stays readable after it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnedRetirement {
+    pub retired_at: crate::Timestamp,
+    pub retain_micros: i64,
+}
+
+impl OwnedRetirement {
+    /// At most one hundred years, the bound the creation lifetime also takes.
+    pub const MAX_RETAIN_MICROS: i64 = 3_155_760_000_000_000;
+
+    pub fn at(retired_at: crate::Timestamp, retain_micros: i64) -> Result<Self> {
+        if !(0..=Self::MAX_RETAIN_MICROS).contains(&retain_micros) {
+            return Err(invalid("Invalid owned retirement retention"));
+        }
+        Ok(Self { retired_at, retain_micros })
+    }
+
+    /// The first system time at which no reader may still resolve the relation's history.
+    pub fn reclaimable_at(self) -> crate::Timestamp {
+        crate::Timestamp(self.retired_at.0.saturating_add(self.retain_micros))
+    }
+
+    pub fn record(self, relation: &crate::OwnedRelation) -> StructFields<Value> {
+        StructFields::from([
+            ("_id".into(), Value::Utf8(relation.name().into())),
+            ("retired_at".into(), Value::I64(self.retired_at.0)),
+            ("retain_micros".into(), Value::I64(self.retain_micros)),
+        ])
+    }
+
+    pub fn decode(record: &StructFields<Value>) -> Result<(crate::OwnedRelation, Self)> {
+        let (Some(Value::Utf8(id)), Some(Value::I64(retired_at)), Some(Value::I64(retain))) =
+            (record.get("_id"), record.get("retired_at"), record.get("retain_micros"))
+        else { return Err(invalid("Owned retirement has no exact retirement point")); };
+        let relation = crate::OwnedRelation::new(id.as_str())?;
+        if record.len() != 3 || !relation.is_root_data() { return Err(invalid("Invalid owned retirement record")); }
+        Ok((relation, Self::at(crate::Timestamp(*retired_at), *retain)?))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedSchema(OwnedSchemaWire);
 
