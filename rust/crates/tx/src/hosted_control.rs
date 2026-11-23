@@ -1023,7 +1023,7 @@ mod retained_release_tests {
         let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
         let row = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
         let id = EntityId::String("key".into());
-        let control = |slot, expected| {
+        let control = |slot: &str, expected| {
             HostedControlWrite::new(admission.clone(), scope, expected, row(slot)).map(TxOp::HostedControl)
         };
         let frontier = |id| Ok::<_, Anomaly>(TxOp::OwnedReplaceDocs {
