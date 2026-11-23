@@ -240,7 +240,9 @@ entity StagedTxTable {
     -- A typed staging copy reserves its selected positions and output arrays under the transaction memory budget.
     -- Staging packs row-backed writes and collects their positions alongside the existing Arrow event positions in command order.
     -- Native SQL puts can stage compatible document columns directly from the mutation query batch.
-    -- A run of puts from one Arrow struct layout retains its schema and event order when the query selected it from a union.
+    -- A run of puts from one Arrow struct layout retains its schema and event order across the union legs that supply it.
+    -- Puts from different struct layouts can share one Arrow batch while retaining the declarations of their original layouts.
+    -- Staging preserves event assembly when a batch from different struct layouts is combined with other writes.
     -- A create-only insert checks each requested interval against the transaction snapshot before staging that document from its Arrow vector.
     -- A governed Arrow event stages the full entity key and the assigned commit position with its document columns.
     -- Staging views retain shared Arrow source allocations while exposing only the buffer spans they use.

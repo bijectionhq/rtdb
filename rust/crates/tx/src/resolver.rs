@@ -1050,18 +1050,29 @@ impl<'a> OpenTransaction<'a> {
             iid: iids.iid(row)?, system_from: system_time,
             valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
         });
+        if matches!(documents.data_type(), DataType::Union(..))
+            && let Ok(Some((put, declarations))) = mutation_layout_batch(documents.as_ref(), &read_header, memory) {
+            match self.buffer.append_assembled_put_batch(table, put, &declarations) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+                Err(error) => return Err(error),
+            }
+        }
         let mut start = 0;
         while start < batch.num_rows() {
-            let Some((document, offset)) = mutation_document(documents.as_ref(), start) else {
+            let Some((document, _)) = mutation_document(documents.as_ref(), start) else {
                 read_header(start)?;
                 return Err(Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document"));
             };
             let end = mutation_document_run(documents.as_ref(), start, document);
-            if end > start + 1 {
-                let staged = mutation_run_batch(documents.as_ref(), document, start..end, &read_header, memory)
+            let gathered_end = if end == start + 1 {
+                alternating_document_run(documents.as_ref(), start, document)
+            } else { end };
+            if gathered_end > start + 1 {
+                let staged = mutation_run_batch(documents.as_ref(), document, start..gathered_end, &read_header, memory)
                     .and_then(|batch| batch.map(|batch| self.buffer.append_batch(table, batch)).transpose());
                 match staged {
-                    Ok(Some(())) => { start = end; continue; }
+                    Ok(Some(())) => { start = gathered_end; continue; }
                     Ok(None) => {}
                     Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
                     Err(error) => return Err(error),
@@ -1069,9 +1080,7 @@ impl<'a> OpenTransaction<'a> {
             }
             for row in start..end {
                 let header = read_header(row)?;
-                let index = if row == start { offset } else {
-                    mutation_document(documents.as_ref(), row).expect("A document run uses one struct array").1
-                };
+                let (document, index) = mutation_document(documents.as_ref(), row).expect("A document run has a struct at every position");
                 let content = document.slice(index, 1);
                 let batch = rtdb_format::data::owned_put_batch(Arc::new(content), &[header], None, memory)?;
                 self.buffer.append_batch(table, batch)?;
@@ -3735,6 +3744,79 @@ fn mutation_document_run(array: &dyn Array, start: usize, document: &arrow_array
     }).unwrap_or(array.len())
 }
 
+fn alternating_document_run(array: &dyn Array, start: usize, document: &arrow_array::StructArray) -> usize {
+    (start..array.len()).find(|&row| {
+        let Some((source, _)) = mutation_document(array, row) else { return true; };
+        source.fields() != document.fields()
+            || row + 1 < array.len() && mutation_document(array, row + 1).is_some_and(|(next, _)| std::ptr::eq(next, source))
+    }).unwrap_or(array.len())
+}
+
+struct MutationPut<'a> {
+    document: &'a arrow_array::StructArray,
+    row: usize,
+    header: EventHeader,
+}
+
+impl rtdb_format::data::EncodedEvent for MutationPut<'_> {
+    fn header(&self) -> EventHeader { self.header }
+    fn recency(&self) -> Option<Timestamp> { None }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool {
+        self.document.fields().iter().all(|field| fields.contains_key(field.name()))
+    }
+    fn put_cell(&self, _: &str, _: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
+        Err(Anomaly::unsupported("rtdb.tx/mutation-layout", "The put payload needs its original Arrow layout"))
+    }
+    fn put_column(&self, name: &str) -> Option<rtdb_format::data::PutColumn<'_>> {
+        use rtdb_format::data::PutColumn;
+        Some(match self.document.fields().iter().position(|field| field.name() == name) {
+            Some(index) => PutColumn::Stored(&self.document.fields()[index], self.document.column(index).as_ref(), self.row),
+            None => PutColumn::Absent,
+        })
+    }
+}
+
+fn mutation_layout_batch(
+    input: &dyn Array, read_header: impl Fn(usize) -> Result<EventHeader>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<(OwnedBatch, StructFields<LogicalType>)>> {
+    let Some((first, _)) = mutation_document(input, 0) else { return Ok(None); };
+    if (1..input.len()).all(|row| mutation_document(input, row).is_some_and(|(source, _)| source.fields() == first.fields())) {
+        return Ok(None);
+    }
+
+    let bound = input.len().checked_mul(256).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let mut scratch = memory.reserve(bound)?;
+    let mut puts = Vec::with_capacity(input.len());
+    let mut layouts = std::collections::HashSet::new();
+    let mut declared = StructFields::<LogicalType>::new();
+    let mut observed: Option<StructFields<LogicalType>> = None;
+    for position in 0..input.len() {
+        let Some((document, row)) = mutation_document(input, position) else { return Ok(None); };
+        let header = read_header(position)?;
+        if layouts.insert(document.fields()) {
+            let lease = Arc::get_mut(&mut scratch).expect("The put selection owns its layouts");
+            let bytes = document.fields().iter().try_fold(lease.bytes(), |bytes, field| {
+                bytes.checked_add(field.size().checked_mul(16).ok_or_else(overflow)?).ok_or_else(overflow)
+            })?;
+            lease.grow_to(bytes)?;
+            let fields = document.fields().iter().map(|field| {
+                Ok((field.name().clone(), rtdb_columnar::from_field(field)?))
+            }).collect::<Result<StructFields<_>>>()?;
+            for (name, ty) in fields.iter() {
+                let ty = declared.get(name).map_or_else(|| ty.clone(), |old| old.join(ty));
+                declared.insert(name.clone(), ty);
+            }
+            observed = Some(match observed {
+                Some(previous) => rtdb_index::merge_column_types(&previous, &fields),
+                None => fields,
+            });
+        }
+        puts.push(MutationPut { document, row, header });
+    }
+    let batch = rtdb_format::data::owned_event_batch(&puts, observed, true, memory)?;
+    Ok(Some((batch, declared)))
+}
+
 fn mutation_run_batch(
     input: &dyn Array, document: &arrow_array::StructArray, rows: std::ops::Range<usize>,
     read_header: impl Fn(usize) -> Result<EventHeader>, memory: &Arc<MemoryBudget>,
@@ -3746,19 +3828,45 @@ fn mutation_run_batch(
         let Ok(header) = read_header(row) else { return Ok(None); };
         headers.push(header);
     }
-    let offset = |row| mutation_document(input, row).expect("A document run uses one struct array").1;
-    let first = offset(rows.start);
-    let (content, _copy): (ArrayRef, _) = if rows.clone().enumerate().all(|(position, row)| offset(row) == first + position) {
+    let locate = |row| mutation_document(input, row).expect("A document run has a struct at every position");
+    let (_, first) = locate(rows.start);
+    let same_source = rows.clone().all(|row| std::ptr::eq(locate(row).0, document));
+    let (content, _copy): (ArrayRef, _) = if rows.clone().enumerate().all(|(position, row)| {
+        let (source, offset) = locate(row);
+        std::ptr::eq(source, document) && offset == first + position
+    }) {
         (Arc::new(document.slice(first, rows.len())), None)
-    } else {
+    } else if same_source {
         let field = arrow_schema::Field::new("doc", document.data_type().clone(), false);
         let bound = rows.clone().try_fold(4096usize, |bytes, row| {
-            rtdb_columnar::estimate_event_copy_cell_bytes(&field, document, offset(row))?
+            rtdb_columnar::estimate_event_copy_cell_bytes(&field, document, locate(row).1)?
                 .checked_mul(4).and_then(|cell| bytes.checked_add(cell)).ok_or_else(overflow)
         })?;
         let copy = memory.reserve(bound)?;
-        let picks = rows.map(|row| Some((0, offset(row)))).collect::<Vec<_>>();
+        let picks = rows.map(|row| Some((0, locate(row).1))).collect::<Vec<_>>();
         (rtdb_columnar::copy_event_cells(&[document], &picks)?, Some(copy))
+    } else {
+        let inventory = rows.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+        let mut copy = memory.reserve(inventory)?;
+        let mut sources = Vec::<&dyn Array>::new();
+        let mut slots = std::collections::HashMap::new();
+        let mut picks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (source, offset) = locate(row);
+            let source_bytes = source.get_array_memory_size();
+            // A single put of a larger retained array can compact its masked payload cells.
+            if source_bytes > 4096 { return Ok(None); }
+            let lease = Arc::get_mut(&mut copy).expect("The mutation gather owns its scratch");
+            lease.grow_to(source_bytes.checked_mul(4).and_then(|bytes| lease.bytes().checked_add(bytes)).ok_or_else(overflow)?)?;
+            let slot = *slots.entry(std::ptr::from_ref(source)).or_insert_with(|| {
+                let slot = sources.len();
+                sources.push(source);
+                slot
+            });
+            picks.push((slot, offset));
+        }
+        let Ok(array) = arrow_select::interleave::interleave(&sources, &picks) else { return Ok(None); };
+        (array, Some(copy))
     };
     rtdb_format::data::owned_put_batch(content, &headers, None, memory).map(Some)
 }
@@ -4711,6 +4819,105 @@ mod tests {
         let items = vector.values().as_primitive::<arrow_array::types::Float32Type>();
         assert_eq!(items.value(0).to_bits(), (-0.0_f32).to_bits());
         assert!(items.is_null(1));
+    }
+
+    #[test]
+    fn mutation_run_gathers_alternating_legs_of_the_same_struct_layout() {
+        use arrow_array::{StructArray, UnionArray, Float64Array};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Field, UnionFields};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let list = |value| Arc::new(arrow_array::FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float64, true)), 2,
+            Arc::new(Float64Array::from(vec![Some(value), None])), None,
+        )) as ArrayRef;
+        let doc = |value| {
+            let data = list(value);
+            StructArray::new(vec![Field::new("vector", data.data_type().clone(), false)].into(), vec![data], None)
+        };
+        let a = doc(-0.0);
+        let b = doc(7.0);
+        let fields = UnionFields::try_new([3, 5], [
+            Field::new("first", a.data_type().clone(), false), Field::new("second", b.data_type().clone(), false),
+        ]).unwrap();
+        let input = UnionArray::try_new(fields, ScalarBuffer::from(vec![5, 3, 5, 3]), Some(ScalarBuffer::from(vec![0; 4])), vec![
+            Arc::new(a), Arc::new(b),
+        ]).unwrap();
+        let (source, _) = mutation_document(&input, 0).unwrap();
+        assert_eq!(alternating_document_run(&input, 0, source), 4);
+        let batch = mutation_run_batch(&input, source, 0..4, |row| Ok(EventHeader {
+            position: None,
+            commit_position: 0, iid: Iid([row as u8; 16]), system_from: Timestamp(10),
+            valid_time: Interval::ALL, op: EventOp::Put,
+        }), &memory).unwrap().unwrap();
+        let put = batch.batch().column_by_name("op").unwrap().as_union().child(2).as_struct();
+        let values = put.column(0).as_fixed_size_list().values().as_primitive::<arrow_array::types::Float64Type>();
+        assert_eq!(values.iter().map(|value| value.map(f64::to_bits)).collect::<Vec<_>>(), [
+            Some(7.0_f64.to_bits()), None, Some((-0.0_f64).to_bits()), None,
+            Some(7.0_f64.to_bits()), None, Some((-0.0_f64).to_bits()), None,
+        ]);
+    }
+
+    #[test]
+    fn heterogeneous_mutation_batch_matches_the_event_schema_and_bytes_of_individual_puts() {
+        use arrow_array::{Float64Array, StructArray, UnionArray};
+        use arrow_buffer::{NullBuffer, ScalarBuffer};
+        use arrow_schema::{Field, UnionFields};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let doc = |value: Value, marker: Option<i64>| {
+            let ty = value.logical_type();
+            let data = rtdb_columnar::copy_array(&ty, &[value]).unwrap();
+            let mut fields = vec![rtdb_columnar::to_field("vector", &ty).unwrap(), Field::new("tag", DataType::Float64, true)];
+            let mut columns = vec![data, Arc::new(Float64Array::from(vec![Some(1.0)]))];
+            if let Some(marker) = marker {
+                fields.push(Field::new("marker", DataType::Int64, false));
+                columns.push(Arc::new(arrow_array::Int64Array::from(vec![marker])));
+            }
+            StructArray::new(fields.into(), columns, None)
+        };
+        let a = doc(Value::list(vec![Value::F32(-0.0), Value::Null]), None);
+        let b = doc(Value::list(vec![Value::F64(3.0), Value::Null]), Some(42));
+        let fields = UnionFields::try_new([3, 5], [
+            Field::new("first", a.data_type().clone(), false), Field::new("second", b.data_type().clone(), false),
+        ]).unwrap();
+        let input = UnionArray::try_new(fields, ScalarBuffer::from(vec![3, 5, 3, 5]), Some(ScalarBuffer::from(vec![0; 4])), vec![
+            Arc::new(a), Arc::new(b),
+        ]).unwrap();
+        let target = TableRef::new("public", "vectors");
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let header = |row| Ok(EventHeader { position: None, commit_position: 0, iid: Iid([row as u8; 16]),
+            system_from: key.system_time, valid_time: Interval::ALL, op: EventOp::Put });
+        let base = Snapshot::new(Arc::new(rtdb_index::TrieCatalog::default()), Arc::new(rtdb_index::TableCatalog::default()),
+            Arc::new(rtdb_index::LiveIndex::new(rtdb_types::BlockIndex(0), None, rtdb_trie::TrieConfig::default())));
+        let mut old = TransactionBuffer::new(base.clone(), key, Arc::clone(&memory)).unwrap();
+        for row in 0..input.len() {
+            let (document, offset) = mutation_document(&input, row).unwrap();
+            let batch = rtdb_format::data::owned_put_batch(Arc::new(document.slice(offset, 1)), &[header(row).unwrap()], None, &memory).unwrap();
+            old.append_batch(&target, batch).unwrap();
+        }
+        let mut combined = TransactionBuffer::new(base, key, Arc::clone(&memory)).unwrap();
+        let (batch, declarations) = mutation_layout_batch(&input, header, &memory).unwrap().unwrap();
+        assert_eq!(declarations.get("marker"), Some(&LogicalType::Scalar(ScalarType::I64)));
+        let put = batch.batch().column_by_name("op").unwrap().as_union().child(2).as_struct().slice(0, 1);
+        let mut columns = put.columns().to_vec();
+        let tag = put.fields().iter().position(|field| field.name() == "tag").unwrap();
+        columns[tag] = Arc::new(Float64Array::new(vec![123.0].into(), Some(NullBuffer::from(vec![false]))));
+        let extra = StructArray::new(put.fields().clone(), columns, None);
+        let extra = rtdb_format::data::owned_put_batch(Arc::new(extra), &[header(4).unwrap()], None, &memory).unwrap();
+        combined.append_assembled_put_batch(&target, batch, &declarations).unwrap();
+        old.append_batch(&target, extra.clone()).unwrap();
+        combined.append_batch(&target, extra).unwrap();
+        let old = old.stage().unwrap();
+        let combined = combined.stage().unwrap();
+        let (old, combined) = (&old.tables()[&target], &combined.tables()[&target]);
+        assert_eq!(old.column_types(), combined.column_types());
+        let encode = |write: &rtdb_index::TableWrite| {
+            let batch = write.batch().unwrap().arrow();
+            crate::ipc::encode(batch.schema_ref(), [batch], &memory).unwrap()
+        };
+        assert_eq!(encode(old).as_slice(), encode(combined).as_slice());
     }
 
     #[test]

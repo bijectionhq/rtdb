@@ -734,8 +734,14 @@ struct PendingTable {
     declared: StructFields<LogicalType>,
     sql_declarations: StructFields<LogicalType>,
     events: Vec<StoredEvent>,
-    batches: Vec<(usize, Arc<IndexBatch>)>,
+    batches: Vec<PendingBatch>,
     reservations: Vec<Arc<MemoryReservation>>,
+}
+
+struct PendingBatch {
+    preceding_events: usize,
+    batch: Arc<IndexBatch>,
+    can_concat: bool,
 }
 
 impl PendingTable {
@@ -749,27 +755,27 @@ impl PendingTable {
         if batches.is_empty() {
             return IndexBatch::copy_events(events, &self.declared, budget);
         }
-        if let [(_, batch)] = batches && events.is_empty() && batch.put_types == self.declared {
-            return Ok(Arc::clone(batch));
+        if let [only] = batches && events.is_empty() && only.batch.put_types == self.declared {
+            return Ok(Arc::clone(&only.batch));
         }
-        if events.is_empty() && let Some((_, first)) = batches.first() && first.put_types == self.declared {
-            let schema = first.arrow().schema();
-            if batches.iter().all(|(_, batch)| batch.arrow().schema() == schema) {
-                let bytes = batches.iter().try_fold(4096usize, |bytes, (_, batch)| {
-                    batch.arrow().get_array_memory_size().checked_mul(4)
+        if events.is_empty() && let Some(first) = batches.first() && first.batch.put_types == self.declared {
+            let schema = first.batch.arrow().schema();
+            if batches.iter().all(|page| page.can_concat && page.batch.arrow().schema() == schema) {
+                let bytes = batches.iter().try_fold(4096usize, |bytes, page| {
+                    page.batch.arrow().get_array_memory_size().checked_mul(4)
                         .and_then(|size| bytes.checked_add(size)).ok_or_else(|| invalid("Write batch size overflow"))
                 })?;
                 let mut reservation = budget.reserve(bytes)?;
-                let combined = arrow_select::concat::concat_batches(&schema, batches.iter().map(|(_, batch)| batch.arrow())).map_err(invalid)?;
+                let combined = arrow_select::concat::concat_batches(&schema, batches.iter().map(|page| page.batch.arrow())).map_err(invalid)?;
                 Arc::get_mut(&mut reservation).expect("write concatenation owns its reservation").shrink_to(combined.get_array_memory_size())?;
                 return IndexBatch::from_owned(OwnedBatch::with_reservation(combined, reservation)?);
             }
         }
         let size_error = || invalid("Write batch size overflow");
-        let positions = || batches.iter().map(|(offset, batch)| (*offset, Some(batch)))
+        let positions = || batches.iter().map(|page| (page.preceding_events, Some(&page.batch)))
             .chain(std::iter::once((self.events.len(), None)));
-        let event_count = batches.iter().try_fold(events.len(), |count, (_, batch)| {
-            count.checked_add(batch.len()).ok_or_else(size_error)
+        let event_count = batches.iter().try_fold(events.len(), |count, page| {
+            count.checked_add(page.batch.len()).ok_or_else(size_error)
         })?;
         let scratch = event_count.checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
         let scratch = events.iter().try_fold(scratch, |bytes, event| match &event.operation {
@@ -777,8 +783,8 @@ impl PendingTable {
                 .and_then(|size| bytes.checked_add(size)).ok_or_else(size_error),
             _ => Ok(bytes),
         })?;
-        let scratch = batches.iter().try_fold(scratch, |bytes, (_, batch)| {
-            batch.put_types.iter().try_fold(bytes, |bytes, (name, ty)| {
+        let scratch = batches.iter().try_fold(scratch, |bytes, page| {
+            page.batch.put_types.iter().try_fold(bytes, |bytes, (name, ty)| {
                 ty.retained_bytes()?.checked_add(name.len()).and_then(|size| size.checked_mul(4))
                     .and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
             })
@@ -962,7 +968,7 @@ impl TransactionBuffer {
                 _ => {}
             }
         }
-        for (_, batch) in &pending.batches {
+        for PendingBatch { batch, .. } in &pending.batches {
             for row in 0..batch.len() {
                 let header = batch.header(row)?;
                 if header.iid != iid || batch.view().entity_key(row)? != key { continue; }
@@ -1097,19 +1103,34 @@ impl TransactionBuffer {
         let _key = self.budget.reserve(key.len().checked_add(4096).ok_or_else(|| invalid("Owned key is too large"))?)?;
         let keys = arrow_array::BinaryArray::from_iter_values([key]);
         let batch = keyed_put_batch(content, &[header], keys, source_bytes, &self.budget)?;
-        self.append_batch_inner(table, batch)?;
+        self.append_batch_inner(table, batch, None)?;
         if let Some(position) = position { self.consume_owned_position(position); }
         Ok(position.and_then(NonZeroU32::new))
     }
 
     pub fn append_batch(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
+        self.append_unpositioned_batch(table, batch, None)
+    }
+
+    /// Stages puts assembled from differing schemas, retaining their original declarations.
+    pub fn append_assembled_put_batch(
+        &mut self, table: &TableRef, batch: OwnedBatch, declarations: &StructFields<LogicalType>,
+    ) -> Result<()> {
+        self.append_unpositioned_batch(table, batch, Some(declarations))
+    }
+
+    fn append_unpositioned_batch(
+        &mut self, table: &TableRef, batch: OwnedBatch, assembled_declarations: Option<&StructFields<LogicalType>>,
+    ) -> Result<()> {
         if self.retains_owned_positions() && table.is_owned_event_data() {
             return Err(invalid("An ordered landing stages governed events in assertion order"));
         }
-        self.append_batch_inner(table, batch)
+        self.append_batch_inner(table, batch, assembled_declarations)
     }
 
-    fn append_batch_inner(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
+    fn append_batch_inner(
+        &mut self, table: &TableRef, batch: OwnedBatch, assembled_declarations: Option<&StructFields<LogicalType>>,
+    ) -> Result<()> {
         let rows = batch.batch().num_rows();
         if rows == 0 { return Ok(()); }
         if batch.batch().schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_ok() {
@@ -1125,7 +1146,7 @@ impl TransactionBuffer {
         let reservation = self.budget.reserve(table.schema.len() + table.table.len() + 4096)?;
         let pending = self.tables.get(table);
         let mut declarations = Vec::new();
-        for (name, ty) in &batch.put_types {
+        for (name, ty) in assembled_declarations.unwrap_or(&batch.put_types) {
             let existing = pending.and_then(|pending| pending.declared.get(name));
             if existing == Some(ty) { continue; }
             let reservation = self.budget.reserve(document_type_bytes(name, ty, existing)?)?;
@@ -1138,7 +1159,11 @@ impl TransactionBuffer {
             pending.declared.insert(name, ty);
             pending.reservations.push(reservation);
         }
-        pending.batches.push((pending.events.len(), batch));
+        pending.batches.push(PendingBatch {
+            preceding_events: pending.events.len(), batch,
+            // Rows from differing schemas require event assembly when combined with another write.
+            can_concat: assembled_declarations.is_none(),
+        });
         pending.reservations.push(reservation);
         self.next_event_ordinal = end;
         Ok(())

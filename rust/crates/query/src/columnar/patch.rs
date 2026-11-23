@@ -4,9 +4,9 @@ use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Field as ArrowField, Fields, UnionMode};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, from_field, to_field};
 use rtdb_plan::{Expr, Schema};
-use rtdb_types::{LogicalType, Result};
+use rtdb_types::{LogicalType, Result, Value};
 
-use super::{ArrowVector, Column, ColumnBatch, SelectedColumn, arrow_cell_is_null, size_error, stable_read_layout};
+use super::{ArrowVector, Column, ColumnBatch, SelectedColumn, arrow_cell_is_null, pack_evaluated_column, size_error, stable_read_layout};
 
 #[derive(Clone, Copy)]
 struct Record<'a> {
@@ -46,12 +46,20 @@ pub(super) fn merge(
     let (Some(old), Some(patch)) = (schema.position(*old), schema.position(*patch)) else { return Ok(None); };
     let bytes = batch.len.checked_mul(256).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
     let reservation = memory.reserve(bytes)?;
+    fn pack_operand(column: &Column, memory: &Arc<MemoryBudget>) -> Option<(Column, Arc<MemoryReservation>)> {
+        let Column::Values(values) = column else { return None; };
+        values.iter().all(|value| matches!(value, Value::Struct(_) | Value::Null | Value::Undefined))
+            .then(|| pack_evaluated_column(values, memory).ok()).flatten()
+    }
+    let operands = [&batch.columns[old], &batch.columns[patch]];
+    let packed = operands.map(|column| pack_operand(column, memory));
+    let [old, patch] = std::array::from_fn(|index| packed[index].as_ref().map_or(operands[index], |(column, _)| column));
     let mut rows = Vec::with_capacity(batch.len);
     let mut layouts = HashMap::new();
     let mut groups = Vec::new();
     let mut positions = Vec::with_capacity(batch.len);
     for row in 0..batch.len {
-        let (Some(old), Some(Some(patch))) = (record(&batch.columns[old], row), record(&batch.columns[patch], row)) else { return Ok(None); };
+        let (Some(old), Some(Some(patch))) = (record(old, row), record(patch, row)) else { return Ok(None); };
         let fields = (old.map(|old| old.array.fields()), patch.array.fields());
         let group = *layouts.entry(fields).or_insert_with(|| {
             let group = groups.len();
@@ -67,8 +75,8 @@ pub(super) fn merge(
     let heterogeneous = groups.len() > 2
         || groups.iter().filter(|((old, _), _)| old.is_some()).count() > 1
         || groups.iter().any(|((_, fields), _)| *fields != groups[0].0.1);
-    let union_records = [old, patch].iter().any(|&column| {
-        (0..batch.len).any(|row| batch.columns[column].arrow_cell(row).flatten()
+    let union_records = [old, patch].iter().any(|column| {
+        (0..batch.len).any(|row| column.arrow_cell(row).flatten()
             .is_some_and(|(_, field, _, _)| matches!(field.data_type(), DataType::Union(..))))
     });
     let mut sources = Vec::with_capacity(groups.len());
@@ -76,7 +84,7 @@ pub(super) fn merge(
         let Some(((array, field, logical), charge)) = merged_group(&rows, &indices, old, patch, memory)? else {
             return Ok(None);
         };
-        if heterogeneous || union_records {
+        if heterogeneous || union_records || packed.iter().any(Option::is_some) {
             rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
         }
         if indices.len() == batch.len {
@@ -183,7 +191,7 @@ mod tests {
     use super::*;
     use arrow_array::RecordBatch;
     use rtdb_plan::{ColumnId, Field};
-    use rtdb_types::{StructFields, Value};
+    use rtdb_types::StructFields;
 
     #[test]
     fn null_patch_cells_keep_existing_fields_and_missing_left_records_keep_the_patch_shape() {
@@ -260,4 +268,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn patch_keeps_arrow_vectors_when_the_other_operand_is_a_row_record() {
+        let memory = MemoryBudget::new(1 << 20);
+        let vector = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into());
+        let record = Value::Struct(StructFields::from([("vector".into(), vector.clone())]));
+        let patch = Value::Struct(StructFields::from([("vector".into(), Value::Null), ("label".into(), Value::I64(5))]));
+        let logical = record.logical_type();
+        let field = Arc::new(to_field("lhs", &logical).unwrap());
+        let array = rtdb_columnar::copy_array(&logical, &[record]).unwrap();
+        let schema = Schema::new([logical.clone(), patch.logical_type()].into_iter().enumerate().map(|(index, data_type)| {
+            Field { id: ColumnId(index as u32), name: format!("c{index}"), qualifier: None, qualified_only: false, unnamed: false, data_type }
+        }).collect()).unwrap();
+        let batch = ColumnBatch::settled(vec![
+            Column::Arrow { array, field, logical: Some(logical) },
+            Column::Values(vec![patch]),
+        ], 1, memory.reserve(4096).unwrap()).unwrap();
+        let args = schema.fields().iter().map(Field::expression).collect::<Vec<_>>();
+        let (column, _charge) = merge(&args, &schema, &batch, &memory).unwrap().unwrap();
+        let Some(Some((array, field, _, row))) = column.arrow_cell(0) else { panic!("Expected an Arrow record"); };
+        let cell = (ArrowCell { array, field, row }).structure().unwrap().next().unwrap();
+        let (components, range) = cell.float_list_span().unwrap();
+        assert_eq!(components.float_component(range.start).unwrap().to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(components.float_component(range.start + 1), None);
+        assert_eq!(column.value(0).unwrap(), Value::Struct(StructFields::from([("vector".into(), vector), ("label".into(), Value::I64(5))])));
+    }
 }

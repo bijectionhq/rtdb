@@ -13,7 +13,7 @@ use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt,
 use crate::{ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, OwnedRelativePeriod, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::bounded_retry::{BOUNDED_RETRY_METADATA_KEY, BoundedRetry};
 use crate::values::{DecodedDocumentLayout, contains_fixed_size_list};
-use crate::values::arguments::canonical_float_field;
+use crate::values::arguments::{canonical_float_field, compatible_float_cell, float_field};
 
 const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
 // The hosted value model admits UTC years 0001 through 9999.
@@ -1570,9 +1570,9 @@ impl DocumentCell<'_> {
     }
 
     fn observed_type(&self, memory: &Arc<MemoryBudget>) -> Result<LogicalType> {
-        if let Self::Arrow { cell, .. } = self && canonical_float_field(cell.field) {
+        if let Self::Arrow { cell, declared } = self && float_field(cell.field) {
             let _scratch = memory.reserve(cell.field.size().checked_mul(16).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
-            return cell.observed_type();
+            if compatible_float_cell(*cell, *declared) { return cell.observed_type(); }
         }
         let _scratch = memory.reserve(self.bound()?)?;
         Ok(self.value()?.logical_type())
@@ -1651,6 +1651,9 @@ fn copy_document_floats(
         return Ok(None);
     }
     let _inventory = memory.reserve(cells.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+    if cells.iter().any(|cell| matches!(cell, Some(DocumentCell::Arrow { cell, declared }) if !compatible_float_cell(*cell, *declared))) {
+        return Ok(None);
+    }
     let values = cells.iter().filter_map(|cell| match cell {
         Some(DocumentCell::Value(value)) => Some(value.as_ref()),
         _ => None,
@@ -1658,40 +1661,54 @@ fn copy_document_floats(
     let (values, _rows) = rtdb_columnar::copy_evaluated_cells(ty, values.len(), memory,
         |row| values[row].retained_bytes(), |row| Ok(values[row].clone()))?;
     let mut next_row = 0;
+    let picks = cells.iter().map(|cell| match cell {
+        None => None,
+        Some(DocumentCell::Value(_)) => {
+            let row = next_row;
+            next_row += 1;
+            Some(ArrowCell { field: target, array: values.as_ref(), row })
+        }
+        Some(DocumentCell::Arrow { cell, .. }) => Some(*cell),
+    });
+    copy_float_cells(target, picks, memory).map(Some)
+}
+
+pub(crate) fn copy_float_cells<'a>(
+    target: &Field, cells: impl ExactSizeIterator<Item = Option<ArrowCell<'a>>>, memory: &Arc<MemoryBudget>,
+) -> Result<(ArrayRef, Arc<MemoryReservation>)> {
+    let base = cells.len().checked_mul(std::mem::size_of::<FloatCell<'_>>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let mut charge = memory.reserve(base)?;
     let mut picks = Vec::with_capacity(cells.len());
     for cell in cells {
-        picks.push(match cell {
-            None => None,
-            Some(DocumentCell::Value(_)) => {
-                let row = next_row;
-                next_row += 1;
-                Some(ArrowCell { field: target, array: values.as_ref(), row })
-            }
-            Some(DocumentCell::Arrow { cell, .. }) => {
-                if !canonical_float_field(cell.field) { return Ok(None); }
-                Some(*cell)
-            }
-        });
-    }
-    let bound = picks.iter().try_fold(4096usize, |bytes, cell| {
         let cell_bytes = match cell {
             Some(cell) => rtdb_columnar::estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?,
             None => rtdb_columnar::estimate_null_copy_cell_bytes(target)?,
         };
-        cell_bytes.checked_mul(4).and_then(|cell| bytes.checked_add(cell)).ok_or_else(overflow)
-    })?;
-    let mut charge = memory.reserve(bound)?;
-    let array = gather_float_cells(target, &picks)?;
+        let lease = Arc::get_mut(&mut charge).expect("The document column owns its reservation");
+        let bound = cell_bytes.checked_mul(4).and_then(|cell| lease.bytes().checked_add(cell)).ok_or_else(overflow)?;
+        lease.grow_to(bound)?;
+        picks.push(cell.map_or(FloatCell::Null, FloatCell::Arrow));
+    }
+    let array = gather_float_layout(target, &picks, picks.len() > 128)?;
+    drop(picks);
     Arc::get_mut(&mut charge).expect("The document column owns its reservation").shrink_to(array.get_array_memory_size())?;
-    Ok(Some((array, charge)))
+    Ok((array, charge))
 }
 
-fn gather_float_cells(target: &Field, cells: &[Option<ArrowCell<'_>>]) -> Result<ArrayRef> {
+#[derive(Clone, Copy)]
+enum FloatCell<'a> {
+    Arrow(ArrowCell<'a>),
+    Null,
+    Masked,
+}
+
+fn gather_float_layout(target: &Field, cells: &[FloatCell<'_>], interleaved: bool) -> Result<ArrayRef> {
     use arrow_array::types::{Float32Type, Float64Type};
 
-    fn visible(cell: Option<ArrowCell<'_>>) -> Result<Option<ArrowCell<'_>>> {
-        cell.map(|cell| cell.physical().and_then(|cell| Ok((!cell.is_null()?).then_some(cell))))
-            .transpose().map(Option::flatten)
+    fn visible(cell: FloatCell<'_>) -> Result<Option<ArrowCell<'_>>> {
+        let FloatCell::Arrow(cell) = cell else { return Ok(None); };
+        let cell = cell.physical()?;
+        Ok((!cell.is_null()?).then_some(cell))
     }
     let mismatch = || invalid("Floating-point document cells disagree with their canonical layout");
     macro_rules! primitive {
@@ -1716,22 +1733,31 @@ fn gather_float_cells(target: &Field, cells: &[Option<ArrowCell<'_>>]) -> Result
             let mut groups = vec![Vec::new(); legs.len()];
             let mut tags = Vec::with_capacity(cells.len());
             let mut offsets = Vec::with_capacity(cells.len());
-            for &cell in cells {
-                let cell = visible(cell)?;
-                let (index, (id, _)) = legs.iter().enumerate().find(|(_, (_, leg))| {
-                    match (cell.map(|cell| cell.field.data_type()), leg.data_type()) {
-                        (None, DataType::Null) => true,
-                        (Some(DataType::List(_)), DataType::List(_)) => true,
-                        (Some(DataType::FixedSizeList(_, a)), DataType::FixedSizeList(_, b)) => a == b,
-                        (Some(source), target) => source == target,
-                        _ => false,
-                    }
-                }).ok_or_else(mismatch)?;
+            for &input in cells {
+                let cell = visible(input)?;
+                let (index, (id, _)) = if matches!(input, FloatCell::Masked) {
+                    // The row writer pads under the first leg within a chunk. Interleaving row-writer chunks uses the null leg.
+                    let mut legs = legs.iter().enumerate();
+                    let first = legs.next();
+                    first.filter(|(_, (_, field))| !interleaved || field.data_type() == &DataType::Null)
+                        .or_else(|| legs.find(|(_, (_, field))| field.data_type() == &DataType::Null))
+                        .or(first)
+                } else {
+                    legs.iter().enumerate().find(|(_, (_, leg))| {
+                        match (cell.map(|cell| cell.field.data_type()), leg.data_type()) {
+                            (None, DataType::Null) => true,
+                            (Some(DataType::List(_)), DataType::List(_)) => true,
+                            (Some(DataType::FixedSizeList(_, a)), DataType::FixedSizeList(_, b)) => a == b,
+                            (Some(source), target) => source == target,
+                            _ => false,
+                        }
+                    })
+                }.ok_or_else(mismatch)?;
                 tags.push(id);
                 offsets.push(i32::try_from(groups[index].len()).map_err(|_| overflow())?);
-                groups[index].push(cell);
+                groups[index].push(cell.map_or(input, FloatCell::Arrow));
             }
-            let children = legs.iter().zip(&groups).map(|((_, field), cells)| gather_float_cells(field, cells)).collect::<Result<Vec<_>>>()?;
+            let children = legs.iter().zip(&groups).map(|((_, field), cells)| gather_float_layout(field, cells, interleaved)).collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(UnionArray::try_new(legs.clone(), tags.into(), Some(offsets.into()), children)
                 .map_err(|error| invalid(error.to_string()))?))
         }
@@ -1754,19 +1780,15 @@ fn gather_float_cells(target: &Field, cells: &[Option<ArrowCell<'_>>]) -> Result
                     };
                     if width != actual_width { return Err(mismatch()); }
                     let (field, array, range) = cell.sequence_range().ok_or_else(mismatch)?;
-                    children.extend(range.map(|row| Some(ArrowCell { field, array, row })));
+                    children.extend(range.map(|row| FloatCell::Arrow(ArrowCell { field, array, row })));
                 } else if let Some(width) = width {
-                    // The row writer can put masked union components in the first leg.
-                    if !matches!(item.data_type(), DataType::Float32 | DataType::Float64 | DataType::Null) {
-                        return Err(mismatch());
-                    }
-                    children.extend(std::iter::repeat_n(None, width));
+                    children.extend(std::iter::repeat_n(FloatCell::Masked, width));
                 }
                 if width.is_none() {
                     offsets.push(i32::try_from(children.len()).map_err(|_| overflow())?);
                 }
             }
-            let values = gather_float_cells(item, &children)?;
+            let values = gather_float_layout(item, &children, interleaved)?;
             let layout = arrow_array::new_empty_array(target.data_type()).to_data();
             let nulls = valid.iter().any(|valid| !valid).then(|| NullBuffer::from(valid));
             let mut data = layout.into_builder().len(cells.len()).nulls(nulls).child_data(vec![values.to_data()]);
@@ -3883,6 +3905,61 @@ mod tests {
     }
 
     #[test]
+    fn receipt_masks_fixed_list_union_components_in_the_first_leg() {
+        let memory = MemoryBudget::new(1 << 24);
+        for middle in [Value::F32(1.0), Value::Null] {
+            let vector = Value::FixedSizeList(vec![Value::F32(-0.0), middle, Value::F64(f64::from_bits(0x7ff8000000000003))].into());
+            let ty = vector.logical_type().maybe();
+            let field = to_field("embedding", &ty).unwrap();
+            let values = copy_array(&ty, &[Value::Null, vector]).unwrap();
+            let input = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), field.clone()])),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])), Arc::clone(&values)],
+            ).unwrap();
+            let documents = ArrowDocuments::from_record_batch(&input, &memory).unwrap().unwrap();
+            let cells = [None, Some(DocumentCell::Arrow {
+                cell: ArrowCell { field: &field, array: values.as_ref(), row: 1 }, declared: Some(&ty),
+            })];
+            let (typed, _) = copy_document_floats(&field, &ty, &cells.each_ref().map(Option::as_ref), &memory).unwrap().unwrap();
+            let components = typed.as_fixed_size_list().values().as_union();
+            let DataType::Union(legs, _) = components.data_type() else { unreachable!() };
+            assert_eq!(components.type_ids()[..3], [legs.iter().next().unwrap().0; 3]);
+
+            let from_rows = |rows: Documents| Operation::Public(TxOp::PutDocs {
+                table: TableRef::new("public", "docs"), documents: rows, valid_from: None, valid_to: None,
+            });
+            let row_documents = documents.to_rows(true, &memory).unwrap();
+            let row = SourceTransaction::from_operations(vec![from_rows(row_documents)], SubmitOptions::default(), &memory).unwrap();
+            let arrow = SourceTransaction::from_operations(vec![Operation::PutReplayArrow {
+                table: TableRef::new("public", "docs"), documents, iids: None, valid_from: None, valid_to: None,
+            }], SubmitOptions::default(), &memory).unwrap();
+            assert_eq!(arrow.body_digest().unwrap(), row.body_digest().unwrap());
+        }
+    }
+
+    #[test]
+    fn receipt_masks_match_the_row_writer_across_its_chunk_boundary() {
+        let memory = MemoryBudget::new(1 << 24);
+        let vector = Value::FixedSizeList(vec![Value::F32(-0.0), Value::F64(3.0), Value::Null].into());
+        let ty = vector.logical_type().maybe();
+        let field = to_field("embedding", &ty).unwrap();
+        let values = copy_array(&ty, &[Value::Null, vector]).unwrap();
+        let expected = read_value(&field, values.as_ref(), 1).unwrap();
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let encode = |array| {
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+            crate::ipc::encode(&schema, [&batch], &memory).unwrap()
+        };
+        for len in [128, 129] {
+            let array = (0..len).map(|row| Some(ArrowCell { field: &field, array: values.as_ref(), row: row % 2 }));
+            let (fast, _fast) = copy_float_cells(&field, array, &memory).unwrap();
+            let (slow, _slow) = rtdb_columnar::copy_evaluated_cells(&ty, len, &memory, |_| expected.retained_bytes(),
+                |row| Ok(if row % 2 == 0 { Value::Null } else { expected.clone() })).unwrap();
+            assert_eq!(encode(fast).as_slice(), encode(slow).as_slice());
+        }
+    }
+
+    #[test]
     fn missing_arrow_id_transit_context_preserves_nullable_float_components() {
         let memory = MemoryBudget::new(1 << 24);
         let document = StructFields::from([
@@ -3895,6 +3972,24 @@ mod tests {
         let expected = document_id(&document, &memory).unwrap_err();
         let direct = arrow.missing_float_document_id(0, &memory).unwrap().unwrap();
         assert_eq!(direct, expected);
+        assert_eq!(arrow.iid(0, arrow.id_reader().unwrap().as_ref(), &memory).unwrap_err(), expected);
+    }
+
+    #[test]
+    fn missing_arrow_id_uses_nested_float_positions_for_transit_context() {
+        let memory = MemoryBudget::new(1 << 24);
+        let document = StructFields::from([
+            ("_id".into(), Value::Null),
+            ("details".into(), Value::Struct(StructFields::from([
+                ("embedding".into(), Value::list(vec![Value::F32(-0.0), Value::F64(f64::INFINITY), Value::Null])),
+                ("label".into(), Value::I32(2)),
+                ("empty".into(), Value::Null),
+            ]))),
+        ]);
+        let documents = Documents::new(vec![document.clone()], &memory).unwrap();
+        let arrow = owned_row_documents(&documents, &memory).unwrap();
+        let expected = document_id(&document, &memory).unwrap_err();
+        assert_eq!(arrow.missing_float_document_id(0, &memory).unwrap().unwrap(), expected);
         assert_eq!(arrow.iid(0, arrow.id_reader().unwrap().as_ref(), &memory).unwrap_err(), expected);
     }
 

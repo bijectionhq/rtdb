@@ -65,6 +65,14 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
                     }
                 }
             }
+            if !unambiguous_field(field) && float_field(field) && canonical_float_field(target)
+                && has_valid_union_nulls(field, array.as_ref())
+                && (0..array.len()).all(|row| compatible_float_cell(ArrowCell { field, array: array.as_ref(), row }, Some(source))) {
+                let cells = (0..array.len()).map(|row| Some(ArrowCell { field, array: array.as_ref(), row }));
+                if let Ok(output) = crate::source::copy_float_cells(target, cells, memory) {
+                    return Ok((output.0, Some(output.1)));
+                }
+            }
             let (output, scratch) = copy_evaluated_cells(ty, batch.num_rows(), memory,
                 |row| estimate_read_cell_bytes(field, array.as_ref(), row),
                 |row| {
@@ -105,13 +113,62 @@ fn aligned_argument(array: &ArrayRef, source: &Field, target: &Field, memory: &A
 }
 
 pub(crate) fn canonical_float_field(field: &Field) -> bool {
+    float_field(field) && unambiguous_field(field)
+}
+
+pub(crate) fn float_field(field: &Field) -> bool {
     field.metadata().is_empty() && match field.data_type() {
-        DataType::List(element) | DataType::FixedSizeList(element, _) => canonical_float_field(element),
-        DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| canonical_float_field(field)) && unambiguous_union(field, fields),
+        DataType::List(element) | DataType::FixedSizeList(element, _) => float_field(element),
+        DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| float_field(field)),
         DataType::Float32 | DataType::Float64 => true,
         DataType::Null => field.is_nullable(),
         _ => false,
     }
+}
+
+fn unambiguous_field(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) =>
+            unambiguous_union(field, fields) && fields.iter().all(|(_, child)| unambiguous_field(child)),
+        DataType::List(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _)
+        | DataType::RunEndEncoded(_, child) => unambiguous_field(child),
+        DataType::Struct(fields) => fields.iter().all(|child| unambiguous_field(child)),
+        _ => true,
+    }
+}
+
+pub(crate) fn compatible_float_cell(cell: ArrowCell<'_>, declared: Option<&LogicalType>) -> bool {
+    fn compatible(cell: ArrowCell<'_>, logical: &LogicalType) -> Option<()> {
+        let ArrowCell { field, array, row } = cell;
+        if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+            let union = array.as_union();
+            let tag = union.type_id(row);
+            let (_, child) = fields.iter().find(|(id, _)| *id == tag)?;
+            let physical = rtdb_columnar::from_field(child).ok()?;
+            let named = match logical {
+                LogicalType::Union(legs) => legs.iter().find(|leg| rtdb_columnar::leg_name(leg).is_ok_and(|name| name == *child.name())),
+                _ => None,
+            };
+            let logical = named.unwrap_or(&physical);
+            if *logical != physical && logical.clone().maybe() != physical { return None; }
+            return compatible(ArrowCell { field: child, array: union.child(tag).as_ref(), row: union.value_offset(row) }, logical);
+        }
+        let physical = rtdb_columnar::from_field(field).ok()?;
+        if *logical != physical && logical.clone().maybe() != physical { return None; }
+        if array.is_null(row) { return Some(()); }
+        let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+        if let LogicalType::List { element, .. } = logical {
+            let (field, array, range) = cell.sequence_range()?;
+            for row in range { compatible(ArrowCell { field, array, row }, element)?; }
+        }
+        Some(())
+    }
+
+    if !float_field(cell.field) { return false; }
+    if declared.is_none() && unambiguous_field(cell.field) { return true; }
+    let Ok(physical) = rtdb_columnar::from_field(cell.field) else { return false; };
+    if declared.is_none_or(|declared| *declared == physical) && unambiguous_field(cell.field) { return true; }
+    compatible(cell, declared.unwrap_or(&physical)).is_some()
 }
 
 fn canonical_argument_field(field: &Field) -> bool {
@@ -312,6 +369,35 @@ fn canonical_argument_ipc_matches_rows_with_nullable_vectors_and_extension_field
     let encoded = crate::source::encode_arguments(&arguments, &memory).unwrap();
     let expected = crate::source::encode_arguments(&from_rows, &memory).unwrap();
     assert_eq!(encoded.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn argument_ipc_gathers_float_union_positions_with_an_unused_conflicting_alias() {
+    use arrow_array::{Float32Array, Float64Array, UnionArray};
+    use arrow_buffer::ScalarBuffer;
+    use arrow_schema::UnionFields;
+    use rtdb_types::Value;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let fields = UnionFields::try_new([5, 3, 8], [
+        Field::new("f64", DataType::Float32, false),
+        Field::new("alternate", DataType::Float32, false),
+        Field::new("double", DataType::Float64, false),
+    ]).unwrap();
+    let array = UnionArray::try_new(fields, ScalarBuffer::from(vec![3, 8, 3]), Some(ScalarBuffer::from(vec![0, 0, 1])), vec![
+        Arc::new(Float32Array::from(vec![123.0])),
+        Arc::new(Float32Array::from(vec![-0.0, f32::from_bits(0x7fc00003)])),
+        Arc::new(Float64Array::from(vec![2.0])),
+    ]).unwrap();
+    let field = Field::new("?_0", array.data_type().clone(), false);
+    assert!(!canonical_float_field(&field));
+    assert!((0..array.len()).all(|row| compatible_float_cell(ArrowCell { field: &field, array: &array, row }, None)));
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap();
+    let arrow = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let rows = SqlArguments::from_rows(vec![vec![Value::F32(-0.0)], vec![Value::F64(2.0)],
+        vec![Value::F32(f32::from_bits(0x7fc00003))]], &memory).unwrap();
+    assert_eq!(crate::source::encode_arguments(&arrow, &memory).unwrap().as_slice(),
+        crate::source::encode_arguments(&rows, &memory).unwrap().as_slice());
 }
 
 #[test]

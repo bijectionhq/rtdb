@@ -488,20 +488,17 @@ impl ArrowDocuments {
         use arrow_array::types::{Float32Type, Float64Type};
         use rtdb_format::transit::{self, TransitValue as T};
 
-        let cells = || self.array.fields().iter().zip(self.array.columns())
-            .map(|(field, array)| ArrowCell { field, array: array.as_ref(), row });
-        if !cells().any(|cell| cell.float_list_span().is_some()) { return Ok(None); }
-        let mut scratch = memory.reserve(4096)?;
-        let mut document = Vec::new();
-        for cell in cells() {
+        fn convert(cell: ArrowCell<'_>, depth: usize, allow_bottom: bool, found_float: &mut bool, lease: &mut MemoryReservation) -> Result<Option<T>> {
+            if depth > rtdb_types::transit_value::MAX_DEPTH { return Ok(None); }
             let physical = cell.physical()?;
-            let read_bound = rtdb_columnar::estimate_read_cell_bytes(physical.field, physical.array, physical.row)?;
-            let lease = Arc::get_mut(&mut scratch).expect("Missing ID context owns its reservation");
-            let bound = lease.bytes().checked_add(read_bound).and_then(|bytes| bytes.checked_add(cell.field.name().len() + 512)).ok_or_else(overflow)?;
+            let bound = lease.bytes().checked_add(cell.field.name().len()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
             lease.grow_to(bound)?;
-            let value = if let Some((field, array, range)) = physical.sequence_range()
-                && physical.float_list_span().is_some() {
-                if !arguments::canonical_float_field(field) { return Ok(None); }
+            Ok(Some(if let Some((field, array, range)) = physical.sequence_range()
+                && physical.float_list_span().is_some() && arguments::compatible_float_cell(cell, None) {
+                if depth == rtdb_types::transit_value::MAX_DEPTH && !range.is_empty() { return Ok(None); }
+                *found_float = true;
+                let bytes = range.len().checked_mul(std::mem::size_of::<T>()).and_then(|bytes| lease.bytes().checked_add(bytes)).ok_or_else(overflow)?;
+                lease.grow_to(bytes)?;
                 let items = range.map(|row| {
                     let cell = (ArrowCell { field, array, row }).physical()?;
                     Ok(if cell.is_null()? {
@@ -513,18 +510,49 @@ impl ArrowDocuments {
                     })
                 }).collect::<Result<_>>()?;
                 T::Array(items)
-            } else if physical.is_null()? {
+            } else if matches!(cell.field.data_type(), DataType::Struct(_)) && let Some(fields) = cell.structure() {
+                let mut document = StructFields::new();
+                for child in fields {
+                    let Some(value) = convert(child, depth + 1, true, found_float, lease)? else { return Ok(None); };
+                    document.insert(child.field.name().clone(), value);
+                }
+                T::Map(document.into_iter().map(|(name, value)| (T::String(name), value)).collect())
+            } else if matches!(cell.field.data_type(), DataType::List(_) | DataType::FixedSizeList(..))
+                && cell.field.metadata().is_empty() && let Some(items) = cell.sequence() {
+                let mut list = Vec::new();
+                for child in items {
+                    let Some(value) = convert(child, depth + 1, false, found_float, lease)? else { return Ok(None); };
+                    list.push(value);
+                }
+                T::Array(list)
+            } else if cell.field.data_type() == &DataType::Null {
+                if !cell.field.is_nullable() && !allow_bottom { return Ok(None); }
+                T::Null
+            } else if cell.array.is_null(cell.row) || physical.is_null()? && arguments::compatible_float_cell(cell, None) {
                 T::Null
             } else {
                 if !matches!(physical.logical_type()?, LogicalType::Scalar(_)) { return Ok(None); }
+                let read_bound = rtdb_columnar::estimate_read_cell_bytes(cell.field, cell.array, cell.row)?;
+                lease.grow_to(lease.bytes().checked_add(read_bound).ok_or_else(overflow)?)?;
                 let mut value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
                 value.admit_object_dates()?;
                 let bytes = rtdb_expr::text_allocation_bound(&value)?;
                 lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(overflow)?)?;
                 transit::value_to_transit(&value)?
-            };
+            }))
+        }
+
+        let cells = self.array.fields().iter().zip(self.array.columns())
+            .map(|(field, array)| ArrowCell { field, array: array.as_ref(), row });
+        let mut scratch = memory.reserve(4096)?;
+        let lease = Arc::get_mut(&mut scratch).expect("Missing ID context owns its reservation");
+        let mut document = Vec::new();
+        let mut found_float = false;
+        for cell in cells {
+            let Some(value) = convert(cell, 1, true, &mut found_float, lease)? else { return Ok(None); };
             document.push((T::String(cell.field.name().clone()), value));
         }
+        if !found_float { return Ok(None); }
         let document = T::Map(document);
         let _json = memory.reserve(transit::json_value_allocation_bound(&document)?)?;
         Ok(Some(Anomaly::incorrect("missing-id", "missing '_id'").with_transit_context("doc", &document)?))

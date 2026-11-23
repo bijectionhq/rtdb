@@ -15,7 +15,7 @@ use rtdb_sql::StaticMutationKind;
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
 use crate::source::{DocumentCell, Operation, owned_projected_documents};
 use crate::values::{BoundArgumentRow, canonical_argument_column, plain_scalar_field};
-use crate::values::arguments::canonical_float_field;
+use crate::values::arguments::{canonical_float_field, compatible_float_cell};
 
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
@@ -430,31 +430,33 @@ fn materialize<'a>(
         }
         RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
             materialize(input, binding, context, &mut |row| {
-                if expressions.iter().all(|expr| matches!(expr.expr, Expr::Column { .. })) {
-                    let values = expressions.iter().map(|expression| {
-                        let Expr::Column { id, .. } = expression.expr else { unreachable!() };
-                        let cell = &row[input.schema().position(id).expect("A static rename refers to its input column")];
-                        Ok(match cell {
+                let mut computed_inputs = BTreeSet::new();
+                for expression in expressions.iter().filter(|expression| !matches!(expression.expr, Expr::Column { .. })) {
+                    expression.expr.visit(&mut |expr| {
+                        if let Expr::Column { id, .. } = expr && let Some(position) = input.schema().position(*id) {
+                            computed_inputs.insert(position);
+                        }
+                    });
+                }
+                let values = row.iter().enumerate().map(|(position, cell)| {
+                    if !computed_inputs.contains(&position) { return Ok(Value::Null); }
+                    if let Some(scope) = context.allocation { scope.reserve(cell.bound()?)?; }
+                    cell.value().map(Cow::into_owned)
+                }).collect::<Result<Vec<_>>>()?;
+                let projected = expressions.iter().map(|expression| {
+                    if let Expr::Column { id, .. } = expression.expr {
+                        let cell = &row[input.schema().position(id).expect("A static projection refers to its input column")];
+                        return Ok(match cell {
                             DocumentCell::Arrow { cell, declared } => DocumentCell::Arrow { cell: *cell, declared: *declared },
                             DocumentCell::Value(value) => {
                                 if let Some(scope) = context.allocation { scope.reserve(value.retained_bytes()?)?; }
                                 DocumentCell::Value(Cow::Owned(value.as_ref().clone()))
                             }
-                        })
-                    }).collect::<Result<_>>()?;
-                    emit(values)
-                } else {
-                    let row = row.into_iter().map(|cell| match cell {
-                        DocumentCell::Value(value) => Ok(value.into_owned()),
-                        cell => {
-                            if let Some(scope) = context.allocation { scope.reserve(cell.bound()?)?; }
-                            cell.value().map(Cow::into_owned)
-                        }
-                    }).collect::<Result<Vec<_>>>()?;
-                    let values = expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), &row, context)
-                        .map(|value| DocumentCell::Value(Cow::Owned(value)))).collect::<Result<_>>()?;
-                    emit(values)
-                }
+                        });
+                    }
+                    evaluate(&expression.expr, input.schema(), &values, context).map(|value| DocumentCell::Value(Cow::Owned(value)))
+                }).collect::<Result<_>>()?;
+                emit(projected)
             })
         }
         _ => Err(Anomaly::fault("rtdb.tx/static-plan", "Static SQL source contains a data-dependent operator")),
@@ -487,8 +489,23 @@ fn project_static_cell<'a>(
         };
         expr
     } else { expr };
-    if let Expr::Parameter { index, .. } = expr
-        && let Some(cell) = arrow(*index).filter(|cell| canonical_float_field(cell.field))
+    fn record_field(field: &arrow_schema::Field) -> bool {
+        plain_scalar_field(field) || canonical_float_field(field)
+            || rtdb_columnar::decimal_field_parameters(field).is_ok_and(|decimal| decimal.is_some())
+            || matches!(field.data_type(), DataType::Struct(fields) if field.metadata().is_empty() && fields.iter().all(|field| record_field(field)))
+    }
+    fn position<'a>(expr: &Expr, arrow: impl Fn(usize) -> Option<ArrowCell<'a>> + Copy) -> Option<ArrowCell<'a>> {
+        match expr {
+            Expr::Parameter { index, .. } => arrow(*index),
+            Expr::Field { expr, name, .. } => {
+                let record = position(expr, arrow)?;
+                if !record_field(record.field) { return None; }
+                record.structure()?.filter(|field| field.field.name() == name).last()
+            }
+            _ => None,
+        }
+    }
+    if let Some(cell) = position(expr, arrow).filter(|cell| compatible_float_cell(*cell, None))
         && matches!(cell.physical()?.field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Null) {
         return Ok(DocumentCell::Arrow { cell, declared: None });
     }
@@ -902,4 +919,37 @@ fn static_patch_and_timed_put_encode_mixed_float_bindings_as_rows_would() {
             Ok(())
         }).unwrap();
     }
+}
+
+#[test]
+fn static_patch_records_selects_the_vector_child_of_a_bound_arrow_record() {
+    let memory = MemoryBudget::new(1 << 25);
+    let value = Value::Struct(StructFields::from([
+        ("_id".into(), Value::I64(1)),
+        ("embedding".into(), Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into())),
+    ]));
+    let ty = value.logical_type();
+    let field = rtdb_columnar::to_field("record", &ty).unwrap();
+    let array = rtdb_columnar::copy_array(&ty, std::slice::from_ref(&value)).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![array.clone()]).unwrap();
+    let arguments = SqlArguments::from_arrow(rtdb_columnar::OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let sql = "PATCH INTO docs RECORDS $1";
+    let plan = rtdb_sql::prepare_static(sql, &SubmissionCatalog("xtdb"),
+        &rtdb_sql::PrepareOptions { parameter_types: arguments.execution_types().enumerate().collect(), ..Default::default() }).unwrap().unwrap();
+    let BoundArgumentRow::Arrow { batch, row, types } = arguments.indexed_bound_rows().next().unwrap().unwrap().1 else { panic!("Expected Arrow"); };
+    let args = rtdb_query::BoundParameters::from_arrow(batch.clone(), row, types.to_vec(), &memory).unwrap();
+    let context = EvalContext { parameters: args.evaluator(), ..EvalContext::default() };
+    let record = batch.batch().column(0).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+    let index = plan.input.schema().fields().iter().position(|field| field.name == "embedding").unwrap();
+    materialize(&plan.input, Some((batch.batch(), row)), &context, &mut |cells| {
+        let DocumentCell::Arrow { cell, .. } = &cells[index] else { panic!("Expected an Arrow child"); };
+        assert!(std::ptr::eq(cell.array, record.column_by_name("embedding").unwrap().as_ref()));
+        Ok(())
+    }).unwrap();
+    let submit = |args| prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }],
+        SubmitOptions::default(), "xtdb", &memory).unwrap();
+    let row = submit(SqlArguments::from_rows(vec![vec![value]], &memory).unwrap());
+    let arrow = submit(arguments);
+    assert_eq!(arrow.encode().unwrap().as_slice(), row.encode().unwrap().as_slice());
+    assert_eq!(arrow.body_digest().unwrap(), row.body_digest().unwrap());
 }
