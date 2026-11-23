@@ -784,6 +784,7 @@ The remainder is an ordinary or counted hosted commit.
 Its placed live Root owner supplies the same attempt marker, the receipt publication marker, the same dispatch retirement and alternative bodies for the exact business and private execution receipt slots.
 Only uniqueness, capacity and final-count violations found after evaluating the primary candidate select the refusal.
 The resolver discards the candidate buffer and orders the alternative under the same transaction key and the original deadline, point, range and hosted-control guards.
+A receipt-only request with a final count condition moves the Sync receipt head for either result.
 The successful response identifies the ordered decision revision.
 Read the exact business receipt at that revision to determine which outcome ordered.
 

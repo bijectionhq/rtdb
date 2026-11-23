@@ -7,6 +7,8 @@ const EXECUTION: &str = "bj_private_execution_receipts";
 const ADMISSION: &str = "bj_fact_root_admission";
 const ATTEMPTS: &str = "fact_attempts";
 const PUBLICATIONS: &str = "fact_publications";
+const ROOT_HEAD: &str = "head";
+const RECEIPT_HEAD: &str = "sync_receipt_head";
 
 fn invalid() -> Anomaly {
     Anomaly::incorrect(
@@ -38,6 +40,19 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         .filter_map(write_relation)
         .map(|relation| relation.name())
         .collect::<std::collections::BTreeSet<_>>();
+    let primary_head = if written_relations
+        .iter()
+        .any(|relation| !matches!(*relation, ATTEMPTS | PUBLICATIONS))
+    {
+        ROOT_HEAD
+    } else if primary
+        .iter()
+        .any(|op| matches!(op, Operation::Public(TxOp::OwnedCheckCapacity { .. })))
+    {
+        RECEIPT_HEAD
+    } else {
+        return Err(invalid());
+    };
     let marker_writes = primary
         .iter()
         .filter(|op| match op {
@@ -100,12 +115,10 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
                 documents,
                 valid_from,
                 valid_to,
-            }) if relation.name() == PUBLICATIONS
-                && marker(documents.rows(), "sync_receipt_head") =>
-            {
+            }) if relation.name() == PUBLICATIONS && marker(documents.rows(), RECEIPT_HEAD) => {
                 if !primary.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedReplaceDocs {
                     relation: old, documents: old_rows, valid_from: start, valid_to: end,
-                }) if old == relation && marker(old_rows.rows(), "head") && start == valid_from && end == valid_to))
+                }) if old == relation && marker(old_rows.rows(), primary_head) && start == valid_from && end == valid_to))
                 {
                     return Err(invalid());
                 }
@@ -332,28 +345,30 @@ mod tests {
         ]
     }
 
+    fn delete_row(relation: &str) -> Operation {
+        Operation::Public(TxOp::OwnedDelete {
+            relation: rtdb_types::OwnedRelation::new(relation).unwrap(),
+            id: EntityId::String("row".into()),
+            valid_from: None,
+            valid_to: None,
+        })
+    }
+
     #[test]
     fn refusal_pairs_every_control_and_exact_attempt_marker() {
-        let mut ops = publications("head");
+        let mut ops = publications(ROOT_HEAD);
+        ops.push(delete_row("fact_first"));
         ops.push(Operation::Public(TxOp::HostedConstraintRefusal));
-        ops.extend(publications("sync_receipt_head"));
+        ops.extend(publications(RECEIPT_HEAD));
         let (primary, refusal) = split(&ops, true).unwrap();
-        assert_eq!((primary.len(), refusal.len()), (6, 6));
+        assert_eq!((primary.len(), refusal.len()), (7, 6));
         assert!(split(&ops, false).is_err());
 
         let partition_head = publications("fact_partition_head:fact_row").remove(1);
         ops.insert(6, partition_head);
         assert!(split(&ops, true).is_err());
 
-        ops.insert(
-            7,
-            Operation::Public(TxOp::OwnedDelete {
-                relation: rtdb_types::OwnedRelation::new("fact_row").unwrap(),
-                id: EntityId::String("row".into()),
-                valid_from: None,
-                valid_to: None,
-            }),
-        );
+        ops.insert(7, delete_row("fact_row"));
         assert!(split(&ops, true).is_ok());
         ops.drain(6..8);
 
@@ -364,6 +379,28 @@ mod tests {
 
         let slot = ops.len() - 1;
         ops[slot] = ops[slot - 1].clone();
+        assert!(split(&ops, true).is_err());
+    }
+
+    #[test]
+    fn receipt_only_decision_requires_a_final_count_and_owns_only_the_receipt_head() {
+        let mut ops = publications(RECEIPT_HEAD);
+        ops.push(Operation::Public(TxOp::HostedConstraintRefusal));
+        ops.extend(publications(RECEIPT_HEAD));
+        assert!(split(&ops, true).is_err());
+
+        ops.insert(
+            0,
+            Operation::Public(TxOp::OwnedCheckCapacity {
+                relation: rtdb_types::OwnedRelation::new("fact_partition").unwrap(),
+                column: "partition".into(),
+                prefix: Vec::new(),
+                at_most: 1,
+            }),
+        );
+        assert!(split(&ops, true).is_ok());
+
+        ops.insert(0, delete_row("fact_partition"));
         assert!(split(&ops, true).is_err());
     }
 
