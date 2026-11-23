@@ -251,24 +251,42 @@ impl Service {
             Action::Publish { epoch, object, length } => {
                 let key = ObjectKey::new(object)?;
                 check_publish_key(&key)?;
-                let before = self.writer(history, epoch).await?;
-                let (body, charge) = socket_work(receive_body(socket, length, &self.memory)).await?;
-                let envelope = ReplicaEnvelope::decode(&body)?.ok_or_else(invalid_frame)?;
-                if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) { return Err(invalid_frame()); }
-                let record = self.writer(history, epoch).await?;
-                if record.storage_prefix() != before.storage_prefix() { return Err(refused()); }
-                let io = IoRegion::new();
-                let version = async {
-                    let files = self.open(&record, Arc::clone(&io)).await?;
-                    let published = IoRegion::retaining(charge, files.put_with_publication(&key, body)).await?;
-                    let version = published.and_then(rtdb_types::PhysicalObjectPublication::into_version);
-                    if version.is_none() && matches!(self.storage, CellStorage::S3 { .. }) {
-                        return Err(Anomaly::incorrect("rtdb.multi/replay-broker-version", "Detached S3 bodies require versioned custody"));
-                    }
-                    Ok(version)
-                }.await;
-                io.close_and_wait().await;
-                let version = version?;
+                let owner = history.deployment.to_string();
+                let task = match &self.custody {
+                    ReplayCustody::Local => None,
+                    ReplayCustody::Hosted { owner } => owner.as_ref(),
+                };
+                // Reserve the broker's provider admission before reading the
+                // body. A concurrent custody closure can now fence or drain it.
+                let body_stream = &mut *socket;
+                let version = crate::archive::stage::with_region(
+                    self.directory.as_ref(), self.keys.as_ref(), &owner, &self.storage, task,
+                    None, None,
+                    |record| {
+                        require_writer(history, epoch, record)?;
+                        Ok(None)
+                    },
+                    |record, _, io| async move {
+                        socket_work(async {
+                            let (body, charge) = receive_body(body_stream, length, &self.memory).await?;
+                            let envelope = ReplicaEnvelope::decode(&body)?.ok_or_else(invalid_frame)?;
+                            if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) {
+                                return Err(invalid_frame());
+                            }
+                            let current = self.writer(history, epoch).await?;
+                            if current.storage_prefix() != record.storage_prefix() {
+                                return Err(refused());
+                            }
+                            let files = self.open(&record, io).await?;
+                            let published = IoRegion::retaining(charge, files.put_with_publication(&key, body)).await?;
+                            let version = published.and_then(rtdb_types::PhysicalObjectPublication::into_version);
+                            if version.is_none() && matches!(self.storage, CellStorage::S3 { .. }) {
+                                return Err(Anomaly::incorrect("rtdb.multi/replay-broker-version", "Detached S3 bodies require versioned custody"));
+                            }
+                            Ok(version)
+                        }).await
+                    },
+                ).await?;
                 self.writer(history, epoch).await?;
                 socket_work(send_header(socket, &Response::Publication { version })).await
             }
@@ -282,11 +300,7 @@ impl Service {
 
     async fn writer(&self, history: History, epoch: u64) -> Result<DeploymentRecord> {
         let record = self.current(history).await?;
-        if epoch == 0 || record.epoch != epoch || record.holder.is_none()
-            || !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
-        {
-            return Err(refused());
-        }
+        require_writer(history, epoch, &record)?;
         Ok(record)
     }
 
@@ -357,6 +371,15 @@ impl Service {
     }
 }
 
+fn require_writer(history: History, epoch: u64, record: &DeploymentRecord) -> Result<()> {
+    if !history.matches(record) || epoch == 0 || record.epoch != epoch || record.holder.is_none()
+        || !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+
 fn decode_reference(frame: &[u8]) -> Result<ReplicaPayloadReference> {
     Ok(ReplicaPayloadReference::from_frame(frame, CURRENT_STORAGE_VERSION, StorageEpoch(0))?.ok_or_else(invalid_frame)?)
 }
@@ -424,4 +447,25 @@ fn invalid_frame() -> Anomaly {
 
 fn transport(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/replay-broker-transport", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broker_publication_follows_the_exact_installed_epoch_and_residence() {
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.holder = Some(rtdb_directory::MemberId("writer".into()));
+        record.epoch = 7;
+        record.lifecycle = Lifecycle::Live;
+        let history = History::of(&record).unwrap();
+        assert!(require_writer(history, 7, &record).is_ok());
+        assert!(require_writer(history, 6, &record).is_err());
+        record.lifecycle = Lifecycle::Moving;
+        assert!(require_writer(history, 7, &record).is_err());
+        record.lifecycle = Lifecycle::Live;
+        record.incarnation += 1;
+        assert!(require_writer(history, 7, &record).is_err());
+    }
 }
