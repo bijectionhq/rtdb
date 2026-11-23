@@ -3265,12 +3265,7 @@ impl<'a> OpenTransaction<'a> {
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         if let Some(sample) = self.decision {
-            let mut evidence = Vec::with_capacity(40);
-            evidence.extend_from_slice(&sample.domain);
-            evidence.extend_from_slice(&sample.epoch.to_be_bytes());
-            evidence.extend_from_slice(&sample.sequence.to_be_bytes());
-            evidence.extend_from_slice(&sample.instant.0.to_be_bytes());
-            document.insert("decision_clock".into(), Value::Binary(evidence));
+            document.insert("decision_clock".into(), Value::Binary(sample.encode().to_vec()));
         }
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
         self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &metadata_type)])

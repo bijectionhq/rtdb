@@ -3634,6 +3634,37 @@ impl NativeSession {
             cancellation, session_cancellation, historical: None, scoped_root: None, attachment: placement, _reservation: charge,
         })
     }
+    /// Reads an acceptance observation by the exact installed transaction key.
+    pub async fn owned_commit_observation(&self, key: TransactionKey) -> Result<Option<rtdb_tx::DecisionObservation>> {
+        let node = &self.service.node;
+        if node.factory.decision_clock.is_none() { return Ok(None); }
+        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/no-acceptance-observation",
+            "The original ordered receipt has no verified receiver clock observation");
+        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, resume_token: None,
+            has_await_floor: false, snapshot_time: None, current_time: node.query_instant(), timezone: self.state.session_timezone().to_owned() };
+        let context = node.query_context_in_placement(self.state.database(), &basis, self.service.identity.as_ref(),
+            self.service.placement.as_ref(), CatalogReadCut::Current, self.state.cancellation()).await?;
+        let args = vec![Value::I64(key.tx_id.0), Value::Timestamp {
+            value: key.system_time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+        }];
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: args.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
+            default_timezone: context.timezone.clone(),
+            ..Default::default()
+        };
+        let mut cursor = prepare_query(
+            "SELECT decision_clock FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ? AND committed",
+            &context, &options,
+        )?.execute(context, args).await?;
+        let batch = cursor.next_batch().await?.filter(|batch| batch.batch().num_rows() == 1).ok_or_else(unavailable)?;
+        if cursor.next_batch().await?.is_some() { return Err(unavailable()); }
+        let batch = batch.batch();
+        let Value::Binary(bytes) = read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)? else {
+            return Err(unavailable());
+        };
+        rtdb_tx::DecisionObservation::decode(&bytes).map(Some)
+    }
+
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
         Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?))

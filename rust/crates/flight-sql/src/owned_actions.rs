@@ -1561,17 +1561,25 @@ impl Service {
         drop(worlds);
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
-        self.owned_tx_reply(outcome.tx_key())
+        self.owned_tx_reply(&native, outcome.tx_key()).await
     }
 
-    fn owned_tx_reply(&self, tx: rtdb_types::TransactionKey) -> Result<ActionResult, Status> {
+    async fn owned_tx_reply(&self, native: &NativeSession, tx: rtdb_types::TransactionKey) -> Result<ActionResult, Status> {
+        let original = native.owned_commit_observation(tx).await.map_err(status)?;
+        let mut clock = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(1, rtdb_tx::DecisionObservation::WIDTH);
+        match original {
+            Some(sample) => clock.append_value(sample.encode()).map_err(arrow)?,
+            None => clock.append_null(),
+        }
         let schema = Arc::new(Schema::new(vec![
             Field::new("tx_id", DataType::Int64, false),
             Field::new("system_time_micros", DataType::Int64, false),
+            Field::new("decision_clock", DataType::FixedSizeBinary(rtdb_tx::DecisionObservation::WIDTH), true),
         ]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
             Arc::new(Int64Array::from(vec![tx.tx_id.0])),
             Arc::new(Int64Array::from(vec![tx.system_time.0])),
+            Arc::new(clock.finish()),
         ]).map_err(arrow)?;
         self.owned_action_reply(&schema, Some(&batch))
     }
@@ -3095,7 +3103,7 @@ impl Service {
         ).await.map_err(status)?;
         if let Some(error) = committed.error() { return Err(status(error.clone())); }
         if !committed.committed() { return Err(Status::aborted("Owned expiry did not commit")); }
-        self.owned_tx_reply(committed.tx_key())
+        self.owned_tx_reply(&session, committed.tx_key()).await
     }
 
     pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -4386,7 +4394,7 @@ impl Service {
             sections, root, observed, *fingerprint, controls, deadline,
         ).await.map_err(status)?;
         drop(observations);
-        self.owned_tx_reply(committed)
+        self.owned_tx_reply(&session, committed).await
     }
 
     fn decode_world_writes(

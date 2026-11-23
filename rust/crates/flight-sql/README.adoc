@@ -255,6 +255,10 @@ Use the same complete entity key across periods and pass the requested valid ins
 World mutation and acceptance-only unique occupancy remain unavailable for this policy.
 Relations without a declaration continue to infer their schema.
 
+Standard owned transaction replies include the ordered transaction ID, its SQL history coordinate, and its recorded decision clock.
+A hosted receiver reads the clock from the original installed outcome by transaction ID and history coordinate before releasing it.
+An installation without a hosted clock returns a null decision observation.
+
 === Holding one owned read cut
 
 Use `rtdb.owned.OpenRead.v3` with an empty body to reserve one present and retain its exact applied catalog.
