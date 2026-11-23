@@ -11,6 +11,7 @@ pub(super) const FIELD: &str = "_ordered_micros";
 const MAX_SLOTS: usize = 1_024;
 const WIDTH: usize = std::mem::size_of::<i64>();
 const SORT_KEY_SLOT: u32 = 1 << 31;
+const SYSTEM_REVISION_SLOT: u32 = 1 << 30;
 
 pub(super) fn fill(
     documents: &Documents,
@@ -74,7 +75,8 @@ pub(super) fn fill_slots(
         let (start, rest) = rest.split_first_chunk::<4>().ok_or_else(invalid)?;
         let start = u32::from_be_bytes(*start);
         let sort_key = start & SORT_KEY_SLOT != 0;
-        let start = usize::try_from(start & !SORT_KEY_SLOT).map_err(|_| invalid())?;
+        let system_revision = start & SYSTEM_REVISION_SLOT != 0;
+        let start = usize::try_from(start & !(SORT_KEY_SLOT | SYSTEM_REVISION_SLOT)).map_err(|_| invalid())?;
         let end = start.checked_add(WIDTH).ok_or_else(invalid)?;
         let (delta, rest) = rest.split_first_chunk::<8>().ok_or_else(invalid)?;
         if column.is_empty() || column.starts_with('_')
@@ -83,12 +85,17 @@ pub(super) fn fill_slots(
         {
             return Err(invalid());
         }
-        let micros = ordered.0.checked_add(i64::from_be_bytes(*delta)).ok_or_else(invalid)?;
-        let bits = if sort_key {
-            micros as u64 ^ (1 << 63)
+        let delta = i64::from_be_bytes(*delta);
+        let bits = if system_revision {
+            if delta != 0 { return Err(invalid()); }
+            let revision = u64::try_from(ordered.0).ok()
+                .and_then(|micros| micros.checked_mul(1_000)).ok_or_else(invalid)?;
+            if sort_key && i64::try_from(revision).is_err() { return Err(invalid()); }
+            revision
         } else {
-            micros as u64
+            ordered.0.checked_add(delta).ok_or_else(invalid)? as u64
         };
+        let bits = if sort_key { bits ^ (1 << 63) } else { bits };
         fill(column, start, bits.to_be_bytes())?;
         previous = (column, end);
         remaining = rest;
@@ -100,7 +107,7 @@ pub(super) fn fill_slots(
 }
 
 pub(super) fn invalid() -> Anomaly {
-    Anomaly::incorrect("rtdb.owned/ordered-micros", "Invalid acceptance-relative binary field slots")
+    Anomaly::incorrect("rtdb.owned/ordered-micros", "Invalid ordered binary time slots")
 }
 
 #[cfg(test)]
@@ -151,5 +158,29 @@ mod tests {
         assert!(fill_row(&mut row.clone(), &overlapping, Timestamp(0), |_| false).is_err());
         let overflow = slots(&[("payload", 0, 1)]);
         assert!(fill_row(&mut row.clone(), &overflow, Timestamp(i64::MAX), |_| false).is_err());
+    }
+
+    #[test]
+    fn fills_revision_nanos_and_acceptance_micros_without_changing_length() {
+        let mut row = StructFields::from([
+            ("body".into(), Value::Binary(vec![0; 16])),
+            ("key".into(), Value::Binary(vec![0; 8])),
+        ]);
+        let recipe = slots(&[
+            ("body", SYSTEM_REVISION_SLOT, 0),
+            ("body", 8, -7),
+            ("key", SYSTEM_REVISION_SLOT | SORT_KEY_SLOT, 0),
+        ]);
+        fill_row(&mut row, &recipe, Timestamp(123), |column| column == "key").unwrap();
+        let Value::Binary(bytes) = &row["body"] else { panic!("Expected binary payload"); };
+        assert_eq!(&bytes[..8], &123_000u64.to_be_bytes());
+        assert_eq!(&bytes[8..], &116i64.to_be_bytes());
+        assert_eq!(row["key"], Value::Binary((123_000u64 ^ (1 << 63)).to_be_bytes().to_vec()));
+
+        let mut row = StructFields::from([("body".into(), Value::Binary(vec![0; 8]))]);
+        let with_offset = slots(&[("body", SYSTEM_REVISION_SLOT, 1)]);
+        assert!(fill_row(&mut row, &with_offset, Timestamp(1), |_| false).is_err());
+        let revision = slots(&[("body", SYSTEM_REVISION_SLOT, 0)]);
+        assert!(fill_row(&mut row, &revision, Timestamp(i64::MAX), |_| false).is_err());
     }
 }

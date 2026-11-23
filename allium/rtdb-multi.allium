@@ -1537,6 +1537,7 @@ rule ConsumeIntake {
 -- The selected refusal publishes its exact receipt and marker using the original guards, deadline and acceptance reading.
 -- No tentative application facts survive the refusal.
 -- The ordered resolver fills each disjoint slot from the transaction reading and checks the completed row against its declared schema.
+-- A binary slot for the system revision uses the assigned timestamp in nanoseconds. An acceptance-relative slot uses microseconds.
 -- Committed events and archive replay carry filled values and require no slot metadata.
 -- While a world is retained the archive retirement fence cannot close its capture.
 -- A completed world-parent suffix remains available while its preparation lease, the held restore, or a retained world still holds it.
