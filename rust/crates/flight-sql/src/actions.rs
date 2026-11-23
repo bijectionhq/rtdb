@@ -33,15 +33,17 @@ impl Service {
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::DECLARE_OWNED_RELATION_V1 => Ok(vec![Ok(self.declare_owned_relation_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body).await?)]),
+                crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V1 => Ok(vec![Ok(self.drop_owned_spatial_path_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_COUNTED_V2 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V2 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_DECIDING_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_STAGED_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V3 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_DECIDING_V2 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_STAGED_V2 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
@@ -52,6 +54,9 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V1 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::SPATIAL_HELD_OWNED_V1 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V1).await?)]),
+                crate::owned_actions::SPATIAL_HELD_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V2).await?)]),
+                crate::owned_actions::SPATIAL_HELD_OWNED_V3 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V3).await?)]),
                 PREPARE_APPLIED_READ_V1 => {
                     self.prepare_applied_read_action(&call, &action.body).await?;
                     Ok(Vec::new())
@@ -97,6 +102,7 @@ impl Service {
                 crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::OverlayAt).await?)]),
                 crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::Overlay).await?)]),
                 crate::owned_actions::HELD_PROTECTED_COVERAGE_V1 => Ok(vec![Ok(self.held_protected_coverage_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V1 => Ok(vec![Ok(self.held_row_carrier_exists_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 => Ok(vec![Ok(self.held_protected_carriers_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
@@ -137,8 +143,7 @@ impl Service {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action.r#type == crate::owned_actions::PUBLISH_WORLD_CUT_V2).await?)])
                 }
-                crate::owned_actions::COMMIT_WORLD_V4 => Ok(vec![Ok(self.validate_world_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HELD_WORLDS_V4 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HELD_WORLDS_V6 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;

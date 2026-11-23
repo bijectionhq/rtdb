@@ -6,6 +6,7 @@
 -- Hosted fork selects a registered capture in the authenticated writer's deployment and derives its basis from the verified archive root.
 -- Hosted world writes use the retained schema and the ordered registration's lifetime.
 -- A held world point handle keeps one ordered local capture and one verified archive region until bounded expiry or close.
+-- A hosted row-erasure owner can observe whether one exact ciphertext carrier exists anywhere in valid time under its held Root cut. The reply contains only a Boolean.
 -- The captured registration fences new opens after ordered drop while an earlier handle stays inside its retained read admission.
 -- A held point condition preserves the local shadow revision, including a tombstone, or verified local absence.
 -- Ordered conditional world writes validate the witnessed placement, deadline and all local conditions before applying effects.
@@ -1358,6 +1359,9 @@ rule ConsumeIntake {
 -- Point release validates the child's registration and the current Root purge frontier.
 -- A validation carrying an exclusive clock limit checks its exact world and pin at ordering.
 -- Held validation compares the accepted Held clock, Proposal validation compares the ordered present, and retained validation compares the fixed inherited clock.
+-- One hosted validation can combine covered Root points and ranges, held world witnesses and individual world clock bounds. Each world remains bound to its original pin and placement.
+-- Ordinary world publications may include independent read-only worlds under the same ordered guard. Data witnesses and clocks of the observers are checked before any publication is applied.
+-- Every publication carries the original held parent pin. An ordinary overlay or explicit clock advance can order from that standing and its expected clock without reading a user fact.
 -- A valid-time window on the child combines boundaries from both retained cuts and resolves each slice by the same point rule.
 -- The child pages the merged identities of both cuts, applying the same tombstone rule before emitting a candidate.
 -- The child seeks both retained orders for a declared path only when its definition agrees across the two cuts.
@@ -1714,6 +1718,13 @@ rule ReapUnreachable {
         ObjectStorage.delete_all_versions(candidate.object.key)
         candidate.deleted = true
 }
+
+-- Original replay pack retirement runs during the local cell sweep.
+-- A parked root can retire an older original pack after the grace while it holds the exact current replay archive and the source lineage.
+-- The reaper checks every L0 member against the archived bytes and accepts checkpoint metadata for the pack's own older block.
+-- The certified replica prefix passes the pack's boundary and ends before the published boundary.
+-- Existing storage admissions, catalog readers, journal dependencies, and declared descendant references retain the original pack.
+-- New serving admissions start at the published checkpoint and acquire the selected replay archive.
 
 rule WithdrawForkReferences {
     -- Each manifest update uses the successor of the sequence whose bytes it read.
@@ -2294,6 +2305,9 @@ rule RefineKeyForLargeDeployments {
     -- The request identifies the coordinator's opened storage residence and replica epoch.
     -- The router and the executor each check that identity against their own authority.
     -- The executor holds the captured snapshot until admitted provider reads have completed.
+    -- A reader sends length-framed Arrow IPC when the coordinator advertises binary reply support.
+    -- Readers execute concurrently and the coordinator admits each binary reply against query memory before receiving its body in fragment order.
+    -- A coordinator can read the earlier base64 reply during a rolling upgrade.
     when: ScanPlanned(deployment, scan)
 
     requires: deployment.cache_bytes > PerMemberCacheShare()
@@ -2714,6 +2728,8 @@ rule HostedCheckpointCapture {
 }
 
 rule HostedCheckpointRecovery {
+    -- An installation with a selected replay archive restores from a complete replay capture and selects that capture when the restore completes.
+    -- A pending restore retains its input while the selected serving capture retains current history.
     when: AuthenticatedRecoveryRestore(authority, name, capture_id, manifest_digest)
 
     requires: ConfiguredOrganizationOwns(authority, name)
@@ -2734,6 +2750,7 @@ rule RetainServingReplayArchive {
     -- The installation publishes the capture and the recovery inventory digest observed in its archive custody together.
     -- A new region opens that source under its own admission before rechecking the published inventory.
     -- Later captures can inherit the admitted source and a newer verified checkpoint can replace it.
+    -- A completed restore can advance to a newer replay capture after the root parks at that checkpoint.
     -- A superseded archive stays available to readers admitted under its identity until their work drains.
     when: AuthenticatedReplayArchiveRetention(authority, name, capture_id, manifest_digest)
 

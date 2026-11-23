@@ -1,0 +1,46 @@
+-- allium: 3
+-- Spatial paths over clear owned relations.
+-- Table events and captured snapshots follow db.allium and allium/live-index.allium.
+
+entity SpatialPath {
+    relation: String
+    name: String
+    generation: Integer
+    geometry_column: String
+    partition_columns: List<String>
+}
+
+entity SpatialPostings {
+    path: SpatialPath
+    trie: String
+    digest: Bytes
+}
+
+-- An exact retry preserves the path generation.
+-- Dropping a path withdraws its declaration at the ordered system cut and retires the generation's artefacts.
+-- A declaration after a drop has a fresh generation.
+-- A posting file is a deterministic function of the trie data and the declared geometry and partition columns.
+-- The posting file stores partition digests, cells and IIDs as sorted Arrow IPC columns.
+-- The builder appends covering keys to typed Arrow columns and sorts their row positions.
+-- A held read decodes posting pages against the admitted immutable IPC allocation.
+-- A posting read admits the recorded object length and provider scratch before reading its body.
+-- Admitted posting and trie provider reads retain the captured catalog until their I/O completes.
+-- Each shape contributes the keys of a bounded covering, and each point contributes a leaf with its reported accuracy class.
+-- A partition's digest is a candidate key, and the exact read also compares the partition bytes on the resolved row.
+-- The exact comparison uses the partition values borrowed from the held read request.
+-- A held read uses the path definition, source inventory, and live segments selected by the same snapshot.
+-- A missing or invalid posting file is covered by reading candidate IIDs through the native Arrow page reader within the read budget.
+-- The live tail contributes candidate IIDs from its held event batches.
+-- One read budget covers all candidate sources and all refined rows.
+-- Any candidate set contains every IID whose visible row matches the requested partition and predicate.
+-- A complete typed identity contributes at most one result at the chosen valid instant.
+-- Complete row history, including delete and erase events, determines visibility before exact geometry refinement.
+-- Only visible rows supply geometry to the read's exact predicate.
+-- A range page advances in complete typed identity order at the original hold.
+-- Nearest ordering compares exact distances and breaks ties by complete typed identity.
+-- A document projection includes the resolved document and its system revision in hit order at the original hold.
+-- Selection retains the winning row positions until it gathers the final document projection.
+-- A selected document projection gathers identity, system revision and the requested fields present in the held relation schema.
+-- An observed read with an admitted placed witness scope, including an empty page, binds the relation frontier for ordered validation.
+-- Erasure orders against the held admission, and its newly compacted source carries no erased posting.
+-- Superseded source tries and their derived files follow trie-cat.allium and gc.allium.

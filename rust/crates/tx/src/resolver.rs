@@ -509,6 +509,35 @@ pub trait TransactionWriter: Send {
 }
 pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Aborted { error: Anomaly, user_metadata: Option<UserMetadata> } }
 
+fn independent_world_observations(operations: &[Operation], publishing: &BTreeSet<Iid>) -> BTreeSet<Iid> {
+    operations.iter().filter_map(|operation| match operation {
+        Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => relation.world(),
+        Operation::Public(TxOp::OwnedCheckWorldScope { clock: Some(clock), .. }) => Some(clock.world),
+        _ => None,
+    }).filter(|world| !publishing.contains(world)).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn batch_observers_exclude_the_publishing_world_and_include_clock_only_worlds() -> Result<()> {
+    let writer = Iid([1; 16]);
+    let clock_only = Iid([2; 16]);
+    let scope = rtdb_types::PlacedAttemptScope::new("held-batch-observations", 1)?;
+    let guarded = rtdb_types::OwnedRelation::new("facts")?.in_world(writer)?;
+    let operations = [
+        Operation::Public(TxOp::OwnedCheckWorldPurge {
+            relation: guarded, pin: writer, frontier: 0, local_frontier: None,
+        }),
+        Operation::Public(TxOp::OwnedCheckWorldScope {
+            scope,
+            clock: Some(rtdb_types::WorldClockLimit { world: clock_only, pin: clock_only, before: Timestamp(7) }),
+        }),
+    ];
+    assert_eq!(independent_world_observations(&operations, &BTreeSet::from([writer])),
+        BTreeSet::from([clock_only]));
+    Ok(())
+}
+
 #[derive(Default)]
 struct PendingOwnedChanges {
     bytes: usize,
@@ -857,9 +886,13 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                 self.declare_owned_unique_path(relation, name, column).await,
             Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
-                self.declare_owned_path(relation, name, columns, false).await,
+                self.declare_owned_path(relation, name, columns, OwnedPathKind::Ordered).await,
+            Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
+                self.drop_owned_spatial_path(relation, name).await,
+            Operation::Public(TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
+                self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
-                self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
+                self.declare_owned_path(relation, name, std::slice::from_ref(column), OwnedPathKind::Search).await,
             Operation::Public(TxOp::HostedConstraintRefusal) => {
                 Err(Anomaly::incorrect("rtdb.hosted/constraint-receipt", "Unexpected refusal boundary"))
             }
@@ -899,8 +932,8 @@ impl<'a> OpenTransaction<'a> {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 self.publish_owned_root_head().await
             }
-            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
-                self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world, *settlement_pin).await?;
+            Operation::Public(TxOp::OwnedPublishWorld { world, parent_pin, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
+                self.publish_owned_world(*world, *parent_pin, attempt, *fingerprint, *expected, *advance_to, *drop_world, *settlement_pin).await?;
                 if delete_root.is_some() || land_root.is_some() { self.publish_owned_root_head().await?; }
                 Ok(())
             },
@@ -1028,17 +1061,52 @@ impl<'a> OpenTransaction<'a> {
         rtdb_query::read_owned_relation_schema(context, owner, relation).await
     }
 
+    async fn drop_owned_spatial_path(
+        &mut self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+    ) -> Result<()> {
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        let catalog = rtdb_types::OwnedRelation::spatial_catalog(owner);
+        let target = relation.table(owner);
+        let snapshot = self.snapshot()?;
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        let Some(mut cursor) = rtdb_query::open_owned_path_catalog(context, &catalog, Some(path.name())).await? else {
+            return Ok(());
+        };
+        let mut present = false;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            for row in 0..batch.num_rows() {
+                let cell = |index| rtdb_columnar::read_value(batch.schema_ref().field(index), batch.column(index).as_ref(), row);
+                if present
+                    || !matches!(cell(0)?, Value::Utf8(name) if name == path.name())
+                    || !matches!(cell(1)?, Value::Utf8(name) if name == target.schema)
+                    || !matches!(cell(2)?, Value::Utf8(name) if name == target.table)
+                {
+                    return Err(Anomaly::incorrect("rtdb.owned/spatial-path", "Spatial path belongs to another relation"));
+                }
+                present = true;
+            }
+        }
+        if present { self.buffer.delete(catalog, &rtdb_types::EntityId::String(path.name().into()), Interval::ALL)?; }
+        Ok(())
+    }
+
     async fn declare_owned_path(
         &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation,
-        columns: &[String], search: bool,
+        columns: &[String], kind: OwnedPathKind,
     ) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let target = relation.table(owner);
-        if search && self.owned_changes.get(relation.name()).is_some_and(|group| group.erased) {
+        if kind != OwnedPathKind::Ordered && self.owned_changes.get(relation.name()).is_some_and(|group| group.erased) {
             return Err(purge_path_uncovered());
         }
-        let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
+        let catalog = match kind {
+            OwnedPathKind::Search => rtdb_types::OwnedRelation::search_catalog(owner),
+            OwnedPathKind::Ordered => rtdb_types::OwnedRelation::path_catalog(owner),
+            OwnedPathKind::Spatial => rtdb_types::OwnedRelation::spatial_catalog(owner),
+        };
         let declaration = self.read_owned_schema(owner, relation).await?;
         let snapshot = self.snapshot()?;
         if declaration.is_none() && !snapshot.contains_table(&target) {
@@ -1046,7 +1114,14 @@ impl<'a> OpenTransaction<'a> {
         }
         let declared_type = |name: &str| declaration.as_ref().and_then(|(schema, _)| schema.path_column_type(name));
         let available = snapshot.column_names(&target);
-        if search {
+        if kind == OwnedPathKind::Spatial {
+            if !(1..=16).contains(&columns.len())
+                || columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
+                || columns.iter().any(|column| column.starts_with('_') || declared_type(column) != Some(rtdb_types::ScalarType::Binary))
+            {
+                return Err(Anomaly::incorrect("rtdb.owned/spatial-path-columns", "Owned spatial paths require distinct declared Binary columns, geometry first"));
+            }
+        } else if kind == OwnedPathKind::Search {
             let [column] = columns else { return Err(invalid_search_path_column()); };
             let clear = if declaration.is_some() {
                 declared_type(column) == Some(rtdb_types::ScalarType::Utf8)
@@ -1174,8 +1249,8 @@ impl<'a> OpenTransaction<'a> {
         }
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let publications = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, advance_to, drop_world, settlement_pin, .. }) =>
-                Some((*world, attempt, *fingerprint, *advance_to, *drop_world, *settlement_pin)),
+            Operation::Public(TxOp::OwnedPublishWorld { world, parent_pin, attempt, fingerprint, advance_to, drop_world, settlement_pin, .. }) =>
+                Some((*world, attempt, *fingerprint, *advance_to, *drop_world, *settlement_pin, *parent_pin)),
             _ => None,
         }).take(9).collect::<Vec<_>>();
         let mut root_publications = operations.iter().filter_map(|operation| match operation {
@@ -1186,14 +1261,17 @@ impl<'a> OpenTransaction<'a> {
         if root_publication.is_some() && (root_publications.next().is_some() || publications.is_empty()) {
             return Err(unavailable());
         }
-        let world_batch = publications.len() > 1 || root_publication.is_some();
+        let publishing_worlds = publications.iter().map(|(world, ..)| *world).collect::<BTreeSet<_>>();
+        let observing_worlds = independent_world_observations(operations, &publishing_worlds);
+        let world_batch = publications.len() > 1 || root_publication.is_some()
+            || (!publications.is_empty() && !observing_worlds.is_empty());
         let hosted_world_reads = crate::hosted_control::hosted_root_world_reads(operations);
         let root_conditions = !publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }) =>
                 relation.world().is_none() && !relation.is_world_catalog(),
             _ => false,
         });
-        if publications.len() > 8 { return Err(unavailable()); }
+        if publications.len() + observing_worlds.len() > 8 { return Err(unavailable()); }
         if publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedReplaceDocs { relation, .. })
             | Operation::OwnedWriteIids { relation, .. } => relation.world().is_some(),
@@ -1226,17 +1304,25 @@ impl<'a> OpenTransaction<'a> {
         let retained_release = crate::hosted_control::retained_release_world(operations);
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
-        let mut clock_limits = operations.iter().filter_map(|operation| match operation {
+        let mut clock_worlds = BTreeSet::new();
+        for clock in operations.iter().filter_map(|operation| match operation {
             Operation::Public(TxOp::OwnedCheckWorldScope { clock: Some(clock), .. }) => Some(clock),
             _ => None,
-        });
-        if let Some(clock) = clock_limits.next() {
-            if clock_limits.next().is_some() || !publications.is_empty()
-                || admitted.iter().any(|world| *world != clock.world)
+        }) {
+            if !(hosted_world_reads || world_batch) || publishing_worlds.contains(&clock.world)
+                || !clock_worlds.insert(clock.world)
             {
                 return Err(unavailable());
             }
             admitted.insert(clock.world);
+            if admitted.len() > 8 {
+                return Err(unavailable());
+            }
+        }
+        if !publications.is_empty() && !observing_worlds.is_empty()
+            && (proposal_land.is_some() || proposal_overlay.is_some() || retained_release.is_some())
+        {
+            return Err(unavailable());
         }
         if proposal_land.is_some() {
             self.buffer.retain_owned_positions()?;
@@ -1252,6 +1338,7 @@ impl<'a> OpenTransaction<'a> {
         }
         admitted.extend(retained_release);
         admitted.extend(proposal_overlay);
+        admitted.extend(publishing_worlds);
         if proposal_overlay.is_none() && publications.iter().any(|publication| publication.5.is_some()) {
             return Err(unavailable());
         }
@@ -1269,6 +1356,11 @@ impl<'a> OpenTransaction<'a> {
                 }
                 self.owned_worlds.insert(world, record);
             }
+        }
+        if publications.iter().any(|(world, _, _, _, _, _, parent_pin)| {
+            self.owned_worlds.get(world).is_none_or(|(record, _)| record.pin != *parent_pin)
+        }) {
+            return Err(unavailable());
         }
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
@@ -1495,10 +1587,8 @@ impl<'a> OpenTransaction<'a> {
             let mut root_rows = 0usize;
             let mut scoped_checks = 0;
             let mut hosted = false;
-            let mut counts = BTreeMap::<Iid, (usize, usize)>::new();
-            if let Some((world, _, _, _, _, Some(_))) = publications.first() {
-                counts.insert(*world, (0, 0));
-            }
+            let mut counts: BTreeMap<Iid, (usize, usize)> = publications.iter()
+                .map(|(world, ..)| (*world, (0, 0))).collect();
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
                     Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
@@ -1540,8 +1630,8 @@ impl<'a> OpenTransaction<'a> {
                         hosted = true;
                         1
                     }
-                    Operation::Public(TxOp::OwnedCheckWorldScope { .. }) => {
-                        scoped_checks += 1;
+                    Operation::Public(TxOp::OwnedCheckWorldScope { clock, .. }) => {
+                        scoped_checks += usize::from(clock.is_none());
                         1
                     }
                     Operation::Public(TxOp::OwnedDeadline { .. }
@@ -1552,7 +1642,7 @@ impl<'a> OpenTransaction<'a> {
                 if effects > 4096 { return Err(unavailable()); }
             }
             if deadline.is_none() || scoped_checks != 1 || !hosted
-                || counts.len() != publications.len() || self.owned_worlds.len() != publications.len()
+                || self.owned_worlds.len() != publications.len() + observing_worlds.len()
             {
                 return Err(unavailable());
             }
@@ -1564,14 +1654,20 @@ impl<'a> OpenTransaction<'a> {
                 }
                 attempts.insert(attempt);
             }
-            for (world, attempt, own_fingerprint, advance_to, drop_world, settlement_pin) in publications {
+            for (world, attempt, own_fingerprint, advance_to, drop_world, settlement_pin, _) in publications {
                 let (rows, witnesses) = counts.remove(&world).ok_or_else(unavailable)?;
-                if (witnesses == 0 && settlement_pin.is_none()) || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
+                if (witnesses == 0 && (drop_world || (proposal_overlay.is_some() && settlement_pin.is_none())))
+                    || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
                     || (rows == 0) != (advance_to.is_some() || drop_world || settlement_pin.is_some())
                     || drop_world && advance_to.is_some()
                 {
                     return Err(unavailable());
                 }
+            }
+            if counts.iter().any(|(world, (rows, witnesses))| {
+                !observing_worlds.contains(world) || *rows != 0 || !(1..=128).contains(witnesses)
+            }) {
+                return Err(unavailable());
             }
         }
         self.check_hosted_controls(operations, source_scope, replay).await?;
@@ -1693,13 +1789,13 @@ impl<'a> OpenTransaction<'a> {
     }
 
     async fn publish_owned_world(
-        &mut self, world: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
+        &mut self, world: Iid, parent_pin: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
         advance_to: Option<Timestamp>, drop_world: bool, settlement_pin: Option<Iid>,
     ) -> Result<()> {
         use rtdb_types::{OwnedRelation, OwnedWorld, WorldClockMode};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let record = &self.owned_worlds.get(&world).ok_or_else(OwnedWorld::unavailable)?.0;
-        if !record.mode.is_writable() && !drop_world {
+        if record.pin != parent_pin || (!record.mode.is_writable() && !drop_world) {
             return Err(OwnedWorld::unavailable());
         }
         let initial_clock = record.initial_clock();
@@ -2480,6 +2576,13 @@ async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
 
 fn insert_exists() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnedPathKind {
+    Ordered,
+    Search,
+    Spatial,
 }
 
 fn invalid_search_path_column() -> Anomaly {

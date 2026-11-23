@@ -833,12 +833,170 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
 
 
 #[tokio::test]
+async fn owned_spatial_flight_pages_share_the_original_cut() {
+    use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, UnionArray, builder::{BinaryBuilder, Int64Builder, ListBuilder, StringBuilder}};
+    use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions};
+    use rtdb_format::ipc::write_arrow_stream;
+
+    fn frame(body: &mut Vec<u8>, component: &str) {
+        body.extend_from_slice(&u16::try_from(component.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(component.as_bytes());
+    }
+
+    fn ipc(body: &mut Vec<u8>, columns: impl IntoIterator<Item = (&'static str, ArrayRef)>) {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        body.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
+    }
+
+    fn point(longitude: f64) -> Vec<u8> {
+        let mut bytes = vec![0, 1];
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&longitude.to_le_bytes());
+        bytes.extend_from_slice(&0.0f64.to_le_bytes());
+        bytes
+    }
+
+    fn select(names: &[&str]) -> ArrayRef {
+        let mut selected = ListBuilder::new(StringBuilder::new());
+        for name in names { selected.values().append_value(name); }
+        selected.append(true);
+        Arc::new(selected.finish())
+    }
+
+    fn query(
+        hold: &[u8], path: &str, valid: i64, after: Option<&str>, region: &[u8],
+        predicate: &str, document_columns: Option<ArrayRef>,
+    ) -> Bytes {
+        let mut body = hold.to_vec();
+        frame(&mut body, "places");
+        frame(&mut body, path);
+        let mut partition = ListBuilder::new(BinaryBuilder::new());
+        partition.values().append_value(b"montrouge");
+        partition.append(true);
+        let mut columns = vec![
+            ("partition", Arc::new(partition.finish()) as ArrayRef),
+            ("region", Arc::new(BinaryArray::from(vec![region]))),
+            ("predicate", Arc::new(StringArray::from(vec![predicate]))),
+            ("valid_micros", Arc::new(Int64Array::from(vec![valid]))),
+            ("limit", Arc::new(Int64Array::from(vec![1]))),
+            ("observe", Arc::new(BooleanArray::from(vec![false]))),
+            ("reported_center", Arc::new(BooleanArray::from(vec![false]))),
+            ("radius_m", Arc::new(Float64Array::from(vec![None::<f64>]))),
+            ("after", Arc::new(StringArray::from(vec![after]))),
+        ];
+        if let Some(selected) = document_columns {
+            columns.push(("document_columns", selected));
+        }
+        ipc(&mut body, columns);
+        body.into()
+    }
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let mut relation = Vec::new();
+    frame(&mut relation, "places");
+    let mut schema = relation.clone();
+    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"never_written","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"borough","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
+
+    let path = "by_location";
+    for (path, geometry) in [(path, "location"), ("by_unwritten", "never_written")] {
+        let mut declaration = relation.clone();
+        ipc(&mut declaration, [
+            ("_id", Arc::new(StringArray::from(vec![path])) as ArrayRef),
+            ("columns", select(&[geometry, "borough"])),
+        ]);
+        client.action("rtdb.owned.DeclareSpatialPath.v1", declaration.into()).await.unwrap();
+    }
+
+    let mut insert = relation.clone();
+    ipc(&mut insert, [
+        ("_id", Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef),
+        ("location", Arc::new(BinaryArray::from_iter_values([point(1.0), point(2.0), point(1.0)]))),
+        ("borough", Arc::new(BinaryArray::from_vec(vec![b"montrouge", b"montrouge", b"elsewhere"]))),
+    ]);
+    client.action("rtdb.owned.Create.v1", insert.into()).await.unwrap();
+
+    let reply = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
+    let hold = &reply[0].body[..16];
+    let valid = i64::from_be_bytes(reply[0].body[16..24].try_into().unwrap());
+    frame(&mut relation, path);
+    client.action("rtdb.owned.DropSpatialPath.v1", relation.into()).await.unwrap();
+
+    let projected = "rtdb.owned.SpatialHeld.v3";
+    for (action, documents, selected) in [
+        ("rtdb.owned.SpatialHeld.v1", false, None),
+        ("rtdb.owned.SpatialHeld.v2", true, None),
+        (projected, true, Some(select(&["borough", "never_written"]))),
+    ] {
+        for (after, expected, more, longitude) in [(None, "a", "1", 1.0), (Some("a"), "b", "0", 2.0)] {
+            let request = query(hold, path, valid, after, &[], "all", selected.clone());
+            let replies = client.action(action, request).await.unwrap();
+            let mut stream = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap();
+            assert_eq!(stream.schema().metadata()["rtdb.owned.spatial_more"], more);
+            assert_eq!(stream.schema().metadata()["rtdb.owned.present_micros"], valid.to_string());
+            let batch = stream.next().unwrap().unwrap();
+            let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
+            assert_eq!(ids.value(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), expected);
+            assert_eq!(batch.num_columns(), if documents { 3 } else { 2 });
+            if documents {
+                let document = batch.column(2).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+                let revision = document.column_by_name("_system_from").unwrap().as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+                let borough = document.column_by_name("borough").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+                assert_eq!(borough.value(0), b"montrouge");
+                if selected.is_some() {
+                    assert_eq!(document.column_names(), ["borough", "_system_from"]);
+                    assert!(document.column_by_name("location").is_none());
+                    assert!(document.column_by_name("never_written").is_none());
+                } else {
+                    let location = document.column_by_name("location").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+                    assert_eq!(location.value(0), point(longitude));
+                }
+                assert!(revision.is_valid(0) && revision.value(0) <= valid);
+            }
+            assert!(stream.next().is_none());
+        }
+
+        let request = query(hold, path, valid, None, &point(20.0), "intersects", selected);
+        let replies = client.action(action, request).await.unwrap();
+        let mut empty = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap();
+        assert_eq!(empty.schema().metadata()["rtdb.owned.spatial_more"], "0");
+        assert!(empty.next().is_none());
+    }
+    let request = query(hold, path, valid, None, &point(2.0), "intersects", Some(select(&[])));
+    let replies = client.action(projected, request).await.unwrap();
+    let batch = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+    let document = batch.column(2).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+    assert_eq!(document.column_names(), ["_system_from"]);
+    let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
+    assert_eq!(ids.value(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "b");
+
+    for (path, geometry, expected) in [(path, "location", true), ("by_unwritten", "never_written", false)] {
+        let request = query(hold, path, valid, None, &[], "all", Some(select(&[geometry])));
+        let replies = client.action(projected, request).await.unwrap();
+        let batch = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+        let document = batch.column(2).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+        assert_eq!(document.column_by_name(geometry).is_some(), expected);
+    }
+
+    let mut wrong_type = ListBuilder::new(Int64Builder::new());
+    wrong_type.append(true);
+    for columns in [select(&["borough", "borough"]), Arc::new(wrong_type.finish())] {
+        let request = query(hold, path, valid, None, &[], "all", Some(columns));
+        assert_eq!(client.action(projected, request).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+    client.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(hold)).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn world_flight_actions_require_a_placed_world_host() {
     let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
     for action in [
         "rtdb.owned.PublishWorldCut.v1", "rtdb.owned.PublishWorldCut.v2",
-        "rtdb.owned.CommitHeldWorlds.v4", "rtdb.owned.CommitWorld.v4",
+        "rtdb.owned.CommitHeldWorlds.v6", "rtdb.owned.CommitHostedWorldReads.v3",
         "rtdb.owned.OpenWorldRead.v4", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
         "rtdb.owned.ReadHeldWorldValidDuring.v2",
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",

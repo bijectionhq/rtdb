@@ -36,6 +36,7 @@ use crate::reference::custody::ReferenceReads;
 #[path = "key_enrollment.rs"]
 mod key_enrollment;
 mod exact_retirement;
+mod replay_retirement;
 
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
@@ -1080,6 +1081,11 @@ impl ObjectStore for EncryptingStore {
         let exact = object::sealed_size(key, length)?;
         self.open(key, self.inner.get_fresh_exact(key, exact).await?)
     }
+    fn exact_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        let sealed = object::sealed_size(key, length)?;
+        let scratch_bytes = sealed.checked_mul(3).ok_or_else(|| Error::Task("Encrypted object allocation size overflow".into()))?;
+        Ok(ObjectReadAllocation { retained_bytes: sealed, scratch_bytes })
+    }
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
         let exact = object::sealed_size(key, length)?;
         let observed = self.inner.observe_fresh_exact(key, exact).await?;
@@ -1601,7 +1607,7 @@ pub async fn run_reaper(
                     if let Some(maintenance) = &maintenance {
                         for record in &deployments {
                             if cancellation.is_cancelled() { return; }
-                            if let Err(error) = reap_local(directory.as_ref(), &storage, maintenance.clone(), record, now, grace).await {
+                            if let Err(error) = reap_local(directory.as_ref(), &storage, maintenance.clone(), record, now, grace, keys.as_deref()).await {
                                 eprintln!("Local garbage for {} is pending: {}", record.id, error.code);
                             }
                         }
@@ -1753,7 +1759,7 @@ pub(crate) async fn recover_hosted_lineage(directory: &dyn Directory, lineage: &
 }
 
 async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenance: Arc<File>,
-    candidate: &DeploymentRecord, now_ms: i64, grace: Duration) -> Result<Reaped> {
+    candidate: &DeploymentRecord, now_ms: i64, grace: Duration, keys: Option<&dyn KeyService>) -> Result<Reaped> {
     let lineage = &candidate.lineage;
     let source = candidate.storage_prefix();
     let local_volume = storage.custody_namespace()?;
@@ -1775,7 +1781,9 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
             break;
         }
     }
-    if !due { return Ok(Reaped::default()); }
+    if !due && !(keys.is_some() && replay_retirement::has_older_pack(bucket.as_ref(), candidate).await?) {
+        return Ok(Reaped::default());
+    }
     let generation = state.retirement_generation();
     let retirement = LineageRetirement { token: Uuid::new_v4(), source, work: RetirementWork::Local { local_volume } };
     directory.change_lineage(lineage, LineageChange::ReserveRetirement {
@@ -1786,7 +1794,11 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
         let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source && can_reap(record))
             else { return Ok(Reaped::default()); };
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
-        reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references)).await
+        let mut reaped = reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references)).await?;
+        if let Some(keys) = keys.filter(|_| replay_retirement::eligible(record)) {
+            reaped.erased += replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references, threshold).await?;
+        }
+        Ok(reaped)
     }.await;
     io.close_and_wait().await;
     directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await?;
@@ -1871,13 +1883,13 @@ mod tests {
         let local_volume = storage.custody_namespace().unwrap();
         directory.change_lineage(&parent.lineage, LineageChange::PrepareFork { preparation, local_volume }).await.unwrap();
         let lock = Arc::new(storage.try_local_maintenance().unwrap().unwrap());
-        assert_eq!(reap_local(directory.as_ref(), &storage, lock.clone(), &stale, i64::MAX, Duration::ZERO).await.unwrap(), Reaped::default());
+        assert_eq!(reap_local(directory.as_ref(), &storage, lock.clone(), &stale, i64::MAX, Duration::ZERO, None).await.unwrap(), Reaped::default());
         let state = directory.lineage_state(&parent.lineage).await.unwrap();
         assert!(state.local_preparations(local_volume).next().is_none());
         assert_eq!(state.retirement_generation(), 0);
 
         source.delete(&file).await.unwrap();
-        let outcome = reap_local(directory.as_ref(), &storage, lock, &stale, i64::MAX, Duration::ZERO).await.unwrap();
+        let outcome = reap_local(directory.as_ref(), &storage, lock, &stale, i64::MAX, Duration::ZERO, None).await.unwrap();
 
         let state = directory.lineage_state(&parent.lineage).await.unwrap();
         assert_eq!(state.retirement_generation(), 1);
@@ -2210,6 +2222,23 @@ mod tests {
         assert!(unsupported.audience.is_none());
         let stale = factory.wrap_stores(&configuration(Some(1)), cached, Some(uncached)).await.unwrap();
         assert!(stale.audience.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_encrypted_posting_reads_admit_scratch_and_require_the_recorded_size() {
+        let store = Arc::new(EncryptingStore::new(Arc::new(MemoryStore::default()), &[7; 32]).unwrap());
+        let key = key("tables/orders/artefacts/l00-b00/spatial/geo-v1.bin");
+        let bytes = Bytes::from_static(b"spatial postings");
+        store.put(&key, bytes.clone()).await.unwrap();
+        let allocation = store.exact_object_allocation(&key, bytes.len()).unwrap();
+        let peak = allocation.retained_bytes + allocation.scratch_bytes;
+        let fallback = rtdb_columnar::MemoryBudget::new(0);
+        let too_small = rtdb_storage::cache::BufferPool::new(store.clone(), peak - 1);
+        assert!(matches!(too_small.get_exact_or(&key, bytes.len(), &fallback).await, Err(Error::MemoryLimit { .. })));
+        let pool = rtdb_storage::cache::BufferPool::new(store, peak);
+        assert_eq!(pool.get_exact_or(&key, bytes.len(), &fallback).await.unwrap().as_slice(), bytes.as_ref());
+        assert!(pool.get_exact_or(&key, bytes.len() - 1, &fallback).await.is_err());
+        assert_eq!(pool.pool_retained_bytes(), 0);
     }
 
     #[tokio::test]

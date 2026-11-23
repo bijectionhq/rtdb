@@ -4,9 +4,11 @@ use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key, log::proto};
 use rtdb_storage::{Error as StorageError, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
-use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
+
+pub(crate) const STRICT_DISPATCH_CUTOFF: &str = "rtdb.replication/strict-dispatch-cutoff";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicaMetadata { pub position: ReplicaPosition, pub timestamp: Timestamp }
@@ -132,20 +134,31 @@ impl PartitionLogs {
         self.source_position(metadata)
     }
     pub async fn enqueue_replica(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp) -> Result<ReplicaReceipt> {
-        self.enqueue_replica_with(envelope, block, now, true, |_| Ok(())).await
+        if matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some()) {
+            return Err(Anomaly::fault("rtdb.replication/strict-dispatch-clock", "Strict replica writes require the live writer clock"));
+        }
+        self.enqueue_replica_with(envelope, block, || now, true, |_| Ok(())).await
     }
     pub(crate) fn replica_inline_limit(&self) -> Option<usize> { self.replica.maximum_append_bytes() }
-    pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp,
+    pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, clock: impl FnOnce() -> Timestamp,
         allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
-        let has_acceptance_stage = match &envelope.message {
-            ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?.is_some(),
-            _ => false,
+        let stage = match &envelope.message {
+            ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?,
+            _ => None,
         };
         let payload = EncodedPayload::encode(envelope.encoded_len(), &self.memory, || Ok(envelope.encode()))?;
         before_enqueue(&payload)?;
+        let now = clock();
+        if let Some(stage) = &stage {
+            let dispatch_upper = now.0.checked_add(1).map(Timestamp);
+            if dispatch_upper.is_none_or(|upper| upper < stage.clock_upper || upper >= stage.cutoff) {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_CUTOFF,
+                    "The writer cannot dispatch the staged transaction inside its guarded cutoff"));
+            }
+        }
         let receipt = match self.replica.enqueue(payload.clone(), now).await {
             Ok(receipt) => receipt,
-            Err(StorageError::MessageTooLarge { .. }) if allow_offload && !has_acceptance_stage => {
+            Err(StorageError::MessageTooLarge { .. }) if allow_offload && stage.is_none() => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
                 self.store.put(&ObjectKey::new(oversized_key(block, &payload_id)?)?, payload).await?;
                 let proxy = ReplicaEnvelope { term: envelope.term, term_sequence: envelope.term_sequence,

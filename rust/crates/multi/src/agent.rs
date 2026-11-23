@@ -1086,6 +1086,11 @@ impl NodeAgent {
     /// Reads a fragment of another node's scan of `name`, from the holding or replica this node has of it, opening a replica if it has neither.
     pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<Response> {
         use base64::Engine;
+        let batches = self.scan_fragment_payload(name, fragment).await?;
+        Ok(Response::Fragment { batches: base64::engine::general_purpose::STANDARD.encode(batches.as_slice()) })
+    }
+
+    async fn scan_fragment_payload(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<rtdb_query::FragmentBytes> {
         if fragment.database() != name { return Err(Anomaly::incorrect("rtdb.multi/fragment-database", format!("A fragment of {} was sent as one of {name}", fragment.database()))); }
         // A reader without the deployment open refuses at once, so its coordinator reads the slice itself rather than wait on an open; it opens a replica on its next pass, for the scans after.
         let open = self.node.catalog().database(name).is_ok() && (self.holdings.lock().contains_key(name) || self.subscriptions.lock().get(name).is_some_and(|subscription| !matches!(subscription.role, Role::Snapshot(_))));
@@ -1095,14 +1100,13 @@ impl NodeAgent {
         }
         self.touch(name);
         let response = self.node.scan_fragment_retained(fragment, self.options.fragments.catch_up, &CancellationToken::new()).await?;
-        let bytes = response.as_slice();
         // A slice too large to answer in one response is read by its coordinator instead.
-        if bytes.len() as u64 > crate::control::MAXIMUM_RESPONSE_BYTES / 4 * 3 - 1024 {
+        if response.as_slice().len() as u64 > crate::control::MAXIMUM_FRAGMENT_BYTES {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/fragment-too-large", format!("A fragment of {name} is larger than one response carries")));
         }
         let table = fragment.table();
         *self.fragments_read.lock().entry((name.to_owned(), format!("{}.{}", table.schema, table.table), fragment.prefix.to_string())).or_default() += 1;
-        Ok(Response::Fragment { batches: base64::engine::general_purpose::STANDARD.encode(bytes) })
+        Ok(response)
     }
 
     /// Serves the deployment's reads as of its checkpoint, opening it from object storage alone unless this node already has it open, at that state or a later one.
@@ -1454,6 +1458,14 @@ fn checkpoint_timeout(name: &str) -> Anomaly {
 
 #[async_trait]
 impl Handler for NodeAgent {
+    async fn fragment_ipc(&self, name: &str, fragment: &rtdb_query::ScanFragment, grant: &str)
+        -> Option<Result<rtdb_query::FragmentBytes>> {
+        Some(match self.check_node_grant(grant, name) {
+            Ok(()) => self.scan_fragment_payload(name, fragment).await,
+            Err(error) => Err(error),
+        })
+    }
+
     async fn handle(&self, request: Request) -> Response {
         let result = match request {
             Request::Activate { name } => self.activate(&name).await,

@@ -1890,6 +1890,69 @@ pub struct AuditAcceptanceStage {
     pub cutoff_micros: i64,
 }
 
+/// Exact retained quorum evidence, including when this audit first had the quorum proof.
+#[derive(Debug, serde::Serialize)]
+pub struct AuditAcceptanceQuorum {
+    pub authority: uuid::Uuid,
+    pub incarnation: u64,
+    pub log_epoch: i32,
+    pub replica_stream: String,
+    pub replica_digest: String,
+    pub required_replica_quorum: usize,
+    pub acceptance: AuditAcceptanceStage,
+    pub replica_append_sample_micros: i64,
+    pub quorum_observed_clock_upper_micros: i64,
+}
+
+/// Read one strict placed transaction whose encrypted replica entry matches a write quorum.
+pub async fn audit_acceptance_quorum(
+    directory: &dyn Directory, keys: &dyn KeyService, authority: uuid::Uuid,
+    incarnation: u64, log_epoch: i32, offset: i64, maximum_message_bytes: usize,
+) -> Result<AuditAcceptanceQuorum> {
+    use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
+
+    if authority.is_nil() || incarnation == 0 || log_epoch < 0 || !(0..(1_i64 << 48)).contains(&offset) {
+        return Err(Anomaly::incorrect("rtdb.multi/acceptance-audit-scope", "Select an exact installation, log epoch and replica offset"));
+    }
+    let id = authority.to_string();
+    let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/acceptance-audit-scope",
+        "The exact installation and replica stream are unavailable");
+    let current = directory.deployment(&id).await?.filter(|record|
+        record.id == id && record.incarnation == incarnation && record.log_epoch == log_epoch && record.lifecycle != Lifecycle::Deleted,
+    ).ok_or_else(unavailable)?;
+    let servers = replica_servers(directory, &current).await?;
+    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
+    let proof = rtdb_logkeeper::certify_committed_range(&stream, offset, offset).await?;
+    let quorum_observed_clock_upper_micros = chrono::Utc::now().timestamp_micros().checked_add(1)
+        .filter(|upper| *upper > 0).ok_or_else(|| Anomaly::fault("rtdb.multi/acceptance-audit-clock", "The audit clock has no valid upper sample"))?;
+
+    let mut entries = rtdb_logkeeper::copy_certified_range(&stream, &proof, maximum_message_bytes.saturating_add(64), 1).await?;
+    let entry = entries.pop().filter(|entry| entry.lsn == offset).ok_or_else(unavailable)?;
+    let cipher = crate::cipher::Cipher::new(&keys.existing(&current.key_id()).await?)?;
+    let payload = cipher.open(&current.replica_seal_scope(), &entry.payload)?;
+    let not_strict = || Anomaly::incorrect("rtdb.multi/acceptance-audit-record", "The certified record is not a strict placed acceptance");
+    let Some(ReplicaEnvelope { term, message: ReplicaBody::ResolvedTx(tx), .. }) = ReplicaEnvelope::decode(&payload)? else {
+        return Err(not_strict());
+    };
+    let stage = tx.checked_acceptance_stage()?.ok_or_else(not_strict)?;
+    let after = directory.deployment(&id).await?.filter(|record|
+        record.id == id && record.incarnation == incarnation && record.log_epoch == log_epoch && record.lifecycle != Lifecycle::Deleted,
+    ).ok_or_else(unavailable)?;
+    if replica_servers(directory, &after).await? != stream.servers { return Err(unavailable()); }
+
+    Ok(AuditAcceptanceQuorum {
+        authority, incarnation, log_epoch, replica_stream: proof.stream, replica_digest: proof.digest,
+        required_replica_quorum: stream.write_quorum,
+        acceptance: AuditAcceptanceStage {
+            replica_offset: offset, source_position: stage.source_position.0, term: term.0,
+            ordered_at_micros: stage.ordered_at.0, staging_clock_upper_micros: stage.clock_upper.0,
+            cutoff_micros: stage.cutoff.0,
+        },
+        replica_append_sample_micros: entry.timestamp,
+        quorum_observed_clock_upper_micros,
+    })
+}
+
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AuditReport {

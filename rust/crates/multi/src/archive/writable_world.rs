@@ -260,7 +260,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         let original = &original;
         with_registered_capture_context(
             directory.as_ref(), archive, keys, hosted_task,
-            CaptureSelection { deployment, capture, manifest: &manifest, suffix: Some(suffix), expected_basis: Some(basis) },
+            CaptureSelection { deployment, capture, manifest: &manifest, suffix: Some(suffix), expected_basis: Some(basis), require_replay: false },
             resources, |context, basis| async move {
                 let (archived, _charge) = rtdb_query::read_owned_world(Arc::clone(&context), owner, world)
                     .await?.ok_or_else(unavailable)?;
@@ -403,7 +403,7 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
         .ok_or_else(OwnedWorld::unavailable)?;
     let basis = with_registered_capture_context(
         directory.as_ref(), archive, keys, hosted_task,
-        CaptureSelection { deployment, capture, manifest: &manifest, suffix, expected_basis: None },
+        CaptureSelection { deployment, capture, manifest: &manifest, suffix, expected_basis: None, require_replay: false },
         resources, |context, basis| {
             let owner = &owner;
             async move {
@@ -469,7 +469,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
             directory.as_ref(), archive, keys, hosted_task,
             CaptureSelection {
                 deployment, capture, manifest: &archived.manifest, suffix: Some(suffix),
-                expected_basis: Some(archived.basis),
+                expected_basis: Some(archived.basis), require_replay: false,
             },
             resources,
             |context, basis| async move {
@@ -771,7 +771,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     };
     let ((schemas, _schema_charge), parent_publication, basis) = with_registered_capture_context(
         directory.as_ref(), archive, keys, hosted_task,
-        CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis },
+        CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis, require_replay: false },
         resources,
         |context, basis| {
             let owner = &owner;
@@ -1014,24 +1014,12 @@ async fn retire_world_pins(
     Ok(())
 }
 
-pub(crate) async fn validate_checkpoint_world(
-    directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession,
-    deployment: Uuid, id: Uuid, checks: Vec<OwnedWorldWitness>,
-    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>,
-) -> Result<TransactionKey> {
-    let OpenWorld { snapshot, record, _schema_charge, .. } = open_world(directory, archive, session, deployment, id).await?;
-    drop(snapshot);
-    let outcome = session.validate_owned_world(&record, checks, controls, deadline, clock).await?;
-    if !outcome.committed() {
-        return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
-    }
-    Ok(outcome.tx_key())
-}
 
 pub(crate) async fn commit_checkpoint_world_batch(
     directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession, deployment: Uuid,
     sections: Vec<rtdb_node::OwnedWorldSection>, root: rtdb_node::OwnedRootSection,
-    fingerprint: [u8; 32], controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+    observed: rtdb_node::OwnedWorldObservations, fingerprint: [u8; 32],
+    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
 ) -> Result<TransactionKey> {
     if !(1..=8).contains(&sections.len()) { return Err(OwnedWorld::unavailable()); }
     let installation = directory.deployment(&deployment.to_string()).await?.ok_or_else(OwnedWorld::unavailable)?;
@@ -1052,7 +1040,7 @@ pub(crate) async fn commit_checkpoint_world_batch(
         }
         admitted.push((retained.until, section));
     }
-    let outcome = session.commit_owned_world_batch(admitted, root, fingerprint, controls, deadline).await?;
+    let outcome = session.commit_owned_world_batch(admitted, root, observed, fingerprint, controls, deadline).await?;
     if !outcome.committed() {
         return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
     }

@@ -140,7 +140,16 @@ The directory publishes the capture and the recovery digest for its archive cust
 [Verus](../verus/serving_replay_handoff/proof.rs) checks the production selection guard against a live holder, a changed checkpoint, a competing selection, and a replacement at the same block.
 The capture format preserves the existing encrypted replay closure, including the original ordered inputs by logical name.
 Later captures can read those inputs from an admitted archive after their original packs disappear.
-Automatic L0 release needs exact original-pack retirement authority, including the remaining older readers, descendants and pending block confirmations.
+The local Multi reaper can erase older original block packs for a parked root once it verifies their exact L0 members in the independent archive of the published checkpoint.
+It holds the local maintenance lock, lineage reservation and archive region while verifying the pack and unlinking it.
+It requires drained storage and catalog readers, no declared descendant references, and a certified replica prefix that passes the old boundary while retaining the published boundary.
+Only the physical original pack is erased, so the archive continues to serve the logical L0 descriptors.
+An in-place restore of an archive-backed installation must adopt a complete replay capture.
+A parked installation can advance its serving archive after restore and preserves the earlier restore receipt.
+The old repair capture becomes eligible for retirement after selection advances and its admitted readers drain.
+The [checkpoint-metadata Verus proofs](../verus/checkpoint_metadata/laws.rs) check the pack and journal bounds and exclude new admissions of the old metadata.
+[LocalReplayPackRetirement](../tla/LocalReplayPackRetirement.tla) checks that new readers can open after erasure and detects weakened guards for original readers, raw copies, descendants, the journal and restore.
+Hosted versioned and unversioned storage still require provider-specific retirement authority for mixed packs.
 
 ## Source retention through copy completion
 

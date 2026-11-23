@@ -109,6 +109,22 @@ async fn scalar_shared_marks_keep_raw_uri_hash_selection_and_nested_object_equal
     assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,$2)", vec![V::list(vec![needle]),V::list(vec![candidate])]).await.unwrap(), [vec![V::Bool(true)]]);
 }
 
+#[tokio::test]
+async fn spilled_scalar_shared_marks_select_raw_hash_candidates_before_comparing() {
+    let cancellation = CancellationToken::new();
+    let base = context(&cancellation, 1 << 27);
+    let spilled = QueryContext::new(
+        base.catalog.clone(), Arc::clone(&base.memory), Timestamp(0), "UTC",
+        QueryOptions { join_build_rows: 0, ..base.options.clone() }, &cancellation,
+    ).unwrap();
+    let needle = V::Timestamp { value: i64::MAX, unit: TimeUnit::Second, timezone: Some("UTC".into()) };
+    let candidate = V::Timestamp { value: 0, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) };
+    assert_eq!(query_at(Arc::clone(&spilled), "SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,$2)", vec![needle,candidate]).await.unwrap(), [vec![V::Bool(false)]]);
+    let needle = V::Uri("HTTP://EXAMPLE.com/%ab".into());
+    let candidate = V::Uri("http://example.com/%AB".into());
+    assert_eq!(query_at(spilled, "SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,NULL)", vec![needle,candidate]).await.unwrap(), [vec![V::Null]]);
+}
+
 #[test]
 fn list_candidates_share_scalar_admission_and_row_arity_at_every_length() {
     let context = context(&CancellationToken::new(), 1 << 27);

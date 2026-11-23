@@ -736,7 +736,7 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };
-    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), Timestamp(100), false, |_| Ok(())).await
+    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), || Timestamp(100), false, |_| Ok(())).await
         else { panic!("an inline-only append must fail before emitting an oversized proxy"); };
     assert_eq!(error.code, "rtdb.storage/message-too-large");
     assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
@@ -749,6 +749,46 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
     let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()) });
     fixture.driver.consume(raw(2, 1, 1, missing)).await.unwrap();
     assert_eq!(fixture.driver.read_position, rtdb_types::ReplicaPosition(2));
+}
+
+#[tokio::test]
+async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
+    let fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 16).await;
+    let position = SourcePosition(1);
+    let attempt = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap().issue()
+        .identify(position, Some("owner")).unwrap();
+    let envelope = ReplicaEnvelope {
+        term: Term(1),
+        term_sequence: Some(TermSequence(1)),
+        message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
+            tx_id: Some(position.0),
+            src_msg_id: Some(position.0),
+            system_time_micros: Some(100),
+            committed: Some(true),
+            placed_attempt: Some(attempt.encode().to_vec()),
+            acceptance_stage: Some(proto::AcceptanceStage {
+                clock_upper_micros: Some(120), cutoff_micros: Some(125),
+            }),
+            ..Default::default()
+        }),
+    };
+    let wall = AtomicI64::new(119);
+    for sample in [118, 124, 130] {
+        let Err(error) = fixture.logs.enqueue_replica_with(
+            &envelope, BlockIndex(0), || Timestamp(wall.load(Ordering::Relaxed)), false,
+            |_| { wall.store(sample, Ordering::Relaxed); Ok(()) },
+        ).await else { panic!("An invalid dispatch clock must leave the replica log untouched"); };
+        assert_eq!(error.code, crate::logs::STRICT_DISPATCH_CUTOFF);
+        assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
+        wall.store(119, Ordering::Relaxed);
+    }
+
+    assert!(fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(119)).await.is_err());
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
+    let receipt = fixture.logs.enqueue_replica_with(
+        &envelope, BlockIndex(0), || Timestamp(123), false, |_| Ok(()),
+    ).await.unwrap();
+    assert_eq!(receipt.durable().await.unwrap().position, ReplicaPosition(0));
 }
 
 #[tokio::test]
@@ -1769,6 +1809,55 @@ async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies
     assert_eq!(result.as_ref().unwrap().result().error().unwrap().code, "rtdb.owned/expired");
     fixture.driver.resolution_finished(resolver, result).await.unwrap();
     fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_strict_write_expired_before_dispatch_resolves_again_from_its_source() {
+    let wall = Arc::new(AtomicI64::new(110));
+    let clock: ReplicationClock = {
+        let wall = Arc::clone(&wall);
+        Arc::new(move || Timestamp(wall.load(Ordering::Relaxed)))
+    };
+    let config = ReplicationConfig { idle_heartbeat: false, ..Default::default() };
+    let mut fixture = fixture_with_clock(config, 1 << 16, Some(clock)).await;
+    let scope = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap();
+    Arc::get_mut(&mut fixture.driver.resolve).unwrap().owned_witness_scope = Some(scope);
+    let claim = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)),
+        message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+    fixture.logs.enqueue_replica(&claim, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
+    let claim_record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
+    fixture.driver.consume(claim_record).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+
+    let command = SourceTransaction::new(vec![TxOp::OwnedDeadline { until: Timestamp(150), recheck_at_staging: true }],
+        SubmitOptions { user: Some("owner".into()), ..Default::default() }, &fixture.memory,
+    ).unwrap().with_placed_seed(Some(scope.issue()));
+    let payload = command.encode().unwrap().into_bytes();
+    let source = fixture.logs.append_source_encoded(payload.clone(), Timestamp(100)).await.unwrap();
+    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(LogRecord {
+        metadata: LogMetadata { offset: LogOffset(source.0), timestamp: Timestamp(100) }, payload,
+    });
+    fixture.driver.resolve_next_source().await.unwrap();
+    let leader = fixture.driver.leader.as_mut().unwrap();
+    let (resolver, result) = super::pending_resolution(&mut leader.resolution).await;
+    assert!(result.as_ref().unwrap().staging_clock_upper().is_some());
+    wall.store(160, Ordering::Relaxed);
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    assert!(!fixture.driver.leader.as_ref().unwrap().accepting_commands());
+
+    let driver = tokio::spawn(fixture.driver.run());
+    tokio::time::timeout(Duration::from_secs(1), fixture.handle.await_source(source, &CancellationToken::new()))
+        .await.unwrap().unwrap();
+    let records = fixture.replica.read_range(LogOffset(0), LogOffset(3)).await.unwrap();
+    assert_eq!(records.len(), 3);
+    let resolved = ReplicaEnvelope::decode(&records[2].payload).unwrap().unwrap();
+    assert_eq!(resolved.term, Term(2));
+    let ReplicaBody::ResolvedTx(tx) = resolved.message else { panic!("Expected an ordered refusal"); };
+    assert_eq!(tx.src_msg_id, Some(source.0));
+    assert_eq!(tx.committed, Some(false));
+    assert!(tx.acceptance_stage.is_none());
+    fixture.handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(1), driver).await.unwrap().unwrap().unwrap();
 }
 
 async fn attach_readback_fixture(replica_message_limit: usize) -> (Fixture, DbOp, oneshot::Receiver<DbOp>, oneshot::Sender<Result<()>>) {

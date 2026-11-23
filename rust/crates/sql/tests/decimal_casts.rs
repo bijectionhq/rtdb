@@ -119,7 +119,8 @@ async fn decimal_sum_raw_output_survives_identity_and_requires_valid_computed_pr
         "CASE WHEN true THEN s ELSE NULL END", "ARRAY[s]", "{'v': s}",
         "ARRAY[s]::DECIMAL(1,0)[]",
     ] {
-        assert_eq!(query(&format!("SELECT {projection} FROM {source}")).await.unwrap_err().code, "rtdb/decimal-precision", "{projection}");
+        let result = query(&format!("SELECT {projection} FROM {source}")).await;
+        assert_eq!(result.as_ref().err().map(|error| error.code.as_str()), Some("rtdb/decimal-precision"), "{projection}: {result:?}");
     }
     assert_eq!(query(&format!("SELECT s + '0'::DECIMAL(1,0) FROM {source}")).await.unwrap().1, decimal(18, 32, 0, 128));
     for projection in ["CAST(s AS DECIMAL(1,0)) > 0", "CAST(s AS DECIMAL) > 0", "COALESCE(s, NULL) > 0"] {
@@ -128,4 +129,11 @@ async fn decimal_sum_raw_output_survives_identity_and_requires_valid_computed_pr
     assert_eq!(query(&format!("SELECT CAST(CAST(s AS DECIMAL(1,0)) AS TEXT) FROM {source}")).await.unwrap().1, Value::Utf8("18".into()));
     assert_eq!(query(&format!("SELECT CASE WHEN false THEN s ELSE NULL END FROM {source}")).await.unwrap().1, Value::Null);
     assert_eq!(query(&format!("SELECT s::DECIMAL(2,0) FROM {source}")).await.unwrap().1, decimal(18, 2, 0, 128));
+    let negative = source.replace("'9'", "'-9'");
+    assert_eq!(query(&format!("SELECT s FROM {negative}")).await.unwrap().1, decimal(-18, 1, 0, 128));
+    assert_eq!(query(&format!("SELECT ARRAY[s] FROM {negative}")).await.unwrap_err().code, "rtdb/decimal-precision");
+    assert_eq!(
+        query("SELECT ARRAY[s] FROM (VALUES ('-9'::DECIMAL(1,0))) AS t(s)").await.unwrap().1,
+        Value::List(vec![decimal(-9, 1, 0, 128)]),
+    );
 }

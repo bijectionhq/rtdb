@@ -40,3 +40,15 @@ pub(crate) fn checkpoint_pack_collectable(pack: i64, youngest: i64, published: O
     checkpoint_metadata_collectable(pack, published, oldest)
         && checkpoint_metadata_collectable(youngest, published, oldest)
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out <==> pack < published && 0 <= anchor_start && anchor_start <= boundary
+        && boundary < anchor_through && anchor_through < published_boundary,
+))]
+pub(crate) fn replay_archive_covers_pack(
+    pack: i64, published: i64, boundary: i64, anchor_start: i64, anchor_through: i64, published_boundary: i64,
+) -> bool {
+    checkpoint_metadata_collectable(pack, Some(published), None)
+        && 0 <= anchor_start && anchor_start <= boundary
+        && boundary < anchor_through && anchor_through < published_boundary
+}

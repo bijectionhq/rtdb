@@ -84,7 +84,7 @@ mod writable_world;
 pub(crate) use writable_world::prepare_checkpoint_world_overlay;
 pub(crate) use writable_world::{finish_checkpoint_replay_parents, prepare_checkpoint_replay_parent};
 pub(crate) use writable_world::retain_replayed_checkpoint_world;
-pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
+pub(crate) use writable_world::{commit_checkpoint_world_batch, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::{WorldFact, WorldPoint};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, retire_world_suffix};
@@ -191,6 +191,12 @@ struct ServingArchive<'a> {
     manifest: &'a str,
 }
 
+impl ServingArchive<'_> {
+    fn media(&self) -> Result<CellStorage> {
+        serde_json::from_str(self.archive).map_err(|_| inconsistent("Invalid retained archive binding"))
+    }
+}
+
 fn serving_archive(record: &DeploymentRecord) -> Result<Option<ServingArchive<'_>>> {
     if let Some(operation) = record.serving_replay_capture {
         require_capture_open(record, operation)?;
@@ -221,6 +227,46 @@ pub(crate) fn serving_archive_operation(record: &DeploymentRecord) -> Result<Opt
     Ok(serving_archive(record)?.map(|source| source.point.operation))
 }
 
+pub(crate) fn has_local_replay_archive(record: &DeploymentRecord) -> Result<bool> {
+    if record.serving_replay_capture.is_none() { return Ok(false); }
+    let Some(selected) = serving_archive(record)? else { return Ok(false); };
+    Ok(matches!(selected.media()?, CellStorage::Local { .. }))
+}
+
+pub(crate) async fn with_local_replay_archive<T, F, Fut>(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    record: &DeploymentRecord,
+    run: F,
+) -> Result<Option<T>>
+where
+    F: FnOnce(DeploymentRecord, ArchivedCheckpoint) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let Some(operation) = record.serving_replay_capture else { return Ok(None); };
+    let Some(selected) = serving_archive(record)? else { return Ok(None); };
+    if record.checkpoint != Some(selected.point.checkpoint) { return Ok(None); }
+    let archive = selected.media()?;
+    if !matches!(archive, CellStorage::Local { .. }) || same_storage(storage, &archive) || storage.overlaps(&archive)? {
+        return Ok(None);
+    }
+    stage::with_region(
+        directory, keys, &record.id, &archive, None, Some((operation, None)), None,
+        |current| {
+            if current.version != record.version || serving_archive(current)?.as_ref() != Some(&selected) {
+                return Err(unavailable("The installation changed before opening its replay archive"));
+            }
+            Ok(None)
+        },
+        |admitted, owner, io| async move {
+            let archive = ArchivedCheckpoint::load(&admitted, keys, owner, io, false).await?
+                .ok_or_else(|| inconsistent("The installation lost its retained replay archive"))?;
+            run(admitted, archive).await.map(Some)
+        },
+    ).await
+}
+
 impl ArchivedCheckpoint {
     pub(crate) async fn load(
         record: &DeploymentRecord,
@@ -234,8 +280,7 @@ impl ArchivedCheckpoint {
         if !record.storage_regions.get(&owner).is_some_and(|hold| hold.admits_archive_read(operation)) {
             return Err(inconsistent("Opening the serving archive requires its own storage admission"));
         }
-        let archive: CellStorage = serde_json::from_str(source.archive)
-            .map_err(|_| inconsistent("Invalid retained archive binding"))?;
+        let archive = source.media()?;
         let audience_transport = audience && matches!(&archive, CellStorage::S3 { .. });
         let bucket = archive.open_bucket(region, audience_transport).await?;
         let prefix = format!("checkpoint-captures/{}/{operation}", record.id);
@@ -302,6 +347,16 @@ impl ArchivedCheckpoint {
         let mut value = Vec::with_capacity(archived.value.len());
         layout.seal_frames(&self.serving_cipher, name, frames.start, &plaintext, &mut value)?;
         Ok(ObjectObservation { value: value.into(), version: archived.version })
+    }
+
+    pub(crate) async fn matches_original(&self, name: &ObjectKey, original: &Bytes) -> rtdb_storage::Result<bool> {
+        let Some(object) = self.objects.get(name) else { return Ok(false); };
+        let plaintext = match self.serving_cipher.open_object(name, original) {
+            Err(_) if crate::cipher::object::framed(name) => self.serving_cipher.open(name.as_str(), original)?,
+            result => result?,
+        };
+        if object.bytes != crate::cipher::object::sealed_size(name, plaintext.len())? as u64 { return Ok(false); }
+        Ok(self.read_plaintext(name, object).await? == plaintext)
     }
 
     pub(crate) fn with_serving(self, serving: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
@@ -847,7 +902,8 @@ pub async fn retain_serving_replay(
             return Ok(());
         }
         let previous = serving_archive(record)?.map(|source| source.point.checkpoint.block);
-        let parked = record.holder.is_none() && record.checkpoint_recovery.is_none() && record.move_from.is_none();
+        let restore_pending = record.checkpoint_recovery.as_ref().is_some_and(|repair| repair.completed_at_ms.is_none());
+        let parked = record.holder.is_none() && !restore_pending && record.move_from.is_none();
         let exact_checkpoint = record.checkpoint == Some(point.checkpoint)
             && point.checkpoint.root_sha256.is_some() && record.recovery_manifest_sha256.is_some();
         let same_selection = record.epoch == installation.epoch
@@ -1509,6 +1565,7 @@ async fn admit_lifetime_restore(
     directory: &dyn Directory, archive: &CellStorage, keys: &dyn KeyService,
     point: &CapturePoint, manifest: &str, hosted_task: Option<&rtdb_directory::HostedTask>,
     allow_lifetime_floors: bool,
+    require_replay: bool,
 ) -> Result<()> {
     let mut node = rtdb_node::NodeOptions::default();
     node.owned_relations = true;
@@ -1518,7 +1575,7 @@ async fn admit_lifetime_restore(
     read_world::with_registered_capture_context(
         directory, archive, keys, hosted_task,
         read_world::CaptureSelection { deployment: point.deployment, capture: point.operation,
-            manifest, suffix: None, expected_basis: None },
+            manifest, suffix: None, expected_basis: None, require_replay },
         CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
         |context, basis| async move {
             if basis.system_time.0 != point.checkpoint.system_time {
@@ -1687,7 +1744,7 @@ pub(crate) async fn seal_checkpoint_transfer(
         directory, archive, keys, hosted_task,
         read_world::CaptureSelection {
             deployment: intent.source, capture: intent.capture,
-            manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None,
+            manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None, require_replay: false,
         },
         CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
         Some(read_world::TerminalReplay { storage, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
@@ -1759,7 +1816,9 @@ pub(crate) async fn restore_checkpoint(
         .ok_or_else(|| unavailable("The current installation key is unavailable"))?;
     // The Directory CAS below still requires this same current checkpoint after
     // validating its authenticated source root. Recovery retains its ordered tail.
-    admit_lifetime_restore(directory, archive, keys, &point, &manifest_sha256, hosted_task, true).await?;
+    admit_lifetime_restore(
+        directory, archive, keys, &point, &manifest_sha256, hosted_task, true, current.serving_replay_capture.is_some(),
+    ).await?;
 
     let fenced = update_installation(directory, &id, |record| {
         if read_receipt(record)?.is_some() {
@@ -1772,6 +1831,7 @@ pub(crate) async fn restore_checkpoint(
         if !same_incarnation(record, &point)
             || record.checkpoint != Some(point.checkpoint)
             || record.move_from.is_some()
+            || record.serving_replay_capture != current.serving_replay_capture
             || capture_receipt(record, archive, deployment, operation)?
                 != Some((point.clone(), manifest_sha256.clone()))
         {
@@ -1850,7 +1910,7 @@ pub(crate) async fn restore_checkpoint(
         record.lifecycle = recovery.previous_lifecycle;
         record.compaction_replay_cutoff = Some(cutoff.0);
         record.recovery_manifest_sha256 = None;
-        record.serving_replay_capture = None;
+        record.serving_replay_capture = record.serving_replay_capture.map(|_| operation);
         record.checkpoint_repair_receipts.insert(operation, recovery.clone());
         Ok(())
     })
@@ -2241,7 +2301,8 @@ mod tests {
         let bytes = Bytes::from_static(b"observed bytes");
         store.put(&name, bytes.clone()).await?;
         let closure = BTreeMap::from([(name.clone(), Some(publication_digest(&bytes)))]);
-        let plan = plan_checkpoint_copy(&store, closure, Some(bytes.len() as u64 + crate::cipher::SEALED_OVERHEAD as u64)).await?;
+        let budget = crate::cipher::object::sealed_size(&name, bytes.len())? as u64;
+        let plan = plan_checkpoint_copy(&store, closure, Some(budget)).await?;
         assert_eq!(plan[0].version.as_ref().map(|identity| identity.key.as_str()),
             Some("serving/v06/tables/t/data/example.arrow"),
             "the source plan must retain the physical storage identity");
@@ -2289,6 +2350,26 @@ mod tests {
         let store = read(substituted)?;
         assert!(matches!(store.get_range(&name, range.start as u64..range.end as u64).await,
             Err(Error::ConflictingObject(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_legacy_original_matches_the_same_plaintext_in_a_framed_archive() -> Result<()> {
+        let name = key("tables/t/data/l00-rc-b00.arrow")?;
+        let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
+        let serving_cipher = Cipher::new(&[7; crate::keys::KEY_BYTES])?;
+        let ciphertext = archive_cipher.seal_object(&name, b"first input")?;
+        let files = PrefixedStore::new(Arc::new(rtdb_storage::MemoryStore::default()), "archive/objects");
+        files.put(&name, ciphertext.clone()).await?;
+        let original = serving_cipher.seal_deterministic(name.as_str(), b"first input")?;
+        let substituted = serving_cipher.seal_deterministic(name.as_str(), b"other input")?;
+        let archive = ArchivedCheckpoint {
+            files, audience_transport: false,
+            objects: BTreeMap::from([(name.clone(), ArchivedObject::from_sealed(&name, &ciphertext)?)]),
+            archive_cipher, serving_cipher,
+        };
+        assert!(archive.matches_original(&name, &original).await?);
+        assert!(!archive.matches_original(&name, &substituted).await?);
         Ok(())
     }
 

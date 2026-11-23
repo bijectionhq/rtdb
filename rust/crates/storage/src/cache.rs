@@ -377,6 +377,21 @@ impl BufferPool {
         Ok(CacheLease { allocation, range: 0..length })
     }
 
+    /// Reads an immutable object of the recorded length without filling the pool on a miss.
+    pub async fn get_exact_or(&self, key: &ObjectKey, length: usize, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        let end = u64::try_from(length).map_err(|_| Error::Task("Object size exceeds the storage range".into()))?;
+        if let Some(lease) = self.held_range(key, &(0..end))
+            && !lease.is_partial_allocation()
+        {
+            return Ok(lease);
+        }
+        let allocation = self.store.exact_object_allocation(key, length)?;
+        let reservation = reserve_read(length, allocation, |bytes| self.reserve(bytes).or_else(|_| reserve_from(fallback, bytes)))?;
+        let bytes = reservation.retaining_io(self.store.get_fresh_exact(key, length)).await?;
+        let allocation = Arc::new(reservation.finish(bytes)?);
+        Ok(CacheLease { allocation, range: 0..length })
+    }
+
     async fn fetch_whole(&self, key: &ObjectKey, length: usize, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<RetainedBytes>> {
         let allocation = self.store.whole_object_allocation(key, length)?;
         let reservation = reserve_read(length, allocation, reserve)?;

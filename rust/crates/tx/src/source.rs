@@ -31,7 +31,7 @@ pub(crate) enum Operation {
 impl Operation {
     pub(crate) fn owned_relation(&self) -> Option<&rtdb_types::OwnedRelation> {
         match self {
-            Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. }
+            Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. } | TxOp::OwnedDeclareSpatialPath { relation, .. } | TxOp::OwnedDropSpatialPath { relation, .. }
                 | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
                 | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckWorldPurge { relation, .. }
                 | TxOp::OwnedErase { relation, .. } | TxOp::OwnedSweepExpired { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
@@ -84,9 +84,11 @@ impl SourceTransaction {
                     (capacity_condition_bytes(relation, column.capacity(), prefix.capacity())?, None, 0),
                 Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, when, .. }) =>
                     (capacity_condition_bytes(relation, column.capacity(), when.capacity())?, None, 0),
+                Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
+                    (relation.name().len() + name.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
-                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
+                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
                     (owned_path_bytes(relation, name, columns)?, None, 0),
                 Operation::Public(TxOp::HostedControl(control)) => (control.retained_bytes()?, None, 0),
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => (Value::document_retained_bytes(record)?.saturating_add(attempt.len()), None, 128),
@@ -319,9 +321,11 @@ impl SourceTransaction {
                     capacity_condition_bytes(relation, column.capacity(), prefix.capacity())?,
                 Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, when, .. }) =>
                     capacity_condition_bytes(relation, column.capacity(), when.capacity())?,
+                Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
+                    relation.name().len() + name.name().len(),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
-                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
+                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
                     owned_path_bytes(relation, name, columns)?,
                 Operation::Public(TxOp::HostedControl(control)) => control.retained_bytes()?,
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => Value::document_retained_bytes(record)?.saturating_add(attempt.len() + 128),
@@ -473,16 +477,25 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("column".into(), Value::Utf8(column.clone()));
             "rtdb-owned-search-path-v1"
         }
+        Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("name".into(), Value::Utf8(name.name().into()));
+            "rtdb-owned-drop-spatial-path-v1"
+        }
         Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("schema".into(), Value::Binary(schema.to_json()?));
             "rtdb-owned-relation-v1"
         }
-        Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) => {
+        Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("name".into(), Value::Utf8(name.name().into()));
             body.insert("columns".into(), Value::list(columns.iter().cloned().map(Value::Utf8).collect()));
-            "rtdb-owned-path-v1"
+            if matches!(operation, Operation::Public(TxOp::OwnedDeclareSpatialPath { .. })) {
+                "rtdb-owned-spatial-path-v1"
+            } else {
+                "rtdb-owned-path-v1"
+            }
         }
         Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -534,8 +547,9 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             "rtdb-owned-publish-root-v1"
         }
-        Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
+        Operation::Public(TxOp::OwnedPublishWorld { world, parent_pin, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
             body.insert("world".into(), Value::Uuid(world.0));
+            body.insert("parent_pin".into(), Value::Uuid(parent_pin.0));
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             body.insert("expected".into(), expected.map_or(Value::Null, |time| Value::I64(time.0)));
@@ -1348,23 +1362,26 @@ impl SourceOperationReader<'_> {
         let value_fields: &[&str] = match name.as_str() {
             "sql" => &["query", "args"],
             "rtdb-owned-search-path-v1" | "rtdb-owned-unique-path-v1" => &["relation", "name", "column"],
+            "rtdb-owned-drop-spatial-path-v1" => &["relation", "name"],
             "rtdb-owned-relation-v1" => &["relation", "schema"],
             "rtdb-owned-capacity-v1" => &["relation", "column", "prefix_bytes", "cap"],
             "rtdb-owned-check-capacity-v1" => &["relation", "column", "prefix", "at_most"],
-            "rtdb-owned-path-v1" => &["relation", "name", "columns"],
+            "rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1" => &["relation", "name", "columns"],
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => &["until"],
             "rtdb-hosted-constraint-refusal-v1" => &["version"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
+            "rtdb-owned-fork-overlay-v1" => &["registration", "previous", "attempt", "fingerprint", "overlay_world", "overlay_pin"],
             "rtdb-owned-root-retained-sibling-v1" => &["registration", "previous", "sibling", "attempt", "fingerprint"],
             "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-root-retained-advance-v1" | "rtdb-owned-root-retained-renewal-v1" | "rtdb-owned-root-proposal-hold-v1" | "rtdb-owned-root-proposal-shorten-v1" | "rtdb-owned-controls-retained-fork-v1"
             | "rtdb-owned-controls-proposal-fork-v1" | "rtdb-owned-root-proposal-fork-v1" => &["registration", "previous", "attempt", "fingerprint"],
             "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
-            "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
-            "rtdb-owned-settle-proposal-v1" | "rtdb-owned-land-proposal-v1" | "rtdb-owned-drop-with-root-delete-v1" => &["world", "attempt", "fingerprint", "expected", "pin"],
-            "rtdb-owned-publish-world-v2" => &["world", "attempt", "fingerprint", "expected", "advance_to"],
+            "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "parent_pin", "attempt", "fingerprint", "expected"],
+            "rtdb-owned-settle-proposal-v1" | "rtdb-owned-land-proposal-v1" | "rtdb-owned-drop-with-root-delete-v1" => &["world", "parent_pin", "attempt", "fingerprint", "expected", "pin"],
+            "rtdb-owned-publish-world-v2" => &["world", "parent_pin", "attempt", "fingerprint", "expected", "advance_to"],
             "rtdb-owned-check-world-purge-v3" => &["relation", "pin", "frontier", "local_frontier"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
+            "rtdb-owned-check-world-clock-v1" => &["scope", "world", "pin", "before"],
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
@@ -1440,13 +1457,13 @@ impl SourceOperationReader<'_> {
                 TxOp::OwnedPublishRoot { attempt, fingerprint }
             }
             "rtdb-owned-settle-proposal-v1" | "rtdb-owned-land-proposal-v1" | "rtdb-owned-publish-world-v1" | "rtdb-owned-publish-world-v2" | "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1" => {
-                let (Value::Uuid(world), Value::Utf8(attempt), Value::Binary(fingerprint)) =
-                    (value("world")?, value("attempt")?, value("fingerprint")?) else {
+                let (Value::Uuid(world), Value::Uuid(parent_pin), Value::Utf8(attempt), Value::Binary(fingerprint)) =
+                    (value("world")?, value("parent_pin")?, value("attempt")?, value("fingerprint")?) else {
                     return Err(invalid("Owned world publication has invalid fields"));
                 };
                 let fingerprint = fingerprint.try_into().map_err(|_| invalid("Invalid world publication fingerprint"))?;
                 TxOp::OwnedPublishWorld {
-                    world: rtdb_types::Iid(world), attempt, fingerprint,
+                    world: rtdb_types::Iid(world), parent_pin: Iid(parent_pin), attempt, fingerprint,
                     drop_world: matches!(name.as_str(), "rtdb-owned-land-proposal-v1" | "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1"),
                     land_root: if name == "rtdb-owned-land-proposal-v1" {
                         let Value::Uuid(pin) = value("pin")? else { return Err(invalid("Proposal landing has no original pin")); };
@@ -1509,6 +1526,11 @@ impl SourceOperationReader<'_> {
                 else { return Err(invalid("Owned search path declaration has invalid fields")); };
                 TxOp::OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, column }
             }
+            "rtdb-owned-drop-spatial-path-v1" => {
+                let (Value::Utf8(relation), Value::Utf8(name)) = (value("relation")?, value("name")?)
+                    else { return Err(invalid("Owned spatial path removal has invalid fields")); };
+                TxOp::OwnedDropSpatialPath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)? }
+            }
             "rtdb-owned-relation-v1" => {
                 let (Value::Utf8(relation), Value::Binary(schema)) = (value("relation")?, value("schema")?)
                     else { return Err(invalid("Owned relation declaration has invalid fields")); };
@@ -1517,7 +1539,7 @@ impl SourceOperationReader<'_> {
                     schema: rtdb_types::OwnedSchema::from_json(&schema)?,
                 }
             }
-            "rtdb-owned-path-v1" => {
+            name_of_operation @ ("rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1") => {
                 let (Value::Utf8(relation), Value::Utf8(name), Value::List(columns)) =
                     (value("relation")?, value("name")?, value("columns")?)
                 else { return Err(invalid("Owned path declaration has invalid fields")); };
@@ -1525,7 +1547,14 @@ impl SourceOperationReader<'_> {
                     Value::Utf8(column) => Ok(column),
                     _ => Err(invalid("Owned path names a non-text column")),
                 }).collect::<Result<_>>()?;
-                TxOp::OwnedDeclarePath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, columns }
+                let relation = rtdb_types::OwnedRelation::new(relation)?;
+                let spatial = name_of_operation == "rtdb-owned-spatial-path-v1";
+                let name = rtdb_types::OwnedRelation::new(name)?;
+                if spatial {
+                    TxOp::OwnedDeclareSpatialPath { relation, name, columns }
+                } else {
+                    TxOp::OwnedDeclarePath { relation, name, columns }
+                }
             }
             "rtdb-owned-fixed-range-v1" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Fixed range declaration has no relation")); };
@@ -1834,6 +1863,28 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn ordered_world_clock_advance_keeps_its_parent_pin_without_point_checks() {
+        let world = Iid([4; 16]);
+        let pin = Iid([5; 16]);
+        let operation = TxOp::OwnedPublishWorld {
+            world, parent_pin: pin, attempt: "0000000000000000000000".into(),
+            fingerprint: [1; 32], expected: Some(Timestamp(17)),
+            advance_to: Some(Timestamp(22)), drop_world: false,
+            settlement_pin: None, land_root: None, delete_root: None,
+        };
+        let source = SourceTransaction::new(
+            vec![operation], SubmitOptions::default(), &budget(),
+        ).unwrap();
+        let replayed = roundtrip(&source);
+        assert!(matches!(replayed.operations.as_slice(),
+            [Operation::Public(TxOp::OwnedPublishWorld {
+                world: actual, parent_pin, expected: Some(Timestamp(17)),
+                advance_to: Some(Timestamp(22)), ..
+            })] if *actual == world && *parent_pin == pin
+        ));
     }
 
     #[test]

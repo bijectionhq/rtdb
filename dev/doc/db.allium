@@ -1164,6 +1164,11 @@ rule LeaderProcessesArtefactsRemoved {
 rule AppendReplicaMessage {
     -- Append the message to the replica log, in resolution order, STAMPED with this leader's term and the next position within it.
     -- Every record the term writes goes through this one ordered path, the block upload included, so the term's positions follow the log's order.
+    -- The native writer resamples a strict placed transaction's clock after encoding and fingerprinting the final frame.
+    -- The rounded upper sample must be at least the retained staging sample and strictly before the guarded cutoff.
+    -- A staged strict write holds later resolution, appender commands and a full block's cut until its admitted read-back.
+    -- On failure the appender submits no frame and the driver discards the term's speculative suffix before reclaiming and resolving the durable source again.
+    -- Transport and quorum durability still follow dispatch and depend on the installed receiver's service bound.
     --
     -- Nothing here is atomic across messages and nothing needs to be: a superseded leader is fenced by the term its records carry, checked when it reads them back, not by an append that fails.
     --
@@ -1933,6 +1938,7 @@ surface QueryAccess {
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys when the aggregate specifies an order.
         -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
+        -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
@@ -1947,6 +1953,7 @@ surface QueryAccess {
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
+        -- Computed Arrow projections validate decimal precision on the selected result cells, including nested decimals.
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
         -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
         -- Adjacent compatible projections can pass computed scalar results as Arrow columns, including into a mutation's document projection.

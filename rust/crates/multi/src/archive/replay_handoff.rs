@@ -15,3 +15,13 @@ pub(super) fn may_install(
         None => true,
     }
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(retained =>
+    ensures retained <==> (selected.is_some() && selected.unwrap() == capture)
+        || (repair.is_some() && repair.unwrap().0 == capture
+            && (repair.unwrap().1 || selected.is_none())),
+))]
+pub(super) fn retains_capture(selected: Option<u128>, repair: Option<(u128, bool)>, capture: u128) -> bool {
+    matches!(selected, Some(source) if source == capture)
+        || matches!(repair, Some((source, pending)) if source == capture && (pending || selected.is_none()))
+}

@@ -20,7 +20,7 @@ const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
-       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
+       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST]] [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
@@ -44,6 +44,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi observe-holder --directory DIR --id UUID --incarnation N\n\
        rtdb-multi move-observed-holder --directory DIR --observation FILE --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
+       rtdb-multi audit-acceptance --directory DIR --keys PATH --id UUID --incarnation N --log-epoch N --replica-offset N\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
@@ -336,7 +337,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 53 } else { 13 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 57 } else { 13 },
             pgwire_arrow_copy_out: true,
         };
         let mut output = std::io::stdout().lock();
@@ -362,6 +363,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 private_key: arguments.required("private-key")?.into(),
                 password_file: arguments.required("password-file")?.into(),
                 ready_file: arguments.required("ready-file")?.into(),
+                owned_flight: arguments.present("owned-flight"),
+                flight_control_relations: arguments.present("flight-control-relations")
+                    .then(|| arguments.required("flight-control-relations")
+                        .map(|list| list.split(',').map(str::to_owned).collect()))
+                    .transpose()?,
             }, cancellation).await
         }
         "initialize-directory" => MemoryDirectory::initialize(std::path::Path::new(arguments.required("state")?)),
@@ -887,6 +893,21 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             if arguments.present("require-quorum") && report.replica_digests.len() < report.required_replica_quorum {
                 return Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/audit-quorum", "A write quorum could not verify a common committed interval"));
             }
+            Ok(())
+        }
+        "audit-acceptance" => {
+            let authority = installation_id(&arguments)?;
+            let incarnation = arguments.required("incarnation")?.parse()
+                .map_err(|_| usage("--incarnation must be a positive integer".into()))?;
+            let log_epoch = arguments.required("log-epoch")?.parse()
+                .map_err(|_| usage("--log-epoch must be a nonnegative integer".into()))?;
+            let offset = arguments.required("replica-offset")?.parse()
+                .map_err(|_| usage("--replica-offset must be a nonnegative integer".into()))?;
+            let directory = directory(arguments.required("directory")?).await?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let report = admin::audit_acceptance_quorum(directory.as_ref(), keys.as_ref(), authority,
+                incarnation, log_epoch, offset, 4 << 20).await?;
+            println!("{}", serde_json::to_string_pretty(&report).expect("an acceptance audit serializes"));
             Ok(())
         }
         "audit-log" => {

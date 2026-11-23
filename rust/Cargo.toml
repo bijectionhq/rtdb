@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/apache-avro", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser", "vendor/datafusion-common", "vendor/datafusion-doc", "vendor/datafusion-execution", "vendor/datafusion-expr", "vendor/datafusion-expr-common", "vendor/datafusion-functions", "vendor/datafusion-functions-aggregate-common", "vendor/datafusion-functions-window-common", "vendor/datafusion-macros", "vendor/datafusion-physical-expr", "vendor/datafusion-physical-expr-common"]
+exclude = ["vendor/bijection-geometry", "vendor/apache-avro", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser", "vendor/datafusion-common", "vendor/datafusion-doc", "vendor/datafusion-execution", "vendor/datafusion-expr", "vendor/datafusion-expr-common", "vendor/datafusion-functions", "vendor/datafusion-functions-aggregate-common", "vendor/datafusion-functions-window-common", "vendor/datafusion-macros", "vendor/datafusion-physical-expr", "vendor/datafusion-physical-expr-common"]
 
 [patch.crates-io]
 datafusion-common = { path = "vendor/datafusion-common" }
@@ -65,6 +65,7 @@ rtdb-multi = { path = "crates/multi" }
 rtdb-simulation = { path = "crates/simulation" }
 rtdb-text = { path = "crates/text" }
 rtdb-search = { path = "crates/search" }
+rtdb-spatial = { path = "crates/spatial" }
 sqlparser = { path = "vendor/sqlparser", version = "=0.63.0" }
 arrow-array = { version = "=58.4.1", features = ["ffi"] }
 arrow-buffer = "=58.4.1"

@@ -1,5 +1,6 @@
 //! One local deployment using the same directory, log and gateway as a cell.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -9,8 +10,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use rtdb_directory::{Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemoryDirectory};
+use rtdb_flight_sql::HostedControlConfig;
 use rtdb_logkeeper::{LocalListener, PreparedJournal, ServerOptions};
-use rtdb_server::config::NodeConfiguration;
+use rtdb_server::config::{FlightSettings, NodeConfiguration};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -26,11 +28,13 @@ use crate::admin::installation_record;
 use crate::agent::AgentOptions;
 use crate::capability::CellSecret;
 use crate::deployment::CellStorage;
+use crate::flight_gateway;
 use crate::gateway::{self, GatewayOptions};
 use crate::keys::{KeyService, LocalKeyService};
 use crate::lease::{LeaseOptions, MemberLease, Registration};
 
-pub const STANDALONE_PROTOCOL: u32 = 1;
+pub const STANDALONE_PROTOCOL: u32 = 2;
+const AUTHORITY_FORMAT: u32 = 1;
 const AUTHORITY: &str = "authority.json";
 const DIRECTORY: &str = "directory";
 const JOURNAL: &str = "journal";
@@ -76,7 +80,7 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
     let keys = LocalKeyService::new(root.join(KEYS))?;
     let key = keys.key(&record.key_id()).await?;
     let authority = Authority {
-        format: STANDALONE_PROTOCOL,
+        format: AUTHORITY_FORMAT,
         database: record.name.clone(),
         installation: id,
         journal: journal_id,
@@ -97,6 +101,8 @@ pub struct StandaloneSettings {
     pub private_key: PathBuf,
     pub password_file: PathBuf,
     pub ready_file: PathBuf,
+    pub owned_flight: bool,
+    pub flight_control_relations: Option<BTreeSet<String>>,
 }
 
 #[derive(Serialize)]
@@ -106,6 +112,8 @@ struct Ready<'a> {
     installation: Uuid,
     host: std::net::IpAddr,
     port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owned_flight_port: Option<u16>,
 }
 
 pub async fn serve_standalone(
@@ -149,12 +157,23 @@ pub async fn serve_standalone(
             "The standalone RTDB password must contain 64 hexadecimal digits",
         ));
     }
-    let configuration = NodeConfiguration::from_yaml(&format!(
+    let mut configuration = NodeConfiguration::from_yaml(&format!(
         "server:\n  host: 127.0.0.1\n  port: 0\nauthn: !SingleRootUser\n  password: \"{password}\"\n"
     ))?;
+    if let Some(flight) = owned_flight_settings(settings.owned_flight, settings.flight_control_relations)? {
+        configuration.flight_sql = Some(flight);
+    }
     let tls = gateway_tls(&settings.certificate, &settings.private_key)?;
     let gateway = TcpListener::bind(LOOPBACK).await.map_err(io)?;
     let address = gateway.local_addr().map_err(io)?;
+    let flight = if settings.owned_flight {
+        Some(TcpListener::bind(LOOPBACK).await.map_err(io)?)
+    } else {
+        None
+    };
+    let owned_flight_port = flight.as_ref().map(|listener| {
+        listener.local_addr().map(|address| address.port()).map_err(io)
+    }).transpose()?;
     let capabilities = Arc::new(CellSecret::generate()?);
 
     let journal = PreparedJournal::reopen_member(
@@ -221,12 +240,21 @@ pub async fn serve_standalone(
             if cancellation.is_cancelled() { return Ok(()); }
             write_private(&settings.ready_file, &Ready {
                 format: STANDALONE_PROTOCOL, database: &settings.name, installation: settings.id,
-                host: address.ip(), port: address.port(),
+                host: address.ip(), port: address.port(), owned_flight_port,
             }, false)?;
             let options = GatewayOptions { tls: Some(tls), capabilities: Some(capabilities), ..Default::default() };
             let journal_lost = lease.lost();
+            let flight = async {
+                match flight {
+                    Some(listener) => flight_gateway::serve(
+                        listener, Arc::clone(&directory), options.clone(), cancellation.clone(),
+                    ).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
-                result = gateway::serve(gateway, directory, options, cancellation.clone()) => result,
+                result = gateway::serve(gateway, Arc::clone(&directory), options.clone(), cancellation.clone()) => result,
+                result = flight => result,
                 _ = journal_lost.cancelled() => Err(invalid("The local RTDB journal lost its membership")),
                 _ = node.tasks.join_next() => Err(invalid("A standalone RTDB node task stopped")),
             }
@@ -257,6 +285,26 @@ pub async fn serve_standalone(
     result.and(lease.retire().await)
 }
 
+fn owned_flight_settings(
+    enabled: bool,
+    relations: Option<BTreeSet<String>>,
+) -> Result<Option<FlightSettings>> {
+    if !enabled {
+        if relations.is_some() {
+            return Err(invalid("Flight control relations require --owned-flight"));
+        }
+        return Ok(None);
+    }
+    Ok(Some(FlightSettings {
+        owned_native_actions: true,
+        hosted_controls: relations.map(|relations| HostedControlConfig {
+            owner: "xtdb".to_owned(),
+            relations,
+        }),
+        ..FlightSettings::default()
+    }))
+}
+
 fn read_authority(root: &Path, name: &str, id: Uuid) -> Result<Authority> {
     for directory in [DIRECTORY, JOURNAL, KEYS, OBJECTS] {
         private_directory(&root.join(directory))?;
@@ -264,7 +312,7 @@ fn read_authority(root: &Path, name: &str, id: Uuid) -> Result<Authority> {
     let raw = read_bounded(&root.join(AUTHORITY), 4096)?;
     let authority: Authority =
         serde_json::from_str(&raw).map_err(|error| invalid(error.to_string()))?;
-    if authority.format != STANDALONE_PROTOCOL || authority.database != name || authority.installation != id {
+    if authority.format != AUTHORITY_FORMAT || authority.database != name || authority.installation != id {
         return Err(invalid(
             "The retained standalone RTDB authority identifies another deployment",
         ));
@@ -371,6 +419,20 @@ fn invalid(message: impl Into<String>) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_owned_flight_requires_opt_in_and_scopes_control_relations() {
+        let relations = BTreeSet::from(["bj_installation".to_owned()]);
+        assert!(owned_flight_settings(false, None).unwrap().is_none());
+        assert!(owned_flight_settings(false, Some(relations.clone())).is_err());
+        let ordinary = owned_flight_settings(true, None).unwrap().unwrap();
+        assert!(ordinary.owned_native_actions);
+        assert!(ordinary.hosted_controls.is_none());
+        let owned = owned_flight_settings(true, Some(relations.clone())).unwrap().unwrap();
+        let controls = owned.hosted_controls.unwrap();
+        assert_eq!(controls.owner, "xtdb");
+        assert_eq!(controls.relations, relations);
+    }
 
     #[tokio::test]
     async fn initialization_installs_the_original_key_and_journal_only_once() {

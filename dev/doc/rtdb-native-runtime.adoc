@@ -63,6 +63,14 @@ The search accelerator can prune a ranked limit over the two-argument score and 
 The five-argument score uses the ordinary SQL sort and limit.
 See link:../../rust/crates/search/README.adoc[the search reference] and link:fts.allium[the specification].
 
+== Spatial paths
+
+Owned clear relations can declare a WGS84 XY spatial path with leading equality partition fields.
+The maintenance lane builds cell postings over each settled trie.
+A held read covers unindexed inputs within its work allowance, resolves candidate history at its system and valid cuts, then evaluates exact topology or distance.
+A placed observed read can carry an ordered relation-frontier witness, including when no location matches.
+See link:spatial.allium[the spatial path specification] and link:../../rust/crates/flight-sql/README.adoc[the owned Flight SQL actions].
+
 == Operations
 
 Health HTTP exposes the index, metrics, started, alive and ready routes, plus POST `/system/finish-block`.

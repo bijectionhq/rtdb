@@ -104,7 +104,7 @@ impl NodeServices {
         let search = default_search(format);
         Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
             compaction_relay: None, world_constraints: None, read_fence: None, scan_fragmenter: None,
-            artefact_kinds: search.artefact_kinds, scan_accelerators: search.scan_accelerators }
+            artefact_kinds: search.artefact_kinds.into_iter().chain([Arc::new(rtdb_spatial::SpatialArtefacts) as Arc<dyn rtdb_maintenance::ArtefactKind>]).collect(), scan_accelerators: search.scan_accelerators }
     }
 }
 
@@ -2044,6 +2044,29 @@ impl OwnedReadSession {
         self.range_page(&relation.in_world(world)?, path, crate::ordered_index::RowBounds::Compound(request), Some(valid)).await
     }
 
+    /// Evaluates a spatial path at this held cut.
+    pub async fn spatial(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.spatial_projected(relation, path, request, observe, rtdb_spatial::Projection::Identities).await
+    }
+
+    /// Evaluates a spatial path and returns the requested Arrow projection at this held cut.
+    pub async fn spatial_projected(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool, projection: rtdb_spatial::Projection<'_>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let lease = context.catalog.read_lease();
+        let work = rtdb_spatial::read_held(Arc::clone(&context), &self.owner, relation, path, request, projection);
+        let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((page, witness))
+    }
+
     /// Reads one covered page from the named ordered path at this held cut.
     pub async fn range(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
@@ -2563,6 +2586,12 @@ pub struct OwnedRootSection {
     pub publication: Option<OwnedRootPublication>,
 }
 
+#[derive(Default)]
+pub struct OwnedWorldObservations {
+    pub checks: Vec<OwnedWorldWitness>,
+    pub clocks: Vec<(rtdb_types::WorldClockLimit, Timestamp)>,
+}
+
 pub struct OwnedRootPublication {
     pub attempt: String,
     pub writes: Vec<TxOp>,
@@ -2747,42 +2776,9 @@ impl NativeSession {
         self.state.execute_tx(ops, Default::default()).await
     }
 
-    pub async fn validate_owned_world(
-        &mut self, record: &rtdb_types::OwnedWorld, checks: Vec<OwnedWorldWitness>,
-        controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>,
-    ) -> Result<TransactionResult> {
-        let unavailable = rtdb_types::OwnedWorld::unavailable;
-        let count = controls.len().saturating_add(checks.len().saturating_mul(2)).saturating_add(2);
-        if checks.len() > 128 || (checks.is_empty() && clock.is_none()) || controls.is_empty() || count > 4096
-            || controls.iter().any(|control| !control.is_check())
-            || clock.is_some_and(|clock| clock.world != record.id || clock.pin != record.pin)
-        {
-            return Err(unavailable());
-        }
-        let scope = self.placed_history()?.ok_or_else(unavailable)?;
-        let now = self.service.node.now();
-        let mut until = deadline.min(record.until);
-        for check in &checks {
-            if check.world != record.id || check.pin != record.pin
-                || check.relation.world() != Some(record.id) || scope != check.scope || now >= check.until
-            {
-                return Err(unavailable());
-            }
-            until = until.min(check.until);
-        }
-        if now >= until { return Err(unavailable()); }
-        let _operations = self.service.node.memory().reserve(count * (std::mem::size_of::<TxOp>() + 512))?;
-        let mut ops = Vec::with_capacity(count);
-        ops.push(TxOp::owned_deadline(until));
-        ops.push(TxOp::OwnedCheckWorldScope { scope, clock });
-        ops.extend(controls.into_iter().map(TxOp::HostedControl));
-        Self::append_world_checks(&mut ops, checks);
-        self.state.execute_tx(ops, Default::default()).await
-    }
-
     pub async fn commit_owned_world_batch(
         &mut self, sections: Vec<(Timestamp, OwnedWorldSection)>,
-        root: OwnedRootSection, fingerprint: [u8; 32],
+        root: OwnedRootSection, observed: OwnedWorldObservations, fingerprint: [u8; 32],
         controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
     ) -> Result<TransactionResult> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
@@ -2874,7 +2870,9 @@ impl NativeSession {
                 OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
                 OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop | OwnedWorldEffect::SettleProposal => 0,
             };
-            if !worlds.insert(section.world) || (!retained_release && !terminal_proposal && !proposal_close && !(1..=128).contains(&section.checks.len()))
+            let standing = !proposal_overlay && matches!(&section.effect, OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::Clock(_));
+            if !worlds.insert(section.world)
+                || (section.checks.is_empty() && !standing && !retained_release && !terminal_proposal && !proposal_close)
                 || section.checks.len() > 128
                 || !attempts.insert(&section.attempt)
             {
@@ -2892,6 +2890,17 @@ impl NativeSession {
                 until = until.min(check.until);
             }
         }
+        let observed_worlds = observed.checks.iter().map(|check| check.world)
+            .chain(observed.clocks.iter().map(|(clock, _)| clock.world))
+            .collect::<std::collections::BTreeSet<_>>();
+        if !observed_worlds.is_empty()
+            && (!observed_worlds.is_disjoint(&worlds) || worlds.len() + observed_worlds.len() > 8
+                || retained_release || proposal_land || proposal_overlay)
+        {
+            return Err(unavailable());
+        }
+        effects = effects.saturating_add(observed.checks.len().saturating_mul(2))
+            .saturating_add(observed.clocks.len());
         if effects > 4096 || now >= until { return Err(unavailable()); }
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
@@ -2899,6 +2908,9 @@ impl NativeSession {
         ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
         ops.extend(root.checks);
+        if !observed_worlds.is_empty() {
+            self.append_hosted_world_read_checks(&mut ops, observed)?;
+        }
         if let Some(root) = root.publication {
             ops.extend(root.writes);
             if !delete_root && !proposal_land {
@@ -2916,7 +2928,7 @@ impl NativeSession {
                 OwnedWorldEffect::Drop => (None, true, None),
                 OwnedWorldEffect::SettleProposal => (None, false, Some(section.parent_pin)),
             };
-            ops.push(TxOp::OwnedPublishWorld { world: section.world, attempt: section.attempt,
+            ops.push(TxOp::OwnedPublishWorld { world: section.world, parent_pin: section.parent_pin, attempt: section.attempt,
                 fingerprint, expected: section.expected_clock, advance_to, drop_world,
                 settlement_pin,
                 land_root: proposal_land.then_some(section.parent_pin),
@@ -2926,13 +2938,17 @@ impl NativeSession {
     }
 
     pub fn append_hosted_world_read_checks(
-        &self, ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldWitness>,
+        &self, ops: &mut Vec<TxOp>, observed: OwnedWorldObservations,
     ) -> Result<()> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let scope = self.placed_history()?.ok_or_else(unavailable)?;
+        let scoped = ops.iter().any(|op| matches!(op,
+            TxOp::OwnedCheckWorldScope { scope: selected, clock: None } if *selected == scope
+        ));
         let Some(TxOp::OwnedDeadline { until, .. }) = ops.first_mut() else {
             return Err(unavailable());
         };
-        let scope = self.placed_history()?.ok_or_else(unavailable)?;
+        let OwnedWorldObservations { checks, clocks } = observed;
         let now = self.service.node.now();
         let mut worlds = std::collections::BTreeSet::new();
         for check in &checks {
@@ -2942,10 +2958,25 @@ impl NativeSession {
             worlds.insert(check.world);
             *until = (*until).min(check.until);
         }
+        let mut bounds = std::collections::BTreeMap::<_, rtdb_types::WorldClockLimit>::new();
+        for (clock, expires) in clocks {
+            worlds.insert(clock.world);
+            *until = (*until).min(expires);
+            let bound = bounds.entry(clock.world).or_insert(clock);
+            if bound.pin != clock.pin {
+                return Err(unavailable());
+            }
+            bound.before = bound.before.min(clock.before);
+        }
         if !(1..=8).contains(&worlds.len()) || checks.len() > 8 * 128 || now >= *until {
             return Err(unavailable());
         }
-        ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
+        if !scoped {
+            ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
+        }
+        ops.extend(bounds.into_values().map(|clock| TxOp::OwnedCheckWorldScope {
+            scope, clock: Some(clock),
+        }));
         Self::append_world_checks(ops, checks);
         Ok(())
     }

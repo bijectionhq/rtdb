@@ -46,6 +46,7 @@ rtdb-s3 = { workspace = true, optional = true }
 rtdb-azure = { workspace = true, optional = true }
 rtdb-gcs = { workspace = true, optional = true }
 rtdb-pg-source = { workspace = true, optional = true }
+rtdb-spatial.workspace = true
 rtdb-search = { workspace = true, optional = true }
 rtdb-text = { workspace = true, optional = true }
 async-trait.workspace = true

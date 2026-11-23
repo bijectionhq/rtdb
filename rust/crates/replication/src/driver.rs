@@ -19,7 +19,7 @@ use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, Pro
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
-use crate::logs::{DecodedReplica, replica_decode_bound};
+use crate::logs::{DecodedReplica, STRICT_DISPATCH_CUTOFF, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::matching_present_integer;
 use crate::state::fail_pending;
@@ -324,7 +324,13 @@ struct AppliedTrieRemoval {
 impl LeaderState {
     fn resolver(&self) -> Result<&TxResolver> { self.resolver.as_ref().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
     fn resolver_mut(&mut self) -> Result<&mut TxResolver> { self.resolver.as_mut().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
-    fn can_poll_source(&self) -> bool { self.recovery_write.is_none() && self.cycle.accepting() }
+    fn can_poll_source(&self) -> bool {
+        self.recovery_write.is_none() && self.cycle.accepting() && !self.pending_strict_write()
+    }
+    fn pending_strict_write(&self) -> bool {
+        self.pending.front().is_some_and(|pending| matches!(&pending.body,
+            WriteBody::Resolved(tx) if tx.staging_clock_upper().is_some()))
+    }
     fn accepting(&self) -> bool { self.can_poll_source() && self.resolution.is_none() }
     fn drained_for_strict_source(&self) -> bool { self.pending.is_empty() && self.production.is_none() }
     fn ready_source(&self) -> bool {
@@ -507,11 +513,16 @@ impl ReplicationDriver {
                 Event::Command(None) => return Ok(()),
                 Event::Appender(result) => {
                     if let Some(leader) = &mut self.leader { leader.job = None; }
-                    return match result {
-                        Err(error) => Err(error),
-                        Ok(()) if self.cancellation.is_cancelled() => Ok(()),
-                        Ok(()) => Err(invalid("Replica append pump exited during an active term")),
-                    };
+                    match result {
+                        Err(error) if error.code == STRICT_DISPATCH_CUTOFF => {
+                            // Drop the speculative suffix before the source can be resolved again.
+                            for held in self.demote().await? { self.apply_admitted(held).await?; }
+                            self.start_claim()?;
+                        }
+                        Err(error) => return Err(error),
+                        Ok(()) if self.cancellation.is_cancelled() => return Ok(()),
+                        Ok(()) => return Err(invalid("Replica append pump exited during an active term")),
+                    }
                 }
             }
         }
@@ -968,7 +979,12 @@ impl ReplicationDriver {
                                 return Err(error);
                             }
                         };
-                        if let Some(leader) = &mut self.leader { complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Transaction(result))); }
+                        if let Some(leader) = &mut self.leader {
+                            complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Transaction(result)));
+                            if message.acceptance_stage.is_some() && leader.cycle.is_full(self.config.rows_per_block) {
+                                self.cut().await?;
+                            }
+                        }
                     } else {
                         if leading {
                             if let Some(operation) = &message.db_op { self.effects.apply_db_op(operation).await?; }
@@ -1279,10 +1295,11 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn enqueue_resolved(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>) -> Result<()> {
+        let strict = resolved.staging_clock_upper().is_some();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.resolved(resolved.writes().row_count()?)?;
         leader.enqueue(WriteBody::Resolved(resolved), self.partition.value().live().block_index(), completion, &self.resolve.memory)?;
-        if leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+        if !strict && leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
         Ok(())
     }
     async fn cut(&mut self) -> Result<()> {

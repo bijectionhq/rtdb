@@ -8,13 +8,13 @@ pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use prost::Message;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_array, entity_id_type, read_entity_id, selected_cell};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
@@ -36,15 +36,23 @@ use crate::{
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
+pub(crate) const SPATIAL_HELD_OWNED_V1: &str = "rtdb.owned.SpatialHeld.v1";
+pub(crate) const SPATIAL_HELD_OWNED_V2: &str = "rtdb.owned.SpatialHeld.v2";
+pub(crate) const SPATIAL_HELD_OWNED_V3: &str = "rtdb.owned.SpatialHeld.v3";
+
+#[derive(Clone, Copy)]
+pub(crate) enum SpatialHeldWire { V1, V2, V3 }
+pub(crate) const DROP_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DropSpatialPath.v1";
+pub(crate) const DECLARE_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DeclareSpatialPath.v1";
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
-pub(crate) const COMMIT_HOSTED_DECIDING_V1: &str = "rtdb.owned.CommitHostedDeciding.v1";
-pub(crate) const COMMIT_HOSTED_STAGED_V1: &str = "rtdb.owned.CommitHostedStaged.v1";
+pub(crate) const COMMIT_HOSTED_DECIDING_V2: &str = "rtdb.owned.CommitHostedDeciding.v2";
+pub(crate) const COMMIT_HOSTED_STAGED_V2: &str = "rtdb.owned.CommitHostedStaged.v2";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
-pub(crate) const COMMIT_HOSTED_WORLD_READS_V2: &str = "rtdb.owned.CommitHostedWorldReads.v2";
+pub(crate) const COMMIT_HOSTED_WORLD_READS_V3: &str = "rtdb.owned.CommitHostedWorldReads.v3";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
@@ -201,6 +209,7 @@ pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdent
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
+pub(crate) const HELD_ROW_CARRIER_EXISTS_V1: &str = "rtdb.owned.ReadHeldRowCarrierExists.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
@@ -228,8 +237,7 @@ pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V2: &str = "rtdb.owned.PublishHeldWorldRetention.v2";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
-pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
-pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
+pub(crate) const COMMIT_HELD_WORLDS_V6: &str = "rtdb.owned.CommitHeldWorlds.v6";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -463,7 +471,18 @@ impl OwnedWorldReadResource {
 struct HostedWorldRead {
     held: Arc<OwnedWorldReadResource>,
     witnesses: Vec<OwnedWorldWitness>,
+    clock: Option<rtdb_types::WorldClockLimit>,
     _reservation: Arc<MemoryReservation>,
+}
+
+fn take_held_world_observations(worlds: &mut [HostedWorldRead]) -> Result<rtdb_node::OwnedWorldObservations, Status> {
+    let mut observed = rtdb_node::OwnedWorldObservations::default();
+    for read in worlds {
+        read.held.snapshot.check().map_err(status)?;
+        observed.checks.append(&mut read.witnesses);
+        observed.clocks.extend(read.clock.map(|clock| (clock, read.held.snapshot.evidence_until())));
+    }
+    Ok(observed)
 }
 
 struct OwnedRankRequest<'a> {
@@ -543,7 +562,17 @@ fn split_position_mask(body: &[u8]) -> Result<((Timestamp, u32), &[u8]), Status>
 }
 
 fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
-    let mut stream = OwnedStream::read(arrow, call.memory()).map_err(status)?.into_pages();
+    let stream = OwnedStream::read(arrow, call.memory()).map_err(status)?;
+    single_owned_batch(stream)
+}
+
+fn decode_spatial_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
+    let stream = OwnedStream::read_buffer(arrow_buffer::Buffer::from(arrow), call.memory()).map_err(status)?;
+    single_owned_batch(stream)
+}
+
+fn single_owned_batch(stream: OwnedStream) -> Result<OwnedBatch, Status> {
+    let mut stream = stream.into_pages();
     let [batch] = stream.as_slice() else {
         return Err(invalid("Owned action requires exactly one Arrow record batch"));
     };
@@ -554,6 +583,19 @@ fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
         return Err(invalid("Owned action requires unique column names"));
     }
     Ok(stream.pop().expect("validated one batch"))
+}
+
+fn owned_scalar<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<Option<(&'a T, usize)>, Status> {
+    let Some((index, field)) = batch.schema_ref().column_with_name(name) else { return Ok(None); };
+    let Some((field, array, row)) = selected_cell(field, batch.column(index).as_ref(), 0).map_err(status)? else {
+        return Ok(None);
+    };
+    if field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) {
+        return Err(invalid(format!("Owned field {name} has an unsupported Arrow extension")));
+    }
+    let array = array.as_any().downcast_ref::<T>()
+        .ok_or_else(|| invalid(format!("Owned field {name} has an invalid Arrow type")))?;
+    Ok(Some((array, row)))
 }
 
 fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
@@ -589,7 +631,15 @@ impl Service {
         self.owned_write_reply(call, vec![TxOp::OwnedDeclareRelation { relation, schema }]).await
     }
 
-    pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn drop_owned_spatial_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, body) = split_relation(body)?;
+        let (name, tail) = split_relation(body)?;
+        if !tail.is_empty() { return Err(invalid("Owned spatial path removal has trailing bytes")); }
+        self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }]).await
+    }
+
+    pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &[u8], spatial: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, arrow)?;
@@ -606,7 +656,12 @@ impl Service {
             _ => Err(invalid("Owned path key column is not text")),
         }).collect::<Result<Vec<_>, _>>()?;
         let name = OwnedRelation::new(name.as_str()).map_err(status)?;
-        self.owned_write_reply(call, vec![TxOp::OwnedDeclarePath { relation, name, columns }]).await
+        let declaration = if spatial {
+            TxOp::OwnedDeclareSpatialPath { relation, name, columns }
+        } else {
+            TxOp::OwnedDeclarePath { relation, name, columns }
+        };
+        self.owned_write_reply(call, vec![declaration]).await
     }
 
     pub(crate) async fn declare_owned_fixed_range_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -722,6 +777,7 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
         let ([kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing hosted root commit kind"))?;
         let counted = match kind {
@@ -747,16 +803,21 @@ impl Service {
         let mut handles = BTreeSet::new();
         let mut worlds = Vec::with_capacity(count);
         for _ in 0..count {
-            let (handle, tail) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world handle"))?;
+            let (clock, tail) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world clock bound"))?;
+            let clock = Timestamp(i64::from_be_bytes(*clock));
+            let (handle, tail) = tail.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world handle"))?;
             let (count, tail) = tail.split_first_chunk::<2>().ok_or_else(|| invalid("Missing held world witness count"))?;
             let count = usize::from(u16::from_be_bytes(*count));
-            if !handles.insert(*handle) || !(1..=MAX_WORLD_WITNESSES).contains(&count) {
+            if !handles.insert(*handle) || count > MAX_WORLD_WITNESSES || (count == 0 && clock == Timestamp::MAX) {
                 return Err(invalid("Invalid or repeated hosted world read"));
             }
             let (nonces, tail) = tail.split_at_checked(count * 16).ok_or_else(|| invalid("Truncated held world witnesses"))?;
             let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
             let (witnesses, reservation) = held.conditions(call, held.world, nonces)?;
-            worlds.push(HostedWorldRead { held, witnesses, _reservation: reservation });
+            let clock = (clock != Timestamp::MAX).then(|| rtdb_types::WorldClockLimit {
+                world: rtdb_types::Iid(*held.world.as_bytes()), pin: held.snapshot.parent_pin(), before: clock,
+            });
+            worlds.push(HostedWorldRead { held, witnesses, clock, _reservation: reservation });
             body = tail;
         }
         Ok((worlds, body))
@@ -817,8 +878,9 @@ impl Service {
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
 
-        let world_checks = worlds.iter().map(|read| read.witnesses.len()).sum::<usize>();
-        let world_ops = world_checks * 2 + usize::from(world_checks != 0);
+        let world_ops = worlds.iter()
+            .map(|read| read.witnesses.len() * 2 + usize::from(read.clock.is_some()))
+            .sum::<usize>() + usize::from(!worlds.is_empty());
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len())
             .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging }];
@@ -1037,7 +1099,7 @@ impl Service {
 
     async fn owned_write_reply_with_reads(
         &self, call: &Call, mut operations: Vec<TxOp>, witnesses: Witnesses,
-        worlds: Vec<HostedWorldRead>,
+        mut worlds: Vec<HostedWorldRead>,
     ) -> Result<ActionResult, Status> {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
@@ -1056,19 +1118,13 @@ impl Service {
                 operations.push(evidence.clone().operation());
             }
         }
-        let mut holds = Vec::new();
         if !worlds.is_empty() {
-            let mut checks = Vec::new();
-            for read in worlds {
-                read.held.snapshot.check().map_err(status)?;
-                checks.extend(read.witnesses);
-                holds.push((read.held, read._reservation));
-            }
-            native.append_hosted_world_read_checks(&mut operations, checks).map_err(status)?;
+            let observed = take_held_world_observations(&mut worlds)?;
+            native.append_hosted_world_read_checks(&mut operations, observed).map_err(status)?;
         }
         operations.extend(refusal.into_iter().flatten());
         let outcome = native.state_mut().execute_tx(operations, Default::default()).await.map_err(status)?;
-        drop(holds);
+        drop(worlds);
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
         self.owned_tx_reply(outcome.tx_key())
@@ -1475,6 +1531,18 @@ impl Service {
         let reply = self.owned_point_reply(&schema, None, at, at, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn held_row_carrier_exists_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Protected row existence needs its held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let present = held.snapshot.protected_row_carrier_exists(&relation, &id, scope).await.map_err(status)?;
+        Ok(ActionResult { body: wire::retain(vec![u8::from(present)], call.reserve(64)?) })
     }
 
     pub(crate) async fn held_protected_carriers_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1947,6 +2015,138 @@ impl Service {
         let rows = count_rows.as_ref().or_else(|| page.as_ref().map(OwnedBatch::batch));
         let reply = self.owned_point_reply(&schema, rows, system.unwrap_or_else(|| held.snapshot.present()), valid_at, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn spatial_held_owned_action(&self, call: &Call, body: &Bytes, wire: SpatialHeldWire) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held spatial read has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        let (relation, request) = split_relation(request)?;
+        let (path, request) = split_relation(request)?;
+        let batch = decode_spatial_batch(call, body.slice_ref(request))?;
+        let selected_documents = matches!(wire, SpatialHeldWire::V3);
+        let expected_columns = if selected_documents { 10 } else { 9 };
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_columns {
+            return Err(invalid("Owned held spatial read requires one request row"));
+        }
+        let batch = batch.batch();
+        let document_columns;
+        let projection = match wire {
+            SpatialHeldWire::V1 => rtdb_spatial::Projection::Identities,
+            SpatialHeldWire::V2 => rtdb_spatial::Projection::Documents,
+            SpatialHeldWire::V3 => {
+                let layout = batch.schema_ref().field_with_name("document_columns").map(Field::data_type);
+                if !matches!(layout, Ok(DataType::List(item)) if item.data_type() == &DataType::Utf8
+                    && !item.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)) {
+                    return Err(invalid("Spatial document_columns must be a List<Utf8>"));
+                }
+                let columns = ArrowCell::named(batch, "document_columns", 0).and_then(ArrowCell::list)
+                    .ok_or_else(|| invalid("Spatial document_columns must be a List<Utf8>"))?;
+                if columns.len() > 128 {
+                    return Err(invalid("Spatial document_columns exceeds its column limit"));
+                }
+                let mut names = BTreeSet::new();
+                for column in columns {
+                    let name = column.utf8().ok_or_else(|| invalid("Spatial document columns must be Utf8 values"))?;
+                    if name.is_empty() || name.len() > 128 || name.starts_with('_')
+                        || name.chars().any(char::is_control) || !names.insert(name) {
+                        return Err(invalid("Spatial document columns must be distinct owned field names"));
+                    }
+                }
+                document_columns = names.into_iter().collect::<Vec<_>>();
+                rtdb_spatial::Projection::SelectedDocuments(&document_columns)
+            }
+        };
+        let (Some((parts, parts_row)), Some((region, region_row)), Some((predicate, predicate_row)),
+             Some((valid_at, valid_row)), Some((limit, limit_row)), Some((observe, observe_row)),
+             Some((reported_center, center_row))) = (
+            owned_scalar::<ListArray>(batch, "partition")?, owned_scalar::<BinaryArray>(batch, "region")?,
+            owned_scalar::<StringArray>(batch, "predicate")?, owned_scalar::<Int64Array>(batch, "valid_micros")?,
+            owned_scalar::<Int64Array>(batch, "limit")?, owned_scalar::<BooleanArray>(batch, "observe")?,
+            owned_scalar::<BooleanArray>(batch, "reported_center")?,
+        ) else { return Err(invalid("Owned held spatial request has invalid fields")); };
+        let region = region.value(region_row);
+        let offsets = parts.value_offsets();
+        let indices = offsets[parts_row] as usize..offsets[parts_row + 1] as usize;
+        if indices.len() > 15 || region.len() > 1 << 20 {
+            return Err(invalid("Owned held spatial request exceeds its byte or partition limit"));
+        }
+        let DataType::List(element) = parts.data_type() else { unreachable!() };
+        let partition = indices.map(|row| {
+            binary_cell(element, parts.values().as_ref(), row).map_err(status)?
+                .filter(|value| value.len() <= 4096).map(std::borrow::Cow::Borrowed)
+                .ok_or_else(|| invalid("Spatial partition values must be bounded Binary values"))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let radius = owned_scalar::<Float64Array>(batch, "radius_m")?.map(|(array, row)| array.value(row));
+        let predicate = rtdb_spatial::Predicate::parse(predicate.value(predicate_row), radius, reported_center.value(center_row)).map_err(status)?;
+        let after = match batch.schema_ref().column_with_name("after") {
+            Some((index, field)) => selected_cell(field, batch.column(index).as_ref(), 0).map_err(status)?
+                .map(|(field, array, row)| read_entity_id(field, array, row).map_err(status)).transpose()?,
+            None => None,
+        };
+        let valid_at = Timestamp(valid_at.value(valid_row));
+        let limit = usize::try_from(limit.value(limit_row)).map_err(|_| invalid("Invalid spatial limit"))?;
+        let observe = observe.value(observe_row);
+        let present = held.snapshot.system_time();
+        let (page, witness) = held.snapshot.spatial_projected(&relation, &path, rtdb_spatial::Request {
+            partition, region: region.into(), predicate, valid_at, after, limit,
+        }, observe, projection).await.map_err(status)?;
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("rtdb.owned.spatial_more".into(), if page.more { "1" } else { "0" }.into());
+        if let Some(witness) = witness {
+            let nonce = held.remember(call, &relation, witness)?;
+            metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
+        }
+        let documents = page.documents();
+        let document = documents.as_ref().map(|documents| {
+            let mut batch = documents.batch().clone();
+            if selected_documents { batch.remove_column(0); }
+            StructArray::from(batch)
+        });
+        let mut fields = vec![
+            rtdb_columnar::to_field("_id", &entity_id_type()).map_err(status)?,
+            Field::new("distance_m", DataType::Float64, true),
+        ];
+        if let Some(document) = &document {
+            fields.push(Field::new("document", DataType::Struct(document.fields().clone()), false));
+        }
+        let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+        let mut charge = None;
+        let output = if page.hits.is_empty() {
+            None
+        } else {
+            let ids = if let Some(documents) = documents {
+                let batch = documents.batch();
+                let (source, target) = (batch.schema_ref().field(0), schema.field(0));
+                let array = batch.column(0);
+                charge = Some(call.reserve(rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, target).map_err(status)?)?);
+                rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target).ok()
+                    .map(|(_, array)| array).filter(|array| array.data_type() == target.data_type())
+            } else { None };
+            let ids = if let Some(ids) = ids { ids } else {
+                let ids = || page.hits.iter().map(|hit| EntityIdRef::from(&hit.id));
+                let bound = ids().try_fold(4096, |bytes, id| {
+                    let text_bytes = match id {
+                        EntityIdRef::String(text) | EntityIdRef::Keyword(text) => text.len(),
+                        _ => 0,
+                    };
+                    wire::add(bytes, wire::add(128, wire::mul(text_bytes, 4)?)?)
+                })?;
+                charge = Some(call.reserve(bound)?);
+                entity_id_array(ids()).map_err(status)?
+            };
+            let distances = Arc::new(Float64Array::from_iter(page.hits.iter().map(|hit| hit.distance_m)));
+            let mut columns = vec![ids, distances];
+            if let Some(document) = document {
+                columns.push(Arc::new(document));
+            }
+            Some(RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?)
+        };
+        let reply = self.owned_point_reply(&schema, output.as_ref(), present, valid_at, None)?;
+        drop(charge);
+        held.snapshot.check_relations([&relation]).map_err(status)?;
         Ok(reply)
     }
 
@@ -3140,8 +3340,10 @@ impl Service {
             proposal_eligible &= mode == rtdb_types::WorldClockMode::Proposal
                 && ((*kind == 0 && count != 0) || *kind == 3);
             terminal_proposal |= *kind == 3;
-            if count == 0 && !release_eligible && !close_eligible && !(proposal_eligible && terminal_proposal) {
-                return Err(invalid("Ordinary world effects require original witnesses"));
+            if count == 0 && !matches!(*kind, 0 | 1)
+                && !release_eligible && !close_eligible && !(proposal_eligible && terminal_proposal)
+            {
+                return Err(invalid("This world effect requires original witnesses"));
             }
             if (*kind == 0 && !mode.is_writable())
                 || (*kind == 1 && !matches!(mode, rtdb_types::WorldClockMode::Held { .. }))
@@ -3179,7 +3381,21 @@ impl Service {
                 attempt: attempt.to_owned(), effect,
             });
         }
+        let (mut observations, body) = if let Some(body) = body.strip_prefix(&[0, 0]) {
+            (Vec::new(), body)
+        } else {
+            self.hosted_world_read_prefix(call, body)?
+        };
+        if count + observations.len() > 8 || observations.iter().any(|read| worlds.contains(&read.held.world)) {
+            return Err(invalid("World batch observations must fit the batch and use independent worlds"));
+        }
+        let observed_ops = observations.iter()
+            .map(|read| read.witnesses.len() * 2 + usize::from(read.clock.is_some())).sum::<usize>();
+        rows_left = rows_left.checked_sub(observed_ops).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
+        if !observations.is_empty() && *root_kind >= 3 {
+            return Err(invalid("Independent observers require an ordinary world batch"));
+        }
         let (root_read, body) = match *root_kind {
             0 => (None, body),
             1 | 2 | 3 | 4 | 5 | 6 | 7 => {
@@ -3303,58 +3519,12 @@ impl Service {
             }
             root.checks.push(evidence.clone().operation());
         }
+        let observed = take_held_world_observations(&mut observations)?;
         let committed = host.commit_world_batch(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            sections, root, *fingerprint, controls, deadline,
+            sections, root, observed, *fingerprint, controls, deadline,
         ).await.map_err(status)?;
-        self.owned_tx_reply(committed)
-    }
-
-    pub(crate) async fn validate_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
-        let world = Uuid::from_bytes(*world);
-        let (deadline, groups) = groups.split_first_chunk::<8>()
-            .ok_or_else(|| invalid("Owned world validation has no deadline"))?;
-        let deadline = Timestamp(i64::from_be_bytes(*deadline));
-        let (clock, groups) = groups.split_first_chunk::<8>()
-            .ok_or_else(|| invalid("Owned world validation has no clock bound"))?;
-        let clock = Timestamp(i64::from_be_bytes(*clock));
-        let (handle, rest) = groups.split_first_chunk::<16>()
-            .ok_or_else(|| invalid("Owned world commit has no held handle"))?;
-        let (count, rest) = rest.split_first_chunk::<2>()
-            .ok_or_else(|| invalid("Owned world commit has no witness count"))?;
-        let count = usize::from(u16::from_be_bytes(*count));
-        if count > MAX_WORLD_WITNESSES || (count == 0 && clock == Timestamp::MAX) {
-            return Err(invalid("Owned world validation requires a clock bound or at least one point witness"));
-        }
-        let (nonces, groups) = rest.split_at_checked(count * 16)
-            .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
-        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-        let (checks, _condition_charge) = held.conditions(call, world, nonces)?;
-        let clock = (clock != Timestamp::MAX).then(|| rtdb_types::WorldClockLimit {
-            world: rtdb_types::Iid(*world.as_bytes()), pin: held.snapshot.parent_pin(), before: clock,
-        });
-        let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
-        let policy = self.hosted_control_policy(call)?;
-        let control_groups = owned_groups(groups, true, false)?;
-        hosted_control::admit_control_targets(policy, control_groups.iter().map(|(relation, _)| relation))?;
-        let scope = self.hosted_control_scope(call).await?;
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - (2 * checks.len() + 2);
-        let (control_checks, _control_charges) = self.decode_hosted_control_groups(
-            call, control_groups, scope, &mut rows_left, true,
-        )?;
-        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-        let attachment = attachment.ok_or_else(unsupported)?;
-        let connection = self.connection(call, &call.database).await?;
-        let mut session = connection.borrow().await?;
-        require_idle(&session)?;
-        held.snapshot.check().map_err(status)?;
-        let committed = host.validate_world(
-            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            world, checks, control_checks, deadline, clock,
-        ).await.map_err(status)?;
+        drop(observations);
         self.owned_tx_reply(committed)
     }
 

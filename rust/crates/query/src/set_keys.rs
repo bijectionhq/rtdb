@@ -1,11 +1,11 @@
 use std::{collections::HashMap, mem::size_of, sync::Arc};
 
 use rtdb_columnar::MemoryReservation;
-use rtdb_types::Result;
+use rtdb_types::{LogicalType, Result};
 
 use crate::{
     QueryContext,
-    columnar::ColumnBatch,
+    columnar::{Column, ColumnBatch},
     cursor::OwnedRow,
     invalid,
     operators::{combine_equality_hash, equality_hash, rows_equal},
@@ -55,6 +55,17 @@ enum KeyHash {
     Vector,
 }
 
+pub(crate) fn vector_cell_hash(column: &Column, row: usize) -> Option<i32> {
+    if let Some(key) = ScalarKey::read(column, row) { return Some(key.hash() as i32); }
+    let (array, field, logical, row) = column.arrow_cell(row)??;
+    let logical = match logical? { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical };
+    if !matches!(logical, LogicalType::Scalar(_)) { return None; }
+    let physical = rtdb_columnar::from_field(field).ok()?;
+    let physical = match &physical { LogicalType::Maybe(inner) => inner.as_ref(), physical => physical };
+    if physical != logical { return None; }
+    rtdb_columnar::hash_cell(field, array, row, 0).ok()
+}
+
 impl<'a> Key<'a> {
     fn bind(
         batch: &'a ColumnBatch,
@@ -64,10 +75,10 @@ impl<'a> Key<'a> {
         hashing: KeyHash,
     ) -> Result<(u32, Self)> {
         let hash = batch.columns.iter().try_fold(0, |hash, column| {
-            ScalarKey::read(column, row).map(|cell| match hashing {
-                KeyHash::Set => combine_equality_hash(hash, cell.hash()),
-                KeyHash::Vector => crate::join_storage::combine_cell_hash(hash, cell.hash() as i32),
-            })
+            match hashing {
+                KeyHash::Set => ScalarKey::read(column, row).map(|cell| combine_equality_hash(hash, cell.hash())),
+                KeyHash::Vector => vector_cell_hash(column, row).map(|cell| crate::join_storage::combine_cell_hash(hash, cell)),
+            }
         });
         let key = ArrowKey {
             batch,

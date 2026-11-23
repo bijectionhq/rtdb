@@ -8,7 +8,7 @@ use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestam
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, finish_checkpoint_replay_parents, validate_checkpoint_world, fork_checkpoint_world_selected, prepare_checkpoint_replay_parent, retain_replayed_checkpoint_world},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, finish_checkpoint_replay_parents, fork_checkpoint_world_selected, prepare_checkpoint_replay_parent, retain_replayed_checkpoint_world},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -144,22 +144,15 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>) -> BoxFuture<'a, Result<TransactionKey>> {
-        Box::pin(async move {
-            let deployment = self.deployment(&call)?;
-            validate_checkpoint_world(self.directory.as_ref(), &self.archive, call.session, deployment, world, checks, controls, deadline, clock).await
-        })
-    }
-
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
-        root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],
+        root: rtdb_node::OwnedRootSection, observed: rtdb_node::OwnedWorldObservations, fingerprint: [u8; 32],
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             commit_checkpoint_world_batch(self.directory.as_ref(), &self.archive, call.session, deployment,
-                sections, root, fingerprint, controls, deadline).await
+                sections, root, observed, fingerprint, controls, deadline).await
         })
     }
 

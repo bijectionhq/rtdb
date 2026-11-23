@@ -1168,6 +1168,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bijection-geometry"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "num-rational",
+ "num-traits",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4625,6 +4636,7 @@ dependencies = [
  "rtdb-node",
  "rtdb-plan",
  "rtdb-query",
+ "rtdb-spatial",
  "rtdb-sql",
  "rtdb-storage",
  "rtdb-tx",
@@ -4908,6 +4920,7 @@ dependencies = [
  "rtdb-replication",
  "rtdb-s3",
  "rtdb-search",
+ "rtdb-spatial",
  "rtdb-sql",
  "rtdb-storage",
  "rtdb-temporal",
@@ -5208,6 +5221,31 @@ dependencies = [
  "rtdb-storage",
  "rtdb-types",
  "tokio",
+]
+
+[[package]]
+name = "rtdb-spatial"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "bijection-geometry",
+ "bytes",
+ "rtdb-columnar",
+ "rtdb-format",
+ "rtdb-index",
+ "rtdb-maintenance",
+ "rtdb-plan",
+ "rtdb-query",
+ "rtdb-storage",
+ "rtdb-types",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

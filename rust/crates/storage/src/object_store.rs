@@ -210,6 +210,10 @@ pub trait ObjectStore: Send + Sync {
     fn whole_object_allocation(&self, _key: &ObjectKey, length: usize) -> Result<ObjectReadAllocation> {
         Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes: 0 })
     }
+    /// How much storage an exact whole-object read must admit before reading the body.
+    fn exact_object_allocation(&self, key: &ObjectKey, length: usize) -> Result<ObjectReadAllocation> {
+        self.whole_object_allocation(key, length)
+    }
     /// Reads a whole immutable object of the reserved length.
     async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> Result<RetainedBytes> {
         self.get_reserved_range(key, 0..reservation.length() as u64, reservation).await

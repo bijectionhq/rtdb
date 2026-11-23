@@ -60,7 +60,7 @@ impl OpenTransaction<'_> {
             ));
         }
         let path = OwnedRelation::new(rule.path.as_str())?;
-        self.declare_owned_path(relation, &path, &[rule.column.clone(), "_id".into()], false)
+        self.declare_owned_path(relation, &path, &[rule.column.clone(), "_id".into()], OwnedPathKind::Ordered)
             .await?;
         self.buffer.put(
             storage,
