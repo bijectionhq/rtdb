@@ -97,6 +97,35 @@ pub async fn open_owned_valid_boundaries(
     open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), Some(valid), Some(&["_id"]), true).await
 }
 
+/// Streams the projected members of an owned Root at the declaring transaction's cut.
+pub async fn open_owned_constraint_projection(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    valid: Timestamp, columns: &[&str],
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || !relation.is_root_data() || columns.is_empty() {
+        return Err(address_unavailable());
+    }
+    let name = QualifiedTable {
+        database: context.catalog.default_database().to_owned(),
+        table: relation.table(owner),
+    };
+    let context = context.for_owned_relation(name.clone(), None);
+    let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
+    let columns = columns.iter().enumerate().map(|(index, name)| Field {
+        id: ColumnId(index as u32), name: (*name).into(), qualifier: None, qualified_only: false,
+        unnamed: false, data_type: table.scan_column_type(name),
+    }).collect();
+    let scan = Arc::new(Relation::scan(Scan {
+        table, columns,
+        valid_time: TemporalFilter::At(Expr::Literal(Value::Timestamp {
+            value: valid.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+        })),
+        system_time: TemporalFilter::Default, clamp_valid_time: false,
+        iids: None, predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
+    })?);
+    PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await.map(Some)
+}
+
 /// Opens a bounded page of visible identities in complete UTF-8 key order.
 pub async fn open_owned_identity_page(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,

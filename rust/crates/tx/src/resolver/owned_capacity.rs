@@ -23,11 +23,12 @@ pub(super) struct OwnedCapacityChanges {
 
 struct TouchedRule {
     policy: CapacityPolicy,
+    added: Vec<(String, Vec<u8>)>,
     ids: BTreeSet<EntityId>,
     writes: i64,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct CapacityRule {
     column: String,
     prefix_bytes: Option<NonZeroUsize>,
@@ -87,10 +88,23 @@ impl CapacityRule {
     }
 
     fn admits(&self, schema: &rtdb_types::OwnedSchema) -> Result<bool> {
-        Ok(schema.path_column_type(&self.column) == Some(ScalarType::Binary)
-            && predicates(&self.when)?
-                .into_iter()
-                .all(|(column, _)| schema.path_column_type(column) == Some(ScalarType::Binary)))
+        Ok(
+            schema.path_column_type(&self.column) == Some(ScalarType::Binary)
+                && predicates(&self.when)?
+                    .into_iter()
+                    .all(|(column, _)| schema.path_column_type(column) == Some(ScalarType::Binary)),
+        )
+    }
+
+    fn columns<'a>(&'a self, qualifiers: &[(&'a str, &[u8])]) -> Vec<&'a str> {
+        std::iter::once(self.column.as_str())
+            .chain(
+                qualifiers
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .filter(|&name| name != self.column.as_str()),
+            )
+            .collect()
     }
 
     fn decode(value: &Value) -> Result<Self> {
@@ -146,7 +160,7 @@ fn predicates(mut encoded: &[u8]) -> Result<Vec<(&str, &[u8])>> {
     Ok(result)
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CapacityPolicy {
     rules: Vec<CapacityRule>,
     through_events: i64,
@@ -352,6 +366,9 @@ impl OpenTransaction<'_> {
         when: &[u8],
     ) -> Result<()> {
         OwnedRelation::new(relation.name())?;
+        if !relation.is_root_data() {
+            return Err(invalid_rule());
+        }
         let owner = self
             .options
             .user
@@ -359,14 +376,21 @@ impl OpenTransaction<'_> {
             .filter(|owner| !owner.is_empty())
             .ok_or_else(no_owned_principal)?;
         let rule = CapacityRule::new(column.into(), prefix_bytes, cap, when.to_vec())?;
-        let storage = relation.capacity_table(owner);
         let target = relation.table(owner);
+        let base = self.buffer.base_snapshot();
+        let base_frontier = base.relation_event_frontier(&target)?;
         let snapshot = self.snapshot()?;
         let frontier = snapshot.relation_event_frontier(&target)?;
-        let mut policy = self
-            .capacity_policy(snapshot.clone(), owner, relation)
-            .await?;
-        if !policy.rules.is_empty() && policy.through_events != frontier {
+        let mut policy = match self
+            .capacity_changes
+            .relations
+            .get(relation)
+            .and_then(Option::as_ref)
+        {
+            Some(touched) => touched.policy.clone(),
+            None => self.capacity_policy(base, owner, relation).await?,
+        };
+        if !policy.rules.is_empty() && policy.through_events != base_frontier {
             return Err(uncovered());
         }
         let index = match policy
@@ -385,34 +409,65 @@ impl OpenTransaction<'_> {
             }
             Err(index) => index,
         };
-        if frontier != 0 || !snapshot.trie_entries(&target).is_empty() {
-            return Err(Anomaly::incorrect(
-                "rtdb.owned/capacity-bootstrap",
-                "A capacity rule requires a relation with no prior events",
-            ));
-        }
-        if let Some((schema, _)) = self.read_owned_schema(owner, relation).await?
-            && !rule.admits(&schema)?
+        let schema = self.read_owned_schema(owner, relation).await?;
+        if let Some((schema, _)) = &schema
+            && (schema.lifetime_micros().is_some() || !rule.admits(schema)?)
         {
             return Err(invalid_rule());
+        }
+        // Existing caps already require acceptance-valid mutations. Otherwise
+        // the immutable relation declaration must rule out scheduled changes.
+        if policy.rules.is_empty()
+            && (frontier != 0 || !snapshot.trie_entries(&target).is_empty())
+            && !schema
+                .as_ref()
+                .is_some_and(|(schema, _)| schema.has_acceptance_validity())
+        {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/capacity-bootstrap",
+                "A populated relation needs acceptance validity to declare its first capacity rule",
+            ));
         }
         if policy.rules.len() >= MAX_RULES {
             return Err(invalid_rule());
         }
+        let identity = (rule.column.clone(), rule.when.clone());
         policy.rules.insert(index, rule);
+        policy.through_events = base_frontier;
         self.capacity_changes
             .reservations
             .push(self.context.memory.reserve(policy.retained_bytes())?);
-        self.buffer.put(storage, policy.document(), Interval::ALL)?;
-        self.capacity_changes.relations.insert(
-            relation.clone(),
-            Some(TouchedRule {
+        let writes = frontier
+            .checked_sub(base_frontier)
+            .filter(|writes| *writes >= 0)
+            .ok_or_else(uncovered)?;
+        let slot = self
+            .capacity_changes
+            .relations
+            .entry(relation.clone())
+            .or_default();
+        if let Some(touched) = slot {
+            if touched.writes != writes {
+                return Err(uncovered());
+            }
+            touched.policy = policy;
+            touched.added.push(identity);
+        } else {
+            *slot = Some(TouchedRule {
                 policy,
+                added: vec![identity],
                 ids: BTreeSet::new(),
-                writes: 0,
-            }),
-        );
+                writes,
+            });
+        }
         Ok(())
+    }
+
+    pub(super) fn has_staged_capacity(&self, relation: &OwnedRelation) -> bool {
+        self.capacity_changes
+            .relations
+            .get(relation)
+            .is_some_and(Option::is_some)
     }
 
     pub(super) async fn track_capacity_mutation(
@@ -433,6 +488,7 @@ impl OpenTransaction<'_> {
                 .push(self.context.memory.reserve(policy.retained_bytes())?);
             let rule = (!policy.rules.is_empty()).then_some(TouchedRule {
                 policy,
+                added: Vec::new(),
                 ids: BTreeSet::new(),
                 writes: 0,
             });
@@ -476,7 +532,7 @@ impl OpenTransaction<'_> {
             .relations
             .values()
             .flatten()
-            .all(|touched| touched.writes == 0)
+            .all(|touched| touched.writes == 0 && touched.added.is_empty())
         {
             return Ok(());
         }
@@ -492,13 +548,14 @@ impl OpenTransaction<'_> {
         for (relation, touched) in changes.relations {
             let Some(TouchedRule {
                 mut policy,
+                added,
                 ids,
                 writes,
             }) = touched
             else {
                 continue;
             };
-            if writes == 0 {
+            if writes == 0 && added.is_empty() {
                 continue;
             }
             let target = relation.table(&owner);
@@ -516,22 +573,36 @@ impl OpenTransaction<'_> {
                 .memory
                 .reserve(64 + ids.len() * policy.rules.len() * 128)?;
             let mut locators = BTreeSet::from([EntityId::String(RULE.into()).iid()]);
-            let mut proof = self.hosted_replay.as_ref().map(|_| ConstraintMembers::default());
+            let mut proof =
+                (writes > 0 && self.hosted_replay.is_some()).then(ConstraintMembers::default);
             for rule in &policy.rules {
-                self.apply_capacity_rule(
-                    &owner,
-                    &relation,
-                    rule,
-                    &ids,
-                    &base,
-                    &next,
-                    &mut locators,
-                    proof.as_mut(),
-                )
-                .await?;
+                if added
+                    .iter()
+                    .any(|(column, when)| rule.identity() == (column.as_str(), when.as_slice()))
+                {
+                    self.bootstrap_capacity_rule(&owner, &relation, rule, &next, &mut locators)
+                        .await?;
+                } else if writes != 0 {
+                    self.apply_capacity_rule(
+                        &owner,
+                        &relation,
+                        rule,
+                        &ids,
+                        &base,
+                        &next,
+                        &mut locators,
+                        proof.as_mut(),
+                    )
+                    .await?;
+                }
             }
             if let (Some(replay), Some(proof)) = (&mut self.hosted_replay, proof) {
-                replay.match_constraint(&relation, ReplayConstraintKind::Capacity, writes, proof.finish())?;
+                replay.match_constraint(
+                    &relation,
+                    ReplayConstraintKind::Capacity,
+                    writes,
+                    proof.finish(),
+                )?;
             }
             policy.through_events = through;
             self.buffer.put(
@@ -539,6 +610,75 @@ impl OpenTransaction<'_> {
                 policy.document(),
                 Interval::ALL,
             )?;
+        }
+        Ok(())
+    }
+
+    async fn bootstrap_capacity_rule(
+        &mut self,
+        owner: &str,
+        relation: &OwnedRelation,
+        rule: &CapacityRule,
+        snapshot: &Snapshot,
+        locators: &mut BTreeSet<Iid>,
+    ) -> Result<()> {
+        let qualifiers = predicates(&rule.when)?;
+        let columns = rule.columns(&qualifiers);
+        let context = self
+            .context
+            .query_context(
+                snapshot.clone(),
+                self.tx_key().system_time,
+                &self.options.default_tz,
+                self.trace_parent,
+            )?
+            .with_accelerators(Arc::from([]));
+        let Some(mut rows) = rtdb_query::open_owned_constraint_projection(
+            context,
+            owner,
+            relation,
+            self.owned_constraint_present(),
+            &columns,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let mut counts = BTreeMap::new();
+        while let Some(rows) = rows.next_batch().await? {
+            let rows = rows.batch();
+            for row in 0..rows.num_rows() {
+                self.context.check_cancelled()?;
+                let Some(prefix) = self.capacity_key(rows, row, rule, &qualifiers)? else {
+                    continue;
+                };
+                let id = rule.bucket_id(&prefix);
+                let count = match counts.entry(id) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        if !locators.insert(entry.key().iid()) {
+                            return Err(uncovered());
+                        }
+                        let charge = self.context.memory.reserve(
+                            (prefix.len() + rule.column.len() + rule.when.len()) * 4 + 512,
+                        )?;
+                        entry.insert((0i64, charge))
+                    }
+                };
+                if count.0 == rule.cap {
+                    return Err(Anomaly::new(
+                        AnomalyCategory::Conflict,
+                        "rtdb.owned/capacity-already-exceeded",
+                        "An owned prefix already exceeds its declared capacity",
+                    ));
+                }
+                count.0 += 1;
+            }
+        }
+        let storage = relation.capacity_table(owner);
+        for (id, (count, _charge)) in counts {
+            self.buffer
+                .put(storage.clone(), count_document(&id, count), Interval::ALL)?;
         }
         Ok(())
     }
@@ -555,14 +695,7 @@ impl OpenTransaction<'_> {
         mut proof: Option<&mut ConstraintMembers>,
     ) -> Result<()> {
         let qualifiers = predicates(&rule.when)?;
-        let columns = std::iter::once(rule.column.as_str())
-            .chain(
-                qualifiers
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .filter(|&name| name != rule.column.as_str()),
-            )
-            .collect::<Vec<_>>();
+        let columns = rule.columns(&qualifiers);
         let valid = Interval::at(self.owned_constraint_present())?;
         let mut deltas = BTreeMap::<EntityId, Delta>::new();
         let mut allocations = Vec::new();
@@ -586,33 +719,15 @@ impl OpenTransaction<'_> {
                 let Some(row) = self.read_occupancy_row(cursor, id, uncovered).await? else {
                     continue;
                 };
-                let row = row.batch();
-                let mut matches = true;
-                for &(column, expected) in &qualifiers {
-                    let actual = self.read_occupancy_value(row, column, uncovered)?;
-                    match actual {
-                        Value::Binary(bytes) if bytes.as_slice() == expected => (),
-                        Value::Binary(_) | Value::Null | Value::Undefined => {
-                            matches = false;
-                            break;
-                        }
-                        _ => return Err(invalid_key()),
-                    }
-                }
-                if !matches {
+                let Some(prefix) = self.capacity_key(row.batch(), 0, rule, &qualifiers)? else {
                     continue;
-                }
-                let Value::Binary(key) = self.read_occupancy_value(row, &rule.column, uncovered)?
-                else {
-                    return Err(invalid_key());
                 };
-                let prefix = rule.bucket(&key).ok_or_else(invalid_key)?;
                 allocations.push(
                     self.context
                         .memory
                         .reserve((prefix.len() + rule.column.len() + rule.when.len()) * 4 + 512)?,
                 );
-                let delta = deltas.entry(rule.bucket_id(prefix)).or_default();
+                let delta = deltas.entry(rule.bucket_id(&prefix)).or_default();
                 let count = if final_state {
                     &mut delta.claims
                 } else {
@@ -652,7 +767,11 @@ impl OpenTransaction<'_> {
                 continue;
             }
             if let Some(proof) = proof.as_deref_mut() {
-                let member = if final_count == 0 { ConstraintMember::Removed } else { ConstraintMember::Count(final_count) };
+                let member = if final_count == 0 {
+                    ConstraintMember::Removed
+                } else {
+                    ConstraintMember::Count(final_count)
+                };
                 proof.insert(&id, member, &self.context.memory)?;
             }
             if final_count == 0 {
@@ -660,15 +779,36 @@ impl OpenTransaction<'_> {
             } else {
                 self.buffer.put(
                     storage.clone(),
-                    StructFields::from([
-                        ("_id".into(), id.as_value()),
-                        ("count".into(), Value::I64(final_count)),
-                    ]),
+                    count_document(&id, final_count),
                     Interval::ALL,
                 )?;
             }
         }
         Ok(())
+    }
+
+    fn capacity_key(
+        &self,
+        rows: &RecordBatch,
+        row: usize,
+        rule: &CapacityRule,
+        qualifiers: &[(&str, &[u8])],
+    ) -> Result<Option<Vec<u8>>> {
+        for &(column, expected) in qualifiers {
+            match self.read_occupancy_value_at(rows, row, column, uncovered)? {
+                Value::Binary(bytes) if bytes.as_slice() == expected => (),
+                Value::Binary(_) | Value::Null | Value::Undefined => return Ok(None),
+                _ => return Err(invalid_key()),
+            }
+        }
+        let Value::Binary(mut key) =
+            self.read_occupancy_value_at(rows, row, &rule.column, uncovered)?
+        else {
+            return Err(invalid_key());
+        };
+        let length = rule.bucket(&key).ok_or_else(invalid_key)?.len();
+        key.truncate(length);
+        Ok(Some(key))
     }
 
     pub(super) async fn check_capacity_schema(
@@ -678,9 +818,21 @@ impl OpenTransaction<'_> {
         relation: &OwnedRelation,
         schema: &rtdb_types::OwnedSchema,
     ) -> Result<()> {
-        let policy = self.capacity_policy(snapshot, owner, relation).await?;
+        let stored;
+        let policy = match self
+            .capacity_changes
+            .relations
+            .get(relation)
+            .and_then(Option::as_ref)
+        {
+            Some(touched) => &touched.policy,
+            None => {
+                stored = self.capacity_policy(snapshot, owner, relation).await?;
+                &stored
+            }
+        };
         for rule in &policy.rules {
-            if !rule.admits(schema)? {
+            if schema.lifetime_micros().is_some() || !rule.admits(schema)? {
                 return Err(invalid_rule());
             }
         }
@@ -727,6 +879,13 @@ impl OpenTransaction<'_> {
         self.read_occupancy_cell(cursor, id, column, uncovered)
             .await
     }
+}
+
+fn count_document(id: &EntityId, count: i64) -> StructFields<Value> {
+    StructFields::from([
+        ("_id".into(), id.as_value()),
+        ("count".into(), Value::I64(count)),
+    ])
 }
 
 fn invalid_rule() -> Anomaly {

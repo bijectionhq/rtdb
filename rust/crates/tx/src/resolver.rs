@@ -1633,7 +1633,9 @@ impl<'a> OpenTransaction<'a> {
         if snapshot.contains_table(&OwnedRelation::obsolete_purge_table(owner)) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native erasure"));
         }
-        if snapshot.contains_table(&relation.unique_table(owner)) || snapshot.contains_table(&relation.capacity_table(owner)) {
+        if snapshot.contains_table(&relation.unique_table(owner))
+            || snapshot.contains_table(&relation.capacity_table(owner)) || self.has_staged_capacity(relation)
+        {
             return Err(purge_path_uncovered());
         }
         let table = relation.table(owner);
@@ -1798,7 +1800,7 @@ impl<'a> OpenTransaction<'a> {
         }
         if let Some(root) = relation.root_relation() {
             let snapshot = self.snapshot()?;
-            if snapshot.contains_table(&root.capacity_table(owner)) {
+            if snapshot.contains_table(&root.capacity_table(owner)) || self.has_staged_capacity(&root) {
                 return Err(Anomaly::incorrect("rtdb.owned/world-capacity-uncovered", "World writes require inherited capacity accounting"));
             }
             if snapshot.contains_table(&root.unique_table(owner)) {

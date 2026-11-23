@@ -821,6 +821,48 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
 }
 
 #[tokio::test]
+async fn populated_capacity_is_installed_at_the_final_relation_frontier() {
+    use rtdb_types::{EntityId, OwnedRelation, OwnedSchema};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("populated-capacity").unwrap();
+    let schema = OwnedSchema::from_json(
+        br#"{"fields":[{"name":"canonical","type":{"kind":"binary"},"optional":false,"nullable":false}],"validity":"acceptance"}"#,
+    ).unwrap();
+    let insert = |id: i64| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(id)), ("canonical".into(), Value::Binary(vec![7, id as u8])),
+        ])], node.memory()).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let initial = writer.state_mut().execute_tx(vec![
+        TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
+        insert(1), insert(2), insert(3),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(initial.committed(), "{:?}", initial.error());
+
+    let rule = || TxOp::OwnedDeclareCapacity {
+        relation: relation.clone(), column: "canonical".into(), prefix_bytes: 1, cap: 2, when: Vec::new(),
+    };
+    let refused = writer.state_mut().execute_tx(vec![rule()], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(refused.error().unwrap().code, "rtdb.owned/capacity-already-exceeded");
+    let applied = writer.state_mut().execute_tx(vec![
+        TxOp::OwnedDelete { relation: relation.clone(), id: EntityId::Integer(1), valid_from: None, valid_to: None },
+        rule(),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(applied.committed(), "{:?}", applied.error());
+    let next = writer.state_mut().execute_tx(vec![insert(4)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(next.error().unwrap().code, "rtdb.owned/capacity-exceeded");
+
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn owned_acceptance_validity_rejects_scheduled_writes_at_ordering() {
     use rtdb_types::{OwnedRelation, OwnedSchema};
 

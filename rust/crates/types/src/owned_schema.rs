@@ -284,6 +284,10 @@ impl OwnedSchema {
 
     pub fn lifetime_micros(&self) -> Option<i64> { self.0.lifetime_micros }
 
+    pub fn has_acceptance_validity(&self) -> bool {
+        self.0.validity == Validity::Acceptance
+    }
+
     pub fn requires_bounded_period(&self) -> bool {
         self.0.validity == Validity::BoundedPeriod
     }

@@ -402,11 +402,15 @@ impl OpenTransaction<'_> {
     }
 
     pub(super) fn read_occupancy_value(&self, row: &RecordBatch, column: &str, uncovered: fn() -> Anomaly) -> Result<Value> {
-        let (slot, field) = row.schema_ref().column_with_name(column).ok_or_else(uncovered)?;
-        let column = row.column(slot).as_ref();
-        let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, 0)?;
+        self.read_occupancy_value_at(row, 0, column, uncovered)
+    }
+
+    pub(super) fn read_occupancy_value_at(&self, rows: &RecordBatch, row: usize, column: &str, uncovered: fn() -> Anomaly) -> Result<Value> {
+        let (slot, field) = rows.schema_ref().column_with_name(column).ok_or_else(uncovered)?;
+        let column = rows.column(slot).as_ref();
+        let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, row)?;
         let _read = self.context.memory.reserve(bytes.saturating_add(4096))?;
-        rtdb_columnar::read_value(field, column, 0)
+        rtdb_columnar::read_value(field, column, row)
     }
 }
 

@@ -655,7 +655,11 @@ An empty covered page has no rows and carries the already-known held present in 
 `rtdb.owned.DeclareCapacity.v2` takes the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `column: Utf8`, `prefix_bytes: Int64` (0–4096), `cap: Int64` (positive), and `when: Binary`.
 `when` contains zero to four equality predicates in column-name order. Each consists of a one-byte UTF-8 column-name length and the name, followed by a big-endian u16 value length and the exact nonempty Binary value (up to 2052 bytes).
-An owned relation may declare up to 16 distinct projection and predicate combinations before its first fact event. Declarations return the same transaction-key Arrow row as Create.
+An owned Root relation may declare up to 16 distinct projection and predicate combinations.
+A populated relation can declare its first cap when its schema requires validity from acceptance with an open end and has no creation lifetime.
+The resolver initializes the new rule's covered counters from the final visible rows at the declaring revision.
+If a prefix already exceeds the proposed cap, the transaction aborts with `rtdb.owned/capacity-already-exceeded`.
+Successful declarations return the same transaction-key Arrow row as Create.
 Zero counts complete Binary keys. An empty complete key charges a single relation-wide bucket. Positive widths count prefixes of that length. Keys are limited to 4096 bytes.
 Each qualified projection and partition has its own counter. A row charges the rule only while all its predicates match. One shared relation frontier certifies all counters.
 Writes to the governed root must start at ordered present and have an unbounded valid end.
