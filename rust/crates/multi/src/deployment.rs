@@ -252,7 +252,15 @@ pub struct LogkeeperLogConfig {
     /// Inclusive original intake position consumed before a transferred target may write.
     #[serde(default)]
     pub transferred_source_through: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_intake_cut: Option<TransferIntakeCut>,
     pub write_quorum: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferIntakeCut {
+    pub replica_through: i64,
+    pub source_through: i64,
 }
 
 pub fn write_quorum(ensemble: usize) -> usize { ensemble / 2 + 1 }
@@ -323,6 +331,10 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
         transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
             let terminal = activation.replica.bootstrap.terminal.source_through;
             record.checkpoint.map_or(terminal, |checkpoint| terminal.max(checkpoint.source))
+        }),
+        transfer_intake_cut: record.checkpoint_transfer_activation.as_deref().map(|activation| {
+            let terminal = &activation.replica.bootstrap.terminal;
+            TransferIntakeCut { replica_through: terminal.replica_through, source_through: terminal.source_through }
         }),
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
         previous_servers,

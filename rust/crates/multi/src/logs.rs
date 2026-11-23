@@ -202,13 +202,14 @@ impl LogFactory for LogkeeperLogFactory {
             AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery }
         } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
-        let mut next = next_source_offset(replica.as_ref(), epoch).await?;
+        let mut next = next_source_offset_from_cut(replica.as_ref(), epoch, config.transfer_intake_cut).await?;
         if let Some(through) = config.transferred_source_through {
             let floor = through.checked_add(1).filter(|floor| *floor >= 0)
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/intake-floor", "Invalid transferred source offset"))?;
             SourcePosition::from_epoch_offset(epoch, floor)?;
             next = next.max(floor);
         }
+        if config.transfer_intake_cut.is_some() { SourcePosition::from_epoch_offset(epoch, next)?; }
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {
             let intake = Arc::clone(&intake);
@@ -237,23 +238,46 @@ fn member_ids(servers: &[JournalEndpoint]) -> Result<Vec<rtdb_directory::MemberI
 /// The first source offset no replica record can already have consumed.
 /// Every replica record consumes at most one source position, so the newest one named, plus one per later record, bounds every position assigned before; oversized records, whose position is out of line, are covered by that count.
 pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Result<i64> {
+    next_source_offset_from_cut(replica, epoch, None).await
+}
+
+async fn next_source_offset_from_cut(
+    replica: &dyn Log, epoch: StorageEpoch, cut: Option<crate::deployment::TransferIntakeCut>,
+) -> Result<i64> {
+    let invalid_floor = || Anomaly::fault("rtdb.multi/intake-floor", "Invalid transferred source or replica offset");
     let latest = replica.latest()?.0;
-    let mut end = latest + 1;
+    let mut end = latest.checked_add(1).ok_or_else(invalid_floor)?;
+    let (mut floor, source_floor) = if let Some(cut) = cut {
+        if cut.replica_through < -1 || cut.source_through < -1 || cut.replica_through > latest { return Err(invalid_floor()); }
+        ReplicaPosition::from_epoch_offset(epoch, cut.replica_through)?;
+        SourcePosition::from_epoch_offset(epoch, cut.source_through)?;
+        (cut.replica_through.checked_add(1).ok_or_else(invalid_floor)?,
+         cut.source_through.checked_add(1).ok_or_else(invalid_floor)?)
+    } else { (0, 0) };
     let mut after_newest = 0i64;
-    let mut floor = 0;
+    let mut missing = 0i64;
+    let mut observed_next = 0i64;
     let mut window = INTAKE_TIP_WINDOW;
     while end > floor {
-        let start = (end - window).max(floor);
+        let start = end.saturating_sub(window).max(floor);
         let records = match replica.read_range(LogOffset(start), LogOffset(end)).await {
             Ok(records) => records,
-            // Trimmed below here: the scan continues from the first retained record.
-            Err(rtdb_storage::Error::UnavailableLogRange { first_retained, .. }) if first_retained > start && first_retained < end => { floor = first_retained; continue; }
-            Err(rtdb_storage::Error::UnavailableLogRange { .. }) => break,
+            Err(rtdb_storage::Error::UnavailableLogRange { first_retained, .. }) if first_retained > start => {
+                missing += first_retained.min(end) - floor;
+                floor = first_retained;
+                continue;
+            }
+            Err(rtdb_storage::Error::UnavailableLogRange { .. }) if cut.is_none() => break,
             Err(error) => return Err(error.into()),
         };
         for record in records.iter().rev() {
             match source_position(&record.payload, epoch)? {
-                Scanned::Position(position) => return Ok(position + 1 + after_newest),
+                Scanned::Position(position) => {
+                    let next = position.checked_add(1).and_then(|next| next.checked_add(after_newest)).ok_or_else(invalid_floor)?;
+                    if cut.is_none() { return Ok(next); }
+                    observed_next = observed_next.max(next);
+                    after_newest += 1;
+                }
                 Scanned::MayConsume => after_newest += 1,
                 Scanned::Consumes => {}
             }
@@ -261,7 +285,10 @@ pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Resul
         end = start;
         window = SCAN_WINDOW;
     }
-    Ok(after_newest)
+    let anchored = source_floor.checked_add(after_newest)
+        .and_then(|next| next.checked_add(if cut.is_some() { missing } else { 0 }))
+        .ok_or_else(invalid_floor)?;
+    Ok(observed_next.max(anchored))
 }
 
 enum Scanned { Position(i64), MayConsume, Consumes }
@@ -522,6 +549,7 @@ mod tests {
             require_read_index: false,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
+            transfer_intake_cut: None,
             frozen_at: None,
             previous_servers: None,
         };
@@ -554,6 +582,7 @@ mod tests {
             frozen_at: None,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
+            transfer_intake_cut: None,
             write_quorum: 1,
         };
         let provider = Arc::new(MemoryLog::new(1024));
@@ -663,6 +692,20 @@ mod tests {
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42, "a claim consumes no source position");
         append(&replica, ReplicaBody::TriesAdded(Default::default())).await;
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 43, "a record that names no position may have consumed one");
+    }
+
+    #[tokio::test]
+    async fn transferred_intake_counts_only_after_the_ordered_replica_cut() {
+        use crate::deployment::TransferIntakeCut;
+
+        let replica = MemoryLog::starting_at(1 << 20, LogOffset(502));
+        let cut = TransferIntakeCut { replica_through: 501, source_through: 1000 };
+        assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(cut)).await.unwrap(), 1001);
+        append(&replica, ReplicaBody::OversizedMessage(proto::OversizedMessage::default())).await;
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(cut)).await.unwrap(), 1002);
+        let earlier = TransferIntakeCut { replica_through: 499, ..cut };
+        assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(earlier)).await.unwrap(), 1004);
     }
 
     #[tokio::test]
