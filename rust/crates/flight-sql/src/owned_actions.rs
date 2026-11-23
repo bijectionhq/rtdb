@@ -188,8 +188,14 @@ pub(crate) const HELD_OWNED_POSITION_VALID_DURING_V1: &str = "rtdb.owned.ReadHel
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_WORLD_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldValidDuringAt.v1";
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
+pub(crate) const HELD_WORLD_PARENT_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentIdentityPageAt.v1";
+pub(crate) const HELD_WORLD_PARENT_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentValidDuringAt.v1";
+pub(crate) const SEARCH_HELD_WORLD_PARENT_AT_V1: &str = "rtdb.owned.SearchHeldWorldParentAt.v1";
+
+pub(crate) enum WorldHistoricalRead { Current, EarlierEffective, EarlierParent }
+
 pub(crate) const HELD_WORLD_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPageAt.v1";
-pub(crate) enum WorldIdentityRead { Effective, Overlay, OverlayAt, EffectiveAt }
+pub(crate) enum WorldIdentityRead { Effective, Overlay, OverlayAt, EffectiveAt, ParentAt }
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
@@ -1886,10 +1892,10 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], historical: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
-        let (earlier, request) = if historical {
+        let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
             let (mode, rest) = request.split_first().ok_or_else(|| invalid("Missing historical world search selector"))?;
             let parent_only = match *mode {
                 0 => true,
@@ -1899,6 +1905,10 @@ impl Service {
             let (system, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing historical world search system revision"))?;
             (Some((Timestamp(i64::from_be_bytes(*system)), parent_only)), rest)
         } else { (None, request) };
+        let (parent_at, request) = if matches!(mode, WorldHistoricalRead::EarlierParent) {
+            let (system, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing earlier parent search revision"))?;
+            (Some(Timestamp(i64::from_be_bytes(*system))), rest)
+        } else { (None, request) };
         let (valid, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world search valid instant"))?;
         let valid = Timestamp(i64::from_be_bytes(*valid));
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
@@ -1907,19 +1917,23 @@ impl Service {
             return Err(Status::failed_precondition("Search requires evidence for every selected world partition"));
         }
         let relations = rank.partitions.iter().map(|(relation, _)| relation.clone()).collect::<Vec<_>>();
-        let scope = if historical {
+        let scope = if parent_at.is_some() {
+            owned_rank_scope(b"rtdb.owned.search.world-parent-at.v1\0", &body[..32 + rank.frame_len], rank.query)
+        } else if earlier.is_some() {
             owned_rank_scope(b"rtdb.owned.search.world-at.v1\0", &body[..33 + rank.frame_len], rank.query)
         } else {
             owned_rank_scope(b"rtdb.owned.search.world.v1\0", &body[..24 + rank.frame_len], rank.query)
         };
-        let (page, witnesses) = if let Some((system, parent_only)) = earlier {
+        let (page, witnesses) = if let Some(system) = parent_at {
+            held.snapshot.ranked_search_parent_at(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid, system).await
+        } else if let Some((system, parent_only)) = earlier {
             held.snapshot.ranked_search_at(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid, system, parent_only).await
         } else {
             held.snapshot.ranked_search(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid).await
         }.map_err(status)?;
         if witnesses.len() != relations.len() { return Err(Status::internal("Incomplete retained search evidence")); }
         let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness, false)).collect::<Result<Vec<_>, _>>()?;
-        let reply = self.owned_rank_reply(call, page, scope, nonces, earlier.map_or_else(|| held.snapshot.present(), |(system, _)| system), valid)?;
+        let reply = self.owned_rank_reply(call, page, scope, nonces, parent_at.or_else(|| earlier.map(|(system, _)| system)).unwrap_or_else(|| held.snapshot.present()), valid)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
@@ -2430,20 +2444,20 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, body: &[u8], historical: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, body: &[u8], selection: WorldHistoricalRead) -> Result<ActionResult, Status> {
         use rtdb_types::Interval;
 
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
-        let (system, body) = if historical {
+        let (system, body) = if !matches!(selection, WorldHistoricalRead::Current) {
             let (system, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world schedule has no revision"))?;
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
         } else { (None, body) };
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world history has no source"))?;
         let parent_only = match *mode {
-            0 => false,
-            1 if !historical => true,
+            0 if !matches!(selection, WorldHistoricalRead::EarlierParent) => false,
+            1 if !matches!(selection, WorldHistoricalRead::EarlierEffective) => true,
             _ => return Err(invalid("Invalid owned world history source")),
         };
         let (relation, arrow_bytes) = split_relation(body)?;
@@ -2458,7 +2472,12 @@ impl Service {
         let valid = Interval::new(from, to).map_err(status)?;
         if valid.is_empty() { return Err(invalid("Owned world history requires a nonempty valid window")); }
         let (slices, witness) = if let Some(system) = system {
-            (held.snapshot.valid_during_at(&relation, &id, valid, system).await.map_err(status)?, None)
+            if parent_only {
+                let (slices, witness) = held.snapshot.parent_schedule_at(&relation, &id, valid, system).await.map_err(status)?;
+                (slices, Some(witness))
+            } else {
+                (held.snapshot.valid_during_at(&relation, &id, valid, system).await.map_err(status)?, None)
+            }
         } else {
             held.snapshot.valid_during(&relation, &id, valid, parent_only).await.map_err(status)?
         };
@@ -2499,7 +2518,7 @@ impl Service {
                 _ => return Err(invalid("Invalid historical world identity selector")),
             }
         } else { (false, body) };
-        let (system, body) = if matches!(mode, WorldIdentityRead::EffectiveAt | WorldIdentityRead::OverlayAt) {
+        let (system, body) = if matches!(mode, WorldIdentityRead::EffectiveAt | WorldIdentityRead::OverlayAt | WorldIdentityRead::ParentAt) {
             let (system, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world identities have no revision"))?;
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
         } else { (None, body) };
@@ -2519,6 +2538,8 @@ impl Service {
             .ok_or_else(|| invalid("Owned world identity bound must be nullable Utf8"))?;
         let after = (!after.is_null(0)).then(|| after.value(0));
         let page = match (mode, system) {
+            (WorldIdentityRead::ParentAt, Some(system)) =>
+                held.snapshot.parent_identity_page_at(&relation, valid, after, limit, system).await,
             (WorldIdentityRead::EffectiveAt, Some(system)) =>
                 held.snapshot.identity_page_at(&relation, valid, after, limit, system, parent_only).await,
             (WorldIdentityRead::OverlayAt, Some(system)) =>

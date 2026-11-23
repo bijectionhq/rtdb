@@ -105,6 +105,16 @@ pub trait OwnedWorldRead: Send + Sync {
     fn measure<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
     ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>>;
+    fn parent_identity_page_at<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize, system: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn parent_schedule_at<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(Vec<(Interval, Timestamp)>, OwnedWorldWitness)>>;
+    fn ranked_search_parent_at<'a>(
+        &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>>;
     fn parent_range_at<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>,
         valid: Timestamp, system: Timestamp,

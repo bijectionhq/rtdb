@@ -182,6 +182,25 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::measure(self, relation, path, request))
     }
+    fn parent_identity_page_at<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize, system: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
+        Box::pin(async move {
+            let page = HeldCheckpointWorld::parent_identity_page_at(self, relation, valid, after, limit, system).await?;
+            Ok(WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations })
+        })
+    }
+    fn parent_schedule_at<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(Vec<(Interval, Timestamp)>, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::parent_schedule_at(self, relation, id, valid, system))
+    }
+    fn ranked_search_parent_at<'a>(
+        &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>> {
+        Box::pin(HeldCheckpointWorld::ranked_search_parent_at(self, partitions, query, offset, limit, valid, system))
+    }
     fn parent_range_at<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>,
         valid: Timestamp, system: Timestamp,
