@@ -166,6 +166,12 @@ impl S3KeyService {
 
 #[async_trait::async_trait]
 impl KeyService for S3KeyService {
+    async fn grant_deployment_key(&self, id: &str, binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<super::UnitOutput> {
+        let material = self.existing_key(id).await.map_err(super::journal::key_error)?;
+        super::delivery::require_deployment_key(material, binding)?;
+        Ok(super::UnitOutput::Granted)
+    }
+
     fn custody_namespace(&self) -> Result<String> {
         Ok(format!("s3:{}", self.bucket))
     }

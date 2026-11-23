@@ -252,7 +252,6 @@ impl ClassicObjectKeys {
             for path in paths { withdraw_slot(&path)?; }
             Ok(())
         }).await?;
-        super::drain_unit_delivery().await;
         Ok(())
     }
 }
@@ -299,6 +298,17 @@ impl ObjectCipher for ClassicObjectKeys {
         let key = key.clone();
         self.region
             .run_blocking(move || {
+                if matches!(operation, UnitOperation::Grant) {
+                    let custody = Arc::new(open_slot_lock(&path)?);
+                    custody.lock_shared().map_err(io(&path))?;
+                    if path.with_extension("closed").try_exists().map_err(io(&path))? {
+                        return Err(Error::ErasedUnderView);
+                    }
+                    if fs::metadata(&path).map_err(io(&path))?.len() != KEY_BYTES as u64 {
+                        return Err(Error::Task("Invalid Classic unit key".into()));
+                    }
+                    return Ok(UnitOutput::HeldGrant { until: None, custody });
+                }
                 with_key(&path, operation.provisions(), |cipher| {
                     operation.apply(cipher, &key)
                 })
@@ -422,16 +432,20 @@ fn with_key<T>(
     operate(&cipher?)
 }
 
-fn lock(path: &Path) -> crate::Result<File> {
+fn open_slot_lock(path: &Path) -> crate::Result<File> {
     let lock = path.with_extension("lock");
-    let file = File::options()
+    File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock)
-        .map_err(io(&lock))?;
-    file.lock().map_err(io(&lock))?;
+        .map_err(io(&lock))
+}
+
+fn lock(path: &Path) -> crate::Result<File> {
+    let file = open_slot_lock(path)?;
+    file.lock().map_err(io(&path.with_extension("lock")))?;
     Ok(file)
 }
 

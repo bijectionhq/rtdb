@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ring::digest::{SHA256, digest};
 use rtdb_storage::{Error, ObjectKey, Result, sealing::ObjectCipher};
 
-use super::{KEY_BYTES, KeyService, UnitOperation, UnitOutput, journal::key_error};
+use super::{KEY_BYTES, KeyService, UnitOperation, UnitOutput};
 
 /// The deployment key remains the custody owner for objects sealed under it.
 pub(crate) struct DeploymentDelivery {
@@ -25,11 +25,14 @@ impl ObjectCipher for DeploymentDelivery {
         if !matches!(operation, UnitOperation::Grant) {
             return Err(Error::Task("Deployment delivery authority only confirms grants".into()));
         }
-        let mut current = self.keys.existing_key(&self.id).await.map_err(key_error)?
-            .ok_or(Error::ErasedUnderView)?;
-        let matches = digest(&SHA256, &current).as_ref() == self.binding.as_slice();
-        current.fill(0);
-        if !matches { return Err(Error::ErasedUnderView); }
-        Ok(UnitOutput::Granted)
+        self.keys.grant_deployment_key(&self.id, self.binding).await
     }
+}
+
+pub(super) fn require_deployment_key(material: Option<[u8; KEY_BYTES]>, binding: [u8; KEY_BYTES]) -> Result<()> {
+    let mut current = material.ok_or(Error::ErasedUnderView)?;
+    let matches = digest(&SHA256, &current).as_ref() == binding.as_slice();
+    current.fill(0);
+    if !matches { return Err(Error::ErasedUnderView); }
+    Ok(())
 }

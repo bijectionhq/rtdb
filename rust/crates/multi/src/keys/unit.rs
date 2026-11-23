@@ -207,6 +207,10 @@ impl LocalKeyService {
         let result = io
             .run_blocking(move || {
                 let vault = service.archive_vault().map_err(key_error)?;
+                if matches!(operation, UnitOperation::Grant) {
+                    let custody = Arc::new(vault.hold_local_unit_delivery(&slot)?);
+                    return Ok(UnitOutput::HeldGrant { until: None, custody });
+                }
                 vault.with_local_slot(&slot, operation.provisions(), deadline, |material| {
                     with_material(material, deadline, |key| operation.apply(key, &name))
                 })
@@ -303,7 +307,6 @@ impl LocalKeyService {
             Ok(complete())
         })
         .await??;
-        rtdb_storage::sealing::drain_unit_delivery().await;
         Ok(())
     }
 
@@ -325,7 +328,6 @@ impl LocalKeyService {
             Ok(complete())
         })
         .await??;
-        rtdb_storage::sealing::drain_unit_delivery().await;
         Ok(())
     }
 }

@@ -3166,6 +3166,9 @@ impl KeyService for InterruptedInstall {
     async fn key(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.key(deployment).await }
     async fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment).await }
     async fn existing_key(&self, deployment: &str) -> rtdb_types::Result<Option<[u8; 32]>> { self.keys.existing_key(deployment).await }
+    async fn grant_deployment_key(&self, deployment: &str, binding: [u8; 32]) -> rtdb_storage::Result<rtdb_multi::keys::UnitOutput> {
+        self.keys.grant_deployment_key(deployment, binding).await
+    }
     async fn copy(&self, from: &str, to: &str) -> rtdb_types::Result<()> { self.keys.copy(from, to).await }
     async fn destroy(&self, deployment: &str) -> rtdb_types::Result<()> { self.keys.destroy(deployment).await }
     async fn validate_install(&self, deployment: &str, key: &[u8; 32]) -> rtdb_types::Result<()> { self.keys.validate_install(deployment, key).await }

@@ -68,6 +68,10 @@ pub trait KeyService: Send + Sync {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
     /// Read current custody without creating a key.
     async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>>;
+    /// Confirms the original key and keeps the authority live through delivery.
+    async fn grant_deployment_key(&self, _id: &str, _binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<UnitOutput> {
+        Err(rtdb_storage::Error::Closed("The deployment key owner cannot grant delivery".into()))
+    }
     /// Gives `to` the key `from` has, for a fork whose objects are copies of its parent's.
     async fn copy(&self, from: &str, to: &str) -> Result<()>;
     /// Withdraws the key and permanently refuses provisioning for this deployment ID.
@@ -330,6 +334,20 @@ impl LocalKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for LocalKeyService {
+    async fn grant_deployment_key(&self, id: &str, binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<UnitOutput> {
+        let vault = self.clone();
+        let id = id.to_owned();
+        IoRegion::new().run_blocking(move || {
+            let map = journal::key_error;
+            let path = vault.path(&id).map_err(map)?;
+            let custody = Arc::new(vault.lock_key_shared(&path).map_err(map)?);
+            vault.require_raw_key(&id).map_err(map)?;
+            let material = read_key(&path, fs::read(&path).map_err(io).map_err(map)?).map_err(map)?;
+            delivery::require_deployment_key(Some(material), binding)?;
+            Ok(UnitOutput::HeldGrant { until: None, custody })
+        }).await
+    }
+
     async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.load_key(self.directory.join(".namespace"), None).await }
 
     async fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
