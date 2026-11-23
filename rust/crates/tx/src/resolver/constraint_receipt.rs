@@ -10,6 +10,7 @@ const PUBLICATIONS: &str = "fact_publications";
 const ROOT_HEAD: &str = "head";
 const RECEIPT_HEAD: &str = "sync_receipt_head";
 const DECISION_PREFIX: &str = "root_decision:";
+const IMPACT_PREFIX: &str = "root_decision_impact:";
 const MAX_DECISION_BYTES: usize = 1 << 20;
 
 fn invalid() -> Anomaly {
@@ -28,8 +29,11 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
     };
     let primary = &ops[..index];
     let refusal = &ops[index + 1..];
+    let impact_count = refusal.iter().filter_map(hosted).filter(|control| decision_impact(control)).count();
+    let receipts = refusal.len() - impact_count;
     if !placed
-        || !matches!(refusal.len(), 6 | 7)
+        || !matches!(receipts, 6 | 7)
+        || (impact_count != 0 && receipts != 7)
         || !(primary.iter().all(primary_op)
             || crate::hosted_control::hosted_root_world_reads(primary))
     {
@@ -83,12 +87,13 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         .count();
     // Each alternative replacement is matched below. Counting both sets also
     // rules out silently dropping an unrelated control or attempt on refusal.
-    let records_decision = refusal.len() == 7;
-    if control_writes != 4 + usize::from(records_decision) || marker_writes != 2 {
+    let records_decision = receipts == 7;
+    if control_writes != 4 + usize::from(records_decision) + impact_count || marker_writes != 2 {
         return Err(invalid());
     }
 
     let mut types = 0;
+    let mut impact_ids = std::collections::BTreeSet::new();
     for alternative in refusal {
         let bit = match alternative {
             Operation::Public(TxOp::HostedControl(control)) => {
@@ -99,6 +104,17 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
                         original.name() == control.name() && original.id() == control.id()
                     })
                     .ok_or_else(invalid)?;
+                if decision_impact(control) {
+                    let replacement = control.replacement().ok_or_else(invalid)?;
+                    if control.scope() != original.scope() || control.expected() != original.expected()
+                        || original.replacement() != Some(replacement)
+                        || !matches!(replacement.get("admission"), Some(Value::Binary(body)) if !body.is_empty() && body.len() <= 4096)
+                        || !impact_ids.insert(control.id())
+                    {
+                        return Err(invalid());
+                    }
+                    continue;
+                }
                 control_choice(original, control)?
             }
             Operation::Public(TxOp::OwnedInsertDocs {
@@ -178,6 +194,17 @@ fn hosted(op: &Operation) -> Option<&HostedControlWrite> {
         Operation::Public(TxOp::HostedControl(control)) => Some(control),
         _ => None,
     }
+}
+
+fn decision_impact(control: &HostedControlWrite) -> bool {
+    if control.name() != ADMISSION { return false; }
+    let EntityId::String(id) = control.id() else { return false; };
+    let Some((digest, page)) = id.strip_prefix(IMPACT_PREFIX).and_then(|suffix| suffix.split_once(':')) else {
+        return false;
+    };
+    digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && (page == "head" || page.parse::<u64>().is_ok_and(|number| number.to_string() == page))
 }
 
 fn control_choice(original: &HostedControlWrite, refusal: &HostedControlWrite) -> Result<u8> {
@@ -410,6 +437,40 @@ mod tests {
         let slot = ops.len() - 1;
         ops[slot] = ops[slot - 1].clone();
         assert!(split(&ops, true).is_err());
+    }
+
+    #[test]
+    fn kept_constraint_refusal_preserves_decision_impact_pages() -> Result<()> {
+        use rtdb_types::{OwnedRelation, PlacedAttemptScope, Timestamp};
+
+        let digest = "a".repeat(64);
+        let decision = format!("{DECISION_PREFIX}{digest}");
+        let impact = format!("{IMPACT_PREFIX}{digest}:head");
+        let scope = PlacedAttemptScope::new("installed-replica", 1)?;
+        let control = |id: &str, expected, payload| -> Result<Operation> {
+            let fields = StructFields::from([
+                ("_id".into(), Value::Utf8(id.into())),
+                ("admission".into(), Value::Binary(vec![payload])),
+            ]);
+            Ok(Operation::Public(TxOp::HostedControl(HostedControlWrite::new(
+                OwnedRelation::new(ADMISSION)?, scope, expected, fields,
+            )?)))
+        };
+        let mut ops = publications(ROOT_HEAD);
+        ops.push(delete_row("fact_first"));
+        ops.push(control(&decision, None, 1)?);
+        ops.push(control(&impact, Some(Timestamp(1)), 3)?);
+        ops.push(Operation::Public(TxOp::HostedConstraintRefusal));
+        ops.extend(publications(RECEIPT_HEAD));
+        ops.push(control(&decision, None, 2)?);
+        ops.push(control(&impact, Some(Timestamp(1)), 3)?);
+        assert!(split(&ops, true).is_ok());
+
+        ops.pop();
+        assert!(split(&ops, true).is_err());
+        ops.push(control(&impact, Some(Timestamp(1)), 4)?);
+        assert!(split(&ops, true).is_err());
+        Ok(())
     }
 
     #[test]
