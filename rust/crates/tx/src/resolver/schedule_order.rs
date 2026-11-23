@@ -63,6 +63,17 @@ fn action_command_matches(record: &Json) -> bool {
     ))
 }
 
+fn continuation_policy_matches(continuation: &Json) -> bool {
+    let Some(record) = continuation.as_object() else { return false };
+    let named = record.get("name").is_some_and(|name| {
+        name.is_null() || name.as_str().is_some_and(|name| {
+            !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+        })
+    });
+    let policy = matches!(record.get("on_failure").and_then(Json::as_str), Some("retry" | "skip"));
+    named && policy && record.get("then").is_none_or(continuation_policy_matches)
+}
+
 pub(super) fn validate(operations: &[Operation]) -> Result<()> {
     let controls = operations.iter().filter_map(|op| match op {
         Operation::Public(TxOp::HostedControl(control))
@@ -128,6 +139,14 @@ pub(super) fn validate(operations: &[Operation]) -> Result<()> {
             continue;
         }
         let data = body(control)?;
+        if let Some(continuation) = data.pointer("/task/continuation").filter(|value| !value.is_null())
+            && !continuation_policy_matches(continuation)
+        {
+            return Err(Anomaly::incorrect(
+                "rtdb.hosted/task-delivery-policy",
+                "A task must order its delivery name and failure policy with its command",
+            ));
+        }
         if id.starts_with(ACTION) {
             if !action_command_matches(&data) {
                 return Err(Anomaly::incorrect("rtdb.hosted/task-command", "The action carrier differs from its authored command"));
