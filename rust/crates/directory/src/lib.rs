@@ -896,7 +896,7 @@ impl DeploymentRecord {
     /// The key custody record for one residence. Withdrawing an old
     /// residence's key cannot withdraw the current residence's key record.
     pub fn key_id(&self) -> String {
-        if self.checkpoint_stage.is_some() {
+        if self.checkpoint_stage.is_some() || self.checkpoint_transfer_activation.is_some() {
             format!("stage-{}-{}", self.id, self.incarnation)
         } else if self.incarnation == 1 {
             self.id.clone()
