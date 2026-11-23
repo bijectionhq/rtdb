@@ -28,6 +28,8 @@
 --
 -- Query and fragment snapshots on coordinated storage register with the catalog floor before storage access.
 -- An admitted capture retains that registration through its provider requests.
+-- Compaction and stored artefact builds register their input catalogs on coordinated storage.
+-- A fallback build registers the catalog it recaptures for its own reads.
 -- Replicated snapshots on uncoordinated storage hold a bounded read lease.
 -- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
 -- A node confirms any pending observation its catalog has already applied before deciding whether to sample the tip again.

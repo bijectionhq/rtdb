@@ -79,6 +79,55 @@ async fn building_all_records_every_available_artefact_once() {
     running.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn a_stored_artefact_holds_its_catalog_until_the_build_drains() {
+    use rtdb_storage::LocalStore;
+    use rtdb_types::{CatalogCut, ReplicaPosition};
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct HeldBuild { started: Notify, finish: Notify }
+
+    #[async_trait]
+    impl ArtefactBuilder for HeldBuild {
+        async fn definitions(&self, _: &Arc<PartitionValue>, _: &CancellationToken) -> Result<Vec<ArtefactDefinition>> {
+            Ok(vec![definition("body")])
+        }
+        async fn build(&self, job: &ArtefactJob, _: rtdb_maintenance::ArtefactSource<'_>, _: &Arc<PartitionValue>,
+            _: &CancellationToken,
+        ) -> Result<ArtefactRecord> {
+            self.started.notify_one();
+            self.finish.notified().await;
+            Ok(record(&job.definition.id))
+        }
+    }
+
+    let catalog = TrieCatalog::new(100).unwrap().with_tries(table(), [trie("l01-rc-b00", 100)], Timestamp(100)).unwrap();
+    let tables = TableCatalog::default().with_seeded_table(table(), Vec::new()).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let selected = CatalogCut { storage_version: StorageVersion(7), storage_epoch: StorageEpoch(0),
+        replica_epoch: StorageEpoch(0), through: ReplicaPosition(1) };
+    state.publish_catalog_cut(selected).unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let open = || Arc::new(LocalStore::open(directory.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+    let collector = open();
+    let builder = Arc::new(HeldBuild::default());
+    let (driver, handle) = ArtefactDriver::new(state.clone(), builder.clone(), Arc::new(Applying(state)),
+        (StorageVersion(7), StorageEpoch(0)), "search", open(), 1, 1, false).unwrap();
+    let cancellation = CancellationToken::new();
+    let running = tokio::spawn(driver.run(cancellation.clone()));
+    let build = tokio::spawn(async move { handle.build_all().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), builder.started.notified()).await.unwrap();
+    let newer = CatalogCut { through: ReplicaPosition(2), ..selected };
+    assert!(!collector.advance_catalog_floor(newer).await.unwrap());
+    builder.finish.notify_one();
+    build.await.unwrap().unwrap();
+    assert!(collector.advance_catalog_floor(newer).await.unwrap());
+    cancellation.cancel();
+    running.await.unwrap().unwrap();
+}
+
 #[test]
 fn a_stray_is_an_unrecorded_object_of_a_settled_definition_no_longer_in_force_under_a_live_trie() {
     let slug = TableSlug::recorded("public$docs").unwrap();
