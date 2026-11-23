@@ -28,6 +28,7 @@ pub trait ReplicaReadIndex: Send + Sync {
             offset: self.confirm().await?,
             wait: std::time::Duration::from_millis(20),
             retention: None,
+            certified_read: None,
         })
     }
 }
@@ -36,6 +37,7 @@ pub struct ProtectedReadIndex {
     pub offset: rtdb_storage::log::LogOffset,
     pub wait: std::time::Duration,
     pub retention: Option<Arc<dyn Send + Sync>>,
+    pub certified_read: Option<Arc<rtdb_types::residence_trace::CertifiedRead>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

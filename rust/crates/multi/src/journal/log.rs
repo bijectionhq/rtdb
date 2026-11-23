@@ -328,6 +328,7 @@ impl ReplicaReadIndex for JournalLog {
                         offset,
                         wait: Duration::from_secs(2),
                         retention: Some(retention),
+                        certified_read: None,
                     });
                 }
                 Err(ReadFailure::Refused(error)) => {

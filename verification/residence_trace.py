@@ -77,10 +77,64 @@ def installed_publication(event):
     return (*ordered_object_fence(event), event["key"])
 
 
-def verify_native(events, *, verify_catalog_history=True):
+def decision_identity(event, through="through"):
+    require(digest(event["ensemble"]) and digest(event["decision"]) and event["epoch"] > 0 and event[through] >= 0,
+            "certified decision lacks its exact authority")
+    return (event["stream"], event["epoch"], tuple(event["ensemble"]), event[through], tuple(event["decision"]))
+
+
+def certified_invocation(event):
+    nonce = event["invocation"]
+    require(len(nonce) == 16 and all(type(byte) is int and 0 <= byte < 256 for byte in nonce) and any(nonce),
+            "certified read lacks its probe invocation")
+    return tuple(nonce), decision_identity(event)
+
+
+def verify_certificate(event):
+    identity = decision_identity(event)
+    statement = bytes(event["statement"])
+    fingerprint = hashlib.sha256(b"rtdb.logkeeper/decision/v1\0" + statement).digest()
+    require(fingerprint == bytes(event["decision"]) and digest(event["prefix_digest"])
+            and digest(event["predecessor_digest"]) and -1 <= event["predecessor"] < event["through"],
+            "the portable statement belongs to another prefix")
+    roster = event["roster"]
+    require(roster == sorted(set(roster)) and len(roster) // 2 < event["quorum"] <= len(roster),
+            "the decision has no intersecting authority roster")
+    for witnesses in (event["voters"], event["installers"]):
+        require(len(witnesses) == len(set(witnesses)) == event["quorum"] and set(witnesses).issubset(roster),
+                "the decision lacks its distinct physical-journal quorum")
+    return identity
+
+
+def verify_certified_reads(events):
+    decisions, probes, captured = set(), {}, {}
+    for event in events:
+        kind = event["event"]
+        if kind == "certified-decision":
+            decisions.add(verify_certificate(event))
+        elif kind == "certified-read-index":
+            invocation, identity = certified_invocation(event)
+            require(probes.setdefault(invocation, identity) == identity, "a read probe changed its certified decision")
+        elif kind == "certified-catalog-capture":
+            invocation, identity = certified_invocation(event)
+            require(captured.setdefault(invocation, identity) == identity, "a catalog capture changed its certified decision")
+    for invocation, identity in probes.items():
+        require(identity in decisions, "read probe lacks its exact installed certificate")
+    for invocation, identity in captured.items():
+        require(probes.get(invocation) == identity, "catalog capture lacks its exact certified read probe")
+    answers = 0
+    for event in events:
+        if event["event"] == "certified-answer":
+            invocation, identity = certified_invocation(event)
+            require(captured.get(invocation) == identity, "answer lacks its exact certified catalog capture")
+            answers += 1
+    return answers
+
+
+def verify_native(events, *, verify_catalog_history=True, verify_certificate_history=True):
     require(events, "the native trace is empty")
     deletes, trims, catalogs, captures, holds, attempts, reads = {}, set(), {}, {}, {}, {}, set()
-    published_decisions, installed_grants = set(), set()
+    published_decisions, installed_grants, certificates = set(), set(), set()
     for index, event in enumerate(events):
         try:
             kind = event["event"]
@@ -100,14 +154,24 @@ def verify_native(events, *, verify_catalog_history=True):
                 installed_grants.add(installed_publication(event))
             elif kind == "remove-installed-publication":
                 require(installed_publication(event) in installed_grants, "installed deletion lacks its exact grant")
+            elif kind == "certified-decision":
+                certificates.add(verify_certificate(event))
+            elif kind in {"certified-read-index", "certified-catalog-capture", "certified-answer"}:
+                certified_invocation(event)
             elif kind == "quorum-publication":
                 peers = event["installed"]
                 require(digest(event["ensemble"]) and event["epoch"] > 0 and event["through"] >= 0
                         and event["quorum"] > 0 and len(peers) == len(set(peers)) and len(peers) >= event["quorum"],
                         "publication lacks its durable quorum")
-                published_decisions.add((event["stream"], event["epoch"], tuple(event["ensemble"]), event["through"]))
+                fingerprint = event.get("decision")
+                if fingerprint is not None:
+                    require(decision_identity(event) in certificates, "publication precedes its observed installation certificate")
+                published_decisions.add((event["stream"], event["epoch"], tuple(event["ensemble"]), event["through"],
+                                         tuple(fingerprint) if fingerprint is not None else None))
             elif kind == "quorum-receipt":
-                decision = (event["stream"], event["epoch"], tuple(event["ensemble"]), event["decision_through"])
+                fingerprint = event.get("decision")
+                decision = (event["stream"], event["epoch"], tuple(event["ensemble"]), event["decision_through"],
+                            tuple(fingerprint) if fingerprint is not None else None)
                 require(decision in published_decisions and 0 <= event["through"] <= event["decision_through"],
                         "append receipt precedes its observed quorum publication")
             elif kind == "retirement-recovery-dependency":
@@ -185,6 +249,8 @@ def verify_native(events, *, verify_catalog_history=True):
 
     if verify_catalog_history:
         verify_catalogs(catalogs)
+    if verify_certificate_history:
+        verify_certified_reads(events)
 
 
 def replica_scope(event):
@@ -199,7 +265,7 @@ def exact_checkpoint(event, checkpoint, manifest):
 def verify_joined(captures):
     """Join independently captured owner events by immutable identity and authority revision."""
     for events in captures:
-        verify_native(events, verify_catalog_history=False)
+        verify_native(events, verify_catalog_history=False, verify_certificate_history=False)
     events = [event for capture in captures for event in capture]
     published, catalogs, installed_trims, dependencies, replay_holds, exclusions = {}, {}, {}, {}, {}, {}
     for event in events:
@@ -226,7 +292,7 @@ def verify_joined(captures):
             exclusions[publication] = min(event["revision"], exclusions.get(publication, event["revision"]))
     verify_catalogs(catalogs)
     ordered_fences = {ordered_object_fence(event) for event in events if event["event"] == "ordered-object-fence"}
-    joined = 0
+    joined = verify_certified_reads(events)
     for event in events:
         kind = event["event"]
         if kind == "authorize-trim":

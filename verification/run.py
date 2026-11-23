@@ -4999,6 +4999,19 @@ def verify_native_recovery_trace(args, source):
         raise ValueError(f"{label}: the native residence capture omitted a checkpoint, hold, or trim observation")
     verify_native(native)
     verify_joined([native])
+    answers = [event for event in native if event["event"] == "certified-answer"]
+    if not answers:
+        raise ValueError(f"{label}: the follower did not deliver an answer from a certified capture")
+    bad_answer = copy.deepcopy(native)
+    answer = next(event for event in bad_answer if event["event"] == "certified-answer")
+    answer["through"] += 1
+    try:
+        verify_joined([bad_answer])
+    except ValueError as error:
+        if "answer lacks its exact certified catalog capture" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted a different answer cut")
     bad_root = copy.deepcopy(native)
     published = next(event for event in bad_root if event["event"] == "authorize-trim")
     published["manifest"][0] ^= 1

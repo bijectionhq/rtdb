@@ -76,6 +76,7 @@ pub struct ActiveLogletReadIndex {
     ensemble: Bytes,
     through: LogOffset,
     decision: Option<StableDecision>,
+    invocation: [u8; 16],
 }
 
 impl ActiveLogletReadIndex {
@@ -84,6 +85,7 @@ impl ActiveLogletReadIndex {
     pub fn ensemble(&self) -> &[u8] { &self.ensemble }
     pub fn through(&self) -> LogOffset { self.through }
     pub fn decision(&self) -> Option<&StableDecision> { self.decision.as_ref() }
+    pub fn invocation(&self) -> [u8; 16] { self.invocation }
 }
 
 struct Shared {
@@ -394,7 +396,7 @@ impl QuorumLog {
 
             let confirmed = |through, decision| ActiveLogletReadIndex {
                 stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(),
-                through: LogOffset(through), decision,
+                through: LogOffset(through), decision, invocation: nonce,
             };
             if let Some(scope) = ensemble.decision_scope(epoch) {
                 let mut selected: Option<&DecisionCertificate> = None;
@@ -427,6 +429,7 @@ impl QuorumLog {
                 if !observed.iter().any(|(_, reply)| reply.visible >= through) {
                     ensemble.ensure_replay(proof.clone()).await?;
                 }
+                proof.observe(ensemble.identity());
                 return Ok(confirmed(through, Some(proof)));
             }
 

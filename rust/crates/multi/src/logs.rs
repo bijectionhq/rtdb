@@ -67,10 +67,22 @@ impl ReplicaReadIndex for LogletReadIndex {
         } else {
             None
         };
+        let certified_read = if rtdb_types::residence_trace::enabled() {
+            index.decision().map(|proof| {
+                let observation = Arc::new(rtdb_types::residence_trace::CertifiedRead {
+                    invocation: index.invocation(), stream: index.stream().to_owned(), epoch: index.epoch(),
+                    ensemble: index.ensemble().try_into().expect("the certified ensemble fingerprint"),
+                    through: offset.0, decision: proof.certificate.statement.fingerprint(),
+                });
+                observation.observe("certified-read-index");
+                observation
+            })
+        } else { None };
         Ok(rtdb_node::ProtectedReadIndex {
             offset,
             wait: READ_INDEX_WITHIN,
             retention: Some(Arc::new((index, replay))),
+            certified_read,
         })
     }
 }

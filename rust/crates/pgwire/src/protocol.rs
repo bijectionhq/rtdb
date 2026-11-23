@@ -623,7 +623,9 @@ impl ProtocolSession {
                 if grant.is_bounded() { writer.flush().await?; }
                 Ok(())
             }
-        }).await.map_err(crate::wire::delivery_error)
+        }).await.map_err(crate::wire::delivery_error)?;
+        grant.observe_answer();
+        Ok(())
     }
 
     async fn simple<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {

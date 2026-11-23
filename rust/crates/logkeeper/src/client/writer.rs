@@ -909,11 +909,19 @@ impl Writer {
     }
 
     fn release(&self, pipeline: &mut Pipeline, quorum: i64) {
+        let decision = if rtdb_types::residence_trace::enabled() {
+            pipeline.stability.as_ref().filter(|proof| proof.certificate.statement.prefix.through == quorum)
+                .map(|proof| {
+                    proof.observe(self.ensemble.identity());
+                    proof.certificate.statement.fingerprint()
+                })
+        } else { None };
         rtdb_types::residence_trace::logkeeper_publication(
             &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), quorum,
             self.ensemble.config.write_quorum,
             || pipeline.replicas.iter().enumerate().filter_map(|(peer, replica)|
                 (replica.installed >= quorum).then_some(peer)).collect(),
+            decision,
         );
         let previous = pipeline.commit;
         pipeline.commit = quorum;
@@ -925,7 +933,7 @@ impl Writer {
                 && receipt.send(Ok(record(&buffered.entry).metadata)).is_ok()
             {
                 rtdb_types::residence_trace::logkeeper_receipt(
-                    &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), buffered.entry.lsn, quorum,
+                    &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), buffered.entry.lsn, quorum, decision,
                 );
             }
         }

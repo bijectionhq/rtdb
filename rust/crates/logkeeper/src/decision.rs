@@ -198,6 +198,23 @@ impl DecisionCertificate {
 }
 
 impl StableDecision {
+    pub(crate) fn observe(&self, ensemble: &[u8]) {
+        use rtdb_types::residence_trace::{CertifiedDecision, logkeeper_decision};
+        logkeeper_decision(|| {
+            let statement = &self.certificate.statement;
+            let journal = |key: &Bytes| journal_id(key.as_ref().try_into().expect("an authenticated journal key")).to_string();
+            CertifiedDecision {
+                stream: &statement.scope.stream, epoch: statement.scope.epoch, ensemble,
+                through: statement.prefix.through, predecessor: statement.prefix.predecessor,
+                decision: statement.fingerprint(), statement: statement.encode_to_vec(),
+                prefix_digest: &statement.prefix.digest, predecessor_digest: &statement.prefix.predecessor_digest,
+                roster: &statement.scope.journals, quorum: statement.scope.quorum,
+                voters: self.certificate.votes.iter().map(|vote| journal(&vote.key)).collect(),
+                installers: self.installed.iter().map(|install| journal(&install.key)).collect(),
+            }
+        });
+    }
+
     pub fn authentic(&self) -> bool {
         if !self.certificate.authentic()
             || self.installed.len() != self.certificate.statement.scope.quorum as usize

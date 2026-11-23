@@ -458,6 +458,7 @@ pub(crate) fn action_result_stream(
                 let value = value?;
                 let grant = plaintext.grant().await.map_err(status)?;
                 grant.check().map_err(status)?;
+                grant.observe_answer();
                 Ok(value)
             }).await.unwrap_or_else(|| Err(cancelled()));
             let stop = result.is_err();

@@ -129,8 +129,16 @@ impl Database {
                     _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
                     _ = self.cancellation.cancelled() => Err(self.replica_behind()),
                     retained = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage) => {
-                        drop(barrier);
-                        retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))
+                        let retained = retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
+                        if let Some(read) = &barrier.certified_read {
+                            if retained.catalog_cut().is_none_or(|cut| cut.through.after_offset(cut.replica_epoch) != read.through) {
+                                return Err(self.replica_behind());
+                            }
+                            read.observe("certified-catalog-capture");
+                            Ok(retained.with_certified_read(read.clone()))
+                        } else {
+                            Ok(retained)
+                        }
                     }
                 };
             }

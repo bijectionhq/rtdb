@@ -10,6 +10,7 @@ use std::{
 
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_types::residence_trace::CertifiedRead;
 
 use super::{ObjectCipher, UnitOperation};
 use crate::{Error, HeldView, IoRegion, ObjectKey, ReadLease, Result};
@@ -42,6 +43,7 @@ struct Unit {
 pub struct PlaintextView {
     memory: Arc<MemoryBudget>,
     units: Mutex<BTreeMap<(usize, ObjectKey), Arc<Unit>>>,
+    certified_reads: Mutex<BTreeMap<[u8; 16], (Arc<CertifiedRead>, Arc<MemoryReservation>)>>,
 }
 
 impl PlaintextView {
@@ -49,6 +51,7 @@ impl PlaintextView {
         Arc::new(Self {
             memory,
             units: Mutex::new(BTreeMap::new()),
+            certified_reads: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -71,6 +74,19 @@ impl PlaintextView {
                 None => work.await,
             }
         }
+    }
+
+    pub fn track_certified_read(read: &Arc<CertifiedRead>) -> rtdb_types::Result<()> {
+        PLAINTEXT_VIEWS.try_with(|views| {
+            for view in views.iter() {
+                let mut reads = view.certified_reads.lock();
+                if let std::collections::btree_map::Entry::Vacant(entry) = reads.entry(read.invocation) {
+                    let charge = view.memory.reserve(256)?;
+                    entry.insert((read.clone(), charge));
+                }
+            }
+            Ok(())
+        }).unwrap_or(Ok(()))
     }
 
     pub fn track(cipher: &Arc<dyn ObjectCipher>, name: &ObjectKey) -> Result<()> {
@@ -160,7 +176,11 @@ impl PlaintextView {
             };
             deadline = Some(deadline.map_or(expires, |prior: Instant| prior.min(expires)));
         }
+        let certified_reads = self.certified_reads.lock();
+        let trace_bytes = self.memory.reserve(certified_reads.len().saturating_mul(std::mem::size_of::<Arc<CertifiedRead>>()))?;
         let delivery = PlaintextDelivery {
+            certified_reads: certified_reads.values().map(|(read, _)| read.clone()).collect(),
+            _trace_bytes: trace_bytes,
             deadline,
             view: None,
             _custody: custody,
@@ -218,6 +238,8 @@ fn expired() -> rtdb_types::Anomaly {
 }
 
 pub struct PlaintextDelivery {
+    certified_reads: Vec<Arc<CertifiedRead>>,
+    _trace_bytes: Arc<MemoryReservation>,
     deadline: Option<Instant>,
     view: Option<(Arc<HeldView>, Option<Arc<ReadLease>>)>,
     _custody: Vec<Arc<dyn Send + Sync>>,
@@ -225,6 +247,12 @@ pub struct PlaintextDelivery {
 }
 
 impl PlaintextDelivery {
+    pub fn observe_answer(&self) {
+        for read in &self.certified_reads {
+            read.observe("certified-answer");
+        }
+    }
+
     pub fn holding(mut self, view: Arc<HeldView>, lease: Option<Arc<ReadLease>>) -> Self {
         self.view = Some((view, lease));
         self

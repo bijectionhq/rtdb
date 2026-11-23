@@ -213,7 +213,11 @@ impl Service {
                 };
                 read.admit(&service, &_call).await?;
                 for data in encoded {
-                    cursor.delivery_grant().await.map_err(status)?.check().map_err(status)?;
+                    {
+                        let grant = cursor.delivery_grant().await.map_err(status)?;
+                        grant.check().map_err(status)?;
+                        grant.observe_answer();
+                    }
                     yield data;
                 }
             }

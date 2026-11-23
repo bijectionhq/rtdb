@@ -306,6 +306,11 @@ impl QueryContext {
         let work = rtdb_storage::IoRegion::retaining(self.clone(), rtdb_storage::IoRegion::leased(self.catalog.read_lease(), work));
         let plaintext = self.plaintext.clone().unwrap_or_else(|| PlaintextView::new(Arc::clone(&self.memory)));
         let work = plaintext.reading(async {
+            for partition in self.catalog.databases.values().flat_map(|database| &database.partitions) {
+                if let Some(read) = partition.certified_read() {
+                    PlaintextView::track_certified_read(read)?;
+                }
+            }
             let answer = work.await?;
             self.grant_delivery(&plaintext).await?;
             Ok(answer)
