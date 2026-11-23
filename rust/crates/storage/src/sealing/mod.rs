@@ -123,7 +123,7 @@ pub struct EncryptingStore {
 }
 
 enum ObjectKeys {
-    Deployment(Cipher),
+    Deployment { cipher: Cipher, delivery: Option<Arc<dyn ObjectCipher>> },
     Units(Arc<dyn ObjectCipher>),
 }
 
@@ -131,7 +131,19 @@ impl EncryptingStore {
     pub fn new(inner: Arc<dyn ObjectStore>, key: &[u8]) -> Result<Self> {
         Ok(Self {
             inner,
-            keys: ObjectKeys::Deployment(Cipher::new(key)?),
+            keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: None },
+            replica_publications: false,
+            classic_control: None,
+        })
+    }
+
+    /// Opens a deployment-key store whose custody owner can confirm answer delivery.
+    pub fn with_deployment_delivery(
+        inner: Arc<dyn ObjectStore>, key: &[u8], authority: Arc<dyn ObjectCipher>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner,
+            keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: Some(authority) },
             replica_publications: false,
             classic_control: None,
         })
@@ -158,7 +170,14 @@ impl EncryptingStore {
 
     async fn crypt(&self, name: &ObjectKey, operation: UnitOperation) -> crate::Result<UnitOutput> {
         match &self.keys {
-            ObjectKeys::Deployment(cipher) => operation.apply(cipher, name),
+            ObjectKeys::Deployment { cipher, delivery } => {
+                let reads_plaintext = !operation.provisions();
+                let output = operation.apply(cipher, name)?;
+                if reads_plaintext && let Some(authority) = delivery {
+                    PlaintextView::track(authority, name)?;
+                }
+                Ok(output)
+            }
             ObjectKeys::Units(ledger) => {
                 let reads_plaintext = !operation.provisions();
                 let output = ledger.operate(name, operation).await?;

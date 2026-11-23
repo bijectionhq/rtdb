@@ -241,6 +241,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialized_deployment_plaintext_requires_its_original_key() {
+        use std::sync::atomic::AtomicBool;
+        use bytes::Bytes;
+        use crate::{MemoryStore, ObjectStore, sealing::EncryptingStore};
+
+        struct DeploymentKey(AtomicBool);
+
+        #[async_trait::async_trait]
+        impl ObjectCipher for DeploymentKey {
+            async fn operate(&self, _: &ObjectKey, _: UnitOperation) -> Result<UnitOutput> {
+                if self.0.load(Ordering::Relaxed) { Ok(UnitOutput::Granted) }
+                else { Err(Error::ErasedUnderView) }
+            }
+        }
+
+        let key = Arc::new(DeploymentKey(AtomicBool::new(true)));
+        let store = EncryptingStore::with_deployment_delivery(
+            Arc::new(MemoryStore::default()), &[8; 32], key.clone(),
+        ).unwrap();
+        let name = ObjectKey::new("tables/data").unwrap();
+        let original = Bytes::from_static(b"cached plaintext");
+        store.put(&name, original.clone()).await.unwrap();
+        let view = PlaintextView::new(MemoryBudget::new(64 << 10));
+        let plaintext = view.reading(store.get(&name)).await.unwrap();
+        assert_eq!(plaintext, original);
+
+        key.0.store(false, Ordering::Relaxed);
+        assert_eq!(view.grant().await.err().unwrap().code, "rtdb/erased-under-view");
+    }
+
+    #[tokio::test]
     async fn buffered_plaintext_cannot_renew_past_its_read_lease() {
         let memory = MemoryBudget::new(64 << 10);
         let view = PlaintextView::new(memory);

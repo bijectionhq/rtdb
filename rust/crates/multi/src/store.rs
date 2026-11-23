@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::cipher::{Cipher, object};
 use crate::catalog_readers::CatalogReaders;
 use crate::deployment::CellStorage;
-use crate::keys::KeyService;
+use crate::keys::{DeploymentDelivery, KeyService};
 pub use rtdb_storage::sealing::EncryptingStore;
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
@@ -313,12 +313,13 @@ impl RemoteStorageFactory for CellStoreFactory {
             Some(material) => material,
             None => self.enroll_serving_key(&config, &id).await?,
         };
-        let ordinary = EncryptingStore::new(cached, &material)?.with_replica_publications(
+        let delivery = DeploymentDelivery::new(self.keys.clone(), id, &material);
+        let ordinary = EncryptingStore::with_deployment_delivery(cached, &material, delivery.clone())?.with_replica_publications(
             self.replica_payload_reclamation && matches!(config.storage, crate::deployment::CellStorage::S3 { .. }),
         );
         let ordinary = Arc::new(ordinary);
         let audience = audience.zip(self.audience_writer(&config, &record)).map(|(store, source)| {
-            let store = Arc::new(AudienceObjectStore(EncryptingStore::new(store, &material)?));
+            let store = Arc::new(AudienceObjectStore(EncryptingStore::with_deployment_delivery(store, &material, delivery)?));
             Ok::<_, Anomaly>(AudienceReadStorage { source, store })
         }).transpose()?;
         Ok(OpenedServingStores { ordinary, audience })

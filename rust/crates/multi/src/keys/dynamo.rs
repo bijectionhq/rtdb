@@ -73,6 +73,7 @@ impl KeyService for DynamoKeyService {
             .expression_attribute_names("#material", KEY)
             .expression_attribute_values(":yes", AttributeValue::Bool(true))
             .send().await.map_err(|_| unavailable("destroy"))?;
+        rtdb_storage::sealing::drain_unit_delivery().await;
         Ok(())
     }
 

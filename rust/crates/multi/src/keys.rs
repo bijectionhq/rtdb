@@ -16,6 +16,8 @@ use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 mod archive;
+mod delivery;
+pub(crate) use delivery::DeploymentDelivery;
 mod assertion;
 mod journal;
 mod unit;
