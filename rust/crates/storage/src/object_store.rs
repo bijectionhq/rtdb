@@ -432,9 +432,9 @@ impl LocalStore {
 
     /// Settles the prefixes selected by the verified offline repair anchor.
     pub async fn retire_classic_log_prefixes(&self, anchor: crate::LocalRepairAnchor,
-        replica: &Path, maximum: usize,
+        replica: &Path, maximum: usize, vault: Option<&crate::sealing::ClassicKeyVault>,
     ) -> rtdb_types::Result<()> {
-        crate::classic_retirement::retire_log_prefixes(self, anchor, replica, maximum).await
+        crate::classic_retirement::retire_log_prefixes(self, anchor, replica, maximum, vault).await
     }
     /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {

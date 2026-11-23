@@ -168,16 +168,29 @@ pub(crate) fn prefix_end(file: &mut File, path: &Path, maximum: usize, boundary:
     Err(corrupt(path, boundary, "the checkpoint boundary does not name a complete record"))
 }
 
-pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u64) -> Result<()> {
+pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u64, keys: Option<&ClassicObjectKeys>) -> Result<()> {
     let zeros = [0; 8192];
     let mut next = 0;
-    if end > 0 && read_record_header_at(file, path, maximum, 0, end)?.sealed {
-        return Err(Error::Closed("Sealed Classic log retirement requires its original key authority".into()));
-    }
     while next < end {
         let header = read_record_header_at(file, path, maximum, next, end)?;
-        file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
-        file.write_all(&[if header.sealed { RETIRED_SEALED_SEPARATOR } else { RETIRED_SEPARATOR }]).map_err(|error| Error::io(path, error))?;
+        if header.sealed != keys.is_some() {
+            return Err(corrupt(path, next, "the log frame uses a different custody profile"));
+        }
+        if !header.retired {
+            if let Some(keys) = keys {
+                let mut sealed = vec![0; header.payload_size];
+                file.read_exact(&mut sealed).map_err(|error| Error::io(path, error))?;
+                read_record_trailer(file, path, header.metadata.offset)?;
+                keys.retire_record(header.metadata.offset.0, header.metadata.timestamp.0, &sealed)?;
+            }
+            file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
+            file.write_all(&[if header.sealed { RETIRED_SEALED_SEPARATOR } else { RETIRED_SEPARATOR }])
+                .map_err(|error| Error::io(path, error))?;
+            if header.sealed {
+                // The frame identity survives until its retirement marker is durable.
+                crate::sync_file(file).map_err(|error| Error::io(path, error))?;
+            }
+        }
         file.seek(SeekFrom::Start(next + HEADER_BYTES)).map_err(|error| Error::io(path, error))?;
         let mut remaining = header.payload_size;
         while remaining > 0 {
@@ -205,7 +218,7 @@ fn inspect(file: &mut File, path: &Path, maximum: usize, sealed: bool) -> Result
     Ok(latest)
 }
 
-pub(super) fn physical_maximum(maximum: usize, sealed: bool) -> Result<usize> {
+pub(crate) fn physical_maximum(maximum: usize, sealed: bool) -> Result<usize> {
     maximum.checked_add(if sealed { LOG_SEAL_OVERHEAD } else { 0 })
         .filter(|size| *size <= i32::MAX as usize)
         .ok_or_else(|| Error::Task("local log payload and seal exceed i32 framing".into()))
@@ -600,6 +613,39 @@ mod retention_tests {
     use super::*;
 
     #[test]
+    fn sealed_prefix_resumes_after_key_withdrawal_before_frame_settlement() -> Result<()> {
+        let payloads = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
+        let vault = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
+        let vault = ClassicKeyVault::open(vault.path()).map_err(|error| Error::Task(error.to_string()))?;
+        let path = Arc::new(payloads.path().join("REPLICA_LOG"));
+        let keys = vault.log_keys(&path, true, IoRegion::new()).map_err(|error| Error::Task(error.to_string()))?;
+        let mut writer = Writer {
+            file: File::options().read(true).write(true).create_new(true).open(path.as_ref())
+                .map_err(|error| Error::io(&path, error))?,
+            path: Arc::clone(&path),
+            timestamps: Arc::new(SuppliedTimestamp),
+            keys: Some(Arc::clone(&keys)),
+        };
+        let record = |payload: &'static [u8]| Queued {
+            payload: Bytes::from_static(payload), timestamp: Timestamp(5), durable: oneshot::channel().0,
+        };
+        let records = writer.append(&[record(b"old payload"), record(b"retained boundary")])?;
+        let maximum = physical_maximum(1024, true)?;
+        let end = prefix_end(&mut writer.file, &path, maximum, records[1].offset, false)?;
+        let header = read_record_header_at(&mut writer.file, &path, maximum, 0, end)?;
+        let mut sealed = vec![0; header.payload_size];
+        writer.file.read_exact(&mut sealed).map_err(|error| Error::io(&path, error))?;
+        keys.retire_record(0, records[0].timestamp.0, &sealed)?;
+        assert!(matches!(keys.open_record(0, records[0].timestamp.0, &sealed), Err(Error::ErasedUnderView)));
+        for _ in 0..2 {
+            settle_prefix(&mut writer.file, &path, maximum, end, Some(&keys))?;
+        }
+        writer.file.seek(SeekFrom::Start(end)).map_err(|error| Error::io(&path, error))?;
+        assert_eq!(read_record(&mut writer.file, &path, maximum, Some(&keys))?.payload, Bytes::from_static(b"retained boundary"));
+        Ok(())
+    }
+
+    #[test]
     fn settling_a_prefix_keeps_frame_offsets_and_excludes_its_payloads() -> Result<()> {
         let scratch = tempfile::NamedTempFile::new().map_err(|error| Error::Task(error.to_string()))?;
         let path = Arc::new(scratch.path().to_path_buf());
@@ -615,11 +661,11 @@ mod retention_tests {
         let records = writer.append(&[record(b"old receipt"), record(b"surviving suffix")])?;
         let before = records[1].offset;
         let end = prefix_end(&mut writer.file, &path, 1024, before, false)?;
-        for _ in 0..2 { settle_prefix(&mut writer.file, &path, 1024, end)?; }
+        for _ in 0..2 { settle_prefix(&mut writer.file, &path, 1024, end, None)?; }
 
         let bytes = fs::read(path.as_ref()).map_err(|error| Error::io(&path, error))?;
         assert!(bytes[HEADER_BYTES as usize..HEADER_BYTES as usize + b"old receipt".len()].iter().all(|byte| *byte == 0));
-        assert_eq!(inspect(&mut writer.file, &path, 1024)?, before);
+        assert_eq!(inspect(&mut writer.file, &path, 1024, false)?, before);
         writer.file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(&path, error))?;
         assert!(matches!(read_record(&mut writer.file, &path, 1024, None), Err(Error::UnavailableLogRange { requested: 0, .. })));
         writer.file.seek(SeekFrom::Start(before.0 as u64)).map_err(|error| Error::io(&path, error))?;

@@ -7,7 +7,7 @@ use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_compacted_primary_
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result, SourcePosition};
 
 use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
-    log::{LogOffset, local::{prefix_end, settle_prefix}}, sealing::ObjectCipher};
+    log::{LogOffset, local::{physical_maximum, prefix_end, settle_prefix}}, sealing::{ClassicKeyVault, ClassicObjectKeys, ObjectCipher, UnitOperation}};
 
 
 struct TrieDeletionGrant<'a> {
@@ -86,8 +86,9 @@ impl<'a> TrieDeletionGrant<'a> {
 }
 
 struct ClassicLogDeletionGrant {
-    source: (PathBuf, File, u64),
-    replica: (PathBuf, File, u64),
+    source: (PathBuf, File, u64, Option<Arc<ClassicObjectKeys>>),
+    replica: (PathBuf, File, u64, Option<Arc<ClassicObjectKeys>>),
+    storage_keys: Option<Arc<ClassicObjectKeys>>,
     source_through: SourcePosition,
     maximum: usize,
     _recovery_gate: Arc<dyn Send + Sync>,
@@ -95,17 +96,35 @@ struct ClassicLogDeletionGrant {
 
 impl ClassicLogDeletionGrant {
     async fn authorize(store: &LocalStore, anchor: LocalRepairAnchor, replica: &Path,
-        maximum: usize,
+        maximum: usize, vault: Option<&ClassicKeyVault>,
     ) -> Result<Self> {
         let unavailable = || Anomaly::incorrect("rtdb.storage/log-retirement", "Retiring a local log requires its exact retained checkpoint and exclusive custody");
         let gate = store.try_lock_recovery_deletion().await?.ok_or_else(unavailable)?;
         if store.retained_repair_anchor().await? != Some(anchor) || replica.file_name().and_then(|name| name.to_str()) != Some("REPLICA_LOG") {
             return Err(unavailable());
         }
-        crate::sealing::ClassicKeyVault::require_unsealed_log(replica)?;
-        crate::sealing::ClassicKeyVault::require_unsealed_log(&replica.with_file_name("LOG"))?;
+        let source = replica.with_file_name("LOG");
+        let (source_keys, replica_keys, storage_keys) = match vault {
+            Some(vault) => (
+                Some(vault.log_keys(&source, false, Arc::clone(store.io_region()))?),
+                Some(vault.log_keys(replica, false, Arc::clone(store.io_region()))?),
+                Some(vault.units(store, Arc::clone(store.io_region()), false).await?),
+            ),
+            None => {
+                ClassicKeyVault::require_unsealed_log(replica)?;
+                ClassicKeyVault::require_unsealed_log(&source)?;
+                ClassicKeyVault::require_unenrolled(store).await?;
+                (None, None, None)
+            }
+        };
+        let maximum = physical_maximum(maximum, vault.is_some())?;
         let root = ObjectKey::new(block_key(anchor.block)?)?;
-        let catalog = BlockCatalog::decode(&store.get_fresh(&root).await?)?;
+        let bytes = store.get_fresh(&root).await?;
+        let bytes = match &storage_keys {
+            Some(keys) => keys.operate(&root, UnitOperation::Open(bytes)).await?.bytes()?,
+            None => bytes,
+        };
+        let catalog = BlockCatalog::decode(&bytes)?;
         if catalog.publication_sha256() != Some(anchor.sha256)
             || catalog.boundary_replica_position() != Some(anchor.boundary)
         {
@@ -115,7 +134,6 @@ impl ClassicLogDeletionGrant {
             .filter(|source| source.after_offset(anchor.boundary.epoch()) >= 0).ok_or_else(unavailable)?;
         let replica = replica.to_path_buf();
         store.io_region().run(move || {
-            let source = replica.with_file_name("LOG");
             let open = |path: &Path| OpenOptions::new().read(true).write(true).open(path)
                 .map_err(|error| Error::io(path, error));
             let mut source_file = open(&source)?;
@@ -126,8 +144,11 @@ impl ClassicLogDeletionGrant {
                 LogOffset(source_through.after_offset(anchor.boundary.epoch())), true)?;
             let replica_end = prefix_end(&mut replica_file, &replica, maximum,
                 LogOffset(anchor.boundary.offset()), false)?;
-            Ok(Self { source: (source, source_file, source_end), replica: (replica, replica_file, replica_end),
-                source_through, maximum, _recovery_gate: gate })
+            Ok(Self {
+                source: (source, source_file, source_end, source_keys),
+                replica: (replica, replica_file, replica_end, replica_keys),
+                storage_keys, source_through, maximum, _recovery_gate: gate,
+            })
         }).await.map_err(Into::into)
     }
 
@@ -135,18 +156,23 @@ impl ClassicLogDeletionGrant {
         let through = self.source_through;
         IoRegion::retaining(Arc::clone(&self._recovery_gate), async {
             let locked = store.io_region().run(move || {
-                let (path, file, end) = &mut self.source;
-                settle_prefix(file, path, self.maximum, *end)?;
-                let (path, file, end) = &mut self.replica;
-                settle_prefix(file, path, self.maximum, *end)?;
+                let (path, file, end, keys) = &mut self.source;
+                settle_prefix(file, path, self.maximum, *end, keys.as_deref())?;
+                let (path, file, end, keys) = &mut self.replica;
+                settle_prefix(file, path, self.maximum, *end, keys.as_deref())?;
                 Ok(self)
             }).await?;
-            for object in store.list(Some(&ObjectKey::new("skipped-txs")?)).await? {
-                if skipped_tx_position(object.key.as_str()).is_some_and(|position|
-                    position.epoch() == through.epoch() && position <= through)
-                {
-                    store.delete(&object.key).await?;
-                }
+            let skipped = store.list(Some(&ObjectKey::new("skipped-txs")?)).await?
+                .into_iter().filter_map(|object| {
+                    skipped_tx_position(object.key.as_str()).filter(|position|
+                        position.epoch() == through.epoch() && *position <= through
+                    ).map(|_| object.key)
+                }).collect::<Vec<_>>();
+            if let Some(keys) = &locked.storage_keys {
+                keys.withdraw_units(&skipped).await?;
+            }
+            for key in skipped {
+                store.delete(&key).await?;
             }
             drop(locked);
             Ok(())
@@ -155,9 +181,9 @@ impl ClassicLogDeletionGrant {
 }
 
 pub(crate) async fn retire_log_prefixes(store: &LocalStore, anchor: LocalRepairAnchor,
-    replica: &Path, maximum: usize,
+    replica: &Path, maximum: usize, vault: Option<&ClassicKeyVault>,
 ) -> Result<()> {
-    ClassicLogDeletionGrant::authorize(store, anchor, replica, maximum).await?.settle(store).await
+    ClassicLogDeletionGrant::authorize(store, anchor, replica, maximum, vault).await?.settle(store).await
 }
 
 pub(crate) async fn retire(store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {

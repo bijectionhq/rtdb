@@ -242,7 +242,7 @@ impl ClassicObjectKeys {
         self.withdraw_units(std::slice::from_ref(key)).await
     }
 
-    async fn withdraw_units(&self, keys: &[ObjectKey]) -> crate::Result<()> {
+    pub(crate) async fn withdraw_units(&self, keys: &[ObjectKey]) -> crate::Result<()> {
         if keys.is_empty() { return Ok(()); }
         let paths = keys.iter().map(|key| {
             if key.as_str() == OWNER { return Err(Error::InvalidKey(key.to_string())); }
@@ -363,6 +363,38 @@ impl ClassicObjectKeys {
             cipher.open(&associated, ciphertext)
         })
     }
+
+    pub(crate) fn retire_record(&self, offset: i64, timestamp: i64, sealed: &[u8]) -> crate::Result<()> {
+        let (publication, _) = sealed.split_at_checked(16)
+            .ok_or_else(|| Error::Task("The sealed Classic frame has no publication identity".into()))?;
+        let publication = Uuid::from_slice(publication)
+            .map_err(|_| Error::Task("Invalid log publication identity".into()))?;
+        let slot = self.name(&ObjectKey::new(format!("frames/{publication}"))?);
+        let marker = slot.with_extension("retirement");
+        let mut binding = ring::digest::Context::new(&SHA256);
+        binding.update(b"rtdb.classic.log-retirement/v1\0");
+        binding.update(&offset.to_be_bytes());
+        binding.update(&timestamp.to_be_bytes());
+        binding.update(sealed);
+        let binding = binding.finish();
+        match fs::read(&marker) {
+            Ok(prior) if prior == binding.as_ref() => {}
+            Ok(_) => return Err(Error::Task("The sealed log retirement intent differs".into())),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // Authenticate this offset and its original publication before
+                // recording authority to destroy its slot.
+                self.open_record(offset, timestamp, sealed)?;
+                let mut intent = tempfile::NamedTempFile::new_in(self.path.as_ref()).map_err(io(&marker))?;
+                intent.write_all(binding.as_ref()).map_err(io(&marker))?;
+                crate::sync_file(intent.as_file()).map_err(io(&marker))?;
+                intent.persist_noclobber(&marker).map_err(|error| io(&marker)(error.error))?;
+                sync_directory(self.path.as_ref()).map_err(io(&marker))?;
+            }
+            Err(error) => return Err(io(&marker)(error)),
+        }
+        withdraw_slot(&slot)
+    }
+
 }
 
 fn with_key<T>(
