@@ -77,6 +77,14 @@ impl<'a> ListView<'a> {
         }
     }
 
+    pub fn binary(self, index: usize) -> Option<&'a [u8]> {
+        match self {
+            Self::Values(values) => match values.get(index)? { Value::Binary(bytes) => Some(bytes), _ => None },
+            Self::Scalars(values) if index < self.len() => values.binary(index),
+            _ => None,
+        }
+    }
+
     pub fn is_packed_numeric(self) -> bool { !matches!(self, Self::Values(_) | Self::Scalars(_)) }
 
     pub fn numeric_component(self, index: usize) -> NumericCell {

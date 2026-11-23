@@ -416,6 +416,7 @@ variant TxMessage : SourceMessage {
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
+    -- Source replay validates fixed-range binary and text bounds from the selected child positions.
     -- Replica replay can validate hosted control and world inventories from selected UTF-8 child positions.
     -- PATCH replay binds compatible document and IID vectors to the mutation plan as one list of records.
     -- Put and create-only insert replay retain their Arrow document vectors.

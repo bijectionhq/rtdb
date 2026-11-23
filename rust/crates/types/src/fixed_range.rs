@@ -64,11 +64,15 @@ impl FixedRangeKey {
         let Value::Binary(binary) = binary else {
             return Err(invalid());
         };
+        Self::from_parts(binary, id)
+    }
+
+    fn from_parts(binary: &[u8], id: &str) -> Result<Self> {
         if binary.len() > FIXED_RANGE_COMPONENT_BYTES || id.len() > FIXED_RANGE_COMPONENT_BYTES {
             return Err(invalid());
         }
         Ok(Self {
-            binary: binary.clone(),
+            binary: binary.to_vec(),
             id: id.to_owned(),
         })
     }
@@ -94,10 +98,11 @@ impl FixedRangeKey {
         let Value::List(values) = value else {
             return Err(invalid());
         };
-        let crate::ListView::Values([binary, Value::Utf8(id)]) = values.view() else {
-            return Err(invalid());
-        };
-        Self::new(binary, id)
+        let values = values.view();
+        if values.len() != 2 { return Err(invalid()); }
+        let binary = values.binary(0).ok_or_else(invalid)?;
+        let id = values.utf8(1).ok_or_else(invalid)?;
+        Self::from_parts(binary, id)
     }
 
     pub fn belongs_to(&self, id: &EntityId) -> bool {
@@ -182,4 +187,29 @@ fn invalid() -> Anomaly {
         "rtdb.owned/fixed-range-evidence",
         "Invalid fixed owned range evidence",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixed_range_key_accepts_packed_binary_and_text_legs() {
+        use std::sync::Arc;
+        use arrow_array::{Array, BinaryArray, StringArray, UnionArray};
+        use arrow_schema::{DataType, Field, UnionFields};
+
+        let fields = UnionFields::try_new([3, 7], [
+            Field::new("binary", DataType::Binary, false),
+            Field::new("utf8", DataType::Utf8, false),
+        ]).unwrap();
+        let bytes: &[u8] = &[5, 2];
+        let array = UnionArray::try_new(fields, vec![3, 7].into(), Some(vec![0, 0].into()), vec![
+            Arc::new(BinaryArray::from(vec![bytes])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ]).unwrap();
+        let field = Arc::new(Field::new("value", array.data_type().clone(), false));
+        let list = crate::ListValue::from_scalar_arrow(field, Arc::new(array)).unwrap();
+        let key = super::FixedRangeKey::from_value(&crate::Value::List(list)).unwrap();
+        assert_eq!(key.binary, bytes);
+        assert_eq!(key.id, "a");
+    }
 }

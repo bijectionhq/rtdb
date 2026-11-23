@@ -47,7 +47,6 @@ impl ScalarList {
             (DataType::FixedSizeBinary(width), None) => ScalarType::FixedSizeBinary(*width),
             (DataType::FixedSizeBinary(16), Some("uuid")) => ScalarType::Uuid,
             (DataType::Int32, Some("xt/oid")) => ScalarType::Oid,
-            (DataType::Int32, Some("xt/regclass")) => ScalarType::RegClass,
             (DataType::Int32, Some("xt/regproc")) => ScalarType::RegProc,
             (_, Some(_)) => return None,
             (ty, None) => match ty {
@@ -130,6 +129,12 @@ impl ScalarList {
             && array.is_valid(row)).then(|| array.as_string::<i32>().value(row))
     }
 
+    pub(crate) fn binary(&self, index: usize) -> Option<&[u8]> {
+        let (field, array, row) = self.active_cell(index);
+        (field.data_type() == &DataType::Binary && !field.metadata().contains_key("ARROW:extension:name")
+            && array.is_valid(row)).then(|| array.as_binary::<i32>().value(row))
+    }
+
     pub(crate) fn value(&self, index: usize) -> Value {
         if let Some(scalar) = &self.scalar {
             return Self::scalar_value(scalar, self.array.as_ref(), index);
@@ -155,7 +160,6 @@ impl ScalarList {
             ScalarType::FixedSizeBinary(_) => Value::FixedSizeBinary(array.as_fixed_size_binary().value(index).to_vec()),
             ScalarType::Uuid => Value::Uuid(array.as_fixed_size_binary().value(index).try_into().expect("uuid width")),
             ScalarType::Oid => Value::Oid(array.as_primitive::<arrow_array::types::Int32Type>().value(index)),
-            ScalarType::RegClass => Value::RegClass(array.as_primitive::<arrow_array::types::Int32Type>().value(index)),
             ScalarType::RegProc => Value::RegProc(array.as_primitive::<arrow_array::types::Int32Type>().value(index)),
             ScalarType::DateDay => Value::DateDay(temporal() as i32),
             ScalarType::DateMilli => Value::DateMilli(temporal()),
