@@ -473,3 +473,84 @@ async fn compaction_preserves_raw_decimal_coefficients_in_current_and_historical
     assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[tokio::test]
+async fn reinsertion_keeps_erase_effective_at_earlier_system_times_after_compaction() {
+    use rtdb_temporal::HistoryResolver;
+    use rtdb_types::{EventOp, TemporalBounds};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let table = TableRef::new("public", "docs");
+    let slug = TableSlug::for_unrecorded_table(&table).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let memory = MemoryBudget::new(64 * 1024 * 1024);
+    let executor = SegmentCompactor::new(store.clone(), state, Arc::clone(&memory), StorageVersion(6), StorageEpoch(0), MergeConfig {
+        temporary_directory: temporary.path().into(), ..Default::default()
+    }).unwrap();
+    let fields = StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let row = |system, valid_time, operation| StoredEvent {
+        origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]),
+        system_from: Timestamp(system), valid_time, operation, recency: None,
+    };
+    let put = |value| StoredOperation::Put(StructFields::from([("value".into(), Value::I64(value))]));
+    let erase = row(200, Interval::ALL, StoredOperation::Erase);
+    let older = row(100, Interval::ALL, put(10));
+    let read = |rows: &[StoredEvent], system, valid| {
+        let mut resolver = HistoryResolver::new(TemporalBounds {
+            valid_time: Interval::from_micros(valid, valid + 1).unwrap(),
+            system_time: Interval::from_micros(system, system + 1).unwrap(),
+        }, false);
+        rows.iter().flat_map(|row| resolver.resolve(&row.header(), &row.operation).unwrap())
+            .map(|row| match row.source {
+                StoredOperation::Put(document) => document.get("value").unwrap().clone(),
+                _ => unreachable!(),
+            }).collect::<Vec<_>>()
+    };
+
+    for (block, (system, validity)) in [
+        (300, Interval::from_micros(300, i64::MAX).unwrap()),
+        (200, Interval::from_micros(200, i64::MAX).unwrap()),
+        (200, Interval::ALL),
+        (200, Interval::from_micros(200, 400).unwrap()),
+    ].into_iter().enumerate() {
+        let block = BlockIndex(block as i64 + 1);
+        let input = TrieKey::l0(block).unwrap();
+        let selected = [row(system, validity, put(11)), erase.clone()];
+        let original = [selected[0].clone(), erase.clone(), older.clone()];
+        assert!(read(&original, 100, 350).is_empty());
+        assert_eq!(read(&original, system, 350), [Value::I64(11)]);
+
+        let batch = build_event_batch(&selected, Some(fields.clone()), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, true);
+        metadata.write_leaf(&batch).unwrap();
+        let (metadata, _) = metadata.finish().unwrap();
+        store.put(&ObjectKey::new(slug.data_key(&input)).unwrap(), write_file(&batch.schema(), &[batch]).unwrap().into()).await.unwrap();
+        store.put(&ObjectKey::new(slug.metadata_key(&input)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+
+        let output = TrieKey::new(1, None, vec![], block).unwrap();
+        let job = CompactionJob { table: table.clone(), inputs: vec![input], part: vec![], output, recency_mode: RecencyMode::Partition };
+        let notice = executor.execute(&job, &CancellationToken::new()).await.unwrap();
+        let mut outputs: Vec<TrieKey> = notice.tries.iter().map(|detail| detail.trie_key().parse().unwrap()).collect();
+        outputs.sort();
+        let mut compacted = Vec::new();
+        for key in outputs {
+            let bytes = store.get(&ObjectKey::new(slug.data_key(&key)).unwrap()).await.unwrap();
+            let mut file = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
+            for page in 0..file.page_count() {
+                let batch = EventBatch::new(file.read_page(page).unwrap()).unwrap();
+                for index in 0..batch.len() {
+                    compacted.push(batch.read_event(index).unwrap());
+                }
+            }
+        }
+        assert_eq!(compacted.iter().filter(|row| row.header().op == EventOp::Erase).collect::<Vec<_>>(), [&erase],
+            "erase marker after reinsertion at {system} over {validity:?}");
+        compacted.push(older.clone());
+        compacted.sort_by_key(|row| std::cmp::Reverse(row.system_from));
+        assert_eq!(read(&compacted, 100, 350), read(&original, 100, 350));
+        assert_eq!(read(&compacted, system, 350), read(&original, system, 350));
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}

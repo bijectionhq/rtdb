@@ -287,12 +287,20 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
             system_from: None, erased: false,
         })?;
         if state.erased { continue; }
+        let header = event.header();
+        if header.op == EventOp::Erase {
+            state.erased = true;
+            charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+            let mut marker = event.clone();
+            marker.valid_time = Interval::ALL;
+            result.push(marker);
+            continue;
+        }
         if state.system_from != Some(event.system_from) {
             state.calculator.reset();
             state.system_from = Some(event.system_from);
         }
-        let header = event.header();
-        let resolved = state.calculator.visit(&header, |polygon| {
+        state.calculator.visit(&header, |polygon| {
             if header.position.is_some() || header.commit_position != 0 || header.op == EventOp::Redacted {
                 charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
                 result.push(event.clone());
@@ -308,13 +316,6 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
             }
             Ok(())
         })?;
-        if header.op == EventOp::Erase { state.erased = true; }
-        if resolved.is_none() {
-            charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-            let mut event = event.clone();
-            event.valid_time = Interval::ALL;
-            result.push(event);
-        }
     }
     Ok((result, charges))
 }
@@ -396,6 +397,7 @@ impl SegmentCompactor {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let mut rows = Vec::new();
             let mut charges = Vec::new();
+            let mut erase_times = BTreeMap::new();
             for page in &task.pages {
                 let input = &mut inputs[page.segment];
                 let batch = read_page(&mut input.reader, page.page, &self.memory)?;
@@ -408,6 +410,13 @@ impl SegmentCompactor {
                 }
                 let path = if job.part.len() > task.path.len() { &job.part } else { &task.path };
                 events.retain(|event| planner::matches_path(event.iid, path));
+                if job.recency_mode == RecencyMode::Partition {
+                    for event in events.iter().filter(|event| event.header().op == EventOp::Erase) {
+                        if let std::collections::btree_map::Entry::Vacant(entry) = erase_times.entry((event.iid, event.system_from)) {
+                            entry.insert(self.memory.reserve(512)?);
+                        }
+                    }
+                }
                 charges.push(event_reservation(&self.memory, &events, 2)?);
                 rows.push(planner::PageRows { source_precedence: source_precedence[page.segment], events });
             }
@@ -437,7 +446,10 @@ impl SegmentCompactor {
                 if event.op == EventOp::Erase && job.table.stores_expiring_transaction_metadata() {
                     continue;
                 }
-                if event.position.is_some() || event.commit_position != 0 || event.op == EventOp::Redacted {
+                // Splitting an erase from same-time events lets trie precedence override operation order.
+                if erase_times.contains_key(&(event.iid, event.system_from)) {
+                    recency = Timestamp::MAX;
+                } else if event.position.is_some() || event.commit_position != 0 || event.op == EventOp::Redacted {
                     recency = recency.max(event.system_from);
                 }
                 let target = if job.recency_mode == RecencyMode::Partition && recency != Timestamp::MAX {

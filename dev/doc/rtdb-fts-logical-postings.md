@@ -54,6 +54,7 @@ The directory keeps headers, stable origins, and an Arrow location hint through 
 Where events carry typed keys, the full key delimits the history behind the routing IID.
 Compaction preserves event origins, so a reader can find a relocated payload when the hint's trie has retired.
 Each erase advances the entity's frontier and removes earlier events, including for reads at older system times.
+Primary compaction preserves the erase marker's all-time bounds for scan pruning and keeps it ordered with reinsertions at the same system time.
 A directory can bootstrap from retained L0 sources with stable event origins.
 Legacy points can route through per-trie histories or the selected primary pages.
 Upgrade readers and compaction workers together with ingest writers when enabling this mode or upgrading an existing format 16 deployment.

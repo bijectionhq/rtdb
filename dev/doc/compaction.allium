@@ -147,7 +147,7 @@ config {
 -- An expiring transaction metadata table merges its earliest live L0 with all older active primary inputs into one unpartitioned successor.
 -- Its merge consumes ordered erase events to exclude older puts, then omits those erase events from the complete successor.
 -- The installed successor supersedes its covered inputs irrespective of the ordinary partial-file size limit.
--- L0 normalization retains the latest erase marker and excludes every older event for the same entity.
+-- Native L0 normalization retains the latest erase marker with its full valid-time extent and excludes earlier events for the same entity, including preceding operations at the same system time.
 -- Other exact entity keys in the same IID bucket remain eligible for normalization.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.
 -- The merge heap admits pages ordered by ascending IID and descending system position.
@@ -157,6 +157,7 @@ config {
 --   L0 → L1C/L1H: recency is calculated for each event through bitemporal resolution.
 --     Events with recency = ∞ go to the current output file.
 --     Events with finite recency are routed to historical output files, partitioned into weekly buckets.
+--     Native compaction assigns infinite recency to an erase marker and surviving events with the same IID and system time, preserving their merge order in the current output.
 --     With `within_file_recency_branching` on, every row of a historical output file carries the recency computed for it in a `_recency` column; current output files carry none.
 --   All other compactions: recency from the input file's trie key is preserved into a single output file.
 --     Recency is never recomputed above L1H.
