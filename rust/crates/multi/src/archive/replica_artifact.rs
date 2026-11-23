@@ -414,7 +414,7 @@ mod tests {
                     },
                     source_incarnation: 1, source_log_epoch: 0,
                     checkpoint: Checkpoint { block: 1, boundary: 7, source: 1, system_time: 10, root_sha256: Some([1; 32]) },
-                    media: CellMedia { objects: "objects".into(), keys: "keys".into() },
+                    media: CellMedia { objects: [4; 32], keys: "keys".into() },
                     transfer_only: true, staged_manifest_sha256: Some("staged".into()),
                 },
                 source_writer_epoch: 1, fenced_writer_epoch: 2,
