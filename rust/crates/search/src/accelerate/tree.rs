@@ -8,68 +8,48 @@ use rtdb_text::Scorer;
 use tokio::sync::OnceCell;
 
 use super::*;
-use crate::file::{TREE_FORMAT_VERSION, TreeFile, TreeLocator, TreeRankOrder, TreeRanked};
+use super::point::SearchWitness;
+use crate::file::{TREE_FORMAT_VERSION, TreeFile, TreeRankOrder, TreeRanked};
 
-struct RecordedTree {
-    key: ObjectKey,
-    owner: ArtefactOwner,
-    definition_id: String,
-    locator: TreeLocator,
-    members: BTreeMap<u32, TrieKey>,
+pub(super) struct RecordedTree {
+    pub(super) pack: Arc<super::routing::Pack>,
+    pub(super) members: BTreeMap<u32, TrieKey>,
     discovery: bool,
     opened: OnceCell<Arc<TreeFile>>,
 }
 
 impl RecordedTree {
-    fn select(request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<Option<Vec<Self>>> {
-        let snapshot = request.snapshot;
-        let table = &definition.table;
-        let Some(entry) = snapshot.table_entry(table) else { return Ok(None); };
-        let definition_id = definition.artefact_id_for(TREE_FORMAT_VERSION);
-        let earliest = request.bounds.valid_time.lower().0.min(request.bounds.system_time.lower().0);
-        let mut sources = BTreeMap::<ObjectKey, Self>::new();
-        for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live) {
-            if trie.key.recency().is_some_and(|date| date.epoch_day().saturating_mul(86_400_000_000) <= earliest) { continue; }
-            let Some(record) = trie.artefact(KIND, &definition_id, definition.version) else { continue; };
-            let Some(locator) = record.stats.as_deref().and_then(crate::file::decode_tree_locator)
-                .filter(|locator| i64::try_from(locator.length).ok() == record.file_size) else { continue; };
-            let owner = ArtefactOwner::of(&trie.key, record)?;
-            let Some(member) = owner.tries().iter().position(|key| key == &trie.key) else { return Ok(None); };
-            let key = ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?;
-            let discovery = record.stats.as_deref().and_then(crate::file::decode_sections)
-                .is_none_or(|sections| sections.iter().any(|section| section.meets(request.bounds)));
-            let source = sources.entry(key.clone()).or_insert_with(|| Self {
-                key, owner, definition_id: definition_id.clone(), locator: locator.clone(),
-                members: BTreeMap::new(), discovery: false, opened: OnceCell::new(),
-            });
-            if source.locator != locator { return Ok(None); }
-            source.members.insert(member as u32, trie.key.clone());
-            source.discovery |= discovery;
-        }
-        Ok((!sources.is_empty()).then(|| sources.into_values().collect()))
+    fn select(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition,
+        column: usize, matching: &Query, include_packs: bool) -> Result<Vec<Self>> {
+        let routing = runtime.table_routing(request.snapshot, definition, request.storage, include_packs)?;
+        Ok(routing.packs().filter_map(|pack| {
+            let members = pack.visible_members(request.bounds);
+            (!members.is_empty()).then(|| Self { pack: Arc::clone(pack), members,
+                discovery: pack.can_nominate(request.bounds, column, matching), opened: OnceCell::new() })
+        }).collect())
     }
 
-    async fn open(&self, runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<Arc<TreeFile>> {
+    pub(super) async fn open(&self, runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<Arc<TreeFile>> {
         self.opened.get_or_try_init(|| async {
             let entry = request.snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
-            let identity = crate::file::artefact_identity(entry.slug.as_str(), &self.owner, &self.definition_id, definition.version);
-            match runtime.tree_file(request.storage, &self.key, &self.locator, &definition.columns, &identity, definition.version, false).await {
+            let identity = crate::file::artefact_identity(entry.slug.as_str(), &self.pack.owner, &self.pack.definition_id, definition.version);
+            match runtime.tree_file(request.storage, &self.pack.key, &self.pack.locator, &definition.columns, &identity, definition.version, false).await {
                 Ok(file) => Ok(file),
-                Err(crate::runtime::FileError::Missing) => Err(Anomaly::fault("rtdb.storage/missing-object", self.key.as_str())),
+                Err(crate::runtime::FileError::Missing) => Err(Anomaly::fault("rtdb.storage/missing-object", self.pack.key.as_str())),
                 Err(crate::runtime::FileError::Corrupt(error) | crate::runtime::FileError::Unavailable(error)) => Err(error),
             }
         }).await.cloned()
     }
 
-    fn report(&self, runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition, error: &Anomaly) {
+    pub(super) fn report(&self, runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition, error: &Anomaly) {
         if crate::runtime::FileError::from_anomaly(error.clone()).needs_repair() {
-            runtime.report(Suspect { database: request.database.into(), table: definition.table.clone(), owner: self.owner.clone(),
-                artefact_id: self.definition_id.clone(), version: definition.version });
+            runtime.report(Suspect { database: request.database.into(), table: definition.table.clone(), owner: self.pack.owner.clone(),
+                artefact_id: self.pack.definition_id.clone(), version: definition.version });
         }
     }
 }
 
-struct Nomination { iid: Iid, source: Option<usize>, visibility: Vec<[i64; 4]> }
+struct Nomination { iid: Iid, source: Option<usize>, witness: Option<SearchWitness>, visibility: Vec<[i64; 4]> }
 enum Task {
     Open(usize),
     Expand(usize),
@@ -136,7 +116,7 @@ fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, tokens: &dyn Fn() ->
         TreeRankOrder::Score => RankKey::integer(score, None),
     };
     Ok(Some((key, Nomination {
-        iid: header.iid, source: None, visibility: Vec::new(),
+        iid: header.iid, source: None, witness: Some(SearchWitness::Live(header.version())), visibility: Vec::new(),
     })))
 }
 
@@ -163,13 +143,18 @@ async fn visible(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, defi
 impl SearchAccelerator {
     pub(super) async fn tree_top_k(&self, request: &ScanRequest<'_>, definition: &SearchDefinition, column: &str,
         column_id: ColumnId, matching: &Query, scoring_query: Query, ascending_id: Option<ColumnId>,
-        permit_uuid_order: bool, limit: usize, scope: Option<&BTreeSet<Iid>>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
-        if request.partitions.len() != 1 || !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point() {
+        permit_uuid_order: bool, limit: usize, scope: Option<&BTreeSet<Iid>>, include_packs: bool, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        if !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point() {
             work.tree_decline = Some("unsupported-snapshot");
             return Ok(None);
         }
-        let Some(sources) = RecordedTree::select(request, definition)? else { work.tree_decline = Some("no-tree"); return Ok(None); };
-        if !matching.phrases().is_empty() {
+        let Some(column_index) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
+        let sources = RecordedTree::select(&self.runtime, request, definition, column_index, matching, include_packs)?;
+        if sources.is_empty() && request.snapshot.serving_search::<crate::runtime::ServingPostings>().is_none() {
+            work.tree_decline = Some("no-tree");
+            return Ok(None);
+        }
+        if !matching.phrases().is_empty() && !sources.is_empty() && sources.iter().all(|source| source.pack.locator.format() == TREE_FORMAT_VERSION) {
             let paged = definition.artefact_id_for(crate::file::FORMAT_VERSION);
             if sources.iter().flat_map(|source| source.members.values()).all(|key| {
                 request.snapshot.trie_catalog().trie(&definition.table, key)
@@ -179,16 +164,16 @@ impl SearchAccelerator {
                 return Ok(None);
             }
         }
-        let Some(column_index) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
         let scorer = Arc::new(Scorer::new(scoring_query, None));
         let Some(ranking) = scorer.for_ranking() else { return Ok(None); };
         let tree_tries = sources.iter().flat_map(|source| source.members.values().cloned()).collect();
+        let visibility = super::point::PackedVisibility::new(request, &definition.table, &sources, column_index);
         let TrieFiles::Complete(Found { files, .. }) = self.trie_files(request, definition, column, &[matching, scorer.query()],
             LoadSearch::Rank, Some(&tree_tries)).await? else { work.tree_decline = Some("coverage"); return Ok(None); };
         let keep_ids = ascending_id.is_some();
         let order = if keep_ids {
             TreeRankOrder::Integer
-        } else if permit_uuid_order && files.is_empty() && sources.iter().all(|source| source.locator.has_canonical_uuid_iids()) {
+        } else if permit_uuid_order && files.is_empty() && sources.iter().all(|source| source.pack.locator.has_canonical_uuid_iids()) {
             TreeRankOrder::Uuid
         } else {
             TreeRankOrder::Score
@@ -203,7 +188,7 @@ impl SearchAccelerator {
         }
         let mut ranks = (0..sources.len()).map(|_| OnceLock::new()).collect::<Vec<OnceLock<TreeRanked>>>();
         for (index, source) in sources.iter().enumerate() {
-            if source.discovery && matching.terms().iter().all(|term| source.locator.might_contain(column_index as u32, term)) {
+            if source.discovery {
                 frontier.push(RankKey::integer(f64::INFINITY, None), Task::Open(index));
             }
         }
@@ -211,7 +196,11 @@ impl SearchAccelerator {
         let mut nominated = 0;
         let segments: Vec<_> = request.snapshot.iter_segments(&definition.table).collect();
         for (index, segment) in segments.iter().enumerate() {
-            let (pages, covered) = self.runtime.live_pages(request.database, segment, column);
+            let (pages, covered) = self.runtime.live_pages_at(Some(request.snapshot), request.database, segment, column);
+            if !self.runtime.can_scan_live_gap(segment, column, covered)? {
+                work.tree_decline = Some("live-coverage-budget");
+                return Ok(None);
+            }
             for page in pages {
                 if let Some(bound) = page.bound(matching, scorer.query(), keep_ids) {
                     frontier.push(bound, Task::Live(index, page));
@@ -232,22 +221,66 @@ impl SearchAccelerator {
         let mut visited = BTreeSet::new();
         let mut verified = Vec::new();
         let mut rows = BTreeMap::new();
-        let mut to_verify = BTreeSet::new();
+        let mut deferred = BTreeMap::<Iid, rtdb_query::ResolvedSearchRow>::new();
+        let mut to_verify = BTreeMap::<Iid, (RankKey, Option<SearchWitness>)>::new();
+        let shared_rank = request.verifier.partition_ranking();
+        let trusted = request.scan.top_k.as_ref().is_some_and(|top| top.score.is_some())
+            && request.verifier.permits_search_witness() && match request.scan.predicates.as_slice() {
+                [Expr::Column { id, .. }] => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
+                [Expr::Call { name, .. }] => name.eq_ignore_ascii_case("match"),
+                _ => false,
+            };
         let batch_size = limit.clamp(1, 128);
         let mut rounds = 0;
         loop {
             if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
             if to_verify.is_empty() && verified.len() >= limit
                 && verified_cutoff(&mut verified, limit).is_some_and(|kth| frontier.ready.peek().is_none_or(|entry| kth.beats(entry.key))) { break; }
+            if to_verify.is_empty() && let Some(cutoff) = shared_rank.and_then(|rank| rank.cutoff(limit))
+                && frontier.ready.peek().is_some_and(|entry| entry.key.score < cutoff) {
+                work.shared_cutoff_prunes += frontier.ready.len();
+                break;
+            }
             if !to_verify.is_empty() && (to_verify.len() >= batch_size || frontier.ready.is_empty()) {
                 rounds += 1;
                 if rounds > 16 { work.tree_decline = Some("verification-budget"); return Ok(None); }
                 work.verification_rounds += 1;
                 work.verifier_rows += to_verify.len();
-                let scores = request.verifier.score_visible(std::mem::take(&mut to_verify), column_id, ascending_id, &scorer).await?;
+                let pending = std::mem::take(&mut to_verify);
+                let iids = pending.keys().copied().collect();
+                let resolved = visibility.resolve(&self.runtime, request, definition, &sources, &iids).await;
+                let scores = match resolved {
+                    Ok(Some(resolved)) => {
+                        work.packed_resolved += resolved.len();
+                        let mut gather = Vec::new();
+                        for version in resolved {
+                            let iid = version.row.version.iid;
+                            let (key, witness) = pending[&iid];
+                            if trusted && witness.is_some() && witness == version.witness {
+                                verified.push((key, iid));
+                                deferred.insert(iid, version.row);
+                                work.deferred_payloads += 1;
+                            } else { gather.push(version.row); }
+                        }
+                        match request.verifier.score_resolved(gather, column_id, ascending_id, &scorer).await {
+                            Ok(Some(scores)) => scores,
+                            Ok(None) => request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?,
+                            Err(error) if error.code.starts_with("rtdb.storage/") || error.code == "rtdb.query/search-row" => {
+                                request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(None) => request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?,
+                    Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
+                    Err(_) => request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?,
+                };
+                if let Some(rank) = shared_rank { rank.add_verified(limit, scores.iter()); }
                 for (iid, score, id) in scores.ranked() {
                     let key = if order == TreeRankOrder::Uuid { RankKey::uuid(score, iid.0) } else { RankKey::integer(score, id) };
-                    verified.push((key, iid));
+                    if deferred.remove(&iid).is_some() {
+                        if let Some(entry) = verified.iter_mut().find(|(_, known)| *known == iid) { entry.0 = key; }
+                    } else { verified.push((key, iid)); }
                     if let Some(row) = scores.row(iid) { rows.insert(iid, row); }
                 }
                 if let Some(kth) = verified_cutoff(&mut verified, limit) {
@@ -255,6 +288,7 @@ impl SearchAccelerator {
                     else { verified.retain(|(key, _)| !key.score_order(kth).is_lt()); }
                     let winners: BTreeSet<_> = verified.iter().map(|(_, iid)| *iid).collect();
                     rows.retain(|iid, _| winners.contains(iid));
+                    deferred.retain(|iid, _| winners.contains(iid));
                 }
                 continue;
             }
@@ -288,7 +322,7 @@ impl SearchAccelerator {
                     frontier.nominate_batch(candidates.into_iter().filter(|candidate| sources[index].members.contains_key(&candidate.member))
                         .map(|candidate| {
                             let key = candidate.key;
-                            (key, Nomination { iid: candidate.iid, source: Some(index), visibility: candidate.rectangles })
+                            (key, Nomination { iid: candidate.iid, source: Some(index), witness: Some(SearchWitness::Packed(index, candidate.document)), visibility: candidate.rectangles })
                         }));
                 }
                 Task::Legacy(index) => {
@@ -306,7 +340,7 @@ impl SearchAccelerator {
                         if !selected.members.contains_key(&run.member) { continue; }
                         let id = keep_ids.then(|| selected.file.integer_id(run)).flatten();
                         frontier.push(RankKey::integer(score, id), Task::Verify(Nomination {
-                            iid: Iid(run.iid), source: None, visibility: Vec::new(),
+                            iid: Iid(run.iid), source: None, witness: None, visibility: Vec::new(),
                         }));
                     }
                 }
@@ -325,13 +359,37 @@ impl SearchAccelerator {
                 Task::Verify(mut nomination) => {
                     let iid = nomination.iid;
                     if visited.contains(&iid) || request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
+                    if visibility.covers(iid) {
+                        visited.insert(iid);
+                        to_verify.insert(iid, (entry.key, nomination.witness));
+                        continue;
+                    }
                     match visible(&self.runtime, request, definition, &sources, &mut nomination).await {
                         Ok(false) => continue,
-                        Ok(true) => { visited.insert(iid); to_verify.insert(iid); }
+                        Ok(true) => { visited.insert(iid); to_verify.insert(iid, (entry.key, None)); }
                         Err(_) => { work.tree_decline = Some("visibility-page"); return Ok(None); }
                     }
                 }
             }
+        }
+        if !deferred.is_empty() {
+            let remaining = deferred.keys().copied().collect::<BTreeSet<_>>();
+            let scores = request.verifier.score_resolved(deferred.into_values().collect(), column_id, ascending_id, &scorer).await;
+            let scores = match scores {
+                Ok(Some(scores)) => scores,
+                Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
+                _ => { work.tree_decline = Some("winner-payload"); return Ok(None); }
+            };
+            let checked: BTreeMap<_, _> = scores.ranked().map(|(iid, score, id)| (iid, (score, id))).collect();
+            for (key, iid) in verified.iter().filter(|(_, iid)| remaining.contains(iid)) {
+                if checked.get(iid).is_none_or(|(score, id)| *score != key.score || (key.integer_id().is_some() && *id != key.integer_id())) {
+                    work.tree_decline = Some("winner-version");
+                    return Ok(None);
+                }
+                let Some(row) = scores.row(*iid) else { work.tree_decline = Some("winner-payload"); return Ok(None); };
+                rows.insert(*iid, row);
+            }
+            if let Some(rank) = shared_rank { rank.add_verified(limit, scores.iter()); }
         }
         let iids = verified.iter().map(|&(_, iid)| iid).collect();
         if request.scan.top_k.as_ref().is_some_and(|top| top.score.is_some()) {

@@ -97,10 +97,10 @@ impl RecoveredBlockConfirmation {
         let key = TrieKey::l0(catalog.block_index())?.to_string();
         let token_bytes = catalog.external_source_token().map_or(0, <[u8]>::len);
         let bytes = table_blocks.iter().try_fold(token_bytes, |bytes, (table, block)| {
-            let count = l0_details(block, &key).count();
-            let detail_bytes = table.schema.len().checked_add(table.table.len()).and_then(|len| len.checked_add(key.len()))
-                .and_then(|len| len.checked_add(1024)).and_then(|len| len.checked_mul(count));
-            detail_bytes.and_then(|detail_bytes| bytes.checked_add(detail_bytes))
+            let names = table.schema.len().checked_add(table.table.len())?.checked_add(1024)?;
+            l0_details(block, &key).try_fold(bytes, |bytes, detail| {
+                bytes.checked_add(names)?.checked_add(detail.encoded_size())
+            })
         }).and_then(|bytes| bytes.checked_mul(4)).and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(|| invalid("Recovered block notification exceeds addressable memory"))?;
         let reservation = memory.reserve(bytes)?;
@@ -452,6 +452,12 @@ impl BlockStore {
     }
     /// Cancellation is observed between pages and completed storage operations; an upload already started is awaited.
     pub async fn produce_cancellable(&self, prepared: &BlockPreparation, boundary: &ReplicaRecord, databases: BTreeMap<String, DatabaseConfig>, cancellation: &CancellationToken) -> Result<ProducedBlock> {
+        self.produce_with_search(prepared, boundary, databases, cancellation, None).await
+    }
+
+    pub(crate) async fn produce_with_search(&self, prepared: &BlockPreparation, boundary: &ReplicaRecord,
+        databases: BTreeMap<String, DatabaseConfig>, cancellation: &CancellationToken,
+        search: Option<&dyn crate::ServingSearchBuilder>) -> Result<ProducedBlock> {
         check_cancelled(cancellation)?;
         let ReplicaBody::BlockBoundary(message) = &boundary.envelope.message else { return Err(invalid("Block production requires a boundary")); };
         let index = BlockIndex(message.block_index.unwrap_or_default());
@@ -489,7 +495,13 @@ impl BlockStore {
             let (metadata_file, summary) = metadata.finish()?;
             let bytes = metadata_file.write()?;
             self.store.put(&ObjectKey::new(entry.slug.metadata_key(&trie))?, Bytes::from(bytes)).await?;
-            tries.insert(table.clone(), vec![CatalogTrie::notification(trie, size, Some(summary))?]);
+            let artefacts = match search {
+                Some(search) => search.seal(prepared.value(), table, &trie, temporary.path(), size as u64, cancellation).await?,
+                None => Vec::new(),
+            };
+            let mut notification = CatalogTrie::notification(trie, size, Some(summary))?;
+            notification.artefacts = artefacts;
+            tries.insert(table.clone(), vec![notification]);
             tokio::task::yield_now().await;
         }
         let table_blocks = prepared.table_blocks(&tries, boundary.metadata.timestamp)?;
@@ -563,7 +575,8 @@ pub(crate) fn l0_tries(index: BlockIndex, tables: &BTreeMap<rtdb_types::TableRef
             let summary = detail.trie_metadata.as_ref().map(|summary| proto::TrieMetadata {
                 temporal_metadata: summary.temporal_metadata.clone(), row_count: summary.row_count, iid_bloom: None,
             });
-            let trie = CatalogTrie::notification(key.clone(), detail.data_file_size.unwrap_or_default(), summary)?;
+            let mut trie = CatalogTrie::notification(key.clone(), detail.data_file_size.unwrap_or_default(), summary)?;
+            trie.artefacts = detail.artefacts.clone();
             if notification.as_ref().is_some_and(|existing| existing != &trie) {
                 return Err(invalid("Conflicting L0 notifications for one table and block"));
             }

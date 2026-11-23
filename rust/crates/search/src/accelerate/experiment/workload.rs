@@ -10,6 +10,7 @@ use super::super::{Narrowing, NarrowingWork, SearchAccelerator};
 pub enum Policy<'a> {
     Current,
     Baseline,
+    Tree14,
     Exhaustive,
     FilterFirst(&'a BTreeSet<Iid>),
     SkipRetry,
@@ -41,6 +42,7 @@ impl SearchAccelerator {
         let options = match policy {
             Policy::Current => Narrowing::default(),
             Policy::Baseline => Narrowing { baseline: true, ..Default::default() },
+            Policy::Tree14 => Narrowing { omit_packs: true, ..Default::default() },
             Policy::Exhaustive => Narrowing { is_oracle: true, ..Default::default() },
             Policy::FilterFirst(scope) if request.bounds.valid_time.is_point() && request.bounds.system_time.is_point() => {
                 Narrowing { scope: Some(scope), ..Default::default() }
@@ -67,7 +69,8 @@ impl SearchAccelerator {
             "filter_scope": work.filter_scope, "retry_redundant": work.retry_redundant,
             "tree": {"opened_roots": work.tree_roots, "expansions": work.tree_expansions, "decline": work.tree_decline,
                 "range_requests": work.tree_io.requests, "range_bytes": work.tree_io.bytes, "page_cache_hits": work.tree_io.cache_hits,
-                "requests_by_kind": page_reads, "uncovered_live_rows": work.uncovered_live_rows, "retained_rows": work.retained_rank_rows},
+                "requests_by_kind": page_reads, "uncovered_live_rows": work.uncovered_live_rows, "retained_rows": work.retained_rank_rows,
+                "packed_resolved": work.packed_resolved, "deferred_payloads": work.deferred_payloads, "shared_cutoff_prunes": work.shared_cutoff_prunes},
         });
         Ok((picked, work.scores, report))
     }

@@ -36,13 +36,15 @@ pub(super) enum Table {
     ImpactIds,
     Synopsis,
     RankNodes,
+    Versions,
+    Routes,
 }
 
 impl Table {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 21] = [
         Self::Header, Self::Columns, Self::Members, Self::Pages, Self::Events,
         Self::Runs, Self::RowRuns, Self::Sections, Self::Terms, Self::Postings,
-        Self::Windows, Self::Blocks, Self::Frequencies, Self::Positions, Self::Directory, Self::Root, Self::ImpactIds, Self::Synopsis, Self::RankNodes,
+        Self::Windows, Self::Blocks, Self::Frequencies, Self::Positions, Self::Directory, Self::Root, Self::ImpactIds, Self::Synopsis, Self::RankNodes, Self::Versions, Self::Routes,
     ];
 
     fn field(self) -> Field {
@@ -121,12 +123,21 @@ impl Table {
                 ("frequency", T::UInt32, false), ("stored_length", T::UInt32, false),
                 ("unit_score", T::Float64, false), ("minimum", T::Int64, true), ("peak_minimum", T::Int64, true),
             ])),
+            Self::Versions => ("versions", fields([
+                ("commit_position", T::UInt32, false), ("member", T::UInt32, false),
+                ("page", T::UInt32, false), ("row", T::UInt32, false),
+            ])),
+            Self::Routes => ("routes", fields([
+                ("kind", T::UInt8, false), ("lower", T::Binary, false), ("upper", T::Binary, false),
+                ("offset", T::UInt64, false), ("metadata", T::UInt32, false), ("body", T::UInt64, false),
+                ("digest", T::FixedSizeBinary(32), false),
+            ])),
         };
         Field::new(name, list_type(T::Struct(fields)), false)
     }
 
     pub(super) fn fields(self) -> Fields {
-        let T::LargeList(item) = schema(super::TREE_FORMAT_VERSION).field(self as usize).data_type().clone() else { unreachable!() };
+        let T::LargeList(item) = schema(super::PACKED_FORMAT_VERSION).field(self as usize).data_type().clone() else { unreachable!() };
         let T::Struct(fields) = item.data_type() else { unreachable!() };
         fields.clone()
     }
@@ -154,6 +165,7 @@ fn tables(format: i32) -> &'static [Table] {
     match format {
         LEGACY_FORMAT_VERSION => &Table::ALL[..10],
         FORMAT_VERSION => &Table::ALL[..14],
+        super::TREE_FORMAT_VERSION => &Table::ALL[..19],
         _ => &Table::ALL,
     }
 }
@@ -161,10 +173,12 @@ fn tables(format: i32) -> &'static [Table] {
 pub(super) fn schema(format: i32) -> &'static SchemaRef {
     static LEGACY: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tables(LEGACY_FORMAT_VERSION).iter().copied().map(Table::field).collect::<Vec<_>>())));
     static PAGED: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tables(FORMAT_VERSION).iter().copied().map(Table::field).collect::<Vec<_>>())));
-    static TREE: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(Table::ALL.map(Table::field).to_vec())));
+    static TREE: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tables(super::TREE_FORMAT_VERSION).iter().copied().map(Table::field).collect::<Vec<_>>())));
+    static PACKED: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(Table::ALL.map(Table::field).to_vec())));
     match format {
         LEGACY_FORMAT_VERSION => &LEGACY,
         FORMAT_VERSION => &PAGED,
+        super::PACKED_FORMAT_VERSION => &PACKED,
         _ => &TREE,
     }
 }
@@ -397,8 +411,7 @@ pub(super) struct Reader {
 }
 
 impl Reader {
-    pub(super) fn from_checked_batches(batches: Vec<RecordBatch>) -> Self {
-        let format = super::TREE_FORMAT_VERSION;
+    pub(super) fn from_checked_batches(batches: Vec<RecordBatch>, format: i32) -> Self {
         Self { read: ReadPages::Local(Box::new(|_| Err(corrupt("Search page was not materialized")))),
             decoder: FileDecoder::new(Arc::clone(schema(format)), arrow_ipc::MetadataVersion::V5),
             blocks: Vec::new(), hashes: String::new(), pages: batches.into_iter().map(OnceLock::from).collect(), format, length: 0 }

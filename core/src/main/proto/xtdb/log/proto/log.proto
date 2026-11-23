@@ -140,6 +140,7 @@ message ArtefactRecord {
     // Size of the published object, including its headers and auxiliary sections.
     int64 file_size = 6;
     PublishedObjectVersion published_version = 7;
+    repeated string pack_members = 8;
 }
 
 // The data files one artefact is derived from.
@@ -149,6 +150,7 @@ enum ArtefactScope {
     TRIE = 0;
     // Every data file of its trie's partition group, recorded alike on each member's entry, and deleted once no member remains.
     PART_GROUP = 1;
+    PACK = 2;
 }
 
 message ArtefactEntry {

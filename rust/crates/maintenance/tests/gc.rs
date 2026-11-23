@@ -102,12 +102,19 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
     }
     let live_artefact = ObjectKey::new(entry.slug.artefact_key(&"l01-rc-b01".parse().unwrap(), "search", "body", 1).unwrap()).unwrap();
     store.put(&live_artefact, Bytes::from_static(b"artefact")).await.unwrap();
+    let l0: TrieKey = "l00-rc-b00".parse().unwrap();
+    let sealed = ObjectKey::new(entry.slug.artefact_key(&l0, "search", "body~a1f15", 1).unwrap()).unwrap();
+    store.put(&sealed, Bytes::from_static(b"sealed search")).await.unwrap();
+    let catalog = catalog.with_artefacts(&table, [(l0, rtdb_format::log::proto::ArtefactRecord {
+        kind: Some("search".into()), definition_id: Some("body~a1f15".into()), definition_version: Some(1), ..Default::default()
+    })]);
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
     let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     assert_eq!(*publisher.commits.lock().unwrap(), vec![vec!["l01-rc-b00".parse::<TrieKey>().unwrap()]]);
     assert!(store.head(&ObjectKey::new(entry.slug.data_key(&"l00-rc-b00".parse().unwrap())).unwrap()).await.is_ok());
+    assert!(store.head(&sealed).await.is_err());
     assert!(store.head(&live_artefact).await.is_ok(), "a live trie's artefacts stay");
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap().len(), 2);
@@ -560,7 +567,7 @@ async fn retirement_binds_only_the_same_version_the_catalog_published() {
 }
 
 #[tokio::test]
-async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
+async fn shared_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
@@ -572,6 +579,17 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let object = |definition| ObjectKey::new(entry.slug.group_artefact_prefix(&group) + &format!("/search/{definition}-v1.bin")).unwrap();
     let (agreed, mixed, legacy) = (object("body"), object("mixed"), object("legacy"));
     let store = Arc::new(MemoryStore::default());
+    let members = group.members();
+    let pack = rtdb_format::keys::ArtefactOwner::Pack(
+        rtdb_format::keys::ArtefactPack::new(vec![members[0].clone(), members[1].clone()]).unwrap());
+    let packed = ObjectKey::new(entry.slug.owner_artefact_key(&pack, "search", "packed", 1).unwrap()).unwrap();
+    store.put(&packed, Bytes::from_static(b"shared pack")).await.unwrap();
+    catalog = catalog.with_artefacts(&table, pack.tries().into_iter().map(|trie| (trie,
+        rtdb_format::log::proto::ArtefactRecord {
+            kind: Some("search".into()), definition_id: Some("packed".into()), definition_version: Some(1),
+            scope: Some(rtdb_format::log::proto::ArtefactScope::Pack as i32),
+            pack_members: pack.tries().iter().map(ToString::to_string).collect(), ..Default::default()
+        })));
     for key in [&agreed, &mixed, &legacy] {
         store.put(key, Bytes::from_static(b"artefact")).await.unwrap();
     }
@@ -628,11 +646,13 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let one_superseded = supersede(catalog.clone(), 0);
     assert_eq!(collect(one_superseded.clone()).await, ["l02-rc-p0-b00".parse::<TrieKey>().unwrap()]);
     assert!(store.head(&agreed).await.is_ok(), "three members are still live");
+    assert!(store.head(&packed).await.is_ok());
     assert!(receipts().await.is_empty());
     let collected = one_superseded.without_tries(&table, &["l02-rc-p0-b00".parse().unwrap()].into());
     let all_superseded = (1..4).fold(collected, supersede);
     let retired = collect(all_superseded).await;
     assert_eq!(retired.len(), 3);
+    assert!(store.head(&packed).await.is_err());
     let recorded = receipts().await;
     assert_eq!(recorded.len(), 3);
     for key in [&agreed, &mixed, &legacy] {

@@ -47,7 +47,7 @@ mod join_storage;
 mod join_spill;
 mod mark;
 
-pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, ConstantEvaluator, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest, ScanSelection, SnapshotRow};
+pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, ConstantEvaluator, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, PartitionRanking, ResolvedSearchRow, ScanAccelerator, ScanRequest, ScanSelection, SearchRowLocation, SnapshotRow};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryOptions, retain_catalog_snapshot};
 pub use fragment::{FragmentBytes, FragmentDepth, FragmentReply, FragmentResidence, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment, evaluate_fragment_retained};
 pub use cursor::{PreparedQuery, QueryCursor, encoding_ordered_batch};

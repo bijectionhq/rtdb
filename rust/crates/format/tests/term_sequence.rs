@@ -15,7 +15,7 @@ fn every_message_kind_carries_its_term_position_through_the_codec() {
         ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/foo".into()), trie_keys: vec!["trie".into()] }),
         ReplicaBody::OversizedMessage(pb::OversizedMessage { storage_version: Some(1), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("payload".into()), ..Default::default() }),
         ReplicaBody::ArtefactsAdded(pb::ArtefactsAdded { storage_version: Some(1), storage_epoch: Some(0), table_name: Some("public/foo".into()), source_msg_id: Some(1),
-            entries: vec![pb::ArtefactEntry { trie_key: Some("l01-rc-b00".into()), record: Some(pb::ArtefactRecord { kind: Some("search".into()), definition_id: Some("docs_body".into()), definition_version: Some(1), stats: Some(vec![1, 2]), scope: None, file_size: None, published_version: None }) }] }),
+            entries: vec![pb::ArtefactEntry { trie_key: Some("l01-rc-b00".into()), record: Some(pb::ArtefactRecord { kind: Some("search".into()), definition_id: Some("docs_body".into()), definition_version: Some(1), stats: Some(vec![1, 2]), scope: None, file_size: None, published_version: None, pack_members: Vec::new() }) }] }),
     ];
     for message in messages {
         let stamped = ReplicaEnvelope { term: Term(3), term_sequence: Some(TermSequence(5)), message };

@@ -1,6 +1,8 @@
 #[cfg(feature = "experiments")]
 pub mod experiment;
 mod tree;
+mod point;
+pub(crate) mod routing;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -112,6 +114,7 @@ struct Narrowing<'a> {
     baseline: bool,
     skip_retry: bool,
     estimate_first: bool,
+    omit_packs: bool,
     scope: Option<&'a BTreeSet<Iid>>,
 }
 
@@ -134,6 +137,9 @@ struct NarrowingWork {
     tree_expansions: usize,
     uncovered_live_rows: usize,
     retained_rank_rows: usize,
+    packed_resolved: usize,
+    deferred_payloads: usize,
+    shared_cutoff_prunes: usize,
     tree_io: crate::file::TreeIoStats,
     tree_decline: Option<&'static str>,
 }
@@ -275,7 +281,7 @@ impl SearchAccelerator {
     /// Where a trie's recorded search file is, if it has one: its key, the trie or partition group it was built over, and which member of it the trie is.
     fn recorded_key(snapshot: &Snapshot, table: &rtdb_types::TableRef, trie: &rtdb_index::CatalogTrie, definition: &SearchDefinition) -> Result<Option<Recorded>> {
         let Some(entry) = snapshot.table_entry(table) else { return Ok(None) };
-        let formats = [crate::file::FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::TANTIVY_FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION];
+        let formats = [crate::file::FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::TANTIVY_FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION];
         let Some(record) = formats.into_iter().find_map(|format| {
             trie.artefact(KIND, &definition.artefact_id_for(format), definition.version)
         }) else { return Ok(None) };
@@ -393,7 +399,7 @@ impl SearchAccelerator {
     fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
         let mut candidates = BTreeSet::new();
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
-            let complete = self.runtime.visit_live_matches(request.database, segment, column, query, true, request.cancellation, |row, _| {
+            let complete = self.runtime.visit_live_matches_at(Some(request.snapshot), request.database, segment, column, query, true, request.cancellation, |row, _| {
                 let header = segment.header(row)?;
                 if may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) {
                     candidates.insert(header.iid);
@@ -932,7 +938,7 @@ impl SearchAccelerator {
         let scoring_query = Query::parse(&text);
         if !options.estimate_first && !options.baseline {
             let (result, io) = crate::file::observe_tree_io(self.tree_top_k(request, definition, column, top_k.column, matching,
-                scoring_query.clone(), ascending_id, uuid_order, limit, options.scope, work)).await;
+                scoring_query.clone(), ascending_id, uuid_order, limit, options.scope, !options.omit_packs, work)).await;
             work.tree_io = io;
             if let Some(result) = result? { return Ok(Some(result)); }
         }
@@ -970,7 +976,7 @@ impl SearchAccelerator {
             _ => false,
         };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
-            let complete = self.runtime.visit_live_matches(request.database, segment, column, matching, true, request.cancellation, |row, tokens| {
+            let complete = self.runtime.visit_live_matches_at(Some(request.snapshot), request.database, segment, column, matching, true, request.cancellation, |row, tokens| {
                 if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
                 if cfg!(feature = "experiments") { work.postings_visited += 1; }
                 let header = segment.header(row)?;

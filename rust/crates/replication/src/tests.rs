@@ -973,7 +973,7 @@ async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_ent
     let value = partition.value();
     let live = value.trie_catalog().current_tries(&table)[0].key.clone();
     let slug = value.table_catalog().entry(&table).unwrap().slug.clone();
-    let record = |id: &str| proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None, scope: None, file_size: None, published_version: None };
+    let record = |id: &str| proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None, scope: None, file_size: None, published_version: None, pack_members: Vec::new() };
     let unknown: rtdb_format::keys::TrieKey = "l01-rc-b07".parse().unwrap();
     let file = |key: &rtdb_format::keys::TrieKey, id: &str| rtdb_storage::ObjectKey::new(slug.artefact_key(key, "search", id, 1).unwrap()).unwrap();
     for key in [file(&live, "body"), file(&unknown, "body"), file(&live, "title")] { store.put(&key, Bytes::from_static(b"artefact")).await.unwrap(); }
@@ -2526,7 +2526,7 @@ fn a_group_objects_file_is_deleted_or_dropped_from_caches_only_with_the_groups_l
     let mut catalog = rtdb_index::TrieCatalog::new(16).unwrap();
     for bucket in 0..4 { catalog = add(catalog, &format!("l02-rc-p{bucket}-b00")); }
     for bucket in 0..4 { catalog = add(catalog, &format!("l03-rc-p0{bucket}-b01")); }
-    let record = proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some("body".into()), definition_version: Some(1), stats: None, scope: Some(proto::ArtefactScope::PartGroup as i32), file_size: None, published_version: None };
+    let record = proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some("body".into()), definition_version: Some(1), stats: None, scope: Some(proto::ArtefactScope::PartGroup as i32), file_size: None, published_version: None, pack_members: Vec::new() };
     let value = rtdb_index::PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap();
     let group = |key: &str| key.parse::<TrieKey>().unwrap().part_group().unwrap();
     let object = |key: &str| rtdb_storage::ObjectKey::new(slug.owner_artefact_key(&ArtefactOwner::Group(group(key)), "search", "body", 1).unwrap()).unwrap();

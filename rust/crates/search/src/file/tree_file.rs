@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -6,12 +6,12 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch, StructArray, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
 use arrow_buffer::Buffer;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::Result;
+use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
 use sha2::{Digest, Sha256};
 use crate::rank_windows::window_of;
 
-use super::{TREE_FORMAT_VERSION, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
-    page_tree::{Child, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
+use super::{PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
+    page_tree::{Child, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
 
 pub(super) const POSTING: u8 = 0;
 pub(super) const TERM: u8 = 1;
@@ -21,7 +21,8 @@ pub(super) const PAGE_ROWS: u8 = 4;
 const TERM_ROWS: usize = 32;
 pub(super) const DOCUMENT_ROWS: usize = 256;
 const EVENT_ROWS: usize = 1024;
-const MAX_ROOT_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_ROOT_BYTES: u64 = 64 * 1024;
+const INLINE_ROOT_BYTES: usize = 8 * 1024;
 const SYNOPSIS_BYTES: usize = 512;
 
 fn page_kind(directory: u8) -> PageKind {
@@ -70,7 +71,8 @@ fn start_rows(table: Table, array: &StructArray, start: usize, len: usize) -> Re
 }
 
 pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, StructArray)>,
-    [(_, events), (_, runs), (_, row_runs)]: [(Table, StructArray); 3], plan: PostingPlan) -> Result<()> {
+    [(_, events), (_, runs), (_, row_runs)]: [(Table, StructArray); 3], plan: PostingPlan,
+    positions: Option<Vec<u32>>) -> Result<()> {
     let take = |fields: &mut Vec<(Table, StructArray)>, field: Table| -> StructArray {
         let at = fields.iter().position(|(table, _)| *table as usize == field as usize).expect("writer populated this table");
         fields.remove(at).1
@@ -80,12 +82,23 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
     let impact_ids = take(&mut fields, Table::ImpactIds);
     let windows = take(&mut fields, Table::Windows);
     let pages = take(&mut fields, Table::Pages);
+    let mut routing = BTreeMap::<u8, Vec<Child>>::new();
+    let packed = positions.is_some();
+    let mut directory = |writer: &mut _, kind, children: Vec<Child>| {
+        if packed && children.len() <= 48 && children.iter().all(|child| child.lower.len() + child.upper.len() <= 256) {
+            routing.insert(kind, children.clone());
+        }
+        write_directory(writer, children)
+    };
+    let members = fields.iter().find(|(shape, _)| matches!(shape, Table::Members)).expect("member starts are recorded");
+    let member_starts = members.1.column(0).as_primitive::<UInt32Type>().clone();
+    let page_starts = pages.column(0).as_primitive::<UInt32Type>();
     let frequencies = plan.write(writer)?;
     let postings = frequencies.into_iter().enumerate().map(|(index, page)| {
         let key = ordinal(index + super::paged::FIRST_POSTING_PAGE).to_vec();
         Child { lower: key.clone(), upper: key, page }
     }).collect();
-    let posting_dir = write_directory(writer, postings)?;
+    let posting_dir = directory(writer, POSTING, postings)?;
 
     let term_columns = terms.column(0).as_primitive::<UInt32Type>();
     let term_names = terms.column(1).as_string::<i32>();
@@ -102,15 +115,19 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
         let end = (start + TERM_ROWS).min(terms.len());
         let key = |row| term_key(term_columns.value(row), term_names.value(row));
         let nodes = (start..end).map(|row| rank_tree::write_term(writer, blocks, impact_ids, row)).collect::<Result<Vec<_>>>()?;
-        let page = writer.page([
+        let entry = [
             (Table::Terms, terms.slice(start, end - start)),
             (Table::RankNodes, rank_tree::nodes_array(&nodes)?),
             (Table::Blocks, rank_tree::inline_rows(blocks, &nodes, start, Table::Blocks)?),
             (Table::ImpactIds, rank_tree::inline_rows(impact_ids, &nodes, start, Table::ImpactIds)?),
-        ])?;
+        ];
+        if packed && start == 0 && end == terms.len() && entry.iter().map(|(_, array)| array.get_array_memory_size()).sum::<usize>() <= 8192 {
+            fields.extend(entry.iter().cloned());
+        }
+        let page = writer.page(entry)?;
         term_pages.push(Child { lower: key(start), upper: key(end - 1), page });
     }
-    let term_dir = write_directory(writer, term_pages)?;
+    let term_dir = directory(writer, TERM, term_pages)?;
 
     let mut doc_pages = Vec::new();
     for start in (0..runs.len()).step_by(DOCUMENT_ROWS) {
@@ -122,28 +139,59 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
             (Table::Windows, windows.slice(first_window, last_window - first_window + 1))])?;
         doc_pages.push(Child { lower: ordinal(start).to_vec(), upper: ordinal(end - 1).to_vec(), page });
     }
-    let doc_dir = write_directory(writer, doc_pages)?;
+    let doc_dir = directory(writer, DOCUMENT, doc_pages)?;
 
     let iids = events.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search IID layout");
     let mut event_pages = Vec::new();
     for start in (0..events.len()).step_by(EVENT_ROWS) {
         let end = (start + EVENT_ROWS).min(events.len());
         let start_row = Table::Pages.array(vec![Arc::new(arrow_array::UInt32Array::from(vec![start as u32]))])?;
-        let page = writer.page([(Table::Events, events.slice(start, end - start)), (Table::Pages, start_row),
-            (Table::RowRuns, start_rows(Table::RowRuns, &row_runs, start, end - start)?)])?;
+        let mut fields = vec![(Table::Events, events.slice(start, end - start)), (Table::Pages, start_row),
+            (Table::RowRuns, start_rows(Table::RowRuns, &row_runs, start, end - start)?)];
+        if let Some(positions) = &positions {
+            let (mut members, mut pages, mut local_rows) = (Vec::new(), Vec::new(), Vec::new());
+            for row in start as u32..end as u32 {
+                let page = page_starts.values().partition_point(|&first| first <= row).checked_sub(1)
+                    .ok_or_else(|| fault("Search event precedes its primary page"))?;
+                let member = member_starts.values().partition_point(|&first| first <= page as u32).checked_sub(1)
+                    .ok_or_else(|| fault("Search page precedes its primary member"))?;
+                members.push(member as u32);
+                pages.push(page as u32 - member_starts.value(member));
+                local_rows.push(row - page_starts.value(page));
+            }
+            fields.push((Table::Versions, Table::Versions.array(vec![
+                Arc::new(arrow_array::UInt32Array::from(positions[start..end].to_vec())),
+                Arc::new(arrow_array::UInt32Array::from(members)), Arc::new(arrow_array::UInt32Array::from(pages)),
+                Arc::new(arrow_array::UInt32Array::from(local_rows)),
+            ])?));
+        }
+        let page = writer.page(fields)?;
         event_pages.push(Child {
             lower: event_key(iids.value(start), start as u32), upper: event_key(iids.value(end - 1), (end - 1) as u32), page,
         });
     }
-    let event_dir = write_directory(writer, event_pages)?;
+    let event_dir = directory(writer, VISIBILITY, event_pages)?;
     let counts = Table::Pages.array(vec![Arc::new(arrow_array::UInt32Array::from(vec![events.len() as u32, runs.len() as u32]))])?;
     let page_map = writer.page([(Table::Pages, pages)])?;
-    let page_dir = write_directory(writer, vec![Child { lower: ordinal(0).to_vec(), upper: ordinal(0).to_vec(), page: page_map }])?;
+    let page_dir = directory(writer, PAGE_ROWS, vec![Child { lower: ordinal(0).to_vec(), upper: ordinal(0).to_vec(), page: page_map }])?;
     fields.push((Table::Pages, counts));
     fields.push((Table::Synopsis, Table::Synopsis.array(vec![Arc::new(
         arrow_array::FixedSizeBinaryArray::try_from_iter([synopsis].iter()).map_err(fault)?,
     )])?));
     fields.push((Table::Root, root_table(&[(POSTING, posting_dir), (TERM, term_dir), (DOCUMENT, doc_dir), (VISIBILITY, event_dir), (PAGE_ROWS, page_dir)])?));
+    if packed {
+        let mut direct = Vec::new();
+        let mut bytes = 0;
+        for kind in [TERM, VISIBILITY, DOCUMENT, PAGE_ROWS, POSTING] {
+            let Some(children) = routing.remove(&kind) else { continue; };
+            let added: usize = children.iter().map(|child| child.lower.len() + child.upper.len() + 64).sum();
+            if direct.len() + children.len() <= 48 && bytes + added <= 4096 {
+                bytes += added;
+                direct.extend(children.into_iter().map(|child| (kind, child)));
+            }
+        }
+        fields.push((Table::Routes, inline_routes(&direct)?));
+    }
     let root = writer.page(fields)?;
     let range = root.range()?;
     if range.end - range.start > MAX_ROOT_BYTES { return Err(fault("Search root exceeds its read budget")); }
@@ -156,10 +204,12 @@ pub(crate) struct TreeLocator {
     page: PageRef,
     synopsis: Option<Arc<[u8; SYNOPSIS_BYTES]>>,
     canonical_uuid_iids: bool,
+    format: i32,
+    inline_root: Option<Arc<[u8]>>,
 }
 
 impl TreeLocator {
-    pub fn read(input: &mut File) -> Result<Self> {
+    pub fn read(input: &mut File, format: i32) -> Result<Self> {
         let locator = FooterLocator::read(input)?;
         let footer_len = locator.length - locator.start - 10;
         input.seek(SeekFrom::Start(locator.start as u64)).map_err(fault)?;
@@ -179,21 +229,30 @@ impl TreeLocator {
         let mut bytes = vec![0; (range.end - range.start) as usize];
         input.read_exact(&mut bytes).map_err(fault)?;
         page.digest = Sha256::digest(&bytes).into();
-        let decoder = arrow_ipc::reader::FileDecoder::new(Arc::clone(super::layout::schema(TREE_FORMAT_VERSION)), arrow_ipc::MetadataVersion::V5);
+        let decoder = arrow_ipc::reader::FileDecoder::new(Arc::clone(super::layout::schema(format)), arrow_ipc::MetadataVersion::V5);
+        let inline_root = (format == PACKED_FORMAT_VERSION && lz4_flex::block::compress(&bytes).len() <= INLINE_ROOT_BYTES)
+            .then(|| Arc::from(bytes.as_slice()));
         let root = page.decode(Buffer::from_vec(bytes), &decoder)?;
         let synopsis = table(&root, Table::Synopsis);
         let bits = synopsis.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search synopsis layout");
         if bits.len() != 1 || bits.is_null(0) { return Err(corrupt("Search root has no complete term synopsis")); }
         let synopsis = Arc::new(bits.value(0).try_into().map_err(fault)?);
-        Ok(Self { length: locator.length as u64, page, synopsis: Some(synopsis), canonical_uuid_iids: false })
+        Ok(Self { length: locator.length as u64, page, synopsis: Some(synopsis), format, inline_root, canonical_uuid_iids: false })
     }
 
     pub fn encode(&self) -> String {
         let digest = encode_hex(&self.page.digest);
-        let header = format!("{}:{}:{}:{}:{digest}", self.length, self.page.offset, self.page.metadata, self.page.body);
+        let prefix = if self.format == PACKED_FORMAT_VERSION { "v15:" } else { "" };
+        let header = format!("{prefix}{}:{}:{}:{}:{digest}", self.length, self.page.offset, self.page.metadata, self.page.body);
         let Some(bits) = self.synopsis.as_deref() else { return header; };
         let check = synopsis_digest(&self.page.digest, bits);
         let mut encoded = format!("{header}:{}:{}", encode_hex(bits), encode_hex(&check));
+        if let Some(root) = &self.inline_root {
+            encoded.push(':');
+            encoded.push_str(&encode_hex(&lz4_flex::block::compress(root)));
+        } else if self.format == PACKED_FORMAT_VERSION && self.canonical_uuid_iids {
+            encoded.push(':');
+        }
         if self.canonical_uuid_iids {
             encoded.push(':');
             encoded.push_str(&encode_hex(&uuid_evidence_digest(&self.page.digest)));
@@ -202,6 +261,7 @@ impl TreeLocator {
     }
 
     pub fn decode(value: &str) -> Option<Self> {
+        let (format, value) = value.strip_prefix("v15:").map_or((TREE_FORMAT_VERSION, value), |value| (PACKED_FORMAT_VERSION, value));
         let mut fields = value.split(':');
         let length = fields.next()?.parse().ok()?;
         let offset = fields.next()?.parse().ok()?;
@@ -210,13 +270,18 @@ impl TreeLocator {
         let digest = decode_hex(fields.next()?)?;
         let page = PageRef { offset, metadata, body, digest };
         let range = page.range().ok()?;
-        let synopsis = fields.next().zip(fields.next())
-            .and_then(|(bits, check)| decode_hex::<SYNOPSIS_BYTES>(bits).zip(decode_hex::<32>(check)))
+        if range.end > length || range.end - range.start > MAX_ROOT_BYTES { return None; }
+        let synopsis = fields.next().and_then(decode_hex::<SYNOPSIS_BYTES>).zip(fields.next().and_then(decode_hex::<32>))
             .filter(|(bits, check)| synopsis_digest(&digest, bits) == *check).map(|(bits, _)| Arc::new(bits));
+        let root = if format == PACKED_FORMAT_VERSION { fields.next() } else { None };
+        let expected = (range.end - range.start) as usize;
+        let inline_root = root.filter(|hex| hex.len() <= INLINE_ROOT_BYTES * 2).and_then(decode_bytes)
+            .and_then(|bytes| lz4_flex::block::decompress(&bytes, expected).ok())
+            .filter(|bytes| bytes.len() == expected)
+            .filter(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)) == digest).map(Arc::from);
         let canonical_uuid_iids = synopsis.is_some() && fields.next().and_then(decode_hex::<32>)
             .is_some_and(|check| check == uuid_evidence_digest(&digest));
-        (range.end <= length && range.end - range.start <= MAX_ROOT_BYTES)
-            .then_some(Self { length, page, synopsis, canonical_uuid_iids })
+        Some(Self { length, page, synopsis, format, inline_root, canonical_uuid_iids })
     }
 
     pub fn with_uuid_iid_evidence(self, canonical_uuid_iids: bool) -> Self {
@@ -226,6 +291,12 @@ impl TreeLocator {
     pub fn has_canonical_uuid_iids(&self) -> bool { self.canonical_uuid_iids }
 
     pub fn digest(&self) -> [u8; 32] { self.page.digest }
+    pub fn format(&self) -> i32 { self.format }
+    pub(crate) fn inline_root_bytes(&self) -> usize { self.inline_root.as_ref().map_or(0, |root| root.len()) }
+
+    pub fn without_inline_root(&self) -> Self {
+        Self { inline_root: None, ..self.clone() }
+    }
 
     pub fn might_contain(&self, column: u32, term: &str) -> bool {
         self.synopsis.as_ref().is_none_or(|synopsis| synopsis_bits(&term_key(column, term))
@@ -234,6 +305,11 @@ impl TreeLocator {
 }
 
 fn encode_hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
+
+fn decode_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    (0..hex.len()).step_by(2).map(|position| u8::from_str_radix(&hex[position..position + 2], 16).ok()).collect()
+}
 
 fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
     if hex.len() != N * 2 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
@@ -262,6 +338,16 @@ pub(crate) struct TreeFile {
     reader: TreeReader,
     root: RecordBatch,
     directories: BTreeMap<u8, DirectoryRef>,
+    routes: BTreeMap<u8, Vec<Child>>,
+    format: i32,
+}
+
+pub(crate) struct PackedEvent {
+    pub header: EventHeader,
+    pub member: u32,
+    pub page: u32,
+    pub row: u32,
+    pub document: Option<u32>,
 }
 
 impl TreeFile {
@@ -278,14 +364,17 @@ impl TreeFile {
     }
 
     async fn open(source: PageSource, locator: &TreeLocator, columns: &[String], identity: &str, version: i64) -> Result<Self> {
-        let reader = TreeReader::new(source, locator.length);
-        let root = reader.page(locator.page, PageKind::Root).await?;
+        let reader = TreeReader::new(source, locator.length, locator.format);
+        let root = match &locator.inline_root {
+            Some(bytes) => reader.inline_page(locator.page, Arc::clone(bytes))?,
+            None => reader.page(locator.page, PageKind::Root).await?,
+        };
         let header = table(&root, Table::Header);
         let definitions = header.column(2).as_primitive::<Int64Type>();
         let names = table(&root, Table::Columns);
         let keys = header.column(3).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search identity layout");
         if header.len() != 1 || definitions.is_null(0) || definitions.value(0) != version
-            || header.column(0).as_primitive::<Int32Type>().value(0) != TREE_FORMAT_VERSION
+            || header.column(0).as_primitive::<Int32Type>().value(0) != locator.format
             || header.column(1).as_primitive::<Int32Type>().value(0) != rtdb_text::ANALYZER_VERSION
             || keys.value(0) != artefact_digest(identity)
             || !names.column(0).as_string::<i32>().iter().eq(columns.iter().map(|column| Some(column.as_str()))) {
@@ -296,7 +385,8 @@ impl TreeFile {
             || directories.values().any(|dir| dir.page.offset >= locator.page.offset) {
             return Err(corrupt("Search tree root has incomplete directories"));
         }
-        Ok(Self { reader, root, directories })
+        let routes = if locator.format == PACKED_FORMAT_VERSION { read_inline_routes(&root, &directories)? } else { BTreeMap::new() };
+        Ok(Self { reader, root, directories, routes, format: locator.format })
     }
 
     pub(super) fn root(&self) -> &RecordBatch { &self.root }
@@ -307,7 +397,11 @@ impl TreeFile {
 
     pub async fn verify(&self) -> Result<()> {
         for kind in [TERM, POSTING, DOCUMENT, VISIBILITY, PAGE_ROWS] {
-            for page in self.reader.leaves(self.directories[&kind]).await? { self.reader.page(page, page_kind(kind)).await?; }
+            let pages = self.reader.leaves(self.directories[&kind]).await?;
+            if self.routes.get(&kind).is_some_and(|route| !route.iter().map(|child| child.page).eq(pages.iter().copied())) {
+                return Err(corrupt("Inline search route does not cover its directory"));
+            }
+            for page in pages { self.reader.page(page, page_kind(kind)).await?; }
         }
         rank_tree::materialize_blocks(&self.reader, &self.all(TERM).await?).await?;
         Ok(())
@@ -333,7 +427,7 @@ impl TreeFile {
         }
         let row_maps = Table::RowRuns.array(vec![list(Arc::new(arrow_array::UInt32Array::from(rows)), lengths,
             item_of(&Table::RowRuns.fields()[0]))?])?;
-        let layout = super::layout::record(TREE_FORMAT_VERSION, [
+        let layout = super::layout::record(self.format, [
             (Table::Header, table(&self.root, Table::Header)),
             (Table::Columns, table(&self.root, Table::Columns)),
             (Table::Members, table(&self.root, Table::Members)),
@@ -343,14 +437,14 @@ impl TreeFile {
             (Table::Blocks, rank_tree::materialize_blocks(&self.reader, &terms).await?),
             (Table::Windows, concat(&documents, Table::Windows)?),
         ])?;
-        let visibility = super::layout::record(TREE_FORMAT_VERSION, [
+        let visibility = super::layout::record(self.format, [
             (Table::Events, concat(&visibility, Table::Events)?),
             (Table::Runs, concat(&documents, Table::Runs)?),
             (Table::RowRuns, row_maps),
         ])?;
         let mut pages = vec![layout, visibility];
         pages.extend(self.all(POSTING).await?);
-        super::SearchFile::open_reader(super::layout::Reader::from_checked_batches(pages), columns)
+        super::SearchFile::open_reader(super::layout::Reader::from_checked_batches(pages, self.format), columns)
             .map(|file| file.with_reservation(reservation))
     }
 
@@ -360,10 +454,37 @@ impl TreeFile {
     }
 
     pub(super) async fn find(&self, kind: u8, key: &[u8]) -> Result<Option<RecordBatch>> {
-        if let Some(page) = self.reader.find(self.directories[&kind], key).await? {
+        if let Some(page) = self.reference(kind, key).await? {
             return self.reader.page(page, page_kind(kind)).await.map(Some);
         }
         Ok(None)
+    }
+
+    async fn reference(&self, kind: u8, key: &[u8]) -> Result<Option<PageRef>> {
+        match self.routes.get(&kind) {
+            Some(children) => Ok(direct_reference(children, key)),
+            None => self.reader.find(self.directories[&kind], key).await,
+        }
+    }
+
+    pub(super) async fn term_pages(&self, column: u32, names: &[String]) -> Result<Vec<Option<RecordBatch>>> {
+        use futures::{FutureExt, TryStreamExt};
+        if self.format == PACKED_FORMAT_VERSION && !table(&self.root, Table::Terms).is_empty() {
+            return Ok(names.iter().map(|_| Some(self.root.clone())).collect());
+        }
+        let mut in_flight = futures::stream::FuturesOrdered::new();
+        let mut requests = Vec::with_capacity(names.len());
+        for name in names {
+            let key = term_key(column, name);
+            in_flight.push_back(async move { self.reference(TERM, &key).await }.boxed());
+            if in_flight.len() == 8 {
+                requests.push(in_flight.try_next().await?.expect("queued term returns its reference"));
+            }
+        }
+        while let Some(reference) = in_flight.try_next().await? { requests.push(reference); }
+        let unique = requests.iter().flatten().copied().collect::<BTreeSet<_>>().into_iter().collect();
+        let pages = self.reader.pages(unique, PageKind::Terms).await?;
+        Ok(requests.into_iter().map(|request| request.map(|page| pages[&page].clone())).collect())
     }
 
     pub(super) async fn all(&self, kind: u8) -> Result<Vec<RecordBatch>> {
@@ -373,7 +494,10 @@ impl TreeFile {
     }
 
     pub(super) async fn find_ordinals(&self, kind: u8, ordinals: std::collections::BTreeSet<usize>) -> Result<BTreeMap<usize, RecordBatch>> {
-        let references = self.reader.find_ordinals(self.directories[&kind], ordinals.into_iter().collect()).await?;
+        let references = match self.routes.get(&kind) {
+            Some(children) => ordinals.into_iter().filter_map(|row| direct_reference(children, &ordinal(row)).map(|page| (row, page))).collect(),
+            None => self.reader.find_ordinals(self.directories[&kind], ordinals.into_iter().collect()).await?,
+        };
         let pages = self.reader.pages(references.iter().map(|(_, reference)| *reference).collect(), page_kind(kind)).await?;
         references.into_iter().map(|(ordinal, reference)| {
             pages.get(&reference).cloned().map(|page| (ordinal, page)).ok_or_else(|| corrupt("Search page was omitted"))
@@ -399,6 +523,66 @@ impl TreeFile {
         }
         Ok(found)
     }
+
+    pub(crate) async fn versions(&self, iids: &BTreeSet<Iid>, column: usize, budget: &Arc<MemoryBudget>)
+        -> Result<(BTreeMap<Iid, Vec<PackedEvent>>, Arc<MemoryReservation>)> {
+        if self.format != PACKED_FORMAT_VERSION { return Err(corrupt("Search pack does not record logical versions")); }
+        let mut reservation = budget.reserve(4096usize.saturating_add(iids.len().saturating_mul(192)))?;
+        let ranges: Vec<_> = iids.iter().map(|iid| (event_key(&iid.0, 0), event_key(&iid.0, u32::MAX))).collect();
+        let pages = match self.routes.get(&VISIBILITY) {
+            Some(children) => children.iter().filter(|child| {
+                let index = ranges.partition_point(|(_, upper)| upper < &child.lower);
+                ranges.get(index).is_some_and(|(lower, _)| lower <= &child.upper)
+            }).map(|child| child.page).collect(),
+            None => self.reader.covering(self.directories[&VISIBILITY], &ranges).await?,
+        };
+        let batches = self.reader.pages(pages, PageKind::Visibility).await?;
+        let mut found = BTreeMap::<Iid, Vec<PackedEvent>>::new();
+        let mut count = 0usize;
+        for batch in batches.values() {
+            let events = table(batch, Table::Events);
+            let versions = table(batch, Table::Versions);
+            let keys = events.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search IID layout");
+            let bounds: [_; 3] = std::array::from_fn(|index| events.column(index + 1).as_primitive::<Int64Type>());
+            let operations = events.column(4).as_primitive::<arrow_array::types::UInt8Type>();
+            let locations: [_; 4] = std::array::from_fn(|index| versions.column(index).as_primitive::<UInt32Type>());
+            let row_runs = table(batch, Table::RowRuns);
+            let columns = row_runs.column(0).as_list::<i64>();
+            if events.is_empty() || versions.len() != events.len() || column >= columns.len() || versions.columns().iter().any(|values| values.null_count() != 0) {
+                return Err(corrupt("Search visibility page has incomplete version references"));
+            }
+            let docs = columns.value(column);
+            let docs = docs.as_primitive::<UInt32Type>();
+            if docs.len() != events.len() || docs.null_count() != 0 {
+                return Err(corrupt("Search version references have an incomplete row map"));
+            }
+            let first = Iid::from_slice(keys.value(0))?;
+            let last = Iid::from_slice(keys.value(keys.len() - 1))?;
+            if first > last { return Err(corrupt("Search versions have an invalid IID range")); }
+            for &iid in iids.range(first..=last) {
+                let start = lower_bound(keys.len(), |row| keys.value(row) < iid.0.as_slice());
+                let end = lower_bound(keys.len(), |row| keys.value(row) <= iid.0.as_slice());
+                count = count.saturating_add(end - start);
+                Arc::get_mut(&mut reservation).expect("version reads own their scratch")
+                    .grow_to(4096usize.saturating_add(iids.len().saturating_mul(192)).saturating_add(count.saturating_mul(192)))?;
+                for row in start..end {
+                    let document = docs.value(row);
+                    found.entry(iid).or_default().push(PackedEvent {
+                        header: EventHeader { iid, system_from: Timestamp(bounds[0].value(row)), commit_position: locations[0].value(row),
+                            valid_time: Interval::from_micros(bounds[1].value(row), bounds[2].value(row))?, op: super::op_of(operations.value(row))? },
+                        member: locations[1].value(row), page: locations[2].value(row), row: locations[3].value(row),
+                        document: (document < super::NULL_DOC).then_some(document),
+                    });
+                }
+            }
+        }
+        Ok((found, reservation))
+    }
+}
+
+fn direct_reference(children: &[Child], key: &[u8]) -> Option<PageRef> {
+    let index = children.partition_point(|child| child.upper.as_slice() < key);
+    children.get(index).filter(|child| child.lower.as_slice() <= key).map(|child| child.page)
 }
 
 fn lower_bound(len: usize, before: impl Fn(usize) -> bool) -> usize {
@@ -439,7 +623,7 @@ mod tests {
         rows.sort_unstable_by_key(|row| row.iid);
         let mut file = tempfile::tempfile().unwrap();
         super::super::write_versioned_group(&columns, [[Ok(rows.clone())]], "tree", 42, None, &mut file, None, TREE_FORMAT_VERSION).unwrap();
-        let locator = TreeLocator::read(&mut file).unwrap();
+        let locator = TreeLocator::read(&mut file, TREE_FORMAT_VERSION).unwrap();
         assert_eq!(TreeLocator::decode(&locator.encode()), Some(locator.clone()));
         assert!(!locator.has_canonical_uuid_iids());
         let certified = locator.clone().with_uuid_iid_evidence(true);
@@ -472,6 +656,47 @@ mod tests {
             .map(|(doc, score)| (doc.iid, score.to_bits())).collect::<BTreeMap<_, _>>();
         assert_eq!(actual.len(), rows.len());
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn a_pack_authenticates_inline_routes_and_finds_versions_in_both_members() {
+        let columns = ["body".to_owned()];
+        let row = |iid, system_from, op, value: Option<&str>| super::super::SearchRow {
+            identity: None, iid: [iid; 16], system_from, valid_from: 0, valid_to: i64::MAX,
+            op, values: vec![value.map(tokens)],
+        };
+        let mut file = tempfile::tempfile().unwrap();
+        let members = [
+            vec![Ok(vec![row(1, 3, EventOp::Delete, None)]), Ok(vec![row(1, 2, EventOp::Put, Some("audit report"))])],
+            vec![Ok(vec![row(9, 2, EventOp::Put, Some("separate report"))])],
+        ];
+        super::super::write_versioned_group(&columns, members, "pack", 1, None, &mut file, None, PACKED_FORMAT_VERSION).unwrap();
+        let locator = TreeLocator::read(&mut file, PACKED_FORMAT_VERSION).unwrap();
+        assert!(locator.inline_root.is_some());
+        let encoded = locator.encode();
+        assert_eq!(TreeLocator::decode(&encoded), Some(locator.clone()));
+        let (prefix, bytes) = encoded.rsplit_once(':').unwrap();
+        let byte = if bytes.ends_with('0') { '1' } else { '0' };
+        let corrupted = format!("{prefix}:{}{byte}", &bytes[..bytes.len() - 1]);
+        assert_eq!(TreeLocator::decode(&corrupted), Some(locator.without_inline_root()));
+
+        file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "pack", 1).await.unwrap();
+        tree.verify().await.unwrap();
+        let first = Iid([1; 16]);
+        let second = Iid([9; 16]);
+        let queried = BTreeSet::from([first, second, Iid([5; 16])]);
+        let budget = MemoryBudget::new(1 << 20);
+        let (versions, _charge) = tree.versions(&queried, 0, &budget).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        let first = &versions[&first];
+        assert_eq!(first.iter().map(|event| (event.header.system_from, event.member, event.page, event.row)).collect::<Vec<_>>(),
+            [(Timestamp(3), 0, 0, 0), (Timestamp(2), 0, 1, 0)]);
+        assert_eq!(first.iter().map(|event| event.document.is_some()).collect::<Vec<_>>(), [false, true]);
+        let second = &versions[&second][0];
+        assert_eq!((second.member, second.page, second.row), (1, 0, 0));
     }
 
     #[test]

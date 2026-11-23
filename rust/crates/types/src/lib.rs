@@ -55,7 +55,7 @@ pub use logical::{IntervalUnit, ListKind, LogicalType, RunEndWidth, ScalarType, 
 pub use type_edn::{TypeForm, function_type_mismatch};
 pub use position::*;
 pub use pg::{PgType, PgTypeDescriptor, pg_name_oid, pg_table_oid};
-pub use time::{EventHeader, EventOp, Instant, Interval, TemporalBounds};
+pub use time::{EventHeader, EventOp, Instant, Interval, RowVersion, TemporalBounds};
 pub use timestamp::Timestamp;
 pub use value::{DecimalValue, Value};
 pub use uri::UriParts;

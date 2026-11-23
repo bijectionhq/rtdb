@@ -279,6 +279,7 @@ contract OutputSegmentLayout {
         -- An output's artefact records are those its node's artefact kinds built for the definitions in force in its snapshot, so two nodes may record different sets.
         -- Each artefact is deterministic in its own key.
         -- Tiered compaction writes one bucket per job and leaves potential group artefacts to the lane, which sees the completed group in the catalog.
+        -- Native packed search describes a retained event with the same logical version after compaction and records its position in the new primary file.
 }
 
 ------------------------------------------------------------

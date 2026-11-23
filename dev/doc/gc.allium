@@ -398,10 +398,16 @@ rule DeleteAndCommitChunkRule {
     -- A partition group's artefacts (trie-cat.allium: ArtefactScope) are derived from every member's data file, so they go once the cycle collects the last member the catalog holds, before any chunk.
     -- A recorded shared file binds to an observed provider version only when at least one retained record names it and every retained record for that file witnesses that same publication.
     -- A member the catalog holds and this cycle does not collect, live or not yet past its garbage lifetime, keeps them.
+    -- A search pack follows the same retention rule using the member list in its object name.
+    -- finished_pack_files selects packs whose held members are all eligible and whose final held member is in the current deletion chunk.
+    -- A sealed search file on a garbage level-0 trie can retire when neither a checkpoint nor a reader needs that trie and the read lease has elapsed.
+    -- Its primary data and metadata retain their recovery custody.
     -- See: maintenance/src/gc.rs (collect_table, finished_groups)
     when: DeleteAndCommitChunk(table, chunk)
 
     ensures:
+        for key in finished_pack_files(table, chunk):
+            ObjectStoreDelete(key)
         for group in finished_groups(table, chunk):
             for key in ObjectStoreList(trie_cat/group_artefact_prefix(table, group)):
                 ObjectStoreDelete(key)

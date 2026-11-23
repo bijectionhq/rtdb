@@ -55,13 +55,15 @@ The node option `search: {enabled: false}` turns off the lane and acceleration.
 `MATCH` still returns the same rows.
 `search: {threads: N}` sizes the lane per database.
 `search: {writeFormat: 14}` enables authenticated Arrow search files for newly indexed tries.
+`search: {writeFormat: 15}` also enables snapshot-pinned serving postings and packed Arrow visibility for ranked SQL.
 The server defaults to format 11 for rolling upgrades.
 Upgrade all readers and maintenance lanes that share the database before enabling Arrow writes.
-Upgraded nodes can read and repair retained format 11, 12, 13 and 14 files.
+Upgraded nodes can read and repair retained formats 11 through 15.
 Accelerated queries score against the column values visible at the snapshot.
 The search accelerator can prune a ranked limit over the two-argument score and a `MATCH` on the same column.
 The five-argument score uses the ordinary SQL sort and limit.
 See link:../../rust/crates/search/README.adoc[the search reference] and link:fts.allium[the specification].
+See link:rtdb-fts-snapshot-native.md[the format 15 design] for publication, ranking and retention.
 
 == Spatial paths
 

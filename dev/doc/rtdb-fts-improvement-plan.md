@@ -1,5 +1,8 @@
 # RTDB full-text search improvement plan
 
+This plan records the format 14 work.
+The [format 15 design](rtdb-fts-snapshot-native.md) describes the next step for snapshot-pinned visibility, commit-time search and shared packs.
+
 ## Objective
 
 Return exact ranked SQL rows after inspecting only the search and primary data needed to prove the result at the requested bitemporal snapshot.

@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn trie(key: &str, size: i64) -> CatalogTrie { CatalogTrie { key: key.parse().unwrap(), data_file_size: size, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None } }
-fn definition(id: &str) -> ArtefactDefinition { ArtefactDefinition { table: table(), kind: "search".into(), id: id.into(), version: 1, historical: true, group_bytes: None } }
-fn record(id: &str) -> ArtefactRecord { ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None, scope: None, file_size: None, published_version: None } }
+fn definition(id: &str) -> ArtefactDefinition { ArtefactDefinition { table: table(), kind: "search".into(), id: id.into(), version: 1, historical: true, group_bytes: None, packed: false } }
+fn record(id: &str) -> ArtefactRecord { ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None, scope: None, file_size: None, published_version: None, pack_members: Vec::new() } }
 fn catalog() -> TrieCatalog {
     let mut catalog = TrieCatalog::new(100).unwrap();
     for (key, size) in [("l00-rc-b00", 10), ("l01-rc-b00", 10), ("l01-r20200106-b00", 10), ("l02-rc-p0-b00", 100), ("l02-rc-p1-b00", 100), ("l02-rc-p2-b00", 100), ("l02-rc-p3-b00", 100), ("l01-rc-b01", 10), ("l00-rc-b02", 10)] {
@@ -127,6 +127,30 @@ fn a_partition_group_whose_members_all_lack_the_artefact_is_one_job_within_its_b
     assert!(matches!(compacted.trie(&table(), &"l02-rc-p0-b00".parse().unwrap()).unwrap().state, TrieState::Garbage { .. }));
     assert_eq!(keys(&available_artefact_jobs(&compacted, &[grouped("body", 400)])), ["body:g03-rc-p0-b01", "body:l02-rc-p1-b00", "body:l02-rc-p2-b00", "body:l02-rc-p3-b00", "body:l01-r20200106-b00"],
         "a group one of whose members has been superseded is built a live member at a time");
+}
+
+#[test]
+fn a_pack_can_replace_existing_singletons_with_live_primaries_from_different_blocks() {
+    let mut catalog = catalog();
+    for bucket in 0..4 {
+        catalog = catalog.with_tries(table(), [trie(&format!("l03-rc-p0{bucket}-b01"), 25)], Timestamp(101)).unwrap();
+    }
+    let body = ArtefactDefinition { packed: true, ..grouped("body", 400) };
+    let first = "l03-rc-p00-b01".parse::<TrieKey>().unwrap();
+    let second = "l02-rc-p1-b00".parse::<TrieKey>().unwrap();
+    let catalog = catalog.with_artefacts(&table(), [(first.clone(), record("body")), (second.clone(), record("body"))]);
+    let jobs = available_artefact_jobs(&catalog, &[body]);
+    let job = jobs.iter().filter(|job| matches!(job.owner, ArtefactOwner::Pack(_)))
+        .find(|job| job.tries().contains(&first)).unwrap();
+    assert!(job.tries().contains(&second));
+    let pack = ArtefactRecord { scope: Some(ArtefactScope::Pack as i32),
+        pack_members: job.tries().iter().map(ToString::to_string).collect(), ..record("body") };
+    let packed = catalog.with_artefacts(&table(), job.tries().into_iter().map(|trie| (trie, pack.clone())));
+    for member in job.tries() {
+        let trie = packed.trie(&table(), &member).unwrap();
+        let recorded = trie.artefact("search", "body", 1).unwrap();
+        assert_eq!(ArtefactOwner::of(&member, recorded).unwrap(), job.owner);
+    }
 }
 
 #[test]

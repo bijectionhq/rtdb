@@ -12,7 +12,7 @@ use rtdb_text::stored_length;
 use rtdb_types::{Anomaly, EntityId, EventHeader, Iid, Result};
 
 use super::{
-    FORMAT_VERSION, TREE_FORMAT_VERSION, NO_DOC, NULL_DOC, IndexedRow, Section, SearchPage, STORED_IMPACTS, artefact_digest,
+    FORMAT_VERSION, TREE_FORMAT_VERSION, PACKED_FORMAT_VERSION, NO_DOC, NULL_DOC, IndexedRow, Section, SearchPage, STORED_IMPACTS, artefact_digest,
     fault, lifespan, op_code, sections_array,
     layout::{Table, Writer, item_of, list},
     paged::PostingPlan,
@@ -27,13 +27,14 @@ pub(super) struct Events {
     valid_to: Vec<i64>,
     operation: Vec<u8>,
     keys: BinaryBuilder,
+    positions: Vec<u32>,
 }
 
 impl Events {
     pub fn new() -> Self {
         Self {
             iid: FixedSizeBinaryBuilder::new(16), system_from: Vec::new(),
-            valid_from: Vec::new(), valid_to: Vec::new(), operation: Vec::new(), keys: BinaryBuilder::new(),
+            valid_from: Vec::new(), valid_to: Vec::new(), operation: Vec::new(), keys: BinaryBuilder::new(), positions: Vec::new(),
         }
     }
 
@@ -44,15 +45,17 @@ impl Events {
         self.valid_to.push(header.valid_time.upper().0);
         self.operation.push(op_code(header.op));
         self.keys.append_option(key);
+        self.positions.push(header.commit_position);
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<arrow_array::StructArray> {
-        Table::Events.array(vec![
+    pub fn finish(mut self) -> Result<(arrow_array::StructArray, Vec<u32>)> {
+        let events = Table::Events.array(vec![
             Arc::new(self.iid.finish()), Arc::new(Int64Array::from(self.system_from)),
             Arc::new(Int64Array::from(self.valid_from)), Arc::new(Int64Array::from(self.valid_to)),
             Arc::new(UInt8Array::from(self.operation)), Arc::new(self.keys.finish()),
-        ])
+        ])?;
+        Ok((events, self.positions))
     }
 }
 
@@ -267,17 +270,19 @@ impl Builder {
         ])?;
         let mut directory = vec![(Table::Header, header), (Table::Columns, column_table), (Table::Members, members),
             (Table::Pages, pages), (Table::Sections, sections_array(&sections)?), (Table::Terms, terms)];
-        let visibility = [(Table::Events, self.events.finish()?), (Table::Runs, self.runs.finish()?), (Table::RowRuns, row_runs)];
+        let (events, positions) = self.events.finish()?;
+        let visibility = [(Table::Events, events), (Table::Runs, self.runs.finish()?), (Table::RowRuns, row_runs)];
         let postings = postings.into_iter().flat_map(BTreeMap::into_values);
         if self.format >= FORMAT_VERSION {
             let plan = PostingPlan::new(postings);
-            if self.format == TREE_FORMAT_VERSION {
+            if self.format >= TREE_FORMAT_VERSION {
                 directory.push((Table::ImpactIds, plan.ids(&self.window_ids)?));
             }
             directory.push((Table::Windows, Table::Windows.array(vec![Arc::new(Int64Array::from(self.window_ids))])?));
             directory.push((Table::Blocks, plan.directory()?));
-            if self.format == TREE_FORMAT_VERSION {
-                super::tree_file::write(&mut writer, directory, visibility, plan)?;
+            if self.format >= TREE_FORMAT_VERSION {
+                super::tree_file::write(&mut writer, directory, visibility, plan,
+                    (self.format == PACKED_FORMAT_VERSION).then_some(positions))?;
             } else {
                 writer.page(directory)?;
                 writer.page(visibility)?;

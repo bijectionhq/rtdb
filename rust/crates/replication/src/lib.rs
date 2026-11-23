@@ -17,7 +17,7 @@ mod table_replay;
 
 pub use admission::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint, RecoveredPartition};
-pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, TermHandle};
+pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
 pub use repair::{LocalRepair, PublishedReplayedPrimary, RepairCheckpoint, ReplayedPrimary, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};

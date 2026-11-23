@@ -539,6 +539,8 @@ rule ApplyResolvedTx {
     --
     -- The DURABLE head advance ALONE makes the transaction queryable.
     -- The shared external snapshot is a lazily-advanced cache, rebuilt on the next demanding read, and is not refreshed here.
+    -- In the native packed-search mode, the durable head installs the admitted search coverage with the imported live tables.
+    -- Inadequate search admission may leave a coverage gap that follows the pinned view and is evaluated by the scan.
     when: RecordApplied(resolver)
 
     requires: not resolver.is_empty

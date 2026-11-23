@@ -33,6 +33,7 @@ arrow-select.workspace = true
 memmap2.workspace = true
 bytes.workspace = true
 futures.workspace = true
+lz4_flex.workspace = true
 sha2.workspace = true
 tantivy.workspace = true
 stable_deref_trait.workspace = true

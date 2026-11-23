@@ -102,7 +102,7 @@ fn a_tiered_trie_belongs_to_the_partition_group_of_its_siblings() {
 #[test]
 fn a_record_names_its_tries_object_or_its_groups() {
     let slug = TableSlug::recorded("public$docs").unwrap();
-    let record = |scope: pb::ArtefactScope| pb::ArtefactRecord { kind: Some("search".into()), definition_id: Some("docs".into()), definition_version: Some(1), stats: None, scope: Some(scope as i32), file_size: None, published_version: None };
+    let record = |scope: pb::ArtefactScope| pb::ArtefactRecord { kind: Some("search".into()), definition_id: Some("docs".into()), definition_version: Some(1), stats: None, scope: Some(scope as i32), file_size: None, published_version: None, pack_members: Vec::new() };
     let member: TrieKey = "l02-rc-p1-b05".parse().unwrap();
     assert_eq!(slug.recorded_artefact_key(&member, &record(pb::ArtefactScope::Trie)).unwrap(), "tables/public$docs/artefacts/l02-rc-p1-b05/search/docs-v1.bin");
     assert_eq!(slug.recorded_artefact_key(&member, &record(pb::ArtefactScope::PartGroup)).unwrap(), "tables/public$docs/artefacts/g02-rc-b05/search/docs-v1.bin");
