@@ -333,7 +333,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn select_parent_as_of<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
-    ) -> BoxFuture<'a, Result<Timestamp>> {
+    ) -> BoxFuture<'a, Result<Option<Timestamp>>> {
         Box::pin(HeldCheckpointWorld::select_parent_as_of(self, relations, requested))
     }
 

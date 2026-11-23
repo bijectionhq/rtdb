@@ -189,7 +189,7 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<(Timestamp, Timestamp)>>>;
     fn select_parent_as_of<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
-    ) -> BoxFuture<'a, Result<Timestamp>>;
+    ) -> BoxFuture<'a, Result<Option<Timestamp>>>;
     fn parent_point_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;

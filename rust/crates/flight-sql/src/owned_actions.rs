@@ -2410,6 +2410,9 @@ impl Service {
         if matches!(selection, WorldCutSelection::AsOfParent) {
             let selected = held.snapshot.select_parent_as_of(&relations, system).await.map_err(status)?;
             for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
+            let Some(selected) = selected else {
+                return Ok(ActionResult { body: Bytes::from_static(&[0]) });
+            };
             return Ok(ActionResult { body: wire::retain(selected.0.to_be_bytes().to_vec(), call.reserve(8)?) });
         }
         let mode = match held.snapshot.clock_mode() {
