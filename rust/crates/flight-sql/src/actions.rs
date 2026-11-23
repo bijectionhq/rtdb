@@ -58,7 +58,7 @@ impl Service {
                 crate::owned_actions::READ_HELD_UNIQUE_V1 => Ok(vec![Ok(self.held_owned_unique_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V2 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::HELD_WORLD_VALID_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_WORLD_VALID_V2 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::HELD_PROTECTED_COVERAGE_V1 => Ok(vec![Ok(self.held_protected_coverage_action(&call, &action.body).await?)]),

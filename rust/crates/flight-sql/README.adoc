@@ -432,11 +432,13 @@ Every call reads the same live cut and archive root. The held handle stays bound
 Use `rtdb.owned.CloseWorldRead.v1` with the 16-byte handle to cancel the read. Success has zero Flight results. The archive lease releases after in-flight I/O drains.
 A held read expires no later than 60 seconds or the world's own expiration. A drop fences new opens. Earlier admitted handles can read only while their original cut and archive lease still admit them.
 
-`rtdb.owned.ReadHeldWorldValidDuring.v1` takes the 16-byte held world handle, a relation prefix and one Arrow row with `_id`, `valid_from_micros: Int64` and `valid_to_micros: Int64`.
+`rtdb.owned.ReadHeldWorldValidDuring.v2` takes the 16-byte held world handle, a source byte, a relation prefix and one Arrow row with `_id`, `valid_from_micros: Int64` and `valid_to_micros: Int64`.
+Source 0 resolves the combined world and source 1 resolves its archived parent for relations without fixed lifetimes.
 The reply carries the held present and resolved window in schema metadata. Each row carries `valid_from_micros`, `valid_to_micros` and the winning `system_from_micros` as signed Int64 values.
 Local tombstones leave gaps, which carry no rows.
 An authenticated placed hold with a live evidence lease returns one opaque `rtdb.owned.world_range_witness` even if the entire window is absent.
-Ordering checks the original parent pin, Root purge frontier and the complete local relation frontier for a writable world.
+Ordering checks the original parent pin and Root purge frontier in both modes.
+The combined view also checks the complete local relation frontier for a writable world.
 History refuses a cut lacking custody coverage or requiring more than 128 candidate slices.
 
 `rtdb.owned.ReadHeldWorldIdentityPage.v1` takes the 16-byte held world handle, a relation prefix and one Arrow request row.

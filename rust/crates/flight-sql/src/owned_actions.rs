@@ -153,7 +153,7 @@ pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
-pub(crate) const HELD_WORLD_VALID_V1: &str = "rtdb.owned.ReadHeldWorldValidDuring.v1";
+pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
@@ -2081,6 +2081,12 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world history has no source"))?;
+        let parent_only = match *mode {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Invalid owned world history source")),
+        };
         let (relation, arrow_bytes) = split_relation(body)?;
         let batch = request_batch(call, arrow_bytes)?;
         let batch = batch.batch();
@@ -2092,7 +2098,7 @@ impl Service {
         let to = history_request_endpoint(batch, "valid_to_micros")?;
         let valid = Interval::new(from, to).map_err(status)?;
         if valid.is_empty() { return Err(invalid("Owned world history requires a nonempty valid window")); }
-        let (slices, witness) = held.snapshot.valid_during(&relation, &id, valid).await.map_err(status)?;
+        let (slices, witness) = held.snapshot.valid_during(&relation, &id, valid, parent_only).await.map_err(status)?;
         let _rows = call.reserve(4096 + slices.len() * 128)?;
         let mut metadata = std::collections::HashMap::from([
             (OWNED_PRESENT.into(), held.snapshot.present().0.to_string()),

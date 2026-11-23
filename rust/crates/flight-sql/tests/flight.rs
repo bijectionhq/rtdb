@@ -840,7 +840,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.PublishWorldCut.v1", "rtdb.owned.PublishWorldCut.v2",
         "rtdb.owned.CommitHeldWorlds.v4", "rtdb.owned.CommitWorld.v3",
         "rtdb.owned.OpenWorldRead.v4", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v1",
-        "rtdb.owned.ReadHeldWorldValidDuring.v1",
+        "rtdb.owned.ReadHeldWorldValidDuring.v2",
         "rtdb.owned.CloseWorldRead.v1",
     ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();

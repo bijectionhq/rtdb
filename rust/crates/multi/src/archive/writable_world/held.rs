@@ -416,13 +416,20 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn valid_during(
-        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, parent_only: bool,
     ) -> Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)> {
         self.check_relation(relation)?;
         if valid.is_empty() { return Err(OwnedWorld::unavailable()); }
+        if parent_only && self.open.snapshot.lifetime_point_policy(relation).await?.is_some() {
+            return Err(OwnedWorld::unavailable());
+        }
         self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
-        let local = self.open.snapshot.open_world_shadow_boundaries(self.open.record.id, relation, id, valid).await?;
-        let local = read_boundaries(local, valid).await?;
+        let local = if parent_only {
+            Vec::new()
+        } else {
+            let scan = self.open.snapshot.open_world_shadow_boundaries(self.open.record.id, relation, id, valid).await?;
+            read_boundaries(scan, valid).await?
+        };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Boundaries {
             relation: relation.clone(), id: id.clone(), valid,
@@ -441,13 +448,22 @@ impl HeldCheckpointWorld {
         if boundaries.len() > MAX_HISTORY_SLICES + 1 { return Err(history_limit()); }
         let mut visible = Vec::with_capacity(boundaries.len().saturating_sub(1));
         for window in boundaries.windows(2) {
-            if let Some(fact) = self.point(relation, id, window[0], false).await?.fact {
+            let fact = if parent_only {
+                self.archive_point(relation, id, window[0], None).await?
+            } else {
+                self.point(relation, id, window[0], false).await?.fact
+            };
+            if let Some(fact) = fact {
                 visible.push((Interval::new(window[0], window[1])?, fact.revision));
             }
         }
         let witness = if self.evidence_until() > self.present().system_time {
-            Some(self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
-                .await?.pop().ok_or_else(OwnedWorld::unavailable)?)
+            Some(if parent_only {
+                self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?
+            } else {
+                self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
+                    .await?.pop().ok_or_else(OwnedWorld::unavailable)?
+            })
         } else {
             None
         };

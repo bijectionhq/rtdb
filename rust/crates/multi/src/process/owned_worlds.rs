@@ -204,9 +204,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
 
     fn valid_during<'a>(
-        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval,
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval, parent_only: bool,
     ) -> BoxFuture<'a, Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)>> {
-        Box::pin(HeldCheckpointWorld::valid_during(self, relation, id, valid))
+        Box::pin(HeldCheckpointWorld::valid_during(self, relation, id, valid, parent_only))
     }
 
     fn identity_page<'a>(

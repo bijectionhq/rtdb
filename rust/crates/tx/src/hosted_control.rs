@@ -954,7 +954,9 @@ mod retained_release_tests {
         let marker = frontier("public_fact_head:AAAAAAAAAAAAAAAAAAAAAA")?;
         assert!(is_proposal_landing_frontier(&marker));
         operations.push(Operation::Public(marker));
-        assert_eq!(hosted_proposal_land(&operations), Some((world, pin, false)));
+        assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
+            world, pin, effect: ProposalLandingEffect::Points,
+        }));
 
         operations.push(Operation::Public(frontier("public_fact_head:BAAAAAAAAAAAAAAAAAAAAA")?));
         assert_eq!(hosted_proposal_land(&operations), None);
@@ -1012,7 +1014,9 @@ mod retained_release_tests {
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.pop();
         operations.push(root_point(start));
-        assert_eq!(hosted_proposal_land(&operations), Some((world, pin, false)));
+        assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
+            world, pin, effect: ProposalLandingEffect::FixedPeriod,
+        }));
         let root_point = operations.pop().unwrap();
         operations.pop();
         operations.push(root_point);
@@ -1219,10 +1223,24 @@ pub(crate) fn proposal_landing_frontier_rows(op: &crate::source::Operation) -> O
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProposalLandingEffect {
+    Points,
+    FixedPeriod,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostedProposalLanding {
+    pub(crate) world: rtdb_types::Iid,
+    pub(crate) pin: rtdb_types::Iid,
+    pub(crate) effect: ProposalLandingEffect,
+}
+
 /// One exact Proposal terminal effect and its matching witnessed Root writes.
 pub(crate) fn hosted_proposal_land(
     operations: &[crate::source::Operation],
-) -> Option<(rtdb_types::Iid, rtdb_types::Iid, bool)> {
+) -> Option<HostedProposalLanding> {
     use crate::{TxOp, source::Operation};
     let mut landing = None;
     let mut replacements = std::collections::BTreeMap::new();
@@ -1280,7 +1298,8 @@ pub(crate) fn hosted_proposal_land(
     if replacements.is_empty() || frontiers.len() > replacements.len() || close && !frontiers.is_empty() {
         return None;
     }
-    if replacements.len() != 1 && replacements.values().any(|(_, _, start)| start.is_some()) {
+    let fixed_period = replacements.values().any(|(_, _, start)| start.is_some());
+    if fixed_period && replacements.len() != 1 {
         return None;
     }
     if operations.iter().filter_map(Operation::owned_relation)
@@ -1299,7 +1318,9 @@ pub(crate) fn hosted_proposal_land(
                 && !operations.iter().any(|op| match op {
                     Operation::Public(TxOp::OwnedCheckWorldPurge { .. }) => true,
                     _ => op.owned_relation().is_some_and(|relation| relation.world().is_some()),
-                })).then_some((world, pin, true));
+                })).then_some(HostedProposalLanding {
+                    world, pin, effect: ProposalLandingEffect::Close,
+                });
         }
         let local = relation.in_world(world).ok()?;
         let local_checked = operations.windows(2).any(|pair| matches!(pair, [
@@ -1319,5 +1340,9 @@ pub(crate) fn hosted_proposal_land(
         }
         if !root_checked || !local_checked { return None; }
     }
-    (expected_clock.is_some() && proposal_land_controls(controls)).then_some((world, pin, false))
+    (expected_clock.is_some() && proposal_land_controls(controls)).then_some(HostedProposalLanding {
+        world,
+        pin,
+        effect: if fixed_period { ProposalLandingEffect::FixedPeriod } else { ProposalLandingEffect::Points },
+    })
 }

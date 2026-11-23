@@ -79,10 +79,12 @@ impl Kind {
 }
 
 pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
+    use crate::hosted_control::ProposalLandingEffect;
+
     let mut selected = BTreeMap::<Iid, BTreeSet<&str>>::new();
     let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
     for operation in operations {
-        if matches!(proposal_land, Some((_, _, false)))
+        if proposal_land.is_some_and(|landing| landing.effect != ProposalLandingEffect::Close)
             && crate::hosted_control::proposal_landing_frontier_rows(operation).is_some()
         {
             continue;
@@ -124,8 +126,8 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) =>
             Some(Ok((ROOT, Kind::Root, attempt, fingerprint))),
         Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, advance_to, drop_world, settlement_pin, delete_root, .. }) => {
-            let kind = if let Some((landed, _, close)) = proposal_land && landed == *world {
-                if close { Kind::ProposalClose } else { Kind::ProposalLanding }
+            let kind = if let Some(landing) = proposal_land && landing.world == *world {
+                if landing.effect == ProposalLandingEffect::Close { Kind::ProposalClose } else { Kind::ProposalLanding }
             }
                 else if delete_root.is_some() { Kind::RootRetainedDrop }
                 else if retained_release == Some(*world) { Kind::ControlsRetainedDrop }

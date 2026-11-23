@@ -133,6 +133,9 @@
 -- The transaction orders these conditions with Root facts and hosted controls, and the observed worlds receive no writes.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
+-- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
+-- Its ordered condition checks the original parent pin and Root purge frontier.
+-- A single finite Proposal replacement can land after the Root publication advances when the transaction checks both exact starts and both held timeline frontiers.
 -- Fully covered range counts and completed head valid windows can issue relation-frontier evidence under the same placed lease as range pages.
 -- Held system versions seek both window edges in the relation's ordered change journal and verify its event frontier.
 -- Both directions advance past every scanned source group, including groups with no change to the requested identity.
