@@ -3008,6 +3008,11 @@ impl<'a> OpenTransaction<'a> {
             Ok(false) => None,
             Err(error) => Some(Err(error)),
         });
+        let read_id = |row| -> Result<(EntityId, Arc<MemoryReservation>)> {
+            let id = documents.owned_id_ref(row)?;
+            let reservation = memory.reserve(id.owned_payload_bytes().saturating_mul(4))?;
+            Ok((id.into_owned(), reservation))
+        };
         let _scratch = memory.reserve(4096usize.saturating_add(array.fields().len().saturating_mul(512)))?;
         let mut all_deleted = true;
         for row in 0..array.len() {
@@ -3048,7 +3053,7 @@ impl<'a> OpenTransaction<'a> {
             }
             all_deleted &= deleted;
             if create_only {
-                let id = documents.owned_id(row)?;
+                let (id, _identity) = read_id(row)?;
                 self.require_world_create_absence(owner, root, relation, &id).await?;
             }
         }
@@ -3070,13 +3075,16 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         if bounded_held {
-            for row in 0..array.len() { self.reserve_bounded_period_write(relation, documents.owned_id(row)?)?; }
+            for row in 0..array.len() {
+                let (id, _identity) = read_id(row)?;
+                self.reserve_bounded_period_write(relation, id)?;
+            }
         }
         let table = relation.table(owner);
         let system_from = self.tx_key().system_time;
         let mut projection = OwnedPutProjection::default();
         for row in 0..array.len() {
-            let id = documents.owned_id(row)?;
+            let (id, _identity) = read_id(row)?;
             let iid = iids.map_or_else(|| id.iid(), |iids| iids[row]);
             let mut positions = Vec::new();
             let mut kind = OwnedChangeKind::Put;

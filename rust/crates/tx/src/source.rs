@@ -1968,8 +1968,22 @@ fn canonical_document_struct(
     rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))
 }
 
+fn masks_dense_union(field: &Field, parent_can_mask: bool) -> bool {
+    match field.data_type() {
+        DataType::Struct(children) => children.iter().any(|child| masks_dense_union(child, parent_can_mask || field.is_nullable())),
+        DataType::FixedSizeList(child, _) => masks_dense_union(child, parent_can_mask || field.is_nullable()),
+        DataType::List(child) => masks_dense_union(child, false),
+        DataType::Union(legs, UnionMode::Dense) => parent_can_mask || legs.iter().any(|(_, child)| masks_dense_union(child, false)),
+        _ => false,
+    }
+}
+
 fn canonical_arrow_document_column(field: &Field, cells: &[Option<&DocumentCell<'_>>], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
     if canonical_float_field(field) || !crate::values::legacy_owned_arrow_field(field) || cells.is_empty() { return Ok(None); }
+    if masks_dense_union(field, false) {
+        // The legacy writer's chunk concatenation can retag union cells masked by a null parent.
+        return Ok(None);
+    }
     let _selection = arrays.reserve_scratch(cells.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
     let mut sources: Vec<(&Field, &dyn Array)> = Vec::new();
     let mut picks = Vec::with_capacity(cells.len());
@@ -2039,15 +2053,18 @@ fn legacy_owned_arrow_documents(
         {
             return Ok(None);
         }
-        if *logical != LogicalType::Nothing {
-            rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory)?;
+        if *logical != LogicalType::Nothing
+            && rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory).is_err()
+        {
+            return Ok(None);
         }
         let target = to_field(field.name(), logical)?;
         if field.as_ref() == &target {
             fields.push(Arc::clone(field));
             columns.push(Arc::clone(column));
         } else {
-            let reservation = memory.reserve(rtdb_columnar::arrow_relayout_bound(column.as_ref(), field, &target)?)?;
+            let Ok(bound) = rtdb_columnar::arrow_relayout_bound(column.as_ref(), field, &target) else { return Ok(None); };
+            let reservation = memory.reserve(bound)?;
             let Ok((_, column)) = rtdb_columnar::relayout_arrow_column(Arc::clone(column), field, &target) else { return Ok(None); };
             if column.data_type() != target.data_type() { return Ok(None); }
             fields.push(Arc::new(target));
@@ -4427,6 +4444,37 @@ mod tests {
         assert_eq!(arrow.encode().unwrap().as_slice(), rows.encode().unwrap().as_slice());
         assert_eq!(arrow.body_digest().unwrap(), rows.body_digest().unwrap());
         assert!(matches!(roundtrip(&rows).operations.as_slice(), [Operation::OwnedArrowIids { .. }]));
+    }
+
+    #[test]
+    fn legacy_source_preserves_dense_union_padding_beneath_null_companions() {
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new("companions").unwrap();
+        let rows = Documents::new((0..130).map(|id| {
+            let detail = match id {
+                0 => Value::Struct(StructFields::from([("value".into(), Value::I64(1))])),
+                1 => Value::Struct(StructFields::from([("value".into(), Value::Utf8("text".into()))])),
+                2 => Value::Struct(StructFields::from([("value".into(), Value::Null)])),
+                _ => Value::Null,
+            };
+            StructFields::from([("_id".into(), Value::I64(id)), ("detail".into(), detail)])
+        }).collect(), &memory).unwrap();
+        let prepared = owned_row_documents(&rows, &memory).unwrap();
+        let field = &prepared.array().fields()[1];
+        let detail = prepared.array().column(1).as_ref();
+        let logical = prepared.column_type("detail").unwrap();
+        let cells = (0..rows.rows().len()).map(|row| DocumentCell::Arrow {
+            cell: ArrowCell { field, array: detail, row }, declared: Some(logical),
+        }).collect::<Vec<_>>();
+        let selected = cells.iter().map(Some).collect::<Vec<_>>();
+        assert!(canonical_arrow_document_column(field, &selected, &mut BatchBuilder::new(4096, &memory).unwrap()).unwrap().is_none());
+        let upload = OwnedBatch::new(RecordBatch::from(prepared.array().clone()), &memory).unwrap();
+        let documents = ArrowDocuments::from_legacy_owned_payload(&upload, &memory).unwrap().unwrap();
+        let source = |operation| SourceTransaction::new(vec![operation], SubmitOptions::default(), &memory).unwrap();
+        let baseline = source(TxOp::OwnedInsertDocs { relation: relation.clone(), documents: rows, valid_from: None, valid_to: None });
+        let typed = source(TxOp::OwnedArrowDocs { relation, documents, create_only: true, valid_from: None, valid_to: None });
+        assert_eq!(baseline.encode().unwrap().as_slice(), typed.encode().unwrap().as_slice());
+        assert_eq!(baseline.body_digest().unwrap(), typed.body_digest().unwrap());
     }
 
     #[test]

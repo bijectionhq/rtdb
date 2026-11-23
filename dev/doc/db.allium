@@ -437,6 +437,7 @@ variant TxMessage : SourceMessage {
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
     -- Source decoding retains the Arrow columns and presence policy for compatible legacy Root, publication, and world shadow writes.
     -- The legacy source writer derives compatible structured document types from selected Arrow cells and aligns dense union tags to the source schema.
+    -- It preserves the canonical union padding beneath null parent cells.
     -- A legacy document page with a stable logical layout can share a source leg with authored Arrow documents.
     -- An undeclared compatible owned relation stages those floating-point vectors from the decoded Arrow fields.
     -- A legacy owned operation retains its row encoding for source IPC and receipt generation.
