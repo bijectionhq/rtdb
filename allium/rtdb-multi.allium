@@ -695,6 +695,10 @@ contract LogService {
         -- A cross-cell successor reseals detached bodies under its broker and binds the returned publication into the new committed frame.
         -- The broker grants a body version after the directory fence covers its original position and matching provider uploads and readers have drained.
         -- Settlement withdraws the unit key and verifies absence of that provider version. Physical journal trim progresses independently.
+        -- A writer reserves a detached publication before uploading and registers the exact pointer before enqueue.
+        -- A prepared pointer retains its unread journal interval until a certified frame consumes it or a newer journal epoch excludes it.
+        -- No pointer can be issued for a draft once the original writer's admission is closed.
+        -- The broker retires an excluded draft only after upload drain and records the exact provider grant before key withdrawal.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.

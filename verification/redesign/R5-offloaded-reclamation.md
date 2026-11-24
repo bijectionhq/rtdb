@@ -44,3 +44,9 @@ A successor checkpoint permits the census to advance past a finite replay ticket
 The broker can redeem an already admitted dependency using the physical journal anchor, the original ticket and the exact frame proof.
 A new replay cannot open below the detached boundary. A copy from a registered suffix pin inherits its original authenticated interval.
 The pending census is bounded. Open-ended recovery scopes still protect their ranges through drain.
+
+Ordinary hosted writer uploads enter the directory before provider effects.
+Enqueue first orders the exact pointer digest at the broker.
+A certified positive receipt transfers custody to the committed journal. After response loss the broker retains and scans the uninspected interval.
+A newer confirmed or sealed journal epoch fences the original writer. Once the broker proves the whole retained interval lacks the pointer and joins provider drain, it records a grant for the exact staged version and settles it.
+Transfer stages enter a separate receipt protocol and still need terminal settlement for bodies left before seeding.

@@ -488,6 +488,7 @@ pub enum StorageRegion {
         custody: ReplayCustody,
         closed: bool,
         publications: BTreeMap<uuid::Uuid, StoragePublication>,
+        writer: Option<ReplicaWriterPublication>,
     },
     /// A fork has admitted provider I/O against this physical residence.
     ReferenceRead {
@@ -506,6 +507,27 @@ pub enum StorageRegion {
         object: String,
         capture: uuid::Uuid,
     },
+}
+
+/// A writer's prepared detached object holds the unread journal interval until
+/// the broker finds its exact committed reference or certifies its exclusion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaWriterPublication {
+    pub epoch: u64,
+    pub scanned_through: i64,
+    pub body_sha256: [u8; 32],
+    pub attempt: Option<uuid::Uuid>,
+    pub version: Option<PhysicalObjectVersion>,
+    pub reference: Option<[u8; 32]>,
+    pub retirement: Option<ReplicaDraftRetirement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaDraftRetirement {
+    pub token: uuid::Uuid,
+    pub version: Option<PhysicalObjectVersion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1155,7 +1177,11 @@ impl DeploymentRecord {
 
     /// First replica offsets retained by open regions and captures that still need the journal.
     pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
-        self.storage_regions.values().filter_map(StorageRegion::first_required_replica)
+        self.storage_regions.values().filter_map(|region| match region {
+            StorageRegion::ReplicaPublication { writer: Some(writer), .. } if writer.retirement.is_none() =>
+                Some(writer.scanned_through.saturating_add(1)),
+            region => region.first_required_replica(),
+        })
             .chain(self.capture_replica_offsets())
             .chain(self.live_replica_suffixes(now_ms)
                 .map(|pin| self.verified_suffix_interval(pin).map_or(0, |interval| interval[0])))

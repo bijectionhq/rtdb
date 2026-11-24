@@ -29,7 +29,7 @@ use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
 
 mod units;
 pub(crate) use units::JournalUnits;
-pub(crate) use units::commits_payload_reference;
+pub(crate) use units::{commits_payload_reference, payload_reference_digest};
 use units::OVERHEAD as UNIT_OVERHEAD;
 
 const SCAN_WINDOW: i64 = 256;
@@ -594,6 +594,13 @@ impl SealedLog {
         Ok(log)
     }
 
+    async fn admit_detached_append(&self, payload: &Bytes) -> rtdb_storage::Result<Option<(RecoveryAdmission, Bytes)>> {
+        let Some(admission) = &self.recovery else { return Ok(None); };
+        if !ReplicaFrame::has_external_payload(payload).map_err(|error| rtdb_storage::Error::Task(error.to_string()))? { return Ok(None); }
+        admission.admit_detached_append(payload).await?;
+        Ok(Some((admission.clone(), payload.clone())))
+    }
+
     fn admit_size(&self, payload: &Bytes) -> rtdb_storage::Result<()> {
         if let Some(maximum) = self.maximum_append_bytes()
             && payload.len() > maximum
@@ -638,21 +645,25 @@ impl Log for SealedLog {
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         self.admit_size(&payload)?;
+        let staged = self.admit_detached_append(&payload).await?;
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
         let receipt = self.inner.enqueue(self.units.seal(payload).await?, timestamp).await?;
-        Ok(observe_attempt(receipt, outcome))
+        Ok(observe_detached_commit(observe_attempt(receipt, outcome), staged))
     }
     async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         self.admit_size(&payload)?;
-        self.inner.enqueue_maintenance(self.units.seal(payload).await?, timestamp).await
+        let staged = self.admit_detached_append(&payload).await?;
+        let receipt = self.inner.enqueue_maintenance(self.units.seal(payload).await?, timestamp).await?;
+        Ok(observe_detached_commit(receipt, staged))
     }
     async fn available_append_capacity(&self) -> rtdb_storage::Result<Option<rtdb_storage::log::AppendCapacity>> {
         self.inner.available_append_capacity().await
     }
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
+        let staged = self.admit_detached_append(&payload).await?;
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
         let receipt = self.inner.enqueue_guarded(self.units.seal(payload).await?, guard).await?;
-        Ok(observe_attempt(receipt, outcome))
+        Ok(observe_detached_commit(observe_attempt(receipt, outcome), staged))
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
     async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }
@@ -688,6 +699,15 @@ impl Log for SealedLog {
         if let Some(admission) = &self.recovery { admission.retain_offloaded(&mut records).await?; }
         Ok(records)
     }
+}
+
+fn observe_detached_commit(receipt: AppendReceipt, stage: Option<(RecoveryAdmission, Bytes)>) -> AppendReceipt {
+    let Some((admission, frame)) = stage else { return receipt; };
+    AppendReceipt::observed(async move {
+        let metadata = receipt.durable().await?;
+        admission.observe_detached_commit(metadata.offset, frame);
+        Ok(metadata)
+    })
 }
 
 fn observe_attempt(receipt: AppendReceipt, outcome: Option<crate::residence_trace::AttemptOutcome>) -> AppendReceipt {

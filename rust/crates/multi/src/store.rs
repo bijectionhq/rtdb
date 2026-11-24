@@ -746,6 +746,7 @@ pub(crate) async fn release_region(directory: &dyn Directory, deployment: &str, 
             Some(StorageRegion::Remote { closed, .. } | StorageRegion::ReplicaPublication { closed, .. }) if *closed => {
                 if !removed_readers { return Ok(()); }
             }
+            Some(StorageRegion::ReplicaPublication { closed, writer: Some(_), .. }) => *closed = true,
             Some(StorageRegion::Remote { closed, publications, .. } | StorageRegion::ReplicaPublication { closed, publications, .. }) if !publications.is_empty() => *closed = true,
             None if !uncertain && !removed_readers => return Ok(()),
             _ => { record.storage_regions.remove(&region); }

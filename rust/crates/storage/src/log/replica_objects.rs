@@ -121,6 +121,7 @@ impl ReplicaPayloadReference {
     }
 
     pub fn object(&self) -> &ObjectKey { &self.key }
+    pub fn body_sha256(&self) -> [u8; 32] { self.digest }
     pub fn publication(&self) -> Option<&PhysicalObjectVersion> { self.publication.as_ref() }
 
     pub async fn read_at(

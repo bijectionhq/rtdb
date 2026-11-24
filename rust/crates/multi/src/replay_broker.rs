@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, ReplicaPayloadCandidate, StoragePublication, StorageRegion};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, ReplicaPayloadCandidate, ReplicaWriterPublication, StoragePublication, StorageRegion};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::{CURRENT_STORAGE_VERSION, oversized_block_index, oversized_key}};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, remote::PublicationJournal, log::{ReplicaPayload, ReplicaPayloadReference}, sealing::{DeliveryIo, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, PhysicalObjectVersion, Result, StorageEpoch};
@@ -29,6 +29,8 @@ use crate::{
     reference::PrefixedStore,
     store::EncryptingStore,
 };
+
+mod staging;
 
 const MAX_HEADER: usize = 16 << 10;
 const MAX_BODY: usize = 64 << 20;
@@ -73,6 +75,8 @@ struct Request {
 enum Action {
     Read { ticket: Uuid, position: i64, reference: String },
     Publish { route: PublishRoute, object: String, length: usize },
+    AdmitAppend { epoch: u64, reference: String },
+    ObserveAppend { position: i64, reference: String },
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -94,6 +98,7 @@ impl PublishRoute {
 enum Response {
     Payload { length: usize },
     Publication { version: Option<PhysicalObjectVersion> },
+    AppendAdmitted,
     Refused { category: AnomalyCategory, code: String },
 }
 
@@ -178,6 +183,26 @@ impl Client {
         &self, history: History, epoch: u64, object: &ObjectKey, bytes: Bytes,
     ) -> Result<Option<PhysicalObjectVersion>> {
         self.publish_with(history, PublishRoute::Writer { epoch }, object, bytes).await
+    }
+
+    pub(crate) async fn admit_append(&self, history: History, epoch: u64, frame: &[u8]) -> Result<()> {
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Ok(()); };
+        let action = Action::AdmitAppend { epoch, reference: URL_SAFE_NO_PAD.encode(frame) };
+        let mut socket = remote.connect(history, action).await?;
+        match socket_work(read_response(&mut socket)).await? {
+            Response::AppendAdmitted => Ok(()),
+            _ => Err(invalid_frame()),
+        }
+    }
+
+    pub(crate) async fn observe_append(&self, history: History, position: i64, frame: &[u8]) -> Result<()> {
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Ok(()); };
+        let action = Action::ObserveAppend { position, reference: URL_SAFE_NO_PAD.encode(frame) };
+        let mut socket = remote.connect(history, action).await?;
+        match socket_work(read_response(&mut socket)).await? {
+            Response::AppendAdmitted => Ok(()),
+            _ => Err(invalid_frame()),
+        }
     }
 
     pub(crate) async fn seed(
@@ -356,7 +381,11 @@ impl Service {
         for record in self.directory.deployments().await? {
             if cancellation.is_cancelled() { break; }
             for (&id, region) in &record.storage_regions {
-                if let StorageRegion::ReplicaPublication { custody, closed, publications, .. } = region {
+                if let StorageRegion::ReplicaPublication { writer: Some(_), .. } = region {
+                    if let Err(error) = self.reclaim_staged(&inventory, &record, id, region).await {
+                        tracing::warn!(installation = %record.id, stage = %id, code = %error.code, "Detached staging awaits settlement");
+                    }
+                } else if let StorageRegion::ReplicaPublication { custody, closed, publications, .. } = region {
                     let drained = match custody {
                         ReplayCustody::Hosted { owner: Some(owner) } => *closed || self.directory.hosted_task_stopped(owner).await?,
                         _ => false,
@@ -443,11 +472,7 @@ impl Service {
             observation["uploads"] = serde_json::json!(publication_retaining(&owner, &candidate.key).collect::<Vec<_>>());
             observation
         });
-        let io = IoRegion::new();
-        let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, owner.log_epoch), Arc::clone(&io));
-        let withdrawn = ledger.withdraw(&logical).await;
-        io.close_and_wait().await;
-        withdrawn?;
+        self.withdraw_body_key(&owner, &logical).await?;
         crate::residence_trace::record("withdraw-detached-key", || effect());
         remove(physical.clone(), candidate.version.clone()).await?;
         crate::residence_trace::record("remove-version", || effect());
@@ -484,6 +509,16 @@ impl Service {
                 let frame = URL_SAFE_NO_PAD.decode(reference).map_err(|_| invalid_frame())?;
                 self.read_for_ticket(history, ticket, position, &frame, &self.memory, Some(socket)).await?;
                 Ok(())
+            }
+            Action::AdmitAppend { epoch, reference } => {
+                let reference = URL_SAFE_NO_PAD.decode(reference).map_err(|_| invalid_frame())?;
+                self.admit_staged_append(history, epoch, &reference).await?;
+                socket_work(send_header(socket, &Response::AppendAdmitted)).await
+            }
+            Action::ObserveAppend { position, reference } => {
+                let reference = URL_SAFE_NO_PAD.decode(reference).map_err(|_| invalid_frame())?;
+                self.observe_staged_append(history, position, &reference).await?;
+                socket_work(send_header(socket, &Response::AppendAdmitted)).await
             }
             Action::Publish { route, object, length } => {
                 let key = ObjectKey::new(object)?;
@@ -558,6 +593,8 @@ impl Service {
         check_publish_key(key)?;
         let envelope = ReplicaEnvelope::decode(&body)?.ok_or_else(invalid_frame)?;
         if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) { return Err(invalid_frame()); }
+        let body_sha256 = ring::digest::digest(&ring::digest::SHA256, &body)
+            .as_ref().try_into().expect("SHA-256 width");
         let region = Uuid::new_v4();
         let local = match self.custody {
             ReplayCustody::Local => self.keys.hold_local_storage_region(region)?,
@@ -575,8 +612,14 @@ impl Service {
                 {
                     return Err(refused());
                 }
+                let writer = match route {
+                    PublishRoute::Writer { epoch } if matches!(self.storage, CellStorage::S3 { .. }) => {
+                        Some(staging::reserve_writer_body(record, key, epoch, body_sha256)?)
+                    }
+                    _ => None,
+                };
                 record.storage_regions.insert(region, StorageRegion::ReplicaPublication {
-                    key: key.to_string(), custody: self.custody.clone(), closed: false, publications: Default::default(),
+                    key: key.to_string(), custody: self.custody.clone(), closed: false, publications: Default::default(), writer,
                 });
                 Ok(())
             }).await?;
@@ -598,7 +641,11 @@ impl Service {
             }.await;
             io.close_and_wait().await;
             let version = version?;
-            require_publication(history, route, &self.current(history).await?, key)?;
+            if matches!(route, PublishRoute::Writer { .. }) && let Some(version) = &version {
+                self.finish_staged_upload(history, route, region, key, version).await?;
+            } else {
+                require_publication(history, route, &self.current(history).await?, key)?;
+            }
             Ok(version)
         }.await;
         if attempted {
@@ -755,10 +802,14 @@ impl PublicationJournal for BrokerUpload {
         let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned() };
         crate::admin::update_installation(self.directory.as_ref(), &self.history.deployment.to_string(), |record| {
             require_publication(self.history, self.route, record, &self.logical)?;
-            let Some(StorageRegion::ReplicaPublication { key, closed: false, publications, .. }) =
+            let Some(StorageRegion::ReplicaPublication { key, closed: false, publications, writer, .. }) =
                 record.storage_regions.get_mut(&self.region) else { return Err(refused()); };
             if key.as_str() != self.logical.as_str() || publications.get(&attempt).is_some_and(|prior| prior != &publication) {
                 return Err(refused());
+            }
+            if let Some(writer) = writer {
+                if writer.attempt.is_some_and(|prior| prior != attempt) { return Err(refused()); }
+                writer.attempt = Some(attempt);
             }
             publications.insert(attempt, publication.clone());
             Ok(())
@@ -841,7 +892,7 @@ fn require_publication(
 }
 
 fn require_writer(history: History, epoch: u64, record: &DeploymentRecord) -> Result<()> {
-    if !history.matches(record) || epoch == 0 || record.epoch != epoch || record.holder.is_none()
+    if !history.matches(record) || epoch == 0 || record.epoch != epoch || record.holder.is_none() || record.is_resident_idle()
         || !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
     {
         return Err(refused());

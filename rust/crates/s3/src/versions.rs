@@ -30,6 +30,13 @@ pub struct VersionedInventory {
     terminal_allocation: Option<uuid::Uuid>,
 }
 
+/// Current exact evidence for one conditional upload attempt.
+pub enum CreateAttemptPublication {
+    Absent,
+    Other,
+    Published(PhysicalObjectVersion),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VersionStatus {
     Absent,
@@ -130,6 +137,39 @@ impl VersionedInventory {
             }
             _ => false,
         })
+    }
+
+    pub async fn observe_create_attempt(
+        &self, key: &ObjectKey, attempt: Option<uuid::Uuid>,
+    ) -> Result<CreateAttemptPublication> {
+        self.inspect((key.clone(), attempt), |owner, (key, attempt)| async move {
+            let path = Path::from(format!("{}/{key}", owner.root));
+            match owner.client.head_object().bucket(&owner.namespace.bucket).key(path.as_ref())
+                .set_request_payer(owner.request_payer.clone()).send().await
+            {
+                Ok(head) => {
+                    let matched = attempt.is_some_and(|attempt| head.metadata().is_some_and(|metadata| {
+                        metadata.get("rtdb-publication").is_some_and(|published| published == &attempt.to_string())
+                    }));
+                    if !matched { return Ok(CreateAttemptPublication::Other); }
+                    let version = head.version_id().filter(|version| valid_object_version(version.as_bytes()))
+                        .ok_or_else(|| unavailable("The successful upload has no exact version"))?;
+                    Ok(CreateAttemptPublication::Published(PhysicalObjectVersion {
+                        namespace: owner.namespace.clone(), key: path.to_string(), version: version.to_owned(),
+                    }))
+                }
+                Err(error) if error.as_service_error().is_some_and(|error| error.is_not_found()) => {
+                    let page = owner.client.list_object_versions().bucket(&owner.namespace.bucket)
+                        .prefix(path.as_ref()).max_keys(1).set_request_payer(owner.request_payer.clone()).send().await
+                        .map_err(|error| unavailable(format!("The staged version inventory could not be read: {error}")))?;
+                    let had_history = page.is_truncated() != Some(false)
+                        || page.versions().iter().any(|object| object.key() == Some(path.as_ref()))
+                        || page.delete_markers().iter().any(|object| object.key() == Some(path.as_ref()));
+                    Ok(if had_history { CreateAttemptPublication::Other } else { CreateAttemptPublication::Absent })
+                }
+                Err(error) => Err(unavailable(format!("The staged upload could not be observed: {error}"))),
+            }
+        }).await
     }
 
     pub async fn exact_retirement_available(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<bool> {

@@ -134,6 +134,24 @@ impl RecoveryAdmission {
         client.publish(history, self.writer_epoch, key, body).await.map_err(broker_error)
     }
 
+    pub(crate) async fn admit_detached_append(&self, payload: &[u8]) -> Result<()> {
+        let client = self.holds.broker.as_ref().ok_or_else(no_broker)?;
+        let record = self.current_record().await?;
+        client.admit_append(History::of(&record).map_err(broker_error)?, self.writer_epoch, payload).await.map_err(broker_error)
+    }
+
+    pub(crate) fn observe_detached_commit(&self, position: LogOffset, frame: Bytes) {
+        let Some(broker) = self.holds.broker.clone() else { return; };
+        let admission = self.clone();
+        self.holds.tasks.spawn(async move {
+            if let Ok(record) = admission.current_record().await
+                && let Ok(history) = History::of(&record)
+            {
+                let _ = broker.observe_append(history, position.0, &frame).await;
+            }
+        });
+    }
+
     pub(crate) async fn retain_offloaded(&self, records: &mut [LogRecord]) -> Result<()> {
         let mut offloaded = Vec::new();
         for record in records {

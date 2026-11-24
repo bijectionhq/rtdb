@@ -126,8 +126,12 @@ fn split_header(sealed: &[u8]) -> Result<(&[u8], &[u8])> {
 /// frame without opening the journal frame or borrowing its key.
 pub(crate) fn commits_payload_reference(sealed: &[u8], reference: &[u8]) -> bool {
     let supplied = reference_digest(reference);
-    sealed.len() >= OVERHEAD && supplied != [0; 32]
-        && sealed.get(PUBLICATION_BYTES..HEADER_BYTES) == Some(supplied.as_slice())
+    supplied != [0; 32] && payload_reference_digest(sealed) == Some(supplied)
+}
+
+pub(crate) fn payload_reference_digest(sealed: &[u8]) -> Option<[u8; 32]> {
+    if sealed.len() < OVERHEAD { return None; }
+    sealed.get(PUBLICATION_BYTES..HEADER_BYTES)?.try_into().ok()
 }
 
 fn reference_digest(plaintext: &[u8]) -> [u8; 32] {
