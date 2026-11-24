@@ -544,7 +544,7 @@ impl RankSource for PartitionRankSource<'_> {
                 let mut charge = request.memory.reserve(4096)?;
                 let index = match &task { Task::Live(index, _) | Task::LiveSuffix(index, _) => *index, _ => unreachable!() };
                 let segment = self.segments[index];
-                let visit = |row, matched| {
+                let visit = |row, matched: crate::runtime::LiveMatch<'_>| {
                     if let Some(hit) = nominate_live(segment, row, matched, request, self.ranking.scorer(), self.order, self.scope)? {
                         if nominations.len() % 128 == 0 { reserve_ranking(&mut charge, nominations.len() + 128)?; }
                         nominations.push(hit);

@@ -253,7 +253,7 @@ impl SourceTransaction {
         let (pages, mut options, guard, legacy, abort_on_legacy_resolver) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_ref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
-                let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, user: tx.user.clone(), user_metadata: tx.user_metadata.as_deref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
+                let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, user: tx.user.clone(), user_metadata: tx.user_metadata.as_ref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
                 let guard = match (&tx.idempotency_guard, &tx.replay_submission, &tx.bounded_retry) {
                     (Some(guard), None, None) => {
                         let submitted_at = Timestamp(guard.submitted_at_micros.ok_or_else(|| invalid("Idempotency guard has no submission timestamp"))?);
@@ -408,7 +408,7 @@ impl SourceTransaction {
         let (tx_ops, _tx_ops_reservation) = bytes.into_parts();
         let (user_metadata, _user_metadata_reservation) = metadata.map(RetainedBytes::into_parts).unzip();
         let tx = rtdb_format::generated::xtdb::log::proto::Tx {
-            tx_ops: Some(tx_ops),
+            tx_ops: Some(tx_ops.into()),
             default_tz: Some(self.options.default_tz.clone()), user: self.options.user.clone(),
             user_metadata: user_metadata.map(Into::into), external_source_token: None,
             idempotency_guard,

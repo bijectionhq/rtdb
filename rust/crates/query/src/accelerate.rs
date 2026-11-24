@@ -69,8 +69,8 @@ pub struct ScanRequest<'a> {
     pub verifier: &'a dyn CandidateVerifier,
 }
 
-impl ScanRequest<'_> {
-    pub fn iid_scope(&self) -> Option<IidScope<'_>> {
+impl<'a> ScanRequest<'a> {
+    pub fn iid_scope(&self) -> Option<IidScope<'a>> {
         self.candidate_iids.map(IidScope::Arrow).or_else(|| self.scan.iids.as_ref().map(IidScope::Set))
     }
 
