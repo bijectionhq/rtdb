@@ -36,7 +36,7 @@
 --
 -- A hosted Proposal landing prepares private immutable table segments from its complete admitted footprint at the offered clock.
 -- The source record seals this generation with the exact footprint and its installed predecessor transaction, block and catalog cut.
--- The resolver drains earlier writes and admits the generation only at that predecessor and clock.
+-- The resolver drains earlier writes and admits the generation only at that predecessor, clock and placed witness scope.
 -- The normal replica read-back installs the generation, Proposal drop, receipt and admitted task controls in a single live value.
 -- The selected refusal has only its attempt and receipt effects and leaves the Root publication and Proposal in place.
 

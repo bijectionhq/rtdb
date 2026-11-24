@@ -1,5 +1,5 @@
 {
-  "summary": "The shipped prepared Proposal switch requires the complete original predecessor, physical catalog, assigned source transaction and assigned system time for either prepared outcome.",
+  "summary": "The shipped prepared Proposal switch preserves the original staged writes and disposition and requires the original clock slot and witness scope, complete predecessor and physical catalog, assigned source transaction and assigned system time.",
   "flags": ["--no-external-by-default"],
   "min_verified_functions": 2,
   "controls": {
@@ -19,6 +19,15 @@
       "defect": "A prepared generation can switch with an assigned source position different from the source position that owns its effects.",
       "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_key.0 == assigned_key.0\n", "replace": ""}],
       "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 1
+    },
+    "substitute-installed-witness-scope": {
+      "defect": "A prepared generation can publish after the installed witness scope changes.",
+      "mutate": [
+        {"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "            && receiver == Some(prepared_scope)\n", "replace": ""},
+        {"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "\n        && matches!(receiver, Some(scope) if Scope::eq(&scope, &prepared_scope))", "replace": ""}
+      ],
+      "expect": [{"file": "verification/verus/prepared_landing_basis/laws.rs", "function": "select_original_staged_landing", "category": "postcondition not satisfied"}],
       "min_verified_functions": 1
     },
     "substitute-assigned-time": {

@@ -1,5 +1,5 @@
-use crate::prepared_landing_basis::{generation_matches, LandingBasis};
-use vstd::prelude::*;
+use crate::prepared_landing_basis::{generation_matches, prepared_authority_matches, select_generation, LandingBasis};
+use vstd::{laws_eq::obeys_concrete_eq, prelude::*};
 
 verus! {
 
@@ -19,6 +19,36 @@ pub(crate) fn switch_preserves_prepared_basis(
             && prepared.replica_through == installed.replica_through,
 {
     generation_matches(prepared, installed, prepared_key, assigned)
+}
+
+pub(crate) fn select_original_staged_landing<Clock: Eq, Scope: Eq, Writes>(
+    prepared: LandingBasis,
+    installed: LandingBasis,
+    prepared_key: (i64, i64),
+    assigned: (i64, i64),
+    prepared_clock: Clock,
+    prepared_scope: Scope,
+    clock: Option<Clock>,
+    scope: Option<Scope>,
+    receiver: Option<Scope>,
+    writes: Writes,
+    refused: bool,
+) -> (selected: Option<(Writes, bool)>)
+    requires obeys_concrete_eq::<Clock>(), obeys_concrete_eq::<Scope>(),
+    ensures
+        selected == if prepared == installed && prepared_key == assigned
+            && clock == Some(prepared_clock) && scope == Some(prepared_scope)
+            && receiver == Some(prepared_scope)
+        {
+            Some((writes, refused))
+        } else {
+            None
+        },
+{
+    if !prepared_authority_matches(prepared_clock, prepared_scope, clock, scope, receiver) {
+        return None;
+    }
+    select_generation(prepared, installed, prepared_key, assigned, writes, refused)
 }
 
 }
