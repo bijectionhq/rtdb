@@ -8,12 +8,12 @@ publish.workspace = true
 description = "The RTDB multi log server and its quorum client: many named streams, epoch-fenced appends, write-quorum commit"
 
 [features]
-# Exposes the pure pieces of the protocol, the per-stream server state machine and the recovery planning, for `rtdb-simulation`.
-simulation = []
+simulation = ["dep:journal-contract"]
 
 [dependencies]
 rtdb-types.workspace = true
 rtdb-storage.workspace = true
+journal-contract = { workspace = true, optional = true }
 async-trait.workspace = true
 bytes.workspace = true
 crc32fast.workspace = true
@@ -27,6 +27,7 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+journal-contract = { workspace = true, features = ["conformance"] }
 tempfile.workspace = true
 
 [lints]

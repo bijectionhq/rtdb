@@ -18,6 +18,7 @@
 -- Directory rules apply to directory deployments, and installed-journal obligations have their own authority invariants.
 --
 -- Status: target design, ahead of the implementation.
+-- The opt-in stream driver uses the Logkeeper `journal-contract` boundary specified in Logkeeper's verification/target-journal.md.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- The target serving protocol uses scoped attempt receipts and a loglet read index.
 -- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
