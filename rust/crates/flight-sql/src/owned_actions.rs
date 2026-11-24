@@ -27,7 +27,7 @@ use rtdb_format::ipc::OwnedStream;
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
-use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
