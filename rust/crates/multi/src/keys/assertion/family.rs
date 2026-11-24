@@ -1,21 +1,22 @@
 //! Private current custody for a Proposal occurrence and its landed copies.
 
-use std::{collections::BTreeSet, fs, io::ErrorKind, sync::Arc};
+use std::{collections::BTreeSet, fmt, fs, io::ErrorKind, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use ring::digest::{SHA256, digest};
+use ring::digest::{Context, SHA256, digest};
 use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, PlacementBinding, Position, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, LocalKeyService, io};
-use crate::keys::malformed;
+use crate::keys::{assertion_deadline::AssertionDeadline, malformed};
 
 pub(super) const LOCAL_PREFIX: &str = "assertion-family-";
 pub(in crate::keys) const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const ATTEMPTS: usize = 8;
+const DENIED: &[u8] = b"RTFD\x01";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +94,29 @@ pub struct FamilyFence {
     pub link_capabilities: BTreeSet<AssertionStage>,
 }
 
+impl FamilyFence {
+    pub fn vault_inventory(&self) -> [u8; 32] {
+        let mut inventory = Context::new(&SHA256);
+        inventory.update(b"rtdb.multi/family-vault-inventory/v1\0");
+        inventory.update(self.order.as_bytes());
+        for (role, stages) in [(0, &self.assertion_capabilities), (1, &self.link_capabilities)] {
+            for stage in stages {
+                inventory.update(&[role]);
+                inventory.update(stage.deployment.as_bytes());
+                inventory.update(&stage.incarnation.get().to_be_bytes());
+                inventory.update(stage.stage.as_bytes());
+            }
+        }
+        for position in &self.positions {
+            inventory.update(&[2]);
+            inventory.update(&position.to_bytes());
+        }
+        let mut result = [0; 32];
+        result.copy_from_slice(inventory.finish().as_ref());
+        result
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Landing {
@@ -148,11 +172,29 @@ impl Family {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::keys) enum FamilyRecord {
+    Family(Uuid),
+    Denial(Position),
+}
+
+impl fmt::Display for FamilyRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Family(id) => write!(formatter, "{id}"),
+            Self::Denial(position) => {
+                let address = URL_SAFE_NO_PAD.encode(digest(&SHA256, &position.to_bytes()));
+                write!(formatter, "denied-{address}")
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub(in crate::keys) trait FamilyJournal: Send + Sync {
-    async fn read_family(&self, id: Uuid, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>>;
+    async fn read_family(&self, record: FamilyRecord, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>>;
     async fn write_family(
-        &self, id: Uuid, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
+        &self, record: FamilyRecord, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
     ) -> Result<bool>;
 }
 
@@ -168,6 +210,7 @@ impl<'a> AssertionFamilies<'a> {
     }
 
     pub async fn register(&self, family: Uuid, original: FamilyOccurrence) -> Result<()> {
+        self.require_position_open(original.position).await?;
         for _ in 0..ATTEMPTS {
             if let Some((prior, _)) = self.read(family).await? {
                 if prior.original != original {
@@ -216,6 +259,7 @@ impl<'a> AssertionFamilies<'a> {
     pub async fn activate_ordered_landing(
         &self, family: Uuid, placement: PlacementBinding, reservation: LandingReservation,
     ) -> Result<()> {
+        self.require_position_open(placement.position).await?;
         self.update(family, |record| {
             record.require_live()?;
             if placement.assertion != reservation.destination
@@ -247,6 +291,7 @@ impl<'a> AssertionFamilies<'a> {
     /// Current check for the exact occurrence already admitted for release.
     /// The caller owns the final release fence and draining previously admitted work.
     pub async fn require_live_occurrence(&self, family: Uuid, occurrence: FamilyOccurrence) -> Result<()> {
+        self.require_position_open(occurrence.position).await?;
         let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
         record.require_live()?;
         if record.original == occurrence || record.landings.iter().any(|landing| {
@@ -274,16 +319,66 @@ impl<'a> AssertionFamilies<'a> {
         }).await
     }
 
-    async fn read(&self, family: Uuid) -> Result<Option<(Family, String)>> {
+    /// Remove private membership only after signed deadline settlement and
+    /// after every original position has its own durable denial.
+    pub async fn settle(
+        &self, family: Uuid, deadline: &AssertionDeadline<'_>, custody_key: &[u8; 32],
+    ) -> Result<()> {
+        for _ in 0..ATTEMPTS {
+            let (bytes, etag) = self.read_family_bytes(family).await?.ok_or_else(conflict)?;
+            if bytes.as_ref() == DENIED {
+                return Ok(());
+            }
+            let record = decode_family(&bytes)?;
+            let fence = record.fence_inventory(record.fenced.ok_or_else(conflict)?);
+            deadline.require_settled_family(&fence, custody_key).await?;
+            for position in fence.positions {
+                let address = FamilyRecord::Denial(position);
+                if !self.journal.write_family(address, &self.region, None, Bytes::from_static(DENIED)).await? {
+                    self.require_denial(address).await?;
+                }
+            }
+            if self.journal.write_family(FamilyRecord::Family(family), &self.region,
+                Some(&etag), Bytes::from_static(DENIED)).await?
+            {
+                return Ok(());
+            }
+        }
+        Err(contention())
+    }
+
+    pub async fn require_position_open(&self, position: Position) -> Result<()> {
+        if let Some((bytes, _)) = self.journal.read_family(FamilyRecord::Denial(position), &self.region).await? {
+            if bytes.as_ref() != DENIED {
+                return Err(malformed());
+            }
+            return Err(rtdb_storage::Error::ErasedUnderView.into());
+        }
+        Ok(())
+    }
+
+    async fn require_denial(&self, address: FamilyRecord) -> Result<()> {
+        match self.journal.read_family(address, &self.region).await? {
+            Some((bytes, _)) if bytes.as_ref() == DENIED => Ok(()),
+            _ => Err(conflict()),
+        }
+    }
+
+    async fn read_family_bytes(&self, family: Uuid) -> Result<Option<(Bytes, String)>> {
         if family.is_nil() {
             return Err(conflict());
         }
-        let Some((bytes, etag)) = self.journal.read_family(family, &self.region).await? else {
+        self.journal.read_family(FamilyRecord::Family(family), &self.region).await
+    }
+
+    async fn read(&self, family: Uuid) -> Result<Option<(Family, String)>> {
+        let Some((bytes, etag)) = self.read_family_bytes(family).await? else {
             return Ok(None);
         };
-        let state = serde_json::from_slice(&bytes)
-            .map_err(|_| Anomaly::fault("rtdb.multi/assertion-family-record", "Invalid family custody record"))?;
-        Ok(Some((state, etag)))
+        if bytes.as_ref() == DENIED {
+            return Err(rtdb_storage::Error::ErasedUnderView.into());
+        }
+        Ok(Some((decode_family(&bytes)?, etag)))
     }
 
     async fn write(&self, family: Uuid, previous: Option<&str>, record: &Family) -> Result<bool> {
@@ -294,7 +389,7 @@ impl<'a> AssertionFamilies<'a> {
                 "rtdb.multi/assertion-family-size", "The assertion family exceeds its custody inventory limit",
             ));
         }
-        self.journal.write_family(family, &self.region, previous, bytes.into()).await
+        self.journal.write_family(FamilyRecord::Family(family), &self.region, previous, bytes.into()).await
     }
 
     async fn update<T>(
@@ -309,6 +404,11 @@ impl<'a> AssertionFamilies<'a> {
         }
         Err(contention())
     }
+}
+
+fn decode_family(bytes: &[u8]) -> Result<Family> {
+    serde_json::from_slice(bytes)
+        .map_err(|_| Anomaly::fault("rtdb.multi/assertion-family-record", "Invalid family custody record"))
 }
 
 fn conflict() -> Anomaly {
@@ -340,26 +440,26 @@ fn local_record(vault: &LocalKeyService, path: &std::path::Path) -> Result<Optio
 
 #[async_trait::async_trait]
 impl FamilyJournal for LocalKeyService {
-    async fn read_family(&self, id: Uuid, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>> {
+    async fn read_family(&self, record: FamilyRecord, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>> {
         self.require_assertion_broker()?;
         let owner = self.clone();
         region.run_blocking(move || Ok((|| {
             let vault = owner.archive_vault()?;
-            let path = vault.path(&format!("{LOCAL_PREFIX}{id}"))?;
+            let path = vault.path(&format!("{LOCAL_PREFIX}{record}"))?;
             let _lock = vault.lock_key_shared(&path)?;
             local_record(&vault, &path)
         })())).await?
     }
 
     async fn write_family(
-        &self, id: Uuid, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
+        &self, record: FamilyRecord, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
     ) -> Result<bool> {
         self.require_assertion_broker()?;
         let owner = self.clone();
         let previous = previous.map(str::to_owned);
         region.run_blocking(move || Ok((|| {
             let vault = owner.archive_vault()?;
-            let path = vault.path(&format!("{LOCAL_PREFIX}{id}"))?;
+            let path = vault.path(&format!("{LOCAL_PREFIX}{record}"))?;
             let _lock = vault.lock_key(&path)?;
             if local_record(&vault, &path)?.as_ref().map(|(_, etag)| etag) != previous.as_ref() {
                 return Ok(false);

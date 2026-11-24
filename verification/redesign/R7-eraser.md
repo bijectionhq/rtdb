@@ -80,7 +80,9 @@ The original local or S3 vault serializes family enrollment, activation, and fen
 A reservation enrolls a fresh destination stage and a distinct stage for the encrypted link.
 A fence from the Proposal original or any active copy inventories all active positions and both capabilities for pending landings.
 The stage and family operations require an installed publication verifier and release owner before use in serving.
-Terminal family settlement also needs per-position denials and destruction of the private link and family inventory.
+The private deadline journal checks the family's exact committed capability inventory and all release drains before dispatching stage retirement through the original vault routes.
+A terminal signed deadline disposition permits the family vault to persist independent position denials and remove private membership.
+The installed custodian still supplies the original vault route for each stage and signs its settlement.
 
 Native ordered sealed ingress, the exact original fence and roster, current release admission, and installed holder adapters are required before operating this profile.
 The scheduler supports bounded page reads and exact retry, while a configured capacity and fault envelope has yet to establish a service bound.

@@ -36,6 +36,14 @@ impl AssertionStage {
         Ok(Self { deployment, incarnation, stage })
     }
 
+    pub fn deployment(self) -> Uuid {
+        self.deployment
+    }
+
+    pub fn incarnation(self) -> NonZeroU64 {
+        self.incarnation
+    }
+
     pub(super) fn key_id(self) -> String {
         format!("{}{}-{}-{}", Self::KEY_PREFIX, self.deployment, self.incarnation, self.stage)
     }

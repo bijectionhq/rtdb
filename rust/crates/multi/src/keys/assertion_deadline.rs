@@ -14,6 +14,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::{AssertionStage, FamilyFence};
+
 pub const READER_DRAIN_LIMIT_MS: u64 = 120_000;
 pub const DESTRUCTION_TARGET_MS: u64 = 86_400_000;
 pub const FIXED_DEADLINE_MS: u64 = 30 * DESTRUCTION_TARGET_MS;
@@ -360,6 +362,13 @@ pub trait DestructionCustody: Send + Sync {
     ) -> Result<Option<Settlement>>;
 }
 
+/// Resolve the original vault for each enrolled stage and confirm its permanent
+/// tombstone. The installed holder owns its credential and the signed receipt.
+#[async_trait::async_trait]
+pub trait AssertionVaultRoutes: Send + Sync {
+    async fn retire_original(&self, stage: AssertionStage) -> Result<()>;
+}
+
 pub struct AssertionDeadline<'a> {
     journal: &'a dyn DeadlineJournal,
 }
@@ -391,6 +400,61 @@ impl<'a> AssertionDeadline<'a> {
     pub async fn release_hold(&self, order: Uuid, hold: Uuid, ordered_at_ms: u64) -> Result<()> {
         self.update(order, |record| record.release_hold(hold, ordered_at_ms)).await?;
         Ok(())
+    }
+
+    /// Executes the vault part of an installed holder's dispatched obligation.
+    /// The holder signs its disposition only after all exact stages settle.
+    pub async fn retire_family_capabilities(
+        &self, fence: &FamilyFence, obligation: Obligation, vaults: &dyn AssertionVaultRoutes,
+    ) -> Result<()> {
+        let record = self.family_order(fence).await?;
+        if obligation.kind != CustodyKind::AssertionVault
+            || obligation.inventory != fence.vault_inventory()
+            || !record.order.obligations.contains(&obligation)
+        {
+            return Err(changed());
+        }
+        let Phase::Destroying { settlements, .. } = &record.phase else { return Err(changed()); };
+        if record.order.obligations.iter()
+            .filter(|item| item.kind == CustodyKind::ReleaseDrain)
+            .any(|item| !settlements.iter().any(|receipt| receipt.obligation == *item))
+        {
+            return Err(changed());
+        }
+        for &stage in fence.assertion_capabilities.iter().chain(&fence.link_capabilities) {
+            vaults.retire_original(stage).await?;
+        }
+        Ok(())
+    }
+
+    async fn family_order(&self, fence: &FamilyFence) -> Result<Record> {
+        let (record, _) = self.read(fence.order).await?.ok_or_else(changed)?;
+        let inventory = fence.vault_inventory();
+        if !record.order.obligations.iter().any(|item| {
+            item.kind == CustodyKind::AssertionVault && item.inventory == inventory
+        }) {
+            return Err(changed());
+        }
+        Ok(record)
+    }
+
+    pub(super) async fn require_settled_family(&self, fence: &FamilyFence, custody_key: &[u8; 32]) -> Result<()> {
+        let record = self.family_order(fence).await?;
+        let report = record.attestation.ok_or_else(changed)?;
+        let Phase::Destroying { ordered_at_ms, settlements } = &record.phase else { return Err(changed()); };
+        if report.statement.order != record.order.id
+            || report.statement.domain != record.order.domain
+            || report.statement.logical_commit != record.order.logical_commit
+            || report.statement.ordered_at_ms != *ordered_at_ms
+            || report.statement.roster_digest != hash(&record.order.obligations)?
+            || report.statement.settlement_digest != hash(settlements)?
+            || settlements.len() != record.order.obligations.len()
+        {
+            return Err(changed());
+        }
+        UnparsedPublicKey::new(&ED25519, custody_key)
+            .verify(&report.statement.signing_bytes()?, &report.signature)
+            .map_err(|_| invalid("The original custody authority did not sign the disposition"))
     }
 
     /// Resume the durable irreversible order before calling an original holder.
@@ -672,6 +736,99 @@ mod tests {
         async fn page(&self, _: Option<Uuid>) -> Result<Vec<Uuid>> {
             unreachable!("audit reads the exact signed cohort")
         }
+    }
+
+    #[tokio::test]
+    async fn family_retirement_waits_for_drains_and_keeps_independent_denials() -> Result<()> {
+        use std::{num::NonZeroU64, sync::Arc};
+
+        use bytes::Bytes;
+        use rtdb_storage::IoRegion;
+        use rtdb_types::{AssertionId, Position};
+        use crate::keys::{AssertionAuthoring, AssertionKeyService, FamilyOccurrence, KeyService,
+            LandingReservation, LocalKeyService};
+
+        struct LocalVault<'a>(&'a LocalKeyService, &'a Arc<IoRegion>);
+        #[async_trait::async_trait]
+        impl AssertionVaultRoutes for LocalVault<'_> {
+            async fn retire_original(&self, stage: AssertionStage) -> Result<()> {
+                self.0.retire_assertion_stage(stage, self.1).await
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let vault = LocalKeyService::with_archive_broker(directory.path())?;
+        let region = IoRegion::new();
+        let local = LocalVault(&vault, &region);
+        let families = vault.assertion_families(Arc::clone(&region)).unwrap();
+        let family = Uuid::new_v4();
+        let signer = signer();
+        let custody_key = signer.public_key().as_ref().try_into().unwrap();
+        let mut order = order(&signer);
+        let stage = || AssertionStage::new(order.domain, NonZeroU64::MIN, Uuid::new_v4());
+        let original = FamilyOccurrence {
+            position: Position { line_generation: [3; 16], publication: 1, ordinal: NonZeroU64::MIN },
+            assertion: AssertionId::from_bytes([3; 32]),
+            capability: stage()?,
+        };
+        let pending = LandingReservation {
+            source: original.position,
+            destination: AssertionId::from_bytes([4; 32]),
+            capability: stage()?,
+            link_capability: stage()?,
+            review_commitment: [5; 32],
+        };
+        families.register(family, original).await?;
+        families.reserve_landing(family, pending).await?;
+        let form = AssertionAuthoring { assertion_id: original.assertion, scope_commitment: [9; 32], codec: 1 };
+        let body = Bytes::from_static(b"family original");
+        let sealed = vault.seal_assertion_stage(original.capability, form, &region, body.clone()).await?;
+        let fence = families.fence(family, original.position, order.id).await?;
+        assert!(families.require_live_occurrence(family, original).await.is_err());
+        order.obligations[1].inventory = fence.vault_inventory();
+        let vault_obligation = order.obligations[1];
+        let mut record = Record::new(order);
+        let observed_at_ms = READER_DRAIN_LIMIT_MS + record.order.committed_at_ms;
+        record.begin(observed_at_ms)?;
+        let journal = RetainedEvidence(BTreeMap::from([(fence.order, encode(&record)?)]));
+        let deadline = AssertionDeadline::new(&journal);
+        assert!(deadline.retire_family_capabilities(&fence, vault_obligation, &local).await.is_err());
+        assert!(families.settle(family, &deadline, &custody_key).await.is_err());
+
+        let obligations = record.order.obligations.clone();
+        let sign = |order: &ErasureOrder, obligation| -> Result<Settlement> {
+            let mut settlement = Settlement {
+                obligation, observed_at_ms, disposition: [6; 32], signature: Vec::new(),
+            };
+            settlement.signature = signer.sign(&settlement.signing_bytes(order, observed_at_ms)?)
+                .as_ref().to_vec();
+            Ok(settlement)
+        };
+        let drain = sign(&record.order, obligations[0])?;
+        record.join(drain, observed_at_ms)?;
+        let journal = RetainedEvidence(BTreeMap::from([(fence.order, encode(&record)?)]));
+        let deadline = AssertionDeadline::new(&journal);
+        deadline.retire_family_capabilities(&fence, vault_obligation, &local).await?;
+        deadline.retire_family_capabilities(&fence, vault_obligation, &local).await?;
+        assert!(vault.open_assertion_for_resolution(original.capability, form, &region, sealed).await.is_err());
+        assert!(vault.seal_assertion_stage(pending.capability, form, &region, body.clone()).await.is_err());
+        assert!(vault.seal_assertion_stage(pending.link_capability, form, &region, body).await.is_err());
+
+        for obligation in obligations.into_iter().skip(1) {
+            let settled = sign(&record.order, obligation)?;
+            record.join(settled, observed_at_ms)?;
+        }
+        record.attestation = record.report(&signer)?;
+        let journal = RetainedEvidence(BTreeMap::from([(fence.order, encode(&record)?)]));
+        let deadline = AssertionDeadline::new(&journal);
+        assert!(families.settle(family, &deadline, &[0; 32]).await.is_err());
+        families.settle(family, &deadline, &custody_key).await?;
+        families.settle(family, &deadline, &custody_key).await?;
+        let reloaded = LocalKeyService::with_archive_broker(directory.path())?;
+        let reloaded = reloaded.assertion_families(region).unwrap();
+        assert!(reloaded.require_position_open(original.position).await.is_err());
+        assert!(reloaded.register(Uuid::new_v4(), original).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]
