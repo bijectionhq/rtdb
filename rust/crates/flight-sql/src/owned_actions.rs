@@ -2373,6 +2373,7 @@ impl Service {
             (None, request)
         };
         let (relation, request) = split_relation(request)?;
+        let legacy = (!compact).then(|| request_batch(call, request)).transpose()?;
         let (id, _identity, system, valid) = if compact {
             let (system, request) = selection_time(request)?;
             let (from, request) = selection_time(request)?;
@@ -2382,8 +2383,7 @@ impl Service {
             if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
             (id, identity, system, valid)
         } else {
-            let batch = request_batch(call, request)?;
-            let batch = batch.batch();
+            let batch = legacy.as_ref().expect("scalar window request").batch();
             if batch.num_columns() != 4 || batch.num_rows() != 1 {
                 return Err(invalid("Owned history requires one row with _id, a system cut and two valid endpoints"));
             }

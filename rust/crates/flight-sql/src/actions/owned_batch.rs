@@ -243,7 +243,7 @@ impl SelectionEncoder {
         &mut self, memory: &Arc<MemoryBudget>, schema: &SchemaRef,
         batch: Option<&RecordBatch>, maximum_message_bytes: usize,
     ) -> Result<Option<ActionResult>, Status> {
-        if schema.fields().iter().any(|field| !matches!(field.data_type(),
+        if schema.metadata().len() > 32 || schema.fields().iter().any(|field| !matches!(field.data_type(),
             DataType::Null | DataType::Boolean | DataType::Int64 | DataType::UInt64
             | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::Timestamp(..)))
         {
@@ -267,12 +267,15 @@ impl SelectionEncoder {
             }
         }
         let options = IpcWriteOptions::default();
-        let fields = Arc::new(Schema::new(schema.fields().clone()));
-        if changed {
+        let fields = if changed {
+            let fields = Arc::new(Schema::new(schema.fields().clone()));
             let frame = rtdb_format::ipc::write_schema_message_with_options(&fields, &options).map_err(status)?;
             response.extend_from_slice(&u32::try_from(frame.len()).map_err(arrow)?.to_be_bytes());
             response.extend_from_slice(&frame);
-        }
+            Some(fields)
+        } else {
+            None
+        };
         if let Some(batch) = batch {
             let (dictionaries, data) = IpcDataGenerator::default().encode(
                 batch, &mut DictionaryTracker::new(false), &options, &mut CompressionContext::default(),
@@ -285,7 +288,7 @@ impl SelectionEncoder {
         if wire::add(response.len(), 1024)? > maximum_message_bytes {
             return Ok(None);
         }
-        if changed {
+        if let Some(fields) = fields {
             let Ok(retained) = memory.reserve(wire::schema_bound(&fields)?) else { return Ok(None) };
             self.schema = Some((fields, retained));
         }
