@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ops::Range, sync::Arc};
+use std::{collections::{BTreeMap, btree_map::Entry}, ops::Range, sync::Arc};
 
 use arrow_array::{Array, StructArray, cast::AsArray, types::UInt32Type};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -165,36 +165,36 @@ impl TermRoutes {
 
 pub(crate) async fn read_routes(store: &dyn PageStore, root: Option<&RootRef>, field: u32, matching: &Query,
     scoring: &RankScorer, runs: &BTreeMap<RunId, usize>, memory: &Arc<MemoryBudget>) -> Result<TermRoutes> {
-    let mut routes = TermRoutes { scores: BTreeMap::new(), _charge: memory.reserve(4096)? };
+    let mut routes = TermRoutes { scores: BTreeMap::new(), _charge: memory.reserve(0)? };
     let Some(root) = root else { return Ok(routes); };
-    let mut bounds = BTreeMap::<&str, BTreeMap<usize, TermStats>>::new();
-    let mut retained = 0usize;
+    let mut bounds_charge = memory.reserve(0)?;
+    let mut bounds = BTreeMap::<&str, TermRows>::new();
     for term in matching.terms() {
         let rows = read_term(store, root, field, term, runs, memory).await?;
-        if rows.is_empty() { return Ok(routes); }
-        retained = retained.saturating_add(rows.len().saturating_mul(192));
-        grow(&mut routes._charge, retained)?;
+        if rows.stats.is_empty() { return Ok(routes); }
+        admit_map_entry(&mut bounds_charge, bounds.len(), 128)?;
         bounds.insert(term.as_str(), rows);
     }
     let Some(rarest) = bounds.values().min_by_key(|rows| {
-        rows.values().fold(0u64, |count, stats| count.saturating_add(u64::from(stats.doc_freq)))
+        rows.stats.values().fold(0u64, |count, stats| count.saturating_add(u64::from(stats.doc_freq)))
     }) else { return Ok(routes); };
-    routes.scores = rarest.keys().copied().filter(|run| bounds.values().all(|rows| rows.contains_key(run)))
-        .map(|run| (run, 0.0)).collect();
+    for run in rarest.stats.keys().filter(|&run| bounds.values().all(|rows| rows.stats.contains_key(run))) {
+        admit_map_entry(&mut routes._charge, routes.scores.len(), 64)?;
+        routes.scores.insert(*run, 0.0);
+    }
     if routes.scores.is_empty() { return Ok(routes); }
-    for (index, term) in scoring.scorer().query().terms().iter().enumerate() {
-        let loaded;
-        let rows = match bounds.get(term.as_str()) {
+    let scorer = scoring.scorer();
+    let scoring_terms = scorer.query().terms();
+    let unit_scores = scorer.uses_unit_term_scores();
+    bounds.retain(|term, _| scoring_terms.iter().any(|scored| scored.as_str() == *term));
+    for (index, term) in scoring_terms.iter().enumerate() {
+        let rows = match bounds.remove(term.as_str()) {
             Some(rows) => rows,
-            None => {
-                loaded = read_term(store, root, field, term, runs, memory).await?;
-                grow(&mut routes._charge, retained.saturating_add(loaded.len().saturating_mul(192)))?;
-                &loaded
-            }
+            None => read_term(store, root, field, term, runs, memory).await?,
         };
-        for (run, stats) in rows {
+        for (run, stats) in &rows.stats {
             if let Some(score) = routes.scores.get_mut(run) {
-                *score += if scoring.scorer().uses_unit_term_scores() { stats.unit_bound }
+                *score += if unit_scores { stats.unit_bound }
                     else { scoring.term_bound(index, stats.max_tf, stats.min_len) };
             }
         }
@@ -202,20 +202,35 @@ pub(crate) async fn read_routes(store: &dyn PageStore, root: Option<&RootRef>, f
     Ok(routes)
 }
 
+struct TermRows {
+    stats: BTreeMap<usize, TermStats>,
+    _charge: Arc<MemoryReservation>,
+}
+
 async fn read_term(store: &dyn PageStore, root: &RootRef, field: u32, term: &str, runs: &BTreeMap<RunId, usize>,
-    memory: &Arc<MemoryBudget>) -> Result<BTreeMap<usize, TermStats>> {
+    memory: &Arc<MemoryBudget>) -> Result<TermRows> {
     let range = term_range(field, term);
     let start = range.start.clone();
-    let mut found = BTreeMap::new();
-    for row in cow_tree::scan(store, root, range, memory).await? {
+    let mut charge = memory.reserve(0)?;
+    let mut stats = BTreeMap::new();
+    cow_tree::visit(store, root, range, &|_| true, memory, |row| {
         let run: RunId = row.key.strip_prefix(start.as_slice()).and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| invalid("Invalid term directory row key"))?;
         let index = runs.get(&run).copied().ok_or_else(|| invalid("Term directory names an inactive run"))?;
-        if found.insert(index, TermStats::decode(&row.value)?).is_some() {
+        let summary = TermStats::decode(&row.value)?;
+        let entries = stats.len();
+        let Entry::Vacant(entry) = stats.entry(index) else {
             return Err(invalid("Term directory repeats a run for a term"));
-        }
-    }
-    Ok(found)
+        };
+        admit_map_entry(&mut charge, entries, 192)?;
+        entry.insert(summary);
+        Ok(true)
+    }).await?;
+    Ok(TermRows { stats, _charge: charge })
+}
+
+fn admit_map_entry(charge: &mut Arc<MemoryReservation>, entries: usize, bytes_per_entry: usize) -> Result<()> {
+    grow(charge, 512usize.saturating_add(entries.saturating_add(1).saturating_mul(bytes_per_entry)))
 }
 
 fn grow(charge: &mut Arc<MemoryReservation>, bytes: usize) -> Result<()> {
@@ -306,10 +321,10 @@ mod tests {
         edits.record(0, "report", replacement, Some(stats(1, 2, 2))).unwrap();
         let after = edits.apply(&pages, Some(&before), &memory).await.unwrap().unwrap();
         assert_eq!(read_term(&pages, &before, 0, "report", &BTreeMap::from([(old, 0), (kept, 1)]), &memory)
-            .await.unwrap().into_keys().collect::<Vec<_>>(), [0]);
+            .await.unwrap().stats.keys().copied().collect::<Vec<_>>(), [0]);
         let active = BTreeMap::from([(replacement, 2), (kept, 1)]);
-        assert_eq!(read_term(&pages, &after, 0, "report", &active, &memory).await.unwrap().into_keys().collect::<Vec<_>>(), [2]);
-        assert_eq!(read_term(&pages, &after, 0, "memo", &active, &memory).await.unwrap().into_keys().collect::<Vec<_>>(), [1]);
+        assert_eq!(read_term(&pages, &after, 0, "report", &active, &memory).await.unwrap().stats.keys().copied().collect::<Vec<_>>(), [2]);
+        assert_eq!(read_term(&pages, &after, 0, "memo", &active, &memory).await.unwrap().stats.keys().copied().collect::<Vec<_>>(), [1]);
 
         pages.0.lock().unwrap().insert(after.digest, Bytes::from_static(b"corrupt"));
         assert!(read_term(&pages, &after, 0, "report", &active, &memory).await.is_err());
@@ -334,6 +349,6 @@ mod tests {
         }
 
         let routes = read_term(&pages, &published, 0, "report", &BTreeMap::from([(run, 0)]), &memory).await.unwrap();
-        assert_eq!(routes.into_keys().collect::<Vec<_>>(), [0]);
+        assert_eq!(routes.stats.keys().copied().collect::<Vec<_>>(), [0]);
     }
 }
