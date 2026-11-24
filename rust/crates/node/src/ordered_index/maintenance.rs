@@ -2,19 +2,21 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     io::Cursor,
+    ops::Range,
     sync::Arc,
 };
 
-use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
-use rtdb_format::data::EventBatch;
+use arrow_buffer::Buffer;
+use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_format::{data::EventBatch, ipc::PageDecoder};
 use rtdb_index::Snapshot;
 use rtdb_maintenance::{
     CycleWorker, SnapshotSource,
     input::read_page,
 };
 use rtdb_replication::{PartitionLogs, RetainedTableReplay};
-use rtdb_storage::{HeldView, IoRegion, ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, Iid, Result, TableRef, Timestamp, WorldShadow};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation, cache::BufferPool};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, Iid, PhysicalObjectVersion, Result, TableRef, Timestamp, WorldShadow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -143,7 +145,7 @@ impl OrderedIndexMaintenance {
                 if cuts.cuts.scope == 0 {
                     let mut roots = checkpoint.roots();
                     let advanced =
-                        replay_flushed(&tree, definition, &sources, &cuts, &mut roots, cancellation).await;
+                        replay_flushed(&tree, definition, &sources, cuts, &mut roots, cancellation).await;
                     match advanced {
                         Ok(rows) if checkpoint.source_rows.checked_add(rows) == Some(expected) => {
                             let next = checkpoint::publish(
@@ -171,7 +173,7 @@ impl OrderedIndexMaintenance {
         checkpoint::request_collection(&tree, through).await?;
         let mut roots = RevisionRoots::default();
         let rows =
-            replay_flushed(&tree, definition, &sources, &cuts, &mut roots, cancellation).await?;
+            replay_flushed(&tree, definition, &sources, cuts, &mut roots, cancellation).await?;
         if rows != expected {
             return Err(incomplete_source());
         }
@@ -287,6 +289,83 @@ async fn read_flushed(
     Ok(rows)
 }
 
+struct ReplayRangeReader<'a> {
+    store: &'a dyn ObjectStore,
+    source: &'a SourceFile,
+    version: PhysicalObjectVersion,
+    memory: &'a Arc<MemoryBudget>,
+    cancellation: &'a CancellationToken,
+}
+
+impl ReplayRangeReader<'_> {
+    async fn read(&self, range: Range<u64>) -> Result<Buffer> {
+        let length = range.end.checked_sub(range.start)
+            .filter(|_| range.end <= self.source.size as u64)
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| format_error("An ordered source range exceeds its adopted file"))?;
+        let key = &self.source.object;
+        let allocation = self.store.scan_range_allocation(key, length).map_err(source_read_error)?;
+        let retained = self.memory.reserve(allocation.retained_bytes.max(length))?;
+        let scratch = (allocation.scratch_bytes > 0).then(|| self.memory.reserve(allocation.scratch_bytes)).transpose()?;
+        let reservation = ReadReservation::funded(length, Arc::clone(&retained), scratch);
+        let observed = self.cancellation.run_until_cancelled(reservation.retaining_io(self.store.observe_range(key, range)))
+            .await.ok_or_else(cancelled)?.map_err(source_read_error)?;
+        if observed.version.as_ref() != Some(&self.version) || observed.value.len() != length {
+            return Err(format_error("An ordered source range differs from its observed file"));
+        }
+        Ok(rtdb_columnar::retain_buffer_with_owner(&Buffer::from(observed.value), retained))
+    }
+}
+
+async fn read_replay_ranges(
+    store: &dyn ObjectStore,
+    memory: &Arc<MemoryBudget>,
+    source: &SourceFile,
+    columns: &[String],
+    cancellation: &CancellationToken,
+    mut visit: impl FnMut(EventBatch) -> Result<()> + Send,
+) -> Result<Option<i64>> {
+    let head = cancellation.run_until_cancelled(store.observe_head(&source.object))
+        .await.ok_or_else(cancelled)?.map_err(source_read_error)?;
+    let size = head.value.size;
+    if head.value.key != source.object || size != source.size as u64 {
+        return Err(format_error("An ordered index source differs from the adopted file"));
+    }
+    let Some(version) = head.version else {
+        return Ok(None);
+    };
+    let reader = ReplayRangeReader { store, source, version, memory, cancellation };
+    let trailer = size.checked_sub(10).ok_or_else(|| format_error("Arrow file is shorter than its footer"))?;
+    let length = {
+        let bytes = reader.read(trailer..size).await?;
+        arrow_ipc::reader::read_footer_length(bytes.as_slice().try_into().map_err(format_error)?).map_err(format_error)?
+    };
+    let footer = trailer.checked_sub(length as u64).ok_or_else(|| format_error("Arrow footer exceeds its file"))?;
+    let opening = length.checked_add(10).and_then(|length| length.checked_mul(16))
+        .and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| format_error("Arrow footer allocation overflow"))?;
+    let _opening = memory.reserve(opening)?;
+    let mut decoder = {
+        let bytes = reader.read(footer..trailer).await?;
+        PageDecoder::from_footer(bytes.as_slice(), footer, None)?
+    };
+    if decoder.dictionary_count() != 0 {
+        return Ok(None);
+    }
+    decoder.project_event_payload(columns);
+    let mut rows = 0_i64;
+    for page in 0..decoder.page_count() {
+        let wire = reader.read(decoder.page_range(page)?).await?;
+        let charge = memory.reserve(decoder.page_bound(page, wire.as_slice())?)?;
+        let page = OwnedBatch::with_reservation(decoder.decode_file_page(page, wire)?, charge)?;
+        let batch = EventBatch::new(page.batch().clone())?;
+        rows = rows
+            .checked_add(i64::try_from(batch.len()).map_err(format_error)?)
+            .ok_or_else(incomplete_source)?;
+        visit(batch)?;
+    }
+    Ok(Some(rows))
+}
+
 fn source_read_error(error: rtdb_storage::Error) -> Anomaly {
     if matches!(error, rtdb_storage::Error::MissingObject(_)) {
         return Anomaly::new(AnomalyCategory::NotFound, "rtdb.ordered-index/missing-source", error.to_string());
@@ -346,8 +425,13 @@ impl ErasureCuts {
 
 struct ReplayInputs {
     cuts: ErasureCuts,
-    decoded: Option<Vec<(i64, Vec<EventBatch>)>>,
-    _charges: Vec<Arc<MemoryReservation>>,
+    decoded: Option<Vec<RetainedSource>>,
+}
+
+struct RetainedSource {
+    rows: i64,
+    pages: Vec<(EventBatch, Arc<MemoryReservation>)>,
+    _opening: Option<Arc<MemoryReservation>>,
 }
 
 async fn erase_cuts(
@@ -357,7 +441,7 @@ async fn erase_cuts(
     retained_columns: &[String],
     cancellation: &CancellationToken,
 ) -> Result<ReplayInputs> {
-    let mut inputs = ReplayInputs { cuts: ErasureCuts::default(), decoded: Some(Vec::new()), _charges: Vec::new() };
+    let mut inputs = ReplayInputs { cuts: ErasureCuts::default(), decoded: Some(Vec::new()) };
     let budget = (memory.available_bytes() / 8).min(32 << 20);
     let mut retained = 0usize;
     for source in sources {
@@ -366,7 +450,6 @@ async fn erase_cuts(
         retained = retained.saturating_add(source.size);
         if retained > budget {
             inputs.decoded = None;
-            inputs._charges.clear();
         }
         // A retained page will also supply the later ordered-key replay.
         let columns = if inputs.decoded.is_some() { retained_columns } else { &[] };
@@ -379,11 +462,9 @@ async fn erase_cuts(
                     footer = Some(Arc::clone(opening));
                 }
                 if retained <= budget {
-                    pages.push(batch);
-                    inputs._charges.push(Arc::clone(page));
+                    pages.push((batch, Arc::clone(page)));
                 } else {
                     inputs.decoded = None;
-                    inputs._charges.clear();
                     pages.clear();
                     footer = None;
                 }
@@ -392,8 +473,7 @@ async fn erase_cuts(
         };
         let rows = read_flushed(storage, memory, source, columns, cancellation, &mut visit).await?;
         if let Some(decoded) = &mut inputs.decoded {
-            decoded.push((rows, pages));
-            inputs._charges.extend(footer);
+            decoded.push(RetainedSource { rows, pages, _opening: footer });
         }
     }
     Ok(inputs)
@@ -404,10 +484,10 @@ async fn flushed_changes(
     definition: &Definition,
     source: &SourceFile,
     cancellation: &CancellationToken,
-    retain: impl Fn(rtdb_types::EventHeader, AddressRef<'_>) -> bool + Send + Sync,
+    cuts: Option<&ErasureCuts>,
 ) -> Result<(i64, Changes)> {
-    let mut changes = Changes::default();
-    let rows = read_flushed(&tree.storage, &tree.memory, source, &source_columns(definition), cancellation, |batch, _, _| {
+    let columns = source_columns(definition);
+    let add = |changes: &mut Changes, batch: EventBatch| {
         changes.add_batch(
             &batch,
             0,
@@ -415,10 +495,21 @@ async fn flushed_changes(
             &tree.memory,
             cancellation,
             KeyLayout::for_table(&definition.table),
-            &retain,
+            |header, address| cuts.is_none_or(|cuts| cuts.retains(header, address)),
         )
-    })
-    .await?;
+    };
+    let store = tree.storage.object_store().as_ref();
+    if cuts.is_some() && store.supports_observed_scan_ranges(&source.object) {
+        let mut changes = Changes::default();
+        match read_replay_ranges(store, &tree.memory, source, &columns, cancellation, |batch| add(&mut changes, batch)).await {
+            Ok(Some(rows)) => return Ok((rows, changes)),
+            Ok(None) => (),
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+            Err(error) => return Err(error),
+        }
+    }
+    let mut changes = Changes::default();
+    let rows = read_flushed(&tree.storage, &tree.memory, source, &columns, cancellation, |batch, _, _| add(&mut changes, batch)).await?;
     Ok((rows, changes))
 }
 
@@ -426,23 +517,24 @@ async fn replay_flushed(
     tree: &Tree,
     definition: &Definition,
     sources: &[SourceFile],
-    inputs: &ReplayInputs,
+    inputs: ReplayInputs,
     roots: &mut RevisionRoots,
     cancellation: &CancellationToken,
 ) -> Result<i64> {
     let mut rows = 0_i64;
-    let retain = |header: rtdb_types::EventHeader, address: AddressRef<'_>| inputs.cuts.retains(header, address);
-    for (file, source) in sources.iter().enumerate() {
-        let (count, changes) = if let Some(decoded) = &inputs.decoded {
-            let (count, pages) = &decoded[file];
+    let ReplayInputs { cuts, decoded } = inputs;
+    let mut decoded = decoded.map(Vec::into_iter);
+    for source in sources {
+        let (count, changes) = if let Some(decoded) = &mut decoded {
+            let held = decoded.next().ok_or_else(incomplete_source)?;
             let mut changes = Changes::default();
-            for batch in pages {
-                changes.add_batch(batch, 0, &definition.columns, &tree.memory, cancellation,
-                    KeyLayout::for_table(&definition.table), retain)?;
+            for (batch, _page) in held.pages {
+                changes.add_batch(&batch, 0, &definition.columns, &tree.memory, cancellation,
+                    KeyLayout::for_table(&definition.table), |header, address| cuts.retains(header, address))?;
             }
-            (*count, changes)
+            (held.rows, changes)
         } else {
-            flushed_changes(tree, definition, source, cancellation, retain).await?
+            flushed_changes(tree, definition, source, cancellation, Some(&cuts)).await?
         };
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         apply_block(tree, source.block, roots, changes, cancellation).await?;
@@ -472,7 +564,7 @@ async fn tail_changes(
 ) -> Result<(i64, Arc<Changes>)> {
     let load = || async {
         if let Some(source) = source {
-            let (rows, changes) = flushed_changes(tree, definition, source, cancellation, |_, _| true).await?;
+            let (rows, changes) = flushed_changes(tree, definition, source, cancellation, None).await?;
             return Ok((rows, Arc::new(changes)));
         }
         let mut changes = Changes::default();
@@ -751,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn replay_projects_keys_and_keeps_the_original_event_headers() -> Result<()> {
         use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
-        use rtdb_types::{Iid, Interval, StructFields, Value};
+        use rtdb_types::{LogicalType, ScalarType, StructFields, Value};
 
         let memory = MemoryBudget::new(32 << 20);
         let storage = BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20);
@@ -762,7 +854,11 @@ mod tests {
                 ("key".to_owned(), Value::I64(7)), ("payload".to_owned(), Value::Utf8("wide".repeat(512))),
             ])),
         };
-        let batch = build_event_batch(std::slice::from_ref(&event), None, None)?;
+        let fields = StructFields::from([
+            ("key".to_owned(), LogicalType::Scalar(ScalarType::I64)),
+            ("payload".to_owned(), LogicalType::Scalar(ScalarType::Utf8)),
+        ]);
+        let batch = build_event_batch(std::slice::from_ref(&event), Some(fields), None)?;
         let bytes = rtdb_format::ipc::write_file(batch.schema_ref(), std::slice::from_ref(&batch))?;
         let source = SourceFile { block: 4, object: ObjectKey::new("test/order-index/projected")?, size: bytes.len(), rows: Some(1) };
         storage.object_store().put(&source.object, bytes.into()).await?;
@@ -794,10 +890,197 @@ mod tests {
         assert_eq!(inputs.cuts.scope, 5);
         assert_eq!(inputs.cuts.by_iid[&event.iid].0, event.header().precedence());
         let decoded = inputs.decoded.as_ref().expect("the selected replay fits the retention budget");
-        assert_eq!(decoded[0].0, 1);
-        assert_eq!(decoded[0].1[0].arrow(), &batch);
+        assert_eq!(decoded[0].rows, 1);
+        assert_eq!(decoded[0].pages[0].0.arrow(), &batch);
         assert!(memory.used_bytes() > 128);
         drop(inputs);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    struct ReplayStore {
+        inner: rtdb_storage::MemoryStore,
+        source: ObjectKey,
+        ranges: std::sync::atomic::AtomicBool,
+        reads: parking_lot::Mutex<Vec<Option<Range<u64>>>>,
+        changed_at: Option<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ReplayStore {
+        fn supports_scan_ranges(&self, _: &ObjectKey) -> bool {
+            self.ranges.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::StoredObject> {
+            self.inner.head(key).await
+        }
+
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<bytes::Bytes> {
+            if key == &self.source {
+                self.reads.lock().push(None);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<bytes::Bytes> {
+            if key == &self.source {
+                self.reads.lock().push(Some(range.clone()));
+            }
+            Ok(bytes::Bytes::copy_from_slice(&self.inner.get_range(key, range).await?))
+        }
+
+        async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<rtdb_storage::StoredObject>> {
+            Ok(rtdb_storage::ObjectObservation { value: self.head(key).await?, version: Some(replay_version(key, "original")) })
+        }
+
+        async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<bytes::Bytes>> {
+            let version = if self.changed_at == Some(range.start) { "replacement" } else { "original" };
+            Ok(rtdb_storage::ObjectObservation { value: self.get_range(key, range).await?, version: Some(replay_version(key, version)) })
+        }
+
+        async fn put(&self, key: &ObjectKey, bytes: bytes::Bytes) -> rtdb_storage::Result<()> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> rtdb_storage::Result<()> {
+            self.inner.put_file(key, source).await
+        }
+
+        async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::StoredObject>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    fn replay_version(key: &ObjectKey, version: &str) -> PhysicalObjectVersion {
+        PhysicalObjectVersion {
+            namespace: rtdb_types::S3ObjectNamespace { bucket: "test".into(), endpoint: None, region: None },
+            key: key.to_string(), version: version.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn declined_retention_replays_exact_page_ranges_with_the_same_erasure_cut() -> Result<()> {
+        use crate::ordered_index::{key::AtomRef, tree::{Address, IndexRevision, Link}};
+        use rtdb_format::ipc::ArrowFile;
+        use rtdb_types::{LogicalType, ScalarType, StructFields, Value};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let put = |key| StoredOperation::Put(StructFields::from([
+            ("key".to_owned(), Value::I64(key)), ("payload".to_owned(), Value::Utf8("wide".repeat(512))),
+        ]));
+        let erased = StoredEvent {
+            iid: Iid([7; 16]), operation: StoredOperation::Erase, system_from: Timestamp(124),
+            commit_position: 3, entity_key: None, valid_time: Interval::ALL, origin: None, position: None, recency: None,
+        };
+        let old = StoredEvent { operation: put(99), commit_position: 1, system_from: Timestamp(123), ..erased.clone() };
+        let earlier = StoredEvent { operation: put(98), commit_position: 2, ..erased.clone() };
+        let winner = StoredEvent { operation: put(7), commit_position: 4, ..erased.clone() };
+        let fields = StructFields::from([
+            ("key".to_owned(), LogicalType::Scalar(ScalarType::I64)),
+            ("payload".to_owned(), LogicalType::Scalar(ScalarType::Utf8)),
+        ]);
+        let pages = [
+            build_event_batch(&[earlier, old], Some(fields.clone()), None)?,
+            build_event_batch(&[winner.clone(), erased], Some(fields), None)?,
+        ];
+        let bytes = rtdb_format::ipc::write_file(pages[0].schema_ref(), &pages)?;
+        let source = SourceFile { block: 4, object: ObjectKey::new("test/order-index/source")?, size: bytes.len(), rows: Some(4) };
+        let input = ArrowFile::from_buffer(Buffer::from(bytes.clone()), None)?;
+        let size = source.size as u64;
+        let trailer = size - 10;
+        let footer = trailer - arrow_ipc::reader::read_footer_length(bytes[trailer as usize..].try_into().unwrap()).unwrap() as u64;
+        let expected_ranges = vec![Some(trailer..size), Some(footer..trailer), Some(input.page_range(0)?), Some(input.page_range(1)?)];
+
+        let store = Arc::new(ReplayStore {
+            inner: rtdb_storage::MemoryStore::default(), source: source.object.clone(),
+            ranges: AtomicBool::new(true), reads: parking_lot::Mutex::new(Vec::new()), changed_at: None,
+        });
+        store.put(&source.object, bytes.into()).await?;
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let memory = MemoryBudget::new(32 << 20);
+        let cancellation = CancellationToken::new();
+        let definition = Definition { name: "ordered".into(), table: TableRef::new("public", "orders"), columns: vec!["key".into()], version: 0 };
+        let sources = [source];
+        let mut root_digests = Vec::new();
+        for ranged in [true, false] {
+            store.ranges.store(ranged, Ordering::Relaxed);
+            let other_work = memory.reserve(memory.limit_bytes() - (512 << 10))?;
+            let inputs = erase_cuts(&storage, &memory, &sources, &definition.columns, &cancellation).await?;
+            assert!(inputs.decoded.is_none());
+            drop(other_work);
+            assert_eq!(std::mem::take(&mut *store.reads.lock()), vec![None]);
+
+            let tree = Tree::new(&storage, &definition.directory()?, &memory, inputs.cuts.scope).await?;
+            let mut roots = RevisionRoots::default();
+            assert_eq!(replay_flushed(&tree, &definition, &sources, inputs, &mut roots, &cancellation).await?, 4);
+            let reads = std::mem::take(&mut *store.reads.lock());
+            if ranged {
+                assert_eq!(reads, expected_ranges);
+            } else {
+                assert_eq!(reads, vec![None]);
+            }
+
+            assert!(roots.at(&tree, IndexRevision::through_time(Timestamp(123))).await?.is_none());
+            let (_, root) = roots.at(&tree, IndexRevision::MAX).await?.expect("the reinsert is visible");
+            let spans = tree.spans(&root, &Address::new(winner.iid, bytes::Bytes::new())).await?;
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].tuple.view().cell(0), AtomRef::Integer(7));
+            let Some(Link::Stored(pointer)) = roots.archived else { panic!("expected stored revisions"); };
+            root_digests.push(pointer.digest.clone());
+        }
+        assert_eq!(root_digests[0], root_digests[1]);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unversioned_replay_uses_the_complete_file_reader() -> Result<()> {
+        let store = rtdb_storage::MemoryStore::default();
+        let source = SourceFile {
+            block: 4, object: ObjectKey::new("test/order-index/unversioned")?, size: 1, rows: None,
+        };
+        store.put(&source.object, bytes::Bytes::from_static(&[0])).await?;
+        let memory = MemoryBudget::new(1 << 20);
+        let observed = read_replay_ranges(&store, &memory, &source, &[],
+            &CancellationToken::new(), |_| panic!("unversioned range published a row")).await?;
+        assert!(observed.is_none());
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_range_from_another_observed_version_refuses_replay_without_a_whole_read() -> Result<()> {
+        let event = StoredEvent {
+            iid: Iid([4; 16]), operation: StoredOperation::Erase, system_from: Timestamp(123),
+            commit_position: 0, entity_key: None, valid_time: Interval::ALL, origin: None, position: None, recency: None,
+        };
+        let batch = build_event_batch(&[event], None, None)?;
+        let pages = [batch.clone(), batch];
+        let bytes = rtdb_format::ipc::write_file(pages[0].schema_ref(), &pages)?;
+        let input = rtdb_format::ipc::ArrowFile::from_buffer(Buffer::from(bytes.clone()), None)?;
+        let source = SourceFile { block: 4, object: ObjectKey::new("test/order-index/version")?, size: bytes.len(), rows: Some(2) };
+        let store = Arc::new(ReplayStore {
+            inner: rtdb_storage::MemoryStore::default(), source: source.object.clone(),
+            ranges: std::sync::atomic::AtomicBool::new(true), reads: parking_lot::Mutex::new(Vec::new()),
+            changed_at: Some(input.page_range(1)?.start),
+        });
+        store.put(&source.object, bytes.into()).await?;
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let memory = MemoryBudget::new(32 << 20);
+        let cancellation = CancellationToken::new();
+        let definition = Definition { name: "ordered".into(), table: TableRef::new("public", "orders"), columns: vec!["key".into()], version: 0 };
+        let tree = Tree::new(&storage, &definition.directory()?, &memory, 5).await?;
+        let cuts = ErasureCuts::default();
+        let result = flushed_changes(&tree, &definition, &source, &cancellation, Some(&cuts)).await;
+        let error = result.err().expect("the replacement range must be refused");
+        assert_eq!(error.message.as_deref(), Some("An ordered source range differs from its observed file"));
+        assert_eq!(store.reads.lock().len(), 4);
+        assert!(store.reads.lock().iter().all(Option::is_some));
         assert_eq!(memory.used_bytes(), 0);
         Ok(())
     }

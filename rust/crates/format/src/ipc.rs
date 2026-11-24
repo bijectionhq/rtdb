@@ -26,7 +26,6 @@ mod undefined;
 
 pub struct ArrowFile {
     reader: Box<dyn RetainedReader>,
-    event_projection: Option<event_projection::EventProjection>,
     pages: PageDecoder,
     next_page: usize,
     encoded_page_sizes: Vec<usize>,
@@ -229,18 +228,16 @@ impl ArrowFile {
             let bytes = read_block(reader.as_mut(), &block, false)?;
             pages.load_dictionary(index, bytes)?;
         }
-        Ok(Self { reader, event_projection: None, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
+        Ok(Self { reader, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
     }
 
     pub fn schema(&self) -> SchemaRef {
-        self.event_projection.as_ref().map_or_else(|| self.pages.schema(), |projection| Arc::clone(&projection.schema))
+        self.pages.event_projection.as_ref().map_or_else(|| self.pages.schema(), |projection| Arc::clone(&projection.schema))
     }
 
     /// Selects event headers, the document ID, and the named direct children of the put struct.
     pub fn project_event_payload(&mut self, columns: &[String]) {
-        if self.pages.dictionary_count() == 0 && self.pages.schema.fields().len() == self.pages.source_schema.fields().len() {
-            self.event_projection = event_projection::EventProjection::new(&self.pages.schema, columns);
-        }
+        self.pages.project_event_payload(columns);
     }
     pub fn page_count(&self) -> usize { self.pages.blocks.len() }
 
@@ -261,23 +258,8 @@ impl ArrowFile {
     }
 
     pub fn read_page(&mut self, page: usize) -> Result<RecordBatch> {
-        let block = self.pages.block(page)?;
-        let buffer = read_block(self.reader.as_mut(), block, true)?;
-        let batch = if let Some(projection) = &self.event_projection {
-            let bytes = prepare_block(block, buffer, &self.pages.source_schema, false)?;
-            let (header, body_start) = block_message(block, &bytes)?;
-            let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
-            if (message.version() == self.pages.version || self.pages.version == arrow_ipc::MetadataVersion::V1)
-                && let Some(batch) = projection.decode(&self.pages.source_schema, message, &bytes.slice(body_start)) {
-                batch
-            } else {
-                // Reference-writer undefined unions need normalization by the full decoder.
-                let batch = self.pages.decode_prepared(block, bytes)?;
-                projection.select_decoded(&batch)?
-            }
-        } else {
-            self.pages.decode_page(page, buffer)?
-        };
+        let buffer = read_block(self.reader.as_mut(), self.pages.block(page)?, true)?;
+        let batch = self.pages.decode_file_page(page, buffer)?;
         self.next_page = page + 1;
         Ok(batch)
     }
@@ -294,6 +276,7 @@ impl ArrowFile {
 
 pub struct PageDecoder {
     decoder: FileDecoder,
+    event_projection: Option<event_projection::EventProjection>,
     schema: SchemaRef,
     source_schema: SchemaRef,
     decoded_schema: SchemaRef,
@@ -328,7 +311,7 @@ impl PageDecoder {
                 return Err(invalid("Arrow block exceeds data region"));
             }
         }
-        Ok(Self { decoder, schema, source_schema, decoded_schema: decoded, version: footer.version(), blocks, dictionaries })
+        Ok(Self { decoder, event_projection: None, schema, source_schema, decoded_schema: decoded, version: footer.version(), blocks, dictionaries })
     }
 
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
@@ -406,6 +389,29 @@ impl PageDecoder {
             // Some reference layouts use undefined union legs or unknown null counts.
             Err(_) => self.decode_page(page, bytes),
         }
+    }
+
+    /// Configures `decode_file_page` to select event headers, the document ID, and the named put fields.
+    pub fn project_event_payload(&mut self, columns: &[String]) {
+        if self.dictionary_count() == 0 && self.schema.fields().len() == self.source_schema.fields().len() {
+            self.event_projection = event_projection::EventProjection::new(&self.schema, columns);
+        }
+    }
+
+    /// Decodes one exact record block using the file's configured event projection.
+    /// The caller funds the wire bytes and `page_bound` through use of the batch.
+    pub fn decode_file_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
+        let Some(projection) = &self.event_projection else { return self.decode_page(page, bytes); };
+        let block = self.block(page)?;
+        let bytes = prepare_block(block, bytes, &self.source_schema, false)?;
+        let (header, body_start) = block_message(block, &bytes)?;
+        let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
+        if (message.version() == self.version || self.version == arrow_ipc::MetadataVersion::V1)
+            && let Some(batch) = projection.decode(&self.source_schema, message, &bytes.slice(body_start)) {
+            return Ok(batch);
+        }
+        // Reference-writer undefined unions need normalization by the full decoder.
+        projection.select_decoded(&self.decode_prepared(block, bytes)?)
     }
 
     /// Admits selected decode allocations while `wire` owns the already-funded IPC bytes.
