@@ -146,7 +146,36 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
 
 #[tokio::test]
 async fn owned_search_counts_no_documents_for_null_or_absent_text() {
-    use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, StructFields};
+    verify_owned_search_empty_corpus(false).await;
+    verify_owned_search_empty_corpus(true).await;
+}
+
+fn owned_search_schema(wrapped: bool, acceptance: bool) -> rtdb_types::OwnedSchema {
+    let kind = if wrapped {
+        serde_json::json!({"kind":"struct","fields":[
+            {"name":"v2_value","type":{"kind":"utf8"},"optional":false,"nullable":true}
+        ]})
+    } else {
+        serde_json::json!({"kind":"utf8"})
+    };
+    let mut schema = serde_json::json!({
+        "fields": [{"name":"body","type": kind,"optional": true,"nullable": !wrapped}],
+        "validity": if acceptance { "acceptance" } else { "explicit" },
+    });
+    if wrapped { schema["version"] = 2.into(); }
+    rtdb_types::OwnedSchema::from_json(&serde_json::to_vec(&schema).unwrap()).unwrap()
+}
+
+fn owned_search_value(wrapped: bool, value: Value) -> Value {
+    if wrapped {
+        Value::Struct(rtdb_types::StructFields::from([("v2_value".into(), value)]))
+    } else {
+        value
+    }
+}
+
+async fn verify_owned_search_empty_corpus(wrapped: bool) {
+    use rtdb_types::{EntityId, OwnedRelation, StructFields};
 
     let mut options = options();
     options.owned_relations = true;
@@ -156,10 +185,10 @@ async fn owned_search_counts_no_documents_for_null_or_absent_text() {
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let relation = OwnedRelation::new("owned-sparse-search").unwrap();
     let path = OwnedRelation::new("owned-sparse-body").unwrap();
-    let schema = OwnedSchema::from_json(br#"{"fields":[{"name":"body","type":{"kind":"utf8"},"optional":true,"nullable":true}],"validity":"acceptance"}"#).unwrap();
+    let schema = owned_search_schema(wrapped, true);
     let rows = rtdb_tx::Documents::new(vec![
         StructFields::from([("_id".into(), Value::I64(1))]),
-        StructFields::from([("_id".into(), Value::I64(2)), ("body".into(), Value::Null)]),
+        StructFields::from([("_id".into(), Value::I64(2)), ("body".into(), owned_search_value(wrapped, Value::Null))]),
     ], node.memory()).unwrap();
     let installed = session.state_mut().execute_tx(vec![
         TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
@@ -185,25 +214,30 @@ async fn owned_search_counts_no_documents_for_null_or_absent_text() {
 
 #[tokio::test]
 async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() {
-    verify_owned_search_artefacts(13).await;
+    verify_owned_search_artefacts(13, false).await;
 }
 
 #[tokio::test]
 async fn an_owned_corpus_reads_a_published_format_eleven_file() {
-    verify_owned_search_artefacts(11).await;
+    verify_owned_search_artefacts(11, false).await;
 }
 
 #[tokio::test]
 async fn an_owned_corpus_reads_a_published_format_fourteen_tree() {
-    verify_owned_search_artefacts(14).await;
+    verify_owned_search_artefacts(14, false).await;
 }
 
 #[tokio::test]
 async fn an_owned_corpus_reads_a_published_format_fifteen_tree() {
-    verify_owned_search_artefacts(15).await;
+    verify_owned_search_artefacts(15, false).await;
 }
 
-async fn verify_owned_search_artefacts(format: u32) {
+#[tokio::test]
+async fn owned_fact_text_ranks_the_same_before_and_after_sidecar_publication() {
+    verify_owned_search_artefacts(13, true).await;
+}
+
+async fn verify_owned_search_artefacts(format: u32, wrapped: bool) {
     use rtdb_types::{EntityId, OwnedRelation, StructFields};
 
     let mut options = options();
@@ -222,13 +256,21 @@ async fn verify_owned_search_artefacts(format: u32) {
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let relation = OwnedRelation::new("owned-search-docs").unwrap();
     let path = OwnedRelation::new("owned-body").unwrap();
-    let documents = rtdb_tx::Documents::new((0..20).map(|id| StructFields::from([
-        ("_id".into(), Value::I64(id)),
-        ("body".into(), Value::Utf8("an invoice".into())),
-        ("secret".into(), Value::Binary(vec![7, 9])),
-    ])).collect(), node.memory()).unwrap();
-    let insert = TxOp::OwnedInsertDocs { relation: relation.clone(), documents, valid_from: Some(Timestamp(0)), valid_to: None };
-    assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+    let documents = rtdb_tx::Documents::new((0..20).map(|id| {
+        let mut row = StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("body".into(), owned_search_value(wrapped, Value::Utf8("an invoice".into()))),
+        ]);
+        if !wrapped { row.insert("secret".into(), Value::Binary(vec![7, 9])); }
+        row
+    }).collect(), node.memory()).unwrap();
+    let mut setup = Vec::new();
+    if wrapped {
+        setup.push(TxOp::OwnedDeclareRelation { relation: relation.clone(), schema: owned_search_schema(true, false) });
+    }
+    setup.push(TxOp::OwnedInsertDocs { relation: relation.clone(), documents, valid_from: Some(Timestamp(0)), valid_to: None });
+    let result = session.state_mut().execute_tx(setup, AutonomousTxOptions::default()).await.unwrap();
+    assert!(result.committed(), "{:?}", result.error());
 
     let declare = |column: &str| TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: column.into() };
     let rejected = session.state_mut().execute_tx(vec![declare("secret")], AutonomousTxOptions::default()).await.unwrap();
@@ -237,7 +279,7 @@ async fn verify_owned_search_artefacts(format: u32) {
     assert!(accepted.committed(), "{:?}", accepted.error());
     let changed = rtdb_tx::Documents::new(vec![StructFields::from([
         ("_id".into(), Value::I64(0)),
-        ("body".into(), Value::Utf8("paid".into())),
+        ("body".into(), owned_search_value(wrapped, Value::Utf8("paid".into()))),
     ])], node.memory()).unwrap();
     let replace = TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: changed, valid_from: Some(Timestamp(0)), valid_to: None };
     assert!(session.state_mut().execute_tx(vec![replace], AutonomousTxOptions::default()).await.unwrap().committed());

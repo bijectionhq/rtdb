@@ -507,6 +507,19 @@ impl OwnedSchema {
         }
     }
 
+    pub fn search_column_logical_type(&self, name: &str) -> Option<LogicalType> {
+        if self.path_column_type(name) == Some(ScalarType::Utf8) {
+            return self.path_column_logical_type(name);
+        }
+        let field = self.path_field(name)?;
+        let Kind::Struct { fields } = &field.kind else { return None; };
+        let [value] = fields.as_slice() else { return None; };
+        (self.is_v2() && field.optional && !field.nullable
+            && value.name == crate::OWNED_FACT_TEXT_VALUE && !value.optional && value.nullable
+            && matches!(&value.kind, Kind::Utf8 {}))
+            .then(|| field.logical())
+    }
+
     pub fn path_column_logical_type(&self, name: &str) -> Option<LogicalType> {
         self.path_field(name).and_then(|field| {
             let ty = field.kind.path_logical()?;

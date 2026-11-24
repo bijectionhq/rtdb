@@ -28,13 +28,9 @@ pub const DEFINITIONS: (&str, &str) = ("xt", "search_indexes");
 pub(crate) fn has_owned_search_text(snapshot: &Snapshot, table: &TableRef, column: &str) -> Result<bool> {
     let types = snapshot.column_types_for(table, [column.to_owned()]);
     let kind = types.get(column).unwrap_or(&LogicalType::Nothing);
-    if kind.is_clear_search_text() {
-        return Ok(true);
-    }
-    if kind.legs().iter().all(|leg| matches!(leg, LogicalType::Null)) {
-        return Ok(false);
-    }
-    Err(Anomaly::incorrect("rtdb.owned/search-column", "Owned search path no longer describes only clear text"))
+    kind.owned_search_text_presence().ok_or_else(|| Anomaly::incorrect(
+        "rtdb.owned/search-column", "Owned search path no longer describes only clear text",
+    ))
 }
 
 /// The definitions in force in the database's snapshots, as of `now` in valid time.

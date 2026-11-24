@@ -430,7 +430,7 @@ fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool,
     let mut values = Vec::new();
     let mut revisions = Vec::new();
     for column in columns {
-        let text = event.put_text(column)?;
+        let text = event.put_search_text(column, with_identity)?;
         if mode == crate::file::BuildMode::History {
             revisions.push(match text { PutText::Utf8(text) => Some(logical::text_revision(text)), _ => None });
             continue;

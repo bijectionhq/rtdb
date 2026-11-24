@@ -1130,8 +1130,7 @@ impl HeldCheckpointWorld {
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         if columns.len() != partitions.len() || partitions.iter().zip(&columns).any(|((relation, _), column)| {
             !self.open.record.schemas.relation(relation)
-                .and_then(|schema| schema.path_column_logical_type(column))
-                .is_some_and(|kind| kind.is_clear_search_text())
+                .and_then(|schema| schema.search_column_logical_type(column)).is_some()
         }) {
             return Err(OwnedWorld::unavailable());
         }
@@ -1677,9 +1676,17 @@ fn expired_lifetime() -> rtdb_types::Anomaly {
 }
 
 fn search_text<'a>(fact: &'a WorldFact, column: &str) -> Result<Option<&'a str>> {
-    let Some(cell) = ArrowCell::named(&fact.row, column, 0) else { return Ok(None); };
-    if cell.logical_type()? == rtdb_types::LogicalType::Null { return Ok(None); }
-    cell.utf8().map(Some).ok_or_else(OwnedWorld::unavailable)
+    search_row_text(&fact.row, column)
+}
+
+fn search_row_text<'a>(row: &'a RecordBatch, column: &str) -> Result<Option<&'a str>> {
+    let Some(cell) = ArrowCell::named(row, column, 0) else { return Ok(None); };
+    let logical = rtdb_columnar::from_field(cell.field)?;
+    match rtdb_columnar::owned_text_cell(&logical, cell.field, cell.array, cell.row)? {
+        rtdb_columnar::TextCell::Missing => Ok(None),
+        rtdb_columnar::TextCell::Utf8(text) => Ok(Some(text)),
+        rtdb_columnar::TextCell::Other => Err(OwnedWorld::unavailable()),
+    }
 }
 
 struct InheritedRelation<'a> {
@@ -2080,9 +2087,7 @@ impl<'a> InheritedRelation<'a> {
                 Arc::clone(&writer.overlay), self.owner, self.relation, path,
             ).await? { return Err(unavailable()); }
         }
-        if !self.schema.path_column_logical_type(&column)
-            .is_some_and(|kind| kind.is_clear_search_text())
-        {
+        if self.schema.search_column_logical_type(&column).is_none() {
             return Err(unavailable());
         }
         let instant = Interval::at(valid)?;
@@ -2940,6 +2945,28 @@ pub(crate) async fn open_held_checkpoint_world(
 #[cfg(test)]
 mod ancestor_boundaries_tests {
     use super::*;
+
+    #[test]
+    fn world_search_uses_the_exact_text_of_a_complete_replacement() -> Result<()> {
+        let body = |value: Option<&str>| -> ArrayRef {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(arrow_schema::Field::new(rtdb_types::OWNED_FACT_TEXT_VALUE, arrow_schema::DataType::Utf8, true)),
+                Arc::new(arrow_array::StringArray::from(vec![value])) as ArrayRef,
+            )]))
+        };
+        let row = RecordBatch::try_from_iter([
+            ("body", body(Some("café\0🙂"))),
+            ("null", body(None)),
+            ("empty", body(Some(""))),
+            ("binary", Arc::new(arrow_array::BinaryArray::from_vec(vec![b"a"])) as ArrayRef),
+        ]).map_err(rtdb_columnar::arrow_error)?;
+        assert_eq!(search_row_text(&row, "body")?, Some("café\0🙂"));
+        assert_eq!(search_row_text(&row, "empty")?, Some(""));
+        assert_eq!(search_row_text(&row, "null")?, None);
+        assert_eq!(search_row_text(&row, "missing")?, None);
+        assert!(search_row_text(&row, "binary").is_err());
+        Ok(())
+    }
 
     #[test]
     fn merged_identities_stop_at_the_first_unseen_source() {

@@ -54,7 +54,7 @@ fn visit_live_rows<'a>(segment: &'a rtdb_index::LiveTable, from: u32, to: u32, c
     let mut row = from;
     for (batch, start) in segment.batches_from(from) {
         let end = start + (batch.len() - start).min((to - row) as usize);
-        let column = batch.view().put_text_column(column);
+        let column = batch.view().put_search_text_column(column, segment.table().is_owned_event_data());
         for offset in start..end {
             if !visit(row, &column, offset)? { return Ok(false); }
             row += 1;

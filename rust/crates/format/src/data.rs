@@ -224,6 +224,7 @@ pub struct PutTextColumn<'a> {
     batch: &'a EventBatch,
     position: Option<usize>,
     strings: Option<&'a StringArray>,
+    owned: bool,
     logical: std::cell::OnceCell<&'a LogicalType>,
 }
 
@@ -250,7 +251,13 @@ impl<'a> PutTextColumn<'a> {
                 PutText::Utf8(strings.value(put.offset))
             });
         }
-        rtdb_columnar::text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
+        let field = &put.array.fields()[position];
+        let array = put.array.column(position).as_ref();
+        if self.owned {
+            rtdb_columnar::owned_text_cell(logical, field, array, put.offset)
+        } else {
+            rtdb_columnar::text_cell(logical, field, array, put.offset)
+        }
     }
 }
 
@@ -268,10 +275,20 @@ impl<'a> EventRef<'a> {
 
     /// Borrows ordinary UTF-8 cells from a validated put document.
     pub fn put_text(&self, name: &str) -> Result<PutText<'a>> {
+        self.put_search_text(name, false)
+    }
+
+    pub fn put_search_text(&self, name: &str, owned: bool) -> Result<PutText<'a>> {
         let Some(put) = self.put else { return Ok(PutText::Missing); };
         let Some(position) = put.position(name) else { return Ok(PutText::Missing); };
         let logical = put.field_type(position)?;
-        rtdb_columnar::text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
+        let field = &put.array.fields()[position];
+        let array = put.array.column(position).as_ref();
+        if owned {
+            rtdb_columnar::owned_text_cell(logical, field, array, put.offset)
+        } else {
+            rtdb_columnar::text_cell(logical, field, array, put.offset)
+        }
     }
 
     pub fn document_allocation_bound(&self) -> Result<usize> {
@@ -433,6 +450,10 @@ impl EventBatch {
     }
 
     pub fn put_text_column(&self, name: &str) -> PutTextColumn<'_> {
+        self.put_search_text_column(name, false)
+    }
+
+    pub fn put_search_text_column(&self, name: &str, owned: bool) -> PutTextColumn<'_> {
         let field = self.operations().ok().and_then(|operations| {
             let DataType::Union(fields, _) = operations.data_type() else { return None; };
             let (id, _) = fields.iter().find(|(_, field)| field.name() == "put")?;
@@ -440,7 +461,7 @@ impl EventBatch {
         });
         let position = field.and_then(|array| array.fields().iter().position(|field| field.name() == name));
         let strings = field.zip(position).and_then(|(array, position)| array.column(position).as_any().downcast_ref::<StringArray>());
-        PutTextColumn { batch: self, position, strings, logical: Default::default() }
+        PutTextColumn { batch: self, position, strings, owned, logical: Default::default() }
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }

@@ -55,7 +55,31 @@ pub enum LogicalType {
     RunEndEncoded { width: RunEndWidth, value: Box<LogicalType> },
 }
 
+pub const OWNED_FACT_TEXT_VALUE: &str = "v2_value";
+
 impl LogicalType {
+    /// Classifies an owned search column, including null-only pages of a fact text wrapper.
+    pub fn owned_search_text_presence(&self) -> Option<bool> {
+        let mut has_text = false;
+        for leg in self.legs() {
+            match leg {
+                Self::Null => {}
+                Self::Scalar(ScalarType::Utf8) => has_text = true,
+                Self::Struct(fields) if fields.len() == 1 => {
+                    for value in fields.get(OWNED_FACT_TEXT_VALUE)?.legs() {
+                        match value {
+                            Self::Null => {}
+                            Self::Scalar(ScalarType::Utf8) => has_text = true,
+                            _ => return None,
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(has_text)
+    }
+
     /// Whether this type admits text and no non-text values besides null.
     pub fn is_clear_search_text(&self) -> bool {
         let legs = self.legs();

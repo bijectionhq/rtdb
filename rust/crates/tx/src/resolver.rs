@@ -1375,7 +1375,12 @@ impl<'a> OpenTransaction<'a> {
                     let columns = cell("columns").and_then(ArrowCell::list).ok_or_else(conflict)?;
                     for name in columns {
                         let name = name.utf8().ok_or_else(conflict)?;
-                        if before.path_column_logical_type(name) != after.path_column_logical_type(name) {
+                        let column_type = |schema: &rtdb_types::OwnedSchema| if catalog.is_owned_search_catalog() {
+                            schema.search_column_logical_type(name)
+                        } else {
+                            schema.path_column_logical_type(name)
+                        };
+                        if column_type(before) != column_type(after) {
                             return Err(conflict());
                         }
                     }
@@ -1530,8 +1535,8 @@ impl<'a> OpenTransaction<'a> {
             }
         } else if kind == OwnedPathKind::Search {
             let [column] = columns else { return Err(invalid_search_path_column()); };
-            let clear = if declaration.is_some() {
-                declared_type(column) == Some(rtdb_types::ScalarType::Utf8)
+            let clear = if let Some((schema, _)) = &declaration {
+                schema.search_column_logical_type(column).is_some()
             } else {
                 let types = snapshot.column_types_for(&target, columns.iter().cloned());
                 types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text)

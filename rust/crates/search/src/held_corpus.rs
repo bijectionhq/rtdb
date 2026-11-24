@@ -161,7 +161,7 @@ impl HeldTextCorpus {
                 let _identity = self.memory.reserve(id_bytes.saturating_mul(2))?;
                 let id = rtdb_columnar::read_entity_id(id_field, ids, row)?.into_owned();
                 if shadows.contains(&id) { continue; }
-                let value = match rtdb_columnar::text_cell(&logical, text_field, text, row)? {
+                let value = match rtdb_columnar::owned_text_cell(&logical, text_field, text, row)? {
                     rtdb_columnar::TextCell::Utf8(text) => Some(text),
                     rtdb_columnar::TextCell::Missing => None,
                     rtdb_columnar::TextCell::Other => return Err(corpus_limit()),

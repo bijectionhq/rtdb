@@ -844,7 +844,7 @@ async fn rank_owned_artefacts(
                             }
                         }
                         if !same_run { return Err(uncovered_owned_search()); }
-                        let PutText::Utf8(text) = rtdb_columnar::text_cell(&logical, field, batch.column(column).as_ref(), row)?
+                        let PutText::Utf8(text) = rtdb_columnar::owned_text_cell(&logical, field, batch.column(column).as_ref(), row)?
                             else { return Err(uncovered_owned_search()); };
                         let score = if overlapping == 1 {
                             candidate.score

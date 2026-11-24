@@ -186,6 +186,8 @@ impl ReplayWorlds {
                         1 => Value::Utf8(input.text()?.into()),
                         2 => Value::Binary(input.frame()?.into()),
                         3 => Value::I64(input.number()?),
+                        4 => fact_text(Value::Null),
+                        5 => fact_text(Value::Utf8(input.text()?.into())),
                         _ => return Err(invalid()),
                     };
                     if fields.insert(name.into(), value).is_some() {
@@ -221,6 +223,10 @@ impl ReplayWorlds {
         }
         Ok(worlds)
     }
+}
+
+fn fact_text(value: Value) -> Value {
+    Value::Struct(StructFields::from([(rtdb_types::OWNED_FACT_TEXT_VALUE.into(), value)]))
 }
 
 struct Input<'a>(&'a [u8]);
@@ -274,6 +280,42 @@ pub(crate) fn invalid() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_world_shadow_keeps_exact_wrapped_text_and_present_null() {
+        fn frame(out: &mut Vec<u8>, text: &str) {
+            out.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+
+        let mut body = MAGIC.to_vec();
+        for count in [0u32, 0, 1] {
+            body.extend_from_slice(&count.to_be_bytes());
+        }
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&[1; 16]);
+        frame(&mut body, "facts");
+        frame(&mut body, "key");
+        body.extend_from_slice(&10i64.to_be_bytes());
+        body.extend_from_slice(&20i64.to_be_bytes());
+        body.extend_from_slice(&3u16.to_be_bytes());
+        frame(&mut body, "body");
+        body.push(5);
+        frame(&mut body, "café\0🙂");
+        frame(&mut body, "null");
+        body.push(4);
+        frame(&mut body, "legacy");
+        body.push(1);
+        frame(&mut body, "legacy");
+        body.extend_from_slice(&0u32.to_be_bytes());
+
+        let replay = ReplayWorlds::decode(&body).unwrap();
+        let fields = replay.shadows[0].fields.as_ref().unwrap();
+        assert_eq!(fields.get("body"), Some(&fact_text(Value::Utf8("café\0🙂".into()))));
+        assert_eq!(fields.get("null"), Some(&fact_text(Value::Null)));
+        assert_eq!(fields.get("legacy"), Some(&Value::Utf8("legacy".into())));
+        assert!(fields.get("missing").is_none());
+    }
 
     #[test]
     fn replay_world_clock_and_omission_cannot_share_a_position() {

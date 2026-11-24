@@ -93,6 +93,7 @@ pub(crate) enum PathDeclarationWire {
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V2: &str = "rtdb.owned.DeclareRelation.v2";
+pub(crate) const OWNED_SHARED_SEARCH_TEXT_V1: &str = "rtdb.owned.SharedSearchText.v1";
 pub(crate) const OWNED_LAYOUT_CAPABILITIES_V1: &str = "rtdb.owned.LayoutCapabilities.v1";
 pub(crate) const OWNED_RELATION_LAYOUT_V1: &str = "rtdb.owned.RelationLayout.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
@@ -843,6 +844,12 @@ fn require_idle(native: &NativeSession) -> Result<(), Status> {
 }
 
 impl Service {
+    pub(crate) fn owned_shared_search_text_action(&self, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if !body.is_empty() { return Err(invalid("Owned shared search text takes an empty body")); }
+        Ok(ActionResult { body: Bytes::from_static(b"\x01") })
+    }
+
     pub(crate) fn owned_layout_capabilities_action(&self, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if !body.is_empty() { return Err(invalid("Owned layout capabilities takes an empty body")); }

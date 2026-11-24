@@ -12,6 +12,17 @@ pub enum TextCell<'a> {
 
 /// Borrows an ordinary string from a logical Arrow cell, including a union leg or a run end.
 pub fn text_cell<'a>(logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize) -> Result<TextCell<'a>> {
+    text_cell_in_layout(logical, field, array, row, false)
+}
+
+/// Borrows text from the ordinary column or the single value in an owned fact cell.
+pub fn owned_text_cell<'a>(logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize) -> Result<TextCell<'a>> {
+    text_cell_in_layout(logical, field, array, row, true)
+}
+
+fn text_cell_in_layout<'a>(
+    logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize, owned: bool,
+) -> Result<TextCell<'a>> {
     if row >= array.len() || array.data_type() != field.data_type() {
         return Err(invalid("Text cell is outside its Arrow layout"));
     }
@@ -36,7 +47,7 @@ pub fn text_cell<'a>(logical: &LogicalType, field: &Field, array: &'a dyn Array,
                     &derived
                 }
             };
-            text_cell(logical, child, union.child(tag).as_ref(), union.value_offset(row))
+            text_cell_in_layout(logical, child, union.child(tag).as_ref(), union.value_offset(row), owned)
         }
         DataType::RunEndEncoded(ends, child) => {
             let derived;
@@ -50,7 +61,7 @@ pub fn text_cell<'a>(logical: &LogicalType, field: &Field, array: &'a dyn Array,
             macro_rules! in_run {
                 ($ty:ty) => {{
                     let runs = array.as_run::<$ty>();
-                    text_cell(logical, child, runs.values().as_ref(), runs.get_physical_index(row))
+                    text_cell_in_layout(logical, child, runs.values().as_ref(), runs.get_physical_index(row), owned)
                 }};
             }
             match ends.data_type() {
@@ -61,6 +72,14 @@ pub fn text_cell<'a>(logical: &LogicalType, field: &Field, array: &'a dyn Array,
             }
         }
         _ if array.is_null(row) => Ok(TextCell::Missing),
+        DataType::Struct(fields) if owned => {
+            let LogicalType::Struct(types) = logical else { return Ok(TextCell::Other); };
+            if fields.len() != 1 { return Ok(TextCell::Other); }
+            let child = &fields[0];
+            if child.name() != rtdb_types::OWNED_FACT_TEXT_VALUE { return Ok(TextCell::Other); }
+            let logical = types.get(child.name()).ok_or_else(|| invalid("Fact text has no value type"))?;
+            text_cell(logical, child, array.as_struct().column(0).as_ref(), row)
+        }
         _ => match logical {
             LogicalType::Null | LogicalType::Nothing => Ok(TextCell::Missing),
             LogicalType::Scalar(ScalarType::Utf8) => array.as_any().downcast_ref::<StringArray>()
