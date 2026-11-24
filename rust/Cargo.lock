@@ -5418,6 +5418,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
