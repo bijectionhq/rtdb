@@ -25,6 +25,7 @@ impl NodeConfiguration {
             None => Membership::Durable { primary: self.primary.clone(), skipped: self.skipped_databases.clone() },
         };
         options.read_only = self.read_only_databases;
+        options.default_v1_serving = self.default_v1_serving;
         options.ordered_index_arrow_references = self.ordered_index_arrow_references;
         options.ordered_index_arrow_references_on_private_storage = self.ordered_index_arrow_references_on_private_storage;
         options.default_timezone = self.node_timezone().to_owned();

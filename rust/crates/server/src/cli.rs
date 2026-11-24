@@ -229,6 +229,7 @@ impl DevOptions {
         let path = |path: PathBuf| path.into_os_string().into_string().map_err(|_| invalid("--data must be a UTF-8 path"));
         config.primary.log = Some(Log::LocalLog(LocalLog { path: Some(path(log)?), epoch: Some(0) }));
         config.primary.storage = Some(Storage::LocalStorage(LocalStorage { path: Some(path(storage)?), epoch: Some(0) }));
+        config.default_v1_serving = !self.multi;
         config.auth = rtdb_auth::AuthConfig::SingleRootUser { password: None };
         config.server = Some(PgwireSettings { port: self.pgwire_port, ..Default::default() });
         config.flight_sql = Some(FlightSettings { port: self.flight_sql_port, ..Default::default() });

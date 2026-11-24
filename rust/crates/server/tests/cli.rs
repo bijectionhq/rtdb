@@ -29,6 +29,7 @@ async fn dev_restart() {
     for reopening in [false, true] {
         let limit = options.allocation_limit_bytes;
         let (config, memory, _configuration) = options.load_reserved().unwrap().into_execution(limit).unwrap();
+        assert!(config.node_options(limit).unwrap().default_v1_serving);
         let (handle, driver) = rtdb_server::ServerDriver::open_with_memory(config, limit, memory).await.unwrap();
         assert!(handle.addresses().pgwire.unwrap().ip().is_loopback());
         assert!(handle.addresses().flight_sql.unwrap().ip().is_loopback());

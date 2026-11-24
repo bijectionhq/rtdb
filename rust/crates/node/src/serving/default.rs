@@ -27,6 +27,7 @@ impl ServingDriver for DefaultServing {
     fn uses_database_tokens(&self) -> bool { true }
 
     fn features(&self) -> &[&str] {
+        if !self.handle.is_compatible() { return &[]; }
         if self.writable { NATIVE_WRITE_FEATURES } else { NATIVE_READ_FEATURES }
     }
 

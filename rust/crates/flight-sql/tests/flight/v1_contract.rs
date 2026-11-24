@@ -1527,24 +1527,39 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
 }
 
 #[tokio::test]
-async fn rtdb_v1_native_driver_requires_fences_both_arms_and_replays() {
-    use rtdb_node::serving::NativeServingAuthority;
+async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config::{Log, Storage}};
     use v1::{receipt::Outcome, version::Expect};
 
-    let incarnation = [27; 16];
-    let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
-        "xtdb", NativeServingAuthority {
-            incarnation, checkpoints: None,
-        },
-    );
-    let running = Running::start_with_resources(
-        None, FlightConfig::default(), &[], None, Default::default(), None, Some(Arc::new(resources)),
-    ).await;
-    let database = running.node.catalog().database("xtdb").unwrap();
-    let mut status = database.watch_status();
-    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
-        matches!(status.role, rtdb_replication::Role::Leading(_))
-    })).await.unwrap().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let options = || {
+        let path = |name| Some(root.path().join(name).to_string_lossy().into_owned());
+        let primary = DatabaseConfig {
+            log: Some(Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(Storage::LocalStorage(LocalStorage { path: path("storage"), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut options = NodeOptions {
+            membership: Membership::Durable { primary, skipped: Default::default() },
+            default_v1_serving: true,
+            ..Default::default()
+        };
+        options.replication.rows_per_block = 4;
+        options
+    };
+    let start = || {
+        let options = options();
+        async move {
+            let running = Running::start_with_options(None, FlightConfig::default(), &[], None, options).await;
+            let mut status = running.node.catalog().database("xtdb").unwrap().watch_status();
+            tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+                matches!(status.role, rtdb_replication::Role::Leading(_))
+            })).await.unwrap().unwrap();
+            (running, status)
+        }
+    };
+
+    let (running, mut status) = start().await;
     let mut client = Client::connect(&running.server, None).await;
     let caps = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
     let caps = v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap();
@@ -1595,9 +1610,32 @@ async fn rtdb_v1_native_driver_requires_fences_both_arms_and_replays() {
     assert_eq!(v1::Receipt::decode(status[0].body.clone()).unwrap(), replayed);
 
     let selected = transact_wire(&mut client, v1::TransactRequest {
-        key: vec![4; 16], requires: vec![version(1, Expect::Written(written))], ..stale
+        key: vec![4; 16], requires: vec![version(1, Expect::Written(written))], ..stale.clone()
     }).await.unwrap();
     assert_eq!(selected.outcome, Some(Outcome::Otherwise(v1::Otherwise { failed: vec![0] })));
-    assert_eq!(ints(&query(&mut client, read).await.0), [20, 40]);
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [20, 40]);
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        status.adopted_block.as_ref().is_some_and(|block| block.as_proto().serving_checkpoint.is_some())
+    })).await.unwrap().unwrap();
+    running.stop().await;
+
+    let (running, _) = start().await;
+    let mut client = Client::connect(&running.server, None).await;
+    let status_request = v1::TxStatusRequest { key: stale.key.clone() }.encode_to_vec();
+    let status = client.action("rtdb.v1.TxStatus", status_request.clone().into()).await.unwrap();
+    assert_eq!(v1::Receipt::decode(status[0].body.clone()).unwrap(), replayed);
+    assert_eq!(transact_wire(&mut client, stale).await.unwrap(), replayed);
+    let mut read = read;
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: selected.basis.clone().map(Selection::Exactly) });
+    let (rows, reopened) = query(&mut client, read).await;
+    assert_eq!(ints(&rows), [20, 40]);
+    assert_eq!(reopened.basis, selected.basis);
+
+    client.update("INSERT INTO classic_only (_id, n) VALUES (1, 50)", None).await;
+    assert_eq!(ints(&client.query("SELECT n FROM classic_only FOR ALL VALID_TIME").await), [50]);
+    let caps = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
+    assert!(v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap().features.is_empty());
+    let status = client.action("rtdb.v1.TxStatus", status_request.into()).await.unwrap_err();
+    error(status, v1::AnomalyCategory::Unsupported, "rtdb/default-serving-classic-history");
     running.stop().await;
 }
