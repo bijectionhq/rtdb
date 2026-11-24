@@ -28,7 +28,7 @@ impl NodeConfiguration {
                 "memory-cache" | "xtdb.cache/memory" => ("memoryCache", cache(value, false)?),
                 "disk-cache" | "xtdb.cache/disk" => ("diskCache", cache(value, true)?),
                 "indexer" => ("indexer", durations(fields(value, &[("rows-per-block", "rowsPerBlock"), ("page-limit", "pageLimit"), ("log-limit", "logLimit"), ("skip-txs", "skipTxs"), ("enabled?", "enabled"), ("flush-duration", "flushDuration")])?, &["flushDuration"])?),
-                "compactor" => ("compactor", fields(value, &[("threads", "threads"), ("ree-iids?", "reeIids"), ("within-file-recency-branching?", "withinFileRecencyBranching")])?),
+                "compactor" => ("compactor", fields(value, &[("threads", "threads"), ("opt-in-221?", "optIn221")])?),
                 "search" | "xtdb/search" => ("search", fields(value, &[("enabled?", "enabled"), ("threads", "threads")])?),
                 "skip-dbs" => ("skipDbs", scalar(value)?),
                 "authn" | "xtdb/authn" => ("authn", backend(value, Kind::Authentication)?),

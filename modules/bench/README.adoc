@@ -442,6 +442,88 @@ Once all pieces are in place, verify:
 6. Slack posts a timeseries chart and text summary on completion.
 7. `terraform plan` / `terraform apply` in `cloud/metrics/` succeeds.
 
+== Maintaining the nightly run
+
+=== How a change reaches the nightly run
+
+Most of the nightly run deploys itself from the branch it runs against.
+Every run of `run-nightly-benchmark.yml` builds its own `xtdb-bench` image from the branch head, installs the monitoring stack from `cloud/monitoring/`, and deploys the Helm chart from `cloud/helm/` with `cloud/azure/values.yaml`.
+A change to the benchmark code, the Dockerfile, the workflows, the Helm chart or the monitoring dashboards takes effect on the next run after it lands on `main`.
+
+The two Terraform stacks are the exception: nothing applies them for you.
+
+[cols="1,2,2",options="header"]
+|===
+| Directory | What it manages | When to apply
+
+| `cloud/azure/`
+| The AKS cluster, the benchmark storage account and containers, the managed identity and its federated credentials, the Log Analytics workspace.
+| After any change under `cloud/azure/*.tf`.
+
+| `cloud/metrics/`
+| The Azure dashboard, the per-benchmark anomaly-detection Logic Apps and their KQL queries, the Slack action group.
+| After any change under `cloud/metrics/`: adding, retiring or re-scaling a benchmark, or changing a query or a dashboard panel.
+|===
+
+Until someone applies, the live dashboards and alerts run on the old definitions, so an alert can fire, or stay silent, on a query the repo no longer has.
+Apply as part of landing the change, not later.
+
+=== Access
+
+You need the Azure CLI logged into the `XTDB long-run reliability` subscription, with rights over the `cloud-benchmark-resources` and `xtdb-bench-terraform-state` resource groups:
+
+[source,bash]
+----
+az login --scope https://management.azure.com//.default
+az account set --subscription "XTDB long-run reliability"
+----
+
+If you don't have access to the subscription, ask the team in `#xtdb-dev` rather than working around it.
+
+Both stacks keep their state remotely in the `xtdbbenchstate` storage account, so `terraform init` is all the local setup there is.
+Provider versions are pinned by the committed `.terraform.lock.hcl` in each directory; commit it again whenever `terraform init -upgrade` changes it.
+
+=== Applying a change
+
+[source,bash]
+----
+cd modules/bench/cloud/metrics   # or cloud/azure
+terraform init
+# cloud/metrics only: the live alert relay holds the current Slack webhook URL
+export TF_VAR_slack_webhook_url=$(az logic workflow show -g cloud-benchmark-resources -n xtdb-bench-alert-relay \
+  --query 'definition.actions.PostToSlack.inputs.uri' -o tsv)
+terraform plan
+terraform apply
+----
+
+Read the plan before you apply it:
+
+* Expect it to touch only what your change touches.
+  A destroy is right only for a benchmark you've deliberately retired; anything else being destroyed or replaced means the live state has drifted, or the plan isn't the one you think.
+* If the plan carries changes you didn't make, someone else's merged change hasn't been applied yet.
+  Check its commit before you apply it alongside yours.
+* The plan should show no change to any Logic App's `uri`.
+  One means `TF_VAR_slack_webhook_url` doesn't match the URL the alerts post to today; apply it only if you're deliberately moving them to a new webhook.
+
+=== GitHub secrets
+
+The workflows read these repository secrets (Settings → Secrets and variables → Actions).
+GitHub never shows a secret's value again once it's set, so to replace one, go back to where it comes from.
+
+[cols="2,2,2",options="header"]
+|===
+| Secret | Used for | Where it comes from
+
+| `BENCHMARK_AZURE_CLIENT_ID`, `BENCHMARK_AZURE_TENANT_ID`, `BENCHMARK_AZURE_SUBSCRIPTION_ID` | Logging the workflows into Azure (OIDC). | The Entra app registration the workflows log in as.
+| `BENCHMARK_AZURE_USER_MANAGED_IDENTITY_CLIENT_ID` | The workload identity the benchmark pods run as. | `terraform output user_assigned_identity_client_id` in `cloud/azure/`.
+| `BENCHMARK_GITHUB_PAT` | Letting the benchmark dispatch the cleanup workflow when it finishes. | A fine-grained PAT with Actions write access to `xtdb/xtdb`. It expires, so replace it before it does.
+| `BENCHMARK_SLACK_BOT_TOKEN`, `BENCHMARK_SLACK_CHANNEL_ID` | Posting results to Slack. | The Slack app's OAuth page, and the channel's details.
+| `BENCHMARK_GRAFANA_ADMIN_PASSWORD` | The Grafana instance the monitoring stack installs. | Any password you choose; nothing else uses it.
+| `BENCHMARK_DATASETS_AWS_ACCESS_KEY_ID`, `BENCHMARK_DATASETS_AWS_SECRET_ACCESS_KEY`, `BENCHMARK_DATASETS_AWS_REGION` | Reading the ClickBench dataset from S3. | An IAM user with read access to the datasets bucket.
+|===
+
+The Slack webhook URL the alerts post to isn't a GitHub secret: it's a Terraform variable of `cloud/metrics/`, read back from the live alert relay as shown above.
+
 == CI and Grafana Dashboard Images
 
 === GitHub Actions

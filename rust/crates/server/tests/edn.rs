@@ -11,7 +11,7 @@ fn clojure_config_aliases_backends_millisecond_durations_and_env_are_decoded() {
        :flight-sql {:session-idle-timeout 2500}
        :memory-cache {:max-cache-bytes 4096}
        :indexer {:enabled? false :flush-duration 5000 :skip-txs [1 2]}
-       :compactor {:threads 0 :ree-iids? true}
+       :compactor {:threads 0 :opt-in-221? true}
        :ignored-option {:secret "must not be echoed"}}
     "#, &|name| (name == "LOG_PATH").then(|| "logs".into())).unwrap();
     assert!(matches!(config.primary.log, Some(database_config::Log::LocalLog(ref log)) if log.path.as_deref() == Some("logs") && log.epoch == Some(3)));
@@ -21,6 +21,7 @@ fn clojure_config_aliases_backends_millisecond_durations_and_env_are_decoded() {
     assert_eq!(config.memory_cache.maximum_bytes, Some(4096));
     assert_eq!(config.indexer.flush_duration, std::time::Duration::from_secs(5));
     assert!(!config.indexer.enabled);
+    assert!(config.compactor.run_end_encoded_iids && config.compactor.within_file_recency_branching);
     assert_eq!(warnings, ["Unknown configuration key: :ignored-option"]);
 }
 
@@ -35,7 +36,7 @@ fn edn_authentication_retains_its_default_differences_from_yaml() {
     let AuthConfig::UserList { users, rules, .. } = config.auth else { panic!("expected user list") };
     assert_eq!(users["alice"].encoded(), "encoded");
     assert_eq!(rules[0].method, Method::Password);
-    assert_eq!(rules[0].remote_address.as_deref(), Some("127.0.0.1"));
+    assert_eq!(rules[0].remote_address.as_ref().map(|block| block.as_str()), Some("127.0.0.1"));
 }
 
 #[test]

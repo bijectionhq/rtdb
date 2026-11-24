@@ -119,7 +119,7 @@ fn startup_auth_rules_remain_ordered_and_default_oidc_to_reference_trust() {
     let AuthConfig::UserList { users, rules, .. } = config.auth else { panic!() };
     assert_eq!(users["alice"].encoded(), "encoded");
     assert_eq!(rules[0].method, Method::Password);
-    assert_eq!(rules[1].remote_address.as_deref(), Some("127.0.0.1"));
+    assert_eq!(rules[1].remote_address.as_ref().map(|block| block.as_str()), Some("127.0.0.1"));
     let config = decode("authn: !OpenIdConnect\n  issuerUrl: http://localhost:8080/realm\n  clientId: db\n  clientSecret: secret").unwrap();
     let AuthConfig::OpenIdConnect(config) = config.auth else { panic!() };
     assert_eq!(config.rules[0].method, Method::Trust);
@@ -179,8 +179,28 @@ fn scan_tie_order_uses_an_explicit_positive_naming_epoch() {
 }
 
 #[test]
+fn a_malformed_auth_rule_remote_address_stops_the_configuration_loading() {
+    let error = decode("authn: !UserList\n  users: {}\n  rules:\n    - method: TRUST\n      remoteAddress: 10.0.0.0/33\n").unwrap_err();
+    assert_eq!(error.code, "xtdb.authn/invalid-remote-address");
+}
+
+#[test]
+fn compactor_opt_in_221_turns_on_both_formats_from_yaml_or_environment() {
+    let off = decode("{}").unwrap().compactor;
+    assert!(!off.run_end_encoded_iids && !off.within_file_recency_branching);
+    let on = decode("compactor: {optIn221: true}").unwrap().compactor;
+    assert!(on.run_end_encoded_iids && on.within_file_recency_branching);
+    let environment = |name: &str| (name == "XTDB_COMPACTOR_221_OPT_IN").then(|| "true".to_owned());
+    let on = NodeConfiguration::from_yaml_with_environment("{}", &environment, false).unwrap().compactor;
+    assert!(on.run_end_encoded_iids && on.within_file_recency_branching);
+    for removed in ["reeIids", "withinFileRecencyBranching"] {
+        assert!(decode(&format!("compactor: {{{removed}: true}}")).is_err(), "{removed}");
+    }
+}
+
+#[test]
 fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
-    let config = decode("memoryCache: {maxSizeBytes: 1024}\nindexer: {enabled: false, rowsPerBlock: 42, pageLimit: 16, logLimit: 8, skipTxs: [3, 9], flushDuration: PT5S}\ncompactor: {threads: 0, reeIids: true, withinFileRecencyBranching: true}\ngarbageCollector: {enabled: false, blocksToKeep: 4, garbageLifetime: PT12H, readerLease: PT30M, readerLeaseMargin: PT20S}\nreadOnlyDatabases: true").unwrap();
+    let config = decode("memoryCache: {maxSizeBytes: 1024}\nindexer: {enabled: false, rowsPerBlock: 42, pageLimit: 16, logLimit: 8, skipTxs: [3, 9], flushDuration: PT5S}\ncompactor: {threads: 0, optIn221: true}\ngarbageCollector: {enabled: false, blocksToKeep: 4, garbageLifetime: PT12H, readerLease: PT30M, readerLeaseMargin: PT20S}\nreadOnlyDatabases: true").unwrap();
     let options = config.node_options(8192).unwrap();
     assert_eq!(options.cache_bytes, 1024);
     assert_eq!(options.execution_memory_bytes, 7168);

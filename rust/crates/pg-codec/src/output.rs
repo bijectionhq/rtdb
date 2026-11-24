@@ -98,8 +98,7 @@ pub fn encode_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Op
 
 fn write_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Option<&str>, zoned: bool, environment: &SessionEnvironment, output: &mut impl Write) -> Result<()> {
     if format == Format::Binary {
-        let nanos = nanos(value, unit);
-        let micros = if zoned { nanos.div_euclid(1000) } else { nanos / 1000 };
+        let micros = nanos(value, unit).div_euclid(1000);
         let value = i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS);
         write_bytes(output, &value.to_be_bytes())
     } else {

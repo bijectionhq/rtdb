@@ -123,13 +123,23 @@ fn decimal_text_and_tagged_values_keep_full_scale_without_zero_expansion() {
 }
 
 #[test]
-fn timestamp_binary_writers_keep_local_truncation_and_zoned_flooring() {
+fn binary_timestamps_send_the_microsecond_their_text_form_shows() {
     let epoch = 946_684_800_000_000i64;
     let local = Value::Timestamp { value: -1, unit: TimeUnit::Nanosecond, timezone: None };
     let zoned = Value::Timestamp { value: -1, unit: TimeUnit::Nanosecond, timezone: Some("UTC".into()) };
-    assert_eq!(output(PgType::Timestamp, Format::Binary, &local), (-epoch).to_be_bytes());
+    assert_eq!(output(PgType::Timestamp, Format::Binary, &local), (-epoch - 1).to_be_bytes());
+    assert_eq!(output(PgType::Timestamp, Format::Text, &local), b"1969-12-31 23:59:59.999999");
     assert_eq!(output(PgType::TimestampTz, Format::Binary, &zoned), (-epoch - 1).to_be_bytes());
     assert_eq!(output(PgType::TimestampTz, Format::Text, &zoned), b"1969-12-31 23:59:59.999999+00:00");
+
+    let pre_1970 = Value::Timestamp { value: -2_147_483_647_111_157_001, unit: TimeUnit::Nanosecond, timezone: None };
+    assert_eq!(output(PgType::Timestamp, Format::Text, &pre_1970), b"1901-12-13 20:45:52.888842");
+    assert_eq!(output(PgType::Timestamp, Format::Binary, &pre_1970), (-2_147_483_647_111_158i64 - epoch).to_be_bytes());
+    for (value, unit) in [(-1i64, TimeUnit::Second), (-1, TimeUnit::Millisecond)] {
+        let local = Value::Timestamp { value, unit, timezone: None };
+        let micros = if unit == TimeUnit::Second { -1_000_000 } else { -1_000 };
+        assert_eq!(output(PgType::Timestamp, Format::Binary, &local), (micros - epoch).to_be_bytes());
+    }
 }
 
 #[test]

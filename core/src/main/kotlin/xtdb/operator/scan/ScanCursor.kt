@@ -27,8 +27,6 @@ class ScanCursor(
     private val ownedSegments: List<Segment<*>>,
     private val mergeTasks: Iterator<MergeTask>,
 
-    private val schema: Map<String, Any>, private val args: RelationReader,
-
     private val metrics: ScanMetrics
 ) : ICursor {
 
@@ -44,8 +42,8 @@ class ScanCursor(
     private fun RelationReader.maybeSelect(iidPred: SelectionSpec?, path: ByteArray) =
         when (iidPred) {
             null -> this
-            is MultiIidSelector -> select(iidPred.select(al, this, path))
-            else -> select(iidPred.select(al, this, this@ScanCursor.schema, this@ScanCursor.args))
+            is MultiIidSelector -> select(iidPred.select(al, this, path).toSelection())
+            else -> select(iidPred.select(this).toSelection())
         }
 
     private val bufferedRels: Queue<RelationReader> = LinkedList()
@@ -81,7 +79,7 @@ class ScanCursor(
 
                 bitemporalConsumer.build()
                     .map { childRel ->
-                        colPreds.fold(childRel) { acc, colPred -> acc.select(colPred.select(al, acc, schema, args)) }
+                        colPreds.fold(childRel) { acc, colPred -> acc.select(colPred.select(acc).toSelection()) }
                     }
                     .filter { it.rowCount > 0 }
                     .safeMap { it.openSlice(al) }
@@ -109,8 +107,7 @@ class ScanCursor(
     }
 
     override fun close() {
-        bufferedRels.apply { closeAll(); clear() }
+        (bufferedRels + ownedSegments + colPreds.values).closeAll()
         bufferedRels.clear()
-        ownedSegments.closeAll()
     }
 }

@@ -19,12 +19,55 @@ async fn open(config: AuthConfig) -> Arc<Authenticator> {
 
 #[test]
 fn routing_preserves_unknown_address_rejection_before_a_looser_rule() {
-    let rules = vec![MethodRule { method: Method::Password, user: Some("alice".into()), remote_address: Some("127.0.0.1".into()) }, MethodRule::any(Method::Trust)];
+    let rules = vec![MethodRule { method: Method::Password, user: Some("alice".into()), remote_address: Some(AddressBlock::parse("127.0.0.1").unwrap()) }, MethodRule::any(Method::Trust)];
     assert_eq!(method_for(&rules, Some("alice"), None), None);
     assert_eq!(method_for(&rules, Some("bob"), None), Some(Method::Trust));
     assert_eq!(method_for(&rules, Some("alice"), Some("127.0.0.1")), Some(Method::Password));
     assert_eq!(method_for(&rules, Some("alice"), Some("192.0.2.1")), Some(Method::Trust));
     assert_eq!(method_for(&[], None, None), None);
+}
+
+fn rule(method: Method, address: &str) -> MethodRule { MethodRule { method, user: None, remote_address: Some(AddressBlock::parse(address).unwrap()) } }
+
+#[test]
+fn a_rule_naming_a_cidr_block_matches_every_caller_inside_it() {
+    let rules = [rule(Method::Trust, "10.0.0.0/8"), rule(Method::Trust, "172.16.0.0/12"), MethodRule::any(Method::Password)];
+    assert_eq!(method_for(&rules, Some("alice"), Some("10.1.2.3")), Some(Method::Trust));
+    assert_eq!(method_for(&rules, Some("alice"), Some("11.0.0.1")), Some(Method::Password));
+    assert_eq!(method_for(&rules, Some("alice"), Some("172.31.255.255")), Some(Method::Trust));
+    assert_eq!(method_for(&rules, Some("alice"), Some("172.32.0.0")), Some(Method::Password));
+    assert_eq!(method_for(&[rule(Method::Trust, "0.0.0.0/0"), MethodRule::any(Method::Password)], None, Some("203.0.113.9")), Some(Method::Trust));
+}
+
+#[test]
+fn ipv6_rules_match_the_callers_address_whichever_form_either_is_written_in() {
+    let fallback = MethodRule::any(Method::Password);
+    for (address, caller) in [("::1", "0:0:0:0:0:0:0:1"), ("0:0:0:0:0:0:0:1", "::1"), ("2001:db8::/32", "2001:0db8:ffff::1"), ("fe80::/10", "febf::1")] {
+        assert_eq!(method_for(&[rule(Method::Trust, address), fallback.clone()], None, Some(caller)), Some(Method::Trust), "{address} against {caller}");
+    }
+    assert_eq!(method_for(&[rule(Method::Trust, "2001:db8::/32"), fallback.clone()], None, Some("2001:db9::1")), Some(Method::Password));
+}
+
+#[test]
+fn an_ipv4_rule_matches_an_ipv4_mapped_caller_and_never_another_ipv6_one() {
+    let rules = [rule(Method::Trust, "10.0.0.0/8"), MethodRule::any(Method::Password)];
+    assert_eq!(method_for(&rules, None, Some("::ffff:10.1.2.3")), Some(Method::Trust));
+    assert_eq!(method_for(&rules, None, Some("::a01:203")), Some(Method::Password));
+    assert_eq!(method_for(&[rule(Method::Trust, "::ffff:10.0.0.0/8"), MethodRule::any(Method::Password)], None, Some("10.1.2.3")), Some(Method::Trust));
+}
+
+#[test]
+fn a_caller_address_that_is_not_an_ip_literal_stops_at_the_first_address_rule() {
+    let rules = [rule(Method::Password, "10.0.0.0/8"), MethodRule::any(Method::Trust)];
+    assert_eq!(method_for(&rules, None, Some("localhost")), None);
+}
+
+#[test]
+fn a_malformed_remote_address_is_rejected_rather_than_never_matching() {
+    for address in ["10.0.0.0/33", "::/129", "10.0.0.0/-0", "10.0.0.0/+8", "10.0.0.0/", "10.0.0/8", "fe80::1%eth0", "localhost", "x:1", "::ffff:0:0/96", ""] {
+        let error = AddressBlock::parse(address).unwrap_err();
+        assert_eq!(error.code, "xtdb.authn/invalid-remote-address", "{address}");
+    }
 }
 
 #[tokio::test]

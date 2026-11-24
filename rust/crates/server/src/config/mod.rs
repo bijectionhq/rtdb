@@ -300,13 +300,12 @@ fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>)
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "compactor")?;
     let default_threads = environment("XTDB_COMPACTOR_THREADS").and_then(|value| value.parse::<i32>().ok()).unwrap_or_else(|| (std::thread::available_parallelism().map_or(1, usize::from) / 2).max(1) as i32);
     let threads = fields.integer("threads")?.unwrap_or(default_threads).max(0) as usize;
-    let run_end_encoded_iids = fields.boolean("reeIids")?.unwrap_or_else(|| env_boolean(environment, "XTDB_REE_IIDS"));
-    let within_file_recency_branching = fields.boolean("withinFileRecencyBranching")?.unwrap_or_else(|| env_boolean(environment, "XTDB_WITHIN_FILE_RECENCY_BRANCHING"));
+    let opt_in_221 = fields.boolean("optIn221")?.unwrap_or_else(|| env_boolean(environment, "XTDB_COMPACTOR_221_OPT_IN"));
     let scan_tie_order_from_naming_epoch = fields.integer("scanTieOrderFromNamingEpoch")?
         .map(|epoch| u64::try_from(epoch).ok().and_then(std::num::NonZeroU64::new)
             .ok_or_else(|| invalid("compactor.scanTieOrderFromNamingEpoch must be positive"))).transpose()?;
     fields.finish()?;
-    Ok(CompactorSettings { threads, run_end_encoded_iids, within_file_recency_branching, scan_tie_order_from_naming_epoch })
+    Ok(CompactorSettings { threads, run_end_encoded_iids: opt_in_221, within_file_recency_branching: opt_in_221, scan_tie_order_from_naming_epoch })
 }
 fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;
