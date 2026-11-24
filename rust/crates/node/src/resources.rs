@@ -238,6 +238,7 @@ pub struct NativeResources {
     pub(crate) classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
     token_kms: Option<Arc<dyn rtdb_crypt::Kms>>,
     native_checkpoint_kms: Option<Arc<dyn rtdb_crypt::Kms>>,
+    local_checkpoint_vault: Option<PathBuf>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
@@ -248,7 +249,7 @@ pub struct NativeResources {
 impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
-            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, io: IoRegion::new(),
+            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, local_checkpoint_vault: None, io: IoRegion::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false,
             serving_authorities: BTreeMap::new() }
     }
@@ -262,6 +263,13 @@ impl NativeResources {
     }
     pub fn with_native_checkpoint_kms(mut self, kms: Arc<dyn rtdb_crypt::Kms>) -> Self {
         self.native_checkpoint_kms = Some(kms);
+        self.local_checkpoint_vault = None;
+        self
+    }
+    /// Uses the original filesystem generation authority for a freshly sealed Local residence.
+    pub fn with_local_checkpoint_kms(mut self, kms: rtdb_crypt::FileKms) -> Self {
+        self.local_checkpoint_vault = Some(kms.vault_path().to_owned());
+        self.native_checkpoint_kms = Some(Arc::new(kms));
         self
     }
     /// Installs the same durable database incarnation and claim authority on each replica.
@@ -417,7 +425,23 @@ impl ResourceFactory for NativeResources {
 
     async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> {
         self.validate(name, configuration)?;
-        let io = self.io.child();
+        let local_erasure_vault = self.local_checkpoint_vault.as_deref().filter(|_| {
+            name == "xtdb" && self.classic_vault.is_some() && configuration.external_source.is_none()
+        });
+        let residence = match (&configuration.storage, &configuration.log) {
+            (Some(database_config::Storage::LocalStorage(storage)), Some(database_config::Log::LocalLog(_)))
+                if configuration.mode.unwrap_or(0) != 1 || local_erasure_vault.is_some() =>
+            {
+                let path = PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?);
+                let exclusive = local_erasure_vault.is_some();
+                Some(Arc::new(self.io.run_blocking(move || {
+                    std::fs::create_dir_all(&path).map_err(|error| rtdb_storage::Error::Task(error.to_string()))?;
+                    rtdb_storage::sealing::open_local_residence(&path, exclusive)
+                }).await?) as Arc<dyn Send + Sync>)
+            }
+            _ => None,
+        };
+        let io = self.io.child_holding(residence);
         let opened = async {
             let epoch = match &configuration.storage {
                 Some(database_config::Storage::InMemoryStorage(storage)) => storage.epoch,
@@ -440,14 +464,24 @@ impl ResourceFactory for NativeResources {
                     let store = if let Some(database_config::Log::LocalLog(log)) = &configuration.log {
                         store.with_catalog_ledger(StorageEpoch(log.epoch.unwrap_or_default()))
                     } else { store };
-                    let store: Arc<dyn ObjectStore> = Arc::new(store);
                     if let Some(vault) = &self.classic_vault {
                         vault.require_separate_path(&payload)?;
-                        let keys = vault.units(store.as_ref(), Arc::clone(&io), allow_enrollment).await?;
-                        Arc::new(rtdb_storage::sealing::ClassicKeyVault::wrap(store, keys)?)
+                        let residence = match (local_erasure_vault, &configuration.log) {
+                            (Some(checkpoint), Some(database_config::Log::LocalLog(log))) if epoch == 0 => {
+                                let journal = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
+                                std::fs::create_dir_all(&journal).map_err(|error| rtdb_storage::Error::Task(error.to_string()))?;
+                                vault.require_separate_path(&journal)?;
+                                Some(rtdb_storage::sealing::LocalErasureResidence::open(
+                                    store.root(), &journal, checkpoint, log.epoch.unwrap_or_default(),
+                                )?)
+                            }
+                            _ => None,
+                        };
+                        let keys = vault.local_units(&store, Arc::clone(&io), allow_enrollment, residence).await?;
+                        Arc::new(rtdb_storage::sealing::ClassicKeyVault::wrap(Arc::new(store), keys)?)
                     } else {
-                        rtdb_storage::sealing::ClassicKeyVault::require_unenrolled(store.as_ref()).await?;
-                        store
+                        rtdb_storage::sealing::ClassicKeyVault::require_unenrolled(&store).await?;
+                        Arc::new(store)
                     }
                 }
                 Some(database_config::Storage::RemoteStorage(storage)) => {
@@ -519,7 +553,7 @@ impl NativeResources {
             }
             Some(database_config::Log::LocalLog(log)) => {
                 let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
-                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io), false)?;
+                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io), storage.store.local_erasure_custody().is_some())?;
                 let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(io), bind_lineage)?;
                 let epoch = StorageEpoch(log.epoch.unwrap_or(0));
                 Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition,

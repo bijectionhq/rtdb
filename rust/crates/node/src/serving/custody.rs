@@ -318,6 +318,7 @@ mod tests {
         assert!(contributors.is_none());
         check_delivery(state.index(), &vault, &groups).await.unwrap();
         let page = || ChangePage {
+            read_custody: None,
             groups: vec![ChangeGroup {
                 cut: row.cut,
                 rows: vec![ChangeRow {

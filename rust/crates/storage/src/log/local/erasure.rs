@@ -91,6 +91,15 @@ impl LocalLog {
 
 #[async_trait]
 impl CheckpointKeyRetirement for LocalLog {
+    async fn settled_local_checkpoint_prefix(&self) -> rtdb_types::Result<Option<(CheckpointPrefix, LogOffset)>> {
+        let keys = self.keys.clone().ok_or_else(invalid)?;
+        Ok(self.reads.run_blocking(move || keys.with_local_prefix_retirement(|path| {
+            let Some(intent) = read_intent(path)? else { return Ok(None); };
+            if intent.settled != intent.before { return Err(invalid()); }
+            Ok(Some((intent.retirement, LogOffset(intent.before as i64))))
+        })).await?)
+    }
+
     async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<()> {
         Ok(self.validate_erasure_prefix(cut).await?)
     }

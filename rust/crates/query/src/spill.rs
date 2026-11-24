@@ -38,6 +38,7 @@ impl SpillRegion {
         Ok(())
     }
     pub fn create(self: &Arc<Self>) -> Result<SpillWriter> {
+        if self.limit == 0 { return Err(invalid("spill-limit", "Query spilling is disabled")); }
         let (file, path) = NamedTempFile::new_in(self.directory()?).map_err(io_error)?.into_parts();
         Ok(SpillWriter { file: BufWriter::new(file), position: 0, retained: Arc::new(SpillFile { path, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
     }

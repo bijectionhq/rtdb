@@ -107,6 +107,7 @@ impl ServingScope {
             _ => upper.max(after),
         };
         Ok(ChangePage {
+            read_custody: None,
             groups,
             through: Basis::new(head.incarnation(), through),
             complete: !more && until.is_none_or(|until| until <= head.position()),

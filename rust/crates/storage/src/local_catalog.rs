@@ -121,6 +121,20 @@ impl LocalCatalogLedger {
         Ok(self.held_catalogs()?.iter().all(|hold| !hold.retains(cut, None)))
     }
 
+    pub(crate) fn require_erasure_admission(&self, cut: Option<CatalogCut>) -> Result<()> {
+        let _gate = self.lock()?;
+        if self.floor()?.is_some_and(|floor| !cut.is_some_and(|cut| covers(cut, floor))) {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view",
+                "The captured catalog precedes the Local erasure floor"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verifies_erasure_admission(&self, cut: CatalogCut) -> Result<bool> {
+        let _gate = self.lock()?;
+        Ok(self.covers_floor(cut)? && self.held_catalogs()?.iter().all(|hold| !hold.retains(cut, None)))
+    }
+
     fn covers_floor(&self, cut: CatalogCut) -> Result<bool> {
         if cut.replica_epoch != self.replica_epoch || !well_formed(cut)
             || cut.through.after_offset(cut.replica_epoch) < 0

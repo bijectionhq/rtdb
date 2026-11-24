@@ -517,7 +517,9 @@ impl BufferPool {
 
     /// Tries to cache an exact immutable object using only the shared pool's budget.
     pub async fn get_exact_cached_or(&self, key: &ObjectKey, length: usize, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
-        if length > self.budget.limit_bytes() { return self.get_exact_or(key, length, fallback).await; }
+        if !self.store.permits_shared_read_cache() || length > self.budget.limit_bytes() {
+            return self.get_exact_or(key, length, fallback).await;
+        }
         let mut cleanup = EmptyEntryCleanup { pool: self, key, armed: true };
         if let Ok(entry) = self.entry(key) {
             let mut slot = entry.allocation.lock().await;
@@ -730,6 +732,20 @@ mod view_tests {
     fn cache_view(pool: &BufferPool, name: &str, view: View, bytes: usize) -> bool {
         let Some(reservation) = pool.admit(bytes) else { return false };
         pool.insert_view(&key(name), view, Arc::new(Decoded { _reservation: reservation, readers: Arc::new(()) }))
+    }
+
+    #[tokio::test]
+    async fn an_exact_read_does_not_cache_decrypted_bytes_against_provider_policy() {
+        let sealed = crate::sealing::EncryptingStore::new(Arc::new(MemoryStore::default()), &[9; 32]).unwrap();
+        let name = key("test");
+        sealed.put(&name, Bytes::from_static(b"sealed")).await.unwrap();
+        let pool = BufferPool::new(Arc::new(sealed), 1 << 20);
+        let memory = MemoryBudget::new(1 << 20);
+        let read = pool.get_exact_cached_or(&name, 6, &memory).await.unwrap();
+        assert_eq!(read.as_slice(), b"sealed");
+        assert!(!pool.holds(&name));
+        drop(read);
+        assert_eq!(pool.pool_retained_bytes(), 0);
     }
 
     #[tokio::test]

@@ -22,6 +22,10 @@ enum Input {
 struct Inspection { database: Arc<Database>, memory: Arc<MemoryBudget>, input: Input }
 
 pub(crate) async fn open(database: Arc<Database>, request: InspectionRequest, memory: Arc<MemoryBudget>) -> Result<Box<dyn CatalogInspection>> {
+    if database.object_store().local_erasure_custody().is_some() {
+        return Err(Anomaly::unsupported("rtdb/erasure-inspection",
+            "An enrolled Local erasure residence serves data through its captured catalog"));
+    }
     let input = match request {
         InspectionRequest::SourceLog { from, to, tx_ops } => Input::Log { range: database.logs.source_range(SourcePosition(from), SourcePosition(to)).await?, source: true, tx_ops },
         InspectionRequest::ReplicaLog { from, to } => Input::Log { range: database.logs.replica_range(ReplicaPosition(from), ReplicaPosition(to)).await?, source: false, tx_ops: false },

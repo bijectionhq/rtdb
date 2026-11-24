@@ -1325,6 +1325,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             ));
         }
         Ok(ChangePage {
+            read_custody: None,
             groups: vec![ChangeGroup {
                 cut,
                 rows: vec![ChangeRow {

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
 use rtdb_index::branches::BranchIndex;
-use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
+use rtdb_replication::{NATIVE_READ_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
 use tokio_util::sync::CancellationToken;
@@ -20,11 +20,13 @@ pub(crate) struct DefaultServing {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) tokens: Arc<crate::database::tokens::DatabaseTokens>,
     pub(crate) writable: bool,
+    pub(crate) write_features: Vec<&'static str>,
 }
 
 impl DefaultServing {
     async fn open_change_page(&self, view: &NativeServingView, mut page: ChangePage) -> Result<ChangePage> {
         page.key_generation = view.key_generation;
+        page.read_custody = view.read_custody.clone();
         if !view.index.has_custody_groups() {
             return Ok(page);
         }
@@ -45,13 +47,14 @@ impl ServingDriver for DefaultServing {
             return &["query", "query.linearizable", "sql.history", "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance"];
         }
         if !self.handle.is_compatible() { return &[]; }
-        if self.writable { NATIVE_WRITE_FEATURES } else { NATIVE_READ_FEATURES }
+        if self.writable { &self.write_features } else { NATIVE_READ_FEATURES }
     }
 
     async fn query(
         &self, source: QuerySource, track: bool, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
         if self.handle.has_classic_read() {
+            if self.handle.has_local_erasure_fence() { return Err(rtdb_crypt::erased_under_view()); }
             if source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || source.layer != Layer::Merged || track {
                 return Err(Anomaly::unsupported("rtdb/classic-query-scope", "The Classic catalog only serves untracked queries on merged main"));
             }
@@ -72,10 +75,18 @@ impl ServingDriver for DefaultServing {
         };
         let cut = branch.cut();
         let key_generation = snapshot.key_generation;
+        let snapshot_read_custody = snapshot.read_custody.clone();
         let (snapshot, custody_groups, custody_contributors) = if snapshot.index.has_custody_groups() {
             let vault = self.tokens.authority().await?.custody_vault();
             super::custody::snapshot(&branch, &self.memory, &vault).await?
         } else { (rtdb_query::branch_snapshot(&branch, &self.memory)?, BTreeSet::new(), Some(BTreeSet::new())) };
+        let snapshot = match snapshot_read_custody {
+            Some(custody) => {
+                let deadline = custody.deadline();
+                snapshot.with_read_custody(custody, deadline)
+            }
+            None => snapshot,
+        };
         Ok(QueryView { snapshot, cut, claim, custody_groups, custody_contributors, key_generation })
     }
 
@@ -104,11 +115,11 @@ impl ServingDriver for DefaultServing {
             let vault = self.tokens.authority().await?.custody_vault();
             super::custody::check_delivery(&index, &vault, groups).await?;
         }
-        self.handle.authority().check_checkpoint_generation(generation).await
+        self.handle.check_read_generation(generation).await
     }
 
     async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
-        if self.handle.has_classic_read() { return Err(super::custody_release::release_unavailable()); }
+        if self.handle.has_classic_read() || self.handle.has_local_erasure_fence() { return Err(super::custody_release::release_unavailable()); }
         Ok(self.handle.view(At::Linearizable, cancellation).await?.index)
     }
 
@@ -117,7 +128,7 @@ impl ServingDriver for DefaultServing {
     }
 
     async fn submit_custody_release(&self, command: TrustedCustodyCommand, cancellation: &CancellationToken) -> Result<Receipt> {
-        if !self.writable || self.handle.has_classic_read() { return Err(super::custody_release::release_unavailable()); }
+        if !self.writable || self.handle.has_classic_read() || self.handle.has_local_erasure_fence() { return Err(super::custody_release::release_unavailable()); }
         self.handle.submit_custody_release(command, cancellation).await
     }
 
@@ -130,7 +141,7 @@ impl ServingDriver for DefaultServing {
         let index = self.current_custody(cancellation).await?;
         super::custody_release::check_release_cut(&index, writer, groups, self.clock.now())?;
         if let Some(generation) = generation {
-            self.handle.authority().check_checkpoint_generation(generation).await?;
+            self.handle.check_read_generation(generation).await?;
         }
         Ok(())
     }
@@ -163,6 +174,10 @@ impl ServingDriver for DefaultServing {
             match scope.query(&snapshot.index, source.clone(), now, &self.memory, vault.as_ref()).await {
                 Ok((mut view, raw)) => {
                     view.key_generation = snapshot.key_generation;
+                    if let Some(custody) = snapshot.read_custody.clone() {
+                        let deadline = custody.deadline();
+                        view.snapshot = view.snapshot.with_read_custody(custody, deadline);
+                    }
                     if track {
                         view.claim = Some(self.tokens.authority().await?.issuer().await?
                             .seal_scoped_claim(raw, &scope.labels).await?);
@@ -285,5 +300,5 @@ fn change_page(view: &NativeServingView, request: &Changes, after: Basis, now: T
         }
         Ok(ChangeGroup { cut: *cut, rows })
     }).collect::<Result<_>>()?;
-    Ok(ChangePage { groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new(), key_generation: None })
+    Ok(ChangePage { read_custody: None, groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new(), key_generation: None })
 }

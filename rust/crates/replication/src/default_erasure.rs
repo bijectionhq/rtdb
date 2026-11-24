@@ -22,6 +22,8 @@ use crate::{
 };
 
 mod inventory;
+mod local_read;
+pub use local_read::{LocalDefaultErasureReadFence, LocalErasureRead};
 mod terminal;
 
 pub(crate) use terminal::ErasureCompleted;

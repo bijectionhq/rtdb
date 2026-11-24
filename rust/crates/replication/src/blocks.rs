@@ -674,7 +674,13 @@ impl BlockStore {
             let trie = TrieKey::l0(index)?;
             let mut metadata = MetadataBuilder::new(false, false);
             let mut reservations = Vec::new();
-            let temporary = tempfile::NamedTempFile::new().map_err(io_error)?;
+            let private = self.store.local_erasure_custody().is_some();
+            if private && search.is_some() { return Err(crate::default_erasure::unsupported()); }
+            let named = if private { None } else { Some(tempfile::NamedTempFile::new().map_err(io_error)?) };
+            let temporary = match &named {
+                Some(file) => file.reopen(),
+                None => tempfile::tempfile(),
+            }.map_err(io_error)?;
             let mut writer = None;
             let pages = live.block_pages(&self.memory)?;
             write_node(live.trie().root(), &pages, &self.memory, &temporary, &mut writer, &mut metadata, &mut reservations, cancellation).await?;
@@ -684,11 +690,13 @@ impl BlockStore {
             let data_key = ObjectKey::new(entry.slug.data_key(&trie))?;
             let release_receipt_l0 = self.store.releases_receipt_l0() && table.stores_expiring_transaction_metadata()
                 && rtdb_format::keys::is_receipt_l0_file(data_key.as_str());
-            let data = if release_receipt_l0 {
-                self.store.put_file_with_publication(&data_key, temporary.path()).await?
-            } else {
-                self.store.put_file(&data_key, temporary.path()).await?;
-                None
+            let data = match &named {
+                None => self.store.put_private_file(&data_key, file, release_receipt_l0).await?,
+                Some(temporary) if release_receipt_l0 => self.store.put_file_with_publication(&data_key, temporary.path()).await?,
+                Some(temporary) => {
+                    self.store.put_file(&data_key, temporary.path()).await?;
+                    None
+                }
             };
             check_cancelled(cancellation)?;
             let _metadata_serialization = self.memory.reserve(metadata.serialization_bound()?)?;
@@ -703,7 +711,7 @@ impl BlockStore {
             };
             let artefacts = match (self.staged_table_artefacts(entry, index).await?, search) {
                 (Some(records), _) => records,
-                (None, Some(search)) => search.seal(prepared.value(), table, &trie, temporary.path(), size as u64, cancellation).await?,
+                (None, Some(search)) => search.seal(prepared.value(), table, &trie, named.as_ref().ok_or_else(crate::default_erasure::unsupported)?.path(), size as u64, cancellation).await?,
                 (None, None) => Vec::new(),
             };
             let mut notification = CatalogTrie::notification(trie, size, Some(summary))?;
@@ -778,7 +786,7 @@ impl BlockStore {
     }
 }
 
-fn write_node<'a>(node: &'a TrieNode, pages: &'a BlockPages<'a>, memory: &'a Arc<MemoryBudget>, temporary: &'a tempfile::NamedTempFile, writer: &'a mut Option<ArrowFileWriter>, metadata: &'a mut MetadataBuilder, retained: &'a mut Vec<Arc<MemoryReservation>>, cancellation: &'a CancellationToken) -> BoxFuture<'a, Result<usize>> {
+fn write_node<'a>(node: &'a TrieNode, pages: &'a BlockPages<'a>, memory: &'a Arc<MemoryBudget>, temporary: &'a std::fs::File, writer: &'a mut Option<ArrowFileWriter>, metadata: &'a mut MetadataBuilder, retained: &'a mut Vec<Arc<MemoryReservation>>, cancellation: &'a CancellationToken) -> BoxFuture<'a, Result<usize>> {
     Box::pin(async move {
     check_cancelled(cancellation)?;
     match node {
@@ -792,7 +800,7 @@ fn write_node<'a>(node: &'a TrieNode, pages: &'a BlockPages<'a>, memory: &'a Arc
         TrieNode::Leaf(leaf) => {
             let rows = leaf.sorted_rows(pages.live_table())?;
             let batch = pages.copy(&rows)?;
-            if writer.is_none() { *writer = Some(ArrowFileWriter::new_reserved(temporary.reopen().map_err(io_error)?, batch.batch().schema().as_ref(), memory)?); }
+            if writer.is_none() { *writer = Some(ArrowFileWriter::new_reserved(temporary.try_clone().map_err(io_error)?, batch.batch().schema().as_ref(), memory)?); }
             writer.as_mut().ok_or_else(|| invalid("Missing page writer"))?.write(batch.batch())?;
             let (node, metadata_charge) = metadata.write_leaf_reserved(batch.batch(), memory)?;
             retained.push(metadata_charge);

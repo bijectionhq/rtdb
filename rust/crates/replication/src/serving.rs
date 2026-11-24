@@ -7,7 +7,7 @@ use rtdb_format::journal::ObjectId;
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, log::proto};
 use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite}};
 use rtdb_tx::transact::{
-    COUNT_RANGE_CONSTRAINT, Decision, Erasure, GROUPED_COUNT_CONSTRAINT, InstalledReceipt, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, Resolution, ScopedTransact,
+    COUNT_RANGE_CONSTRAINT, Decision, Erasure, GROUPED_COUNT_CONSTRAINT, InstalledReceipt, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, PHYSICAL_ERASURE, Receipt, Resolution, ScopedTransact,
     TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState,
     TransactionRecord, TrustedCustodyCommand,
 };
@@ -144,6 +144,7 @@ pub struct NativeServingView {
     pub floor: Basis,
     pub changes: Arc<VecDeque<(BranchCut, Vec<BranchWrite>)>>,
     pub key_generation: Option<u64>,
+    pub read_custody: Option<Arc<crate::LocalErasureRead>>,
     compatible: bool,
     classic_head: Option<ReplicaPosition>,
 }
@@ -155,10 +156,21 @@ pub struct NativeServingHandle {
     pub(crate) authority: NativeServingAuthority,
     pub(crate) source_authority: Arc<SourceAuthority>,
     pub(crate) source_replies: Arc<SourceReplies>,
+    pub(crate) local_read_fence: Option<Arc<crate::LocalDefaultErasureReadFence>>,
 }
 
 impl NativeServingHandle {
     pub fn authority(&self) -> &NativeServingAuthority { &self.authority }
+    pub fn has_local_erasure_fence(&self) -> bool { self.local_read_fence.is_some() }
+
+    pub async fn check_read_generation(&self, generation: u64) -> Result<()> {
+        let _admission = match &self.local_read_fence {
+            Some(fence) => Some(fence.admit(generation).await?),
+            None => None,
+        };
+        self.authority.check_checkpoint_generation(generation).await
+    }
+
     pub fn is_compatible(&self) -> bool { self.view.borrow().compatible }
 
     pub fn has_classic_read(&self) -> bool {
@@ -219,8 +231,12 @@ impl NativeServingHandle {
             cancellation.run_until_cancelled(view.wait_for(|applied| !applied.compatible || applied.index.head().basis >= basis))
                 .await.ok_or_else(interrupted)?.map_err(|_| unavailable())?;
         }
-        let snapshot = view.borrow().clone();
+        let mut snapshot = view.borrow().clone();
         if !snapshot.compatible { return Err(incompatible()); }
+        if let Some(fence) = &self.local_read_fence {
+            let generation = snapshot.key_generation.ok_or_else(default_erasure::unsupported)?;
+            snapshot.read_custody = Some(fence.admit(generation).await?);
+        }
         Ok(snapshot)
     }
 
@@ -240,7 +256,7 @@ impl NativeServingHandle {
             self.replication.serving_barrier(cancellation).await?;
             return self.replication.serving_validate(request, cancellation).await;
         }
-        if let Err(error) = request.check_source_admission() {
+        if let Err(error) = request.check_source_admission(self.has_local_erasure_fence()) {
             if !request.transaction.uses_erasure()
                 && let Some(fingerprint) = request.transaction.custody_request_digest
             {
@@ -295,8 +311,8 @@ impl<C> NativeRequest<C> {
         self.transaction.ops.is_empty() && self.transaction.otherwise.is_empty()
     }
 
-    fn check_source_admission(&self) -> Result<()> {
-        if self.transaction.uses_erasure() {
+    fn check_source_admission(&self, physical_erasure: bool) -> Result<()> {
+        if self.transaction.uses_erasure() && (!physical_erasure || self.scope.is_some()) {
             return Err(Anomaly::unsupported("rtdb/erasure-required", "Default erasure needs ordered retirement of the source and replica keys"));
         }
         let features = if self.scope.is_some() { SCOPED_FEATURES } else { NATIVE_WRITE_FEATURES };
@@ -334,6 +350,7 @@ pub(crate) struct NativeServing {
     pending: BTreeMap<u64, proto::NoOp>,
     timed_source: Option<SourcePosition>,
     erasure_in_flight: bool,
+    pub(crate) physical_erasure: bool,
     pending_replies: usize,
     shares_main: bool,
     classic_charges: Vec<Arc<MemoryReservation>>,
@@ -452,13 +469,14 @@ impl NativeServing {
             index: fold.index().clone(),
             floor: fold.index().head().basis,
             key_generation,
+            read_custody: None,
             changes: Arc::default(), compatible: true, classic_head: None,
         });
         let source_authority = Arc::new(SourceAuthority::new(store, authority.incarnation));
         Ok((Self {
             authority, fold: Some(fold), position, pipeline: None,
             collect_checkpoints, writer: None, pending: BTreeMap::new(),
-            timed_source: None, erasure_in_flight: false, pending_replies: 0,
+            timed_source: None, erasure_in_flight: false, physical_erasure: false, pending_replies: 0,
             shares_main: shared_checkpoint || position == 0, classic_charges: Vec::new(),
             view, source_authority, source_replies: Arc::default(),
         }, receiver))
@@ -551,7 +569,7 @@ impl NativeServing {
             Err(error) => return self.source_reply(source, Err(error)),
         };
         if request.is_validation() { return self.source_reply(source, Err(invalid_source_request())); }
-        if let Err(error) = request.check_source_admission() { return self.source_reply(source, Err(error)); }
+        if let Err(error) = request.check_source_admission(self.physical_erasure && self.shares_main) { return self.source_reply(source, Err(error)); }
         if self.request_pending(&request) { return Err(invalid()); }
         if self.pipeline.is_none() {
             let next = self.next_position()?;
@@ -561,6 +579,13 @@ impl NativeServing {
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
         let scope = request.scope.as_ref().map(NativeServingScope::authority);
         let features = if scope.is_some() { SCOPED_FEATURES } else { NATIVE_WRITE_FEATURES };
+        let erasure_features;
+        let features: &[&str] = if request.transaction.uses_erasure() {
+            erasure_features = [features, &[PHYSICAL_ERASURE]].concat();
+            &erasure_features
+        } else {
+            features
+        };
         let decision = pipeline.decide_after(&request.transaction, now, features, &request.claims, scope, time_floor);
         match decision {
             Ok(Decision::Answer(receipt)) => self.source_reply(source, Ok(receipt)),

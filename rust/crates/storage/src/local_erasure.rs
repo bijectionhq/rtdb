@@ -95,6 +95,19 @@ impl LocalStore {
             .await?)
     }
 
+    /// Covers the already completed inventory selected by this residence's exact recovery floor.
+    pub async fn completed_erasure_recovery(&self) -> Result<Option<LocalErasureRecovery>> {
+        let Some(fence) = self.erasure_recovery_fence().await? else { return Ok(None); };
+        let path = self.object_progress_path(fence);
+        Ok(self.io_region().run_blocking(move || {
+            let Some(progress) = read_progress(&path)? else { return Ok(None); };
+            if progress.fence != fence || progress.settled != progress.count || fence.inventory_sha256.is_none() {
+                return Err(invalid());
+            }
+            Ok(Some(fence))
+        }).await?)
+    }
+
     fn object_progress_path(&self, fence: LocalErasureRecovery) -> std::path::PathBuf {
         self.root().join(format!(
             ".tmp/catalog-ledger/erasure-objects-{}",
@@ -244,12 +257,7 @@ fn read_object_progress(
     count: usize,
     names_sha256: [u8; 32],
 ) -> crate::Result<Option<ObjectProgress>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::io(path, error)),
-    };
-    let progress: ObjectProgress = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let Some(progress) = read_progress(path)? else { return Ok(None); };
     if progress.fence != fence
         || progress.count != count
         || progress.names_sha256 != names_sha256
@@ -259,6 +267,15 @@ fn read_object_progress(
     }
     Ok(Some(progress))
 }
+
+fn read_progress(path: &Path) -> crate::Result<Option<ObjectProgress>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::io(path, error)),
+        };
+        Ok(Some(serde_json::from_slice(&bytes).map_err(|_| invalid())?))
+    }
 
 fn write_synced(path: &Path, value: &impl Serialize) -> crate::Result<()> {
     let dir = path.parent().ok_or_else(invalid)?;

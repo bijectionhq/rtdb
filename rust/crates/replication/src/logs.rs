@@ -134,6 +134,9 @@ impl PartitionLogs {
         self.placed_transfer().is_some_and(|transfer| transfer.after < offset && offset <= transfer.through)
     }
 
+    pub(crate) fn source_journal_lineage(&self) -> Option<uuid::Uuid> { self.source.journal_lineage() }
+    pub(crate) fn replica_journal_lineage(&self) -> Option<uuid::Uuid> { self.replica.journal_lineage() }
+
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
     pub fn install_replica_reference_source(
         &self, checkpoint: Option<rtdb_format::catalog::BlockCatalog>, file_size_target: i64,

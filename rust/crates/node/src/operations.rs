@@ -119,6 +119,10 @@ impl Node {
     async fn prepare_reset(&self, database: &str, export: Option<&Path>, cancellation: &CancellationToken) -> Result<CompactorReset> {
         self.require_compactor_reset()?;
         let database = self.catalog().database(database)?;
+        if database.object_store().local_erasure_custody().is_some() {
+            return Err(Anomaly::unsupported("rtdb.compactor-reset/custody",
+                "The enrolled Local erasure residence retains its original publication authority"));
+        }
         database.require_writable()?;
         let source = cancellation.run_until_cancelled(database.flush()).await.ok_or_else(reset_cancelled)??;
         tokio::time::timeout(Duration::from_secs(300), database.replication.await_source(source, cancellation)).await
@@ -174,6 +178,12 @@ impl Node {
     pub async fn snapshot_export(&self, database: &str, now: Timestamp) -> Result<Option<SnapshotExport>> {
         self.require_offline_export()?;
         let database = self.catalog().database(database)?;
+        if database.object_store().local_classic_key_slots().is_some()
+            || database.native_serving_authority.as_ref().is_some_and(|authority| authority.checkpoints.is_some())
+        {
+            return Err(Anomaly::unsupported("rtdb.export/custody-binding",
+                "Snapshot export requires an independently admitted destination for sealed state"));
+        }
         let value = database.partition.value();
         let Some(captured) = value.table_catalog().block() else { return Ok(None); };
         let block_index = captured.block_index();

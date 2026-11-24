@@ -545,6 +545,7 @@ pub struct ReplicationDriver {
     serving: Option<NativeServing>,
     default_erasure: Option<DefaultErasure>,
     default_erasure_read_fence: Option<Arc<dyn crate::DefaultErasureReadFence>>,
+    local_erasure_read_fence: Option<Arc<crate::LocalDefaultErasureReadFence>>,
     default_erasure_grant_micros: Option<u64>,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     compaction_replay_cutoff: Option<ReplicaPosition>,
@@ -633,6 +634,7 @@ impl ReplicationDriver {
         }
         let store = Arc::clone(self.resolve.storage.object_store());
         let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_ref(), collect_checkpoints)?;
+        serving.physical_erasure = self.local_erasure_read_fence.is_some();
         if let Some(block) = &block { serving.verify_checkpoint_prefix(block)?; }
         serving.recover_classic(self.partition.snapshot(), block.as_ref().and_then(|block| block.boundary_replica_position()),
             &self.resolve.storage, &self.resolve.memory, &self.cancellation,
@@ -648,7 +650,8 @@ impl ReplicationDriver {
         let source_authority = Arc::clone(&serving.source_authority);
         let source_replies = Arc::clone(&serving.source_replies);
         self.serving = Some(serving);
-        Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies })
+        Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies,
+            local_read_fence: self.local_erasure_read_fence.clone() })
     }
 
     async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>, replica: ReplicaPosition) -> Result<()> {
@@ -1956,6 +1959,11 @@ impl ReplicationDriver {
     }
 
     async fn admit_serving_source(&mut self, position: SourcePosition, request: Result<SourceRequest>) -> Result<()> {
+        let request = match request {
+            Ok(request) if request.transaction.uses_erasure() && !self.effects.secondary_databases()?.is_empty() =>
+                Err(default_erasure::unsupported()),
+            request => request,
+        };
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
         let request = match request {

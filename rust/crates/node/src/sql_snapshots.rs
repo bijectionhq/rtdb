@@ -106,7 +106,12 @@ impl SqlSnapshots {
         let bytes = view.retained_bytes()?.checked_add(owner.as_ref().map_or(0, |owner| owner.len()) + 256)
             .and_then(|bytes| bytes.checked_add(token.len())).ok_or_else(unretained)?;
         let charge = memory.reserve(bytes)?;
-        let expires = tokio::time::Instant::now() + HOLD_FOR;
+        let mut expires = tokio::time::Instant::now() + HOLD_FOR;
+        if let Some(cutoff) = view.catalog.read_lease().and_then(|lease| lease.provider_cutoff())
+            && view.catalog.database(view.database())?.storage.object_store().local_erasure_custody().is_some()
+        {
+            expires = expires.min(cutoff.into());
+        }
         let view = with_expiry(view, expires.into_std());
         let entry = Arc::new(SqlSnapshot { owner, view, expires, _charge: charge });
         let evicted = {
@@ -130,17 +135,7 @@ impl SqlSnapshots {
                 }
                 let Some(registry) = registry.upgrade() else { break; };
                 let now = tokio::time::Instant::now();
-                loop {
-                    let entry = {
-                        let mut entries = registry.entries.lock();
-                        if entries.front().is_some_and(|(_, entry)| entry.expires <= now) {
-                            entries.pop_front()
-                        } else {
-                            None
-                        }
-                    };
-                    if entry.is_none() { break; }
-                }
+                registry.entries.lock().retain(|(_, entry)| entry.expires > now);
             }
         });
     }

@@ -140,6 +140,7 @@ impl KafkaFrameKeys {
         let keys = ClassicObjectKeys {
             path: Arc::clone(&self.0.path),
             region: Arc::clone(&self.0.region),
+            erasure: None,
         };
         self.0
             .region

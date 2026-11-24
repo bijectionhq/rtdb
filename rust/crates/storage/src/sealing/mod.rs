@@ -5,9 +5,9 @@ mod classic;
 mod delivery;
 mod publication;
 pub use publication::{PublicationSealing, PUBLICATION_ID_BYTES};
-pub use delivery::{DeliveryDeadline, DeliveryIo, current_delivery_deadline, PlaintextDelivery, PlaintextDependencies, PlaintextReleaseCheck, PlaintextScopes, PlaintextView, RootRankAuthority, RootRankSelection, drain_unit_delivery};
+pub use delivery::{DeliveryDeadline, DeliveryIo, current_delivery_deadline, PlaintextDelivery, PlaintextDependencies, PlaintextReleaseCheck, PlaintextScopes, PlaintextView, RootRankAuthority, RootRankSelection, drain_unit_delivery, PLAINTEXT_DELIVERY_WINDOW};
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
-pub use classic::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD, KafkaFrameKeys, KafkaPrefixRetirement};
+pub use classic::{ClassicKeyVault, ClassicObjectKeys, LocalErasureCustody, LocalErasureResidence, open_local_residence, KAFKA_LOG_SEAL_OVERHEAD, KafkaFrameKeys, KafkaPrefixRetirement};
 
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
 
@@ -171,6 +171,7 @@ pub struct EncryptingStore {
     published: Option<PublicationSealing>,
     classic_control: Option<ObjectKey>,
     classic_catalog_vault: Option<Arc<std::path::Path>>,
+    local_erasure_custody: Option<Arc<LocalErasureCustody>>,
 }
 
 enum ObjectKeys {
@@ -186,6 +187,7 @@ impl EncryptingStore {
             published: None,
             classic_control: None,
             classic_catalog_vault: None,
+            local_erasure_custody: None,
         })
     }
 
@@ -199,6 +201,7 @@ impl EncryptingStore {
             published: None,
             classic_control: None,
             classic_catalog_vault: None,
+            local_erasure_custody: None,
         })
     }
 
@@ -209,6 +212,7 @@ impl EncryptingStore {
             published: None,
             classic_control: None,
             classic_catalog_vault: None,
+            local_erasure_custody: None,
         }
     }
 
@@ -235,6 +239,11 @@ impl EncryptingStore {
         let body = stored.size.checked_sub(overhead).ok_or_else(|| Error::ConflictingObject(stored.key.to_string()))?;
         Ok(StoredObject { size: object::plaintext_size(&stored.key, body)?, ..stored })
     }
+    fn with_local_erasure_custody(mut self, custody: Option<Arc<LocalErasureCustody>>) -> Self {
+        self.local_erasure_custody = custody;
+        self
+    }
+
     fn with_classic_control(mut self, marker: ObjectKey, vault: Arc<std::path::Path>) -> Self {
         self.classic_control = Some(marker);
         self.classic_catalog_vault = Some(vault);
@@ -305,11 +314,16 @@ impl EncryptingStore {
     async fn put_framed_file(
         &self, key: &ObjectKey, source: &Path, with_publication: bool,
     ) -> crate::Result<Option<rtdb_types::PhysicalObjectPublication>> {
-        use object::PreparedFile;
-
         let source = source.to_path_buf();
         let file = tokio::task::spawn_blocking(move || object::prepare_file(source))
             .await.map_err(|error| Error::Task(error.to_string()))??;
+        self.put_prepared_file(key, file, with_publication).await
+    }
+
+    async fn put_prepared_file(&self, key: &ObjectKey, file: object::PreparedFile, with_publication: bool)
+        -> crate::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        use object::PreparedFile;
+
         let file = match file {
             PreparedFile::Framed(file) => file,
             PreparedFile::Buffered(body) => {
@@ -421,6 +435,35 @@ impl ObjectStore for EncryptingStore {
         } else {
             None
         }
+    }
+
+    async fn require_erasure_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<()> {
+        if self.local_erasure_custody.is_some() {
+            let local = self.inner.local_maintenance_store().ok_or_else(|| Anomaly::unsupported(
+                "rtdb.storage/erasure-catalog", "The original Local catalog is unavailable"))?;
+            local.require_erasure_catalog(cut).await?;
+        }
+        Ok(())
+    }
+
+    async fn catalog_delivery_lease(&self) -> Result<Option<Arc<crate::ReadLease>>> {
+        if self.local_erasure_custody.is_some() {
+            return Ok(Some(Arc::new(crate::ReadLease::until(
+                std::time::Instant::now() + PLAINTEXT_DELIVERY_WINDOW,
+            ))));
+        }
+        Ok(None)
+    }
+
+    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> crate::Result<()> {
+        if self.local_erasure_custody.is_some() {
+            return Err(Error::Closed("An enrolled Local erasure residence cannot copy payloads to a separate custody".into()));
+        }
+        self.put(destination, self.get(source).await?).await
+    }
+
+    fn local_erasure_custody(&self) -> Option<&Arc<LocalErasureCustody>> {
+        self.local_erasure_custody.as_ref()
     }
 
     fn local_classic_key_slots(&self) -> Option<&dyn ObjectCipher> {
@@ -777,6 +820,16 @@ impl ObjectStore for EncryptingStore {
             .map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;
         self.put(key, Bytes::from(bytes)).await
     }
+    async fn put_private_file(
+        &self, key: &ObjectKey, source: std::fs::File, with_publication: bool,
+    ) -> crate::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        if !object::framed(key) { return Err(Error::InvalidKey(key.to_string())); }
+        let local = self.inner.local_maintenance_store().ok_or_else(|| Error::Closed(
+            "Private file publication requires the original Local residence".into()))?;
+        let file = local.io_region().run_blocking(move || object::prepare_file_handle("<private-file>".into(), source)).await?;
+        self.put_prepared_file(key, file, with_publication).await
+    }
+
     async fn put_with_publication(
         &self,
         key: &ObjectKey,

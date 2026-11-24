@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
@@ -63,6 +63,7 @@ pub struct Changes {
 }
 
 pub struct ChangePage {
+    pub read_custody: Option<Arc<rtdb_replication::LocalErasureRead>>,
     pub groups: Vec<ChangeGroup>,
     pub through: Basis,
     pub complete: bool,

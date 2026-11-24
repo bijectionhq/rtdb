@@ -46,7 +46,11 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
             }
         }
         let kms = rtdb_crypt::FileKms::open(&path, || rtdb_node::SystemClock.now().0)?;
-        resources = resources.with_native_checkpoint_kms(Arc::new(kms));
+        resources = if config.default_v1_serving && std::env::var_os("RTDB_DEFAULT_LOCAL_ERASURE").is_some_and(|value| value == "1") {
+            resources.with_local_checkpoint_kms(kms)
+        } else {
+            resources.with_native_checkpoint_kms(Arc::new(kms))
+        };
     }
     let mut sources = ExternalSources::new();
     let mut registrations = Vec::new();

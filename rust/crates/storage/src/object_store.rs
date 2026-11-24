@@ -175,7 +175,9 @@ pub trait ObjectStore: Send + Sync {
     /// Whether returned bytes may be reused across reads without returning to this owner.
     fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
+    fn local_erasure_custody(&self) -> Option<&Arc<crate::sealing::LocalErasureCustody>> { None }
     fn local_classic_key_slots(&self) -> Option<&dyn crate::sealing::ObjectCipher> { None }
+    async fn require_erasure_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<()> { Ok(()) }
     /// Resolves the single payload named by an authenticated replica delivery.
     async fn read_replica_payload(&self, _custody: &crate::log::ReplicaObjectCustody,
         _memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<crate::log::ReplicaPayload> {
@@ -384,6 +386,11 @@ pub trait ObjectStore: Send + Sync {
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
+    /// Publishes from a private file descriptor without requiring a plaintext path.
+    async fn put_private_file(&self, _key: &ObjectKey, _source: File, _with_publication: bool)
+        -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        Err(Error::Closed("The store has no private file publication".into()))
+    }
     /// Returns the identity from the successful write or from the read that verified an identical existing object.
     async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
         self.put(key, bytes).await?;
@@ -577,10 +584,22 @@ impl LocalStore {
         Ok(gate.map(|gate| Arc::new(gate) as Arc<dyn Send + Sync>))
     }
 
-    pub(crate) async fn close_erasure_catalog(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+    pub async fn close_erasure_catalog(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         let ledger = self.catalog.clone().ok_or_else(|| rtdb_types::Anomaly::unsupported(
             "rtdb.storage/erasure-catalog", "This store has no local catalog ledger"))?;
         self.io.read(ledger, cut, |ledger, &cut| Ok(ledger.close_erasure_admission(cut))).await?
+    }
+
+    pub async fn require_erasure_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<()> {
+        let ledger = self.catalog.clone().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb.storage/erasure-catalog", "This store has no local catalog ledger"))?;
+        self.io.read(ledger, cut, |ledger, &cut| Ok(ledger.require_erasure_admission(cut))).await?
+    }
+
+    pub async fn verifies_erasure_catalog(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        let ledger = self.catalog.clone().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb.storage/erasure-catalog", "This store has no local catalog ledger"))?;
+        self.io.read(ledger, cut, |ledger, &cut| Ok(ledger.verifies_erasure_admission(cut))).await?
     }
 
     /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.

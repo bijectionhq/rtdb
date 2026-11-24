@@ -20,6 +20,8 @@ use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 
 mod kafka_references;
 mod kafka_retirement;
+mod local_erasure;
+pub use local_erasure::{LocalErasureCustody, LocalErasureResidence, open_local_residence};
 pub use kafka_retirement::KafkaPrefixRetirement;
 
 const OWNER: &str = "~rtdb-classic-key-lineage";
@@ -73,8 +75,35 @@ impl ClassicKeyVault {
         region: Arc<IoRegion>,
         allow_enrollment: bool,
     ) -> Result<Arc<ClassicObjectKeys>> {
+        self.object_units(store, region, allow_enrollment, None).await
+    }
+
+    pub async fn local_units(
+        &self,
+        store: &crate::LocalStore,
+        region: Arc<IoRegion>,
+        allow_enrollment: bool,
+        erasure: Option<LocalErasureResidence>,
+    ) -> Result<Arc<ClassicObjectKeys>> {
+        self.object_units(store, region, allow_enrollment, erasure).await
+    }
+
+    async fn object_units(
+        &self,
+        store: &dyn ObjectStore,
+        region: Arc<IoRegion>,
+        allow_enrollment: bool,
+        erasure: Option<LocalErasureResidence>,
+    ) -> Result<Arc<ClassicObjectKeys>> {
         let marker = ObjectKey::new(OWNER)?;
-        let anchor = match store.get_fresh_exact(&marker, 16).await {
+        let read = || async {
+            let size = store.head_fresh(&marker).await?.size;
+            if !matches!(size, 16 | 17) {
+                return Err(Error::Task("The Classic key lineage is malformed".into()));
+            }
+            store.get_fresh_exact(&marker, size as usize).await
+        };
+        let anchor = match read().await {
             Ok(bytes) => bytes,
             Err(Error::MissingObject(_)) if allow_enrollment => {
                 let objects = store.list(None).await?;
@@ -84,19 +113,22 @@ impl ClassicKeyVault {
                     ));
                 }
                 let vault = self.clone();
-                let proposal = region
-                    .run_blocking(move || {
-                        let id = Uuid::new_v4();
-                        let scope = vault.0.join(id.simple().to_string());
-                        fs::create_dir(&scope).map_err(io(&scope))?;
-                        sync_directory(&vault.0).map_err(io(&vault.0))?;
-                        Ok(id)
-                    })
-                    .await?;
-                let publication = store
-                    .put(&marker, Bytes::copy_from_slice(proposal.as_bytes()))
-                    .await;
-                match store.get_fresh_exact(&marker, 16).await {
+                let proposed = erasure.clone();
+                let proposal = region.run_blocking(move || {
+                    let id = Uuid::new_v4();
+                    let scope = vault.0.join(id.simple().to_string());
+                    fs::create_dir(&scope).map_err(io(&scope))?;
+                    let strict = match proposed {
+                        Some(residence) => residence.enroll_if_pristine(&scope)?,
+                        None => false,
+                    };
+                    sync_directory(&vault.0).map_err(io(&vault.0))?;
+                    let mut bytes = id.as_bytes().to_vec();
+                    if strict { bytes.push(local_erasure::LINEAGE_VERSION); }
+                    Ok(bytes)
+                }).await?;
+                let publication = store.put(&marker, Bytes::from(proposal)).await;
+                match read().await {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         publication?;
@@ -106,16 +138,22 @@ impl ClassicKeyVault {
             }
             Err(error) => return Err(error.into()),
         };
-        let id = Uuid::from_slice(&anchor)
+        let id = Uuid::from_slice(&anchor[..16])
             .map_err(|_| invalid("The Classic key lineage is malformed"))?;
         let path = self.0.join(id.simple().to_string());
         if !path.is_dir() {
             return Err(invalid("The original Classic key authority is unavailable"));
         }
-        Ok(Arc::new(ClassicObjectKeys {
-            path: path.into(),
-            region,
-        }))
+        let erasure = match anchor.get(16) {
+            None => None,
+            Some(&local_erasure::LINEAGE_VERSION) => {
+                let residence = erasure.ok_or_else(|| invalid("The enrolled Local root requires its original erasure custody"))?;
+                let path = path.clone();
+                Some(Arc::new(region.run_blocking(move || residence.reopen(path)).await?))
+            }
+            _ => return Err(invalid("The Classic key lineage version is unsupported")),
+        };
+        Ok(Arc::new(ClassicObjectKeys { path: path.into(), region, erasure }))
     }
 
     pub fn log_keys(
@@ -186,6 +224,7 @@ impl ClassicKeyVault {
         Ok(Arc::new(ClassicObjectKeys {
             path: namespace.into(),
             region,
+            erasure: None,
         }))
     }
 
@@ -207,7 +246,7 @@ impl ClassicKeyVault {
         if !path.is_dir() {
             return Err(invalid("The Classic Kafka topic requires its original enrolled key vault"));
         }
-        Ok(Arc::new(KafkaFrameKeys(ClassicObjectKeys { path: path.into(), region })))
+        Ok(Arc::new(KafkaFrameKeys(ClassicObjectKeys { path: path.into(), region, erasure: None })))
     }
 
     pub fn require_unsealed_log(path: &Path) -> Result<()> {
@@ -226,13 +265,16 @@ impl ClassicKeyVault {
         keys: Arc<ClassicObjectKeys>,
     ) -> Result<EncryptingStore> {
         let vault = Arc::clone(&keys.path);
-        Ok(EncryptingStore::with_units(store, keys).with_classic_control(ObjectKey::new(OWNER)?, vault))
+        let erasure = keys.erasure.clone();
+        Ok(EncryptingStore::with_units(store, keys).with_classic_control(ObjectKey::new(OWNER)?, vault)
+            .with_local_erasure_custody(erasure))
     }
 }
 
 pub struct ClassicObjectKeys {
     path: Arc<Path>,
     region: Arc<IoRegion>,
+    erasure: Option<Arc<LocalErasureCustody>>,
 }
 
 impl ClassicObjectKeys {
@@ -417,7 +459,7 @@ impl KafkaFrameKeys {
         if before < 0 {
             return Err(Error::Task("The Kafka floor is negative".into()));
         }
-        let keys = Self(ClassicObjectKeys { path: Arc::clone(&self.0.path), region: Arc::clone(&self.0.region) });
+        let keys = Self(ClassicObjectKeys { path: Arc::clone(&self.0.path), region: Arc::clone(&self.0.region), erasure: None });
         self.0.region.run_blocking(move || {
             let path = &keys.0.path;
             let floor = path.join("retired-before");

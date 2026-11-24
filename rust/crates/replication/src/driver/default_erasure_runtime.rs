@@ -19,6 +19,11 @@ impl ReplicationDriver {
         self
     }
 
+    pub fn with_local_default_erasure_read_fence(mut self, fence: Arc<crate::LocalDefaultErasureReadFence>) -> Self {
+        self.local_erasure_read_fence = Some(Arc::clone(&fence));
+        self.with_default_erasure_read_fence(fence)
+    }
+
     pub(super) async fn drive_default_erasure(&mut self) -> Result<()> {
         if !self.leader.as_ref().is_some_and(|leader| {
             leader.confirmed && leader.accepting() && leader.drained_for_strict_source()
@@ -44,6 +49,10 @@ impl ReplicationDriver {
                 let Some(grant) = self.default_erasure_grant_micros else {
                     return Ok(());
                 };
+                let Some(fence) = self.default_erasure_read_fence.as_deref() else { return Ok(()); };
+                let predecessor = selected.evidence.prior_generation.ok_or_else(default_erasure::unsupported)?;
+                fence.seal_prior(uuid::Uuid::from_bytes(selected.evidence.cut.basis.incarnation()),
+                    predecessor, selected.evidence.boundary).await?;
                 let upper = Timestamp(
                     (self.clock)()
                         .0
@@ -183,6 +192,10 @@ impl ReplicationDriver {
             return Err(default_erasure::invalid());
         };
         intent.require_selected(*selected, position)?;
+        if self.default_erasure_read_fence.is_some() {
+            let authority = self.serving.as_ref().ok_or_else(serving::unavailable)?.checkpoint_authority();
+            intent.arm_predecessor(authority).await?;
+        }
         self.default_erasure = Some(DefaultErasure::Retiring {
             intent,
             ordered_intent: position,

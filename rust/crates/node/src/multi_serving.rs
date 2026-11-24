@@ -570,6 +570,7 @@ fn changes_page(
         _ => upper.max(after),
     };
     Ok(ChangePage {
+            read_custody: None,
         groups: page,
         through: Basis::new(incarnation, through),
         complete: next.is_none() && until.is_none_or(|until| until <= history.through),

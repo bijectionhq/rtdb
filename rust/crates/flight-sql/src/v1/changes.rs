@@ -971,6 +971,13 @@ impl Service {
                 (page, context)
             };
             self.check_attachment(&call, &database)?;
+            let context = match page.read_custody.clone() {
+                Some(custody) => {
+                    let deadline = custody.deadline();
+                    context.with_delivery_owner(custody, deadline)
+                }
+                None => context,
+            };
             let initial = context.delivery_grant().await.map_err(error::anomaly)?;
             let (headers, cutoff) = call
                 .delivery_headers(&initial, true)

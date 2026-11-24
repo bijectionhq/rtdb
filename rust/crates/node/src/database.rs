@@ -465,10 +465,11 @@ impl DatabaseFactory {
         let cancellation = parent.child_token();
         let log_cancellation = CancellationToken::new();
         let access = if read_only { crate::LogAccess::ReadOnly } else if self.options.replication.may_lead { crate::LogAccess::ReadWrite } else { crate::LogAccess::SourceWriter };
-        let event_history = !read_only && self.options.artefact_threads != 0
+        let mut resources = self.resources.open_storage(&name, &configuration).await?;
+        let sealed_local_erasure = resources.store.local_erasure_custody().is_some();
+        let event_history = !read_only && !sealed_local_erasure && self.options.artefact_threads != 0
             && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
         let native_history = event_history && matches!(&configuration.log, Some(database_config::Log::LocalLog(_)));
-        let mut resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
         let checkpoint_metadata = resources.checkpoint_metadata.take();
         let recovery_storage = Arc::clone(&resources.store);
@@ -477,7 +478,7 @@ impl DatabaseFactory {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
             let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now(), resources.blocks).await?;
-            let opened_logs = if native_history {
+            let opened_logs = if native_history || sealed_local_erasure {
                 self.resources.open_logs_with_replica_lineage(&name, &configuration, access, log_cancellation.clone(), &resources).await?
             } else {
                 self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?
@@ -485,6 +486,10 @@ impl DatabaseFactory {
             if default_restore.is_some() && (opened_logs.placed_transfer.is_some() || opened_logs.source.checkpoint_key_retirement().is_some()
                 || opened_logs.replica.checkpoint_key_retirement().is_some())
             { return Err(crate::node::default_restore::unsupported()); }
+            if sealed_local_erasure && (opened_logs.placed_transfer.is_some()
+                || opened_logs.source.checkpoint_key_retirement().is_none()
+                || opened_logs.replica.checkpoint_key_retirement().is_none())
+            { return Err(local_erasure_unavailable()); }
             let journal_lineage = opened_logs.replica.journal_lineage();
             if let crate::AwaitAuthority::Checkpoint { block, through, root, .. } = &opened_logs.await_authority
                 && (!read_only || through.0 < 0 || through.epoch() != opened_logs.replica_epoch
@@ -547,7 +552,7 @@ impl DatabaseFactory {
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, Arc::clone(&resolve), effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
-            let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
+            let mut builders = if read_only || sealed_local_erasure || self.options.artefact_threads == 0 { Vec::new() } else {
                 let history = match self.resources.table_history(&configuration)? {
                     Some(hosted) => Some(hosted),
                     None if native_history => journal_lineage.map(|lineage|
@@ -573,7 +578,7 @@ impl DatabaseFactory {
                 replica_driver.with_serving_search(Arc::new(PrepareSearch { search, history }))
             } else { replica_driver };
             let publisher: Option<Arc<dyn CompactionPublisher>> = match (&self.compaction_relay, read_only) {
-                _ if self.options.compaction_threads == 0 => None,
+                _ if sealed_local_erasure || self.options.compaction_threads == 0 => None,
                 (_, false) => Some(Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() })),
                 (Some(relay), true) => Some(Arc::new(RelayCompaction { relay: Arc::clone(relay), database: name.clone() })),
                 (None, true) => None,
@@ -601,7 +606,7 @@ impl DatabaseFactory {
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };
-            let ordered_worker = (!read_only && self.options.replication.enabled && self.options.replication.may_lead).then(|| Arc::new(OrderedIndexMaintenance::new(
+            let ordered_worker = (!read_only && !sealed_local_erasure && self.options.replication.enabled && self.options.replication.may_lead).then(|| Arc::new(OrderedIndexMaintenance::new(
                 name.clone(), Arc::clone(&storage), Arc::clone(&self.memory), Arc::clone(&self.clock), Arc::clone(&snapshots), Arc::clone(&logs),
                 self.options.ordered_index_arrow_references
                     || (self.options.ordered_index_arrow_references_on_private_storage
@@ -609,19 +614,25 @@ impl DatabaseFactory {
             )));
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
             let currency = Arc::<ReadCurrency>::default();
+            let mut maintenance_options = self.options.clone();
+            if sealed_local_erasure { maintenance_options.automatic_gc = false; }
             let supervisor = MaintenanceSupervisor { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), currency: Arc::clone(&currency), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
-                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone(), clock: Arc::clone(&self.clock) };
+                observer: Arc::clone(&self.observer), options: maintenance_options, source, ordered_worker, ordered_cycle: ordered_cycle.clone(), clock: Arc::clone(&self.clock) };
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
             let mut serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
             let can_attach_native = serving.is_none() && self.options.replication.enabled && configuration.external_source.is_none();
             if default_restore.is_some() && !can_attach_native { return Err(crate::node::default_restore::unsupported()); }
+            if sealed_local_erasure && (!can_attach_native || !self.options.default_v1_serving || self.options.owned_relations) {
+                return Err(local_erasure_unavailable());
+            }
             let native_authority = if can_attach_native {
                 self.resources.native_serving_authority(&name, &configuration)?
             } else {
                 None
             };
+            if sealed_local_erasure && native_authority.is_some() { return Err(local_erasure_unavailable()); }
             let incarnation = serving.as_ref().map(|driver| driver.incarnation())
                 .or_else(|| native_authority.as_ref().map(|authority| authority.incarnation))
                 .or_else(|| default_restore.as_ref().map(|install| install.seed.basis.incarnation()))
@@ -647,18 +658,32 @@ impl DatabaseFactory {
             };
             let mut default_native_handle = None;
             if let Some(authority) = &native_authority {
+                let mut write_features = rtdb_replication::NATIVE_WRITE_FEATURES.to_vec();
+                if sealed_local_erasure {
+                    let checkpoint = authority.checkpoints.as_ref().ok_or_else(local_erasure_unavailable)?;
+                    let fence = rtdb_replication::LocalDefaultErasureReadFence::open(
+                        &logs, Arc::clone(&checkpoint.kms), Arc::clone(&io), uuid::Uuid::from_bytes(authority.incarnation),
+                    ).await?;
+                    replica_driver = replica_driver.with_local_default_erasure_read_fence(Arc::new(fence));
+                    write_features.push(rtdb_tx::transact::PHYSICAL_ERASURE);
+                }
                 if authority.checkpoints.is_some() && !read_only {
                     let garbage = &self.options.garbage;
                     let grant = garbage.reader_lease_micros()?.checked_add(garbage.reader_lease_margin_micros()?)
                         .ok_or_else(|| Anomaly::incorrect("rtdb/default-erasure-grant", "The Default erasure grant horizon overflows"))?;
+                    let grant = if sealed_local_erasure {
+                        grant.max(rtdb_storage::sealing::PLAINTEXT_DELIVERY_WINDOW.as_micros() as i64)
+                    } else {
+                        grant
+                    };
                     replica_driver = replica_driver.with_default_erasure_grant(grant as u64);
                 }
-                let handle = replica_driver.attach_native_serving(replication.clone(), authority.clone(), self.options.automatic_gc).await?;
+                let handle = replica_driver.attach_native_serving(replication.clone(), authority.clone(), self.options.automatic_gc && !sealed_local_erasure).await?;
                 default_native_handle = Some(handle.clone());
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {
                     handle, memory: Arc::clone(&self.memory), storage: Arc::clone(&storage),
                     clock: Arc::clone(&self.clock), tokens: Arc::clone(&tokens),
-                    writable: !read_only && self.options.replication.may_lead,
+                    writable: !read_only && self.options.replication.may_lead, write_features,
                 }));
             }
             let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
@@ -1015,4 +1040,8 @@ mod assertion_interval_tests {
         assert_eq!(assertion_interval(Some(&database_config::Log::LocalLog(Default::default())), base), base);
         assert_eq!(assertion_interval(Some(&database_config::Log::OtherLog(Default::default())), base), Duration::from_secs(1));
     }
+}
+
+fn local_erasure_unavailable() -> Anomaly {
+    Anomaly::unsupported("rtdb/local-erasure-provider", "Sealed Local erasure requires its original Native serving and journal providers")
 }

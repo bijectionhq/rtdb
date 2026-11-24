@@ -3314,6 +3314,88 @@ fn local_database(directory: &std::path::Path) -> DatabaseConfig {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn default_sealed_local_erase_waits_for_the_original_generation_and_resumes_after_restart() {
+    use rtdb_node::serving::QuerySource;
+    use rtdb_tx::transact::{Erasure, Op, PHYSICAL_ERASURE, Transact};
+    use rtdb_types::rtdb_v1::{At, Layer, MAIN_BRANCH};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let files = tempfile::tempdir().unwrap();
+        let classic_vault = tempfile::tempdir().unwrap();
+        let checkpoint_vault = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+        let runtime = || {
+            let clock_for_keys = Arc::clone(&clock);
+            let kms = rtdb_crypt::FileKms::open(checkpoint_vault.path(), move || clock_for_keys.0.load(Ordering::SeqCst)).unwrap();
+            let keys = rtdb_storage::sealing::ClassicKeyVault::open(classic_vault.path()).unwrap();
+            NodeServices {
+                clock: clock.clone(),
+                resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)
+                    .with_classic_key_vault(keys).with_local_checkpoint_kms(kms)),
+                ..services()
+            }
+        };
+        let mut settings = options();
+        settings.default_v1_serving = true;
+        settings.membership = Membership::Durable { primary: local_database(files.path()), skipped: BTreeSet::new() };
+        let cancel = CancellationToken::new();
+        let (node, owner) = running(settings.clone(), runtime()).await;
+        let database = node.catalog().database("xtdb").unwrap();
+        let serving = database.serving_driver().unwrap();
+        assert!(serving.features().contains(&PHYSICAL_ERASURE));
+        let mut sql = node.session("xtdb", Arc::new(Authority)).unwrap();
+        index_sql(&mut sql, "INSERT INTO erase_rows (_id, value) VALUES (1, 10), (2, 20)").await;
+        index_flush(&node, &database).await;
+        let view = serving.query(QuerySource { branch: MAIN_BRANCH.into(), at: At::Linearizable, layer: Layer::Merged },
+            false, node.now(), &cancel).await.unwrap();
+        let generation = view.key_generation.unwrap();
+        let old_sql_cut = database.snapshot().catalog_cut().unwrap();
+        let old_sql = database.storage().hold_catalog(Some(old_sql_cut)).await.unwrap();
+        let incarnation = uuid::Uuid::from_bytes(serving.incarnation());
+        let key = b"sealed-local-erase".to_vec();
+        let request = Transact {
+            key: key.clone(), require: vec![PHYSICAL_ERASURE.into()], window: Default::default(),
+            guards: Vec::new(), requires: Vec::new(), otherwise: Vec::new(),
+            ops: vec![Op::Erase { branch: None, table: TableRef::new("public", "erase_rows"), ids: vec![EntityId::Integer(1)] }],
+            custody_request_digest: None, request_memory: None,
+        };
+        assert_eq!(serving.transact(request, &cancel).await.unwrap_err().code, "rtdb/erasure-pending");
+        let retirement = checkpoint_vault.path().join(format!("{}-{generation:016x}.retirement", incarnation.simple()));
+        while !retirement.is_file() { tokio::time::sleep(Duration::from_millis(5)).await; }
+        let deadline = i64::from_be_bytes(std::fs::read(retirement).unwrap().try_into().unwrap());
+        assert!(serving.check_read_delivery(Some(generation), &BTreeSet::new(), &cancel).await.is_err());
+        clock.0.store(deadline + 1_000_000, Ordering::SeqCst);
+        assert!(database.object_store().require_erasure_catalog(Some(old_sql_cut)).await.is_err());
+        assert_eq!(serving.tx_status(&key, &cancel).await.unwrap_err().code, "rtdb/erasure-pending");
+        drop(view);
+        assert_eq!(serving.tx_status(&key, &cancel).await.unwrap_err().code, "rtdb/erasure-pending");
+        stop(&node, owner).await;
+        drop(old_sql);
+        drop(sql);
+        drop(database);
+        drop(node);
+
+        let (node, owner) = running(settings, runtime()).await;
+        let database = node.catalog().database("xtdb").unwrap();
+        let serving = database.serving_driver().unwrap();
+        let receipt = loop {
+            match serving.tx_status(&key, &cancel).await {
+                Ok(receipt) => break receipt,
+                Err(error) if error.code == "rtdb/erasure-pending" => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(error) => panic!("failed to recover the ordered erasure: {error}"),
+            }
+        };
+        assert_eq!(receipt.erasure, Some(Erasure::Armed { unreadable_by: Timestamp(deadline) }));
+        assert!(serving.check_read_delivery(Some(generation), &BTreeSet::new(), &cancel).await.is_err());
+        let mut sql = node.session("xtdb", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(sql.query_sql("SELECT _id FROM erase_rows ORDER BY _id", vec![]).await.unwrap()).await,
+            [vec![Value::I64(2)]]);
+        stop(&node, owner).await;
+    }).await.unwrap();
+}
+
 #[tokio::test]
 async fn default_local_restore_activates_an_independent_branch_and_recovers_its_terminal() {
     use rtdb_node::serving::QuerySource;

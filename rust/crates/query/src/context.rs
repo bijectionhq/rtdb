@@ -67,6 +67,7 @@ pub struct CatalogSnapshot {
     read_lease: Option<Arc<rtdb_storage::ReadLease>>,
     read_view: Arc<tokio::sync::OnceCell<Arc<rtdb_storage::HeldView>>>,
     snapshot_suffix: Option<Arc<dyn Send + Sync>>,
+    delivery_owner: Option<(Arc<dyn Send + Sync>, std::time::Instant)>,
     resumed_storage_owner: Option<Arc<BufferPool>>,
 }
 
@@ -90,7 +91,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, archive_history: false, relation_names: Default::default(), owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, resumed_storage_owner: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, archive_history: false, relation_names: Default::default(), owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, delivery_owner: None, resumed_storage_owner: None })
     }
     /// Enable explicit positional control history on a dedicated archive reader.
     pub fn with_archive_history(mut self) -> Self {
@@ -122,7 +123,16 @@ impl CatalogSnapshot {
     }
     /// Provider requests for this catalog's files begin only while the lease admits them.
     pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
-    pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
+    pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> {
+        let cutoff = self.databases.values().flat_map(|database| &database.partitions)
+            .filter_map(Snapshot::read_custody_deadline)
+            .chain(self.delivery_owner.as_ref().map(|(_, cutoff)| *cutoff)).min();
+        match (self.read_lease.clone(), cutoff) {
+            (lease, None) => lease,
+            (Some(lease), Some(cutoff)) => Some(lease.earlier(Arc::new(rtdb_storage::ReadLease::until(cutoff)))),
+            (None, Some(cutoff)) => Some(Arc::new(rtdb_storage::ReadLease::until(cutoff))),
+        }
+    }
     pub(crate) fn reset_sql_snapshot_view(
         &mut self, suffix: Option<Arc<dyn Send + Sync>>, owner: Option<Arc<BufferPool>>,
     ) {
@@ -142,19 +152,28 @@ impl CatalogSnapshot {
 
     pub(crate) async fn held_view(&self) -> Result<Arc<rtdb_storage::HeldView>> {
         self.check_view_lease()?;
+        for database in self.databases.values().filter(|database| database.storage.object_store().local_erasure_custody().is_some()) {
+            for snapshot in &database.partitions {
+                if snapshot.catalog_cut().is_some() || snapshot.read_custody_deadline().is_none() {
+                    database.storage.object_store().require_erasure_catalog(snapshot.catalog_cut()).await?;
+                }
+            }
+        }
         self.read_view.get_or_try_init(|| async {
             let mut registrations = Vec::new();
             for database in self.databases.values() {
                 for snapshot in &database.partitions {
-                    registrations.push(hold_snapshot(snapshot, &database.storage).await?);
+                    if snapshot.catalog_cut().is_some() || snapshot.read_custody_deadline().is_none() {
+                        registrations.push(hold_snapshot(snapshot, &database.storage).await?);
+                    }
                 }
             }
-            let owners = Arc::new((Arc::clone(&self.databases), self.snapshot_suffix.clone()));
+            let owners = Arc::new((Arc::clone(&self.databases), self.snapshot_suffix.clone(), self.delivery_owner.clone()));
             Ok(Arc::new(rtdb_storage::HeldView::new(owners, registrations)))
         }).await.map(Arc::clone)
     }
     pub(crate) fn check_view_lease(&self) -> Result<()> {
-        if let Some(lease) = &self.read_lease { lease.check()?; }
+        if let Some(lease) = self.read_lease() { lease.check()?; }
         Ok(())
     }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
@@ -387,12 +406,22 @@ impl QueryContext {
     }
     /// Both cancellation sources end active pulls; cancelling a cursor leaves either parent unchanged.
     /// The query holds a child of each, so its per-row checks never contend on a token every query shares.
-    pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: impl Into<rtdb_types::Instant>, timezone: impl Into<String>, options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
+    pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: impl Into<rtdb_types::Instant>, timezone: impl Into<String>, mut options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
         if options.batch_rows == 0 || options.list_batch_rows == 0 || options.sort_memory_bytes == 0 {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
+        if catalog.databases.values().any(|database| database.storage.object_store().local_erasure_custody().is_some()) {
+            options.spill_limit_bytes = 0;
+        }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
         Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None, delivery_guard: None, spatial_refinement: false }))
+    }
+
+    pub fn with_delivery_owner(mut self: Arc<Self>, owner: Arc<dyn Send + Sync>, deadline: std::time::Instant) -> Arc<Self> {
+        let catalog = &mut Arc::make_mut(&mut self).catalog;
+        catalog.delivery_owner = Some((owner, deadline));
+        catalog.read_view = Arc::default();
+        self
     }
 
     pub fn with_delivery_guard(mut self: Arc<Self>, guard: Arc<dyn QueryDeliveryGuard>) -> Arc<Self> {

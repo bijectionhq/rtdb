@@ -25,27 +25,34 @@ After both prefixes settle, it closes admission to earlier catalog cuts and wait
 The original vault closes per-object key slots before the provider unlinks their objects.
 The Local ledger persists the name digest and settlement cursor, so repeating an interrupted batch targets the same keys. [Local custody](../../rust/crates/storage/src/local_erasure.rs) · [Catalog tickets](../../rust/crates/storage/src/local_catalog.rs)
 
-Set `RTDB_V1_CHECKPOINT_KEY_VAULT` to an existing private directory outside the Classic and token key vaults to attach a checkpoint generation to Default v1 serving.
-The same vault must be available on restart and when authenticating a sealed image during offline repair.
-Use `--checkpoint-key-vault` to supply it to the repair command.
-Configured inline and initial in-memory views carry the initial generation. A view admitted without a configured vault carries no generation for the delivery gate to recheck.
-Withdrawing the corresponding object slot also cannot revoke bytes already retained in a cache lease.
-A complete provider proof needs an authority that closes and drains or revokes those deliveries, covers exports and other copies, and establishes which generations have no surviving owners.
-Object slot settlement covers the authenticated inventory under its original Classic vault.
-It does not establish complete custody for asynchronous publications outside the census, older generation keys, or previously retained plaintext. [Generation selection](../../rust/crates/replication/src/serving.rs#L98) · [Delivery recheck](../../rust/crates/node/src/serving/default.rs#L105) · [Cache invalidation](../../rust/crates/storage/src/cache.rs#L395)
+Set `RTDB_DEFAULT_LOCAL_ERASURE=1` with `defaultV1Serving`, `RTDB_CLASSIC_KEY_VAULT` and `RTDB_V1_CHECKPOINT_KEY_VAULT` to enroll a fresh native Local primary for public v1 Erase.
+The payload and journal directories and both private vaults must belong to the same original installation.
+The Local provider serializes enrollment with attachment, verifies that the payload and journal locations are pristine, and durably binds their directory and log identities to the checkpoint vault and database incarnation.
+The versioned storage marker requires this authority at reopen.
+Existing Classic histories and legacy sealed enrollments retain their current transaction paths without public Erase capability.
+The enrollment only covers the installation's own storage and delivery paths. [Original Local enrollment](../../rust/crates/storage/src/sealing/classic/local_erasure.rs)
+
+The enrolled profile serves Classic SQL and unscoped v1 Erase.
+It stops background compaction, derived artefact publication and automatic collection on that residence so the inventory has one publication owner.
+Raw inspection, maintenance reset, plaintext query spills, and retained or offline export have no admission on this profile.
+Ordinary block writes stage Arrow data through unnamed file descriptors under the original Local I/O owner.
+The provider forbids independent object copies and shared decrypted cache entries. [Node profile](../../rust/crates/node/src/database.rs) · [Private publication](../../rust/crates/replication/src/blocks.rs) · [Exact-read cache](../../rust/crates/storage/src/cache.rs)
 
 ## Completed erasure
 
-A terminal-capable provider must atomically close admission for held native and Classic reads, plaintext caches and exports.
-Its durable witness binds the exact original deadline and establishes exclusive authority over the predecessor and coverage of earlier generations.
-A held copy that can still deliver beyond that deadline prevents the witness.
-The checkpoint vault configuration alone supplies no such witness. [Read-fence contract](../../rust/crates/replication/src/default_erasure/terminal.rs)
+The confirmed writer selects the sealed successor and closes predecessor admission before sampling the reader deadline.
+The Local vault closes generation admission, and the catalog ledger closes older Classic cuts.
+Native Query and Changes retain their original generation through response delivery.
+Classic SQL retains the catalog ticket through delivery and rechecks the floor when opening or reusing a held catalog.
+Bounded grants cover already admitted transport.
+The provider records its exact closure witness after both kinds of holds drain. [Provider fence](../../rust/crates/replication/src/default_erasure/local_read.rs) · [Catalog holds](../../rust/crates/query/src/context.rs)
 
-The confirmed writer requires the closure before settling log prefixes and objects.
-After settlement and the original deadline, the durable KMS destroys the exact predecessor while keeping the authenticated successor readable.
-The writer orders a completion after the original retirement intent.
-Read-back and restart verify the closure, completed object cursor, destroyed predecessor and readable successor before arming the exact canonical receipt.
-Later checkpoints write under the installed successor and retain the armed receipt. [Driver order](../../rust/crates/replication/src/driver/default_erasure_runtime.rs) · [Generation custody](../../rust/crates/crypt/src/file.rs)
+The ordered retirement intent arms the predecessor's KMS deadline.
+After durable closure, the writer settles both log prefixes and the exact object inventory.
+The writer destroys the predecessor and orders completion after the original deadline.
+Read-back and restart verify the same closure, completed object cursor, destroyed predecessor and readable successor before arming the namespaced canonical receipt.
+Later checkpoints write under the successor.
+A later erasure skips a retired Local replica prefix only when its journal proof matches the completed object inventory and recovery root. [Driver order](../../rust/crates/replication/src/driver/default_erasure_runtime.rs) · [Generation custody](../../rust/crates/crypt/src/file.rs)
 
 ## Sealed Kafka
 
@@ -60,5 +67,4 @@ It records either a detached address or an explicit inline frame and preserves b
 A new inventory requires evidence for every covered coordinate below the broker or key floor and scans the remaining interval directly.
 A position that expired before its evidence was recorded remains irrecoverable to this route. [Kafka range](../../rust/crates/kafka/src/lib.rs#L295) · [Reference evidence](../../rust/crates/storage/src/sealing/classic/kafka_references.rs)
 
-Public physical Erase remains gated.
-Hosted object storage, external pg-source, copied histories without original custody, and deployments with incomplete prefix or reader evidence stay outside this route.
+Public physical Erase remains gated for Kafka, hosted object storage, external pg-source, copied histories, and deployments without their original enrollment and reader authorities.

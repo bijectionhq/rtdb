@@ -309,6 +309,12 @@ pub trait CheckpointKeyRetirement: Send + Sync {
         Ok(None)
     }
 
+    /// Reads a completed Local prefix and the first byte offset beyond it.
+    /// The object custodian separately verifies retirement of detached payloads.
+    async fn settled_local_checkpoint_prefix(&self) -> rtdb_types::Result<Option<(CheckpointPrefix, LogOffset)>> {
+        Ok(None)
+    }
+
     /// Checks the provider's exact prefix before key admission changes.
     async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<()>;
     /// Closes key admission and settles a batch after the caller has closed older recovery cuts.

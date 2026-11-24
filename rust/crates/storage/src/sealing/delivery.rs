@@ -23,6 +23,8 @@ use crate::{Error, HeldView, IoRegion, ObjectKey, ReadLease, Result};
 /// by delaying its reply or by reusing a successful earlier read.
 const GRANT_WINDOW: Duration = Duration::from_secs(30);
 
+pub const PLAINTEXT_DELIVERY_WINDOW: Duration = GRANT_WINDOW;
+
 /// A key owner waits this long after confirming its admission fence before
 /// reporting settlement. The margin covers rate differences between monotonic
 /// clocks at the reader and the owner. The wait starts again on an uncertain retry.

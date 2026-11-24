@@ -232,8 +232,13 @@ pub(in crate::sealing) enum PreparedFile {
 
 pub(in crate::sealing) fn prepare_file(source: PathBuf) -> Result<PreparedFile> {
     let read_error = |error| file_error(&source, error);
-    let mut file = File::open(&source).map_err(read_error)?;
-    if !file.metadata().map_err(read_error)?.is_file() || file.stream_position().is_err() {
+    let file = File::open(&source).map_err(read_error)?;
+    prepare_file_handle(source, file)
+}
+
+pub(in crate::sealing) fn prepare_file_handle(source: PathBuf, mut file: File) -> Result<PreparedFile> {
+    let read_error = |error| file_error(&source, error);
+    if !file.metadata().map_err(read_error)?.is_file() || file.rewind().is_err() {
         let mut body = Vec::new();
         file.read_to_end(&mut body).map_err(read_error)?;
         return Ok(PreparedFile::Buffered(body.into()));

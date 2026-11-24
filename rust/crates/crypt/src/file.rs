@@ -37,6 +37,8 @@ impl FileKms {
         })
     }
 
+    pub fn vault_path(&self) -> &Path { &self.root }
+
     pub fn create_directory(path: &Path) -> Result<()> {
         let mut directory = fs::DirBuilder::new();
         #[cfg(unix)]

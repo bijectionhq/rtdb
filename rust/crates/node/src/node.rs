@@ -735,12 +735,14 @@ impl Node {
         &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
         cancellation: &CancellationToken,
     ) -> Result<rtdb_replication::SqlErasureSource> {
+        database.object_store().require_erasure_catalog(Some(cut)).await?;
         let replay = cancellation.run_until_cancelled(
             rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
         ).await.ok_or_else(cancelled)??;
         let owner = replay.provider().ok_or_else(crate::sql_snapshots::unretained)?;
         let custody = replay.custody().ok_or_else(crate::sql_snapshots::unretained)?;
         rtdb_storage::IoRegion::retaining(custody, async {
+            database.object_store().require_erasure_catalog(Some(cut)).await?;
             let store = database.object_store().open_log_snapshot(owner).await?;
             let storage = Arc::new(BufferPool::with_budget(Arc::clone(&store), Arc::clone(database.storage.budget())));
             let blocks = rtdb_replication::BlockStore::new(Arc::clone(&store),
@@ -760,10 +762,12 @@ impl Node {
         &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
         cancellation: &CancellationToken,
     ) -> Result<crate::sql_snapshots::RecoveredSqlSnapshot> {
+        database.object_store().require_erasure_catalog(Some(cut)).await?;
         let replay = cancellation.run_until_cancelled(
             rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
         ).await.ok_or_else(cancelled)??;
         let installed = &database.storage;
+        installed.object_store().require_erasure_catalog(Some(cut)).await?;
         let (storage, catalog_hold) = if let Some(owner) = replay.provider() {
             let view = installed.object_store().open_log_snapshot(owner).await?;
             (Arc::new(BufferPool::with_budget(view, Arc::clone(installed.budget()))), None)

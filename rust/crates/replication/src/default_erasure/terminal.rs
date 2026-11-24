@@ -13,7 +13,7 @@ use super::{ErasureRetirement, MAX_CONTROL_BYTES, invalid, unsupported};
 
 const COMPLETED_FRAME: u8 = 9;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct DefaultErasureReadCut {
     pub database: Uuid,
     pub block: BlockIndex,
@@ -32,6 +32,9 @@ pub struct DefaultErasureReadCut {
 /// Authority over every held view, plaintext cache and export that can serve the prior state.
 #[async_trait]
 pub trait DefaultErasureReadFence: Send + Sync {
+    /// Closes prior admission before sampling a retirement deadline.
+    async fn seal_prior(&self, database: Uuid, predecessor: u64, boundary: ReplicaPosition) -> Result<()>;
+
     /// Atomically closes prior admission and returns a durable witness that admitted copies cannot deliver beyond the original deadline.
     /// The witness also establishes exclusive retirement authority for the predecessor and coverage of earlier generations.
     async fn close(&self, cut: DefaultErasureReadCut) -> Result<Option<[u8; 32]>>;
@@ -66,6 +69,16 @@ impl ErasureRetirement {
         })
     }
 
+    pub async fn arm_predecessor(self, authority: &NativeServingAuthority) -> Result<()> {
+        let cut = self.read_cut()?;
+        let kms = authority.checkpoints.as_ref().ok_or_else(unsupported)?.kms.as_ref();
+        if !kms.supports_durable_generation_retirement() || cut.database.as_bytes() != &authority.incarnation {
+            return Err(unsupported());
+        }
+        kms.check_readable(Generation { database: cut.database, number: cut.successor }).await?;
+        kms.retire(Generation { database: cut.database, number: cut.predecessor }, cut.unreadable_by.0).await
+    }
+
     pub async fn destroy_predecessor(
         self,
         authority: &NativeServingAuthority,
@@ -95,7 +108,7 @@ impl ErasureRetirement {
             database: cut.database,
             number: cut.predecessor,
         };
-        kms.retire(predecessor, cut.unreadable_by.0).await?;
+        self.arm_predecessor(authority).await?;
         kms.destroy(predecessor).await?;
         kms.generation_destroyed(predecessor).await
     }

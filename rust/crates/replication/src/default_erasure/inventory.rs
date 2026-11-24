@@ -208,6 +208,17 @@ impl RetirementInventory {
                 }
                 objects.insert(key);
             }
+        } else if logs.store().local_erasure_custody().is_some()
+            && let Some((prior, next)) = custody.settled_local_checkpoint_prefix().await?
+        {
+            let local = logs.store().local_maintenance_store().ok_or_else(incomplete)?;
+            let completed = local.completed_erasure_recovery().await?.ok_or_else(incomplete)?;
+            if prior.checkpoint_sha256 != completed.root_sha256 || prior.unreadable_by != completed.unreadable_by
+                || prior.through != completed.boundary.after_offset(logs.replica_epoch)
+                || completed.block >= block || completed.source.epoch() != logs.source_epoch
+                || next.0 <= prior.through || next.0 > through
+            { return Err(incomplete()); }
+            first_live = next.0;
         }
         if first_live == before {
             return Ok(objects);

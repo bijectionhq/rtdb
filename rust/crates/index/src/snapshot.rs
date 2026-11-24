@@ -35,6 +35,7 @@ pub struct Snapshot {
     system_time_cap: Option<Timestamp>,
     catalog_cut: Option<CatalogCut>,
     catalog_read: Option<CatalogRead>,
+    read_custody: Option<(CatalogRead, std::time::Instant)>,
     memos: Arc<SnapshotMemos>,
     certified_read: Option<Arc<rtdb_types::residence_trace::CertifiedRead>>,
 }
@@ -63,7 +64,7 @@ impl OwnedRoutingInventory {
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
-        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None, certified_read: None, memos: Default::default() }
+        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None, read_custody: None, certified_read: None, memos: Default::default() }
     }
     pub(crate) fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
         self.catalog_cut = catalog_cut;
@@ -125,6 +126,16 @@ impl Snapshot {
         self.catalog_read = Some(CatalogRead { permit });
         self
     }
+    /// Retains an in-memory serving selection through evaluation and delivery.
+    pub fn with_read_custody(mut self, permit: Arc<dyn std::any::Any + Send + Sync>, deadline: std::time::Instant) -> Self {
+        self.read_custody = Some((CatalogRead { permit }, deadline));
+        self
+    }
+
+    pub fn read_custody_deadline(&self) -> Option<std::time::Instant> {
+        self.read_custody.as_ref().map(|(_, deadline)| *deadline)
+    }
+
     /// Clones the storage registration that was attached when the catalog was captured.
     pub fn catalog_read_permit<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
         Arc::clone(&self.catalog_read.as_ref()?.permit).downcast().ok()
