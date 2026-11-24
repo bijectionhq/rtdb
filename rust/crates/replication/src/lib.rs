@@ -26,6 +26,15 @@ mod state;
 mod table_replay;
 
 pub use rtdb_tx::project_held_replica;
+
+pub fn verify_archived_transaction(
+    message: &rtdb_format::log::proto::ResolvedTx,
+    predecessor: rtdb_types::TransactionKey,
+    block: rtdb_types::BlockIndex,
+    memory: &std::sync::Arc<rtdb_columnar::MemoryBudget>,
+) -> rtdb_types::Result<()> {
+    rtdb_tx::decode_replica(message, Some(predecessor), block, memory).map(|_| ())
+}
 pub use admission_step::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint, RecoveredPartition};
 pub use driver::{CommittedErasure, ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, RecoverableExternalToken, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};

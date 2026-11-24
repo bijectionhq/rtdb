@@ -169,7 +169,9 @@ impl RecoveredPartition {
             let offset = raw.metadata.offset;
             let record = logs.decode_replica(raw)?.ok_or_else(unretained)?;
             let position = record.metadata.position;
-            if position <= reached || position > cut.through { return Err(unretained()); }
+            if reached.0.checked_add(1) != Some(position.0) || position > cut.through {
+                return Err(unretained());
+            }
             reached = position;
             let (_, admitted) = self.fence.admit_record(record)?;
             let Some(admitted) = admitted else { continue; };

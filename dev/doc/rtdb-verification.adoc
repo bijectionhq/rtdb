@@ -36,10 +36,11 @@ A success acknowledgement is tied to the applied commit.
 Model-check append, read-back, publish and acknowledgement under failover.
 
 |SNAP-1
-|A pinned basis yields one consistent view for the lifetime the engine promises.
-Replaying equivalent durable inputs from a valid checkpoint reconstructs the same state.
+|A pinned basis yields one consistent view for its promised lifetime under current authorization, retention and custody.
+Replay of a certified checkpoint and contiguous resolved suffix preserves each covered winner's line-qualified position and recorded reading, including on recapture and a second restore.
+A certified shadow keeps an erased winner's precedence. Missing required evidence refuses.
 |Model-check atomic publication and replay.
-Replay the same trace through the node after restart.
+Compare each covered cut after restart and successive restore, including an erased winner and an equal-time tie.
 
 |TIME-1
 |At each point, the resolver emits exactly the winning version of the entity or its specified absence.

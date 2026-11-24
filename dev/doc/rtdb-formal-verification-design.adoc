@@ -208,11 +208,13 @@ A conditional operation can observe a prior operation of its own batch.
 An aborted batch leaves the external view unchanged.
 
 |SNAP-1
-|Each read observes its admitted history for the promised lifetime.
-The engine refuses or waits for requests beyond what the selected node can lawfully serve according to the API contract.
+|Each read observes its admitted ordered history for the promised lifetime under current scope, retention and custody.
+A restored read at a covered cut selects the same original line, publication, effect ordinal and recorded reading through successive restores.
+An erased winner keeps its precedence through its certified shadow. The engine refuses or waits when the selected node lacks required evidence.
 |A cursor opened before another commit continues to observe its original view.
 A fresh admission covers every earlier quorum-installed decision and completed fresh read of the same history.
 A stalled staged suffix does not prevent otherwise eligible capture of a certified cut.
+A second restore preserves original winners, including inherited winners and equal-time effects. An erased winner stops fallthrough to an older or inherited value.
 A future basis yields the specified timeout, wait, or refusal.
 
 |TIME-1
@@ -229,15 +231,21 @@ Subsequent reinsertion is visible only in its admitted system and valid ranges.
 |DUR-1
 |A successful placed append receipt names an exact decision installed on a quorum.
 A successful synchronous commit acknowledgement also names the admitted and applied outcome.
-A recovered certified prefix and its replay closure reconstruct the same visible history.
+A certified checkpoint and contiguous suffix reconstruct the same covered history by applying receiver-resolved effects at their original slots.
+Replay preserves exact control, world and journal effects and retained terminal outcomes within their authorized horizon.
+Installation runs without semantic regeneration, clock sampling, guest execution or dispatch.
 |Interrupt before and after append, delivery, apply, and acknowledgement.
 On restart, validate returned receipts against the recovered history and compare exact rows and positions.
+After certified writer handoff, recover the retained original outcome under its original attempt and scope. Missing or expired outcomes remain unknown and confer no authority to execute.
 
 |DUR-2
-|A root eligible for recovery names a complete, readable dependency closure plus a sufficient replay suffix.
+|A root eligible for recovery authenticates its history, checkpoint fold, ancestry, codec, catalog and coverage, with a contiguous resolved suffix through the declared terminal.
+Each covered slot has a present effect, a custody-certified shadow or an authorized omission. Any required missing frame, slot or dependency refuses installation.
 Root selection and deletion of old checkpoints preserve at least one usable recovery path for the supported fault model.
+A writable successor requires a certified terminal handoff and predecessor exclusion. Restoring data cannot roll back a custody fence or hold.
 |With a lost publication reply or omitted listing entry, recovery still finds a usable representation or retained log according to its contract.
 A pending copy cannot count as a complete dependency.
+Remove a required frame, effect slot or omission witness from an otherwise valid archive and require refusal before release.
 
 |COMPACT-1
 |Eligible compaction preserves every in-scope read at a fixed basis.

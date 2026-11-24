@@ -62,7 +62,9 @@ The grant names the exact provider version or terminal creation identity and rem
 The owner keeps a publication in custody whenever a dependency lacks exact replacement evidence or future use lacks exact exclusion evidence. An incomplete inventory leaves the affected scope in custody.
 
 DUR-2::
-Every selectable recovery path authenticates a complete checkpoint and sufficient committed replay under the current recovery authority.
+Every selectable recovery path authenticates a checkpoint fold and a contiguous suffix of receiver-resolved effects under the current recovery authority.
+The certificate binds ancestry, codec, catalog, terminal publication and coverage. Restore preserves original slots, selected effects and recorded readings, with authenticated omissions and shadows where authorized.
+Missing required frames, slots or dependencies refuse release. Writable handoff requires predecessor exclusion and continuity through the certified terminal, including the retained outcome horizon.
 Replacing a path preserves reconstruction of the acknowledged history within the supported fault model and fences superseded dependencies.
 A pointer in a fenced journal range confers no access to a detached payload, including when that journal returns or is restored.
 

@@ -8,7 +8,7 @@ use rtdb_format::{
     catalog::BlockCatalog,
     envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame},
     keys::{CURRENT_STORAGE_VERSION, block_key},
-    log::proto::NoOp,
+    log::proto::{NoOp, ResolvedTx},
 };
 use rtdb_logkeeper::{ArchivedReplicaEntry, JournalDigest};
 use rtdb_types::{Anomaly, BlockIndex, MemoryBudget, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey, TxId};
@@ -197,7 +197,7 @@ pub(crate) async fn capture(
                         let cipher = TerminalReplicaCipher::open(&record, keys, Arc::clone(&io)).await?;
                         let payloads = ServingPayloads::new(&record, region, &certificate, broker, memory)?;
                         let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
-                        let mut progress = SuffixProgress::new(pin, &catalog)?;
+                        let mut progress = SuffixProgress::new(pin, &catalog, FrameKind::Original(PlacedReplay::default()))?;
                         let mut chain = artifact.chain();
                         while let Some(mut entries) = segments.next().await? {
                             let first = entries.first().ok_or_else(suffix_unavailable)?.lsn;
@@ -226,6 +226,14 @@ pub(crate) async fn capture(
                                 } else {
                                     (envelope, None)
                                 };
+                                let predecessor = progress.tx;
+                                let block = BlockIndex(progress.replay.installed.block);
+                                progress.apply(&resolved, pin, |message| {
+                                    if !held {
+                                        rtdb_replication::verify_archived_transaction(message, predecessor, block, memory)?;
+                                    }
+                                    Ok(())
+                                })?;
                                 let mut stripped_reservation = false;
                                 if held {
                                     if let ReplicaBody::NoOp(noop) = &mut resolved.message {
@@ -233,7 +241,7 @@ pub(crate) async fn capture(
                                     }
                                     if let ReplicaBody::ResolvedTx(message) = &mut resolved.message {
                                         rtdb_replication::project_held_replica(
-                                            message, progress.tx, BlockIndex(progress.replay.installed.block), memory,
+                                            message, predecessor, block, memory,
                                         )?;
                                     }
                                 }
@@ -253,7 +261,6 @@ pub(crate) async fn capture(
                                 } else if stripped_reservation || held && matches!(&resolved.message, ReplicaBody::ResolvedTx(_)) {
                                     entry.payload = resolved.encode().into();
                                 }
-                                progress.apply(resolved, pin, |_| Ok(()))?;
                             }
                             artifact.put_segment(&entries, &mut chain).await?;
                             for (offset, digest) in detached {
@@ -323,7 +330,12 @@ pub(super) async fn apply_archived(
     let artifact = suffix_artifact(bucket, cipher, deployment, suffix, pin, &stream)?;
     let expected = artifact.read_manifest(archive_digest(expected)?).await?;
     let catalog = recovered.block.as_ref().ok_or_else(suffix_unavailable)?;
-    let mut progress = SuffixProgress::new(pin, catalog)?;
+    let kind = if pin.custody == CheckpointSuffixCustody::World {
+        FrameKind::HeldProjection
+    } else {
+        FrameKind::Original(PlacedReplay::default())
+    };
+    let mut progress = SuffixProgress::new(pin, catalog, kind)?;
     let mut chain = artifact.chain();
     while progress.next <= pin.replica_through {
         let charge = memory.reserve(MAX_SEGMENT_BYTES * 4 + 4096 + MAX_SEGMENT_ENTRIES * 128)?;
@@ -340,7 +352,7 @@ pub(super) async fn apply_archived(
             } else {
                 envelope
             };
-            progress.apply(envelope, pin, |message| match pin.custody {
+            progress.apply(&envelope, pin, |message| match pin.custody {
                 CheckpointSuffixCustody::World => recovered.apply_held_transaction(message, memory),
                 _ => recovered.apply_archived_transaction(message, memory),
             })?;
@@ -514,7 +526,7 @@ pub(super) struct TerminalReplayProgress {
     writer_epoch: Option<u64>,
     last_offset: i64,
     replay: LogicalReplay,
-    placed: Option<rtdb_types::PlacedTransferDebt>,
+    placed: PlacedReplay,
 }
 
 impl TerminalReplayProgress {
@@ -527,7 +539,7 @@ impl TerminalReplayProgress {
         Ok(Self {
             writer_epoch: None, last_offset: checkpoint.boundary,
             replay: LogicalReplay::new(checkpoint, fence.destination.source_log_epoch, catalog),
-            placed: None,
+            placed: PlacedReplay::default(),
         })
     }
 
@@ -547,52 +559,16 @@ impl TerminalReplayProgress {
         &mut self, envelope: ReplicaEnvelope,
         recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
-        match envelope.message {
+        match &envelope.message {
             ReplicaBody::ResolvedTx(message) => {
                 let next = self.replay.transaction_source(message.src_msg_id)?;
-                match (self.placed.as_ref(), message.placed_slot_terminal.as_deref(), message.placed_attempt.as_deref()) {
-                    (None, None, None) => (),
-                    (Some(debt), Some(terminal), Some(attempt)) => {
-                        let term = rtdb_types::Term(debt.term);
-                        let reserved = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
-                        let terminal = rtdb_types::PlacedTerminal::decode(terminal)?;
-                        let (attempt, _) = rtdb_format::envelope::decode_replica_outcome_attempt(attempt)?;
-                        if attempt != reserved.attempt || terminal.commitment != reserved.commitment
-                            || message.tx_id != Some(attempt.position().0) || message.src_msg_id != message.tx_id
-                            || message.committed.is_none()
-                            || if terminal.fenced { envelope.term <= term || message.committed != Some(false) }
-                               else { envelope.term != term }
-                        {
-                            return Err(suffix_unavailable());
-                        }
-                    }
-                    _ => return Err(suffix_unavailable()),
-                }
-                recovered.apply_archived_transaction(&message, memory)?;
-                self.placed = None;
+                self.placed.finish_transaction(message, envelope.term)?;
+                recovered.apply_archived_transaction(message, memory)?;
                 self.replay.source = next;
             }
-            ReplicaBody::NoOp(noop) if noop.placed_slot_reservation.is_some() => {
-                if self.placed.is_some() || noop.src_msg_id.is_some() || self.replay.pending.is_some() {
-                    return Err(suffix_unavailable());
-                }
-                let reserved = rtdb_types::PlacedReservation::decode(
-                    noop.placed_slot_reservation.as_deref().ok_or_else(suffix_unavailable)?,
-                )?;
-                if self.replay.source_offset(reserved.attempt.position().0)? <= self.replay.source {
-                    return Err(suffix_unavailable());
-                }
-                self.placed = Some(rtdb_types::PlacedTransferDebt {
-                    term: envelope.term.0, reserved_at: self.last_offset, reservation: reserved.encode(),
-                });
-            }
             control => {
-                let control = ReplayControl::read(&control)?;
-                if self.placed.is_some() && !matches!(control, ReplayControl::Advance(None)) {
-                    return Err(suffix_unavailable());
-                }
                 let prior = self.replay.source;
-                self.replay.apply_control(control)?;
+                self.placed.apply_control(control, envelope.term, self.last_offset, &mut self.replay)?;
                 if self.replay.source > prior {
                     recovered.progress.source_position =
                         SourcePosition::from_epoch_offset(self.replay.epoch, self.replay.source)?;
@@ -604,7 +580,7 @@ impl TerminalReplayProgress {
 
     pub(super) fn finish(self, through: i64) -> Result<TerminalReplayFrontier> {
         if self.last_offset != through { return Err(suffix_unavailable()); }
-        Ok(TerminalReplayFrontier { source_through: self.replay.source, placed_debt: self.placed })
+        Ok(TerminalReplayFrontier { source_through: self.replay.source, placed_debt: self.placed.debt })
     }
 }
 
@@ -758,10 +734,16 @@ struct SuffixProgress {
     replay: LogicalReplay,
     writer_epoch: Option<u64>,
     fence: rtdb_replication::TermFence,
+    frames: FrameKind,
+}
+
+enum FrameKind {
+    Original(PlacedReplay),
+    HeldProjection,
 }
 
 impl SuffixProgress {
-    fn new(pin: &CheckpointSuffixPin, catalog: &BlockCatalog) -> Result<Self> {
+    fn new(pin: &CheckpointSuffixPin, catalog: &BlockCatalog, frames: FrameKind) -> Result<Self> {
         let tx = catalog.latest_completed_tx().ok_or_else(suffix_unavailable)?;
         if tx.system_time.0 != pin.checkpoint.system_time
             || pin.checkpoint.boundary.checked_add(1) != Some(pin.journal_interval[0])
@@ -774,6 +756,7 @@ impl SuffixProgress {
             next: pin.journal_interval[0], tx,
             replay: LogicalReplay::new(pin.checkpoint, pin.log_epoch, catalog), writer_epoch: None,
             fence: rtdb_replication::TermFence::from_catalog(catalog)?,
+            frames,
         })
     }
 
@@ -787,24 +770,36 @@ impl SuffixProgress {
     }
 
     fn apply(
-        &mut self, body: ReplicaEnvelope, pin: &CheckpointSuffixPin,
-        apply: impl FnOnce(&rtdb_format::log::proto::ResolvedTx) -> Result<()>,
+        &mut self, body: &ReplicaEnvelope, pin: &CheckpointSuffixPin,
+        apply: impl FnOnce(&ResolvedTx) -> Result<()>,
     ) -> Result<()> {
-        match body.message {
+        match &body.message {
             ReplicaBody::ResolvedTx(row) if row.db_op.is_none() && row.external_source_token.is_none() => {
                 let id = row.tx_id.ok_or_else(suffix_unavailable)?;
                 let time = Timestamp(row.system_time_micros.ok_or_else(suffix_unavailable)?);
                 let source = self.replay.transaction_source(row.src_msg_id)?;
-                if id <= self.tx.tx_id.0 || time <= self.tx.system_time
+                if row.committed.is_none() || id <= self.tx.tx_id.0 || time < self.tx.system_time
                     || id > pin.basis.tx_id.0 || time > pin.basis.system_time || source > pin.source_through
                 {
                     return Err(suffix_unavailable());
                 }
-                apply(&row)?;
+                if let FrameKind::Original(placed) = &mut self.frames {
+                    placed.finish_transaction(row, body.term)?;
+                }
+                apply(row)?;
                 self.tx = TransactionKey { tx_id: TxId(id), system_time: time };
                 self.replay.source = source;
             }
-            control => self.replay.apply_control(ReplayControl::read(&control)?)?,
+            control => match &mut self.frames {
+                FrameKind::Original(placed) =>
+                    placed.apply_control(control, body.term, self.next - 1, &mut self.replay)?,
+                FrameKind::HeldProjection => {
+                    if matches!(control, ReplicaBody::NoOp(noop) if noop.placed_slot_reservation.is_some()) {
+                        return Err(suffix_unavailable());
+                    }
+                    self.replay.apply_control(ReplayControl::read(control)?)?;
+                }
+            },
         }
         Ok(())
     }
@@ -817,6 +812,59 @@ impl SuffixProgress {
             return Err(suffix_unavailable());
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PlacedReplay {
+    debt: Option<rtdb_types::PlacedTransferDebt>,
+}
+
+impl PlacedReplay {
+    fn finish_transaction(&mut self, row: &ResolvedTx, term: rtdb_types::Term) -> Result<()> {
+        match (self.debt.as_ref(), row.placed_slot_terminal.as_deref(), row.placed_attempt.as_deref()) {
+            (None, None, None) => return Ok(()),
+            (Some(debt), Some(terminal), Some(attempt)) => {
+                let owner = rtdb_types::Term(debt.term);
+                let reservation = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
+                let terminal = rtdb_types::PlacedTerminal::decode(terminal)?;
+                let (attempt, _) = rtdb_format::envelope::decode_replica_outcome_attempt(attempt)?;
+                if attempt != reservation.attempt || terminal.commitment != reservation.commitment
+                    || row.tx_id != Some(attempt.position().0) || row.src_msg_id != row.tx_id
+                    || row.committed.is_none()
+                    || if terminal.fenced { term <= owner || row.committed != Some(false) }
+                       else { term != owner }
+                {
+                    return Err(suffix_unavailable());
+                }
+            }
+            _ => return Err(suffix_unavailable()),
+        }
+        self.debt = None;
+        Ok(())
+    }
+
+    fn apply_control(&mut self, body: &ReplicaBody, term: rtdb_types::Term, offset: i64, replay: &mut LogicalReplay) -> Result<()> {
+        if let ReplicaBody::NoOp(noop) = body
+            && let Some(wire) = noop.placed_slot_reservation.as_deref()
+        {
+            if self.debt.is_some() || noop.src_msg_id.is_some() || replay.pending.is_some() {
+                return Err(suffix_unavailable());
+            }
+            let reservation = rtdb_types::PlacedReservation::decode(wire)?;
+            if replay.source_offset(reservation.attempt.position().0)? <= replay.source {
+                return Err(suffix_unavailable());
+            }
+            self.debt = Some(rtdb_types::PlacedTransferDebt {
+                term: term.0, reserved_at: offset, reservation: reservation.encode(),
+            });
+            return Ok(());
+        }
+        let control = ReplayControl::read(body)?;
+        if self.debt.is_some() && !matches!(control, ReplayControl::Advance(None)) {
+            return Err(suffix_unavailable());
+        }
+        replay.apply_control(control)
     }
 }
 
