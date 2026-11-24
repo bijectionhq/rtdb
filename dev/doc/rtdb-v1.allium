@@ -52,6 +52,8 @@ surface StatelessDatabase {
         -- Write and close authenticate the exact fence and original claim receipt before either arm is considered.
         -- The current authority image must match at the configured valid time and at the writer's decision time.
         -- The original writer orders closure, placement replacement and mutation in the same stream.
+        -- A cluster peer relays verified workload admission to the writer under the same configured issuer and authority point.
+        -- The receiver checks the current incarnation and orders the unchanged namespace, attempt commitment and cutoff.
         -- Before a timed effect settles, the writer checks the original fence and the exclusive grant and request cutoffs again.
         -- A separate clear Root read grant names the same exact fence and writer receipt.
         -- Only the active local writer admits clear main Query and rechecks the authority at each frame handoff.

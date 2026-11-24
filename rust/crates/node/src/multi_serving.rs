@@ -187,6 +187,11 @@ pub trait MultiWriteRoute: Send + Sync {
     async fn forward(
         &self, incarnation: [u8; 16], request: &Transact, admission: MultiWriteAdmission<'_>,
     ) -> Result<Option<Receipt>>;
+
+    async fn forward_workload(&self, _incarnation: [u8; 16], _request: workload::Request)
+        -> Result<workload::Reply> {
+        Err(Anomaly::unsupported("rtdb/managed-workload-route", "The host has no managed workload peer route"))
+    }
 }
 
 pub enum MultiWriteAdmission<'a> {
@@ -334,6 +339,10 @@ impl MultiServing {
     }
 
     /// Accepts only the narrow ordered response-release command from an admitted peer.
+    pub async fn managed_workload_local(&self, request: workload::Request) -> Result<workload::Reply> {
+        self.writes.workload(request).await
+    }
+
     pub async fn submit_response_local(&self, request: Transact) -> Result<Receipt> {
         if !request.is_response_release() {
             return Err(crate::serving::custody_release::release_unavailable());
@@ -454,7 +463,15 @@ impl ServingDriver for MultiServing {
 
     async fn managed_workload(&self, request: workload::Request,
                               cancellation: &CancellationToken) -> Result<workload::Reply> {
-        cancellation.run_until_cancelled(self.writes.workload(request)).await.ok_or_else(interrupted)?
+        cancellation.run_until_cancelled(async {
+            let local = self.managed_workload_local(request.clone()).await;
+            if local.as_ref().err().is_some_and(|error| error.code == "rtdb/no-writer")
+                && let Some(route) = &self.route
+            {
+                return route.forward_workload(self.incarnation, request).await;
+            }
+            local
+        }).await.ok_or_else(interrupted)?
     }
 
     async fn transact_scoped(&self, request: Transact, scope: ServingScope,

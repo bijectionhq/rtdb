@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Point {
     pub table: TableRef,
     pub id: EntityId,
@@ -229,6 +229,7 @@ struct Commitment {
     digest: [u8; 32],
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
     pub point: Point,
     pub namespace: [u8; 32],
@@ -236,6 +237,7 @@ pub struct Request {
     pub operation: Operation,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Operation {
     Submit {
         key: Vec<u8>,
@@ -257,12 +259,14 @@ pub enum Operation {
     Predecessor(Predecessor),
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Reply {
     Receipt(Receipt),
     Placement(Evidence),
     Predecessor(Box<PredecessorEvidence>),
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Evidence {
     pub applied: Applied,
     pub placement: Placement,
@@ -270,6 +274,7 @@ pub struct Evidence {
     pub predecessor_retirement_basis: Option<Basis>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PredecessorEvidence {
     pub fence: Evidence,
     pub writer: Evidence,

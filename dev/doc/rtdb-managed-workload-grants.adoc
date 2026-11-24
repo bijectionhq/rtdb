@@ -115,8 +115,10 @@ Put these fields under `authn.workloadGrants`.
 Use the same point for the life of the original incarnation and across its writers.
 The branch is always `main`.
 The assignment profile admits only reserved-prefix OIDC clients under explicit `CLIENT_CREDENTIALS` rules.
-Only the active local Multi writer answers assignment actions and namespaced status.
-A deployment with several serving nodes must deliver these calls to that writer.
+The active Multi writer answers ordered assignment actions and namespaced status.
+An ingress node can relay verified admission on the authenticated cluster peer channel.
+The receiver requires the same issuer, audience, client prefix, configured point and exact attached incarnation.
+Peer routing preserves the original namespace, key, request digest and grant expiry.
 Route changes and uncertain transport outcomes can be recovered at the active writer under the original attempt identity.
 The point is outside the issuer claim and the client request.
 Keep the operator and issuer responsible for the admitted Original and its accepted assignment.

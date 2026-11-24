@@ -11,13 +11,14 @@ use rtdb_node::{
     Clock, MultiWriteAdmission, MultiWriteRoute, Node, SystemClock,
     serving::{ServingDriver, ServingScope},
 };
-use rtdb_tx::transact::{Receipt, Transact};
+use rtdb_tx::transact::{Receipt, Transact, workload};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
     rtdb_v1::{Basis, LabelScope, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, PinnedCheckpointIdentity},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
@@ -41,6 +42,24 @@ pub(super) struct Peer {
     tokens: TokenAuthority,
     memory: Arc<MemoryBudget>,
     outgoing: Semaphore,
+    workload_profile: Option<WorkloadProfile>,
+}
+
+pub(super) struct WorkloadProfile {
+    point: workload::Point,
+    identity: [u8; 32],
+}
+
+impl WorkloadProfile {
+    pub(super) fn new(point: workload::Point, issuer: &str, audience: &str, client_prefix: &str) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb/multi/workload-peer-profile\0");
+        for value in [issuer, audience, client_prefix] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        Self { point, identity: hash.finalize().into() }
+    }
 }
 
 struct DatabaseRoute {
@@ -64,6 +83,7 @@ struct Request {
 enum Admission {
     Ordinary(Option<Scope>),
     CustodyResponse,
+    Workload { profile: [u8; 32], request: Box<workload::Request> },
     Catalog,
     Export {
         pin: Uuid,
@@ -100,6 +120,7 @@ struct Reply {
 #[derive(Serialize, Deserialize)]
 enum Answer {
     Receipt(Receipt),
+    Workload(Box<workload::Reply>),
     Ticket(Vec<u8>),
     Installed(Basis),
     ManagedPinned(PinnedCheckpointIdentity),
@@ -117,6 +138,7 @@ impl Peer {
         address: IpAddr,
         tokens: TokenAuthority,
         memory: Arc<MemoryBudget>,
+        workload_profile: Option<WorkloadProfile>,
     ) -> Arc<Self> {
         Arc::new(Self {
             address,
@@ -124,6 +146,7 @@ impl Peer {
             tokens,
             memory,
             outgoing: Semaphore::new(IN_FLIGHT),
+            workload_profile,
         })
     }
 
@@ -210,12 +233,33 @@ impl Peer {
         reservation: MemoryReservation,
     ) -> Result<Answer> {
         let target = self.selected(Uuid::from_bytes(frame.incarnation));
-        if target != Some(self.address) {
+        if target != Some(self.address) && !matches!(&frame.admission, Admission::Workload { .. }) {
             return Err(unavailable());
         }
         let incarnation = Uuid::from_bytes(frame.incarnation);
         let name = &frame.database;
         let admitted = match frame.admission {
+            Admission::Workload { profile, mut request } => {
+                if frame.request.is_some() || !node.catalog().is_managed()
+                    || !self.workload_profile.as_ref().is_some_and(|installed| {
+                        installed.identity == profile && installed.point == request.point
+                    })
+                {
+                    return Err(workload::denied());
+                }
+                let attached = node.catalog().database(name)?;
+                let serving = attached.serving_driver().ok_or_else(unavailable)?;
+                if serving.incarnation() != frame.incarnation { return Err(unavailable()); }
+                let writer = runtime.ready_driver(name, incarnation).await?;
+                if let workload::Operation::Submit { transaction: Some(transaction), .. } = &mut request.operation {
+                    transaction.request_memory = Some(Arc::new(reservation));
+                }
+                let reply = writer.managed_workload_local(*request).await?;
+                if !node.catalog().database(name).is_ok_and(|current| Arc::ptr_eq(&current, &attached)) {
+                    return Err(unavailable());
+                }
+                return Ok(Answer::Workload(Box::new(reply)));
+            }
             Admission::Catalog if name.is_empty() => {
                 let request = transaction(frame.request, reservation)?;
                 return Ok(Answer::Receipt(
@@ -484,6 +528,37 @@ impl Peer {
         }
     }
 
+    async fn forward_workload(
+        &self, database: &str, incarnation: [u8; 16], request: workload::Request,
+    ) -> Result<workload::Reply> {
+        let profile = self.workload_profile.as_ref().filter(|profile| profile.point == request.point)
+            .ok_or_else(workload::denied)?.identity;
+        let live = self.live.read().expect("Multi peer discovery").clone();
+        let preferred = rtdb_db::preferred(Uuid::from_bytes(incarnation), &live);
+        let peers = preferred.into_iter().chain(live.into_iter().filter(|peer| Some(*peer) != preferred));
+        tokio::time::timeout(TIMEOUT, async {
+            for to in peers.filter(|to| *to != self.address) {
+                let frame = Request {
+                    nonce: Uuid::new_v4(),
+                    from: self.address,
+                    to,
+                    expires: Timestamp(SystemClock.now().0.saturating_add(ADMISSION_MICROS)),
+                    database: database.into(),
+                    incarnation,
+                    admission: Admission::Workload { profile, request: Box::new(request.clone()) },
+                    request: None,
+                };
+                match self.send(frame).await {
+                    Ok(Answer::Workload(reply)) => return Ok(*reply),
+                    Err(error) if matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/peer-unavailable") => (),
+                    Err(error) => return Err(error),
+                    Ok(_) => return Err(unavailable()),
+                }
+            }
+            Err(unavailable())
+        }).await.map_err(|_| unavailable())?
+    }
+
     async fn forward(
         &self,
         database: String,
@@ -544,6 +619,11 @@ impl Peer {
 
 #[async_trait::async_trait]
 impl MultiWriteRoute for DatabaseRoute {
+    async fn forward_workload(&self, incarnation: [u8; 16], request: workload::Request)
+        -> Result<workload::Reply> {
+        self.peer.forward_workload(&self.database, incarnation, request).await
+    }
+
     async fn forward(
         &self,
         incarnation: [u8; 16],
@@ -617,4 +697,46 @@ fn overloaded() -> Anomaly {
         "rtdb/peer-admission",
         "The peer write is outside the supported admission budget",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workload_peer_frame_preserves_settlement_identity_and_grant_cutoff() {
+        let point = workload::Point::new("public.installation_authority", "authority".into(), Timestamp(0)).unwrap();
+        let profile = WorkloadProfile::new(point.clone(), "https://issuer.example/", "cell", "workload-").identity;
+        let nonce = Uuid::new_v4();
+        let frame = Request {
+            nonce,
+            from: "192.0.2.1".parse().unwrap(),
+            to: "192.0.2.2".parse().unwrap(),
+            expires: Timestamp(20),
+            database: "original".into(),
+            incarnation: [1; 16],
+            admission: Admission::Workload {
+                profile,
+                request: Box::new(workload::Request {
+                    point: point.clone(), namespace: [2; 32], expires_at: Timestamp(90),
+                    operation: workload::Operation::Settle {
+                        key: vec![3; 16], family: workload::Family::Write, digest: [4; 32],
+                    },
+                }),
+            },
+            request: None,
+        };
+        let decoded: Request = serde_json::from_slice(&serde_json::to_vec(&frame).unwrap()).unwrap();
+        assert_eq!(decoded.nonce, nonce);
+        assert_eq!(decoded.incarnation, [1; 16]);
+        assert_eq!(decoded.expires, Timestamp(20));
+        let Admission::Workload { profile: received, request } = decoded.admission else { panic!("expected workload admission") };
+        assert_eq!(received, profile);
+        assert_eq!(request.point, point);
+        assert_eq!(request.namespace, [2; 32]);
+        assert_eq!(request.expires_at, Timestamp(90));
+        assert!(matches!(request.operation, workload::Operation::Settle { key, family: workload::Family::Write, digest }
+            if key == vec![3; 16] && digest == [4; 32]));
+        assert_ne!(WorkloadProfile::new(point, "https://issuer.example/", "another-cell", "workload-").identity, profile);
+    }
 }

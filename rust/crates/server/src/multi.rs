@@ -12,7 +12,7 @@ use journal_contract::{
     Identity, Journal, JournalError, StreamId,
     reference::{FileJournal, Limits},
 };
-use rtdb_auth::Authenticator;
+use rtdb_auth::{AuthConfig, Authenticator};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Generation, Kms};
 use rtdb_db::{
@@ -302,11 +302,19 @@ impl MultiRuntime {
         }
         let control_open = if follower.is_some() { DatabaseOpen::Prepared } else { DatabaseOpen::Required };
         let control = open_database(&backends, &kms, control, control_open).await?;
+        let workload_profile = match &config.auth {
+            AuthConfig::OpenIdConnect(oidc) => oidc.workload_grants.as_ref().and_then(|grants| {
+                let point = grants.assignment()?.clone();
+                Some(peer::WorkloadProfile::new(point, oidc.issuer_url.as_str(), grants.audience(), grants.client_id_prefix()))
+            }),
+            _ => None,
+        };
         let peer = backends.peers.as_ref().map(|_| {
             peer::Peer::new(
                 backends.node,
                 control.token_authority(),
                 Arc::clone(&memory),
+                workload_profile,
             )
         });
         let catalog = catalog::Catalog::new(control, peer.clone());
