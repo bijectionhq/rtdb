@@ -385,8 +385,8 @@ impl ObjectStore for EncryptingStore {
         self.inner.settle_classic_trie(key, version).await
     }
 
-    fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> {
-        self.inner.search_staging_owner()
+    async fn search_staging_owner(&self) -> Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
+        self.inner.search_staging_owner().await
     }
     async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> rtdb_types::Result<bool> {
         self.inner.search_staging_drained(owner).await
@@ -398,6 +398,10 @@ impl ObjectStore for EncryptingStore {
         publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>,
     ) -> Result<bool> {
+        if rtdb_format::search_manifest::is_ranged_run(key.as_str()) && self.local_maintenance_store().is_some()
+            && let ObjectKeys::Units(ledger) = &self.keys {
+            return crate::classic_retirement::retire_search_run(self, key, cut, Some(ledger.as_ref())).await;
+        }
         self.inner.release_search_run(key, publication, cut).await
     }
     async fn head(&self, key: &ObjectKey) -> crate::Result<StoredObject> {

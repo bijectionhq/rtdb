@@ -1307,8 +1307,8 @@ impl ObjectStore for GarbageStore {
         }
         Ok(allowed.into_iter().all(|allowed| allowed))
     }
-    fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> {
-        self.catalog_readers.as_ref()?.search_staging_owner()
+    async fn search_staging_owner(&self) -> Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
+        Ok(self.catalog_readers.as_ref().and_then(CatalogReaders::search_staging_owner))
     }
     async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { return Ok(false); };

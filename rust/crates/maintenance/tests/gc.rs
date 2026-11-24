@@ -840,23 +840,34 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     let l0 = TrieKey::l0(BlockIndex(0)).unwrap();
     let catalog = TrieCatalog::default().with_tries(table.clone(), [CatalogTrie::notification(l0, 1, None).unwrap()], Timestamp(10)).unwrap();
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-    let store = Arc::new(MemoryStore::default());
+    let epoch = StorageEpoch(0);
+    let cut = CatalogCut { storage_version: StorageVersion(0), storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(1) };
+    state.publish_catalog_cut(cut).unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let open = || LocalStore::open(files.path()).unwrap().with_catalog_ledger(epoch);
+    let writer = open();
+    let store = Arc::new(open());
     let pending = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
         digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), allocation: Some(vec![16; 16]),
         ..Default::default() };
     let marker = ObjectKey::new(pending.pending_key(&entry.slug).unwrap()).unwrap();
     let body = ObjectKey::new(pending.object_key(&entry.slug).unwrap()).unwrap();
-    let staged = rtdb_format::search_manifest::StagedSearchRun { run: pending, owner: None };
-    store.put(&marker, staged.encode().unwrap().into()).await.unwrap();
+    let owner = writer.search_staging_owner().await.unwrap().unwrap();
+    let staged = rtdb_format::search_manifest::StagedSearchRun { run: pending, owner: Some(owner) };
+    writer.put(&marker, staged.encode().unwrap().into()).await.unwrap();
     let retirement = Arc::new(SearchPublisher { table: table.clone(), state: Arc::clone(&state), abandoned: AtomicBool::new(false) });
-    let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: Arc::clone(&store), commits: Mutex::default() });
+    let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: Arc::new(MemoryStore::default()), commits: Mutex::default() });
     let observer = Arc::new(Observer::default());
     let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), unleased(), fixed_clock()).unwrap()
         .with_search(retirement.clone(), StorageVersion(0), StorageEpoch(0));
     let stop = CancellationToken::new();
     collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
     assert!(!retirement.abandoned.load(Ordering::Relaxed));
-    store.put(&body, Bytes::from_static(b"body")).await.unwrap();
+    writer.put(&body, Bytes::from_static(b"body")).await.unwrap();
+    collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
+    assert!(!retirement.abandoned.load(Ordering::Relaxed));
+    writer.close_and_wait().await;
+    drop(writer);
     collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
     assert!(retirement.abandoned.load(Ordering::Relaxed));
     assert!(store.head(&body).await.is_ok());

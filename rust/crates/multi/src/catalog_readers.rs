@@ -118,17 +118,19 @@ impl CatalogReaders {
     }
 
     pub fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> {
-        self.writer_epoch.map(|writer_epoch| rtdb_format::search_manifest::SearchStagingOwner {
+        self.writer_epoch.map(|writer_epoch| rtdb_format::search_manifest::SearchStagingOwner::Directory {
             region: self.owner,
             writer_epoch,
         })
     }
 
     pub async fn search_staging_drained(&self, staged: rtdb_format::search_manifest::SearchStagingOwner) -> Result<bool> {
+        let rtdb_format::search_manifest::SearchStagingOwner::Directory { region, writer_epoch } = staged
+            else { return Ok(false); };
         Ok(self.directory.deployment(&self.deployment).await?.is_some_and(|record| {
             self.residence_is_open(&record) && self.writer_epoch == Some(record.epoch)
-                && record.holder.is_some() && staged.writer_epoch < record.epoch
-                && !record.storage_regions.contains_key(&staged.region)
+                && record.holder.is_some() && writer_epoch < record.epoch
+                && !record.storage_regions.contains_key(&region)
         }))
     }
 
@@ -352,23 +354,25 @@ mod tests {
     #[tokio::test]
     async fn search_staging_requires_both_writer_turnover_and_region_drain() {
         let (mut readers, directory, record) = serving().await;
-        let staged = rtdb_format::search_manifest::SearchStagingOwner { writer_epoch: 1, region: Uuid::new_v4() };
+        let region = Uuid::new_v4();
+        let writer_epoch = 1;
+        let staged = rtdb_format::search_manifest::SearchStagingOwner::Directory { writer_epoch, region };
         update_installation(directory.as_ref(), &record.id, |current| {
-            current.epoch = staged.writer_epoch;
-            let region = current.storage_regions[&readers.owner].clone();
-            current.storage_regions.insert(staged.region, region);
+            current.epoch = writer_epoch;
+            let held = current.storage_regions[&readers.owner].clone();
+            current.storage_regions.insert(region, held);
             Ok(())
         }).await.unwrap();
-        readers.writer_epoch = Some(staged.writer_epoch);
+        readers.writer_epoch = Some(writer_epoch);
         assert!(!readers.search_staging_drained(staged).await.unwrap());
         update_installation(directory.as_ref(), &record.id, |current| {
             current.epoch += 1;
             Ok(())
         }).await.unwrap();
-        readers.writer_epoch = Some(staged.writer_epoch + 1);
+        readers.writer_epoch = Some(writer_epoch + 1);
         assert!(!readers.search_staging_drained(staged).await.unwrap());
         update_installation(directory.as_ref(), &record.id, |current| {
-            current.storage_regions.remove(&staged.region);
+            current.storage_regions.remove(&region);
             Ok(())
         }).await.unwrap();
         assert!(readers.search_staging_drained(staged).await.unwrap());

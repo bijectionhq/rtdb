@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
-use rtdb_format::{catalog::same_publication_digest, keys::{is_catalog_retirement_file, is_compacted_primary_file}};
+use rtdb_format::{catalog::same_publication_digest, keys::{is_catalog_retirement_file, is_compacted_primary_file}, search_manifest::is_ranged_run};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CATALOG_FILE_PATH_BYTES, CatalogCut, CatalogFilePaths, ReplicaPosition, Result, StorageEpoch};
 
 use crate::{Error, repair_anchor_decision::{self, AnchorInstallation, RecoveryCollection}};
@@ -48,15 +48,21 @@ impl LocalRepairAnchor {
     fn well_formed(self) -> bool { repair_anchor_decision::valid_anchor(self.block.0, self.boundary.0) }
 }
 
+fn terminal_name(key: &str) -> bool {
+    is_compacted_primary_file(key) || is_ranged_run(key)
+}
+
 pub(crate) struct LocalCatalogLedger {
     directory: PathBuf,
     root: Arc<PathBuf>,
     replica_epoch: StorageEpoch,
+    search_witness: parking_lot::Mutex<Option<(uuid::Uuid, File)>>,
 }
 
 impl LocalCatalogLedger {
     pub(crate) fn new(root: Arc<PathBuf>, replica_epoch: StorageEpoch) -> Self {
-        Self { directory: root.join(".tmp/catalog-ledger"), root, replica_epoch }
+        Self { directory: root.join(".tmp/catalog-ledger"), root, replica_epoch,
+            search_witness: parking_lot::Mutex::new(None) }
     }
 
     pub(crate) fn retain(&self, cut: Option<CatalogCut>, paths: Option<&[String]>) -> Result<tempfile::NamedTempFile> {
@@ -70,7 +76,7 @@ impl LocalCatalogLedger {
                 "The captured catalog precedes the local collection floor or belongs to another journal"));
         }
         if let Some(paths) = &claim.catalog_file_paths {
-            for name in paths.iter().filter(|name| is_compacted_primary_file(name)) {
+            for name in paths.iter().filter(|name| terminal_name(name)) {
                 if self.is_terminal(name)? {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
                         "The captured catalog names a terminal local publication"));
@@ -88,7 +94,7 @@ impl LocalCatalogLedger {
     pub(crate) fn close_admission(&self, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
         let _gate = self.lock()?;
         if cut.replica_epoch != self.replica_epoch || !well_formed(cut) || cut.through.after_offset(cut.replica_epoch) < 0
-            || paths.iter().flatten().any(|path| !is_compacted_primary_file(path))
+            || paths.iter().flatten().any(|path| !terminal_name(path))
         {
             return Err(invalid("Invalid local catalog retirement"));
         }
@@ -146,7 +152,7 @@ impl LocalCatalogLedger {
 
     /// The same gate serializes immutable creation and terminal retirement.
     pub(crate) fn publication_gate(&self, key: &crate::ObjectKey) -> crate::Result<Option<File>> {
-        if !is_compacted_primary_file(key.as_str()) { return Ok(None); }
+        if !terminal_name(key.as_str()) { return Ok(None); }
         let gate = self.lock()?;
         if self.is_terminal(key.as_str())? { return Err(Error::ConflictingObject(key.to_string())); }
         Ok(Some(gate))
@@ -176,6 +182,35 @@ impl LocalCatalogLedger {
         crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
         crate::sync_directory(parent).map_err(|error| Error::io(parent, error))?;
         self.sync_ledger()
+    }
+
+    pub(crate) fn search_attachment(&self) -> crate::Result<uuid::Uuid> {
+        let mut live = self.search_witness.lock();
+        if let Some((attachment, _)) = live.as_ref() { return Ok(*attachment); }
+        let _gate = self.lock()?;
+        let attachment = uuid::Uuid::new_v4();
+        let path = self.directory.join(format!("search-writer-{attachment}"));
+        let file = OpenOptions::new().write(true).read(true).create_new(true).open(&path)
+            .map_err(|error| Error::io(&path, error))?;
+        FileExt::lock_exclusive(&file).map_err(|error| Error::io(&path, error))?;
+        crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
+        crate::sync_directory(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
+        *live = Some((attachment, file));
+        Ok(attachment)
+    }
+
+    pub(crate) fn search_drained(&self, attachment: uuid::Uuid) -> crate::Result<bool> {
+        let path = self.directory.join(format!("search-writer-{attachment}"));
+        let file = match OpenOptions::new().write(true).read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(Error::io(&path, error)),
+        };
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(false),
+            Err(error) => Err(Error::io(path, error)),
+        }
     }
 
     pub(crate) fn install_repair_anchor(&self, next: LocalRepairAnchor) -> Result<()> {

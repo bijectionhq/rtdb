@@ -3,8 +3,8 @@ use std::{fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::Arc};
 use fs2::FileExt;
 
 use bytes::Bytes;
-use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_compacted_catalog_file, is_compacted_primary_file, is_receipt_l0_file, skipped_tx_position}, trie_retirement::InstalledRetirement};
-use rtdb_types::{Anomaly, PhysicalObjectVersion, Result, SourcePosition};
+use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_compacted_catalog_file, is_compacted_primary_file, is_receipt_l0_file, skipped_tx_position}, search_manifest::is_ranged_run, trie_retirement::InstalledRetirement};
+use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, Result, SourcePosition};
 
 use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
     log::{LogOffset, local::{physical_maximum, prefix_end, settle_prefix}}, sealing::{ClassicKeyVault, ClassicObjectKeys, ObjectCipher, UnitOperation}};
@@ -85,6 +85,21 @@ impl<'a> TrieDeletionGrant<'a> {
         }?;
         Ok(complete)
     }
+}
+
+pub(crate) async fn retire_search_run(
+    store: &dyn ObjectStore, key: &ObjectKey, cut: Option<CatalogCut>, keys: Option<&dyn ObjectCipher>,
+) -> Result<bool> {
+    if !store.defers_trie_releases() {
+        store.delete(key).await?;
+        return Ok(true);
+    }
+    let (Some(local), Some(cut)) = (store.local_maintenance_store(), cut) else { return Ok(false); };
+    let Some(gate) = local.try_lock_recovery_deletion().await? else { return Ok(false); };
+    let path = is_ranged_run(key.as_str()).then_some(key.as_str());
+    if !store.close_classic_trie_admission(cut, &[path]).await?[0] { return Ok(false); }
+    TrieDeletionGrant { store, files: vec![(key.clone(), None)], recovery_gate: Some(gate), remaining: false }
+        .erase(keys).await
 }
 
 struct ClassicLogDeletionGrant {

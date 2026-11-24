@@ -233,7 +233,7 @@ pub trait ObjectStore: Send + Sync {
         Ok(())
     }
     /// The writer registration that owns a staged search run in this residence.
-    fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> { None }
+    async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> { Ok(None) }
     /// Checks that the staged writer was superseded and its provider work drained.
     async fn search_staging_drained(&self, _owner: rtdb_format::search_manifest::SearchStagingOwner)
         -> rtdb_types::Result<bool> { Ok(false) }
@@ -658,6 +658,27 @@ impl ObjectStore for LocalStore {
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
         crate::classic_retirement::retire(self, receipt, contents).await
+    }
+
+    async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
+        use rtdb_format::search_manifest::SearchStagingOwner;
+        let Some(ledger) = self.catalog.clone() else { return Ok(None); };
+        let attachment = self.io.read(ledger, (), |ledger, _| ledger.search_attachment()).await?;
+        Ok(Some(SearchStagingOwner::Local { attachment }))
+    }
+
+    async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner)
+        -> rtdb_types::Result<bool> {
+        let (Some(ledger), rtdb_format::search_manifest::SearchStagingOwner::Local { attachment }) = (self.catalog.clone(), owner)
+            else { return Ok(false); };
+        Ok(self.io.read(ledger, attachment, |ledger, &attachment| ledger.search_drained(attachment)).await?)
+    }
+
+    fn releases_exact_search_runs(&self) -> bool { self.catalog.is_some() }
+
+    async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
+        crate::classic_retirement::retire_search_run(self, key, cut, None).await
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {

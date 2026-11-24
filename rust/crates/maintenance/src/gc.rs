@@ -70,7 +70,6 @@ pub struct TrieCollector {
     clock: CollectorClock,
     /// When this collector first saw each trie as eligible; a new collector starts empty and waits afresh.
     first_observed: Mutex<BTreeMap<(TableRef, TrieKey), i64>>,
-    first_pending_search: Mutex<BTreeMap<(TableRef, ObjectKey), i64>>,
     first_search_observed: Mutex<BTreeMap<(TableRef, [u8; 32]), i64>>,
     search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     retirements: Option<Arc<dyn TableRetirements>>,
@@ -85,7 +84,7 @@ impl TrieCollector {
     pub fn new(store: Arc<dyn ObjectStore>, partition: Arc<PartitionState>, publisher: Arc<dyn TrieDeletionPublisher>,
         observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
         config.validate()?;
-        Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), first_pending_search: Mutex::default(), search: None,
+        Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), search: None,
             retirements: None, store, partition, publisher, observer, config })
     }
 
@@ -225,28 +224,14 @@ impl TrieCollector {
 
     async fn collect_pending_search(&self, entry: &TableEntry, catalog: &TrieCatalog, durable: Option<BlockIndex>,
         cancellation: &CancellationToken) -> Result<()> {
-        use rtdb_format::search_manifest::{MAX_PENDING_BYTES, StagedSearchRun, pending_prefix};
+        use rtdb_format::search_manifest::{MAX_PENDING_BYTES, SearchStagingOwner, StagedSearchRun, pending_prefix};
         let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
         let prefix = ObjectKey::new(pending_prefix(&entry.slug))?;
         let objects = self.store.list(Some(&prefix)).await?;
         let known = catalog.search_runs(&entry.table).chain(catalog.retired_search_runs(&entry.table).filter_map(|item| item.run.as_ref()))
             .map(|run| ObjectKey::new(run.pending_key(&entry.slug)?).map_err(Anomaly::from)).collect::<Result<BTreeSet<_>>>()?;
-        let coordinated = self.store.search_staging_owner().is_some();
-        let waiting = if coordinated { objects } else {
-            let lease = self.config.reader_lease_micros()?;
-            let now = (self.clock)();
-            let mut observed = self.first_pending_search.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let seen: BTreeSet<_> = objects.iter().map(|object| &object.key).collect();
-            observed.retain(|(table, key), _| table != &entry.table || (seen.contains(key) && !known.contains(key)));
-            drop(seen);
-            objects.into_iter().filter(|object| {
-                if known.contains(&object.key) { return true; }
-                let first = *observed.entry((entry.table.clone(), object.key.clone())).or_insert(now);
-                rtdb_storage::read_lease::collection_waited(first, lease, now)
-            }).collect::<Vec<_>>()
-        };
         let mut abandoned = Vec::new();
-        for intent in waiting {
+        for intent in objects {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             if known.contains(&intent.key) {
                 self.store.delete(&intent.key).await?;
@@ -259,12 +244,8 @@ impl TrieCollector {
                 Err(rtdb_storage::Error::MissingObject(_)) => continue,
                 Err(error) => return Err(error.into()),
             };
-            let Ok(StagedSearchRun { mut run, owner }) = StagedSearchRun::decode(&bytes) else { continue; };
-            if let Some(owner) = owner {
-                if !self.store.search_staging_drained(owner).await? { continue; }
-            } else if coordinated {
-                continue;
-            }
+            let Ok(StagedSearchRun { mut run, owner: Some(owner) }) = StagedSearchRun::decode(&bytes) else { continue; };
+            if !self.store.search_staging_drained(owner).await? { continue; }
             if run.pending_key(&entry.slug)? != intent.key.as_str()
                 || durable.is_none_or(|boundary| run.blocks.last().is_none_or(|last| *last > boundary.0)) {
                 continue;
@@ -274,13 +255,14 @@ impl TrieCollector {
                 Ok(object) if object.size == run.file_size() as u64 => {}
                 Ok(_) => continue,
                 Err(rtdb_storage::Error::MissingObject(_)) => {
-                    if owner.is_some() { self.store.delete(&intent.key).await?; }
+                    self.store.delete(&intent.key).await?;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             }
             run.publication = self.store.retirement_publication(&body).await?.map(Into::into);
-            if self.store.defers_trie_releases() && run.publication.is_none() { continue; }
+            let local = matches!(owner, SearchStagingOwner::Local { .. }) && self.store.local_maintenance_store().is_some();
+            if run.publication.is_none() && !local { continue; }
             let trie = TrieKey::l0(BlockIndex(run.blocks[0]))?.to_string();
             let record = SearchRunChange { run: Some(run), retire_only: Some(true), abandon: Some(true), ..Default::default() }.to_artefact()?;
             abandoned.push(ArtefactEntry { trie_key: Some(trie), record: Some(record) });

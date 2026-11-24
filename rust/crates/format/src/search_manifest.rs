@@ -47,12 +47,12 @@ impl SearchRun {
 
 pub const MAX_PENDING_BYTES: usize = 40 * 1024;
 
-const STAGE_PREFIX: &[u8] = b"RTDB-search-stage\0";
+const STAGE_PREFIX: &[u8] = b"RTDB-search-stage-v2\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SearchStagingOwner {
-    pub region: uuid::Uuid,
-    pub writer_epoch: u64,
+pub enum SearchStagingOwner {
+    Directory { region: uuid::Uuid, writer_epoch: u64 },
+    Local { attachment: uuid::Uuid },
 }
 
 pub struct StagedSearchRun {
@@ -65,10 +65,14 @@ impl StagedSearchRun {
         Self::validate(&self.run)?;
         let mut bytes = STAGE_PREFIX.to_vec();
         match self.owner {
-            Some(owner) if !owner.region.is_nil() && owner.writer_epoch > 0 => {
+            Some(SearchStagingOwner::Directory { region, writer_epoch }) if !region.is_nil() && writer_epoch > 0 => {
                 bytes.push(1);
-                bytes.extend_from_slice(owner.region.as_bytes());
-                bytes.extend_from_slice(&owner.writer_epoch.to_be_bytes());
+                bytes.extend_from_slice(region.as_bytes());
+                bytes.extend_from_slice(&writer_epoch.to_be_bytes());
+            }
+            Some(SearchStagingOwner::Local { attachment }) if !attachment.is_nil() => {
+                bytes.push(2);
+                bytes.extend_from_slice(attachment.as_bytes());
             }
             Some(_) => return Err(invalid("Search upload intent has invalid writer custody")),
             None => bytes.push(0),
@@ -89,7 +93,13 @@ impl StagedSearchRun {
                 let (epoch, bytes) = bytes.split_first_chunk::<8>().ok_or_else(malformed)?;
                 let (region, writer_epoch) = (uuid::Uuid::from_bytes(*region), u64::from_be_bytes(*epoch));
                 if region.is_nil() || writer_epoch == 0 { return Err(malformed()); }
-                (Some(SearchStagingOwner { region, writer_epoch }), bytes)
+                (Some(SearchStagingOwner::Directory { region, writer_epoch }), bytes)
+            }
+            2 => {
+                let (attachment, bytes) = bytes.split_first_chunk::<16>().ok_or_else(malformed)?;
+                let attachment = uuid::Uuid::from_bytes(*attachment);
+                if attachment.is_nil() { return Err(malformed()); }
+                (Some(SearchStagingOwner::Local { attachment }), bytes)
             }
             _ => return Err(malformed()),
         };

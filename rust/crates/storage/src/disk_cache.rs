@@ -329,8 +329,8 @@ impl ObjectStore for DiskCachedStore {
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
         self.remote.release_trie_files(receipt, contents).await
     }
-    fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> {
-        self.remote.search_staging_owner()
+    async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
+        self.remote.search_staging_owner().await
     }
     async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> rtdb_types::Result<bool> {
         self.remote.search_staging_drained(owner).await

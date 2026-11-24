@@ -193,3 +193,14 @@ whose complete claim omits the file does not prevent settlement. Before the
 grant can withdraw keys or unlink the file, it synchronizes a terminal
 marker for its immutable name under the same filesystem lock used by file
 creation. A later admission cannot claim a terminal primary at a new cut.
+
+## Search staging drain
+
+A coordinated Classic filesystem discloses a fresh writer attachment only
+after synchronizing its locked witness. Admitted writes retain that
+attachment through provider work. A collector can order abandonment only
+after it acquires the exact witness exclusively or, for a directory-managed
+upload, after the original epoch and region have drained. It does not infer
+abandonment from the first time it observed an intent. Classic local
+allocated search runs use the same catalog claim, recovery gate and terminal
+name as primary-file retirement.
