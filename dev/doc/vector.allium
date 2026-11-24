@@ -64,6 +64,8 @@ entity ProbePlan {
 -- An IID scope from another accelerator small enough to rank exactly leaves the scan exact.
 -- Each generation probes its eligible clusters nearest centroid first; the recall target sets the starting probe fraction and shortlist.
 -- The shortlist keeps the nearest distinct IIDs by unit-vector distance across generations and the frontier.
+-- One funded score per distinct IID stays available for subsequent rounds, including IIDs omitted from a narrower round.
+-- The scan uses exact ranking if another distinct IID would exceed the funded score bound.
 -- The scan's verifier resolves the shortlist at the read cut and applies every predicate of the scan.
 -- Fewer visible candidates than the limit double the probe fraction and the shortlist until the limit is met, every cluster and row has been considered, or the shortlist would exceed its budget and the scan ranks exactly.
 -- The scan reads only the shortlisted IIDs, resolves their visible versions and computes the exact COSINE_DISTANCE on their stored vectors.

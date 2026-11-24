@@ -94,6 +94,32 @@ fn scrub_documents(documents: &mut Vec<LogicalDocument>, erases: &Erases) -> boo
     documents.len() < before
 }
 
+fn keep_merge_document(
+    documents: &mut BTreeMap<(Iid, usize, TextRevision), LogicalDocument>, erases: &Erases, document: LogicalDocument,
+) -> Result<()> {
+    use std::collections::btree_map::Entry;
+
+    if erases.get(&document.iid).is_some_and(|erase| document.position < *erase) {
+        return Ok(());
+    }
+    match documents.entry((document.iid, document.field, document.revision)) {
+        Entry::Vacant(entry) => { entry.insert(document); },
+        Entry::Occupied(mut entry) => {
+            let prior = entry.get();
+            require_matching_revision(prior, &document)?;
+            if document.position > prior.position { entry.insert(document); }
+        },
+    }
+    Ok(())
+}
+
+fn require_matching_revision(left: &LogicalDocument, right: &LogicalDocument) -> Result<()> {
+    if left.tokens != right.tokens || left.sql_id != right.sql_id {
+        return Err(fault("A logical text revision has conflicting witnesses"));
+    }
+    Ok(())
+}
+
 fn needs_order_replay(run: &SearchRun) -> bool { run.allocation.is_none() && run.has_erases() }
 
 fn revision_hasher(analyzer: rtdb_text::Analyzer) -> Sha256 {
@@ -843,15 +869,24 @@ impl SearchBuilder {
         let mut contents = RunContents::default();
         let bytes = inputs.iter().map(|run| run.file_size()).sum::<i64>().saturating_mul(4);
         let indexing = self.memory.reserve(indexing_allowance(bytes))?;
+        let mut files = Vec::with_capacity(inputs.len());
         for run in inputs {
             if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
             let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
-            contents.documents.extend(file.documents().await?);
             if run.has_erases() {
                 let (erases, _charge) = file.erases(&self.memory).await?;
                 extend_erases(&mut contents.erases, erases);
             }
+            files.push(file);
         }
+        let mut documents = BTreeMap::new();
+        for file in files {
+            file.visit_documents(|document| {
+                if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+                keep_merge_document(&mut documents, &contents.erases, document)
+            }).await?;
+        }
+        contents.documents = documents.into_values().collect();
         let receipt = inputs[0].source_receipt.clone().map(|mut receipt| {
             receipt.blocks.clone_from(&blocks);
             receipt.source_rows = Some(source_rows);
@@ -870,8 +905,7 @@ impl SearchBuilder {
         contents.documents.sort_unstable_by_key(|doc| (id(doc), std::cmp::Reverse(doc.position)));
         for pair in contents.documents.windows(2) {
             let (a, b) = (&pair[0], &pair[1]);
-            if (a.iid, a.field, a.revision) == (b.iid, b.field, b.revision)
-                && (a.tokens != b.tokens || a.sql_id != b.sql_id) { return Err(fault("A logical text revision has conflicting witnesses")); }
+            if id(a) == id(b) { require_matching_revision(a, b)?; }
         }
         contents.documents.dedup_by_key(|doc| id(doc));
         let mut rows: Vec<_> = contents.documents.into_iter().map(MergedRow::Document)
@@ -979,6 +1013,32 @@ mod tests {
 
     const REPLAY_THROUGH: ReplicaPosition = ReplicaPosition(17);
     const TEST_STORAGE: (StorageVersion, StorageEpoch) = (StorageVersion(6), StorageEpoch(0));
+
+    #[test]
+    fn merge_keeps_latest_matching_witness_after_the_erase() -> Result<()> {
+        let iid = Iid([7; 16]);
+        let revision = [4; 32];
+        let doc = |time, text| LogicalDocument {
+            iid,
+            sql_id: Some(9),
+            field: 0,
+            revision,
+            tokens: arrow_array::StringArray::from(vec![text]),
+            position: (Timestamp(time), None, 0),
+        };
+        let erases = BTreeMap::from([(iid, (Timestamp(2), None, 0))]);
+        let mut documents = BTreeMap::new();
+        keep_merge_document(&mut documents, &erases, doc(1, "erased"))?;
+        assert!(documents.is_empty());
+        keep_merge_document(&mut documents, &erases, doc(2, "survives"))?;
+        keep_merge_document(&mut documents, &erases, doc(4, "survives"))?;
+        keep_merge_document(&mut documents, &erases, doc(3, "survives"))?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[&(iid, 0, revision)].position.0, Timestamp(4));
+        assert!(keep_merge_document(&mut documents, &erases, doc(5, "conflict")).is_err());
+        assert_eq!(documents[&(iid, 0, revision)].position.0, Timestamp(4));
+        Ok(())
+    }
 
     struct TableReplay(Vec<EventBatch>);
 

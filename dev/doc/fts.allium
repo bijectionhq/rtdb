@@ -383,6 +383,8 @@ rule RepairUnreadableSearchFile {
 -- A ranked point scan with an explicit IID scope of at most 128 resolves that scope through table history and scores the resolved rows directly.
 -- Other logical scans intersect the authenticated routes of every required term, starting with the term with the smallest recorded document frequency.
 -- A sparse logical conjunction expands the rarest required term's posting directory first and intersects occurrences before reading phrase positions.
+-- Term lookups can share a validated directory traversal while retaining the requested positions of both repeated and missing terms.
+-- A logical run merge reads bounded document and token page pairs and retains the surviving witnesses under the merged erase frontier.
 -- Dense posting runs expand score-bounded windows in priority order.
 -- A missing or unreadable term directory schedules repair and uses each run's authenticated locator for term membership.
 --
