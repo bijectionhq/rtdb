@@ -375,6 +375,24 @@ Position zero masks all assertions in the selected commit.
 Erasure fences and erase events apply to the masked read.
 The point response has the same coordinates as the unmasked historical point.
 
+The ordinary owned endpoint accepts `x-rtdb-owned-ipc: stream-v1` for actions returning a single raw Arrow IPC stream.
+If the owner echoes the header, each Flight result contains one complete Arrow IPC message from the original response, followed by a separate eight-byte IPC end marker.
+The audience endpoint and actions with control envelopes use their existing framing.
+
+`rtdb.owned.ReadPoints.v1` accepts two to 256 held point entries.
+Selectors 0 through 7 map to held Root v2, fixed Root, historical Root, positioned Root, held world v2, earlier accepted world, archived Root parent, and held Root publication cut points in that order.
+`rtdb.owned.ReadRanges.v1` accepts two to 32 held range entries.
+Selectors 0 through 3 map to `ReadHeldRange` v1 through v4 in version order.
+Selectors 4 through 7 map to held world parent, held world overlay, archived Root parent, and earlier accepted world overlay ranges in that order.
+Both actions start with a two-byte big-endian count.
+Each entry contains a one-byte selector, a four-byte big-endian length and the complete corresponding scalar request body.
+The full request is bounded to 2 MiB.
+Initial response metadata acknowledges the batch with `x-rtdb-owned-points: v1` or `x-rtdb-owned-ranges: v1`.
+The owner executes the entries in request order and streams the unchanged Arrow IPC reply for each successful entry.
+The first refusal terminates the stream with its scalar status, and dropping the stream cancels further work.
+Fresh replica sessions admit the same Root selectors as their scalar actions.
+Prepared audience sessions retain their scalar allowances.
+
 Send `rtdb.owned.CloseRead.v1` with only the 16 handle bytes to release it.
 Close success has zero Flight results.
 

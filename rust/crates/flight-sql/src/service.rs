@@ -105,7 +105,7 @@ impl Call {
         Ok(())
     }
 
-    fn handoff_action(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<(), Status> {
+    pub(crate) fn handoff_action(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<(), Status> {
         let handoff = || self.handoff(grant, relay);
         if self.session.audience_source().is_some() {
             self.session.with_audience_handoff(matches!(self.kind, CallKind::AudienceCleanup), handoff)
@@ -487,6 +487,16 @@ pub(crate) async fn action_result_stream(
     plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
 ) -> Result<Response<Output<flight::Result>>, Status> {
     if !values.iter().any(Result::is_ok) { return result_stream(call, values); }
+    handoff_action_results(call, values, plaintext).await
+}
+
+pub(crate) async fn handoff_action_results<I>(
+    call: Call, values: I, plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
+) -> Result<Response<Output<flight::Result>>, Status>
+where
+    I: IntoIterator<Item = Result<flight::Result, Status>>,
+    I::IntoIter: Send + 'static,
+{
     let first = call.cancellation.run_until_cancelled(plaintext.grant()).await.ok_or_else(cancelled)?.map_err(status)?;
     let (headers, cutoff) = call.delivery_headers(&first, false)?;
     let stream: Output<flight::Result> = Box::pin(futures::stream::unfold(
@@ -573,7 +583,9 @@ impl FlightService for Service {
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let kind = CallKind::action(self.0.audience.is_some(), &request.get_ref().r#type);
         let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
-        self.action(call, request.into_inner()).await
+        let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)
+            .is_some_and(|encoding| encoding == "stream-v1");
+        self.action(call, request.into_inner(), ipc_stream).await
     }
 }
 

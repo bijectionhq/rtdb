@@ -1900,6 +1900,119 @@ async fn owned_arrow_writes_refuse_a_decimal_coefficient_outside_declared_precis
 }
 
 #[tokio::test]
+async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order() {
+    use arrow_array::{ArrayRef, ListArray, builder::{ListBuilder, StringBuilder}};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    fn request(prefix: &[u8], columns: Vec<(&str, ArrayRef)>) -> Bytes {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let mut body = prefix.to_vec();
+        body.extend(write_arrow_stream(batch.schema_ref(), &[batch.clone()], IpcWriteOptions::default()).unwrap());
+        body.into()
+    }
+
+    fn batch(entries: &[(u8, &Bytes)]) -> Bytes {
+        let mut frame = (entries.len() as u16).to_be_bytes().to_vec();
+        for (selector, body) in entries {
+            frame.push(*selector);
+            frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            frame.extend_from_slice(body);
+        }
+        frame.into()
+    }
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let relation = b"\0\x05items";
+    let mut schema = relation.to_vec();
+    schema.extend_from_slice(br#"{"fields":[{"name":"value","type":{"kind":"i64"},"optional":false,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
+    let mut columns = ListBuilder::new(StringBuilder::new());
+    columns.values().append_value("value");
+    columns.values().append_value("_id");
+    columns.append(true);
+    let columns: ListArray = columns.finish();
+    client.action("rtdb.owned.DeclarePath.v1", request(relation, vec![
+        ("_id", Arc::new(StringArray::from(vec!["by_value"]))),
+        ("columns", Arc::new(columns)),
+    ])).await.unwrap();
+
+    client.action("rtdb.owned.Create.v1", request(relation, vec![
+        ("_id", Arc::new(Int64Array::from(vec![1]))),
+        ("value", Arc::new(Int64Array::from(vec![9]))),
+    ])).await.unwrap();
+
+    let database = running.node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.build_artefacts().await.unwrap();
+
+    let hold = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap()[0].body.slice(..16);
+    let point_prefix = [hold.as_ref(), relation].concat();
+    let point = |id| request(&point_prefix, vec![
+        ("_id", Arc::new(Int64Array::from(vec![id]))),
+        ("valid_micros", Arc::new(Int64Array::from(vec![None]))),
+    ]);
+    let (present, missing) = (point(1), point(2));
+    let scalar_point = "rtdb.owned.ReadHeldPoint.v2";
+    let points = "rtdb.owned.ReadPoints.v1";
+    let scalar_missing = client.action(scalar_point, missing.clone()).await.unwrap().remove(0).body;
+    let scalar_present = client.action(scalar_point, present.clone()).await.unwrap().remove(0).body;
+    assert_ne!(scalar_present, scalar_missing);
+
+    let input = client.request(Action { r#type: points.into(), body: batch(&[(0, &missing), (0, &present)]) });
+    let reply = client.client.do_action(input).await.unwrap();
+    assert_eq!(reply.metadata().get("x-rtdb-owned-points").unwrap(), "v1");
+    let mut stream = reply.into_inner();
+    assert_eq!(stream.message().await.unwrap().unwrap().body, scalar_missing);
+    assert_eq!(stream.message().await.unwrap().unwrap().body, scalar_present);
+    assert!(stream.message().await.unwrap().is_none());
+
+    let unknown = Bytes::from(vec![0; 16]);
+    let scalar_failure = client.action(scalar_point, unknown.clone()).await.unwrap_err();
+    let input = client.request(Action { r#type: points.into(), body: batch(&[(0, &present), (0, &unknown), (0, &missing)]) });
+    let mut stream = client.client.do_action(input).await.unwrap().into_inner();
+    assert_eq!(stream.message().await.unwrap().unwrap().body, scalar_present);
+    let failure = stream.message().await.unwrap_err();
+    assert_eq!((failure.code(), failure.message()), (scalar_failure.code(), scalar_failure.message()));
+
+    let mut foreign = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let failure = foreign.action(points, batch(&[(0, &present), (0, &missing)])).await.unwrap_err();
+    assert_eq!(failure.code(), tonic::Code::NotFound);
+    drop(foreign);
+
+    let range_prefix = [hold.as_ref(), relation].concat();
+    let range = |lower| request(&range_prefix, vec![
+        ("path", Arc::new(StringArray::from(vec!["by_value"]))),
+        ("lower", Arc::new(Int64Array::from(vec![lower]))),
+        ("upper", Arc::new(Int64Array::from(vec![None]))),
+        ("limit", Arc::new(Int64Array::from(vec![2]))),
+    ]);
+    let scalar_range = "rtdb.owned.ReadHeldRange.v1";
+    let scalar = client.action(scalar_range, range(8)).await.unwrap().remove(0).body;
+    let input = client.request(Action { r#type: "rtdb.owned.ReadRanges.v1".into(), body: batch(&[(0, &range(8)), (0, &range(10))]) });
+    let reply = client.client.do_action(input).await.unwrap();
+    assert_eq!(reply.metadata().get("x-rtdb-owned-ranges").unwrap(), "v1");
+    let replies: Vec<_> = reply.into_inner().try_collect().await.unwrap();
+    assert_eq!(replies.len(), 2);
+    assert_ne!(replies[0].body, replies[1].body);
+    assert_eq!(replies[0].body, scalar);
+    assert_eq!(replies[1].body, client.action(scalar_range, range(10)).await.unwrap()[0].body);
+
+    let mut input = client.request(Action { r#type: scalar_point.into(), body: present });
+    input.metadata_mut().insert("x-rtdb-owned-ipc", "stream-v1".parse().unwrap());
+    let reply = client.client.do_action(input).await.unwrap();
+    assert_eq!(reply.metadata().get("x-rtdb-owned-ipc").unwrap(), "stream-v1");
+    let frames: Vec<_> = reply.into_inner().try_collect().await.unwrap();
+    assert!(frames.len() > 2);
+    assert_eq!(frames.iter().flat_map(|frame| frame.body.iter().copied()).collect::<Vec<_>>(), scalar_present.as_ref());
+
+    client.action("rtdb.owned.CloseRead.v1", hold).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn world_flight_actions_require_a_placed_world_host() {
     let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;

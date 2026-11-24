@@ -130,6 +130,11 @@
 -- The commit checks every observation at the ordering cut and publishes the page atomically.
 -- A placed hosted import decision may carry one Arrow batch for several ordered runs on the same Root relation.
 -- Its schedule restores each run at its original position among inline effects and reconstructs field presence before ordering.
+-- An ordinary Flight caller can submit a bounded ordered sequence of held point or range requests in one action.
+-- Each entry uses its scalar action's admission, held cut, authorization and delivery fence.
+-- The owner streams one scalar IPC reply per successful entry and terminates at the first refusal with that entry's scalar status.
+-- Fresh Flight readers can batch the Root selectors admitted by their route.
+-- An ordinary Flight caller can opt into Arrow IPC message framing for a raw owned reply.
 -- A historical point uses the held catalog and the same identity registry within the admitted cut and its requested system-time cap.
 -- The relation journal certifies historical point coverage, and incomplete coverage refuses the read.
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.

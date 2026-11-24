@@ -1,3 +1,5 @@
+mod owned_batch;
+
 use std::{collections::BTreeMap, sync::Arc};
 use arrow_flight::{Action, Result as ActionResult, sql::{Any, ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest, ActionEndTransactionRequest, EndTransaction, ProstMessageExt}};
 use arrow_schema::{DataType, Field, Schema};
@@ -6,11 +8,15 @@ use prost::Message;
 use rtdb_node::LastSubmittedTx;
 use tonic::{Response, Status};
 use uuid::Uuid;
+pub(crate) use owned_batch::OWNED_IPC_HEADER;
+
 use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, action_result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
 
 fn fresh_replica_action(action: &str) -> bool {
     use crate::owned_actions::*;
     matches!(action, CLOSE_SESSION
+        | owned_batch::READ_POINTS
+        | owned_batch::READ_RANGES
         | OWNED_SPATIAL_READINESS_V1
         | OBSERVE_HELD_HOSTED_V1
         | CONFIRM_APPLIED_HOSTED_V6
@@ -68,13 +74,24 @@ fn fresh_replica_action(action: &str) -> bool {
 }
 
 impl Service {
-    pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
+    pub async fn action(&self, call: Call, action: Action, ipc_stream: bool) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
         use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, HELD_TABLE_PUBLICATION_SEQUENCE_V1, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V3};
         use rtdb_storage::audience_work;
         if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
             return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
         }
+        if let Some(batch) = owned_batch::BatchKind::for_action(&action.r#type) {
+            if call.session.audience_source().is_some() {
+                return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
+            }
+            if !self.0.config.owned_native_actions {
+                return Err(call.error(unsupported()));
+            }
+            return self.held_read_batch(call, batch, action.body).await;
+        }
+        let ipc_stream = ipc_stream && action.r#type.starts_with("rtdb.owned.")
+            && call.session.audience_source().is_none();
         let turn = if call.session.audience_source().is_some() {
             let admit = || -> Result<_, Status> {
                 Ok(match action.r#type.as_str() {
@@ -387,7 +404,7 @@ impl Service {
             }
         };
         let plaintext = rtdb_storage::sealing::PlaintextView::new(Arc::clone(call.memory()));
-        let results = call.cancellation.run_until_cancelled(plaintext.reading(work)).await
+        let mut results = call.cancellation.run_until_cancelled(plaintext.reading(work)).await
             .ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
         if call.session.audience_source().is_some()
             && (results.len() > 1 || results.iter().any(|result| result.as_ref().is_ok_and(|reply|
@@ -395,7 +412,16 @@ impl Service {
         {
             return Err(call.error(Status::resource_exhausted("The audience reply exceeds its transport allowance")));
         }
-        self.publish(); action_result_stream(call, results, plaintext).await
+        self.publish();
+        if ipc_stream && matches!(results.as_slice(), [Ok(reply)] if owned_batch::is_ipc_stream(&reply.body)) {
+            let reply = results.pop().expect("one action result")?;
+            let mut response = crate::service::handoff_action_results(
+                call, owned_batch::IpcFrames(reply.body), plaintext,
+            ).await?;
+            response.metadata_mut().insert(OWNED_IPC_HEADER, "stream-v1".parse().expect("static metadata"));
+            return Ok(response);
+        }
+        action_result_stream(call, results, plaintext).await
     }
     fn claim_transaction(&self, call: &Call, handle: &Bytes) -> Result<Arc<Transaction>, Status> {
         self.transaction(call, handle)?; found(self.0.transactions.take(handle), "transaction")
