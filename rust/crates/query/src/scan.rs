@@ -20,7 +20,7 @@ use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, sele
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
 use crate::columnar::BatchCursor;
-use crate::{ConstantEvaluator, PreparedSearchQuery, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
+use crate::{CandidateIids, ConstantEvaluator, PreparedSearchQuery, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
 struct DataFile {
     storage: Arc<BufferPool>,
@@ -1255,14 +1255,13 @@ impl crate::columnar::BatchCursor for OrderedPayload {
         while self.remaining != 0 {
             self.execution.context.check_cancelled()?;
             let Some(candidates) = self.candidates.as_mut() else { return Ok(None) };
-            let ids = candidates.next_iids(self.remaining.saturating_add(self.skip)).await?;
-            if ids.is_empty() {
+            let Some(ids) = candidates.next_iids(self.remaining.saturating_add(self.skip)).await? else {
                 self.candidates = None;
                 self.source = None;
                 self.found = Default::default();
                 self.join_memory = None;
                 return Ok(None);
-            }
+            };
             let bytes = ids.len().saturating_mul(256);
             match self.join_memory.as_mut() {
                 Some(charge) if charge.bytes() < bytes =>
@@ -1274,24 +1273,27 @@ impl crate::columnar::BatchCursor for OrderedPayload {
             let [snapshot] = database.partitions.as_slice() else {
                 unreachable!("ordered acceleration requires one partition");
             };
-            let mut sorted = ids.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            let mut point = None;
-            if sorted.len() <= 128 && self.execution.context.catalog.owned_position_mask.is_none() {
-                let keys: BTreeSet<_> = sorted.iter().copied().collect();
+            let point_scan = self.execution.context.catalog.owned_position_mask.is_none().then(|| {
                 let mut scan = self.scan.clone();
+                let mut keys = BTreeSet::new();
+                for iid in ids.iter() { keys.insert(iid); }
                 scan.iids = Some(keys);
+                scan
+            });
+            let mut point = None;
+            if let Some(scan) = &point_scan
+                && let Some(keys) = scan.iids.as_ref().filter(|keys| keys.len() <= 128)
+            {
                 let bounds = match &self.source {
                     Some(source) => source.bounds,
-                    None => bounds(&scan, snapshot, &self.execution).await?,
+                    None => bounds(scan, snapshot, &self.execution).await?,
                 };
                 if bounds.valid_time.is_point() && bounds.system_time.is_point() {
                     let search_queries = SearchQueries::default();
                     let constants = &ExecutionConstants { execution: &self.execution, search_queries: &search_queries };
-                    let verifier = ScanVerifier { scan: &scan, execution: &self.execution, constants, pushdowns: None,
+                    let verifier = ScanVerifier { scan, execution: &self.execution, constants, pushdowns: None,
                         partition: snapshot, storage: &database.storage, canonical_entity_iids: false, counts: Default::default() };
-                    point = verifier.point_batch(&scan, bounds, &database.partitions, scan.iids.as_ref().unwrap()).await?;
+                    point = verifier.point_batch(scan, bounds, &database.partitions, keys).await?;
                 }
             }
             let mut batches = Vec::new();
@@ -1303,9 +1305,14 @@ impl crate::columnar::BatchCursor for OrderedPayload {
                         self.scan.clone(), self.execution.clone(), read_bounds, None, false, None)));
                 }
                 let source = self.source.as_mut().unwrap();
-                source.reset_candidates(crate::CandidateIids::from_sorted(&sorted, memory)?);
+                let membership = match point_scan.and_then(|scan| scan.iids) {
+                    Some(keys) => CandidateIids::from_set(keys, memory)?,
+                    None => ids.sorted_membership(memory)?,
+                };
+                source.reset_candidates(membership);
                 Some(source)
             } else {
+                drop(point_scan);
                 None
             };
             let mut source = source;
@@ -1335,7 +1342,7 @@ impl crate::columnar::BatchCursor for OrderedPayload {
             }
             if let Some(source) = source { source.candidate_iids = None; }
             let mut order = Vec::with_capacity(ids.len().min(self.remaining));
-            for iid in ids {
+            for iid in ids.iter() {
                 match self.found.remove(&iid) {
                     None if !self.verify => return Err(invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis")),
                     None | Some(None) => continue,
@@ -1346,15 +1353,19 @@ impl crate::columnar::BatchCursor for OrderedPayload {
                     }
                 }
             }
+            drop(ids);
             if !order.is_empty() {
                 self.remaining -= order.len();
+                let batch = ColumnBatch::take_rows(&batches, &order, &self.projection, memory);
                 if self.remaining == 0 {
+                    drop(order);
+                    drop(batches);
                     self.candidates = None;
                     self.source = None;
                     self.found = Default::default();
                     self.join_memory = None;
                 }
-                return ColumnBatch::take_rows(&batches, &order, &self.projection, memory).map(Some);
+                return batch.map(Some);
             }
         }
         Ok(None)
