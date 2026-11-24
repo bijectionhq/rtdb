@@ -159,7 +159,8 @@ impl CommitEffects {
 
     fn allows_erase(self, relation: &OwnedRelation) -> bool {
         relation.is_root_data() && (matches!(self, Self::Replay | Self::FamilyFence)
-            || matches!(self, Self::HostedRoot) && relation.name() == SHARED_COLUMN_CARRIERS)
+            || matches!(self, Self::HostedRoot)
+                && (relation.name() == SHARED_COLUMN_CARRIERS || relation.name().ends_with("_search")))
     }
 }
 

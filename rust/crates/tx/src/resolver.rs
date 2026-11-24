@@ -754,7 +754,7 @@ pub struct OpenTransaction<'a> {
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
-    family_fence_admitted: bool,
+    search_erasure_admitted: bool,
     placed_attempt: Option<PlacedAttempt>,
     decision: Option<crate::DecisionObservation>,
     clock_slot: Option<crate::OwnedClockSlot>,
@@ -762,7 +762,7 @@ pub struct OpenTransaction<'a> {
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, family_fence_admitted: false, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -2579,6 +2579,7 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         self.check_shared_column_retirement(owner, operations, archive_replay).await?;
+        self.check_shared_search_erasure(owner, operations, archive_replay).await?;
         self.claim_assertion_family_fences(owner, operations, archive_replay).await
     }
 
@@ -2848,9 +2849,9 @@ impl<'a> OpenTransaction<'a> {
             }
             rtdb_types::OwnedChangeKind::Expired(original)
         } else { kind };
-        // The original vault verified every selector. The same source writes the
-        // held search revocation marker and the relation's purge frontier.
-        if !(self.family_fence_admitted && crate::hosted_control::family_root_erase(relation)) {
+        // The admitted erasure names every selector and writes the held
+        // search revocation marker and the relation's purge frontier.
+        if !(self.search_erasure_admitted && crate::hosted_control::family_root_erase(relation)) {
             let search = OwnedRelation::search_catalog(owner);
             if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
                 while let Some(batch) = rows.next_batch().await? {

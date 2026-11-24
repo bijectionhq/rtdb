@@ -25,6 +25,8 @@ fn invalid_family_fence() -> Anomaly {
 }
 
 const SHARED_COLUMN_RETIREMENTS: &str = "fact_unit_column_retirements";
+const SEALED_SEARCH_UNIT_ROWS: &str = "fact_sealed_search_unit_rows";
+const MAX_SEALED_UNIT_ROWS: usize = 2048;
 
 fn invalid_shared_retirement() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/shared-column-retirement", "Invalid ordered shared-column retirement")
@@ -239,6 +241,110 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
+    pub(super) async fn check_shared_search_erasure(
+        &mut self, owner: &str, operations: &[Operation], replay: bool,
+    ) -> Result<()> {
+        if replay || operations.iter().any(|operation| matches!(operation,
+            Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker()
+        )) || !operations.iter().any(|operation| matches!(operation,
+            Operation::Public(TxOp::OwnedErase { relation, .. }) if crate::hosted_control::family_root_erase(relation)
+        )) {
+            return Ok(());
+        }
+        let invalid = || Anomaly::incorrect("rtdb.owned/shared-search-retirement", "Invalid ordered shared search retirement");
+        let _scratch = self.context.memory.reserve(operations.len().saturating_mul(96))?;
+        let mut erases = BTreeMap::<&str, BTreeSet<&str>>::new();
+        let mut count = 0;
+        let mut markers = BTreeSet::new();
+        let mut unit = None;
+        let mut creates = None;
+        let mut witness = 0;
+        let mut receipt = false;
+        for operation in operations {
+            match operation {
+                Operation::Public(TxOp::HostedControl(control)) => {
+                    receipt |= control.name() == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE && !control.is_check();
+                },
+                Operation::Public(TxOp::OwnedErase { relation, id: EntityId::String(id) })
+                    if crate::hosted_control::family_root_erase(relation) => {
+                    if !erases.entry(relation.name()).or_default().insert(id) || count == MAX_SEALED_UNIT_ROWS {
+                        return Err(invalid());
+                    }
+                    count += 1;
+                },
+                Operation::Public(TxOp::OwnedErase { .. }) => return Err(invalid()),
+                Operation::Public(TxOp::OwnedCheckRange { relation, .. }) if relation.name() == SEALED_SEARCH_UNIT_ROWS =>
+                    witness += 1,
+                Operation::Public(TxOp::OwnedCheck { relation, id: EntityId::String(alias), expected, valid_at })
+                    if relation.name() == "fact_unit_fences" => {
+                    if unit.replace((alias.as_str(), expected.is_some(), *valid_at)).is_some()
+                        || alias.len() != 64 || !alias.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                    {
+                        return Err(invalid());
+                    }
+                },
+                _ => {
+                    let Some(write) = crate::hosted_control::owned_document_write(operation) else { continue; };
+                    if write.relation.name() == "fact_sealed_search_erasures" {
+                        if !crate::hosted_control::family_search_erase_marker(&write) { return Err(invalid()); }
+                        for row in write.documents.rows() {
+                            if !markers.insert(row.string_id().ok_or_else(invalid)?) { return Err(invalid()); }
+                        }
+                    } else if write.relation.name() == "fact_unit_fences" {
+                        let mut rows = write.documents.rows();
+                        let row = rows.next().ok_or_else(invalid)?;
+                        if !write.create_only || write.from != Some(Timestamp::MIN)
+                            || !matches!(write.to, None | Some(Timestamp::MAX)) || rows.next().is_some()
+                            || row.binary("unit_phase", invalid)? != Some(b"BFU1\x01")
+                            || creates.replace(row.string_id().ok_or_else(invalid)?).is_some()
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                },
+            }
+        }
+        if witness != 1 || !receipt || !markers.into_iter().eq(erases.keys().copied()) {
+            return Err(invalid());
+        }
+        let (alias, existing, valid) = unit.ok_or_else(invalid)?;
+        if existing {
+            if creates.is_some() { return Err(invalid()); }
+            let fence = self.root_point(owner, &OwnedRelation::new("fact_unit_fences")?,
+                &EntityId::String(alias.to_owned()), valid, invalid).await?;
+            if ArrowCell::named(fence.batch(), "unit_phase", 0).and_then(ArrowCell::binary) != Some(b"BFU1\x01") {
+                return Err(invalid());
+            }
+        } else if creates != Some(alias) {
+            return Err(invalid());
+        }
+        let prefix = format!("{alias}/");
+        let ordered = self.tx_key().system_time;
+        let context = self.context.query_context(
+            self.buffer.base_snapshot().clone(), ordered, &self.options.default_tz, self.trace_parent,
+        )?;
+        let mut inventory = rtdb_query::open_owned_root_prefix_projection(
+            Arc::clone(&context), owner, &OwnedRelation::new(SEALED_SEARCH_UNIT_ROWS)?, ordered,
+            &["_id"], rtdb_columnar::EntityIdRef::String(&prefix),
+        ).await?.ok_or_else(invalid)?;
+        while let Some(held) = inventory.next_batch().await? {
+            let batch = held.batch();
+            let (index, field) = batch.schema_ref().column_with_name("_id").ok_or_else(invalid)?;
+            for row in 0..batch.num_rows() {
+                context.check_cancelled_at(row)?;
+                let rtdb_columnar::EntityIdRef::String(key) =
+                    rtdb_columnar::read_owned_entity_id(field, batch.column(index).as_ref(), row)?
+                else { return Err(invalid()); };
+                let (relation, id) = key.strip_prefix(&prefix)
+                    .and_then(|key| key.split_once('/')).ok_or_else(invalid)?;
+                if !erases.get_mut(relation).is_some_and(|ids| ids.remove(id)) { return Err(invalid()); }
+            }
+        }
+        if erases.values().any(|ids| !ids.is_empty()) { return Err(invalid()); }
+        self.search_erasure_admitted = true;
+        Ok(())
+    }
+
     pub(super) async fn claim_assertion_family_fences(
         &mut self, owner: &str, operations: &[Operation], replay: bool,
     ) -> Result<()> {
@@ -318,7 +424,7 @@ impl OpenTransaction<'_> {
             database: &self.context.database, attempt, durable_predecessor: self.buffer.base_snapshot().tx_basis(),
             family, marker, winner, root_carrier, root_erases: &root_erases,
         }).await?;
-        self.family_fence_admitted = true;
+        self.search_erasure_admitted = true;
         Ok(())
     }
 
@@ -482,7 +588,8 @@ impl OpenTransaction<'_> {
                         | TxOp::HostedControl(_)
                 ) | Operation::OwnedWriteIids { .. } | Operation::OwnedArrowIids { .. }
             ) || ((family_fence || replay.is_some()) && matches!(operation, Operation::Public(TxOp::OwnedErase { .. })))
-                || matches!(operation, Operation::Public(TxOp::OwnedErase { relation, .. }) if relation.name() == SHARED_COLUMN_CARRIERS)
+                || matches!(operation, Operation::Public(TxOp::OwnedErase { relation, .. })
+                    if relation.name() == SHARED_COLUMN_CARRIERS || crate::hosted_control::family_root_erase(relation))
                 || (replay.is_some() && matches!(operation, Operation::Public(TxOp::OwnedReplayResidue { .. })))
         };
         if !operations
