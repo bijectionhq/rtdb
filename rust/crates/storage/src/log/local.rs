@@ -342,6 +342,13 @@ fn write_frames(writer: &mut impl Write, mut remaining: &mut [IoSlice<'_>]) -> i
 }
 
 #[cfg(test)]
+fn write_record(writer: &mut impl Write, separator: u8, payload: &[u8], timestamp: Timestamp, offset: u64) -> io::Result<()> {
+    let header = record_header(separator, payload.len(), timestamp);
+    let trailer = (offset as i64).to_be_bytes();
+    write_frames(writer, &mut [IoSlice::new(&header), IoSlice::new(payload), IoSlice::new(&trailer)])
+}
+
+#[cfg(test)]
 #[test]
 fn arrow_byte_path_vectored_record_keeps_the_payload_slice_and_wire_bytes_after_short_writes() {
     struct ShortWriter<'a> { payload: &'a [u8], output: Vec<u8>, calls: usize }
@@ -361,10 +368,7 @@ fn arrow_byte_path_vectored_record_keeps_the_payload_slice_and_wire_bytes_after_
     }
     for payload in [b"".as_slice(), b"0123456789".as_slice()] {
         let mut writer = ShortWriter { payload, output: Vec::new(), calls: 0 };
-        let header = record_header(RECORD_SEPARATOR, payload.len(), Timestamp(-3));
-        let trailer = 21_i64.to_be_bytes();
-        let mut slices = [IoSlice::new(&header), IoSlice::new(payload), IoSlice::new(&trailer)];
-        write_frames(&mut writer, &mut slices).unwrap();
+        write_record(&mut writer, RECORD_SEPARATOR, payload, Timestamp(-3), 21).unwrap();
         let mut expected = vec![0x1e];
         expected.extend((payload.len() as i32).to_be_bytes());
         expected.extend((-3_i64).to_be_bytes());

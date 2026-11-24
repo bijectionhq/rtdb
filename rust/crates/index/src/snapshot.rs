@@ -331,7 +331,7 @@ fn ordered_index_snapshot_memos_follow_the_captured_basis() {
     #[derive(Default)]
     struct Memo;
     let transaction = TransactionKey { tx_id: rtdb_types::TxId(1), system_time: Timestamp(10) };
-    let live = LiveIndex::new(BlockIndex(0), Some(transaction), TrieConfig::default());
+    let live = LiveIndex::new(BlockIndex(0), Some(transaction), rtdb_trie::TrieConfig::default());
     let snapshot = Snapshot::new(Arc::new(TrieCatalog::default()), Arc::new(TableCatalog::default()), Arc::new(live));
     let memo = snapshot.memo::<Memo>();
     assert!(Arc::ptr_eq(&memo, &snapshot.clone().memo::<Memo>()));

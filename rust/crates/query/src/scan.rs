@@ -11,7 +11,7 @@ use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
-use rtdb_format::{data::PutText, ipc::{PageDecoder, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};

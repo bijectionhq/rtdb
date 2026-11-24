@@ -12,7 +12,7 @@ use rtdb_columnar::{
 };
 use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch, keyed_put_batch};
 use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
-use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, Value};
 
 use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column_types};
 

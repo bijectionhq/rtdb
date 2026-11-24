@@ -1,7 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet}, num::NonZeroU32, sync::Arc};
 
-use arrow_array::TimestampMicrosecondArray;
-use rtdb_columnar::{EntityIdRef, read_entity_id, selected_cell};
+use rtdb_columnar::EntityIdRef;
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 

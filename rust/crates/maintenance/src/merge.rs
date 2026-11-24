@@ -682,14 +682,14 @@ mod tests {
                 },
             }
         }).collect::<Vec<_>>();
-        let schema = OutputSchema { put: fields.clone(), iid_encoding: None, recency: false, keyed: false, include_origins: false, include_positions: false, redacted_leg: false }.schema().unwrap();
+        let schema = OutputSchema { put: fields.clone(), iid_encoding: None, recency: false, keyed: false, topology: false, include_origins: false, include_positions: false, redacted_leg: false }.schema().unwrap();
         for (name, page_size) in [("split", 2), ("coalesce", 4)] {
             let directory = directory.path().join(name);
             std::fs::create_dir(&directory).unwrap();
             let config = MergeConfig { page_size, ..Default::default() };
             let data = directory.join("data.arrow");
             let meta = directory.join("meta.arrow");
-            let mut spill = MergeFile::new(directory.join("spill.arrow"), None, false, &[], &fields, false, false, false, false, &config, &memory).unwrap();
+            let mut spill = MergeFile::new(directory.join("spill.arrow"), None, false, &[], &fields, false, false, false, false, false, &config, &memory).unwrap();
             let events_in = |events: &[StoredEvent]| {
                 EventBatch::new(build_event_batch(events, fields.clone(), None).unwrap()).unwrap().page_events().unwrap()
             };

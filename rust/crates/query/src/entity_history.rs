@@ -161,7 +161,7 @@ pub(crate) fn contains(part: &[u8], iid: Iid) -> bool {
 
 pub(crate) fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "rtdb.query/cancelled", "Entity history read cancelled") }
 
-pub async fn uncovered_history_iids(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types::BlockIndex>,
+pub async fn uncovered_history_iids(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex>,
     scope: Option<crate::IidScope<'_>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
     match read_uncovered(request, covered, scope, limit).await {
         Err(error) if error.category != AnomalyCategory::Interrupted => Ok(None),
@@ -203,7 +203,7 @@ pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_for
     Ok(Some(inspected))
 }
 
-async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types::BlockIndex>,
+async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex>,
     scope: Option<crate::IidScope<'_>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
     let table = &request.scan.table.name.table;
     let mut iids = BTreeSet::new();
