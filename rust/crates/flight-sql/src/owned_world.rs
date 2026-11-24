@@ -294,7 +294,7 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<(TransactionKey, Timestamp)>>;
     fn accepted_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp,
-        system: Timestamp,
+        system: Timestamp, original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,

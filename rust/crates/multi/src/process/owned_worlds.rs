@@ -448,9 +448,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn accepted_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp,
-        system: Timestamp,
+        system: Timestamp, original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>> {
-        Box::pin(async move { HeldCheckpointWorld::accepted_point(self, relation, id, valid, system).await.map(|image| path_touch_result(system, image)) })
+        Box::pin(async move { HeldCheckpointWorld::accepted_point(self, relation, id, valid, system, original_scope).await.map(|image| path_touch_result(system, image)) })
     }
 
     fn read_point<'a>(
