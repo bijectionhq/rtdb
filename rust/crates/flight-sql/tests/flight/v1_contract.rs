@@ -1423,8 +1423,8 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
         matches!(status.role, rtdb_replication::Role::Leading(_))
     })).await.unwrap().unwrap();
     let mut client = Client::connect(&running.server, None).await;
-    let row = |id, text, vector: [f64; 2]| {
-        let embedding = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Float64Type, _, _>([
+    let row = |id, text, vector: [f32; 2]| {
+        let embedding = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>([
             Some(vector.map(Some)),
         ]);
         v1::Row {
@@ -1463,11 +1463,47 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
         ));
         request.source.as_mut().unwrap().at = Some(v1::At { selection: original.basis.clone().map(Selection::Exactly) });
         request.track = true;
+        request.require_clear_rank_input = true;
         let (rows, trailer) = query(&mut client, request).await;
         assert_eq!(ints(&rows), expected);
         assert_eq!(trailer.basis, original.basis);
         assert!(!trailer.claim.unwrap().value.is_empty());
     }
+    let mut request = input(
+        "WITH staged(_id, embedding) AS (
+             VALUES (2, ARRAY[CAST(0 AS REAL), CAST(0 AS REAL)]),
+                    (3, ARRAY[CAST(1 AS REAL), CAST(0 AS REAL)])
+         ), MATERIALIZED candidates AS (
+             SELECT _id, embedding FROM ranked_rows
+             WHERE _id NOT IN (SELECT _id FROM staged)
+             UNION ALL SELECT _id, embedding FROM staged LIMIT 4
+         ), MATERIALIZED scores AS (
+             SELECT _id, COSINE_DISTANCE_F32(embedding, $1) AS distance FROM candidates
+         ), totals AS (
+             SELECT RANK_ADMITTED_COUNT(COUNT(*), 3) AS admitted, COUNT(distance) AS total FROM scores
+         ), hits AS (
+             SELECT _id, distance FROM scores WHERE distance IS NOT NULL
+             ORDER BY distance, ENTITY_SORT_KEY(_id) LIMIT 2
+         )
+         SELECT hits._id, totals.total, totals.admitted FROM totals LEFT JOIN hits ON TRUE
+         ORDER BY hits.distance, ENTITY_SORT_KEY(hits._id)"
+    );
+    let probe = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>([Some([Some(1.0), Some(0.0)])]);
+    let params = RecordBatch::try_from_iter([("probe", Arc::new(probe) as arrow_array::ArrayRef)]).unwrap();
+    request.params_ipc = Some(rtdb_format::ipc::write_stream(params.schema_ref(), &[params.clone()]).unwrap());
+    request.source.as_mut().unwrap().at = Some(v1::At { selection: original.basis.clone().map(Selection::Exactly) });
+    request.track = true;
+    request.require_clear_rank_input = true;
+    let (rows, trailer) = query(&mut client, request).await;
+    assert_eq!(ints(&rows), [1, 3]);
+    assert!(rows.iter().all(|batch| (0..batch.num_rows()).all(|row| integer(batch, 1, row) == 2)));
+    assert_eq!(trailer.basis, original.basis);
+    assert!(!trailer.claim.unwrap().value.is_empty());
+    let mut request = input("SELECT _id FROM ranked_rows WHERE FALSE");
+    request.track = true;
+    request.require_clear_rank_input = true;
+    let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
+    error(status, v1::AnomalyCategory::Unsupported, "rtdb/unsupported");
     running.stop().await;
 }
 

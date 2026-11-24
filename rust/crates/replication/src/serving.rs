@@ -47,11 +47,13 @@ pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, LINEARIZABLE, "branches", "branch.local-layer",
     "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, TIMED_TRANSACT, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, "row-visibility", "tx-status", "sql.history",
     "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance",
+    rtdb_types::rtdb_v1::CLEAR_RANK_INPUT,
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, "branches", "branch.local-layer",
     "changes", "changes.progress-only", "tx-status", "sql.history",
     "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance",
+    rtdb_types::rtdb_v1::CLEAR_RANK_INPUT,
 ];
 const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TRANSACT_REQUIRES, TIMED_TRANSACT, "row-visibility"];
 

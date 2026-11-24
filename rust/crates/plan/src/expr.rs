@@ -28,11 +28,23 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
     if let Some(result) = crate::comparison::signature(&name, arguments) { return result; }
     if let Some(result) = crate::period::predicate_type(&name, arguments) { return result; }
     if let Some(result) = crate::search::signature(&name, arguments) { return result; }
-    if name == "cosine_distance" {
+    if matches!(name.as_str(), "cosine_distance" | "cosine_distance_f32") {
         if arguments.len() != 2 {
-            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "cosine_distance requires two arguments"));
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("{name} requires two arguments")));
         }
         return Ok(LogicalType::Scalar(S::F64).maybe());
+    }
+    if name == "entity_sort_key" {
+        if arguments.len() != 1 {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "entity_sort_key requires one argument"));
+        }
+        return Ok(LogicalType::Scalar(S::Binary).maybe());
+    }
+    if name == "rank_admitted_count" {
+        if arguments.len() != 2 {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "rank_admitted_count requires two arguments"));
+        }
+        return Ok(LogicalType::Scalar(S::I64));
     }
     if name == "approximate_nearest" {
         if arguments.len() != 3 {

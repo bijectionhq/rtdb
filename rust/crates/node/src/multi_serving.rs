@@ -223,7 +223,7 @@ impl ServingDriver for MultiServing {
     fn features(&self) -> &[&str] {
         &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
           "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history",
-          "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance"]
+          "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance", rtdb_types::rtdb_v1::CLEAR_RANK_INPUT]
     }
 
     fn supports_row_visibility(&self) -> bool { true }

@@ -10,6 +10,7 @@ pub const MAIN_BRANCH: &str = "main";
 pub const MAX_BRANCH_BYTES: usize = 255;
 pub const WRITTEN_BASIS_COLUMN: &str = "_rtdb_written_basis";
 pub const QUERY_WRITTEN_BASIS: &str = "query.written-basis";
+pub const CLEAR_RANK_INPUT: &str = "query.clear-rank-input";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelScope {

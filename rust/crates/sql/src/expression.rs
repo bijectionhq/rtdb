@@ -574,11 +574,12 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
         "octet_length" | "length" | "cardinality" | "abs" | "log10" | "ln" | "exp" | "sqrt"
         | "floor" | "ceil" | "ceiling" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh"
         | "asin" | "acos" | "atan" | "lower_inf" | "lower" | "upper" | "upper_inf"
-        | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" | "epoch_nanos_be" => 1..=1,
+        | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" | "epoch_nanos_be" | "entity_sort_key" => 1..=1,
         "search_length" | "search_terms" | "search_token_count" => 1..=2,
         "search_term_matches" => 2..=3,
         "array_upper" | "array_lower" | "array_length" | "mod" | "log" | "power" | "age"
-        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "search_corpus_fingerprint" | "cosine_distance" => 2..=2,
+        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "search_corpus_fingerprint"
+        | "cosine_distance" | "cosine_distance_f32" | "rank_admitted_count" => 2..=2,
         "match" => 2..=3,
         "search_score" => 2..=6,
         "approximate_nearest" => 3..=3,

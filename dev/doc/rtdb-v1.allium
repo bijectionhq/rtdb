@@ -55,6 +55,9 @@ surface StatelessDatabase {
         -- Text search returns matching rows ordered by descending relevance score.
         -- Vector nearest-neighbour reads return at most their requested limit ordered by ascending cosine distance.
         -- Ranking resolves rows at the query's selected cut.
+        -- Bounded rank tables derive their totals from the effective candidate rows before paging.
+        -- A tracked exact-cut rank with an empty window still returns its claim.
+        -- RequireClearRankInput admits an unscoped tracked exact cut whose complete branch-view contributor inventory is proved empty.
 
     @guarantee QueryClaim
         -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.

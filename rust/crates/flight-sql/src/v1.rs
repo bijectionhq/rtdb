@@ -7,7 +7,7 @@ use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 use rtdb_tx::transact::{PHYSICAL_ERASURE, TIMED_TRANSACT, TRANSACT_REQUIRES};
-use rtdb_types::Timestamp;
+use rtdb_types::{Timestamp, rtdb_v1::CLEAR_RANK_INPUT};
 use tonic::{Response, Status, metadata::MetadataMap};
 
 use crate::{
@@ -97,6 +97,10 @@ impl Service {
                         } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
                         }
+                        if features.iter().any(|feature| feature == "query") {
+                            features.extend(["sql.search-analyzer-stats", "sql.cosine-distance-f32", "sql.ranked-window"]
+                                .map(str::to_owned));
+                        }
                         if features.iter().any(|feature| feature == "query") && database.wire_tokens_supported()
                             && database.serving_driver().is_none_or(|driver| driver.supports_query_tokens())
                         {
@@ -109,7 +113,7 @@ impl Service {
                                 features.push(RECEIVER_CLOCK.into());
                             }
                         } else {
-                            features.retain(|feature| feature != "query.track" && feature != "query.page");
+                            features.retain(|feature| feature != "query.track" && feature != "query.page" && feature != CLEAR_RANK_INPUT);
                         }
                     }
                 }

@@ -54,6 +54,23 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         return Ok(Value::Bool(!nullish(column)));
     }
     function_type(&name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
+    match name.as_str() {
+        "cosine_distance_f32" => return crate::vector::cosine_distance_f32(&args[0], &args[1]),
+        "entity_sort_key" => return if nullish(&args[0]) { Ok(Value::Null) } else {
+            Ok(Value::Binary(args[0].entity_id()?.handle_bytes().into()))
+        },
+        "rank_admitted_count" => {
+            let nonnegative = |value| integer(value).and_then(|count| i64::try_from(count).ok()).filter(|count| *count >= 0);
+            let (Some(count), Some(limit)) = (nonnegative(&args[0]), nonnegative(&args[1])) else {
+                return Err(Anomaly::incorrect("rtdb/rank-bound", "Rank admission requires nonnegative integer counts"));
+            };
+            if count > limit {
+                return Err(Anomaly::unsupported("rtdb/rank-bound", "The selected candidate set exceeds the ranking bound"));
+            }
+            return Ok(Value::I64(count));
+        }
+        _ => {}
+    }
     if let Some(result) = crate::period::predicate(&name, args, context) { return result; }
     if let Some(result) = crate::search::call(&name, args, context) { return result; }
     if let Some(result) = crate::string::call(&name, args, context) { return result; }

@@ -91,6 +91,7 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     hash.update([query.track.into()]);
     if query.observe_receiver_clock { hash.update(b"receiver-clock"); }
     if query.custody_release_evidence { hash.update(b"custody-release-evidence"); }
+    if query.require_clear_rank_input { hash.update(b"clear-rank-input"); }
     hash.finalize().into()
 }
 
@@ -201,6 +202,14 @@ impl Service {
         let database = self.wire_database(call, &source.branch, layer).await?;
         let driver = database.serving_driver();
         let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
+        if request.require_clear_rank_input && (
+            !request.track || !matches!(selection, Some(Selection::Exactly(_)))
+                || request.custody_release_evidence || visibility.is_some()
+                || driver.is_none_or(|driver| !driver.supports_query_tokens() || !driver.features().contains(&super::CLEAR_RANK_INPUT))
+                || !database.wire_tokens_supported()
+        ) {
+            return Err(error::unsupported(super::CLEAR_RANK_INPUT));
+        }
         if request.observe_receiver_clock && (
             driver.is_none_or(|driver| !driver.supports_query_tokens())
                 || visibility.is_some()
@@ -324,6 +333,11 @@ impl Service {
                 .map_err(error::anomaly)?;
             (context, page, cut, None, BTreeSet::new(), None, None)
         };
+        if request.require_clear_rank_input && (
+            !custody_groups.is_empty() || !custody_contributors.as_ref().is_some_and(BTreeSet::is_empty)
+        ) {
+            return Err(error::unsupported(super::CLEAR_RANK_INPUT));
+        }
         let parameters = request
             .params_ipc
             .map(|bytes| {

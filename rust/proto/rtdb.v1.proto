@@ -65,6 +65,8 @@ message QueryRequest {
   bool observe_receiver_clock = 6;
   // Request a custody proof on the configured original owner route.
   bool custody_release_evidence = 7;
+  // Require a tracked exact cut whose full applied branch view is proved clear.
+  bool require_clear_rank_input = 8;
 }
 message QueryTrailer {
   Basis basis = 1;

@@ -1,7 +1,7 @@
 use arrow_array::{Array, Float32Array, Float64Array, cast::AsArray, types::{Float16Type, Float32Type, Float64Type}};
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_columnar::ArrowCell;
-use rtdb_types::{Anomaly, ListValue, ListView, Result, Value};
+use rtdb_types::{Anomaly, FloatComponent, ListValue, ListView, Result, Value};
 
 use crate::{compare::nullish, numeric::number};
 
@@ -10,6 +10,42 @@ pub(crate) fn cosine_distance(left: &Value, right: &Value) -> Result<Value> {
         return Ok(Value::Null);
     }
     score_pair(VectorInput::Stored(components(left)?), VectorInput::Stored(components(right)?))
+}
+
+pub(crate) fn cosine_distance_f32(vector: &Value, probe: &Value) -> Result<Value> {
+    if nullish(probe) {
+        return Ok(Value::Null);
+    }
+    let probe = components(probe)?;
+    if !(1..=4096).contains(&probe.len()) {
+        return Err(Anomaly::incorrect("rtdb.vector/dimensions", "The f32 cosine probe requires between 1 and 4096 components"));
+    }
+    let f32_component = |values: ListView<'_>, index| match values.typed_float(index) {
+        Some(FloatComponent::F32(value)) if value.is_finite() => Ok(f64::from(value)),
+        _ => Err(Anomaly::incorrect("rtdb.vector/component", "F32 cosine requires finite float32 components")),
+    };
+    let mut probe_squared = 0.0;
+    for index in 0..probe.len() {
+        let value = f32_component(probe, index)?;
+        probe_squared += value * value;
+    }
+    if probe_squared == 0.0 {
+        return Err(Anomaly::incorrect("rtdb.vector/zero-norm", "The f32 cosine probe must be nonzero"));
+    }
+    if nullish(vector) {
+        return Ok(Value::Null);
+    }
+    let vector = components(vector)?;
+    if vector.len() != probe.len() {
+        return Err(Anomaly::incorrect("rtdb.vector/dimensions", "F32 cosine requires vectors of equal dimension"));
+    }
+    let (mut dot, mut squared) = (0.0, 0.0);
+    for index in 0..probe.len() {
+        let value = f32_component(vector, index)?;
+        dot += f32_component(probe, index)? * value;
+        squared += value * value;
+    }
+    Ok(if squared == 0.0 { Value::Null } else { Value::F64(1.0 - dot / (probe_squared.sqrt() * squared.sqrt())) })
 }
 
 #[derive(Clone, Copy)]
