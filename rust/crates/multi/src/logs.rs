@@ -1076,7 +1076,6 @@ mod tests {
             write_quorum: 1, epoch: record.epoch, require_read_index: false, log_epoch: record.log_epoch,
             transferred_source_through: None, transfer_intake_cut: None, placed_transfer: None, frozen_at: None, previous_servers: None,
             placed_receipt_retirement: false,
-            write_quorum: 1,
         };
         let directory_files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {
