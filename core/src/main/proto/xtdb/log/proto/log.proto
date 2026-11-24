@@ -36,7 +36,7 @@ message Tx {
     bytes placed_attempt_seed = 9;
     BoundedRetry bounded_retry = 10;
     reserved 11;
-    reserved "prepared_landing";
+    reserved prepared_landing;
 }
 
 message BoundedRetry {
