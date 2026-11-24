@@ -679,6 +679,9 @@ impl DatabaseFactory {
                     replica_driver = replica_driver.with_default_erasure_grant(grant as u64);
                 }
                 let handle = replica_driver.attach_native_serving(replication.clone(), authority.clone(), self.options.automatic_gc && !sealed_local_erasure).await?;
+                if handle.supports_row_custody() && tokens.supports_persistent_custody() {
+                    write_features.push(rtdb_tx::transact::ROW_CUSTODY);
+                }
                 default_native_handle = Some(handle.clone());
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {
                     handle, memory: Arc::clone(&self.memory), storage: Arc::clone(&storage),

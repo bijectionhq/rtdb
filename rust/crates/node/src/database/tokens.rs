@@ -47,6 +47,10 @@ impl DatabaseTokens {
         !matches!(self.custody, Custody::Missing)
     }
 
+    pub(super) fn supports_persistent_custody(&self) -> bool {
+        matches!(self.custody, Custody::Configured(_) | Custody::Local(_))
+    }
+
     pub(super) fn new(
         name: &str,
         config: &DatabaseConfig,

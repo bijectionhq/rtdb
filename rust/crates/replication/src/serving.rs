@@ -162,6 +162,9 @@ pub struct NativeServingHandle {
 impl NativeServingHandle {
     pub fn authority(&self) -> &NativeServingAuthority { &self.authority }
     pub fn has_local_erasure_fence(&self) -> bool { self.local_read_fence.is_some() }
+    pub fn supports_row_custody(&self) -> bool {
+        self.authority.checkpoints.is_some() && !self.has_local_erasure_fence()
+    }
 
     pub async fn check_read_generation(&self, generation: u64) -> Result<()> {
         let _admission = match &self.local_read_fence {
@@ -256,7 +259,7 @@ impl NativeServingHandle {
             self.replication.serving_barrier(cancellation).await?;
             return self.replication.serving_validate(request, cancellation).await;
         }
-        if let Err(error) = request.check_source_admission(self.has_local_erasure_fence()) {
+        if let Err(error) = request.check_source_admission(self.has_local_erasure_fence(), self.supports_row_custody()) {
             if !request.transaction.uses_erasure()
                 && let Some(fingerprint) = request.transaction.custody_request_digest
             {
@@ -311,15 +314,15 @@ impl<C> NativeRequest<C> {
         self.transaction.ops.is_empty() && self.transaction.otherwise.is_empty()
     }
 
-    fn check_source_admission(&self, physical_erasure: bool) -> Result<()> {
+    fn check_source_admission(&self, physical_erasure: bool, row_custody: bool) -> Result<()> {
         if self.transaction.uses_erasure() && (!physical_erasure || self.scope.is_some()) {
             return Err(Anomaly::unsupported("rtdb/erasure-required", "Default erasure needs ordered retirement of the source and replica keys"));
         }
-        let features = if self.scope.is_some() { SCOPED_FEATURES } else { NATIVE_WRITE_FEATURES };
-        if self.transaction.uses_custody() && !self.transaction.is_response_release() && !features.contains(&ROW_CUSTODY) {
+        let row_custody = row_custody && self.scope.is_none();
+        if self.transaction.uses_custody() && !self.transaction.is_response_release() && !row_custody {
             return Err(Anomaly::unsupported("rtdb/feature-required", "Default row custody requires an installed delivery fence"));
         }
-        self.transaction.require_sealed_custody(features)
+        self.transaction.require_sealed_custody(if row_custody { &[ROW_CUSTODY] } else { &[] })
     }
 }
 
@@ -453,6 +456,28 @@ impl ServingCheckpoint {
 }
 
 impl NativeServing {
+    fn source_features<C>(&self, request: &NativeRequest<C>) -> std::borrow::Cow<'static, [&'static str]> {
+        use std::borrow::Cow;
+        if request.scope.is_some() {
+            return Cow::Borrowed(SCOPED_FEATURES);
+        }
+        let extra = if self.physical_erasure && self.shares_main &&
+            (request.transaction.uses_erasure() || request.transaction.require.iter().any(|feature| feature == PHYSICAL_ERASURE))
+        {
+            Some(PHYSICAL_ERASURE)
+        } else if self.authority.checkpoints.is_some() && !self.physical_erasure &&
+            (request.transaction.uses_custody() || request.transaction.require.iter().any(|feature| feature == ROW_CUSTODY))
+        {
+            Some(ROW_CUSTODY)
+        } else {
+            None
+        };
+        match extra {
+            Some(feature) => Cow::Owned([NATIVE_WRITE_FEATURES, &[feature]].concat()),
+            None => Cow::Borrowed(NATIVE_WRITE_FEATURES),
+        }
+    }
+
     pub(crate) fn open(mut authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&NativeCheckpointImage>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
         let (fold, position, shared_checkpoint) = match checkpoint {
             Some(checkpoint) => decode_checkpoint_image(checkpoint.bytes(), authority.incarnation)?,
@@ -569,8 +594,12 @@ impl NativeServing {
             Err(error) => return self.source_reply(source, Err(error)),
         };
         if request.is_validation() { return self.source_reply(source, Err(invalid_source_request())); }
-        if let Err(error) = request.check_source_admission(self.physical_erasure && self.shares_main) { return self.source_reply(source, Err(error)); }
+        let row_custody = self.authority.checkpoints.is_some() && !self.physical_erasure;
+        if let Err(error) = request.check_source_admission(self.physical_erasure && self.shares_main, row_custody) {
+            return self.source_reply(source, Err(error));
+        }
         if self.request_pending(&request) { return Err(invalid()); }
+        let features = self.source_features(&request);
         if self.pipeline.is_none() {
             let next = self.next_position()?;
             let fold = self.fold.take().ok_or_else(invalid)?;
@@ -578,15 +607,7 @@ impl NativeServing {
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
         let scope = request.scope.as_ref().map(NativeServingScope::authority);
-        let features = if scope.is_some() { SCOPED_FEATURES } else { NATIVE_WRITE_FEATURES };
-        let erasure_features;
-        let features: &[&str] = if request.transaction.uses_erasure() {
-            erasure_features = [features, &[PHYSICAL_ERASURE]].concat();
-            &erasure_features
-        } else {
-            features
-        };
-        let decision = pipeline.decide_after(&request.transaction, now, features, &request.claims, scope, time_floor);
+        let decision = pipeline.decide_after(&request.transaction, now, &features, &request.claims, scope, time_floor);
         match decision {
             Ok(Decision::Answer(receipt)) => self.source_reply(source, Ok(receipt)),
             Err(error) if error.is_caller_error() => self.source_reply(source, Err(error)),
@@ -614,9 +635,10 @@ impl NativeServing {
         if self.request_pending(&request) { return self.status(&request.transaction.key, request.scope.as_ref()); }
         let durable = self.durable();
         let position = durable.index().head().basis.position();
+        let features = self.source_features(&request);
         let resolution = match &request.scope {
-            Some(scope) => durable.resolve_scoped(&request.transaction, position, now, SCOPED_FEATURES, &request.claims, scope.authority()),
-            None => durable.resolve(&request.transaction, position, now, NATIVE_WRITE_FEATURES, &request.claims),
+            Some(scope) => durable.resolve_scoped(&request.transaction, position, now, &features, &request.claims, scope.authority()),
+            None => durable.resolve(&request.transaction, position, now, &features, &request.claims),
         }?;
         let Resolution::Answer(receipt) = resolution else { return Err(invalid()); };
         project_receipt(durable.index(), receipt, request.scope.as_ref())
@@ -1129,6 +1151,9 @@ mod tests {
         rows[0].protected_columns = vec!["sealed".into()];
         rows[0].custody_payload = Some(rtdb_tx::transact::CustodyPayload { binding: [3; 32], envelope: vec![4] });
         request.ops.insert(0, Op::CreateCustodyGroup { group });
+        let source_request = unscoped(request.clone());
+        assert!(source_request.check_source_admission(false, false).is_err());
+        assert!(source_request.check_source_admission(false, true).is_ok());
         let apply = |serving: &mut NativeServing, request: &Transact, position: u64, source: i64, prior_source: i64| {
             let Resolution::Append(prepared) = serving.durable().resolve(request, position, Timestamp(40), &[ROW_CUSTODY], &VerifiedClaims::default()).unwrap() else { panic!() };
             let message = decision_message(position, &prepared.record().encode().unwrap(), Some(SourcePosition(source)), true, true);
