@@ -66,6 +66,32 @@ pub struct PhysicalObjectVersion {
     pub version: String,
 }
 
+/// Identifies one serving encryption attempt wherever its ciphertext is relocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingPublication {
+    pub origin: [u8; 32],
+    pub attempt: uuid::Uuid,
+}
+
+impl ServingPublication {
+    pub const BYTES: usize = 48;
+    pub const ARCHIVE: Self = Self { origin: [0; 32], attempt: uuid::Uuid::nil() };
+
+    pub fn from_prefix(prefix: &[u8]) -> Option<Self> {
+        let origin: [u8; 32] = prefix.get(..32)?.try_into().ok()?;
+        let attempt = uuid::Uuid::from_slice(prefix.get(32..Self::BYTES)?).ok()?;
+        (attempt.is_nil() == (origin == [0; 32])).then_some(Self { origin, attempt })
+    }
+
+    pub fn prefix(self) -> [u8; Self::BYTES] {
+        let mut prefix = [0; Self::BYTES];
+        prefix[..32].copy_from_slice(&self.origin);
+        prefix[32..].copy_from_slice(self.attempt.as_bytes());
+        prefix
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalObjectPublication {
     pub namespace: S3ObjectNamespace,

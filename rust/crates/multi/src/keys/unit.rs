@@ -108,11 +108,27 @@ impl UnitScope {
             .ok_or_else(|| Error::InvalidKey(name.to_string()))?;
         let tag: [u8; 32] = URL_SAFE_NO_PAD.decode(origin).ok().and_then(|tag| tag.try_into().ok())
             .filter(|tag| *tag != [0; 32]).ok_or_else(|| Error::InvalidKey(name.to_string()))?;
-        Ok(self.publication_scope(tag).slot(&ObjectKey::new(logical)?))
+        let (attempt, logical) = logical.split_once('/').ok_or_else(|| Error::InvalidKey(name.to_string()))?;
+        let attempt = uuid::Uuid::parse_str(attempt).ok().filter(|id| !id.is_nil())
+            .ok_or_else(|| Error::InvalidKey(name.to_string()))?;
+        Ok(self.publication_slot(rtdb_types::ServingPublication { origin: tag, attempt }, &ObjectKey::new(logical)?))
     }
 
-    pub(crate) fn directory_publication_slot(org: &str, lineage: &str, origin: [u8; 32], object: &ObjectKey) -> UnitSlot {
-        Self::directory_serving(org, lineage).publication_scope(origin).slot(object)
+    pub(crate) fn directory_publication_slot(
+        org: &str, lineage: &str, publication: rtdb_types::ServingPublication, object: &ObjectKey,
+    ) -> UnitSlot {
+        Self::directory_serving(org, lineage).publication_slot(publication, object)
+    }
+
+    fn publication_slot(self, publication: rtdb_types::ServingPublication, object: &ObjectKey) -> UnitSlot {
+        let mut name = Context::new(&SHA256);
+        name.update(b"rtdb.multi/directory-publication-attempt/v1\0");
+        name.update(publication.attempt.as_bytes());
+        name.update(object.as_str().as_bytes());
+        UnitSlot {
+            scope: self.publication_scope(publication.origin),
+            digest: name.finish().as_ref().try_into().expect("SHA-256 width"),
+        }
     }
 
     pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {

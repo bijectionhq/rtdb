@@ -165,6 +165,10 @@ impl IoRegion {
         self.publication_journal = Some(journal);
     }
     #[cfg(feature = "remote")]
+    pub fn publication_journal_owner(&self) -> Option<Arc<dyn crate::remote::PublicationJournal>> {
+        self.publication_journal.clone()
+    }
+    #[cfg(feature = "remote")]
     pub fn publication_journal(&self) -> Option<&dyn crate::remote::PublicationJournal> {
         self.publication_journal.as_deref()
     }

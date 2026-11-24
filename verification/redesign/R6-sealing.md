@@ -80,6 +80,11 @@ Versioned S3 reads exact version prefixes and checks all data versions of every 
 The exact directory grant carries the original slot through ciphertext removal and retry.
 Terminal S3 checkpoint metadata pack retirement binds a durable slot plan to the exact pack grant.
 The plan derives each slot from the authenticated pack member and excludes slots with loose or packed aliases elsewhere in the lineage.
-Other hosted packs and orphan slots in an open origin still need a complete publication census.
+A serving envelope carries its attempt UUID with the original residence.
+A fresh write allocates a fresh slot, and raw relocation carries the original attempt unchanged.
+The hosted loose path persists its attempt before sealing and enrolls the corresponding provider upload before any body submission.
+The regional retirement owner closes admission, confirms the exact abort and withdraws unsubmitted or definitively rejected attempts.
+An ambiguous upload reopens the exact selected body or retains the unresolved duty.
+Other hosted packs and unpublished packed or local attempts still require a complete publication census.
 
 [Current cipher](../../rust/crates/storage/src/sealing/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

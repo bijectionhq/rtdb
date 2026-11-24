@@ -827,6 +827,8 @@ pub struct CheckpointCaptureRetirement {
 pub struct StoragePublication {
     pub key: String,
     pub upload_id: String,
+    pub unit: Option<(String, rtdb_types::ServingPublication)>,
+    pub rejected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

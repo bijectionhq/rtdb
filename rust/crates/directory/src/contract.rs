@@ -270,14 +270,14 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
         crate::RetirementWork::Tombstones {
             deployment: parent.id.clone(), target: target.clone(), release: release.clone(),
             data_tombstone: tombstone(&target, "\"original\""), release_tombstone: tombstone(&release, "\"record\""),
-            slot_origin: None,
+            unit: None,
             packed_slots: None,
         }
     } else {
         crate::RetirementWork::S3 {
             deployment: parent.id.clone(), target: target.clone(), release: release.clone(),
             version: version(&target, "original"), release_version: version(&release, "record"),
-            slot_origin: None,
+            unit: None,
         }
     };
     let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: scope, work };

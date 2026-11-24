@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rtdb_directory::DeploymentRecord;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, sealing::PUBLICATION_ID_BYTES};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, ServingPublication};
 
 use crate::{
     keys::{KeyService, UnitScope},
@@ -91,7 +91,7 @@ impl<'a> PublicationCensus<'a> {
         owner: &DeploymentRecord,
         target: &ObjectKey,
         logical: &ObjectKey,
-        origin: [u8; PUBLICATION_ID_BYTES],
+        origin: ServingPublication,
         packed: bool,
     ) -> Result<bool> {
         let may_be_packed =
@@ -138,14 +138,14 @@ async fn has_origin(
     bucket: &dyn ObjectStore,
     key: &ObjectKey,
     offset: u64,
-    expected: [u8; PUBLICATION_ID_BYTES],
+    expected: ServingPublication,
 ) -> Result<bool> {
     let end = offset
         .checked_add(PUBLICATION_ID_BYTES as u64)
         .ok_or_else(changed)?;
     match bucket.observe_range(key, offset..end).await {
         Ok(prefix) if prefix.value.len() == PUBLICATION_ID_BYTES => {
-            Ok(prefix.value.as_ref() == expected.as_slice())
+            Ok(ServingPublication::from_prefix(&prefix.value).ok_or_else(changed)? == expected)
         }
         Ok(_) => Err(changed()),
         Err(Error::MissingObject(_)) => Ok(false),
@@ -185,11 +185,13 @@ mod tests {
         let io = IoRegion::new();
         let peers = [owner.clone(), fork];
         let census = PublicationCensus::new(&keys, &peers, &io);
-        let origin = [7; PUBLICATION_ID_BYTES];
+        let origin = ServingPublication { origin: [7; 32], attempt: uuid::Uuid::new_v4() };
+        let mut member = vec![0; HEADER_BYTES as usize];
+        member[..PUBLICATION_ID_BYTES].copy_from_slice(&origin.prefix());
         let (body, _) = crate::packing::encode_pack(
             &BTreeMap::from([(
                 name.to_string(),
-                Bytes::from(vec![7; HEADER_BYTES as usize]),
+                Bytes::from(member),
             )]),
             Vec::new(),
             0,
@@ -209,7 +211,7 @@ mod tests {
                     &owner,
                     &target,
                     &name,
-                    [9; PUBLICATION_ID_BYTES],
+                    ServingPublication { attempt: uuid::Uuid::new_v4(), ..origin },
                     true
                 )
                 .await

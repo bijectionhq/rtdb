@@ -75,7 +75,7 @@ pub fn held_back(key: &str) -> bool {
 fn is_catalog(key: &str) -> bool { key.starts_with("blocks/b") && key.ends_with(".binpb") }
 
 /// Whether `key` is found only in a pack: what a flush holds back, and the catalog it is packed with.
-fn packed(key: &str) -> bool { held_back(key) || is_catalog(key) }
+pub(crate) fn packed(key: &str) -> bool { held_back(key) || is_catalog(key) }
 
 /// Encodes a pack: the objects back to back, the index as JSON, and the index's length as eight big-endian bytes.
 pub fn encode_pack(objects: &BTreeMap<String, Bytes>, previous: Vec<String>, written_at_ms: i64) -> (Bytes, PackIndex) {

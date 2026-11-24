@@ -33,6 +33,16 @@ fn copy_outcome_unknown(mut error: &(dyn std::error::Error + 'static)) -> bool {
 /// may be submitted. The identity is retained until completion or abort.
 #[async_trait]
 pub trait PublicationJournal: Send + Sync {
+    async fn allocate_unit(&self, _key: &ObjectKey, _logical: &ObjectKey, _unit: rtdb_types::ServingPublication) -> Result<()> {
+        Ok(())
+    }
+    async fn unit_attempt(&self, _key: &ObjectKey, _body: &[u8]) -> Result<Option<uuid::Uuid>> {
+        Ok(None)
+    }
+    async fn unit_outcome(&self, _key: &ObjectKey, _attempt: uuid::Uuid, _upload: &str, _published: bool) -> Result<()> {
+        Ok(())
+    }
+
     async fn admit(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str) -> Result<()>;
     /// A lost admit reply needs cancellation even if no bytes were sent.
     async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str, submitted: bool) -> Result<()>;
@@ -651,7 +661,8 @@ impl RemoteObjects {
         let uploads = self.uploads.as_ref().ok_or_else(|| Error::Remote {
             key: key.to_string(), message: "The cell store has no abortable publication capability".into(),
         })?;
-        let attempt = uuid::Uuid::new_v4();
+        let unit = journal.unit_attempt(key, &bytes).await?;
+        let attempt = unit.unwrap_or_else(uuid::Uuid::new_v4);
         let path = self.path(key);
         let upload = uploads.reserve(&path, attempt).await?;
         if let Err(error) = journal.admit(key, attempt, &upload).await {
@@ -666,8 +677,8 @@ impl RemoteObjects {
             // completion must also be fenced before clearing the admission.
             uploads.abort(&path, &upload).await?;
         }
-        journal.settle(key, attempt, &upload, true).await?;
-        match result {
+        let rejected = matches!(result, Ok(PublicationResult::Conflict));
+        let selected = match result {
             Ok(PublicationResult::Published { version, etag }) => Ok(ProviderPublication { version, etag }),
             Ok(PublicationResult::Conflict) => self.compare_existing(key, bytes).await,
             Err(error) => {
@@ -676,7 +687,19 @@ impl RemoteObjects {
                     _ => Err(error),
                 }
             }
+        };
+        if let Some(unit) = unit {
+            if selected.is_ok() || rejected {
+                if matches!(self.publication_confirmed(key, unit).await?, PublicationResult::Published { .. }) {
+                    journal.unit_outcome(key, unit, &upload, true).await?;
+                } else if rejected {
+                    journal.unit_outcome(key, unit, &upload, false).await?;
+                }
+            }
+        } else {
+            journal.settle(key, attempt, &upload, true).await?;
         }
+        selected
     }
 
     async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<ProviderPublication> {

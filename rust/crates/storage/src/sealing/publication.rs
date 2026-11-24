@@ -2,37 +2,51 @@ use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Bytes, BytesMut};
+use rtdb_types::ServingPublication;
+use uuid::Uuid;
 
 use super::{FramedObject, ObjectCipher, PlaintextView, UnitOperation, UnitOutput};
 use crate::{Error, ObjectKey, Result, RetainedBytes};
 
-pub const PUBLICATION_ID_BYTES: usize = 32;
-type Origin = [u8; PUBLICATION_ID_BYTES];
-const ARCHIVE: Origin = [0; PUBLICATION_ID_BYTES];
+pub const PUBLICATION_ID_BYTES: usize = ServingPublication::BYTES;
 
 /// Selects the original key slot from an immutable object's serving envelope.
 /// The origin travels with the bytes when a pack or fork reference moves.
 #[derive(Clone)]
 pub struct PublicationSealing {
     ledger: Arc<dyn ObjectCipher>,
-    origin: Origin,
+    origin: [u8; 32],
     archive: Option<Arc<dyn ObjectCipher>>,
     applies: fn(&ObjectKey) -> bool,
+    #[cfg(feature = "remote")]
+    attempts: Option<(Arc<dyn crate::remote::PublicationJournal>, String)>,
 }
 
 impl PublicationSealing {
     pub fn new(
         ledger: Arc<dyn ObjectCipher>,
-        origin: Origin,
+        origin: [u8; 32],
         applies: fn(&ObjectKey) -> bool,
     ) -> Self {
-        assert_ne!(origin, ARCHIVE);
+        assert_ne!(origin, [0; 32]);
         Self {
             ledger,
             origin,
             archive: None,
             applies,
+            #[cfg(feature = "remote")]
+            attempts: None,
         }
+    }
+
+    #[cfg(feature = "remote")]
+    pub fn with_attempts(
+        mut self,
+        journal: Arc<dyn crate::remote::PublicationJournal>,
+        prefix: String,
+    ) -> Self {
+        self.attempts = Some((journal, prefix));
+        self
     }
 
     pub fn with_archive(mut self, archive: Arc<dyn ObjectCipher>) -> Self {
@@ -48,33 +62,31 @@ impl PublicationSealing {
         Arc::clone(&self.ledger)
     }
 
-    fn envelope(origin: Origin, sealed: Bytes) -> Bytes {
+    fn envelope(publication: ServingPublication, sealed: Bytes) -> Bytes {
         let mut frame = BytesMut::with_capacity(PUBLICATION_ID_BYTES + sealed.len());
-        frame.extend_from_slice(&origin);
+        frame.extend_from_slice(&publication.prefix());
         frame.extend_from_slice(&sealed);
         frame.freeze()
     }
 
     /// An admitted read-only overlay exposes the original archive ciphertext.
     pub fn archived(sealed: Bytes) -> Bytes {
-        Self::envelope(ARCHIVE, sealed)
+        Self::envelope(ServingPublication::ARCHIVE, sealed)
     }
 
-    fn origin(name: &ObjectKey, bytes: &[u8]) -> Result<Origin> {
-        bytes
-            .get(..PUBLICATION_ID_BYTES)
-            .and_then(|prefix| prefix.try_into().ok())
+    fn identity(name: &ObjectKey, bytes: &[u8]) -> Result<ServingPublication> {
+        ServingPublication::from_prefix(bytes)
             .ok_or_else(|| Error::ConflictingObject(name.to_string()))
     }
 
     pub(super) async fn operate(
         &self,
         name: &ObjectKey,
-        origin: Origin,
+        publication: ServingPublication,
         operation: UnitOperation,
     ) -> Result<UnitOutput> {
         let read = !operation.provisions();
-        let (authority, slot, operation) = if origin == ARCHIVE {
+        let (authority, slot, operation) = if publication == ServingPublication::ARCHIVE {
             let authority = self
                 .archive
                 .as_ref()
@@ -82,8 +94,9 @@ impl PublicationSealing {
             (authority, name.clone(), operation)
         } else {
             let slot = ObjectKey::new(format!(
-                "publications/{}/{name}",
-                URL_SAFE_NO_PAD.encode(origin)
+                "publications/{}/{}/{name}",
+                URL_SAFE_NO_PAD.encode(publication.origin),
+                publication.attempt
             ))?;
             (
                 &self.ledger,
@@ -99,18 +112,32 @@ impl PublicationSealing {
     }
 
     pub async fn seal(&self, name: &ObjectKey, plaintext: Bytes) -> Result<Bytes> {
+        let publication = ServingPublication {
+            origin: self.origin,
+            attempt: Uuid::new_v4(),
+        };
+        #[cfg(feature = "remote")]
+        if let Some((journal, prefix)) = &self.attempts {
+            journal
+                .allocate_unit(
+                    &ObjectKey::new(format!("{prefix}/{name}"))?,
+                    name,
+                    publication,
+                )
+                .await?;
+        }
         let sealed = self
-            .operate(name, self.origin, UnitOperation::Seal(plaintext))
+            .operate(name, publication, UnitOperation::Seal(plaintext))
             .await?
             .bytes()?;
-        Ok(Self::envelope(self.origin, sealed))
+        Ok(Self::envelope(publication, sealed))
     }
 
     pub async fn open(&self, name: &ObjectKey, sealed: Bytes) -> Result<Bytes> {
-        let origin = Self::origin(name, &sealed)?;
+        let publication = Self::identity(name, &sealed)?;
         self.operate(
             name,
-            origin,
+            publication,
             UnitOperation::Open(sealed.slice(PUBLICATION_ID_BYTES..)),
         )
         .await?
@@ -122,10 +149,10 @@ impl PublicationSealing {
         name: &ObjectKey,
         sealed: RetainedBytes,
     ) -> Result<Bytes> {
-        let origin = Self::origin(name, sealed.as_slice())?;
+        let publication = Self::identity(name, sealed.as_slice())?;
         self.operate(
             name,
-            origin,
+            publication,
             UnitOperation::OpenRetained(sealed.discard_prefix(PUBLICATION_ID_BYTES)),
         )
         .await?
@@ -136,16 +163,47 @@ impl PublicationSealing {
         &self,
         name: &ObjectKey,
         header: Bytes,
-    ) -> Result<(FramedObject, [u8; PUBLICATION_ID_BYTES])> {
-        let origin = Self::origin(name, &header)?;
+    ) -> Result<(FramedObject, ServingPublication)> {
+        let publication = Self::identity(name, &header)?;
         let layout = self
             .operate(
                 name,
-                origin,
+                publication,
                 UnitOperation::Header(header.slice(PUBLICATION_ID_BYTES..)),
             )
             .await?
             .header()?;
-        Ok((layout, origin))
+        Ok((layout, publication))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_identity_and_serving_attempts_use_disjoint_frames() {
+        let original = ServingPublication {
+            origin: [5; 32],
+            attempt: Uuid::new_v4(),
+        };
+        let retry = ServingPublication {
+            attempt: Uuid::new_v4(),
+            ..original
+        };
+        assert_eq!(
+            ServingPublication::from_prefix(&original.prefix()),
+            Some(original)
+        );
+        assert_eq!(
+            ServingPublication::from_prefix(&retry.prefix()),
+            Some(retry)
+        );
+        assert_ne!(original.prefix(), retry.prefix());
+        assert_eq!(
+            ServingPublication::from_prefix(&ServingPublication::ARCHIVE.prefix()),
+            Some(ServingPublication::ARCHIVE)
+        );
+        assert!(ServingPublication::from_prefix(&original.origin).is_none());
     }
 }

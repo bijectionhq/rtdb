@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3TombstoneTarget};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3TombstoneTarget, ServingPublication};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -99,7 +99,7 @@ pub enum RetirementWork {
         release: String,
         version: PhysicalObjectVersion,
         release_version: PhysicalObjectVersion,
-        slot_origin: Option<[u8; 32]>,
+        unit: Option<ServingPublication>,
     },
     Tombstones {
         deployment: String,
@@ -107,7 +107,7 @@ pub enum RetirementWork {
         release: String,
         data_tombstone: S3TombstoneTarget,
         release_tombstone: S3TombstoneTarget,
-        slot_origin: Option<[u8; 32]>,
+        unit: Option<ServingPublication>,
         packed_slots: Option<[u8; 32]>,
     },
     ReplayPack {
@@ -606,7 +606,7 @@ mod tests {
             archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: Some(capture),
             tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
             owner: None, closed: false, publications: BTreeMap::from([(Uuid::new_v4(), crate::StoragePublication {
-                key: target.clone(), upload_id: "admitted".into(),
+                key: target.clone(), upload_id: "admitted".into(), unit: None, rejected: false,
             })]),
         });
         let state = LineageState::default().changed(LineageChange::ReserveRetirement {
