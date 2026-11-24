@@ -733,7 +733,7 @@ impl<'a> OpenTransaction<'a> {
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
     fn decision_time(&self) -> Timestamp {
-        self.clock_slot.filter(|slot| slot.funded).map_or_else(|| self.receiver_time(), |slot| slot.reading)
+        self.clock_slot.map_or_else(|| self.receiver_time(), |slot| slot.reading)
     }
 
     fn receiver_time(&self) -> Timestamp {
@@ -1769,7 +1769,7 @@ impl<'a> OpenTransaction<'a> {
         }) {
             return Err(unavailable());
         }
-        if deadline.is_some_and(|until| !crate::system_time::owned_deadline_is_live(self.receiver_time().0, until.0)) {
+        if deadline.is_some_and(|until| !crate::system_time::owned_deadline_is_live(self.decision_time().0, until.0)) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         if let Some(root) = operations.iter().find_map(|operation| match operation {
