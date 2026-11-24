@@ -12,6 +12,10 @@
 -- Its retained input allocations share a per-job ceiling of 1 MiB or one eighth of the memory budget, whichever is smaller.
 -- The metadata and its reservations are released when merge task planning completes.
 -- Spill decoding uses the layout inspected from the same metadata bytes.
+-- Small uncompressed primary files without dictionaries can supply Arrow buffers directly from reserved object bytes.
+-- Retained primary bytes share a separate per-job ceiling of 1 MiB or one eighth of the memory budget, whichever is smaller.
+-- The object reservation follows the last Arrow buffer that uses the file, and merged output pages own their copied cells.
+-- Primary compaction can restart preparation and merge from file-backed primary readers under the same catalog hold when retaining primary bytes encounters memory pressure.
 --
 -- This assumes understanding of the "Building a Bitemporal Index" trilogy:
 -- https://xtdb.com/blog/building-a-bitemp-index-1-taxonomy
