@@ -1,0 +1,33 @@
+{
+  "summary": "The merged held-journal reader selects the first eligible physical publication in scan order and validates each fragment against that publication and its contiguous event frontier.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 4,
+  "controls": {
+    "skip_to_a_later_publication": {
+      "mutate": [{
+        "file": "rust/crates/node/src/node/owned_changes/group.rs",
+        "find": "(!reverse && position < prior)",
+        "replace": "(!reverse && position > prior)"
+      }],
+      "expect": [{
+        "file": "rust/crates/node/src/node/owned_changes/group.rs",
+        "function": "next_group",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 3
+    },
+    "substitute_a_fragment_at_another_time": {
+      "mutate": [{
+        "file": "rust/crates/node/src/node/owned_changes/group.rs",
+        "find": "        && header.history_time == selected_time && entry.history_time == selected_time\n        && header.through_events == entry.through_events\n        && previous_events.checked_add(events)",
+        "replace": "        && header.history_time == selected_time\n        && header.through_events == entry.through_events\n        && previous_events.checked_add(events)"
+      }],
+      "expect": [{
+        "file": "rust/crates/node/src/node/owned_changes/group.rs",
+        "function": "admits_fragment",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 3
+    }
+  }
+}
