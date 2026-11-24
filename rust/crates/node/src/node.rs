@@ -1524,6 +1524,11 @@ pub struct HeldSpatialRange {
     matches: rtdb_spatial::PreparedRange,
 }
 
+pub struct HeldSpatialProbe {
+    held_context: std::sync::Weak<QueryContext>,
+    matches: rtdb_spatial::PreparedProbe,
+}
+
 pub struct HeldSpatialNearest {
     held_context: std::sync::Weak<QueryContext>,
     ranking: rtdb_spatial::PreparedNearest,
@@ -2729,6 +2734,39 @@ impl OwnedReadSession {
         let lease = context.catalog.read_lease();
         let work = held.matches.page(Arc::clone(&context), &self.owner, Some(after), limit, projection);
         let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((page, witness))
+    }
+
+    pub async fn open_spatial_probe(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool, columns: &[&str],
+        region: &rtdb_spatial::PreparedRegion, probe: rtdb_spatial::Probe<'_>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>, Option<HeldSpatialProbe>)> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let work = Box::pin(rtdb_spatial::open_probe(Arc::clone(&context), &self.owner, relation,
+            path, region, request, columns, probe));
+        let (page, matches) = context.reading(work).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        let retained = matches.map(|matches| HeldSpatialProbe { held_context: Arc::downgrade(&self.context), matches });
+        Ok((page, witness, retained))
+    }
+
+    pub async fn next_spatial_probe(
+        &self, held: &HeldSpatialProbe, after: rtdb_columnar::EntityIdRef<'_>,
+        limit: usize, observe: bool, columns: &[&str], probe: rtdb_spatial::Probe<'_>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        if !held.held_context.upgrade().is_some_and(|original| Arc::ptr_eq(&original, &self.context)) {
+            return Err(Anomaly::incorrect("rtdb.owned/spatial-hold", "Spatial probe belongs to another read"));
+        }
+        self.admit_read().await?;
+        let relation = held.matches.relation();
+        let context = self.relation_context(relation)?;
+        let work = Box::pin(held.matches.page(Arc::clone(&context), &self.owner, after, limit, columns, probe));
+        let page = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))

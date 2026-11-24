@@ -196,17 +196,17 @@ pub(super) async fn gather_range(
     document_columns: &DocumentColumns,
     selection: &[(EntityIdRef<'_>, Iid)],
     more: bool,
+    probe: Option<crate::Probe<'_>>,
 ) -> Result<Page> {
     let reservation = context.memory.reserve(4096 + selection.len() * 256)?;
     let positions = selection.iter().enumerate().map(|(rank, (id, _))| (*id, rank))
         .collect::<BTreeMap<_, _>>();
     if positions.len() != selection.len() { return Err(inconsistent_ranking()); }
     let iids = selection.iter().map(|(_, iid)| *iid).collect();
-    let (geometry, partition) = if matches!(projection, Projection::Documents) {
-        (Some(document_columns.geometry.as_str()), document_columns.partition.as_slice())
-    } else {
-        (None, &[][..])
-    };
+    let full = matches!(projection, Projection::Documents);
+    let geometry = (full || probe.is_some() && document_columns.refined_geometry)
+        .then_some(document_columns.geometry.as_str());
+    let partition = if full || probe.is_some() { document_columns.partition.as_slice() } else { &[] };
     let cursor = open_owned_spatial_scan(
         Arc::clone(&context), owner, relation, geometry, partition, valid_at, iids, projection, false,
     ).await?;
@@ -232,6 +232,9 @@ pub(super) async fn gather_range(
         layout = Some((cursor.runtime_schema().clone(), document_columns));
     }
     let selected = selected.into_iter().collect::<Option<Vec<_>>>().ok_or_else(inconsistent_ranking)?;
+    let mut evidence = probe.map(|probe| crate::probe::Evidence::new(
+        probe.certify_point && probe.point_column.is_some() && !selected.is_empty(),
+    ));
     let rows = if selected.is_empty() {
         empty_projected_documents(
             projection, layout.as_ref().map(|(schema, columns)| (schema, columns.as_slice())),
@@ -244,7 +247,12 @@ pub(super) async fn gather_range(
         } else {
             &ids
         };
-        gather_selected(&selected, columns, &context.memory)?
+        if let (Some(probe), Some(evidence)) = (probe, evidence.as_mut()) {
+            let columns = crate::probe::summarize(&selected, columns, probe, evidence, &context.memory)?;
+            gather_selected(&selected, &columns, &context.memory)?
+        } else {
+            gather_selected(&selected, columns, &context.memory)?
+        }
     };
     let distance_reservation = context.memory.reserve(4096 + selection.len() * 16)?;
     let distances = Float64Array::new_null(selection.len());
@@ -256,7 +264,7 @@ pub(super) async fn gather_range(
         includes_documents: projection.has_documents(),
         distances,
         _distance_reservation: distance_reservation,
-        probe: None,
+        probe: evidence,
     })
 }
 

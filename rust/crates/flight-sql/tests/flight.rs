@@ -1513,14 +1513,22 @@ async fn check_spatial_pages_at_the_original_cut() {
     }
 
     fn canonical_point(longitude: f64) -> Vec<u8> {
+        canonical_location(longitude, false)
+    }
+
+    fn canonical_location(longitude: f64, multi: bool) -> Vec<u8> {
         let mut image = vec![13];
         image.extend_from_slice(b"coordinates\0\x01");
         image.push(12);
+        if multi { image.push(12); }
         for coordinate in [longitude, 0.0] {
             image.push(5);
             image.extend_from_slice(&(coordinate.to_bits() ^ (1 << 63)).to_be_bytes());
         }
-        image.extend_from_slice(b"\0\0type\0\x01\x09Point\0\x01\0\0");
+        if multi { image.extend_from_slice(b"\0\0"); }
+        image.extend_from_slice(b"\0\0type\0\x01\x09");
+        image.extend_from_slice(if multi { b"MultiPoint" } else { b"Point" });
+        image.extend_from_slice(b"\0\x01\0\0");
         image
     }
 
@@ -1579,7 +1587,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     let mut relation = Vec::new();
     frame(&mut relation, "places");
     let mut schema = relation.clone();
-    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"never_written","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"borough","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"c_location","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"c_payload","type":{"kind":"binary"},"optional":true,"nullable":false}]}"#);
+    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"never_written","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"borough","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"c_location","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"c_mixed","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"c_payload","type":{"kind":"binary"},"optional":true,"nullable":false}]}"#);
     client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
 
     let path = "by_location";
@@ -1595,13 +1603,16 @@ async fn check_spatial_pages_at_the_original_cut() {
     }
 
     let canonical_path = "by_canonical_location";
-    let mut declaration = relation.clone();
-    ipc(&mut declaration, [
-        ("_id", Arc::new(StringArray::from(vec![canonical_path])) as ArrayRef),
-        ("columns", select(&["c_location", "borough"])),
-        ("geometry_encoding", Arc::new(StringArray::from(vec!["bijection-geometry-v1"]))),
-    ]);
-    client.action("rtdb.owned.DeclareSpatialPath.v2", declaration.into()).await.unwrap();
+    let mixed_path = "by_mixed_location";
+    for (path, geometry) in [(canonical_path, "c_location"), (mixed_path, "c_mixed")] {
+        let mut declaration = relation.clone();
+        ipc(&mut declaration, [
+            ("_id", Arc::new(StringArray::from(vec![path])) as ArrayRef),
+            ("columns", select(&[geometry, "borough"])),
+            ("geometry_encoding", Arc::new(StringArray::from(vec!["bijection-geometry-v1"]))),
+        ]);
+        client.action("rtdb.owned.DeclareSpatialPath.v2", declaration.into()).await.unwrap();
+    }
 
     let mut insert = relation.clone();
     ipc(&mut insert, [
@@ -1609,6 +1620,9 @@ async fn check_spatial_pages_at_the_original_cut() {
         ("location", Arc::new(BinaryArray::from_iter_values([point(1.0), point(2.0), point(1.0), point(1.0)]))),
         ("borough", Arc::new(BinaryArray::from_vec(vec![b"montrouge", b"montrouge", b"elsewhere", b"montrouge"]))),
         ("c_location", Arc::new(BinaryArray::from_iter_values(std::array::from_fn::<_, 4, _>(|_| canonical_point(1.0))))),
+        ("c_mixed", Arc::new(BinaryArray::from_iter_values(
+            (0..4).map(|row| canonical_location(1.0, row == 1)),
+        ))),
         ("c_payload", Arc::new(BinaryArray::from(vec![
             Some(&b"\x09first\0\x01"[..]), Some(&b"\x09old\0\x01"[..]), None, Some(&[2_u8][..]),
         ]))),
@@ -1627,6 +1641,7 @@ async fn check_spatial_pages_at_the_original_cut() {
         ("borough", Arc::new(BinaryArray::from_iter_values([b"montrouge"]))),
         ("never_written", Arc::new(BinaryArray::from(vec![None::<&[u8]>]))),
         ("c_location", Arc::new(BinaryArray::from_iter_values([canonical_point(9.0)]))),
+        ("c_mixed", Arc::new(BinaryArray::from_iter_values([canonical_point(9.0)]))),
         ("c_payload", Arc::new(BinaryArray::from_iter_values([b"\x09new\0\x01"]))),
         ("_absent", select(&["never_written"])),
     ]);
@@ -1684,28 +1699,75 @@ async fn check_spatial_pages_at_the_original_cut() {
     let revision = document.column_by_name("_system_from").unwrap().as_any()
         .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap().value(0);
 
-    let gather = |revision| {
+    let gather = |revision, columns: &[&str]| {
         let mut request = hold.to_vec();
         frame(&mut request, "places");
         ipc(&mut request, [
             ("_id", Arc::new(StringArray::from(vec!["b"])) as ArrayRef),
             ("revision_micros", Arc::new(Int64Array::from(vec![revision]))),
-            ("document_columns", select(&["c_location", "c_payload", "borough"])),
+            ("document_columns", select(columns)),
         ]);
         Bytes::from(request)
     };
-    let reply = client.action("rtdb.owned.SpatialGather.v1", gather(revision)).await.unwrap();
-    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
-    assert_eq!(stream.schema().metadata()["rtdb.owned.valid_micros"], valid.to_string());
-    let winner = stream.next().unwrap().unwrap();
-    let document = winner.column_by_name("document").unwrap().as_any()
-        .downcast_ref::<arrow_array::StructArray>().unwrap();
-    let payload = document.column_by_name("c_payload").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
-    assert_eq!(payload.value(0), b"\x09old\0\x01");
-    assert!(winner.column_by_name("omitted_sizes").is_none());
-    assert_eq!(client.action("rtdb.owned.SpatialGather.v1", gather(revision + 1)).await.unwrap_err().code(),
+    for columns in [&["c_location", "c_payload", "borough"][..], &["c_payload"][..]] {
+        let reply = client.action("rtdb.owned.SpatialGather.v1", gather(revision, columns)).await.unwrap();
+        let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+        assert_eq!(stream.schema().metadata()["rtdb.owned.valid_micros"], valid.to_string());
+        let winner = stream.next().unwrap().unwrap();
+        let document = winner.column_by_name("document").unwrap().as_any()
+            .downcast_ref::<arrow_array::StructArray>().unwrap();
+        if columns.len() == 1 {
+            assert_eq!(document.column_names(), ["c_payload", "_system_from"]);
+        }
+        let payload = document.column_by_name("c_payload").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(payload.value(0), b"\x09old\0\x01");
+        assert!(winner.column_by_name("omitted_sizes").is_none());
+    }
+    assert_eq!(client.action("rtdb.owned.SpatialGather.v1", gather(revision + 1, &["c_payload"])).await.unwrap_err().code(),
         tonic::Code::Internal);
     client.action("rtdb.owned.SpatialClose.v1", capability.into()).await.unwrap();
+
+    let request = query_window(hold, mixed_path, valid, None, &point(1.0), "intersects",
+        Some(select(&["c_mixed", "c_payload", "borough"])), None,
+        Some((&["c_mixed", "c_payload"], Some("c_mixed"))));
+    let reply = client.action("rtdb.owned.SpatialProbe.v1", request).await.unwrap();
+    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    assert!(!stream.schema().metadata().contains_key("rtdb.owned.spatial_exact"));
+    let token = uuid::Uuid::parse_str(&stream.schema().metadata()["rtdb.owned.spatial_filter"]).unwrap();
+    let first = stream.next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(first.schema_ref().field(0), first.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("a"));
+    let document = first.column_by_name("document").unwrap().as_any()
+        .downcast_ref::<arrow_array::StructArray>().unwrap();
+    assert!(document.column_by_name("c_mixed").is_some());
+
+    let mut mixed_capability = hold.to_vec();
+    mixed_capability.extend_from_slice(token.as_bytes());
+    for after in [b'b', b'b', b'z'] {
+        let mut next = mixed_capability.clone();
+        next.extend_from_slice(&[1, 0, 0, after]);
+        let reply = client.action("rtdb.owned.SpatialNext.v1", next.into()).await.unwrap();
+        let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+        let schema = stream.schema();
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "0");
+        assert!(!schema.metadata().contains_key("rtdb.owned.spatial_exact"));
+        if after == b'z' {
+            assert!(stream.next().is_none());
+        } else {
+            let last = stream.next().unwrap().unwrap();
+            assert_eq!(rtdb_columnar::read_entity_id(last.schema_ref().field(0), last.column(0).as_ref(), 0).unwrap(),
+                rtdb_columnar::EntityIdRef::String("d"));
+            let document = last.column_by_name("document").unwrap().as_any()
+                .downcast_ref::<arrow_array::StructArray>().unwrap();
+            assert!(document.column_by_name("c_mixed").is_some());
+            let sizes = last.column_by_name("omitted_sizes").unwrap().as_any()
+                .downcast_ref::<arrow_array::StructArray>().unwrap();
+            let size = sizes.column_by_name("c_payload").unwrap().as_any()
+                .downcast_ref::<arrow_array::UInt32Array>().unwrap();
+            assert_eq!(size.value(0), 1);
+        }
+    }
+    client.action("rtdb.owned.SpatialClose.v1", mixed_capability.into()).await.unwrap();
 
     let projected = "rtdb.owned.SpatialHeld.v3";
     for (action, documents, selected) in [

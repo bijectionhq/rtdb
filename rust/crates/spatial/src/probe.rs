@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BinaryArray, StringArray, StructArray, UInt32Array};
 use arrow_schema::{DataType, Field, Fields};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, selected_cell};
+use rtdb_types::Result;
 
 use crate::read::SelectedHit;
 
@@ -30,14 +31,12 @@ impl Evidence {
 pub(super) fn summarize(
     hits: &[SelectedHit], columns: &[usize], probe: Probe<'_>, evidence: &mut Evidence,
     memory: &Arc<MemoryBudget>,
-) -> Vec<usize> {
+) -> Result<Vec<usize>> {
     if probe.fields.is_empty() {
-        return columns.to_vec();
+        return Ok(columns.to_vec());
     }
     let schema = hits[0].source.batch().schema_ref();
-    let Ok(reservation) = memory.reserve(4096 + columns.len() * (256 + hits.len() * 8)) else {
-        return columns.to_vec();
-    };
+    let reservation = memory.reserve(4096 + columns.len() * (256 + hits.len() * 8))?;
     let mut omitted = Vec::new();
     let mut output = Vec::with_capacity(columns.len());
     for &index in columns {
@@ -64,7 +63,7 @@ pub(super) fn summarize(
         evidence.omitted = Some(StructArray::new(Fields::from(fields), sizes, None));
         evidence._reservation = Some(reservation);
     }
-    output
+    Ok(output)
 }
 
 fn cell_size(field: &Field, array: &dyn Array, row: usize) -> Option<Option<u32>> {

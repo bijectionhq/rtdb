@@ -25,7 +25,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_array, entity_id_type, read_entity_id, selected_cell};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
+use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
 use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
@@ -413,8 +413,22 @@ enum RetainedSpatialQuery {
         matches: rtdb_node::HeldSpatialRange,
         earlier: Option<(OwnedRelation, rtdb_spatial::PreparedRegion)>,
     },
-    Probe { path: OwnedRelation, region: rtdb_spatial::PreparedRegion, certify_point: bool },
+    Probe {
+        path: OwnedRelation,
+        region: rtdb_spatial::PreparedRegion,
+        certify_point: bool,
+        matches: Mutex<Option<Arc<HeldSpatialProbe>>>,
+    },
     Nearest(HeldSpatialNearest),
+}
+
+impl RetainedSpatialQuery {
+    fn discard_probe_matches(&self) -> Result<bool, Status> {
+        match self {
+            Self::Probe { matches, .. } => Ok(matches.lock().map_err(|_| spatial_filters_unavailable())?.take().is_some()),
+            _ => Ok(false),
+        }
+    }
 }
 
 struct RetainedRangeWitness {
@@ -842,6 +856,12 @@ fn single_owned_batch(stream: OwnedStream) -> Result<OwnedBatch, Status> {
 }
 
 fn spatial_filters_unavailable() -> Status { Status::internal("Owned spatial filter storage is unavailable") }
+
+fn spatial_memory_refusal(error: &Status) -> bool {
+    error.metadata().get_bin("xtdb-anomaly-bin").and_then(|value| value.to_bytes().ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|anomaly| anomaly["code"] == "rtdb/memory-budget-exceeded")
+}
 
 fn spatial_document_columns(batch: &RecordBatch) -> Result<Vec<&str>, Status> {
     spatial_column_names(batch, "document_columns")
@@ -3280,11 +3300,12 @@ impl Service {
             let columns = document_columns.as_deref().expect("selected projection");
             let fields = spatial_column_names(input, "omittable_columns")?;
             let request_probe = spatial_probe_request(input, &fields, columns, true)?;
-            let (page, witness) = held.snapshot.spatial_probe_page(
+            let (page, witness, matches) = held.snapshot.open_spatial_probe(
                 &relation, &path, request, observe, columns, &region, request_probe,
             ).await.map_err(status)?;
             let certify_point = page.certifies_point_intersects();
-            (page, witness, Some(RetainedSpatialQuery::Probe { path, region, certify_point }))
+            let matches = Mutex::new(matches.map(Arc::new));
+            (page, witness, Some(RetainedSpatialQuery::Probe { path, region, certify_point, matches }))
         } else if matches!(wire, SpatialHeldWire::Open) {
             held.snapshot.check_relation(&relation).map_err(status)?;
             let region = rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?;
@@ -3305,15 +3326,19 @@ impl Service {
         };
         let mut retained = None;
         let mut token = None;
-        if prepared.is_some() && page.more {
+        if let Some(query) = prepared.as_ref().filter(|_| page.more) {
             let guard = held.spatial_filters.lock().map_err(|_| spatial_filters_unavailable())?;
             if guard.len() >= MAX_SPATIAL_FILTERS { return Err(Status::resource_exhausted("The held read has too many spatial filters")); }
             let nonce = Uuid::new_v4();
             if guard.contains_key(&nonce) { return Err(spatial_filters_unavailable()); }
-            retained = Some((guard, call.reserve(1024)?));
+            let reservation = match call.reserve(1024) {
+                Err(error) if spatial_memory_refusal(&error) && query.discard_probe_matches()? => call.reserve(1024)?,
+                reservation => reservation?,
+            };
+            retained = Some((guard, reservation));
             token = Some(nonce);
         }
-        let reply = self.spatial_reply(call, &held, &relation, valid_at, page, witness, selected_documents, token)?;
+        let reply = self.spatial_reply(call, &held, &relation, valid_at, &page, witness, selected_documents, token, prepared.as_ref())?;
         if let (Some((mut filters, reservation)), Some(token), Some(query)) = (retained, token, prepared) {
             filters.insert(token, Arc::new(RetainedSpatialFilter {
                 relation, batch, query, valid_at, _reservation: reservation,
@@ -3355,16 +3380,34 @@ impl Service {
                     held.snapshot.next_spatial_range(matches, after, limit, observe, projection).await
                 }
             }
-            (RetainedSpatialQuery::Probe { path, region, certify_point }, None) => {
-                let request = rtdb_spatial::Request {
-                    partition: spatial_partition(filter.batch.batch())?,
-                    region: Default::default(), predicate: rtdb_spatial::Predicate::All,
-                    valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
-                };
+            (RetainedSpatialQuery::Probe { path, region, certify_point, matches }, None) => {
                 let input = filter.batch.batch();
                 let fields = spatial_column_names(input, "omittable_columns")?;
                 let probe = spatial_probe_request(input, &fields, &columns, *certify_point)?;
-                held.snapshot.spatial_probe_page(&filter.relation, path, request, observe, &columns, region, probe).await
+                let retained = matches.lock().map_err(|_| spatial_filters_unavailable())?.clone();
+                let cached = if let Some(retained) = retained {
+                    let result = held.snapshot.next_spatial_probe(&retained, after, limit, observe, &columns, probe).await;
+                    drop(retained);
+                    match result {
+                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+                            filter.query.discard_probe_matches()?;
+                            None
+                        }
+                        result => Some(result),
+                    }
+                } else {
+                    None
+                };
+                if let Some(result) = cached {
+                    result
+                } else {
+                    let request = rtdb_spatial::Request {
+                        partition: spatial_partition(input)?,
+                        region: Default::default(), predicate: rtdb_spatial::Predicate::All,
+                        valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
+                    };
+                    held.snapshot.spatial_probe_page(&filter.relation, path, request, observe, &columns, region, probe).await
+                }
             }
             (RetainedSpatialQuery::Nearest(ranking), Some(distance_m)) => {
                 held.snapshot.next_spatial_nearest(ranking, rtdb_spatial::NearestPosition { distance_m, id: after },
@@ -3372,7 +3415,7 @@ impl Service {
             }
             _ => return Err(invalid("Spatial continuation uses another query order")),
         }.map_err(status)?;
-        self.spatial_reply(call, &held, &filter.relation, filter.valid_at, page, witness, true, Some(token))
+        self.spatial_reply(call, &held, &filter.relation, filter.valid_at, &page, witness, true, Some(token), Some(&filter.query))
     }
 
     pub(crate) async fn gather_spatial_owned_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
@@ -3396,7 +3439,7 @@ impl Service {
             .ok_or_else(|| invalid("Spatial gather has no revision"))?;
         let page = held.snapshot.gather_spatial_document(&relation, id, Timestamp(revision.value(row)), &columns)
             .await.map_err(status)?;
-        self.spatial_reply(call, &held, &relation, held.snapshot.system_time(), page, None, true, None)
+        self.spatial_reply(call, &held, &relation, held.snapshot.system_time(), &page, None, true, None, None)
     }
 
     pub(crate) fn close_spatial_owned_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
@@ -3418,7 +3461,34 @@ impl Service {
 
     fn spatial_reply(
         &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, valid_at: Timestamp,
-        page: rtdb_spatial::Page, witness: Option<OwnedRangeWitness>, selected_documents: bool, token: Option<Uuid>,
+        page: &rtdb_spatial::Page, witness: Option<OwnedRangeWitness>, selected_documents: bool, token: Option<Uuid>,
+        query: Option<&RetainedSpatialQuery>,
+    ) -> Result<ActionResult, Status> {
+        let witness = match witness {
+            Some(witness) => {
+                let nonce = match held.remember(call, relation, witness.clone()) {
+                    Err(error) if spatial_memory_refusal(&error)
+                        && query.map(RetainedSpatialQuery::discard_probe_matches).transpose()? == Some(true) =>
+                    {
+                        held.remember(call, relation, witness)?
+                    }
+                    result => result?,
+                };
+                Some(nonce)
+            }
+            None => None,
+        };
+        let encode = || self.encode_spatial_reply(call, held, relation, valid_at, page, witness, selected_documents, token);
+        match encode() {
+            Err(error) if spatial_memory_refusal(&error)
+                && query.map(RetainedSpatialQuery::discard_probe_matches).transpose()? == Some(true) => encode(),
+            result => result,
+        }
+    }
+
+    fn encode_spatial_reply(
+        &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, valid_at: Timestamp,
+        page: &rtdb_spatial::Page, witness: Option<Uuid>, selected_documents: bool, token: Option<Uuid>,
     ) -> Result<ActionResult, Status> {
         let present = held.snapshot.system_time();
         let mut metadata = std::collections::HashMap::new();
@@ -3429,8 +3499,7 @@ impl Service {
         if let Some(distance) = page.next_distance_m {
             metadata.insert("rtdb.owned.spatial_next_distance_m".into(), distance.to_string());
         }
-        if let Some(witness) = witness {
-            let nonce = held.remember(call, relation, witness)?;
+        if let Some(nonce) = witness {
             metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
         }
         if page.certifies_point_intersects() {
