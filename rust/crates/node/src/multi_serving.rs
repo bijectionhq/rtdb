@@ -48,6 +48,10 @@ pub struct MultiServing {
 }
 
 impl MultiServing {
+    pub async fn restored_checkpoint_basis(&self, manifest_digest: [u8; 32]) -> Result<Option<Basis>> {
+        self.database.lock().await.restored_checkpoint_basis(manifest_digest).await
+    }
+
     pub fn new(database: MultiDatabase, memory: Arc<MemoryBudget>) -> Self {
         let incarnation = database.incarnation();
         let tokens = database.token_authority();

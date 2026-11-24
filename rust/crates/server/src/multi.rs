@@ -19,11 +19,11 @@ use rtdb_db::{
 };
 use rtdb_format::database::proto::{DatabaseConfig, LocalStorage, database_config::Storage};
 use rtdb_node::{
-    Clock, DatabaseStorage, LogAccess, MultiServing, NativeResources, Node, OpenedLogs,
-    ResourceFactory, SystemClock, serving::ServingDriver,
+    Clock, DatabaseStorage, DeploymentTransfer, LogAccess, MultiServing, NativeResources, Node,
+    OpenedLogs, ResourceFactory, SystemClock, serving::ServingDriver,
 };
 use rtdb_storage::{IoRegion, LocalStore, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::config::NodeConfiguration;
 
 mod catalog;
-use catalog::Status;
+use catalog::{Status, TransferExport};
 
 const WRITER_LEASE_MICROS: i64 = 5_000_000;
 const CLOCK_DRIFT_MICROS: i64 = 250_000;
@@ -216,7 +216,7 @@ impl MultiRuntime {
             .chain(
                 observed
                     .iter()
-                    .filter(|(_, entry)| entry.status == Status::Ready)
+                    .filter(|(_, entry)| entry.status.ready())
                     .map(|(name, entry)| (name.clone(), entry.database)),
             )
             .collect::<BTreeMap<_, _>>();
@@ -256,9 +256,7 @@ impl MultiRuntime {
     }
 
     async fn provision(&self, name: &str) -> Result<DatabaseConfig> {
-        if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
-            return Err(invalid("Invalid deployment name"));
-        }
+        validate_deployment_name(name)?;
         let id = self
             .bootstrap
             .get(name)
@@ -279,23 +277,187 @@ impl MultiRuntime {
         Ok(self.configuration.clone())
     }
 
+    async fn transfer(
+        &self,
+        source: &str,
+        destination: &str,
+        transfer: DeploymentTransfer,
+        cancellation: &CancellationToken,
+    ) -> Result<(DatabaseConfig, Basis)> {
+        validate_deployment_name(source)?;
+        validate_deployment_name(destination)?;
+        if source == destination {
+            return Err(invalid(
+                "A checkpoint transfer requires separate source and destination deployments",
+            ));
+        }
+        let request = transfer_request_digest(source, &transfer);
+        let mut rows = self.catalog.read().await?;
+        let selected = match rows.remove(destination) {
+            Some(entry) => entry,
+            None => {
+                let original = rows
+                    .remove(source)
+                    .filter(|entry| entry.status.ready())
+                    .ok_or_else(unknown_deployment)?;
+                let export = match transfer {
+                    DeploymentTransfer::Restore { ticket } => {
+                        let driver = self.ensure_driver(source, original.database).await?;
+                        let export = driver
+                            .open_checkpoint_export(ticket.clone(), cancellation)
+                            .await?;
+                        TransferExport::Ticket {
+                            manifest: export.manifest_digest(),
+                            ticket,
+                        }
+                    }
+                    DeploymentTransfer::Fork {
+                        pin,
+                        basis,
+                        retain_until,
+                    } => {
+                        if basis.incarnation() != *original.database.as_bytes() {
+                            return Err(invalid(
+                                "The fork basis belongs to a different source incarnation",
+                            ));
+                        }
+                        TransferExport::Fork {
+                            pin,
+                            basis,
+                            retain_until,
+                        }
+                    }
+                };
+                self.catalog
+                    .reserve_transfer(
+                        destination,
+                        self.catalog.deployment_id(destination),
+                        catalog::Transfer {
+                            request,
+                            source: source.into(),
+                            incarnation: original.database,
+                            export,
+                        },
+                    )
+                    .await?
+            }
+        };
+        let basis = match selected.status {
+            Status::TransferReady {
+                request: prior,
+                basis,
+            } if prior == request => basis,
+            Status::TransferPending(pending) if pending.request == request => {
+                self.finish_transfer(destination, selected.database, &pending, cancellation)
+                    .await?
+            }
+            _ => {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Conflict,
+                    "rtdb/deployment-transfer-conflict",
+                    "The destination is already assigned to a different operation",
+                ));
+            }
+        };
+        Ok((self.configuration.clone(), basis))
+    }
+
+    async fn finish_transfer(
+        &self,
+        name: &str,
+        database: Uuid,
+        pending: &catalog::Transfer,
+        cancellation: &CancellationToken,
+    ) -> Result<Basis> {
+        let bound;
+        let pending = match &pending.export {
+            TransferExport::Fork {
+                pin,
+                basis,
+                retain_until,
+            } => {
+                let source = self.transfer_source(pending).await?;
+                let ticket = source
+                    .export_checkpoint(*pin, *basis, *retain_until, cancellation)
+                    .await?;
+                let export = source
+                    .open_checkpoint_export(ticket.clone(), cancellation)
+                    .await?;
+                bound = self
+                    .catalog
+                    .bind_transfer(
+                        name,
+                        database,
+                        pending.request,
+                        export.manifest_digest(),
+                        ticket,
+                    )
+                    .await?;
+                match &bound {
+                    Status::TransferReady { basis, .. } => return Ok(*basis),
+                    Status::TransferPending(bound) => bound,
+                    _ => return Err(invalid("The ordered transfer lost its bound reservation")),
+                }
+            }
+            TransferExport::Ticket { .. } => pending,
+        };
+        let TransferExport::Ticket { manifest, ticket } = &pending.export else {
+            return Err(invalid(
+                "The ordered transfer is missing its bound checkpoint",
+            ));
+        };
+        let destination = self.ensure_driver(name, database).await?;
+        let basis = match destination.restored_checkpoint_basis(*manifest).await? {
+            Some(basis) => basis,
+            None => {
+                let source = self.transfer_source(pending).await?;
+                let export = source
+                    .open_checkpoint_export(ticket.clone(), cancellation)
+                    .await?;
+                if export.manifest_digest() != *manifest {
+                    return Err(invalid(
+                        "The source pin no longer names the reserved transfer",
+                    ));
+                }
+                destination
+                    .restore_checkpoint(export, cancellation)
+                    .await?
+                    .basis
+            }
+        };
+        self.catalog
+            .mark_transfer_ready(name, database, pending.request, basis)
+            .await?;
+        Ok(basis)
+    }
+
+    async fn transfer_source(&self, pending: &catalog::Transfer) -> Result<Arc<MultiServing>> {
+        let original = self
+            .catalog
+            .read()
+            .await?
+            .remove(&pending.source)
+            .filter(|entry| entry.status.ready() && entry.database == pending.incarnation)
+            .ok_or_else(unknown_deployment)?;
+        self.ensure_driver(&pending.source, original.database).await
+    }
+
     async fn erase(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
-        let selected = self.catalog.read().await?.remove(name).ok_or_else(|| {
-            Anomaly::new(
-                AnomalyCategory::NotFound,
-                "rtdb/unknown-deployment",
-                "The deployment is absent from the ordered catalog",
-            )
-        })?;
-        let selected = match selected.status {
-            Status::Reserved => {
+        let selected = self
+            .catalog
+            .read()
+            .await?
+            .remove(name)
+            .ok_or_else(unknown_deployment)?;
+        let selected = match &selected.status {
+            Status::Reserved | Status::TransferPending(_) => {
                 return Err(Anomaly::new(
                     AnomalyCategory::Busy,
                     "rtdb/deployment-provisioning",
                     "The deployment is waiting for provisioning",
                 ));
             }
-            Status::Ready => {
+            Status::Ready | Status::TransferReady { .. } => {
                 let event = self
                     .ensure_driver(name, selected.database)
                     .await?
@@ -448,8 +610,33 @@ impl MultiRuntime {
         entry: catalog::Deployment,
         writer: bool,
     ) -> Result<()> {
-        match entry.status {
+        match &entry.status {
             Status::Reserved if !writer => return Ok(()),
+            Status::TransferPending(pending) => {
+                if writer {
+                    let cancellation = CancellationToken::new();
+                    match self
+                        .finish_transfer(name, entry.database, pending, &cancellation)
+                        .await
+                    {
+                        Ok(_) => self.attach(node, name).await?,
+                        Err(error)
+                            if retryable(&error)
+                                || matches!(
+                                    error.category,
+                                    AnomalyCategory::Incorrect
+                                        | AnomalyCategory::NotFound
+                                        | AnomalyCategory::Forbidden
+                                        | AnomalyCategory::Unsupported
+                                ) =>
+                        {
+                            ()
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                return Ok(());
+            }
             Status::Retiring(_) | Status::Erased { .. } => {
                 self.databases
                     .write()
@@ -590,6 +777,47 @@ fn check_incarnation(driver: &MultiServing, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+fn validate_deployment_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
+        return Err(invalid("Invalid deployment name"));
+    }
+    Ok(())
+}
+
+fn unknown_deployment() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::NotFound,
+        "rtdb/unknown-deployment",
+        "The deployment is absent from the ordered catalog",
+    )
+}
+
+fn transfer_request_digest(source: &str, transfer: &DeploymentTransfer) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"rtdb/multi/deployment-transfer/v1\0");
+    hash.update((source.len() as u64).to_be_bytes());
+    hash.update(source);
+    match transfer {
+        DeploymentTransfer::Restore { ticket } => {
+            hash.update([0]);
+            hash.update(ticket);
+        }
+        DeploymentTransfer::Fork {
+            pin,
+            basis,
+            retain_until,
+        } => {
+            hash.update([1]);
+            hash.update(pin.as_bytes());
+            hash.update(basis.to_bytes());
+            if let Some(deadline) = retain_until {
+                hash.update(deadline.0.to_be_bytes());
+            }
+        }
+    }
+    hash.finalize().into()
+}
+
 fn retryable(error: &Anomaly) -> bool {
     error.code == "rtdb/unknown-database"
         || matches!(
@@ -625,6 +853,18 @@ struct ServingResources {
 impl ResourceFactory for ServingResources {
     async fn provision_managed_database(&self, name: &str) -> Result<DatabaseConfig> {
         self.runtime.provision(name).await
+    }
+
+    async fn transfer_managed_database(
+        &self,
+        source: &str,
+        destination: &str,
+        transfer: DeploymentTransfer,
+        cancellation: &CancellationToken,
+    ) -> Result<(DatabaseConfig, Basis)> {
+        self.runtime
+            .transfer(source, destination, transfer, cancellation)
+            .await
     }
 
     async fn erase_managed_database(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
@@ -871,8 +1111,14 @@ fn io_error(error: io::Error) -> Anomaly {
 mod tests {
     use super::*;
     use rtdb_flight_sql::{
-        DeploymentAdminAction, DeploymentAdminAuthority, admin_client::DeploymentAdminClient,
-        rtdb::admin::v1::CreateDeploymentRequest,
+        DeploymentAdminAction, DeploymentAdminAuthority,
+        admin_client::DeploymentAdminClient,
+        rtdb::{
+            admin::v1::{
+                CreateDeploymentRequest, ExportCheckpointRequest, RestoreDeploymentRequest,
+            },
+            v1::Basis as WireBasis,
+        },
     };
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
     use rtdb_types::{EntityId, TableRef, Value};
@@ -909,7 +1155,11 @@ mod tests {
                         action,
                         DeploymentAdminAction::Create {
                             deployment: "reports"
-                        }
+                        } | DeploymentAdminAction::Export { deployment: "xtdb" }
+                            | DeploymentAdminAction::Restore {
+                                source: "xtdb",
+                                destination: "copy"
+                            }
                     )
                 {
                     return Ok(());
@@ -917,13 +1167,14 @@ mod tests {
                 Err(Anomaly::new(
                     AnomalyCategory::Forbidden,
                     "rtdb.test/admin",
-                    "The fixture admits report creation only",
+                    "The fixture denies administration outside its selected names",
                 ))
             }
         }
 
         let data = tempfile::tempdir().unwrap();
         let mut expected = None;
+        let mut interrupted_restore = None;
         let key = vec![37; 16];
         for reopen in [false, true] {
             let limit = 256 << 20;
@@ -948,6 +1199,10 @@ mod tests {
             let stop = CancellationToken::new();
             let database = handle.node().catalog().database("xtdb").unwrap();
             let driver = database.serving_driver().unwrap();
+            let endpoint = format!("http://{}", handle.addresses().flight_sql.unwrap());
+            let mut admin = DeploymentAdminClient::connect(endpoint, "Basic eHRkYjpzZWNyZXQ=")
+                .await
+                .unwrap();
             if reopen {
                 let reports = handle.node().catalog().database("reports").unwrap();
                 assert!(reports.serving_driver().is_some());
@@ -969,12 +1224,42 @@ mod tests {
                     .unwrap(),
                     Value::I64(42)
                 );
-            } else {
-                runtime.tick(handle.node()).await.unwrap();
-                let endpoint = format!("http://{}", handle.addresses().flight_sql.unwrap());
-                let mut admin = DeploymentAdminClient::connect(endpoint, "Basic eHRkYjpzZWNyZXQ=")
+                assert!(handle.node().catalog().database("copy").is_err());
+                let (request, applied) = interrupted_restore.take().unwrap();
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        runtime.tick(handle.node()).await.unwrap();
+                        if handle.node().catalog().database("copy").is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let recovered = admin.restore(request).await.unwrap();
+                assert_eq!(
+                    recovered.basis.unwrap().value.as_slice(),
+                    &applied.to_bytes()
+                );
+                let user = handle.authenticator().authenticate_trusted("xtdb").unwrap();
+                let mut session = handle.node().session("copy", user).unwrap();
+                let mut query = session
+                    .query_sql("SELECT value FROM docs", vec![])
                     .await
                     .unwrap();
+                let batch = query.next_batch().await.unwrap().unwrap();
+                assert_eq!(
+                    rtdb_columnar::read_value(
+                        batch.batch().schema().field(0),
+                        batch.batch().column(0).as_ref(),
+                        0,
+                    )
+                    .unwrap(),
+                    Value::I64(42)
+                );
+            } else {
+                runtime.tick(handle.node()).await.unwrap();
                 let rejected = admin
                     .create(CreateDeploymentRequest {
                         deployment: "another".into(),
@@ -1023,6 +1308,51 @@ mod tests {
                     .unwrap();
                 assert_eq!(receipt.outcome, Outcome::Then);
                 expected = Some(receipt.basis);
+                let checkpoint = admin
+                    .export(ExportCheckpointRequest {
+                        deployment: "xtdb".into(),
+                        basis: Some(WireBasis {
+                            value: receipt.basis.to_bytes().to_vec(),
+                        }),
+                        pin: Uuid::new_v4().as_bytes().to_vec(),
+                        retain_until_micros: None,
+                    })
+                    .await
+                    .unwrap()
+                    .checkpoint;
+                let request = RestoreDeploymentRequest {
+                    from: "xtdb".into(),
+                    deployment: "copy".into(),
+                    checkpoint: checkpoint.clone(),
+                };
+                let pending = admin.restore(request.clone()).await.unwrap_err();
+                assert_eq!(pending.category, AnomalyCategory::Unavailable);
+                assert!(handle.node().catalog().database("copy").is_err());
+                let target = runtime
+                    .ensure_driver("copy", runtime.catalog.deployment_id("copy"))
+                    .await
+                    .unwrap();
+                target
+                    .tick(&BTreeSet::from([runtime.backends.node]))
+                    .await
+                    .unwrap();
+                let export = driver
+                    .open_checkpoint_export(checkpoint.clone(), &stop)
+                    .await
+                    .unwrap();
+                let applied = target
+                    .restore_checkpoint(export, &stop)
+                    .await
+                    .unwrap()
+                    .basis;
+                assert!(handle.node().catalog().database("copy").is_err());
+                handle
+                    .node()
+                    .catalog()
+                    .release_deployment_checkpoint("xtdb", checkpoint, &stop)
+                    .await
+                    .unwrap();
+                interrupted_restore = Some((request, applied));
             }
             drop(database);
             handle.shutdown();

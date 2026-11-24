@@ -27,6 +27,11 @@ impl PinnedExport {
         self.image.contents()
     }
 
+    /// Binds a managed transfer reservation to this exact source manifest.
+    pub fn manifest_digest(&self) -> [u8; 32] {
+        manifest_identity(self.image.id())
+    }
+
     pub async fn file(&self, id: ObjectId) -> Result<Plaintext> {
         if !self.image.contents().files.contains(&id) {
             return Err(Anomaly::incorrect(
@@ -203,6 +208,20 @@ impl MultiDatabase {
     pub async fn checkpoint_source(&mut self) -> Result<Option<CheckpointSource>> {
         self.refresh().await?;
         Ok(self.state().coordinates.origin.and_then(|origin| origin.source))
+    }
+
+    /// Recovers the applied destination terminal even after the source pin has expired.
+    pub async fn restored_checkpoint_basis(&mut self, manifest_digest: [u8; 32]) -> Result<Option<Basis>> {
+        self.refresh().await?;
+        match self.state().coordinates.origin {
+            None => Ok(None),
+            Some(origin) if origin.digest == manifest_digest =>
+                Ok(Some(Basis::new(self.incarnation(), origin.through))),
+            Some(_) => Err(Anomaly::new(
+                AnomalyCategory::Conflict, "rtdb/restore-origin-mismatch",
+                "The destination contains a different checkpoint transfer",
+            )),
+        }
     }
 
     /// The destination must durably publish its independent backing before returning success.

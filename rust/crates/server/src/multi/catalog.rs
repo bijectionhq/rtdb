@@ -16,22 +16,63 @@ pub(super) struct Catalog {
     incarnation: Uuid,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct Deployment {
     pub database: Uuid,
     pub status: Status,
     pub written: Basis,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Status {
     Reserved,
     Ready,
+    TransferPending(Transfer),
+    TransferReady {
+        request: [u8; 32],
+        basis: Basis,
+    },
     Retiring(Retirement),
     Erased {
         retirement: Retirement,
         confirmed: Timestamp,
     },
+}
+
+impl Status {
+    pub fn ready(&self) -> bool {
+        matches!(self, Self::Ready | Self::TransferReady { .. })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Transfer {
+    pub request: [u8; 32],
+    pub source: String,
+    pub incarnation: Uuid,
+    pub export: TransferExport,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum TransferExport {
+    Fork {
+        pin: Uuid,
+        basis: Basis,
+        retain_until: Option<Timestamp>,
+    },
+    Ticket {
+        manifest: [u8; 32],
+        ticket: Vec<u8>,
+    },
+}
+
+impl std::fmt::Debug for Transfer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Transfer")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +108,25 @@ impl Catalog {
 
     /// Selects a stable incarnation before any provisioner opens its data stream.
     pub(super) async fn reserve(&self, name: &str, database: Uuid) -> Result<Deployment> {
+        self.reserve_status(name, database, Status::Reserved).await
+    }
+
+    pub(super) async fn reserve_transfer(
+        &self,
+        name: &str,
+        database: Uuid,
+        transfer: Transfer,
+    ) -> Result<Deployment> {
+        self.reserve_status(name, database, Status::TransferPending(transfer))
+            .await
+    }
+
+    async fn reserve_status(
+        &self,
+        name: &str,
+        database: Uuid,
+        status: Status,
+    ) -> Result<Deployment> {
         if database.is_nil() || database == self.incarnation {
             return Err(Anomaly::incorrect(
                 "rtdb/multi-catalog-identity",
@@ -76,24 +136,105 @@ impl Catalog {
         let mut control = self.database.lock().await;
         let entries = read(&mut control).await?;
         if let Some(existing) = entries.get(name) {
-            return check_identity(*existing, database);
+            return check_identity(existing.clone(), database);
         }
         if entries.values().any(|entry| entry.database == database) {
             return Err(conflict());
         }
-        write(
-            &mut control,
-            name,
-            database,
-            Status::Reserved,
-            Version::Absent,
-        )
-        .await?;
+        write(&mut control, name, database, status, Version::Absent).await?;
         let selected = read(&mut control)
             .await?
             .remove(name)
             .ok_or_else(invalid_catalog)?;
         check_identity(selected, database)
+    }
+
+    pub(super) async fn mark_transfer_ready(
+        &self,
+        name: &str,
+        database: Uuid,
+        request: [u8; 32],
+        basis: Basis,
+    ) -> Result<()> {
+        if basis.incarnation() != *database.as_bytes() {
+            return Err(invalid_catalog());
+        }
+        let mut control = self.database.lock().await;
+        let selected = check_identity(find(&mut control, name).await?, database)?;
+        let ready = Status::TransferReady { request, basis };
+        match &selected.status {
+            status if *status == ready => return Ok(()),
+            Status::TransferPending(Transfer {
+                request: prior,
+                export: TransferExport::Ticket { .. },
+                ..
+            }) if *prior == request => (),
+            _ => return Err(conflict()),
+        }
+        write(
+            &mut control,
+            name,
+            database,
+            ready.clone(),
+            Version::Written(selected.written),
+        )
+        .await?;
+        if check_identity(find(&mut control, name).await?, database)?.status != ready {
+            return Err(conflict());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn bind_transfer(
+        &self,
+        name: &str,
+        database: Uuid,
+        request: [u8; 32],
+        manifest: [u8; 32],
+        ticket: Vec<u8>,
+    ) -> Result<Status> {
+        let mut control = self.database.lock().await;
+        let selected = check_identity(find(&mut control, name).await?, database)?;
+        let mut pending = match &selected.status {
+            Status::TransferReady { request: prior, .. } if *prior == request => {
+                return Ok(selected.status);
+            }
+            Status::TransferPending(pending) if pending.request == request => pending.clone(),
+            _ => return Err(conflict()),
+        };
+        if let TransferExport::Ticket {
+            manifest: prior, ..
+        } = pending.export
+        {
+            return if prior == manifest {
+                Ok(selected.status)
+            } else {
+                Err(conflict())
+            };
+        }
+        pending.export = TransferExport::Ticket { manifest, ticket };
+        write(
+            &mut control,
+            name,
+            database,
+            Status::TransferPending(pending),
+            Version::Written(selected.written),
+        )
+        .await?;
+        let selected = check_identity(find(&mut control, name).await?, database)?;
+        match &selected.status {
+            Status::TransferReady { request: prior, .. } if *prior == request => (),
+            Status::TransferPending(Transfer {
+                request: prior,
+                export:
+                    TransferExport::Ticket {
+                        manifest: original, ..
+                    },
+                ..
+            }) if *prior == request && *original == manifest => (),
+            _ => return Err(conflict()),
+        }
+        Ok(selected.status)
     }
 
     /// Called only after the provisioner observes the reserved stream and its key authority.
@@ -140,7 +281,7 @@ impl Catalog {
             generation: event.generation,
             destroy_after,
         };
-        if selected.status == Status::Ready {
+        if selected.status.ready() {
             write(
                 &mut control,
                 name,
@@ -272,6 +413,35 @@ async fn find(control: &mut MultiDatabase, name: &str) -> Result<Deployment> {
 }
 
 fn decode_status(ready: bool, cells: &StructFields<Value>) -> Result<Status> {
+    if let Some(request) = cells.get("transfer_request") {
+        let Value::Binary(request) = request else {
+            return Err(invalid_catalog());
+        };
+        let request = request
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid_catalog())?;
+        return match (
+            ready,
+            cells.get("transfer_basis"),
+            cells.get("transfer_source"),
+            cells.get("transfer_incarnation"),
+        ) {
+            (true, Some(Value::Binary(basis)), None, None) => Ok(Status::TransferReady {
+                request,
+                basis: Basis::from_bytes(basis)?,
+            }),
+            (false, None, Some(Value::Utf8(source)), Some(Value::Uuid(incarnation))) => {
+                Ok(Status::TransferPending(Transfer {
+                    request,
+                    source: source.clone(),
+                    incarnation: Uuid::from_bytes(*incarnation),
+                    export: decode_transfer_export(cells)?,
+                }))
+            }
+            _ => Err(invalid_catalog()),
+        };
+    }
     let retirement = match (
         cells.get("terminal"),
         cells.get("generation"),
@@ -307,6 +477,39 @@ fn decode_status(ready: bool, cells: &StructFields<Value>) -> Result<Status> {
     }
 }
 
+fn decode_transfer_export(cells: &StructFields<Value>) -> Result<TransferExport> {
+    let get = |name| cells.get(name);
+    match (
+        get("transfer_manifest"),
+        get("transfer_ticket"),
+        get("transfer_pin"),
+        get("transfer_fork_basis"),
+    ) {
+        (Some(Value::Binary(manifest)), Some(Value::Binary(ticket)), None, None) => {
+            Ok(TransferExport::Ticket {
+                manifest: manifest
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid_catalog())?,
+                ticket: ticket.clone(),
+            })
+        }
+        (None, None, Some(Value::Uuid(pin)), Some(Value::Binary(basis))) => {
+            let retain_until = match get("transfer_retain_until") {
+                None => None,
+                Some(Value::I64(until)) => Some(Timestamp(*until)),
+                _ => return Err(invalid_catalog()),
+            };
+            Ok(TransferExport::Fork {
+                pin: Uuid::from_bytes(*pin),
+                basis: Basis::from_bytes(basis)?,
+                retain_until,
+            })
+        }
+        _ => Err(invalid_catalog()),
+    }
+}
+
 async fn write(
     control: &mut MultiDatabase,
     name: &str,
@@ -320,14 +523,67 @@ async fn write(
             "database".into(),
             Cell::Value(Value::Uuid(*database.as_bytes())),
         ),
-        (
-            "ready".into(),
-            Cell::Value(Value::Bool(status == Status::Ready)),
-        ),
+        ("ready".into(), Cell::Value(Value::Bool(status.ready()))),
     ]);
     let phase = match status {
         Status::Reserved => b"reserve".to_vec(),
         Status::Ready => b"ready".to_vec(),
+        Status::TransferPending(transfer) => {
+            cells.insert(
+                "transfer_request".into(),
+                Cell::Value(Value::Binary(transfer.request.to_vec())),
+            );
+            cells.insert(
+                "transfer_source".into(),
+                Cell::Value(Value::Utf8(transfer.source)),
+            );
+            cells.insert(
+                "transfer_incarnation".into(),
+                Cell::Value(Value::Uuid(*transfer.incarnation.as_bytes())),
+            );
+            match transfer.export {
+                TransferExport::Fork {
+                    pin,
+                    basis,
+                    retain_until,
+                } => {
+                    cells.insert(
+                        "transfer_pin".into(),
+                        Cell::Value(Value::Uuid(*pin.as_bytes())),
+                    );
+                    cells.insert(
+                        "transfer_fork_basis".into(),
+                        Cell::Value(Value::Binary(basis.to_bytes().to_vec())),
+                    );
+                    if let Some(until) = retain_until {
+                        cells.insert(
+                            "transfer_retain_until".into(),
+                            Cell::Value(Value::I64(until.0)),
+                        );
+                    }
+                    b"transfer-fork".to_vec()
+                }
+                TransferExport::Ticket { manifest, ticket } => {
+                    cells.insert(
+                        "transfer_manifest".into(),
+                        Cell::Value(Value::Binary(manifest.to_vec())),
+                    );
+                    cells.insert("transfer_ticket".into(), Cell::Value(Value::Binary(ticket)));
+                    b"transfer-ticket".to_vec()
+                }
+            }
+        }
+        Status::TransferReady { request, basis } => {
+            cells.insert(
+                "transfer_request".into(),
+                Cell::Value(Value::Binary(request.to_vec())),
+            );
+            cells.insert(
+                "transfer_basis".into(),
+                Cell::Value(Value::Binary(basis.to_bytes().to_vec())),
+            );
+            b"transfer-ready".to_vec()
+        }
         Status::Retiring(retirement) => {
             add_retirement(&mut cells, retirement);
             b"retiring".to_vec()

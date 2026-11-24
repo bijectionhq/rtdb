@@ -142,11 +142,32 @@ pub trait RemoteStorageFactory: Send + Sync {
     async fn block_discovery(&self, _configuration: &Any) -> Result<rtdb_replication::BlockDiscovery> { Ok(rtdb_replication::BlockDiscovery::List) }
 }
 
+#[cfg(feature = "multi")]
+pub enum DeploymentTransfer {
+    Restore {
+        ticket: Vec<u8>,
+    },
+    Fork {
+        pin: uuid::Uuid,
+        basis: rtdb_types::rtdb_v1::Basis,
+        retain_until: Option<rtdb_types::Timestamp>,
+    },
+}
+
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
     /// Provisions or recovers an ordered registration before the node attaches it.
     async fn provision_managed_database(&self, _name: &str) -> Result<DatabaseConfig> {
         Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"))
+    }
+
+    /// Installs an exact checkpoint before making its destination available for attachment.
+    #[cfg(feature = "multi")]
+    async fn transfer_managed_database(
+        &self, _source: &str, _destination: &str, _transfer: DeploymentTransfer,
+        _cancellation: &CancellationToken,
+    ) -> Result<(DatabaseConfig, rtdb_types::rtdb_v1::Basis)> {
+        Err(Anomaly::unsupported("rtdb/deployment-restore", "The runtime has no managed checkpoint transfer authority"))
     }
 
     /// Returns the authenticated erasure evidence and the latest time of confirmed unreadability.

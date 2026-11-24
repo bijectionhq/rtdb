@@ -166,15 +166,29 @@ impl Service {
                         },
                     )
                     .map_err(error::anomaly)?;
-                let basis = catalog
-                    .restore_deployment_checkpoint(
-                        &request.from,
-                        &request.deployment,
-                        request.checkpoint,
-                        &call.cancellation,
-                    )
-                    .await
-                    .map_err(error::anomaly)?;
+                let basis = if catalog.is_managed() {
+                    self.0
+                        .node
+                        .transfer_managed_deployment(
+                            &request.from,
+                            &request.deployment,
+                            rtdb_node::DeploymentTransfer::Restore {
+                                ticket: request.checkpoint,
+                            },
+                            &call.cancellation,
+                        )
+                        .await
+                } else {
+                    catalog
+                        .restore_deployment_checkpoint(
+                            &request.from,
+                            &request.deployment,
+                            request.checkpoint,
+                            &call.cancellation,
+                        )
+                        .await
+                }
+                .map_err(error::anomaly)?;
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: Some(basis_wire(basis)),
@@ -192,17 +206,36 @@ impl Service {
                         },
                     )
                     .map_err(error::anomaly)?;
-                let basis = catalog
-                    .fork_deployment_checkpoint(
-                        &request.from,
-                        &request.deployment,
-                        pin(&request.pin)?,
-                        basis(request.basis)?,
-                        request.retain_until_micros.map(Timestamp),
-                        &call.cancellation,
-                    )
-                    .await
-                    .map_err(error::anomaly)?;
+                let pin = pin(&request.pin)?;
+                let basis = basis(request.basis)?;
+                let retain_until = request.retain_until_micros.map(Timestamp);
+                let basis = if catalog.is_managed() {
+                    self.0
+                        .node
+                        .transfer_managed_deployment(
+                            &request.from,
+                            &request.deployment,
+                            rtdb_node::DeploymentTransfer::Fork {
+                                pin,
+                                basis,
+                                retain_until,
+                            },
+                            &call.cancellation,
+                        )
+                        .await
+                } else {
+                    catalog
+                        .fork_deployment_checkpoint(
+                            &request.from,
+                            &request.deployment,
+                            pin,
+                            basis,
+                            retain_until,
+                            &call.cancellation,
+                        )
+                        .await
+                }
+                .map_err(error::anomaly)?;
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: Some(basis_wire(basis)),

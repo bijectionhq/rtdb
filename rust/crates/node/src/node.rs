@@ -1207,6 +1207,20 @@ impl Node {
         self.catalog.with_current_attachment(&database, || Ok(()))
     }
 
+    /// Makes the destination visible after the ordered catalog observes the restored backing.
+    #[cfg(feature = "multi")]
+    pub async fn transfer_managed_deployment(
+        &self, source: &str, destination: &str, transfer: crate::DeploymentTransfer,
+        cancellation: &CancellationToken,
+    ) -> Result<rtdb_types::rtdb_v1::Basis> {
+        self.ensure_open()?;
+        let (configuration, basis) = self.factory.resources
+            .transfer_managed_database(source, destination, transfer, cancellation).await?;
+        let database = self.database_or_attach(destination.to_owned(), configuration)
+            .await?.ok_or_else(closed)?;
+        self.catalog.with_current_attachment(&database, || Ok(basis))
+    }
+
     /// Returns the durable erasure evidence after the deployment host settles its storage custody.
     pub async fn erase_managed_deployment(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
         self.ensure_open()?;
