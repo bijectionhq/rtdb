@@ -2201,6 +2201,25 @@ async fn control_readback_cannot_replace_a_pending_transaction() {
 }
 
 #[tokio::test]
+async fn foreign_term_readback_cannot_acknowledge_a_pending_write() {
+    let (mut fixture, operation, mut called, finish) = attach_readback_fixture(1 << 27).await;
+    let (key, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    assert!(matches!(receipt.try_recv(), Err(Empty)));
+    let offset = readback.metadata.offset.0;
+    let mut foreign = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+    foreign.term = Term(2);
+    assert_eq!(foreign.term_sequence, Some(TermSequence(1)));
+
+    fixture.driver.consume(raw(offset, 2, 0, ReplicaBody::NoOp(Default::default()))).await.unwrap();
+    assert_eq!(receipt.try_recv().unwrap().unwrap_err().code, "xtdb/leader-term-ended");
+    finish.send(Ok(())).unwrap();
+    fixture.driver.consume(raw(offset + 1, 2, 1, foreign.message)).await.unwrap();
+
+    assert_eq!(called.try_recv().unwrap(), operation);
+    assert_eq!(fixture.handle.progress().current().tx_key, Some(key));
+}
+
+#[tokio::test]
 async fn own_transaction_requires_a_pending_append_for_its_sequence() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
     fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
@@ -2319,6 +2338,7 @@ async fn own_attach_readback_applies_before_the_effect_and_awaits_it_before_prog
     for effect in [Ok(()), Err(Anomaly::incorrect("test/attach-failed", "Applying the database attach failed"))] {
         let (mut fixture, operation, mut called, finish) = attach_readback_fixture(1 << 27).await;
         let (key, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(1)).await;
+        assert!(matches!(receipt.try_recv(), Err(Empty)));
         let partition = Arc::clone(&fixture.driver.partition);
         let progress = Arc::clone(fixture.handle.progress());
 
@@ -2347,6 +2367,8 @@ async fn own_attach_readback_applies_before_the_effect_and_awaits_it_before_prog
                     panic!("expected a transaction receipt");
                 };
                 assert_eq!(applied.tx_key(), key);
+                assert!(applied.committed());
+                assert!(std::ptr::eq(applied.as_ref(), after.latest_result.as_ref().unwrap().result()));
             }
             Err(error) => {
                 assert_eq!(result.unwrap_err(), error);

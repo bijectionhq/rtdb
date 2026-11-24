@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, ReplicaMetadata, ReplicationClock, progress::term_ended};
-use crate::readback_identity::{ReplicaFingerprint, fingerprint};
+use crate::readback_identity::{ReplicaFingerprint, TransactionEvent, fingerprint, matching_present_integer, transaction_completion};
 
 pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>, Option<bytes::Bytes>), Message(ReplicaBody) }
 #[derive(Clone, Debug)]
@@ -57,6 +57,11 @@ impl PendingWrite {
             .map_err(|_| Anomaly::fault("rtdb.replication/invalid-transition", "Pending replica write was submitted twice"))
     }
     pub fn finish(&self, result: Result<Applied>) { if let Some(completion) = self.completion.lock().take() { let _ = completion.send(result); } }
+    pub fn finish_readback_failure(&self, error: Anomaly) {
+        if let Some(outcome) = transaction_completion(TransactionEvent::ReadbackFailed(error)) {
+            self.finish(outcome);
+        }
+    }
 }
 impl Drop for PendingWrite { fn drop(&mut self) { if let Some(completion) = self.completion.get_mut().take() { let _ = completion.send(Err(term_ended())); } } }
 
@@ -202,6 +207,11 @@ impl ReplicaAppender {
                     drop(_copy_reservation);
                     match enqueued {
                         Ok(Some(receipt)) => {
+                            if let WriteBody::Resolved(tx, _) = &request.write.body
+                                && let Some(outcome) = transaction_completion(TransactionEvent::Enqueued(tx.result()))
+                            {
+                                request.write.finish(outcome.map(|result| Applied::Transaction(Arc::new(result.clone()))));
+                            }
                             let receipt = track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable, observation);
                             if guarded {
                                 // A guarded provider owns the tail until its exact quorum settles.
@@ -261,7 +271,9 @@ fn track_receipt(receipt: crate::ReplicaReceipt, write: Option<Arc<PendingWrite>
 }
 
 pub(crate) fn complete_record(pending: &mut VecDeque<Arc<PendingWrite>>, sequence: Option<TermSequence>, result: Result<Applied>) {
-    if let Some(index) = pending.iter().position(|item| item.sequence() == sequence && sequence.is_some()) {
+    if let Some(index) = pending.iter().position(|item| item.sequence().is_some_and(|expected| {
+        matching_present_integer(sequence.map(|sequence| sequence.0), expected.0)
+    })) {
         if let Some(item) = pending.remove(index) { item.finish(result); }
     }
 }

@@ -22,7 +22,7 @@ use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, Rep
 use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catalog_boundary, matches_confirmation, validate_uploaded_root};
 use crate::logs::{APPEND_CAPACITY, DecodedReplica, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
-use crate::readback_identity::matching_present_integer;
+use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
 use crate::state::fail_pending;
 
 #[async_trait]
@@ -991,7 +991,7 @@ impl ReplicationDriver {
                     && self.fence.clone().admit(term, sequence)?.verdict == Verdict::Apply
                 {
                     let error = readback_mismatch(None);
-                    pending.finish(Err(error.clone()));
+                    pending.finish_readback_failure(error.clone());
                     return Err(error);
                 }
                 // The protobuf body can be omitted or too new for this reader to recognize.
@@ -1020,7 +1020,7 @@ impl ReplicationDriver {
             let sequence = record.envelope.term_sequence;
             let record = record.resolve_payload(&self.logs).await.inspect_err(|error| {
                 if let Some(pending) = self.own_pending_tx_at(observed_term, sequence) {
-                    pending.finish(Err(error.clone()));
+                    pending.finish_readback_failure(error.clone());
                 }
             })?;
             self.validate_own_readback(&record)?;
@@ -1050,22 +1050,21 @@ impl ReplicationDriver {
     }
 
     fn own_pending_tx_at(&self, term: Term, sequence: Option<TermSequence>) -> Option<&PendingWrite> {
-        let leader = self.leader.as_ref().filter(|leader| leader.term == term)?;
+        let leader = self.leader.as_ref().filter(|leader| own_readback_term(Some(leader.term.0), term.0))?;
         leader.pending_tx_at(sequence).map(|(pending, _)| pending.as_ref())
     }
     fn validate_own_readback(&self, record: &ReplicaRecord) -> Result<()> {
-        let Some(leader) = self.leader.as_ref().filter(|leader| leader.term == record.envelope.term) else { return Ok(()); };
+        let Some(leader) = self.leader.as_ref().filter(|leader| own_readback_term(Some(leader.term.0), record.envelope.term.0)) else { return Ok(()); };
         let resolved = matches!(&record.envelope.message, ReplicaBody::ResolvedTx(_));
         let Some((pending, _)) = leader.pending_tx_at(record.envelope.term_sequence) else {
             return if resolved { Err(readback_mismatch(replica_tx_id(record))) } else { Ok(()) };
         };
-        if resolved && pending.append_stamp().and_then(|stamp| stamp.fingerprint)
-            .zip(record.fingerprint).is_some_and(|(expected, observed)| expected == observed)
-        {
+        let appended = pending.append_stamp().and_then(|stamp| stamp.fingerprint.as_ref());
+        if readback_matches_transaction(resolved, appended, record.fingerprint.as_ref()) {
             return Ok(());
         }
         let error = readback_mismatch(replica_tx_id(record));
-        pending.finish(Err(error.clone()));
+        pending.finish_readback_failure(error.clone());
         Err(error)
     }
     async fn next_recovery_write(&mut self) -> Result<Option<Arc<PendingWrite>>> {
@@ -1203,7 +1202,7 @@ impl ReplicationDriver {
                 ReplicaBody::ResolvedTx(message) => {
                     let placed = self.check_placed_terminal(record.envelope.term, message)?;
                     let leading = self.leader.is_some();
-                    let own = self.leader.as_ref().is_some_and(|leader| leader.term == record.envelope.term);
+                    let own = own_readback_term(self.leader.as_ref().map(|leader| leader.term.0), record.envelope.term.0);
                     if own {
                         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
                         let head = leader.resolver_mut()?.take_head();
@@ -1221,15 +1220,17 @@ impl ReplicationDriver {
                             self.progress.applied(Some(head.source_position()), Some(AppliedTransaction::new(Arc::clone(&result), head.placed_attempt())), head.external_token().map(<[u8]>::to_vec))?;
                             Ok(result)
                         }.await;
-                        let result = match applied {
-                            Ok(result) => result,
-                            Err(error) => {
+                        match transaction_completion(TransactionEvent::ApplyFinished(applied)) {
+                            Some(Ok(result)) => {
+                                if let Some(leader) = &mut self.leader {
+                                    complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Transaction(result)));
+                                }
+                            }
+                            Some(Err(error)) => {
                                 pending.finish(Err(error.clone()));
                                 return Err(error);
                             }
-                        };
-                        if let Some(leader) = &mut self.leader {
-                            complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Transaction(result)));
+                            None => {}
                         }
                     } else {
                         if leading {
