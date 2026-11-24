@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 
 mod direct_plan;
+mod retired_family;
+pub use retired_family::bind_retired_family_authority;
+pub(crate) use retired_family::RetiredFamilyFence;
 
 use rtdb_types::{
     Anomaly, EntityId, Interval, OwnedPointVersion, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope,
@@ -880,6 +883,19 @@ impl HostedControlWrite {
         }
         let mut result = Self::new(relation, scope, expected, document)?;
         result.check_only = true;
+        Ok(result)
+    }
+
+    pub(crate) fn source_check(
+        relation: OwnedRelation, scope: PlacedAttemptScope, expected: Option<Timestamp>, document: StructFields<Value>,
+    ) -> Result<Self> {
+        if !document.contains_key("retired_family_grant") {
+            return Self::check(relation, scope, expected, document);
+        }
+        let mut result = Self::new(relation, scope, expected, document)?;
+        result.check_only = true;
+        installed_authority_control(std::iter::once(&result))?;
+        RetiredFamilyFence::from_control(&result)?.ok_or_else(authority_required)?;
         Ok(result)
     }
 

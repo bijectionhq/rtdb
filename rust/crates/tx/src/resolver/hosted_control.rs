@@ -404,23 +404,39 @@ impl OpenTransaction<'_> {
         )?;
         let (_, authority) = crate::hosted_control::installed_authority_control(controls.clone())?;
         if authority.scope() != scope { return Err(unavailable()); }
-        let proof = authority.installed_authority()?;
         let stale = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.hosted/stale-authority",
             "The installation authority changed before ordering");
         let point = rtdb_query::read_hosted_control_point(
             Arc::clone(&context), authority.table(), authority.id(), true,
         ).await?;
         let (row, revision) = point.row.ok_or_else(stale)?;
-        if !proof.matches_revision(Some(revision)) { return Err(stale()); }
-        let row = row.batch();
-        let field = |name| {
-            let (index, field) = row.schema_ref().column_with_name(name).ok_or_else(stale)?;
-            rtdb_columnar::read_value(field, row.column(index).as_ref(), 0)
+        let authority_current = if let Some(retired) = crate::hosted_control::RetiredFamilyFence::from_control(authority)? {
+            if !family_fence || validating_world || replay.is_some() || funded.is_some()
+                || authority.expected() != Some(revision)
+            {
+                return Err(unavailable());
+            }
+            let mut retirement = None;
+            for operation in operations {
+                if let Some((world, EntityId::String(id), _)) = family_retirement(operation)? {
+                    if world.is_some() || retirement.replace(id).is_some() { return Err(unavailable()); }
+                }
+            }
+            retired.require_batch(operations, &retirement.ok_or_else(unavailable)?)?;
+            retired.current(&context, &row).await?
+        } else {
+            let proof = authority.installed_authority()?;
+            if !proof.matches_revision(Some(revision)) { return Err(stale()); }
+            let row = row.batch();
+            let field = |name| {
+                let (index, field) = row.schema_ref().column_with_name(name).ok_or_else(stale)?;
+                rtdb_columnar::read_value(field, row.column(index).as_ref(), 0)
+            };
+            let (Value::Utf8(kind), Value::Binary(incarnation), Value::Utf8(writer)) =
+                (field("kind")?, field("incarnation")?, field("writer")?)
+            else { return Err(stale()); };
+            proof.matches(&kind, &incarnation, &writer)
         };
-        let (Value::Utf8(kind), Value::Binary(incarnation), Value::Utf8(writer)) =
-            (field("kind")?, field("incarnation")?, field("writer")?)
-        else { return Err(stale()); };
-        let authority_current = proof.matches(&kind, &incarnation, &writer);
         if !authority_current {
             return Err(stale());
         }

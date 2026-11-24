@@ -31,6 +31,7 @@ pub use bounded_retry::{BOUNDED_RETRY_METADATA_KEY, bounded_retry_original};
 
 mod hosted_control;
 pub use hosted_control::{HostedAuthority, HostedControlWrite, bind_installed_authority, MAX_PROPOSAL_LAND_ROWS, proposal_close_controls, proposal_land_controls, protected_proposal_landing_control, proposal_family_root_write, proposal_overlay_controls, retained_delete_controls, retained_release_controls};
+pub use hosted_control::bind_retired_family_authority;
 pub use hosted_control::{
     hosted_replay_controls, replayed_archive_cut, replayed_parent_logical_time,
     replayed_world_parent, replayed_world_parent_locator,
