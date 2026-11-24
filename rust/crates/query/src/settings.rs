@@ -4,6 +4,8 @@ use rtdb_plan::{QuerySettings, SettingValue};
 use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, TxId, Value};
 use crate::{CatalogSnapshot, QueryContext, invalid};
 
+mod retained_position;
+
 #[async_trait::async_trait]
 pub trait SnapshotAdmission: Send + Sync {
     async fn reopen(&self, token: &str, current: &QueryContext) -> Result<SqlSnapshotView>;
@@ -190,14 +192,15 @@ impl QueryContext {
         let [snapshot] = original.partitions.as_slice() else {
             return Err(invalid("owned-transaction-cut", "An owned publication requires one captured partition"));
         };
-        if through.0 < 0
-            || snapshot.tx_basis().is_none_or(|basis| through > basis.tx_id)
-            || self.catalog.owned_transaction_cut.is_some_and(|cut| through > cut)
-        {
+        let Some(position) = retained_position::admit(
+            snapshot.tx_basis().map(|basis| basis.tx_id.0),
+            self.catalog.owned_transaction_cut.map(|cut| cut.0),
+            through.0,
+        ) else {
             return Err(invalid("owned-transaction-cut", "The requested publication is above its captured cut"));
-        }
+        };
         let context = Arc::make_mut(&mut self);
-        context.catalog.owned_transaction_cut = Some(through);
+        context.catalog.owned_transaction_cut = Some(TxId(position));
         context.catalog.fragmenter = None;
         context.accelerators = Default::default();
         Ok(self)
