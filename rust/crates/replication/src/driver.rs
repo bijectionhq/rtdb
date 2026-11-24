@@ -139,8 +139,19 @@ impl ReplicationHandle {
     /// Cancels the owned driver; the node must join `ReplicationDriver::run` before releasing its dependencies.
     pub fn shutdown(&self) { self.cancellation.cancel(); }
     pub async fn publish_compaction(&self, message: proto::TriesAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        let expected = crate::fact_history::needs_census(&message).then(|| additions(&message.tries)).transpose()?;
         let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::TriesAdded(message)), (self.clock)()).await?;
         self.await_source(position, cancellation).await?;
+        if let Some(expected) = expected {
+            let installed = self.partition.value();
+            for (table, tries) in expected.into_iter().filter(|(table, _)| TableRef::owned_schema(&table.schema)) {
+                if tries.iter().any(|trie| installed.trie_catalog().trie(&table, &trie.key)
+                    .is_none_or(|installed| installed.data_file_size != trie.data_file_size || installed.published_files != trie.published_files))
+                {
+                    return Err(crate::fact_history::uncovered("The receiver retained the preceding FactStore history"));
+                }
+            }
+        }
         Ok(position)
     }
     /// Returns once this node has applied the message; an entry the leader did not accept is recorded on no trie.
@@ -342,7 +353,7 @@ struct LeaderState {
     recovery_write: Option<Arc<PendingWrite>>,
     held: VecDeque<AdmittedReplica>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
     source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
-    waiting_strict_source: Option<SourceInput>,
+    waiting_strict_source: Option<StrictSource>,
     awaiting_placed: Option<SourceInput>,
     settling_placed: bool,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
@@ -357,6 +368,16 @@ struct SourceInput {
     work: SourceWork,
     reservation: Option<PlacedReservation>,
     _decode_charge: Arc<MemoryReservation>,
+}
+
+enum StrictSource {
+    Transaction(SourceInput),
+    Compaction {
+        position: SourcePosition,
+        log_time: Timestamp,
+        message: proto::TriesAdded,
+        _decode_charge: Arc<MemoryReservation>,
+    },
 }
 
 enum SourceWork {
@@ -1449,7 +1470,11 @@ impl ReplicationDriver {
         if leader.waiting_strict_source.is_some() {
             if !leader.ready_source() { return Ok(()); }
             let source = leader.waiting_strict_source.take().expect("checked for a waiting strict source");
-            return self.admit_source(source);
+            return match source {
+                StrictSource::Transaction(source) => self.admit_source(source),
+                StrictSource::Compaction { position, log_time, message, _decode_charge } =>
+                    self.admit_fact_compaction(position, log_time, message).await,
+            };
         }
         let (LogRecord { metadata, payload, .. }, decode_reservation) = if let Some(head) = leader.source_head {
             let tail = leader.source_tail.as_deref_mut().ok_or_else(|| invalid("Prepared source head has no tail"))?;
@@ -1490,7 +1515,7 @@ impl ReplicationDriver {
                 if (reservation.is_some() || matches!(&source.work, SourceWork::Resolve(request) if request.requires_durable_predecessor()))
                     && !leader.drained_for_strict_source()
                 {
-                    leader.waiting_strict_source = Some(source);
+                    leader.waiting_strict_source = Some(StrictSource::Transaction(source));
                 } else {
                     self.admit_source(source)?;
                 }
@@ -1509,6 +1534,13 @@ impl ReplicationDriver {
                 Some(leader.resolver_mut()?.resolve_db_op(durable, position, metadata.timestamp, operation, verdict, &self.resolve).await?)
             }
             Some(SourceMessage::Protobuf(SourceBody::TriesAdded(mut message))) => {
+                if crate::fact_history::needs_census(&message) {
+                    if !leader.drained_for_strict_source() {
+                        leader.waiting_strict_source = Some(StrictSource::Compaction { position, log_time: metadata.timestamp, message, _decode_charge: decode_charge });
+                        return Ok(());
+                    }
+                    return self.admit_fact_compaction(position, metadata.timestamp, message).await;
+                }
                 message.source_msg_id = Some(position.0);
                 leader.enqueue(WriteBody::Message(ReplicaBody::TriesAdded(message)), block, None, &self.resolve.memory)?;
                 leader.resolver_mut()?.advance_source(position)?;
@@ -1549,6 +1581,34 @@ impl ReplicationDriver {
         if let Some(resolved) = resolved { self.enqueue_resolved(resolved, None).await?; }
         Ok(())
     }
+
+    async fn admit_fact_compaction(&mut self, position: SourcePosition, log_time: Timestamp, mut message: proto::TriesAdded) -> Result<()> {
+        let snapshot = self.partition.snapshot();
+        let block = snapshot.block_index();
+        let admitted = async {
+            if message.storage_version != Some(self.logs.storage_version.0) || message.storage_epoch.unwrap_or_default() != self.logs.storage_epoch.0 {
+                return Err(crate::fact_history::uncovered("A compaction belongs to another storage epoch"));
+            }
+            crate::fact_history::admit(self.blocks.object_store(), snapshot, &additions(&message.tries)?,
+                log_time, &self.resolve.memory, &self.cancellation).await
+        };
+        let accepted = self.cancellation.run_until_cancelled(admitted).await.ok_or_else(stopped)?;
+        let body = match accepted {
+            Ok(()) => {
+                message.source_msg_id = Some(position.0);
+                ReplicaBody::TriesAdded(message)
+            }
+            Err(error) => {
+                eprintln!("FactStore compaction retained the previous history: {}", error.code);
+                ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(position.0), ..Default::default() })
+            }
+        };
+        let leader = self.leader.as_mut().ok_or_else(term_ended)?;
+        leader.enqueue(WriteBody::Message(body), block, None, &self.resolve.memory)?;
+        leader.resolver_mut()?.advance_source(position)?;
+        Ok(())
+    }
+
     fn admit_source(&mut self, source: SourceInput) -> Result<()> {
         let Some(reservation) = source.reservation else { return self.begin_source_resolution(source); };
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;

@@ -6,6 +6,7 @@ mod catalog_cut;
 mod checkpoint_discovery;
 mod replay_floor;
 mod driver;
+mod fact_history;
 mod logs;
 mod progress;
 mod readback_identity;

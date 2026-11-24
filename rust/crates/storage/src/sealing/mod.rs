@@ -343,6 +343,11 @@ impl ObjectStore for EncryptingStore {
     ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         crate::classic_catalog_drain::within_vault(self.classic_catalog_vault.clone(), self.inner.retain_catalog_with_paths(cut, paths)).await
     }
+    async fn retain_anchored_catalog(
+        &self, cut: rtdb_types::CatalogCut, checkpoint: rtdb_types::CatalogCheckpoint, paths: Option<Arc<[String]>>,
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
+        crate::classic_catalog_drain::within_vault(self.classic_catalog_vault.clone(), self.inner.retain_anchored_catalog(cut, checkpoint, paths)).await
+    }
     fn defers_trie_releases(&self) -> bool {
         self.inner.defers_trie_releases()
     }

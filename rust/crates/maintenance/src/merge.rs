@@ -18,7 +18,7 @@ use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, compacted_event_sc
 use rtdb_index::{PartitionValue, TrieState};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
-use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
+use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{CompactionExecutor, CompactionJob, RecencyMode, SnapshotSource};
 
@@ -333,13 +333,14 @@ impl CompactionExecutor for SegmentCompactor {
                 "The compaction selection no longer names live inputs"));
         }
         let captured = snapshot.snapshot();
-        let view = HeldView::catalog(self.store.as_ref(), snapshot.clone(), captured.catalog_cut(), captured.catalog_file_paths()).await?;
+        let view = HeldView::catalog_at(self.store.as_ref(), snapshot.clone(), captured.catalog_cut(), captured.catalog_checkpoint()?, captured.catalog_file_paths()).await?;
         IoRegion::reading(view, self.execute_job(job, snapshot, cancellation)).await
     }
 }
 
 impl SegmentCompactor {
     async fn execute_job(&self, job: &CompactionJob, snapshot: Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<TriesAdded> {
+        let positioned_history = TableRef::owned_schema(&job.table.schema);
         let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
         let entry = snapshot.table_catalog().entry(&job.table).cloned().ok_or_else(|| crate::invalid("Compaction table has no recorded slug"))?;
         let mut inputs = Vec::new();
@@ -391,7 +392,7 @@ impl SegmentCompactor {
                 let batch = read_page(&mut input.reader, page.page, &self.memory)?;
                 let _decoded = self.memory.reserve(decoded_bound(batch.batch())?)?;
                 let mut events = EventBatch::new(batch.batch().clone())?.page_events()?;
-                if input.key.level() == 0 {
+                if input.key.level() == 0 && !positioned_history {
                     let (resolved, reservations) = resolve_same_time(&events, &self.memory)?;
                     events = resolved;
                     charges.extend(reservations);
@@ -405,10 +406,24 @@ impl SegmentCompactor {
             let mut states = EntityStates::new();
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
+            let mut previous = None;
             while let Some((stream, row)) = heap.next() {
                 let event = &rows[stream].events[row];
-                let calculator = states.get(event, &self.memory, || AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory)))?;
-                let Some(mut recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
+                let mut recency = if positioned_history {
+                    if event.op == EventOp::Erase {
+                        return Err(crate::invalid("Owned erasure requires its ordered custody successor"));
+                    }
+                    let coordinate = event.position.map(|position| (event.iid, position));
+                    // The receiver checks the contents of every occurrence at
+                    // this coordinate before it can select the replacement.
+                    if coordinate.is_some() && previous == coordinate { continue; }
+                    previous = coordinate;
+                    Timestamp::MAX
+                } else {
+                    let calculator = states.get(event, &self.memory, || AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory)))?;
+                    let Some(recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
+                    recency
+                };
                 // This merge covers every older primary input for an expiring table.
                 if event.op == EventOp::Erase && job.table.stores_expiring_transaction_metadata() {
                     continue;

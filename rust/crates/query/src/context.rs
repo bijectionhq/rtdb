@@ -28,18 +28,8 @@ async fn hold_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Arc<
     {
         return Ok(hold);
     }
-    if let Some(cut) = cut {
-        let anchor = match snapshot.table_catalog().block() {
-            Some(block) => block.boundary_replica_position().zip(block.publication_sha256())
-                .map(|(boundary, root)| rtdb_types::CatalogCheckpoint { boundary, root }),
-            None => Some(rtdb_types::CatalogCheckpoint {
-                boundary: rtdb_types::ReplicaPosition::from_epoch_offset(cut.replica_epoch, -1)?,
-                root: [0; 32],
-            }),
-        };
-        if let Some(anchor) = anchor {
-            return storage.hold_anchored_catalog(cut, anchor, paths).await;
-        }
+    if let Some((cut, anchor)) = cut.zip(snapshot.catalog_checkpoint()?) {
+        return storage.hold_anchored_catalog(cut, anchor, paths).await;
     }
     storage.hold_catalog_with_paths(cut, paths).await
 }

@@ -45,6 +45,58 @@ impl StoredEvent {
             StoredOperation::Redacted => EventOp::Redacted,
         } }
     }
+
+    /// Commits the original fact and its coordinates independently of Arrow
+    /// field order and compaction's physical recency annotation.
+    pub fn history_fingerprint(mut self) -> Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        struct HashWriter(Sha256);
+        impl std::io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let header = self.header();
+        let document = match &mut self.operation {
+            StoredOperation::Put(document) => {
+                order_document(document);
+                Some(document)
+            }
+            StoredOperation::Delete | StoredOperation::Erase | StoredOperation::Redacted => None,
+        };
+        let mut writer = HashWriter(Sha256::new());
+        writer.0.update(b"rtdb/positioned-fact-event/v1\0");
+        serde_json::to_writer(&mut writer, &(header, self.origin.map(|origin| origin.0), self.entity_key.as_deref(), document))
+            .map_err(invalid)?;
+        Ok(writer.0.finalize().into())
+    }
+}
+
+fn order_document(document: &mut StructFields<Value>) {
+    document.retain(|_, value| !matches!(value, Value::Undefined));
+    document.sort_keys();
+    document.values_mut().for_each(order_document_fields);
+}
+
+fn order_document_fields(value: &mut Value) {
+    match value {
+        Value::Struct(document) => order_document(document),
+        Value::List(items) | Value::FixedSizeList(items) => {
+            if let Some(items) = items.values_mut() { items.iter_mut().for_each(order_document_fields); }
+        }
+        Value::Set(items) => items.iter_mut().for_each(order_document_fields),
+        Value::Map { entries, .. } => {
+            for (key, value) in entries {
+                order_document_fields(key);
+                order_document_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// An event an event batch encodes: its header and recency, and the cells of its put document.

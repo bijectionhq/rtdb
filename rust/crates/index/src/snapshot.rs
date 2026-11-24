@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, OwnedRelation, Result, TableRef, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCheckpoint, CatalogCut, LogicalType, OwnedRelation, ReplicaPosition, Result, TableRef, Timestamp, TransactionKey};
 
 use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, TrieState, absent_type};
 
@@ -62,6 +62,15 @@ impl Snapshot {
     /// Returns the conservative installed prefix captured with this physical catalog.
     /// Callers must also bind the opened database and residence before comparing cuts across nodes.
     pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
+    /// The exact checkpoint that supplies the catalog's admitted replica prefix.
+    pub fn catalog_checkpoint(&self) -> Result<Option<CatalogCheckpoint>> {
+        let Some(cut) = self.catalog_cut else { return Ok(None); };
+        Ok(match self.table_catalog.block() {
+            Some(block) => block.boundary_replica_position().zip(block.publication_sha256())
+                .map(|(boundary, root)| CatalogCheckpoint { boundary, root }),
+            None => Some(CatalogCheckpoint { boundary: ReplicaPosition::from_epoch_offset(cut.replica_epoch, -1)?, root: [0; 32] }),
+        })
+    }
     /// Complete paths for compacted primaries and their recorded artefacts, and published search runs.
     /// A claim exceeding the bound retains the conservative scope.
     pub fn catalog_file_paths(&self) -> Option<Arc<[String]>> {

@@ -34,9 +34,17 @@ impl HeldView {
         store: &dyn crate::ObjectStore, owner: Arc<dyn Send + Sync>, cut: Option<rtdb_types::CatalogCut>,
         paths: Option<Arc<[String]>>,
     ) -> rtdb_types::Result<Arc<Self>> {
-        let registration = match paths {
-            Some(paths) => store.retain_catalog_with_paths(cut, paths).await?,
-            None => store.retain_catalog(cut).await?,
+        Self::catalog_at(store, owner, cut, None, paths).await
+    }
+
+    pub async fn catalog_at(
+        store: &dyn crate::ObjectStore, owner: Arc<dyn Send + Sync>, cut: Option<rtdb_types::CatalogCut>,
+        checkpoint: Option<rtdb_types::CatalogCheckpoint>, paths: Option<Arc<[String]>>,
+    ) -> rtdb_types::Result<Arc<Self>> {
+        let registration = match (cut.zip(checkpoint), paths) {
+            (Some((cut, checkpoint)), paths) => store.retain_anchored_catalog(cut, checkpoint, paths).await?,
+            (None, Some(paths)) => store.retain_catalog_with_paths(cut, paths).await?,
+            (None, None) => store.retain_catalog(cut).await?,
         };
         if store.defers_trie_releases() && registration.is_none() {
             return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
