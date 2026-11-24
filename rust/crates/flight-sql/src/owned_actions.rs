@@ -1855,7 +1855,7 @@ impl Service {
                 let start = writes.len();
                 let bytes = charge.bytes();
                 let arrow = relation.is_root_data() || ArrowCell::named(batch.batch(), "_op", row)
-                    .and_then(ArrowCell::utf8).is_some_and(|op| matches!(op, "create" | "replace"));
+                    .and_then(upload::owned_operation).is_some_and(|op| matches!(op, "create" | "replace"));
                 if !arrow || !self.append_owned_arrow_row(writes, relation, batch, row, effects, charge)? {
                     writes.truncate(start);
                     charge.shrink_to(bytes).map_err(status)?;
@@ -1908,7 +1908,7 @@ impl Service {
             charge.grow_to(wire::add(charge.bytes(), id.owned_payload_bytes())?).map_err(status)?;
             Ok(id.into_owned())
         };
-        let operation = cell("_op").and_then(ArrowCell::utf8).ok_or_else(|| invalid("Owned commit _op must be Utf8"))?;
+        let operation = cell("_op").and_then(upload::owned_operation).ok_or_else(|| invalid("Owned commit _op must be Utf8"))?;
         if operation == "require-spatial-path" && effects.allows_spatial_requirement() {
             let EntityIdRef::String(name) = id else { return Err(invalid("Spatial readiness needs a path name")); };
             if source.num_columns() != 4 { return Err(invalid("Invalid spatial readiness condition")); }

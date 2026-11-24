@@ -53,10 +53,9 @@ impl<'a> ImportPage<'a> {
         if batch.num_rows() != self.placements.iter().map(|&(_, rows)| rows).sum::<usize>() {
             return Err(invalid("The import schedule does not consume its batch"));
         }
-        let ops = batch.column_by_name("_op").and_then(|column| column.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| invalid("The import page needs create and check operations"))?;
         let mut creates = 0;
-        for operation in ops.iter() {
+        for row in 0..batch.num_rows() {
+            let operation = ArrowCell::named(batch, "_op", row).and_then(upload::owned_operation);
             match operation {
                 Some("create") => creates += 1,
                 Some("check") => (),
