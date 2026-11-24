@@ -317,14 +317,16 @@ impl State {
         let drained = match self.operation {
             Some(operation)
                 if self.root_drains.len() == self.roots.len()
-                    && self.duties.values().all(|work| work.join.is_some()) =>
+                    && self.duties.values().all(|work| work.join.is_some())
+                    && (self.sql_trigger.is_none() || self.root_preparations.len() == self.roots.len()) =>
             {
                 Some(fingerprint(
-                    b"rtdb.custody/domain-drain/v1\0",
+                    b"rtdb.custody/domain-drain/v2\0",
                     &(
                         operation,
                         membership,
                         roster,
+                        self.selection()?,
                         &self.root_drains,
                         &self.duties,
                     ),
@@ -683,9 +685,11 @@ impl State {
                 root,
                 evidence,
             } => {
-                if self.operation != Some(*operation) {
+                if self.operation != Some(*operation)
+                    || (self.sql_trigger.is_some() && self.root_preparations.len() != self.roots.len())
+                {
                     return Err(conflict(
-                        "The root cut does not belong to the closing operation",
+                        "The root cut does not belong to a prepared closing operation",
                     ));
                 }
                 let enrolled = self
@@ -1127,7 +1131,7 @@ mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
-    fn installed_sql_awaits_an_authenticated_edge_to_every_member() {
+    fn installed_sql_selects_overlapping_markers_after_authenticating_the_cohort() {
         let mut state = State::new(Uuid::new_v4());
         let parent_key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
         let child_key = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).unwrap();
@@ -1139,7 +1143,7 @@ mod tests {
             state.apply(&Action::Enroll {
                 generation: 1, root: placement.deployment,
                 enrollment: Root {
-                    history: installed_history(placement).unwrap(), admission_key: [19; 32],
+                    history: installed_history(placement).unwrap(), admission_key: key.public_key().as_ref().try_into().unwrap(),
                     verification_key: key.public_key().as_ref().try_into().unwrap(),
                 },
             }).unwrap();
@@ -1156,6 +1160,42 @@ mod tests {
         fork.child_signature = child_key.sign(&bytes).as_ref().to_vec();
         state.apply(&Action::EnrollInstalledFork { fork }).unwrap();
         assert!(state.can_start_sql(parent.deployment));
+
+        let mut intents = Vec::new();
+        for (placement, key, offset) in [(parent, &parent_key, 21), (child, &child_key, 37)] {
+            let intent = SqlIntent {
+                placement,
+                transaction: rtdb_types::TransactionKey {
+                    tx_id: rtdb_types::TxId(offset),
+                    system_time: rtdb_types::Timestamp(offset),
+                },
+                position: rtdb_types::ReplicaPosition(offset),
+            };
+            let signature = key.sign(&intent.signing_bytes(state.domain, 1).unwrap()).as_ref().to_vec();
+            state.apply(&Action::RecordSql { generation: 1, intent, signature }).unwrap();
+            intents.push(intent);
+        }
+        let operation = Operation {
+            domain: state.domain, generation: 1, erase: Uuid::new_v4(),
+            target: intents[0].target().unwrap(),
+        };
+        state.apply(&Action::BeginSql {
+            operation, intent: intents[0], verification_key: parent_key.public_key().as_ref().try_into().unwrap(),
+        }).unwrap();
+        for (index, (intent, key)) in intents.into_iter().zip([&parent_key, &child_key]).enumerate() {
+            assert_eq!(state.selection().unwrap(), None);
+            let mut source = SourceErasure {
+                operation, placement: intent.placement, history: installed_history(intent.placement).unwrap(),
+                original_head: [20 + index as u8; 32],
+                selectors: [22 + index as u8; 32], first_marker: Some((intent.transaction, intent.position)),
+                signature: Vec::new(),
+            };
+            source.signature = key.sign(&source.signing_bytes().unwrap()).as_ref().to_vec();
+            state.apply(&Action::SelectSourceErasure { source }).unwrap();
+        }
+        assert!(state.selection().unwrap().is_some());
+        assert!(!state.view().unwrap().successors_ready);
+        assert!(state.view().unwrap().drained.is_none());
     }
 
     #[test]
