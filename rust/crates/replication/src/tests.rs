@@ -2222,8 +2222,10 @@ async fn unrecognized_readback_only_faults_an_admitted_pending_transaction() {
         let before = fixture.driver.partition.value();
         let frame = |term, sequence| {
             let mut frame = vec![rtdb_format::PROTOBUF_LOG_HEADER, 7 << 3, term, 9 << 3, sequence];
-            if unknown_field { frame.extend([12 << 3 | 2, 0]); }
-            Bytes::from(frame)
+            if unknown_field { frame.extend([15 << 3 | 2, 0]); }
+            let frame = Bytes::from(frame);
+            assert!(ReplicaEnvelope::decode(&frame).unwrap().is_none());
+            frame
         };
         let mut discarded = readback.clone();
         discarded.payload = frame(1, 0);
