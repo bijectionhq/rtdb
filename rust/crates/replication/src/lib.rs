@@ -45,4 +45,4 @@ pub use replay_closure::{ReplayBase, ReplayDependencySources, checkpoint_depende
 pub use repair::{LocalRepair, PrimaryReset, PublishedPrimaryReset, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};
-pub use table_replay::RetainedTableReplay;
+pub use table_replay::{RetainedHistory, RetainedTableReplay};
