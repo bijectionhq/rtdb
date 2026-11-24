@@ -287,7 +287,7 @@ The placed Original route checks the archive source fence before opening a Root 
 
 Hosting can use `OriginalAssertionFamilyReader::current_retired` to verify an authenticated archive selection against the current Original attachment.
 The verifier requires exact coverage of the carrier publication, fence, retired frontier and captured cut in the physical Original history.
-It derives the handoff commitment from the ordered `archive-source-fence.v1` row and checks that the same transaction closed the exact original installation's writer and cleared its placement assignment.
+It derives the handoff commitment from the ordered `archive-source-fence.v1` row and checks that the same transaction recorded an empty writer and placement assignment for the exact original installation.
 The current original custody fingerprint and Root audience tablet must match the approved selection.
 Recovery can derive a writer commitment for an existing registry entry by proving its exact pre-fence transaction and checking its creator against the original installation at that transaction.
 This control evidence requires the Original order to be reachable and the selected history to remain readable.
