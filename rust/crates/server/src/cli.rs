@@ -7,7 +7,14 @@ use zeroize::Zeroizing;
 
 use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, PgwireSettings, FlightSettings};
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb node --multi [-f FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+#[cfg(feature = "multi")]
+mod admin;
+#[cfg(feature = "multi")]
+pub use admin::AdminOptions;
+
+pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
+
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb admin --help\n       rtdb node --multi [-f FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -25,6 +32,9 @@ pub struct DevOptions {
 
 #[derive(Clone, Debug)]
 pub enum Command { Help, Version, BuildInfo, Start(StartOptions), StartMulti(StartOptions), Dev(DevOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize, checkpoint_key_vault: Option<PathBuf> },
+    AdminHelp,
+    #[cfg(feature = "multi")]
+    Admin(AdminOptions),
     RepairRetainedCheckpoint { request: rtdb_node::RetainedLocalRepair, memory_bytes: usize, checkpoint_key_vault: Option<PathBuf> },
     RetainRepairBase { request: rtdb_node::RetainRepairBase, memory_bytes: usize, reclaim_receipts: bool }, HashPassword { bcrypt: bool, password: Option<Secret> } }
 
@@ -36,6 +46,14 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
     }
     if matches!(arguments.peek().map(String::as_str), Some("help" | "--help" | "-h")) { return Ok(Command::Help); }
     if matches!(arguments.peek().map(String::as_str), Some("--version" | "-V")) { return Ok(Command::Version); }
+    if arguments.peek().is_some_and(|argument| argument == "admin") {
+        arguments.next();
+        if matches!(arguments.peek().map(String::as_str), Some("help" | "--help" | "-h")) { return Ok(Command::AdminHelp); }
+        #[cfg(feature = "multi")]
+        return Ok(Command::Admin(AdminOptions::parse(arguments, environment)?));
+        #[cfg(not(feature = "multi"))]
+        return Err(Anomaly::unsupported("rtdb.admin/cli", "This binary was built without Multi administration"));
+    }
     if arguments.peek().is_some_and(|argument| argument == "--build-info") {
         arguments.next();
         if arguments.next().is_some() { return Err(invalid("--build-info accepts no arguments")); }

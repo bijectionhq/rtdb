@@ -11,11 +11,11 @@ use crate::{
     v1::error,
 };
 
-const EXPORT: &str = "rtdb.admin.v1.ExportCheckpoint";
-const RESTORE: &str = "rtdb.admin.v1.RestoreDeployment";
-const FORK: &str = "rtdb.admin.v1.ForkDeployment";
-const CREATE: &str = "rtdb.admin.v1.CreateDeployment";
-const DELETE: &str = "rtdb.admin.v1.DeleteDeployment";
+pub(crate) const EXPORT: &str = "rtdb.admin.v1.ExportCheckpoint";
+pub(crate) const RESTORE: &str = "rtdb.admin.v1.RestoreDeployment";
+pub(crate) const FORK: &str = "rtdb.admin.v1.ForkDeployment";
+pub(crate) const CREATE: &str = "rtdb.admin.v1.CreateDeployment";
+pub(crate) const DELETE: &str = "rtdb.admin.v1.DeleteDeployment";
 pub(crate) const ACTIONS: [&str; 5] = [CREATE, DELETE, FORK, EXPORT, RESTORE];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -19,6 +19,15 @@ async fn run() -> Result<()> {
     let command = cli::parse(std::env::args().skip(1), &|key| std::env::var(key).ok())?;
     match command {
         Command::Help => { print!("{}", cli::HELP); Ok(()) }
+        Command::AdminHelp => { print!("{}", cli::ADMIN_HELP); Ok(()) }
+        #[cfg(feature = "multi")]
+        Command::Admin(options) => {
+            let result = options.run().await?;
+            write_report(std::io::stdout().lock(), |output| {
+                serde_json::to_writer(&mut *output, &result).map_err(std::io::Error::other)?;
+                writeln!(output)
+            })
+        }
         Command::Version => { println!("rtdb {}", rtdb_types::runtime_version()); Ok(()) }
         Command::BuildInfo => write_report(std::io::stdout().lock(), |output| {
             serde_json::to_writer(&mut *output, &rtdb_types::compiled_build_info()).map_err(std::io::Error::other)?;
