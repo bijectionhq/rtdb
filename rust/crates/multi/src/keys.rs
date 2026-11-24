@@ -36,10 +36,11 @@ pub(crate) async fn withdraw_archive_records(
 ) -> Result<()> {
     use futures::{StreamExt, TryStreamExt, stream};
     let scope = UnitScope::archive(residence);
-    stream::iter(records.iter().map(|record| async move {
-        let name = archive::associated_unit(record)?;
-        keys.withdraw_unit_key(scope.slot(&name), region).await
-    })).buffer_unordered(16).try_collect::<Vec<()>>().await?;
+    let withdrawals = records.iter().map(|record| {
+        let slot = archive::associated_unit(record).map(|name| scope.slot(&name));
+        async move { keys.withdraw_unit_key(slot?, region).await }
+    }).collect::<Vec<_>>();
+    stream::iter(withdrawals).buffer_unordered(16).try_collect::<Vec<()>>().await?;
     Ok(())
 }
 
