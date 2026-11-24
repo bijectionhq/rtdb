@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use rtdb_tx::{DecisionObservation, HostedControlWrite, OwnedClockSlot};
 use rtdb_types::{Anomaly, EntityId, HOSTED_ROOT_RECEIPTS_TABLE, PlacedAttemptScope, Result, Timestamp, TxId, Value};
 
@@ -12,6 +13,7 @@ pub struct FundedMutationClock {
     pub slot: OwnedClockSlot,
     receipt: String,
     fingerprint: [u8; 32],
+    booking: [u8; 32],
 }
 
 impl FundedMutationClock {
@@ -22,8 +24,19 @@ impl FundedMutationClock {
         let Some(terminal) = written.next() else { return false; };
         written.next().is_none() && terminal.expected().is_none()
             && matches!(terminal.id(), EntityId::String(id) if id == &self.receipt)
-            && matches!(terminal.replacement().and_then(|row| row.get("fingerprint")),
-                Some(Value::Binary(fingerprint)) if fingerprint.as_slice() == self.fingerprint.as_slice())
+            && terminal.replacement().is_some_and(|row| {
+                matches!(row.get("fingerprint"), Some(Value::Binary(fingerprint))
+                    if fingerprint.as_slice() == self.fingerprint.as_slice())
+                    && matches!(row.get("funded_clock"), Some(Value::Binary(original))
+                        if original.as_slice() == self.terminal_evidence().as_slice())
+            })
+    }
+
+    fn terminal_evidence(&self) -> [u8; 40] {
+        let mut bytes = [0; 40];
+        bytes[..8].copy_from_slice(&self.slot.reading.0.to_be_bytes());
+        bytes[8..].copy_from_slice(&self.booking);
+        bytes
     }
 }
 
@@ -78,7 +91,7 @@ impl NativeSession {
             return Err(invalid());
         }
         Ok(FundedMutationClock { slot: OwnedClockSlot { through, reading, issued, funded: true },
-            receipt: receipt.to_owned(), fingerprint: *fingerprint })
+            receipt: receipt.to_owned(), fingerprint: *fingerprint, booking: Sha256::digest(token.as_bytes()).into() })
     }
 }
 
@@ -99,16 +112,21 @@ mod tests {
     fn requires_exactly_the_original_create_only_terminal() -> Result<()> {
         let issued = DecisionObservation { domain: [7; 16], epoch: 1, sequence: 1, instant: Timestamp(300_000) };
         let slot = OwnedClockSlot { through: TxId(4), reading: Timestamp(1_000_000), issued, funded: true };
-        let offer = FundedMutationClock { slot, receipt: "original".into(), fingerprint: [9; 32] };
+        let offer = FundedMutationClock { slot, receipt: "original".into(), fingerprint: [9; 32], booking: [31; 32] };
         let scope = PlacedAttemptScope::new("history", 1)?;
         let row = |id: &str, digest: [u8; 32]| StructFields::from([
             ("_id".into(), Value::Utf8(id.into())),
             ("fingerprint".into(), Value::Binary(digest.to_vec())),
+            ("funded_clock".into(), Value::Binary(offer.terminal_evidence().to_vec())),
         ]);
         let relation = OwnedRelation::new(HOSTED_ROOT_RECEIPTS_TABLE)?;
         let original = HostedControlWrite::new(relation.clone(), scope, None, row("original", [9; 32]))?;
         let replacement = HostedControlWrite::new(relation.clone(), scope, Some(Timestamp(1)), row("original", [9; 32]))?;
-        let substituted = HostedControlWrite::new(relation, scope, None, row("original", [8; 32]))?;
+        let substituted = HostedControlWrite::new(relation.clone(), scope, None, row("original", [8; 32]))?;
+        let mut foreign_booking = row("original", [9; 32]);
+        foreign_booking.insert("funded_clock".into(), Value::Binary(vec![41; 40]));
+        let foreign_booking = HostedControlWrite::new(relation, scope, None, foreign_booking)?;
+        assert!(!offer.admits_terminal(&[foreign_booking]));
         assert!(offer.admits_terminal(std::slice::from_ref(&original)));
         assert!(!offer.admits_terminal(&[replacement]));
         assert!(!offer.admits_terminal(std::slice::from_ref(&substituted)));

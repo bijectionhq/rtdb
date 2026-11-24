@@ -1308,8 +1308,11 @@ impl Service {
         if let Some(offer) = funded {
             let reading = offer.slot.reading;
             let end = reading.0.checked_add(1_000_000).ok_or_else(Self::clock_slot_missed)?;
+            let held_seat = controls.iter().any(|control| control.is_check() && control.expected().is_some()
+                && control.table().table == "bj_fact_root_admission"
+                && matches!(control.id(), EntityId::String(id) if id == "funded_mutation_seat:v1"));
             if deadline <= reading || journal_before.is_none_or(|cutoff| cutoff.before().0 > end)
-                || !worlds.is_empty() || !offer.admits_terminal(&controls)
+                || !worlds.is_empty() || !held_seat || !offer.admits_terminal(&controls)
             {
                 return Err(invalid("Funded mutation requires the original guarded receipt and clock window"));
             }
