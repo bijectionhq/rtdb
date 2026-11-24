@@ -393,6 +393,21 @@ fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<V
     let Some(verdict) = original.pointer_mut(path) else { return false; };
     if verdict.as_str() != Some("delivered") { return false; }
     *verdict = "constraint_refused".into();
+    if clock && original.get("completed_run").is_some() {
+        if !matches!(
+            original.pointer("/task/continuation/kind").and_then(serde_json::Value::as_str),
+            Some("run" | "land"),
+        ) || !matches!(
+            original.pointer("/completed_run/kind").and_then(serde_json::Value::as_str),
+            Some("deferred" | "settled"),
+        ) {
+            return false;
+        }
+        original["completed_run"] = serde_json::json!({
+            "kind": "settled",
+            "outcome": {"status": "refused", "reason": "ConstraintRefused"},
+        });
+    }
     original == refusal
 }
 
@@ -623,6 +638,33 @@ pub(super) fn may_settle(error: &Anomaly) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_constraint_refusal_orders_its_own_fate() {
+        use sha2::{Digest, Sha256};
+
+        let command = r#"["bijection.task.emit.v2",{"destination":{"kind":"function"}},null]"#;
+        let row = |delivered, completed_run| {
+            StructFields::from([("admission".into(), Value::Binary(serde_json::to_vec(&serde_json::json!({
+                "task": {
+                    "command": command,
+                    "digest": format!("{:x}", Sha256::digest(command.as_bytes())),
+                    "continuation": {"kind": "run"}
+                },
+                "delivered": delivered,
+                "completed_run": completed_run,
+            })).unwrap()))])
+        };
+        let primary = row("delivered", serde_json::json!({"kind": "deferred"}));
+        let refusal = row("constraint_refused", serde_json::json!({
+            "kind": "settled", "outcome": {"status": "refused", "reason": "ConstraintRefused"}
+        }));
+        let foreign = row("constraint_refused", serde_json::json!({
+            "kind": "settled", "outcome": {"status": "ok", "result": "null"}
+        }));
+        assert!(continuation_verdict(&primary, &refusal, true));
+        assert!(!continuation_verdict(&primary, &foreign, true));
+    }
 
     #[test]
     fn landing_refusal_keeps_the_request_and_withdraws_candidate_assertions() {
