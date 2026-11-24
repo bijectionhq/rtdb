@@ -380,17 +380,19 @@ fn catalog_inserts(
             write!(sql, "${}", first + 5).expect("String writes do not fail");
             let mut previous = None;
             for stamp in offsets.map(|i| stamp_values.value(i)) {
-                if values.is_null(row)
-                    || stamp <= 0
-                    || stamp as usize > values.value(row).len() + 1
-                    || previous.is_some_and(|offset| offset < stamp)
+                if values.is_null(row) || stamp <= 0 {
+                    return Err(invalid("Invalid ordered catalog stamp"));
+                }
+                let offset = stamp as usize - 1;
+                let end = offset + 8;
+                if end > values.value(row).len() || previous.is_some_and(|previous| previous < end)
                 {
                     return Err(invalid("Invalid ordered catalog stamp"));
                 }
-                previous = Some(stamp);
+                previous = Some(offset);
                 write!(
                     sql,
-                    " PLACING EPOCH_NANOS_BE(CURRENT_TIMESTAMP) FROM {stamp} FOR 0)"
+                    " PLACING EPOCH_NANOS_BE(CURRENT_TIMESTAMP) FROM {stamp} FOR 8)"
                 )
                 .expect("String writes do not fail");
             }

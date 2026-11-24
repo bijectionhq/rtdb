@@ -1125,7 +1125,7 @@ Both actions use the database of the authenticated Flight session.
 For publication, the protobuf body has repeated preceding SQL statements (field 1), the Arrow IPC stream (bytes field 2) and an optional trailing marker statement (field 3).
 Each statement carries its SQL text (string field 1) and optional one-row Arrow IPC arguments (bytes field 2), with fields named `_0`, `_1` and so on.
 The write stream has one batch with `_id` Utf8, `world` Int64, `key` Binary, `idx` Int64, `op` Dictionary(Int32, Utf8), `value` nullable Binary, `number` nullable Int64, `label` Dictionary(Int32, Utf8), `units` List(Utf8), and `stamp_offsets` List(Int32).
-One-based stamp offsets are in descending order, and the owner inserts the original ordered timestamp at those offsets.
+One-based stamp offsets are in descending order, and the owner fills each eight-byte slot with the original ordered timestamp.
 An empty write field submits the guards and optional marker alone.
 The owner keeps the installed SQL catalog layout, including its lowercase hex text key index.
 A single result carries transaction ID (int64 field 1), system time in Unix microseconds (int64 field 2), await token (string field 3), committed (bool field 4), error code (string field 5) and error message (string field 6).

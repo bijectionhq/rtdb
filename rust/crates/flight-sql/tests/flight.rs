@@ -2145,7 +2145,7 @@ fn catalog_writes() -> Bytes {
             Arc::new(BinaryArray::from_vec(vec![&[0, 0xff]])),
             Arc::new(Int64Array::from(vec![0])),
             dictionary("put"),
-            Arc::new(BinaryArray::from_vec(vec![&[0x7f, 0x80]])),
+            Arc::new(BinaryArray::from_vec(vec![&[0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0x80]])),
             Arc::new(Int64Array::from(vec![None])),
             dictionary("catalog"),
             Arc::new(ListArray::new(
@@ -2153,7 +2153,7 @@ fn catalog_writes() -> Bytes {
                 arrow_buffer::OffsetBuffer::new(vec![0, 1].into()),
                 Arc::new(StringArray::from(vec!["unit"])), None,
             )),
-            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([Some([Some(3), Some(2)])])),
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([Some([Some(11), Some(2)])])),
         ],
     )
 }
@@ -2211,8 +2211,9 @@ async fn catalog_actions_publish_exact_position_and_wake_a_separate_session() {
     let check = format!(
         "SELECT _id FROM bj_kernel_writes WHERE key = '00ff' AND idx = 0 AND op = 'put'
          AND label = 'catalog' AND 'unit' = ANY(units) AND number IS NULL
-         AND value = OVERLAY(OVERLAY(X'7f80' PLACING EPOCH_NANOS_BE(_system_from) FROM 3 FOR 0)
-                       PLACING EPOCH_NANOS_BE(_system_from) FROM 2 FOR 0)
+         AND value = OVERLAY(OVERLAY(X'7f0000000000000000aa000000000000000080'
+                       PLACING EPOCH_NANOS_BE(_system_from) FROM 11 FOR 8)
+                       PLACING EPOCH_NANOS_BE(_system_from) FROM 2 FOR 8)
          AND EPOCH_NANOS_BE(_system_from) = EPOCH_NANOS_BE(TIMESTAMP WITH TIME ZONE '{}')",
         chrono::DateTime::from_timestamp_micros(receipt.system_micros).unwrap().to_rfc3339(),
     );
