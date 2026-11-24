@@ -6,23 +6,23 @@ mod discovery;
 pub mod erasure;
 pub(crate) mod prefix_retirement;
 mod reclamation;
+mod retention;
 mod storage;
 
 use super::{
     Authority, Held, InstalledJournal, InstalledRoute, JournalLog, WriterAdmission,
-    adapter_command,
     custody::{CheckpointAuthority, CheckpointCustody, Preparation, Reservation},
-    retention_decision::{checkpoint_next_lsn, trim_target},
+    retention_decision::checkpoint_next_lsn,
 };
 use crate::keys::{JournalKey, KeyService};
 use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
-    Checkpoint, Command, Cut, Enrollment, Hold, Outcome, Refusal, Request, Window,
+    Checkpoint, Command, Cut, Enrollment, Hold, Request,
     service::Route,
 };
 use prost_types::Any;
 use rtdb_columnar::MemoryBudget;
-use rtdb_directory::{Checkpoint as RtdbCheckpoint, DeploymentRecord, now_ms};
+use rtdb_directory::{Checkpoint as RtdbCheckpoint, DeploymentRecord};
 use rtdb_format::{
     catalog::BlockCatalog,
     database::proto::{DatabaseConfig, RemoteStorage, database_config},
@@ -82,7 +82,7 @@ pub(crate) struct Placement {
     archive_prefix: ObjectKey,
     journal_window_bytes: Option<u64>,
     nomination: tokio::sync::Mutex<Option<Request>>,
-    worker_disposal: tokio::sync::Mutex<Option<Request>>,
+    retention: retention::Retention,
     reader_opening: parking_lot::Mutex<std::sync::Weak<Held>>,
     checkpoint_reservations: BTreeMap<u64, Reservation>,
     publication: tokio::sync::Mutex<Option<(Checkpoint, Cut)>>,
@@ -289,7 +289,7 @@ impl Routes {
             custody_work,
             erasure_signer,
             nomination: Default::default(),
-            worker_disposal: Default::default(),
+            retention: Default::default(),
             reader_opening: Default::default(),
             checkpoint_reservations,
             publication: Default::default(),
@@ -746,36 +746,6 @@ impl Placement {
         Ok(Some(Arc::new((plaintext, egress))))
     }
 
-    /// Replenish only bytes the installed voters have already paid for. The
-    /// ordered decision recomputes the limit against concurrent appends.
-    pub(crate) async fn replenish(&self, route: &Route) -> Result<()> {
-        let Some(custodian) = &self.custodian else {
-            return Ok(());
-        };
-        let remaining = route.window.bytes - route.window_spent;
-        let funded = self
-            .journal_window_bytes
-            .unwrap_or(route.reusable_bytes)
-            .min(route.reusable_bytes);
-        let watermark = (crate::process::MAXIMUM_LOG_MESSAGE_BYTES as u64)
-            .saturating_add(ordered_logkeeper::ordered::APPEND_RECORD_CHARGE_BYTES)
-            .max(route.window.bytes / 4);
-        if remaining > watermark || funded <= remaining {
-            return Ok(());
-        }
-        let serial = route
-            .window
-            .serial
-            .checked_add(1)
-            .ok_or_else(|| invalid("The journal window serial space is exhausted"))?;
-        let window = Window {
-            allocation: Uuid::new_v4(),
-            serial,
-            bytes: funded,
-        };
-        custodian.fund(route, window).await
-    }
-
     pub(crate) async fn publish_checkpoint(
         &self,
         keys: &Arc<dyn KeyService>,
@@ -1031,72 +1001,17 @@ impl Placement {
     }
 
     pub(crate) async fn dispose_withdrawn_workers(&self) -> Result<()> {
-        let Some(custodian) = &self.custodian else {
-            return Ok(());
-        };
-        let mut pending = self.worker_disposal.lock().await;
-        Self::settle_worker_disposal(custodian, &mut pending).await?;
-        let mut after = None;
-        loop {
-            let workers = custodian.withdrawn_workers(after).await?;
-            let Some(last) = workers.last() else {
-                return Ok(());
-            };
-            after = Some(last.enrollment);
-            let mut route = custodian.route().await?;
-            for worker in workers {
-                let now = u64::try_from(now_ms()).unwrap_or_default();
-                if adapter_command::disposal_is_due(worker.eligible_at, now, route.time) {
-                    *pending = Some(custodian.request(
-                        &route,
-                        adapter_command::dispose_expired_command(worker.enrollment),
-                    )?);
-                    Self::settle_worker_disposal(custodian, &mut pending).await?;
-                    route = custodian.route().await?;
-                }
-            }
+        if let Some(custodian) = &self.custodian {
+            self.retention.dispose_withdrawn_workers(custodian).await?;
         }
-    }
-
-    async fn settle_worker_disposal(
-        custodian: &InstalledJournal,
-        pending: &mut Option<Request>,
-    ) -> Result<()> {
-        let Some(request) = pending.as_ref() else {
-            return Ok(());
-        };
-        let Command::DisposeExpired { enrollment } = request.command else {
-            return Err(invalid("The pending request is not an expiry disposal"));
-        };
-        let result = custodian.execute(request).await;
-        if result
-            .as_ref()
-            .is_err_and(|error| error.code == "rtdb.multi/ordered-journal")
-        {
-            return result.map(|_| ());
-        }
-        *pending = None;
-        match result?.receipt.outcome {
-            Ok(Outcome::WorkerDisposed(disposed)) if disposed == enrollment => Ok(()),
-            Err(Refusal::Unavailable | Refusal::Expired) => Ok(()),
-            Err(reason) => Err(super::refused(reason)),
-            Ok(_) => Err(invalid(
-                "The journal disposed a different worker enrollment",
-            )),
-        }
+        Ok(())
     }
 
     pub(crate) async fn retain_selected(&self) -> Result<()> {
-        let Some(custodian) = &self.custodian else {
-            return Ok(());
-        };
-        let mut route = custodian.route().await?;
-        if let Some(through) = trim_target(route.floor, route.checkpoint.cut)
-            && custodian.trim(&route, through).await.is_ok()
-        {
-            route = custodian.route().await?;
+        if let Some(custodian) = &self.custodian {
+            self.retention.retain_selected(custodian, self.journal_window_bytes).await?;
         }
-        self.replenish(&route).await
+        Ok(())
     }
 
     pub(crate) async fn retire_unheld_checkpoint(
