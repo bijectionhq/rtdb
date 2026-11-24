@@ -60,6 +60,15 @@ async fn dev_restart() {
 }
 
 #[test]
+fn multi_is_explicit_in_development_and_cluster_startup() {
+    let Command::Dev(development) = parse(&["dev", "--multi", "--data", "data"]) else { panic!("expected development startup") };
+    assert!(development.multi);
+    assert_eq!(development.data, std::path::Path::new("data"));
+    assert!(matches!(parse(&["node", "--multi", "-f", "cluster.yaml"]), Command::StartMulti(_)));
+    assert!(cli::parse(["dev", "--multi", "--port", "5432"].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
 fn dev_rejects_missing_data_and_node_config_overrides() {
     for arguments in [["dev", "--data", "--port"], ["dev", "-f", "node.yaml"]] {
         assert!(cli::parse(arguments.map(str::to_owned), &|_| None).is_err());

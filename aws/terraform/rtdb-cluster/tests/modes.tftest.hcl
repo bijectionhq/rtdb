@@ -33,6 +33,7 @@ run "default_uses_kafka_and_only_the_root_secret" {
   assert {
     condition = (
       aws_ecs_service.node.desired_count == 3 &&
+      length(aws_efs_file_system.keys) == 0 &&
       jsondecode(aws_ecs_task_definition.node.container_definitions)[0].command == ["node", "--file", "/etc/rtdb/cluster-default.yaml"] &&
       length(jsondecode(aws_ecs_task_definition.node.container_definitions)[0].secrets) == 1
     )
@@ -46,16 +47,20 @@ run "multi_passes_the_logkeeper_url_and_credential_selectors" {
     mode        = "multi"
     journal_url = "logkeeper+tls://keeper-1.example.internal:5448,keeper-2.example.internal:5448,keeper-3.example.internal:5448"
     journal_credentials = {
-      ca_certificate = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:ca-Abcdef"
-      certificate    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:crt-Abcdef"
-      private_key    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:key-Abcdef"
+      "0" = {
+        ca_certificate = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:ca-Abcdef"
+        certificate    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:crt-Abcdef"
+        private_key    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:key-Abcdef"
+      }
     }
     journal_client_security_group_id = "sg-22222222"
   }
   assert {
     condition = (
       local.environment.RTDB_JOURNAL_URL == var.journal_url &&
-      local.secrets.RTDB_JOURNAL_PRIVATE_KEY == var.journal_credentials.private_key &&
+      local.secrets.RTDB_JOURNAL_0_PRIVATE_KEY == var.journal_credentials["0"].private_key &&
+      local.environment.RTDB_KEY_DIRECTORY == "/var/lib/rtdb/keys" &&
+      jsondecode(aws_ecs_task_definition.node.container_definitions)[0].command == ["node", "--multi", "--file", "/etc/rtdb/cluster-multi.yaml"] &&
       !contains(keys(local.environment), "RTDB_KAFKA_BOOTSTRAP")
     )
     error_message = "The Multi cluster must pass Logkeeper's URL and client references unchanged."

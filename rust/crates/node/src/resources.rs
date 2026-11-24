@@ -144,6 +144,7 @@ pub trait RemoteStorageFactory: Send + Sync {
 
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
+    fn journal_native_sql(&self) -> bool { false }
     fn table_history(&self, _configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> { Ok(None) }
     fn has_private_storage(&self, _configuration: &DatabaseConfig) -> bool { false }
 

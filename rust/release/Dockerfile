@@ -81,7 +81,7 @@ COPY --from=build /source/rust/target/release/librtdb_ffi.so /usr/local/lib/libr
 COPY --from=build /source/rust/target/release/librtdb_ffi.a /usr/local/lib/librtdb_ffi.a
 COPY rust/crates/ffi/include/rtdb.h /usr/local/include/rtdb.h
 COPY rust/release/default.yaml /etc/rtdb/config.yaml
-COPY rust/release/cluster-default.yaml /etc/rtdb/cluster-default.yaml
+COPY rust/release/cluster-default.yaml rust/release/cluster-multi.yaml /etc/rtdb/
 USER rtdb
 EXPOSE 5432 3000 8080
 ENTRYPOINT ["/usr/local/bin/rtdb"]

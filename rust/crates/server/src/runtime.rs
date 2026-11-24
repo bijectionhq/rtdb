@@ -4,7 +4,7 @@ use std::io::Write;
 use rtdb_auth::{Authenticator, NativeHttp};
 use rtdb_columnar::MemoryBudget;
 use rtdb_metrics::Registry;
-use rtdb_node::{Node, NodeDriver, NodeServices, SystemClock, TransactionClock};
+use rtdb_node::{Node, NodeDriver, NodeServices, SystemClock, TransactionClock, NativeResources, ResourceFactory};
 use rtdb_tx::TransactionAuthorization;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::task::{JoinError, JoinSet};
@@ -70,6 +70,8 @@ impl ServerHandle {
     pub fn shutdown(&self) { self.cancellation.cancel(); }
 }
 
+type ResourceOverride = Box<dyn FnOnce(NativeResources) -> Arc<dyn ResourceFactory> + Send>;
+
 pub struct ServerDriver {
     handle: ServerHandle,
     node: NodeDriver,
@@ -85,24 +87,24 @@ impl ServerDriver {
     /// Run exactly once; request shutdown through the handle and join this run before releasing dependencies.
     pub async fn open(config: NodeConfiguration, allocation_limit_bytes: usize) -> Result<(ServerHandle, Self)> {
         let memory = MemoryBudget::new(config.node_options(allocation_limit_bytes)?.execution_memory_bytes);
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, None).await
     }
 
     /// The supplied execution budget must match the cache/execution split of the process allocation ceiling.
     /// Startup allocations retained by the caller may already hold reservations from this budget.
     pub async fn open_with_memory(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, None).await
     }
 
     /// Opens a node whose databases an outside placement authority attaches and detaches, with no primary database.
     /// Its holders claim as soon as they reach the tip and append nothing while idle.
     pub async fn open_placed(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, placed: PlacedOptions) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed), None).await
     }
 
     /// Uses a host clock for transactions appended to in-memory and local source logs.
     pub async fn open_with_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None, None).await
     }
 
     /// Runs compaction while following the replica log, with no transaction listeners or leader election.
@@ -118,10 +120,15 @@ impl ServerDriver {
         config.flight_sql = None;
         config.indexer.enabled = true;
         config.garbage.enabled = false;
-        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None, None).await
     }
 
-    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>) -> Result<(ServerHandle, Self)> {
+    #[cfg(feature = "multi")]
+    pub async fn open_with_multi(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime) -> Result<(ServerHandle, Self)> {
+        Self::open_mode(config, limit, memory, false, None, None, Some(multi.resource_override())).await
+    }
+
+    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>, override_resources: Option<ResourceOverride>) -> Result<(ServerHandle, Self)> {
         let mut options = config.node_options(allocation_limit_bytes)?;
         options.owned_relations = config.flight_sql.as_ref().is_some_and(|flight| flight.port >= 0 && flight.owned_native_actions);
         if let Some(placed) = &placed {
@@ -167,7 +174,11 @@ impl ServerDriver {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
         }
-        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter, decision_clock,
+        let resources = match override_resources {
+            Some(install) => install(resources),
+            None => Arc::new(resources) as Arc<dyn ResourceFactory>,
+        };
+        let mut services = NodeServices { resources, external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter, decision_clock,
             ..NodeServices::local_with_search_format(authority, metrics.clone(), auth.clone(), metrics.clone(), config.search.write_format) };
         if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;

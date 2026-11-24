@@ -22,6 +22,9 @@
 -- The directory-managed storage and reaper rules describe the deployment path still in service.
 -- The opt-in stream driver uses the Logkeeper `journal-contract` boundary specified in Logkeeper's verification/target-journal.md.
 -- A cluster of the opt-in stream driver runs one node role per process and takes one journal URL with a client identity and trust bundle.
+-- A development process opens FileJournal and a filesystem object store under its selected data directory.
+-- The node uses the persisted database identity and key generations to recover the same journal after reopening the directory.
+-- Each installed node takes an exclusive credential slot before opening its Logkeeper transport.
 -- The same node image runs the default driver with Kafka source and replica logs when the cluster selects default mode.
 -- dev/doc/rtdb-v1.allium defines the stateless consumer surface shared with default mode.
 -- ScopedRowVisibility defines the target contract for labelled rows served by either mode.

@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, PgwireSettings, FlightSettings};
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb node --multi [-f FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -15,7 +15,8 @@ pub enum NodeMode { Node, Ingest, Playground, Compactor }
 pub struct StartOptions { pub mode: NodeMode, pub file: Option<PathBuf>, pub allocation_limit_bytes: usize, pub pgwire_port: i32, pub flight_sql_port: i32, pub object_sort: rtdb_types::ObjectSort }
 #[derive(Clone, Debug)]
 pub struct DevOptions {
-    data: PathBuf,
+    pub data: PathBuf,
+    pub multi: bool,
     pub allocation_limit_bytes: usize,
     pgwire_port: i32,
     flight_sql_port: i32,
@@ -23,7 +24,7 @@ pub struct DevOptions {
 }
 
 #[derive(Clone, Debug)]
-pub enum Command { Help, Version, BuildInfo, Start(StartOptions), Dev(DevOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize },
+pub enum Command { Help, Version, BuildInfo, Start(StartOptions), StartMulti(StartOptions), Dev(DevOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize },
     RepairRetainedCheckpoint { request: rtdb_node::RetainedLocalRepair, memory_bytes: usize },
     RetainRepairBase { request: rtdb_node::RetainRepairBase, memory_bytes: usize, reclaim_receipts: bool }, HashPassword { bcrypt: bool, password: Option<Secret> } }
 
@@ -162,11 +163,13 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         arguments.next();
         let mut options = DevOptions {
             data: ".rtdb".into(),
+            multi: false,
             allocation_limit_bytes: environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1 << 30),
             pgwire_port: 5432,
             flight_sql_port: 3000,
             object_sort,
         };
+        let mut pgwire_requested = false;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "-h" | "--help" => return Ok(Command::Help),
@@ -175,13 +178,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                         .ok_or_else(|| invalid("--data requires a path"))?;
                     options.data = path.into();
                 }
-                "--port" => options.pgwire_port = port(arguments.next())?,
+                "--multi" => options.multi = true,
+                "--port" => {
+                    pgwire_requested = true;
+                    options.pgwire_port = port(arguments.next())?;
+                }
                 "--flight-sql-port" => options.flight_sql_port = port(arguments.next())?,
                 "--memory-limit" => options.allocation_limit_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?,
                 name if name.starts_with("-D") => options.object_sort = crate::config::properties::command_property(name)?,
                 _ => return Err(invalid(format!("Unknown dev option '{argument}'"))),
             }
         }
+        if options.multi && pgwire_requested { return Err(invalid("Multi development serves Flight SQL; use --flight-sql-port")); }
         return Ok(Command::Dev(options));
     }
     let mode = match arguments.peek().map(String::as_str) {
@@ -195,8 +203,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
     };
     let allocation_limit_bytes = environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024);
     let mut options = StartOptions { mode, file: None, allocation_limit_bytes, pgwire_port: 5432, flight_sql_port: 3000, object_sort };
+    let mut multi = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--multi" if mode == NodeMode::Node => multi = true,
             "-h" | "--help" => return Ok(Command::Help),
             "-f" | "--file" if mode != NodeMode::Playground => options.file = Some(PathBuf::from(arguments.next().ok_or_else(|| invalid("--file requires a path"))?)),
             "--memory-limit" => options.allocation_limit_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?,
@@ -206,7 +216,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             _ => return Err(invalid(format!("Unknown option '{argument}'"))),
         }
     }
-    Ok(Command::Start(options))
+    Ok(if multi { Command::StartMulti(options) } else { Command::Start(options) })
 }
 
 impl DevOptions {

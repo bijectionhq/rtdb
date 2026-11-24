@@ -1,0 +1,20 @@
+[package]
+name = "rtdb-journal-logkeeper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+journal-contract.workspace = true
+stream-contract = { package = "journal-contract", git = "https://github.com/bijectionhq/logkeeper.git", rev = "896ed7818780d86e435ebf25c467ac179a1023fb" }
+stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "896ed7818780d86e435ebf25c467ac179a1023fb", features = ["stream"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
