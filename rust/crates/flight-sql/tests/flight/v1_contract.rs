@@ -1967,9 +1967,13 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
     assert_eq!(ints(&query(&mut client, read).await.0), [20]);
     let (changes, coverage) = get::<_, v1::ChangesTrailer>(&mut client, v1::ChangesRequest {
         branch: "trial".into(), tables: vec!["public.native_branch".into()], limit: 1,
-        after: first.basis, images: v1::Images::Both as i32, ..Default::default()
+        after: first.basis, images: v1::Images::Both as i32, observe_applied_positions: true, ..Default::default()
     }).await.unwrap();
     assert_eq!(changes.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let change = changes.iter().find(|batch| batch.num_rows() == 1).unwrap();
+    let position = change.column_by_name("applied_position").unwrap()
+        .as_any().downcast_ref::<arrow_array::UInt64Array>().unwrap();
+    assert_eq!(position.value(0), 3);
     assert_eq!(coverage.through, second.basis);
 
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {

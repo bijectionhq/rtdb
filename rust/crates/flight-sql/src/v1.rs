@@ -114,6 +114,9 @@ impl Service {
                                 features.push(RECEIVER_CLOCK.into());
                                 if call.session.caller.verified_credential {
                                     features.push(APPLIED_POSITION.into());
+                                    if features.iter().any(|feature| feature == "changes") {
+                                        features.push(changes::APPLIED_POSITIONS.into());
+                                    }
                                 }
                             }
                         } else {

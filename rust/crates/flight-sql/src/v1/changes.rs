@@ -10,7 +10,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray,
     GenericByteArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray,
     NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
-    TimestampMicrosecondArray, downcast_primitive,
+    TimestampMicrosecondArray, UInt64Array, downcast_primitive,
     types::{
         ArrowPrimitiveType, BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, Utf8Type,
     },
@@ -44,6 +44,7 @@ use super::{
 
 pub(super) const PROGRESS_ONLY: &str = "changes.progress-only";
 pub(super) const SHARED_IMAGES: &str = "changes.images.stream-v1";
+pub(super) const APPLIED_POSITIONS: &str = "changes.applied-positions";
 const IMAGE_HEADER: &str = "x-rtdb-changes-images";
 const IMAGE_STREAM: &str = "stream-v1";
 const IMAGE_END: [u8; 4] = [0; 4];
@@ -769,6 +770,9 @@ impl Service {
         if database.serving_driver().is_some() {
             return self.applied_changes(call, database, request).await;
         }
+        if request.observe_applied_positions {
+            return Err(call.error(error::unsupported(APPLIED_POSITIONS)));
+        }
         let (database, page) = self
             .open_change_page(&call, database, request, shared_images)
             .await
@@ -905,9 +909,17 @@ impl Service {
         request: proto::ChangesRequest,
     ) -> Result<Response<Output<FlightData>>, Status> {
         let progress_only = request.progress_only;
+        let observe_positions = request.observe_applied_positions;
         let (page, images, context, initial, headers, cutoff) = async {
             let driver = database.serving_driver().expect("checked serving driver");
             let visibility = self.serving_scope(&call, driver)?;
+            if observe_positions && (
+                !call.session.caller.verified_credential || visibility.is_some()
+                    || call.session.audience_source().is_some() || call.session.fresh_replica
+                    || !driver.supports_query_tokens() || !database.wire_tokens_supported()
+            ) {
+                return Err(error::unsupported(APPLIED_POSITIONS));
+            }
             let incarnation = visibility.as_ref().map_or_else(|| driver.incarnation(), |scope| {
                 scope.labels.main_read_incarnation(driver.incarnation())
             });
@@ -988,6 +1000,9 @@ impl Service {
         .map_err(|status| call.error(status))?;
         let mut fields = schema().fields().to_vec();
         fields.push(Arc::new(Field::new("erased", DataType::Boolean, false)));
+        if observe_positions {
+            fields.push(Arc::new(Field::new("applied_position", DataType::UInt64, false)));
+        }
         let schema = Arc::new(Schema::new(fields));
         let service = self.clone();
         let memory = Arc::clone(call.memory());
@@ -1017,7 +1032,7 @@ impl Service {
                         else { row.before.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
                     let after = if erased || !matches!(images, ChangeImages::After | ChangeImages::Both) { None }
                         else { row.after.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
-                    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+                    let mut columns: Vec<ArrayRef> = vec![
                         Arc::new(StringArray::from(vec![format!("{}.{}", row.table.schema, row.table.table)])),
                         Arc::new(TimestampMicrosecondArray::from(vec![group.cut.system_time.0]).with_timezone("UTC")),
                         Arc::new(BooleanArray::from(vec![row.kind == ChangeKind::Opened])),
@@ -1025,7 +1040,12 @@ impl Service {
                         Arc::new(BinaryArray::from(vec![before.as_deref()])),
                         Arc::new(BinaryArray::from(vec![after.as_deref()])),
                         Arc::new(BooleanArray::from(vec![erased])),
-                    ]).map_err(|error| error::map_status(Status::internal(error.to_string())))?;
+                    ];
+                    if observe_positions {
+                        columns.push(Arc::new(UInt64Array::from(vec![group.cut.basis.position()])));
+                    }
+                    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+                        .map_err(|error| error::map_status(Status::internal(error.to_string())))?;
                     for frame in encoder.batch(&batch, &memory).map_err(error::map_status)? {
                         let grant = context.delivery_grant().await.map_err(error::anomaly)?;
                         check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;

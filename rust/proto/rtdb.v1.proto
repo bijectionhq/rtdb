@@ -332,6 +332,9 @@ message ChangesRequest {
   // Requires the changes.progress-only capability and IMAGES_NONE.
   // Return the schema and normal coverage trailer with no row batches.
   bool progress_only = 9;
+  // Append the native applied_position to each row on an unscoped route.
+  // Positions are comparable within the issuing database incarnation and branch.
+  bool observe_applied_positions = 10;
 }
 message ChangesTrailer {
   // For ascending pages this is the next exclusive lower bound.
