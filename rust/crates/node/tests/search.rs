@@ -197,7 +197,7 @@ async fn verify_owned_search_empty_corpus(wrapped: bool) {
     ], node.memory()).unwrap();
     let installed = session.state_mut().execute_tx(vec![
         TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
-        TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: "body".into() },
+        TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: "body".into(), analyzer: rtdb_plan::Analyzer::Simple },
         TxOp::OwnedInsertDocs { relation: relation.clone(), documents: rows, valid_from: None, valid_to: None },
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(installed.committed(), "{:?}", installed.error());
@@ -207,7 +207,7 @@ async fn verify_owned_search_empty_corpus(wrapped: bool) {
     let partitions = [(relation, path)];
     let (empty, _) = held.ranked_search_page(&partitions, "invoice", 0, 4, false).await.unwrap();
     assert_eq!(empty.total, 0);
-    let mut staged = HeldTextCorpus::new(Arc::clone(node.memory()), "invoice").unwrap();
+    let mut staged = HeldTextCorpus::new(Arc::clone(node.memory()), rtdb_text::Analyzer::Simple, "invoice").unwrap();
     staged.shadow(0, EntityId::Integer(1), Some("invoice")).unwrap();
     let (populated, _) = held.ranked_search_with_overlay(&partitions, "invoice", 0, 4, false, None, Some(staged)).await.unwrap();
     assert_eq!(populated.total, 1);
@@ -277,7 +277,7 @@ async fn verify_owned_search_artefacts(format: u32, wrapped: bool) {
     let result = session.state_mut().execute_tx(setup, AutonomousTxOptions::default()).await.unwrap();
     assert!(result.committed(), "{:?}", result.error());
 
-    let declare = |column: &str| TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: column.into() };
+    let declare = |column: &str| TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: column.into(), analyzer: rtdb_plan::Analyzer::Simple };
     let rejected = session.state_mut().execute_tx(vec![declare("secret")], AutonomousTxOptions::default()).await.unwrap();
     assert!(!rejected.committed());
     let accepted = session.state_mut().execute_tx(vec![declare("body")], AutonomousTxOptions::default()).await.unwrap();
@@ -292,7 +292,7 @@ async fn verify_owned_search_artefacts(format: u32, wrapped: bool) {
     assert_eq!(uncovered.search_corpus(&relation, &path, "invoice paid").await.unwrap_err().code, "rtdb.owned/search-uncovered");
     let partitions = [(relation.clone(), path.clone())];
     let staged = || {
-        let mut stage = rtdb_node::HeldTextCorpus::new(Arc::clone(node.memory()), "invoice").unwrap();
+        let mut stage = rtdb_node::HeldTextCorpus::new(Arc::clone(node.memory()), rtdb_text::Analyzer::Simple, "invoice").unwrap();
         stage.shadow(0, EntityId::Integer(1), None).unwrap();
         stage.shadow(0, EntityId::Integer(2), Some("paid")).unwrap();
         stage.shadow(0, EntityId::String("1".into()), Some("an invoice")).unwrap();

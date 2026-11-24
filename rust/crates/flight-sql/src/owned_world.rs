@@ -164,7 +164,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn parent_basis(&self) -> TransactionKey;
     fn ranked_search<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
-        valid: Timestamp, staged: Option<rtdb_node::HeldTextCorpus>,
+        valid: Timestamp, staged: Option<rtdb_node::TextShadows>,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
     fn ranked_search_at<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,

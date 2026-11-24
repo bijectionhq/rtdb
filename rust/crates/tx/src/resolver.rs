@@ -1194,8 +1194,8 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial(rtdb_types::SpatialGeometryEncoding::TaggedWkb)).await,
             Operation::Public(TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, encoding }) =>
                 self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial(*encoding)).await,
-            Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
-                self.declare_owned_path(relation, name, std::slice::from_ref(column), OwnedPathKind::Search).await,
+            Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column, analyzer }) =>
+                self.declare_owned_path(relation, name, std::slice::from_ref(column), OwnedPathKind::Search(*analyzer)).await,
             Operation::Public(TxOp::OwnedDeclareVectorPath { relation, name, column, dimensions, recall }) =>
                 self.declare_owned_vector_path(relation, name, column, *dimensions, *recall).await,
             Operation::Public(TxOp::HostedConstraintRefusal) => {
@@ -1551,7 +1551,7 @@ impl<'a> OpenTransaction<'a> {
             return Err(purge_path_uncovered());
         }
         let catalog = match kind {
-            OwnedPathKind::Search => rtdb_types::OwnedRelation::search_catalog(owner),
+            OwnedPathKind::Search(_) => rtdb_types::OwnedRelation::search_catalog(owner),
             OwnedPathKind::Ordered => rtdb_types::OwnedRelation::path_catalog(owner),
             OwnedPathKind::Spatial(_) => rtdb_types::OwnedRelation::spatial_catalog(owner),
         };
@@ -1569,7 +1569,7 @@ impl<'a> OpenTransaction<'a> {
             {
                 return Err(Anomaly::incorrect("rtdb.owned/spatial-path-columns", "Owned spatial paths require distinct declared Binary columns, geometry first"));
             }
-        } else if kind == OwnedPathKind::Search {
+        } else if matches!(kind, OwnedPathKind::Search(_)) {
             let [column] = columns else { return Err(invalid_search_path_column()); };
             let clear = if let Some((schema, _)) = &declaration {
                 schema.search_column_logical_type(column).is_some()
@@ -1617,6 +1617,11 @@ impl<'a> OpenTransaction<'a> {
                             let stored = rtdb_spatial::path_geometry_encoding(cell("geometry_encoding"))?;
                             if stored != expected { return Err(different()); }
                         }
+                        if let OwnedPathKind::Search(expected) = kind
+                            && text("analyzer").map_or(Some(rtdb_plan::Analyzer::Simple), rtdb_plan::Analyzer::parse) != Some(expected)
+                        {
+                            return Err(different());
+                        }
                         found = true;
                     }
                 }
@@ -1647,6 +1652,9 @@ impl<'a> OpenTransaction<'a> {
             && encoding != rtdb_types::SpatialGeometryEncoding::TaggedWkb
         {
             columns.push(("geometry_encoding", text(encoding.name())));
+        }
+        if let OwnedPathKind::Search(analyzer) = kind && analyzer != rtdb_plan::Analyzer::Simple {
+            columns.push(("analyzer", text(analyzer.name())));
         }
         let document = RecordBatch::try_from_iter(columns)
             .map_err(|error| Anomaly::fault("rtdb.owned/path-catalog", error.to_string()))?;
@@ -3916,7 +3924,7 @@ fn insert_exists() -> Anomaly {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OwnedPathKind {
     Ordered,
-    Search,
+    Search(rtdb_plan::Analyzer),
     Spatial(rtdb_types::SpatialGeometryEncoding),
 }
 

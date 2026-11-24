@@ -482,8 +482,9 @@ The result contains one non-null `count: UInt64` at the held system present and 
 The result schema carries `rtdb.owned.present_micros` and `rtdb.owned.valid_micros`.
 The count requires the same complete generation as a covered range and uses subtree cardinalities without a scan fallback.
 
-`rtdb.owned.DeclareSearchPath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
-Its fields are `_id: Utf8` for the path name and `column: Utf8` for the stored clear-text column.
+`rtdb.owned.DeclareSearchPath.v2` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
+Its fields are `_id: Utf8` for the path name, `column: Utf8` for the stored clear-text column and `analyzer: Utf8` for the path's full-text analyzer (`simple`, `standard`, or a language analyzer as in `CREATE SEARCH INDEX`).
+The analyzer is part of the path: its search files, SearchHeld.v5, its world variants, HybridHeld.v1 and staged overlays all tokenise with it, every partition of one held search must use the same analyzer, and redeclaring the path with another analyzer conflicts.
 The relation must already exist in the authenticated owner's namespace, and the column must contain only text or null.
 The FTS maintenance lane uses the private declaration to build the relation's search files.
 A successful declaration returns the same transaction-key Arrow row as Create.

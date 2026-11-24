@@ -42,9 +42,9 @@ pub use node::RootCatalogRead;
 pub use node::SearchFileFormat;
 #[cfg(feature = "search")]
 pub use rtdb_search::{
-    HeldTextCorpus, OwnedSearchBatch, OwnedSearchPage, owned_ranked as rank_owned_cut,
+    HeldTextCorpus, TextShadows, OwnedSearchBatch, OwnedSearchPage, owned_ranked as rank_owned_cut,
     owned_ranked_overlay_batch as rank_owned_overlay_batch, owned_ranked_with_overlay as rank_owned_overlay_cut,
-    owned_text_column,
+    owned_search_analyzer, owned_text_column,
 };
 #[cfg(feature = "search")]
 pub use rtdb_search::{hybrid, nearest};

@@ -125,8 +125,7 @@ async fn read_definitions(
                         .ok_or_else(|| malformed("history"))?.value(position),
                 }
             };
-            // An owned search path declares no analyzer and uses the simple one.
-            let analyzer = if owned_catalog.is_some() { rtdb_text::Analyzer::Simple } else { optional_analyzer(cell(6), row)? };
+            let analyzer = optional_analyzer(cell(if owned_catalog.is_some() { 5 } else { 6 }), row)?;
             definitions.push(SearchDefinition { name: text(0)?.to_owned(), table, columns, analyzer, version, history });
         }
     }

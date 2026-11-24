@@ -17,7 +17,7 @@
 -- An owned declaration can name an ordinary UTF-8 column or an optional fact struct with a single required, nullable UTF-8 value field.
 -- The fact wrapper distinguishes a missing fact field from a present null, and both contribute no search text.
 -- The owned path keeps its declared column and carrier when the relation declaration is widened.
--- An owned search path declares no analyzer and uses the simple one.
+-- An owned search path declares its analyzer, stored in its catalog row when it is not `simple`; its files, held searches and staged overlays tokenise with it, and one held search ranks paths of one analyzer.
 -- Root and world replay keep the original carrier, including the distinction between an omitted field and its present null value.
 -- Published files include the ordered definition version, artifact identity, and exact token length of each run.
 -- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
