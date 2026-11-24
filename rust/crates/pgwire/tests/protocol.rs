@@ -222,6 +222,67 @@ async fn copy_to_arrow_stream_uses_the_original_read_transaction() {
 }
 
 #[tokio::test]
+async fn copy_to_history_label_dictionary_is_opt_in_at_the_original_cut() {
+    use arrow_array::{DictionaryArray, FixedSizeBinaryArray, Int64Array, StringArray, StructArray, types::Int32Type};
+    use arrow_ipc::reader::StreamReader;
+    use arrow_schema::DataType;
+
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut writer = Client::connect(&running.server, None).await;
+    let mut reader = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&writer.query(r#"INSERT INTO effects (_id, label) VALUES
+        (1, '[]'), (2, '["org:tenant:é"]'), (3, 'top'), (4, '[]')"#).await), b"CZ");
+    assert_eq!(tags(&reader.query("BEGIN READ ONLY").await), b"CZ");
+    assert_eq!(rows(&reader.query("SELECT COUNT(*) FROM effects").await), [vec![Some(b"4".to_vec())]]);
+    assert_eq!(tags(&writer.query("INSERT INTO effects (_id, label) VALUES (5, '[]')").await), b"CZ");
+
+    let expected = [
+        ("[]", 0x37dcbab2e0812c3533cdd7a7238521e2u128.to_be_bytes()),
+        (r#"["org:tenant:é"]"#, 0x9708e3350c49ae4d46dcc78e72242168u128.to_be_bytes()),
+        ("top", 0xc41022fe40b6bf36c736c22351bee076u128.to_be_bytes()),
+    ];
+    for (name, offer) in [("legacy", ""), ("dictionary", "/* rtdb-history-label-dictionary-v1 */ ")] {
+        let sql = format!("COPY ({offer}SELECT _id, label FROM effects ORDER BY _id) TO STDOUT WITH (FORMAT 'arrow-stream')");
+        reader.parse(name, &sql, &[]).await;
+        reader.bind(name, name).await;
+        reader.execute(name, 0).await;
+        reader.send(b'S', &[]).await;
+        let frames = reader.through(b'Z').await;
+        assert_eq!(tags(&frames[..3]), b"12H");
+        assert_eq!(frames[frames.len() - 2].1, b"COPY 4\0");
+        assert_eq!(frames.last().unwrap().1, b"T");
+        let ipc = frames.into_iter().filter(|frame| frame.0 == b'd').flat_map(|(_, bytes)| bytes).collect::<Vec<_>>();
+        let batches = StreamReader::try_new(std::io::Cursor::new(ipc), None).unwrap();
+        let mut count = 0;
+        for batch in batches {
+            let batch = batch.unwrap();
+            let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let array = batch.column(1);
+            for row in 0..batch.num_rows() {
+                let (spelling, expected_id) = expected[count % 3];
+                count += 1;
+                assert_eq!(ids.value(row), count as i64);
+                if offer.is_empty() {
+                    assert_eq!(array.data_type(), &DataType::Utf8);
+                    assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().value(row), spelling);
+                } else {
+                    let dictionary = array.as_any().downcast_ref::<DictionaryArray<Int32Type>>().unwrap();
+                    let symbols = dictionary.values().as_any().downcast_ref::<StructArray>().unwrap();
+                    let index = dictionary.keys().value(row) as usize;
+                    let ids = symbols.column_by_name("id").unwrap().as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+                    let spellings = symbols.column_by_name("canonical").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+                    assert_eq!(ids.value(index), expected_id.as_slice());
+                    assert_eq!(spellings.value(index), spelling);
+                }
+            }
+        }
+        assert_eq!(count, 4);
+    }
+    assert_eq!(tags(&reader.query("COMMIT").await), b"CZ");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn duration_literal_overflow_occurs_only_when_query_output_demands_value() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

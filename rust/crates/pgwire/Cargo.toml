@@ -24,6 +24,7 @@ arrow-ipc.workspace = true
 bytes.workspace = true
 futures.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tempfile.workspace = true

@@ -88,6 +88,14 @@ Capacity validation and the catalog writes share one ordered outcome.
 
 == COPY and memory
 
+A history reader can offer `/* rtdb-history-label-dictionary-v1 */` immediately inside the opening query parenthesis of `COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream')`.
+An owner that accepts the offer writes the Utf8 `label` projection as `Dictionary<Int32, Struct<id: FixedSizeBinary(16), canonical: Utf8>>`.
+Older owners ignore the comment and return the ordinary Arrow schema.
+Each replacement dictionary carries the exact stored spelling and the first 16 SHA-256 bytes of the Bijection native Root catalog label preimage.
+The preimage concatenates `bijection.native-root-catalog.v1`, the big-endian 64-bit length of `label`, the bytes of `label`, the big-endian 64-bit length of the spelling, and the spelling's UTF-8 bytes.
+The owner bounds each dictionary to 4,096 entries, 4,096 bytes per spelling and 1 MiB of distinct spelling bytes.
+Dictionary rows use the same query basis and delivery grants as ordinary COPY.
+
 COPY input is written into a bounded temporary file owned by the protocol state.
 CopyFail, disconnect, shutdown, and completion release that file.
 Transit JSON and MessagePack accept multiple top-level documents, resetting the Transit cache for each value.

@@ -6,17 +6,19 @@ use arrow_array::RecordBatch;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{AccessSettings, CommitResult, NativeSession, Node, TransactionSettings, TransactionStatus};
 use rtdb_pg_codec::Format;
-use rtdb_plan::{CopyFormat, Identifier};
+use rtdb_plan::{CopyFormat, CopyOutFormat, Identifier};
 use rtdb_tx::{ArrowDocuments, Documents, TxOp};
 use rtdb_types::{Anomaly, Result, TableRef, Value};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use crate::error::{cancelled, protocol};
 
+mod history_labels;
+
 /// Encodes each batch while its source buffers are in scope and releases
 /// them before waiting on the connection.
 pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
-    mut cursor: rtdb_query::QueryCursor, memory: &Arc<MemoryBudget>, wire: &mut crate::wire::Writer<W>,
+    mut cursor: rtdb_query::QueryCursor, format: CopyOutFormat, memory: &Arc<MemoryBudget>, wire: &mut crate::wire::Writer<W>,
 ) -> Result<()> {
     let schema = cursor.runtime_schema();
     let bound = schema.fields().iter().try_fold(8192usize, |bytes, field| {
@@ -28,7 +30,13 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
     let fields = schema.fields().iter().map(|field| rtdb_columnar::to_field(&field.name, &field.data_type))
         .collect::<Result<Vec<_>>>()?;
     let schema = arrow_schema::Schema::new(fields);
-    let mut encoder = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), &schema).map_err(arrow_output_error)?;
+    let labels = match format {
+        CopyOutFormat::ArrowStream => None,
+        CopyOutFormat::HistoryLabelDictionaryV1 => history_labels::HistoryLabels::for_schema(&schema),
+    };
+    let wire_schema = labels.as_ref().map_or(&schema, |labels| labels.schema.as_ref());
+    let mut encoder = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), wire_schema)
+        .map_err(arrow_output_error)?;
     wire.send(b'H', &[1, 0, 1, 0, 1]).await?;
     wire.send(b'd', &std::mem::take(encoder.get_mut())).await?;
     wire.flush().await?;
@@ -36,11 +44,28 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
     loop {
         let encoded = cursor.encode_next_batch(|batch| -> Result<_> {
             let batch = rtdb_columnar::conform_batch(batch.clone(), &schema, memory)?;
-            let bytes = batch.batch().get_array_memory_size().checked_mul(6)
+            let (dictionary, _dictionary_charge);
+            let batch = if let Some(labels) = &labels {
+                (dictionary, _dictionary_charge) = labels.encode(batch.batch(), memory)?;
+                &dictionary
+            } else {
+                batch.batch()
+            };
+            let bytes = batch.get_array_memory_size().checked_mul(6)
                 .and_then(|bytes| bytes.checked_add(bound)).ok_or_else(|| protocol("COPY TO batch is too large"))?;
             let reservation = memory.reserve(bytes)?;
-            encoder.write(batch.batch()).map_err(arrow_output_error)?;
-            Ok((batch.batch().num_rows() as u64, std::mem::take(encoder.get_mut()), reservation))
+            let out = if labels.is_some() {
+                // A fresh tracker emits replacement dictionaries without retaining spellings across delivery grants.
+                let mut page = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), wire_schema)
+                    .map_err(arrow_output_error)?;
+                page.get_mut().clear();
+                page.write(batch).map_err(arrow_output_error)?;
+                std::mem::take(page.get_mut())
+            } else {
+                encoder.write(batch).map_err(arrow_output_error)?;
+                std::mem::take(encoder.get_mut())
+            };
+            Ok((batch.num_rows() as u64, out, reservation))
         }).await?;
         let Some(encoded) = encoded else { break };
         let (rows, bytes, _reservation) = encoded.inspect_err(|_| cursor.record_consumer_error())?;

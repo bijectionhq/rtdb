@@ -304,6 +304,10 @@
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
 --      COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream') uses the connection's read basis.
 --      The connection streams Arrow IPC in CopyData frames and ends it before the CopyDone and command completion frames.
+--      A COPY query can offer the history label dictionary through a versioned comment immediately inside its opening parenthesis.
+--      An accepting owner encodes the selected Utf8 label column as a bounded dictionary of durable IDs and exact stored spellings at the same read basis.
+--      The ordinary Utf8 projection remains valid when the owner ignores the offer.
+--      Dictionary frames and their rows share each batch's original delivery grant.
 --      COPY FROM STDIN with an Arrow format submits Arrow document batches.
 --      Without an explicit transaction, each input batch commits separately.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.

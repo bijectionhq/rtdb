@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, mem::size_of, sync::Arc};
 
-use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Identifier, ReadOnlyOptions, ReadWriteOptions, TransactionOptions};
+use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, CopyOutFormat, DiscardTarget, Identifier, ReadOnlyOptions, ReadWriteOptions, TransactionOptions};
 use rtdb_types::{Anomaly, MemoryBudget, MemoryReservation, Result};
 use sqlparser::{ast, parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
 
@@ -402,7 +402,14 @@ impl ControlParser<'_> {
             if !self.token(Token::RParen) { return Err(self.error("Expected closing COPY options parenthesis")); }
             let source = StatementSource::tokens(self.source, &self.tokens[start], &self.tokens[end - 1]);
             crate::parse::parse_statement_syntax(source, source.span(), &self.tokens[start..end])?;
-            return Ok(ControlStatement::CopyOut { query: source.text().into() });
+            let open = source_span(self.source, self.tokens[start - 1].span).end;
+            let offer = self.source[open..source.span().start].trim();
+            let format = if offer == "/* rtdb-history-label-dictionary-v1 */" {
+                CopyOutFormat::HistoryLabelDictionaryV1
+            } else {
+                CopyOutFormat::ArrowStream
+            };
+            return Ok(ControlStatement::CopyOut { query: source.text().into(), format });
         }
         let mut table = vec![self.identifier()?];
         if self.token(Token::Period) { table.push(self.identifier()?); }
