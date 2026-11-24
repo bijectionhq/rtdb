@@ -594,6 +594,17 @@ impl ReplicationDriver {
                 block.as_proto().serving_checkpoint_object.as_deref()).await?,
             None => None,
         };
+        if let Some(keys) = &authority.checkpoints
+            && checkpoint
+                .as_ref()
+                .and_then(serving::NativeCheckpointImage::key_generation)
+                .is_none()
+        {
+            let database = uuid::Uuid::from_bytes(authority.incarnation);
+            keys.kms
+                .create(rtdb_crypt::Generation { database, number: keys.generation })
+                .await?;
+        }
         let store = Arc::clone(self.resolve.storage.object_store());
         let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_ref(), collect_checkpoints)?;
         if let Some(block) = &block { serving.verify_checkpoint_prefix(block)?; }

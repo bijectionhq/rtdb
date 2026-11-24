@@ -427,12 +427,13 @@ impl NativeServing {
             Some(checkpoint) => decode_checkpoint_image(checkpoint.bytes(), authority.incarnation)?,
             None => (TransactState::new(authority.incarnation), 0, false),
         };
+        let key_generation = checkpoint.and_then(NativeCheckpointImage::key_generation)
+            .or_else(|| authority.checkpoints.as_ref().map(|keys| keys.generation));
         let (view, receiver) = watch::channel(NativeServingView {
             index: fold.index().clone(),
             floor: fold.index().head().basis,
-            key_generation: checkpoint.and_then(NativeCheckpointImage::key_generation),
+            key_generation,
             changes: Arc::default(), compatible: true, classic_head: None,
-            key_generation: checkpoint.and_then(NativeCheckpointImage::key_generation),
         });
         let source_authority = Arc::new(SourceAuthority::new(store, authority.incarnation));
         Ok((Self {

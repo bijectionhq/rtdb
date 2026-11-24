@@ -20,10 +20,33 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
     if let Some(vault) = &classic_vault {
         resources = resources.with_classic_key_vault(vault.clone());
     }
-    if let Some(path) = std::env::var_os("RTDB_V1_TOKEN_KEY_VAULT") {
+    let token_vault = std::env::var_os("RTDB_V1_TOKEN_KEY_VAULT").map(std::path::PathBuf::from);
+    if let Some(path) = &token_vault {
         use rtdb_node::Clock;
-        let kms = rtdb_crypt::FileKms::open(std::path::Path::new(&path), || rtdb_node::SystemClock.now().0)?;
+        let kms = rtdb_crypt::FileKms::open(path, || rtdb_node::SystemClock.now().0)?;
         resources = resources.with_token_kms(Arc::new(kms));
+    }
+    if let Some(path) = std::env::var_os("RTDB_V1_CHECKPOINT_KEY_VAULT").map(std::path::PathBuf::from) {
+        use rtdb_node::Clock;
+        if let Some(classic) = &classic_vault {
+            classic.require_separate_path(&path)?;
+        }
+        if let Some(token) = &token_vault {
+            let canonical = |path: &std::path::Path| {
+                path.canonicalize().map_err(|error|
+                    rtdb_types::Anomaly::incorrect("rtdb.server/key-vault", error.to_string()))
+            };
+            let token = canonical(token)?;
+            let checkpoint = canonical(&path)?;
+            if token.starts_with(&checkpoint) || checkpoint.starts_with(&token) {
+                return Err(rtdb_types::Anomaly::incorrect(
+                    "rtdb.server/key-vault",
+                    "Checkpoint and token generation keys require separate vaults",
+                ));
+            }
+        }
+        let kms = rtdb_crypt::FileKms::open(&path, || rtdb_node::SystemClock.now().0)?;
+        resources = resources.with_native_checkpoint_kms(Arc::new(kms));
     }
     let mut sources = ExternalSources::new();
     let mut registrations = Vec::new();

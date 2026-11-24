@@ -289,7 +289,7 @@ pub(crate) async fn recover_rewrite(
     if blocks.object_store().local_classic_key_slots().is_none() {
         return Err(unsupported());
     }
-    let NativeCheckpointImage::Sealed(opened) = image else {
+    let NativeCheckpointImage::Sealed { opened, .. } = image else {
         return Err(unsupported());
     };
     let prior = authority

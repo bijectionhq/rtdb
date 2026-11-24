@@ -615,9 +615,11 @@ impl DatabaseFactory {
                 self.resources.token_kms(), Arc::clone(&self.clock), incarnation));
             let native_authority = match native_authority {
                 None if can_attach_native && self.options.default_v1_serving && name == "xtdb" => {
+                    let incarnation = *tokens.incarnation().await?.as_bytes();
+                    let checkpoints = self.resources.native_checkpoint_kms().map(|kms|
+                        crate::serving::NativeCheckpointAuthority { kms, generation: 1 });
                     Some(crate::serving::NativeServingAuthority {
-                        incarnation: *tokens.incarnation().await?.as_bytes(),
-                        checkpoints: None,
+                        incarnation, checkpoints,
                     })
                 }
                 authority => authority,

@@ -25,8 +25,10 @@ After both prefixes settle, it closes admission to earlier catalog cuts and wait
 The original vault closes per-object key slots before the provider unlinks their objects.
 The Local ledger persists the name digest and settlement cursor, so repeating an interrupted batch targets the same keys. [Local custody](../../rust/crates/storage/src/local_erasure.rs) · [Catalog tickets](../../rust/crates/storage/src/local_catalog.rs)
 
-The first unresolved Local delivery limit is an already admitted native read from an inline image or an in-memory view without a checkpoint.
-Those views carry no generation for the delivery gate to recheck.
+Set `RTDB_V1_CHECKPOINT_KEY_VAULT` to an existing private directory outside the Classic and token key vaults to attach a checkpoint generation to Default v1 serving.
+The same vault must be available on restart and when authenticating a sealed image during offline repair.
+Use `--checkpoint-key-vault` to supply it to the repair command.
+Configured inline and initial in-memory views carry the initial generation. A view admitted without a configured vault carries no generation for the delivery gate to recheck.
 Withdrawing the corresponding object slot also cannot revoke bytes already retained in a cache lease.
 A complete provider proof needs an authority that closes and drains or revokes those deliveries, covers exports and other copies, and establishes which generations have no surviving owners.
 Object slot settlement covers the authenticated inventory under its original Classic vault.
