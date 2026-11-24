@@ -280,7 +280,10 @@ impl<'a> ErasureCoordinator<'a> {
             || rotation.nonce.is_nil()
             || rotation.expires_at <= route.position.saturating_add(1)
             || route.head.next_lsn <= route.checkpoint.cut.next_lsn
-            || reservation.custody.allocation == route.checkpoint.custody.allocation
+            || !crate::journal::custody::member_declaration::fresh_survivor_allocation(
+                reservation.custody.allocation.as_u128(),
+                route.checkpoint.custody.allocation.as_u128(),
+            )
         {
             return Err(invalid(
                 "Erasure staging needs a new root and custody at the exact incumbent head",

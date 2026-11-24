@@ -1,5 +1,7 @@
 //! Builds a spill-free primary checkpoint from an authenticated SQL erasure cut.
 
+mod selection;
+
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     io::Cursor,
@@ -25,6 +27,7 @@ use rtdb_types::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{SqlErasureSource, TermPosition};
+use selection::{keep_inherited_event, keep_local_event, write_survivor_trie};
 
 pub struct SqlSurvivor {
     pub catalog: BlockCatalog,
@@ -224,16 +227,16 @@ impl Events<'_> {
             let header = batch.header(row)?;
             if let Some(origins) = self.inherited_erasure {
                 let origin = batch.origin(row)?.ok_or_else(|| invalid("A dependent event has no authenticated origin"))?;
-                if origins.contains(&origin) { continue; }
+                if !keep_inherited_event(origins.contains(&origin)) {
+                    continue;
+                }
             }
             let position = header
                 .position
                 .ok_or_else(|| invalid("A surviving event has no original transaction position"))?;
-            if self
-                .targets
-                .get(&header.iid)
-                .is_some_and(|before| position < *before)
-            {
+            let before = self.targets.get(&header.iid)
+                .map(|before| (before.transaction.0, before.ordinal));
+            if !keep_local_event(position.transaction.0, position.ordinal, before) {
                 continue;
             }
             let borrowed = batch.borrow_event(row)?;
@@ -405,7 +408,7 @@ impl Candidate<'_> {
         live: &LiveTable,
         cancellation: &CancellationToken,
     ) -> Result<Option<CatalogTrie>> {
-        if live.row_count() == 0 {
+        if !write_survivor_trie(live.row_count()) {
             return Ok(None);
         }
         let pages = live.block_pages(self.memory)?;

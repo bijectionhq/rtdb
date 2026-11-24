@@ -1,6 +1,7 @@
 //! Provider-backed checkpoint custody for installed journals.
 
 mod local;
+pub(super) mod member_declaration;
 
 use super::InstalledJournal;
 use crate::keys::{KeyService, UnitLedger, UnitScope};
@@ -440,7 +441,11 @@ impl CheckpointCustody {
             self.put(custody, &name, body).await?;
             let reader = self.reader(custody).await?;
             let written = reader.observe_head(&name).await?;
-            if written.value.key != name || written.value.size != member.observed_bytes as u64 {
+            if !member_declaration::declares_written_member(
+                written.value.key == name,
+                written.value.size,
+                member.observed_bytes as u64,
+            ) {
                 return Err(invalid(
                     "The copied checkpoint member has a different publication",
                 ));

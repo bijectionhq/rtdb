@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub mod domain;
+mod fork_resolution;
 mod staging;
 mod transfer;
 
@@ -983,15 +984,18 @@ impl Service {
             {
                 return Err(refused());
             }
-            if self.directory.lineage_state(&child.lineage).await?.preparations().any(|(held, _)| held == fork.preparation) {
+            let still_held = self.directory.lineage_state(&child.lineage).await?
+                .preparations().any(|(held, _)| held == fork.preparation);
+            if !fork_resolution::may_check_fork_outcome(still_held) {
                 continue;
             }
 
             // The directory switches the child and consumes the preparation in
             // one decision. Re-read after that fence before resolving the member.
             let child = self.current(fork.child).await?;
-            let published = child.fork_stage.is_none();
-            if published || child.lifecycle == Lifecycle::Deleted {
+            if let Some(published) = fork_resolution::settled_fork_outcome(
+                child.fork_stage.is_some(), child.lifecycle == Lifecycle::Deleted,
+            ) {
                 domain::execute(store, authority, domain::Action::FinishFork { fork, published }).await?;
             }
         }
