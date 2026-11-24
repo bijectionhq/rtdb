@@ -515,6 +515,7 @@ impl SearchBuilder {
                     && left.blocks.len() * 2 <= rtdb_format::search_manifest::MAX_RUN_BLOCKS
                     && left.file_size().saturating_add(right.file_size()) <= limit
                     && compatible_merge_inputs(left, right, self.history.is_some())
+                    && !self.unmergeable.lock().contains(&[left.digest().to_vec(), right.digest().to_vec()])
             });
             let mut adopted = false;
             for pair in candidates {
@@ -522,7 +523,8 @@ impl SearchBuilder {
                 let merged = IoRegion::reading(hold, self.merge_logical(index, columns, &snapshot, pair, cancellation)).await;
                 let prepared = match merged {
                     Ok(Some(run)) => run,
-                    Ok(None) => continue,
+                    // Immutable inputs whose history cannot merge would fail the same way on every pass.
+                    Ok(None) => { self.unmergeable.lock().insert(pair.map(|run| run.digest().to_vec())); continue; }
                     Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); break; }
                     Err(error) => return Err(error),
                 };
@@ -1000,6 +1002,42 @@ mod tests {
         let file = builder.runtime.logical_file(&builder.storage, slug, runs[0], &columns).await.unwrap();
         assert_eq!(file.documents().await.unwrap().into_iter().map(|doc| doc.revision).collect::<Vec<_>>(),
             [text_revision("repaired text"), text_revision("sealed text")]);
+    }
+
+    struct CountedReplay(TableReplay, std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl TableHistorySource for CountedReplay {
+        async fn visit_table(&self, read: HistoryRead<'_>, visit: &mut HistoryVisitor<'_>) -> Result<Option<HistoryCoverage>> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.0.visit_table(read, visit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mixed_pair_whose_history_cannot_extend_its_receipt_is_replayed_once() {
+        let events = ["repaired text", "sealed text"].map(|body| StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8(body.into()))])));
+        let source = Arc::new(CountedReplay(TableReplay(events.iter().enumerate().map(|(block, operation)| {
+            let fields = Some(StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]));
+            let event = StoredEvent { position: None, origin: None, commit_position: 1, entity_key: None,
+                iid: Iid([block as u8; 16]), system_from: Timestamp(block as i64 + 1), valid_time: Interval::ALL,
+                recency: None, operation: operation.clone() };
+            EventBatch::new(build_event_batch(&[event], fields, None).unwrap()).unwrap()
+        }).collect()), Default::default()));
+        let builder = builder(Arc::new(MemoryStore::default())).with_history(Some(source.clone()));
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let prior = SourceReceipt { lineage: Some("native/another-journal".into()), checkpoint_boundary: Some(-1), suffix_through: Some(5),
+            table: Some(index.table.schema_and_table()), shard_range: Some(rtdb_format::search_manifest::FULL_SHARD_RANGE.to_vec()),
+            source_rows: Some(1), erase_frontier_digest: Some(Sha256::digest([]).to_vec()), blocks: vec![0], ..Default::default() };
+        let repaired = SearchRun { source_receipt: Some(prior), ..recorded_run(&index, 0) };
+        let partition = replay_partition(&[(index.table.clone(), repaired), (index.table.clone(), recorded_run(&index, 1))], 1);
+        let publisher = CatalogPublisher { partition: &partition, reject_once: parking_lot::Mutex::default() };
+        let columns = ["body".into()];
+        for _ in 0..2 {
+            builder.merge_logical_runs(&index, &columns, &partition, &publisher, TEST_STORAGE, &CancellationToken::new()).await.unwrap();
+        }
+        assert_eq!(index.records(&partition.value().snapshot()).len(), 2);
+        assert_eq!(source.1.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[derive(Default)]

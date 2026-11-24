@@ -55,11 +55,12 @@ pub struct SearchBuilder {
     columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), Vec<String>>>,
     history: Option<Arc<dyn rtdb_maintenance::TableHistorySource>>,
     scrubbed: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), [u8; 32]>>,
+    unmergeable: Mutex<std::collections::BTreeSet<[Vec<u8>; 2]>>,
 }
 
 impl SearchBuilder {
     pub fn new(database: String, store: Arc<dyn ObjectStore>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>, runtime: Arc<crate::SearchRuntime>) -> Self {
-        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()), history: None, scrubbed: Mutex::new(BTreeMap::new()) }
+        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()), history: None, scrubbed: Mutex::new(BTreeMap::new()), unmergeable: Mutex::default() }
     }
     fn with_history(mut self, history: Option<Arc<dyn rtdb_maintenance::TableHistorySource>>) -> Self {
         self.history = history;
