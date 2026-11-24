@@ -365,6 +365,13 @@ The handles are local to the serving attachment and expire within 120 seconds.
 
 Only the configured Original owner may call `rtdb.custody.v1.Release` with the scoped operations.
 Send `resolve_scoped` with `read_proofs` to check and recover the actual Original contributor registrations' coordinates.
+For a nested protected carrier, send `resolve_scoped_occurrences` with the same ordered `read_proofs` on the Original attachment.
+The reply includes `projected_basis` as the 24 Basis bytes, `read_proofs_sha256` as the 32-byte commitment to that ordered proof list, and `inventory_b64` as standard padded base64 of the v1 `CustodyReadInventory`.
+The bounded inventory confirms every physical branch, relation, typed entity handle, valid interval, written Basis, ordinal, carrier digest and Original receipt against the live custody index.
+Match the exact selected carrier by its address and digest while retaining the complete contributor set for response admission.
+An empty set encodes an empty inventory.
+The private lookup is available only to the configured Original owner and returns metadata.
+Public scoped Query and Changes still produce opaque handles.
 The Original registers and promotes those occurrences through its existing receipt checks and binds the exact transport frame and opaque proof list to its independent response registry.
 Send `check_scoped` or `admit_scoped` with `part`, `frame_sha256` and `read_proofs`.
 RTDB reads the exact promoted registrations and verifies the Original registry, current writer, selected generation and group fences before ordering admission.

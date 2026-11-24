@@ -1,5 +1,7 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use prost::Message as _;
 use rtdb_crypt::tokens::CustodyReadProof;
 use rtdb_node::{
     Database, DatabaseAccess, SystemClock,
@@ -23,6 +25,7 @@ use crate::service::{Call, Service};
 
 pub(crate) const RELEASE: &str = "rtdb.custody.v1.Release";
 const MAX_RELEASE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SCOPED_OCCURRENCE_INVENTORY_BYTES: usize = 1024 * 1024;
 const MAX_READ_PROOFS: usize = 8;
 const MAX_SCOPED_READS: usize = 1024;
 const MAX_SCOPED_READ_MICROS: i64 = 120_000_000;
@@ -176,6 +179,7 @@ enum Request {
     Check(ResponseRequest),
     Admit(ResponseRequest),
     ResolveScoped { read_proofs: Vec<Vec<u8>> },
+    ResolveScopedOccurrences { read_proofs: Vec<Vec<u8>> },
     CheckScoped(ScopedResponseRequest),
     AdmitScoped(ScopedResponseRequest),
     Cancel {
@@ -233,6 +237,11 @@ enum Reply {
     },
     ScopedAdmission { state: &'static str },
     ResolvedScoped { contributors: Vec<OriginalContributor> },
+    ResolvedScopedOccurrences {
+        projected_basis: [u8; Basis::WIDTH],
+        read_proofs_sha256: [u8; 32],
+        inventory_b64: String,
+    },
     Cancelled {
         state: &'static str,
     },
@@ -477,6 +486,32 @@ impl Service {
         Ok(resolved)
     }
 
+    async fn resolve_scoped_occurrences(
+        &self, call: &Call, database: &Database, read: &ScopedRead,
+    ) -> Result<proto::CustodyReadInventory, Status> {
+        let mut inventory = proto::CustodyReadInventory::default();
+        if read.contributors.is_empty() {
+            return Ok(inventory);
+        }
+        let driver = database.serving_driver().ok_or_else(unavailable)?;
+        let index = driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
+        let mut encoded_length = 0;
+        for &(group, commitment) in &read.contributors {
+            let (original, occurrence) = index.custody_read_occurrence(read.source, group, commitment)
+                .map_err(error::anomaly)?;
+            let written_at = index.exact(occurrence.written).map_err(error::anomaly)?.system_time;
+            let evidence = confirmed_occurrence(call, driver, group, original, occurrence, written_at).await?;
+            // Include the repeated field tag and length prefix.
+            let evidence_length = evidence.encoded_len();
+            encoded_length += 1 + prost::length_delimiter_len(evidence_length) + evidence_length;
+            if encoded_length > MAX_SCOPED_OCCURRENCE_INVENTORY_BYTES {
+                return Err(Status::resource_exhausted("Scoped custody occurrence inventory exceeds its bound"));
+            }
+            inventory.contributors.push(evidence);
+        }
+        Ok(inventory)
+    }
+
     pub(super) async fn custody_release_action(
         &self,
         call: &Call,
@@ -498,6 +533,10 @@ impl Service {
             .map_err(error::anomaly)?;
         let release = mounted.release();
         let admit = matches!(&request, Request::Admit(_) | Request::AdmitScoped(_));
+        let _occurrence_charge = match &request {
+            Request::ResolveScopedOccurrences { .. } => Some(call.reserve(MAX_SCOPED_OCCURRENCE_INVENTORY_BYTES * 4)?),
+            _ => None,
+        };
         let reply = match request {
             Request::Prepare { registration } => Reply::Prepared {
                 registration: release
@@ -574,6 +613,20 @@ impl Service {
                 mounted.require_original_writer().await.map_err(error::anomaly)?;
                 let read = self.0.v1.scoped_reads.resolve(self.0.node.now(), route.proof_owner(&owner), &read_proofs).await?;
                 Reply::ResolvedScoped { contributors: self.resolve_scoped_contributors(call, &database, &read).await? }
+            }
+            Request::ResolveScopedOccurrences { read_proofs } => {
+                mounted.require_original_writer().await.map_err(error::anomaly)?;
+                let read = self.0.v1.scoped_reads.resolve(self.0.node.now(), route.proof_owner(&owner), &read_proofs).await?;
+                let inventory = self.resolve_scoped_occurrences(call, &database, &read).await?;
+                mounted.require_original_writer().await.map_err(error::anomaly)?;
+                if read.expires_at <= self.0.node.now() {
+                    return Err(unavailable());
+                }
+                Reply::ResolvedScopedOccurrences {
+                    projected_basis: read.projected.to_bytes(),
+                    read_proofs_sha256: read_proofs_commitment(&read_proofs),
+                    inventory_b64: STANDARD.encode(inventory.encode_to_vec()),
+                }
             }
             Request::CheckScoped(ScopedResponseRequest { part, frame_sha256, read_proofs })
             | Request::AdmitScoped(ScopedResponseRequest { part, frame_sha256, read_proofs }) => {
@@ -720,6 +773,31 @@ mod tests {
         assert!(reads.resolve(Timestamp(49), [8; 32], std::slice::from_ref(&first)).await.is_err());
         assert!(reads.resolve(Timestamp(50), [1; 32], std::slice::from_ref(&first)).await.is_err());
         assert!(reads.resolve(Timestamp(49), [1; 32], &[first, other_scope]).await.is_err());
+    }
+
+    #[test]
+    fn scoped_occurrence_wire_keeps_the_projected_basis_and_exact_inventory_bytes() {
+        let read_proofs = vec![vec![2; 16]];
+        let request = serde_json::json!({
+            "operation": "resolve_scoped_occurrences", "read_proofs": read_proofs
+        });
+        let Request::ResolveScopedOccurrences { read_proofs } = serde_json::from_value(request).unwrap() else {
+            panic!("expected the Original occurrence lookup");
+        };
+        let inventory = proto::CustodyReadInventory {
+            contributors: vec![proto::CustodyReadContributor { row_id: b"\0row".to_vec(), ..Default::default() }],
+            reviewed_source: None,
+        };
+        let reply = serde_json::to_value(Reply::ResolvedScopedOccurrences {
+            projected_basis: Basis::new([3; 16], 1).to_bytes(),
+            read_proofs_sha256: read_proofs_commitment(&read_proofs),
+            inventory_b64: STANDARD.encode(inventory.encode_to_vec()),
+        }).unwrap();
+        assert_eq!(reply.as_object().unwrap().len(), 3);
+        assert_eq!(reply["projected_basis"], serde_json::json!(Basis::new([3; 16], 1).to_bytes()));
+        assert_eq!(reply["read_proofs_sha256"], serde_json::json!(read_proofs_commitment(&read_proofs)));
+        let bytes = STANDARD.decode(reply["inventory_b64"].as_str().unwrap()).unwrap();
+        assert_eq!(proto::CustodyReadInventory::decode(&*bytes).unwrap(), inventory);
     }
 
     #[test]
