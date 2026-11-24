@@ -76,8 +76,11 @@ During a rolling upgrade from a version without format 13 support, set `search: 
 Upgraded nodes can read and repair retained formats 11 through 15.
 Nodes configured for format 16 can repair logical runs from available original L0 inputs or a complete retained local journal.
 The native format 16 writer stores the search lineage in `REPLICA_LOG`, so the journal file carries its identity when moved.
-Keep any existing `REPLICA_LOG.lineage` with a legacy journal until its first writable upgrade.
+Keep any existing `REPLICA_LOG.lineage` with a populated legacy journal until its first writable upgrade.
+The writer preserves the UUID from a valid sidecar when the legacy journal contains records and removes the sidecar after the header is durable.
+An empty legacy journal starts with a fresh UUID when opened for logical search.
 An upgraded journal requires a native reader that supports the lineage header.
+If a follower opened the legacy replica journal read-only, restart it after the writer upgrades the journal to enable repair from native journal history on that follower.
 Accelerated queries score against the column values visible at the snapshot.
 The search accelerator can prune a ranked limit over the two-argument score and a `MATCH` on the same column.
 The five-argument score uses the ordinary SQL sort and limit.

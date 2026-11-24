@@ -31,6 +31,11 @@ fn discard_interrupted_migration(destination: &Path) -> Result<()> {
     }
 }
 
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    sync_directory(directory).map_err(|error| Error::io(directory, error))
+}
+
 pub(crate) struct JournalFile {
     file: File,
     lineage: Option<Uuid>,
@@ -103,10 +108,17 @@ impl JournalFile {
         if self.lineage.is_some_and(|lineage| lineage != cached) {
             return Err(corrupt(path, 0, "replica journal lineage disagrees with its sidecar"));
         }
-        if self.lineage.is_none() && self.records_len().map_err(|error| Error::io(path, error))? == 0 {
-            return Err(corrupt(path, 0, "empty replica journal has an orphaned lineage sidecar"));
-        }
         Ok(Some(cached))
+    }
+
+    pub(super) fn remove_lineage_sidecar(path: &Path) -> Result<()> {
+        let sidecar = path.with_extension("lineage");
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::io(sidecar, error)),
+        }
+        sync_parent_directory(&sidecar)
     }
 
     pub(super) fn bind_lineage(mut self, path: &Path, lineage: Uuid) -> Result<Self> {
@@ -156,10 +168,7 @@ impl JournalFile {
         let io = |error| Error::io(path, error);
         self.sync().map_err(io)?;
         let destination = if self.lineage.is_some() { fs::canonicalize(path).map_err(io)? } else { path.to_path_buf() };
-        if let Some(directory) = destination.parent() {
-            sync_directory(directory).map_err(|error| Error::io(directory, error))?;
-        }
-        Ok(())
+        sync_parent_directory(&destination)
     }
 
     fn physical_offset(&self, offset: u64) -> io::Result<u64> {
@@ -185,5 +194,15 @@ impl Seek for JournalFile {
         };
         self.file.seek(position)?.checked_sub(self.records_start())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek into replica journal lineage header"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replica_journal_lineage_sync_accepts_a_bare_relative_path() -> Result<()> {
+        sync_parent_directory(Path::new("REPLICA_LOG.lineage"))
     }
 }

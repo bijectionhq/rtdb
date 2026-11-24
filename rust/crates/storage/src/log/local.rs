@@ -282,12 +282,20 @@ impl LocalLog {
         }
         if let Some(parent) = file_path.parent() { fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?; }
         let mut file = JournalFile::lock(file_path, true)?;
-        let cached = file.cached_lineage(file_path)?;
+        let mut cached = file.cached_lineage(file_path)?;
         let latest = inspect(&mut file, file_path, maximum, keys.is_some())?;
+        if file.lineage().is_none() && latest == LogOffset(-1) && cached.take().is_some() {
+            // A crash after publishing a fresh UUID would leave a mismatched sidecar and block reopening.
+            file.sync_open(file_path)?;
+            JournalFile::remove_lineage_sidecar(file_path)?;
+        }
         if file.lineage().is_none() && (bind_lineage || cached.is_some()) {
             file = file.bind_lineage(file_path, cached.unwrap_or_else(Uuid::new_v4))?;
         } else {
             file.sync_open(file_path)?;
+        }
+        if cached.is_some() {
+            JournalFile::remove_lineage_sidecar(file_path)?;
         }
         let progress = Arc::new(Progress::new(latest));
         let (send, queue) = mpsc::channel(options.queue_capacity);
@@ -675,27 +683,52 @@ mod tests {
     }
 
     #[test]
-    fn replica_journal_lineage_rejects_an_orphaned_or_mismatched_sidecar() -> Result<()> {
+    fn replica_journal_lineage_accepts_an_empty_legacy_journal_with_a_sidecar() -> Result<()> {
+        for logical_search in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("REPLICA_LOG");
+            let sidecar = path.with_extension("lineage");
+            let cached = Uuid::new_v4();
+            fs::write(&path, []).unwrap();
+            fs::write(&sidecar, cached.as_bytes()).unwrap();
+
+            let reader = ReadOnlyLocalLog::open(&path, Default::default())?;
+            assert_eq!(reader.latest()?, LogOffset(-1));
+            assert_eq!(reader.journal_lineage(), None);
+            let locked = JournalFile::lock(&path, false)?;
+            assert_eq!(locked.cached_lineage(&path)?, Some(cached));
+            drop(locked);
+
+            let (writer, _driver) = if logical_search { open_replica(&path)? } else { LocalLog::open(&path, replica_options())? };
+            assert_eq!(writer.latest()?, LogOffset(-1));
+            assert_eq!(writer.journal_lineage().is_some(), logical_search);
+            assert_ne!(writer.journal_lineage(), Some(cached));
+            assert!(!sidecar.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replica_journal_lineage_rejects_a_mismatched_sidecar_and_finishes_interrupted_cleanup() -> Result<()> {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("REPLICA_LOG");
         let sidecar = path.with_extension("lineage");
         let (log, driver) = open_replica(&path)?;
-        let old_lineage = log.journal_lineage().unwrap();
-        drop((log, driver));
-        fs::remove_file(&path).unwrap();
-        fs::write(&sidecar, old_lineage.as_bytes()).unwrap();
-        assert!(matches!(open_replica(&path), Err(Error::CorruptLog { reason, .. }) if reason.contains("orphaned lineage sidecar")));
-
-        fs::remove_file(&sidecar).unwrap();
-        let (log, driver) = open_replica(&path)?;
-        assert_ne!(log.journal_lineage().unwrap(), old_lineage);
-        assert_eq!(log.latest()?, LogOffset(-1));
+        let lineage = log.journal_lineage().unwrap();
         drop((log, driver));
 
-        fs::write(&sidecar, old_lineage.as_bytes()).unwrap();
+        fs::write(&sidecar, Uuid::from_u128(1).as_bytes()).unwrap();
         let mismatch = |error| matches!(error, Error::CorruptLog { reason, .. } if reason.contains("lineage disagrees"));
         assert!(open_replica(&path).is_err_and(mismatch));
         assert!(ReadOnlyLocalLog::open(&path, Default::default()).is_err_and(mismatch));
+
+        fs::write(&sidecar, lineage.as_bytes()).unwrap();
+        let reader = ReadOnlyLocalLog::open(&path, Default::default())?;
+        assert_eq!(reader.journal_lineage(), Some(lineage));
+        assert!(sidecar.exists());
+        let (reopened, _driver) = LocalLog::open(&path, replica_options())?;
+        assert_eq!(reopened.journal_lineage(), Some(lineage));
+        assert!(!sidecar.exists());
         Ok(())
     }
 
@@ -718,6 +751,9 @@ mod tests {
 
             let cached = Uuid::new_v4();
             if with_sidecar { fs::write(&sidecar, cached.as_bytes()).unwrap(); }
+            let legacy_reader = ReadOnlyLocalLog::open(&path, Default::default())?;
+            assert_eq!(legacy_reader.journal_lineage(), None);
+            assert_eq!(legacy_reader.latest()?, first.offset);
             let interrupted = path.with_file_name(".REPLICA_LOG.rtdb-lineage-migration");
             fs::write(&interrupted, b"interrupted staging contents").unwrap();
             let (migrated, driver) = open_replica(&path)?;
@@ -726,12 +762,14 @@ mod tests {
             if with_sidecar { assert_eq!(lineage, cached); }
             assert_eq!(migrated.latest()?, first.offset);
             assert!(fs::read(&path).unwrap().ends_with(&original));
-            if with_sidecar { fs::remove_file(&sidecar).unwrap(); }
+            assert!(!sidecar.exists());
 
             let shutdown = CancellationToken::new();
             let task = tokio::spawn(driver.run(shutdown.clone()));
             let second = migrated.enqueue(Bytes::from_static(b"after migration"), Timestamp(2)).await?.durable().await?;
             assert_eq!(second.offset, LogOffset(original.len() as i64));
+            assert_eq!(legacy_reader.latest()?, second.offset);
+            assert_eq!(legacy_reader.journal_lineage(), None);
             let mut tail = migrated.tail(LogOffset(-1)).await?;
             let records = tail.poll(Duration::ZERO).await?;
             assert_eq!(records.iter().map(|record| record.metadata).collect::<Vec<_>>(), [first, second]);
@@ -745,6 +783,10 @@ mod tests {
             let reservation = ReadReservation::new(charge, memory.reserve(charge).unwrap());
             assert_eq!(range.next(reservation).await?.unwrap().metadata, first);
             drop(range);
+            let mut replay = crate::log::SharedLog::read_after(migrated.as_ref(), first.offset).await?;
+            let head = replay.poll_head(Duration::ZERO).await?.unwrap();
+            let reservation = ReadReservation::new(head.allocation_bound, memory.reserve(head.allocation_bound).unwrap());
+            assert_eq!(replay.read_head(head, reservation).await?.metadata, second);
             #[cfg(unix)]
             {
                 let reservation = ReadReservation::new(charge, memory.reserve(charge).unwrap());
@@ -758,7 +800,7 @@ mod tests {
             let end = prefix_end(&mut file, &path, 1024, second.offset, false)?;
             settle_prefix(&mut file, &path, 1024, end, None)?;
             drop(file);
-            let (reopened, _driver) = open_replica(&path)?;
+            let (reopened, driver) = open_replica(&path)?;
             assert_eq!(reopened.journal_lineage(), Some(lineage));
             assert_eq!(reopened.latest()?, second.offset);
             let mut tail = reader.tail(first.offset).await?;
@@ -766,6 +808,13 @@ mod tests {
             let head = replay.poll_head(Duration::ZERO).await?.unwrap();
             let reservation = ReadReservation::new(head.allocation_bound, memory.reserve(head.allocation_bound).unwrap());
             assert_eq!(replay.read_head(head, reservation).await?.metadata, second);
+            drop((reopened, driver));
+
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, &original).unwrap();
+            let (replacement, _driver) = open_replica(&path)?;
+            assert_eq!(replacement.latest()?, first.offset);
+            assert_ne!(replacement.journal_lineage().unwrap(), lineage);
         }
         Ok(())
     }
