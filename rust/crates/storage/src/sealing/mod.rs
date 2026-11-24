@@ -399,6 +399,9 @@ impl ObjectStore for EncryptingStore {
     async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         self.inner.release_entity_directory_page(key, cut).await
     }
+    async fn release_entity_directory_pages(&self, keys: &[ObjectKey], cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<usize> {
+        self.inner.release_entity_directory_pages(keys, cut).await
+    }
 
     async fn search_staging_owner(&self) -> Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
         self.inner.search_staging_owner().await

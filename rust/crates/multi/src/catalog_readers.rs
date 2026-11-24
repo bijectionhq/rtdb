@@ -147,6 +147,17 @@ impl CatalogReaders {
         crate::store::exact_retirement::permits_search_release(self.directory.as_ref(), bucket, &record, &store, key, publication).await
     }
 
+    pub async fn permits_search_releases(&self, bucket: &dyn ObjectStore, cut: CatalogCut,
+        items: &[(&ObjectKey, Option<&PublishedObjectVersion>)]) -> Result<Vec<bool>> {
+        if !self.matches_cut(cut)? { return Err(closed()); }
+        let Some(record) = self.directory.deployment(&self.deployment).await? else { return Err(closed()); };
+        if !self.residence_is_open(&record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none() {
+            return Err(closed());
+        }
+        let store = format!("{}/{}", self.residence, self.storage_root);
+        crate::store::exact_retirement::permits_search_releases(self.directory.as_ref(), bucket, &record, &store, items).await
+    }
+
     pub async fn advance(&self, installed: CatalogCut) -> Result<bool> {
         Ok(self.close_admission(installed, &[None]).await?.1[0])
     }

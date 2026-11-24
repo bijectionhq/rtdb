@@ -1596,6 +1596,37 @@ impl ObjectStore for GarbageStore {
         }
         Ok(true)
     }
+    async fn release_entity_directory_pages(&self, keys: &[ObjectKey], cut: Option<rtdb_types::CatalogCut>) -> Result<usize> {
+        let Some(readers) = &self.catalog_readers else {
+            for key in keys { self.delete(key).await?; }
+            return Ok(keys.len());
+        };
+        let Some(cut) = cut else { return Ok(0); };
+        let Some(bucket) = self.release_inventory.as_deref() else { return Ok(0); };
+        let mut publications = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(publication) = self.retirement_publication(key).await? else { break; };
+            publications.push(publication);
+        }
+        let published: Vec<rtdb_format::log::proto::PublishedObjectVersion> = publications.iter().cloned().map(Into::into).collect();
+        let items: Vec<_> = keys.iter().zip(&published).map(|(key, published)| (key, Some(published))).collect();
+        let permitted = readers.permits_search_releases(bucket, cut, &items).await?;
+        let releasable = permitted.iter().take_while(|permitted| **permitted).count();
+        if releasable == 0 { return Ok(0); }
+        let (floor, allowed) = readers.close_admission(cut, &vec![None; releasable]).await?;
+        let mut released = 0;
+        for ((key, publication), allowed) in keys.iter().zip(publications).zip(allowed).take(releasable) {
+            if !allowed { break; }
+            match publication {
+                rtdb_types::PhysicalObjectPublication::Version(version) =>
+                    self.write_release_record(key, Some(floor.clone()), Some(&version), None, None).await?,
+                rtdb_types::PhysicalObjectPublication::Terminal(terminal) =>
+                    self.write_release_record(key, Some(floor.clone()), None, None, Some(&terminal)).await?,
+            }
+            released += 1;
+        }
+        Ok(released)
+    }
 
     fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
         self.inner.whole_object_allocation(key, length)

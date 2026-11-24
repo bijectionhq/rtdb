@@ -987,34 +987,48 @@ const ARCHIVE_SOURCE_HELD: &str = "rtdb.multi/archive-source-held";
 
 pub(crate) async fn permits_search_release(directory: &dyn Directory, bucket: &dyn ObjectStore, owner: &DeploymentRecord,
     store: &str, key: &ObjectKey, publication: Option<&PublishedObjectVersion>) -> Result<bool> {
-    let lineage = directory.lineage_state(&owner.lineage).await?;
-    if lineage.open_generation().is_none() || lineage.preparations().next().is_some() { return Ok(false); }
+    Ok(permits_search_releases(directory, bucket, owner, store, &[(key, publication)]).await?[0])
+}
 
-    let target = ObjectKey::new(format!("{store}/{key}"))?;
-    let terminal = publication.and_then(PublishedObjectVersion::terminal_publication)
-        .filter(|publication| !publication.namespace.bucket.is_empty() && !publication.key.is_empty());
-    let version = publication.filter(|publication| publication.terminal.is_none()).and_then(|publication| {
-        let bucket = publication.bucket.as_ref().filter(|bucket| !bucket.is_empty())?;
-        let key = publication.key.as_ref().filter(|key| !key.is_empty())?;
-        let version = publication.version.as_ref().filter(|version| rtdb_storage::remote::valid_object_version(version.as_bytes()))?;
-        Some(PhysicalObjectVersion {
-            namespace: S3ObjectNamespace { bucket: bucket.clone(), endpoint: publication.endpoint.clone(), region: publication.region.clone() },
-            key: key.clone(), version: version.clone(),
-        })
-    });
-    if general_reference_holds(owner, &[&target])
-        || owner.storage_regions.values().filter_map(archive_source_hold).any(|hold| match &terminal {
-            Some(publication) => !hold.permits_terminal_retirement(publication),
-            None => version.as_ref().is_none_or(|version| !hold.permits_retirement(version)),
-        })
-    {
-        return Ok(false);
-    }
+/// Evaluates every release against one reading of the lineage, the deployments and their fork bases.
+pub(crate) async fn permits_search_releases(directory: &dyn Directory, bucket: &dyn ObjectStore, owner: &DeploymentRecord,
+    store: &str, items: &[(&ObjectKey, Option<&PublishedObjectVersion>)]) -> Result<Vec<bool>> {
+    let lineage = directory.lineage_state(&owner.lineage).await?;
+    if lineage.open_generation().is_none() || lineage.preparations().next().is_some() { return Ok(vec![false; items.len()]); }
     let deployments = directory.deployments().await?;
-    if reference_retains(bucket, &deployments, &owner.lineage, store, &[(key.as_str(), version.as_ref())]).await? {
-        return Ok(false);
+    let mut bases = Vec::new();
+    for record in deployments.iter().filter(|record| record.lineage == owner.lineage && record.lifecycle != Lifecycle::Deleted) {
+        for referrer in stores(bucket, &record.storage_prefix()).await? {
+            bases.push(Base::load(bucket, &referrer).await?);
+        }
     }
-    Ok(lineage == directory.lineage_state(&owner.lineage).await?)
+    let mut permits = Vec::with_capacity(items.len());
+    for (key, publication) in items {
+        let target = ObjectKey::new(format!("{store}/{key}"))?;
+        let terminal = publication.and_then(PublishedObjectVersion::terminal_publication)
+            .filter(|publication| !publication.namespace.bucket.is_empty() && !publication.key.is_empty());
+        let version = publication.filter(|publication| publication.terminal.is_none()).and_then(|publication| {
+            let bucket = publication.bucket.as_ref().filter(|bucket| !bucket.is_empty())?;
+            let key = publication.key.as_ref().filter(|key| !key.is_empty())?;
+            let version = publication.version.as_ref().filter(|version| rtdb_storage::remote::valid_object_version(version.as_bytes()))?;
+            Some(PhysicalObjectVersion {
+                namespace: S3ObjectNamespace { bucket: bucket.clone(), endpoint: publication.endpoint.clone(), region: publication.region.clone() },
+                key: key.clone(), version: version.clone(),
+            })
+        });
+        let held = general_reference_holds(owner, &[&target])
+            || owner.storage_regions.values().filter_map(archive_source_hold).any(|hold| match &terminal {
+                Some(publication) => !hold.permits_terminal_retirement(publication),
+                None => version.as_ref().is_none_or(|version| !hold.permits_retirement(version)),
+            })
+            || bases.iter().any(|base| match &version {
+                Some(version) => base.retains_version(store, key.as_str(), version),
+                None => base.objects.get(key.as_str()).is_some_and(|owner| owner == store),
+            });
+        permits.push(!held);
+    }
+    let unchanged = lineage == directory.lineage_state(&owner.lineage).await?;
+    Ok(permits.into_iter().map(|permitted| permitted && unchanged).collect())
 }
 
 async fn reference_retains(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], lineage: &str,

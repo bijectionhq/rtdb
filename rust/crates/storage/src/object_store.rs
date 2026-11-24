@@ -278,12 +278,18 @@ pub trait ObjectStore: Send + Sync {
         self.delete(key).await?;
         Ok(true)
     }
-    /// Whether this store has a release path for directory pages it writes.
     fn supports_directory_page_release(&self) -> bool { !self.defers_trie_releases() }
     async fn release_entity_directory_page(&self, key: &ObjectKey, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         if self.defers_trie_releases() { return Ok(false); }
         self.delete(key).await?;
         Ok(true)
+    }
+    /// Releases `keys` in order and stops at the first the store refuses, returning how many it released.
+    async fn release_entity_directory_pages(&self, keys: &[ObjectKey], cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<usize> {
+        for (released, key) in keys.iter().enumerate() {
+            if !self.release_entity_directory_page(key, cut).await? { return Ok(released); }
+        }
+        Ok(keys.len())
     }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
