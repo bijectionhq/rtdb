@@ -185,6 +185,8 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Published checkpoint files survive a process restart on the same storage.
     fn syncs_checkpoints(&self) -> bool { false }
+    /// Selects the private Arrow-only ordered-index layout for the lifetime of this attachment.
+    fn ordered_index_arrow_only(&self) -> bool { false }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
     /// Opens the storage projection owned by an exact journal snapshot hold.
     async fn open_log_snapshot(

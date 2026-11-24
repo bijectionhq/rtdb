@@ -272,8 +272,14 @@ Stage (1) carries origin, attempt, response part, address, and the same input.
 Promote (2), check (3), cancel (4), and dispose (5) carry only origin, attempt, part, and address. Each returns byte 1.
 The part orders cell history, Usher, Conductor and response UUIDs followed by the positive u64 ordinal.
 Input kind 0 is the exact member occurrence. Kind 1 adds the world's ordered winning position and the complete world-row authoring prefix.
+Hosted protocol 226 adds input kind 4 to `rtdb.owned.FamilyResponseRelease.v2` for an exact Root landing.
+Kind 4 carries the 104-byte `occurrence` followed by the 248-byte `root-binding`.
+The occurrence names the original Root line and agrees with the binding's position, assertion and stage.
+Prepare and Stage require the exact activation, and the registration commits to the full binding.
+Promote, Check, Cancel and Dispose keep the same registration encoding and cutoff.
 The RTDB adapter derives the registry commitment from the original placed history, the installed incarnation, and the registry table name.
 It authenticates the exact row creator against the current original `bj_installation` writer and checks the original registry address at the same barrier.
+Registration observation also requires the current Original control view to cover the exact transaction sampled when it opened the carrier journal authority.
 Flight and archive rank outputs also carry a bounded current marker check through the plaintext handoff.
 
 ### Ranked response contributor inventory

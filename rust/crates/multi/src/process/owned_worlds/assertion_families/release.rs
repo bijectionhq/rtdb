@@ -2,7 +2,7 @@ use std::{fmt::Write, num::NonZeroU64};
 
 use rtdb_columnar::ArrowCell;
 use rtdb_flight_sql::{FamilyReleaseInputWire, FamilyReleaseRegistrationWire, FamilyReleaseRequest};
-use rtdb_node::{CurrentAssertionFamilyRead, OriginalAssertionFamilyReader};
+use rtdb_node::{AppliedReadFloor, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader};
 use rtdb_types::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +16,7 @@ use super::*;
 struct CarrierJournal<'a> {
     original: &'a OriginalAssertionFamilyReader,
     cancellation: &'a CancellationToken,
+    floor: AppliedReadFloor,
     identity: CarrierJournalIdentity,
     writer: String,
 }
@@ -23,6 +24,8 @@ struct CarrierJournal<'a> {
 impl<'a> CarrierJournal<'a> {
     async fn open(original: &'a OriginalAssertionFamilyReader, cancellation: &'a CancellationToken, deployment: Uuid) -> Result<Self> {
         let current = original.current(deployment, cancellation).await?;
+        let applied = current.applied_source().ok_or_else(OwnedWorld::unavailable)?;
+        let floor = AppliedReadFloor::new(deployment, vec![applied])?;
         let (installation, writer) = Self::installation(&current).await?;
         let source_history = original.history_fingerprint();
         let commitment = |domain: &[u8], fields: &[&[u8]]| {
@@ -36,7 +39,7 @@ impl<'a> CarrierJournal<'a> {
             registry: commitment(b"rtdb.multi/carrier-registry/v1\0", &[&source_history, &installation, b"public.bj_external_key_recovery"]),
             original_writer: commitment(b"rtdb.multi/carrier-writer/v1\0", &[&installation, writer.as_bytes()]),
         };
-        Ok(Self { original, cancellation, identity, writer })
+        Ok(Self { original, cancellation, floor, identity, writer })
     }
 
     async fn installation(current: &CurrentAssertionFamilyRead) -> Result<([u8; 16], String)> {
@@ -68,7 +71,7 @@ impl FamilyReleaseAuthority for CarrierJournal<'_> {
     async fn observe(&self, registration: FamilyReleaseRegistration) -> Result<FamilyReleaseObservation> {
         let unavailable = OwnedWorld::unavailable;
         if registration.owner() != self.identity { return Err(unavailable()); }
-        let current = self.original.current(self.identity.deployment, self.cancellation).await?;
+        let current = self.original.current_covering(&self.floor, self.cancellation).await?;
         let (installation, writer) = Self::installation(&current).await?;
         if installation != self.identity.installation || writer != self.writer { return Err(unavailable()); }
         let part = registration.part();
@@ -127,7 +130,10 @@ fn input<'a>(scope: &Scope, family: Uuid, wire: &'a FamilyReleaseInputWire) -> R
             rtdb_types::OwnedRelation::new(relation.as_str())?;
             FamilyReleaseInput::RootDerived { member: scope.occurrence(*member)?, relation, key }
         }
-        FamilyReleaseInputWire::World { .. } | FamilyReleaseInputWire::RootDerived { .. } =>
+        FamilyReleaseInputWire::RootLanding { member, binding } if member.position.line_generation == scope.root_line =>
+            FamilyReleaseInput::RootLanding { member: scope.occurrence(*member)?, binding: *binding },
+        FamilyReleaseInputWire::World { .. } | FamilyReleaseInputWire::RootDerived { .. }
+        | FamilyReleaseInputWire::RootLanding { .. } =>
             return Err(OwnedWorld::unavailable()),
     })
 }

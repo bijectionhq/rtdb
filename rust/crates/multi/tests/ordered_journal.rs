@@ -928,10 +928,24 @@ async fn exercise_installed_owned_reads() {
     let db = local.catalog().database("shop").unwrap();
     local.confirm_audience_route(&db, deployment).await.unwrap();
     let tx = local.latest_completed_transactions().unwrap()["shop"][0].unwrap();
+    let floor = rtdb_node::AppliedReadFloor::new(deployment, vec![tx]).unwrap();
+    let session = local.session("shop", Arc::new(Reader)).unwrap();
+    let original = session.assertion_family_reader().unwrap();
+    let cancellation = session.state().cancellation();
+    let read = original.current_covering(&floor, cancellation).await.unwrap();
+    assert!(tx.at_or_before(read.applied_source().unwrap()));
+    let other_revision = rtdb_types::TransactionKey {
+        system_time: rtdb_types::Timestamp(tx.system_time.0 - 1), ..tx
+    };
+    let wrong_cut = rtdb_node::AppliedReadFloor::new(deployment, vec![other_revision]).unwrap();
+    assert!(original.current_covering(&wrong_cut, cancellation).await.is_err());
+    let wrong_history = rtdb_node::AppliedReadFloor::new(Uuid::new_v4(), vec![tx]).unwrap();
+    assert!(original.current_covering(&wrong_history, cancellation).await.is_err());
+    drop(read);
+    drop(session);
     let prepaid = local.memory().prepay(32 << 20).unwrap();
     let cache = rtdb_storage::cache::CacheBudget::with_memory(local.memory().prepay(32 << 20).unwrap());
     let mut audience = local.audience_session("shop", Arc::new(Reader), deployment, prepaid, cache).unwrap();
-    let floor = rtdb_node::AppliedReadFloor::new(deployment, vec![tx]).unwrap();
     assert!(audience.prepare_applied_owned_reads(&floor).await.unwrap() > 0);
     drop(audience.open_applied_owned_read(&floor).await.unwrap());
     drop(audience);

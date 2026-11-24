@@ -753,6 +753,10 @@ impl Tree {
         self.permit.is_none() || rtdb_query::encoding_ordered_batch()
     }
 
+    pub fn writes_arrow_references(&self) -> bool {
+        self.arrow_references || self.storage.object_store().ordered_index_arrow_only()
+    }
+
     pub fn retain_result_buffers(
         &self,
         reservation: &Arc<MemoryReservation>,
@@ -862,7 +866,12 @@ impl Tree {
         }
         let mut opening = Arc::try_unwrap(opening)
             .map_err(|_| format_error("Ordered index page read still owns its opening grant"))?;
-        let (page, sidecars) = decode(bytes, pointer.generation, &mut opening)?;
+        let (page, sidecars) = decode(
+            bytes,
+            pointer.generation,
+            store.ordered_index_arrow_only(),
+            &mut opening,
+        )?;
         let entries = page.entry_count()?;
         let measure = page.measure()?;
         if entries != pointer.entries
@@ -1206,7 +1215,7 @@ impl Tree {
                                 _ => Err(format_error("Ordered index revision leaf contains other entries")),
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        if self.arrow_references {
+                        if self.writes_arrow_references() {
                             let references = revisions.iter().map(|(time, root)| (Some(*time), root.as_deref())).collect::<Vec<_>>();
                             ipc::encode(&references::encode(&references)?)?
                         } else {
@@ -1229,7 +1238,7 @@ impl Tree {
                     Arc::get_mut(&mut encoding)
                         .expect("branch encoding owns its reservation")
                         .grow_to(Self::page_encoding_bound(node.page.bytes()))?;
-                    let encoded = if self.arrow_references {
+                    let encoded = if self.writes_arrow_references() {
                         let references = pointers.iter().map(|pointer| (None, Some(pointer.as_ref()))).collect::<Vec<_>>();
                         ipc::encode(&references::encode(&references)?)?
                     } else {
@@ -1318,11 +1327,19 @@ impl Tree {
     }
 }
 
-fn decode(bytes: Bytes, generation: i64, opening: &mut MemoryReservation) -> Result<(Page, usize)> {
+fn decode(
+    bytes: Bytes,
+    generation: i64,
+    arrow_only: bool,
+    opening: &mut MemoryReservation,
+) -> Result<(Page, usize)> {
     if !bytes.starts_with(&ARROW_LEAF_HEADER)
         && !bytes.starts_with(&correction::HEADER)
         && !bytes.starts_with(&ipc::CONTINUATION)
     {
+        if arrow_only {
+            return Err(format_error("An installed ordered index page requires Arrow IPC"));
+        }
         let page = decode_legacy(&bytes, generation)?;
         let retained = page.bytes();
         return Ok((page, retained));

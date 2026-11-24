@@ -2,6 +2,8 @@
 
 use std::{num::NonZeroU64, time::SystemTime};
 
+use rtdb_types::RootLandingBinding;
+
 use super::*;
 
 const MAX_LIVE_MS: u64 = 120_000;
@@ -57,16 +59,18 @@ pub enum FamilyReleaseInput<'a> {
     WorldRow { member: FamilyOccurrence, winner: Position, row: EnrolledWorldRow },
     WorldDerived { member: FamilyOccurrence, stage: AssertionStage, slot: WorldRowSlot<'a> },
     RootDerived { member: FamilyOccurrence, relation: &'a str, key: &'a [u8] },
+    RootLanding { member: FamilyOccurrence, binding: RootLandingBinding },
 }
 
 impl FamilyReleaseInput<'_> {
     fn member(self) -> FamilyOccurrence {
         match self {
-            Self::Member(member) | Self::WorldRow { member, .. } | Self::WorldDerived { member, .. } | Self::RootDerived { member, .. } => member,
+            Self::Member(member) | Self::WorldRow { member, .. } | Self::WorldDerived { member, .. }
+            | Self::RootDerived { member, .. } | Self::RootLanding { member, .. } => member,
         }
     }
 
-    fn require_enrolled(self, family: &Family) -> Result<()> {
+    pub(super) fn require_enrolled(self, family: &Family) -> Result<()> {
         let member = self.member();
         if family.admitted_member(member.assertion) != Some(member) {
             return Err(conflict());
@@ -88,12 +92,13 @@ impl FamilyReleaseInput<'_> {
                 row.world.is_none() && row.capability.is_none() && row.member == member.assertion
                     && row.relation == relation && row.key == key
             }),
+            Self::RootLanding { binding, .. } => return family.require_root_landing(member.capability, binding),
         };
         if !enrolled { return Err(conflict()); }
         Ok(())
     }
 
-    fn commitment(self) -> Result<[u8; 32]> {
+    pub(super) fn commitment(self) -> Result<[u8; 32]> {
         let member = self.member();
         let mut bytes = Context::new(&SHA256);
         bytes.update(b"rtdb.multi/family-release-input/v1\0");
@@ -128,6 +133,15 @@ impl FamilyReleaseInput<'_> {
                     bytes.update(&length.to_be_bytes());
                     bytes.update(field);
                 }
+            }
+            Self::RootLanding { binding, .. } => {
+                if member.position != binding.position || member.assertion != binding.assertion
+                    || member.capability.identity().as_bytes() != &binding.stage
+                {
+                    return Err(conflict());
+                }
+                bytes.update(&[4]);
+                bytes.update(&binding.to_bytes());
             }
         }
         Ok(finish(bytes))
@@ -285,7 +299,7 @@ impl<'a> AssertionFamilies<'a> {
         check_expiry(expires_at_ms)?;
         let registration = FamilyReleaseRegistration::new(owner, client_family, part, input.commitment()?, expires_at_ms);
         let (family, _) = self.read_live_release(registration).await?;
-        input.require_enrolled(&family)?;
+        self.require_release_input(input, &family).await?;
         check_expiry(expires_at_ms)?;
         Ok(registration)
     }
@@ -297,7 +311,7 @@ impl<'a> AssertionFamilies<'a> {
         self.require_release_observation(registration, FamilyReleaseObservation::Live).await?;
         for _ in 0..ATTEMPTS {
             let (mut family, etag) = self.read_live_release(registration).await?;
-            input.require_enrolled(&family)?;
+            self.require_release_input(input, &family).await?;
             if self.read_release_terminal(registration).await?.is_some() { return Err(conflict()); }
             let found = family.release_holds.iter().find(|hold| hold.attempt == registration.attempt);
             if let Some(hold) = found {
@@ -313,6 +327,13 @@ impl<'a> AssertionFamilies<'a> {
             }
         }
         Err(contention())
+    }
+
+    async fn require_release_input(&self, input: FamilyReleaseInput<'_>, family: &Family) -> Result<()> {
+        if let FamilyReleaseInput::RootLanding { binding, .. } = input {
+            self.require_position_open(binding.position).await?;
+        }
+        input.require_enrolled(family)
     }
 
     pub async fn promote_family_release(&self, registration: FamilyReleaseRegistration) -> Result<()> {
