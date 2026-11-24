@@ -1475,6 +1475,63 @@ fn verify_plain_fork_catalog(
     Ok(())
 }
 
+struct ForkInventory {
+    count: usize,
+    digest: ring::digest::Context,
+}
+
+impl ForkInventory {
+    fn tracing() -> Option<Self> {
+        crate::residence_trace::enabled().then(|| Self {
+            count: 0, digest: ring::digest::Context::new(&ring::digest::SHA256),
+        })
+    }
+
+    fn add(&mut self, name: &ObjectKey, extent: u64, metadata: Option<[u8; 32]>, version: Option<&PhysicalObjectVersion>) {
+        let member = serde_json::to_vec(&(name.as_str(), extent, metadata, version)).expect("fork inventory encodes");
+        self.digest.update(&member);
+        self.digest.update(b"\n");
+        self.count += 1;
+    }
+
+    fn observe(self, event: &'static str, kind: &str, source: &DeploymentRecord, child: &DeploymentRecord,
+        checkpoint: Checkpoint, base: Option<&Base>,
+    ) {
+        crate::residence_trace::record(event, || {
+            let digest: [u8; 32] = self.digest.finish().as_ref().try_into().expect("SHA-256 is 32 bytes");
+            let mut fields = fork_trace_scope(source, child, checkpoint);
+            fields["kind"] = serde_json::json!(kind);
+            fields["inventory"] = serde_json::json!({ "members": self.count, "sha256": digest });
+            fields["edges"] = serde_json::json!(base.into_iter().flat_map(|base| base.publications.iter()
+                .map(|(name, publication)| serde_json::json!({
+                    "name": name, "owner": base.objects[name], "publication": publication,
+                }))).collect::<Vec<_>>());
+            fields
+        });
+    }
+}
+
+pub(crate) fn fork_trace_scope(source: &DeploymentRecord, child: &DeploymentRecord, checkpoint: Checkpoint) -> serde_json::Value {
+    serde_json::json!({
+        "lineage": source.lineage, "parent": source.id, "child": child.id,
+        "source_incarnation": source.incarnation, "child_incarnation": child.incarnation,
+        "source_epoch": source.log_epoch, "child_epoch": child.log_epoch,
+        "source_residence": source.storage_prefix(), "child_residence": child.storage_prefix(),
+        "checkpoint": checkpoint,
+    })
+}
+
+fn fork_checkpoint(source: &DeploymentRecord, catalog: &BlockCatalog) -> Checkpoint {
+    let epoch = StorageEpoch(source.log_epoch);
+    Checkpoint {
+        block: catalog.block_index().0,
+        boundary: catalog.boundary_replica_position().map_or(-1, |position| position.after_offset(epoch)),
+        source: catalog.latest_source_position().map_or(-1, |position| position.after_offset(epoch)),
+        system_time: catalog.latest_completed_tx().map_or(i64::MIN, |transaction| transaction.system_time.0),
+        root_sha256: catalog.publication_sha256(),
+    }
+}
+
 /// Called under the source lineage reservation. Verify every logical
 /// dependency and attach only its containing physical unit to the fork.
 pub(crate) async fn reference_fork_checkpoint(
@@ -1534,6 +1591,13 @@ pub(crate) async fn reference_fork_checkpoint(
         }
         base.objects.insert(physical.to_string(), owner.to_owned());
     }
+    let checkpoint = fork_checkpoint(source, &catalog);
+    if let Some(mut inventory) = ForkInventory::tracing() {
+        for member in &sources {
+            inventory.add(&member.name, member.observed_bytes as u64, member.witness.digest, member.version.as_ref());
+        }
+        inventory.observe("fork-source-inventory", "reference", source, child, checkpoint, Some(&base));
+    }
     base.initialize(bucket.as_ref(), &child_root).await?;
     let store = open_deployment_store(bucket, &child_root, PackDiscovery::List, wall_clock()).await?;
     let target = EncryptingStore::published(store, crate::store::directory_publications(keys, child, io)?);
@@ -1545,29 +1609,24 @@ pub(crate) async fn reference_fork_checkpoint(
     }) {
         return Err(inconsistent("A fork pack exposes a checkpoint after the selected cut"));
     }
+    let mut inventory = ForkInventory::tracing();
     for batch in sources.chunks(OBSERVATION_BATCH_MEMBERS) {
         let names = batch.iter().map(|member| member.name.clone()).collect::<Vec<_>>();
         let observed = target.observe_heads(&names).await?;
         for member in batch {
-            if observed.get(&member.name).is_none_or(|head| {
-                head.value.size != member.observed_bytes as u64 || head.version != member.version
-            }) {
-                return Err(inconsistent("The fork does not retain the selected physical inventory"));
-            }
+            let head = observed.get(&member.name).filter(|head| {
+                head.value.size == member.observed_bytes as u64 && head.version == member.version
+            }).ok_or_else(|| inconsistent("The fork does not retain the selected physical inventory"))?;
             if member.witness.digest.is_some() { member.read(&target).await?; }
+            if let Some(inventory) = &mut inventory {
+                inventory.add(&member.name, head.value.size, member.witness.digest, head.version.as_ref());
+            }
         }
     }
-    let boundary = catalog.boundary_replica_position()
-        .map_or(-1, |position| position.after_offset(StorageEpoch(source.log_epoch)));
-    let source_position = catalog.latest_source_position()
-        .map_or(-1, |position| position.after_offset(StorageEpoch(source.log_epoch)));
-    Ok(Checkpoint {
-        block: selected,
-        boundary,
-        source: source_position,
-        system_time: catalog.latest_completed_tx().map_or(i64::MIN, |transaction| transaction.system_time.0),
-        root_sha256: catalog.publication_sha256(),
-    })
+    if let Some(inventory) = inventory {
+        inventory.observe("fork-inventory-verified", "reference", source, child, checkpoint, Some(&base));
+    }
+    Ok(checkpoint)
 }
 
 pub(crate) async fn copy_fork_checkpoint(
@@ -1577,7 +1636,7 @@ pub(crate) async fn copy_fork_checkpoint(
     child: &DeploymentRecord,
     at_block: Option<i64>,
     io: Arc<IoRegion>,
-) -> Result<()> {
+) -> Result<Checkpoint> {
     let selected = at_block.or_else(|| source.checkpoint.map(|checkpoint| checkpoint.block))
         .ok_or_else(|| unavailable("The source has no checkpoint to copy"))?;
     if source.checkpoint_recovery.is_some() || source.serving_replay_capture.is_some() {
@@ -1603,6 +1662,13 @@ pub(crate) async fn copy_fork_checkpoint(
     let mut closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
     closure.remove(&catalog_key);
     let sources = plan_checkpoint_copy(&plaintext, closure, None).await?;
+    let checkpoint = fork_checkpoint(source, &catalog);
+    if let Some(mut inventory) = ForkInventory::tracing() {
+        for member in &sources {
+            inventory.add(&member.name, member.observed_bytes as u64, member.witness.digest, None);
+        }
+        inventory.observe("fork-source-inventory", "copy", source, child, checkpoint, None);
+    }
     let physical = Arc::new(PrefixedStore::new(bucket, destination_root));
     crate::store::check_root(physical.as_ref(), &child.id, true).await?;
     let packed = crate::packing::PackingStore::open(physical, PackDiscovery::List).await?;
@@ -1616,15 +1682,24 @@ pub(crate) async fn copy_fork_checkpoint(
     if copied.publication_sha256() != catalog.publication_sha256() {
         return Err(inconsistent("The fork destination does not hold the selected checkpoint root"));
     }
-    let mut closure = catalog_objects(&destination, &copied, CheckpointContents::Replay).await?.into_iter();
+    let mut closure = catalog_objects(&destination, &copied, CheckpointContents::Replay).await?;
+    let mut inventory = ForkInventory::tracing();
+    closure.remove(&catalog_key);
+    let mut closure = closure.into_iter();
     loop {
         let batch = closure.by_ref().take(OBSERVATION_BATCH_MEMBERS).collect::<Vec<_>>();
         if batch.is_empty() { break; }
         for member in observe_checkpoint_batch(&destination, batch).await? {
             member.witness.require_extent(member.observed_bytes as u64)?;
+            if let Some(inventory) = &mut inventory {
+                inventory.add(&member.name, member.observed_bytes as u64, member.witness.digest, None);
+            }
         }
     }
-    Ok(())
+    if let Some(inventory) = inventory {
+        inventory.observe("fork-inventory-verified", "copy", source, child, checkpoint, None);
+    }
+    Ok(checkpoint)
 }
 
 /// Copies the closure of one already published checkpoint. A capture ID

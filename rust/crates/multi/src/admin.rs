@@ -703,11 +703,10 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
             Some(target_io) => storage.bucket(target_io.clone()).await?,
             None => bucket,
         };
-        let inherited_checkpoint = if same_organisation {
-            Some(crate::archive::reference_fork_checkpoint(bucket, source, keys, &child, selected, Arc::clone(&io)).await?)
+        let checkpoint = if same_organisation {
+            crate::archive::reference_fork_checkpoint(bucket, source, keys, &child, selected, Arc::clone(&io)).await?
         } else {
-            crate::archive::copy_fork_checkpoint(bucket, source, keys, &child, Some(selected), Arc::clone(&io)).await?;
-            None
+            crate::archive::copy_fork_checkpoint(bucket, source, keys, &child, Some(selected), Arc::clone(&io)).await?
         };
         keys.key(&child.key_id()).await?;
         if let Some(stream) = &child_stream {
@@ -717,22 +716,29 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
                 writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?;
             }
         }
-        if let (Some(broker), Some(checkpoint), Some((transactions, suffix_digest))) =
-            (custody_broker, inherited_checkpoint, inherited_tail)
+        if let (Some(broker), Some((transactions, suffix_digest))) = (custody_broker, inherited_tail)
         {
             broker.record_fork_basis(crate::replay_broker::History::of(&child)?, fork_preparation,
                 crate::replay_broker::domain::ForkBasis { checkpoint, suffix_digest, transactions }).await?;
         }
-        Ok(())
+        Ok(checkpoint)
     }.await;
     io.close_and_wait().await;
     let prepared = if hosted {
-        prepared.and(crate::store::release_region(directory.as_ref(), &child.id, fork_preparation.token, false).await)
+        let released = crate::store::release_region(directory.as_ref(), &child.id, fork_preparation.token, false).await;
+        prepared.and_then(|checkpoint| released.map(|()| checkpoint))
     } else {
         prepared
     };
     let published = match prepared {
-        Ok(()) => publish_fork(directory.as_ref(), source, &child, preparation).await,
+        Ok(checkpoint) => publish_fork(directory.as_ref(), source, &child, preparation).await.map(|stored| {
+            crate::residence_trace::record("fork-directory-published", || {
+                let mut fields = crate::archive::fork_trace_scope(source, &stored, checkpoint);
+                fields["revision"] = serde_json::json!(stored.version);
+                fields
+            });
+            stored
+        }),
         Err(error) => Err(ForkPublicationError::Rejected(error)),
     };
     match published {

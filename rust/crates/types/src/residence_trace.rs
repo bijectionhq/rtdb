@@ -105,3 +105,29 @@ pub struct CertifiedDecision<'a> {
 pub fn logkeeper_decision<'a>(decision: impl FnOnce() -> CertifiedDecision<'a>) {
     record("certified-decision", || serde_json::to_value(decision()).expect("decision identity encodes"));
 }
+
+
+#[derive(Serialize)]
+pub struct RepairInventory<'a> {
+    pub residence: &'a str,
+    pub anchor_block: i64,
+    pub anchor_boundary: i64,
+    pub anchor_root: [u8; 32],
+    pub inventory: [u8; 32],
+    pub observed_inventory: [u8; 32],
+    pub target: Option<RepairInventoryTarget>,
+}
+
+#[derive(Serialize)]
+pub struct RepairInventoryTarget {
+    pub invocation: uuid::Uuid,
+    pub block: i64,
+    pub boundary: i64,
+    pub root: [u8; 32],
+}
+
+impl RepairInventory<'_> {
+    pub fn observe(&self, event: &'static str) {
+        record(event, || serde_json::to_value(self).expect("repair inventory encodes"));
+    }
+}

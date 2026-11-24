@@ -149,8 +149,9 @@ It also checks that each logged receipt follows the observed covering quorum pub
 Directory-managed fresh answers carry the portable T1 decision fingerprint through the probe nonce, the applied catalog capture and frontend delivery.
 The native checker also joins the checkpoint publisher to its covering certified decision and from the checkpoint to the installed recovery closure.
 Inherited loglet prefixes without a portable decision carry no certified-answer observation.
-The full native capture still needs the general T2 reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
-The new model, controls and native joins have source review only.
+The native T2 capture joins the directory census, broker grant, provider effect and directory settlement.
+Answer transport deadlines and held-view and key authority use separate observations and model steps.
+The model, controls and native joins have source review only.
 
 
 ### Native authority follow-through
@@ -193,9 +194,25 @@ The checker joins that admission to the origin replay ticket and requires a matc
 Installed receipt reclamation emits the ordered journal's withdrawal position and exact provider path and publication fingerprints.
 The provider trace joins those fingerprints with the placement and withdrawal position before validating physical removal.
 This covers installed receipt publications for which the runtime can obtain an exact object fence.
-The detached broker now has a native deletion replay for its certified contiguous recovery fence.
-The directory records the covered positions and exact versioned publication candidates when it installs the fence.
-The trace joins the retained T1 checkpoint decision and manifest to the broker's exact grant and recorded intervals and upload census.
-The provider effect follows the matching key withdrawal, and observed provider absence precedes directory settlement.
-The native source fixture exercises the journal, directory and broker with a controlled provider effect, before physical trim.
-The general reachability design still needs to advance past unrelated finite holds while preserving their positions.
+The directory installs the body fence from an active-quorum census of a certified batch.
+The observation records every sealed frame in that batch, its exact detached publications, the preceding anchor, the installed anchor and the directory holds present at installation.
+New origins cannot enter the fenced interval.
+A previously admitted origin can redeem its exact position while the dependency remains live.
+The trace joins the admission to the first covering fence and rejects redemption at or after a grant for that position.
+
+Native deletion replay carries the exact checkpoint, manifest and T1 decision into the installed census and the broker's recovery-exclusion decision.
+The broker grants only the candidate whose position has no remaining recovery interval or upload.
+Key withdrawal precedes exact provider version removal, which precedes directory settlement.
+The fixture retains an older finite hold and leaves a historical journal unavailable throughout settlement.
+It also holds the target position through the census, redeems it under the old ticket and drains it before the grant.
+The older hold keeps physical trim blocked.
+The composed model replays these dependencies separately from physical journal trim and exercises a refusal when deletion overtakes a live reader or an upload.
+
+For forks, replay joins the selected checkpoint inventory and the verified destination inventory to the published directory revision.
+Independent copies reopen the destination closure. Shared forks observe logical members and their provider publications through the installed references.
+An inherited edge can be withdrawn after a byte-for-byte comparison of its exact original and replacement, including the released member's entry for a packed object.
+The trace joins the selected manifest edge, the accepted comparison and the manifest sequence that confirms withdrawal.
+
+Retained repair and retained reset both join the enrolled primary inventory to the staged inventory under the original local residence and exact checkpoint boundaries.
+Replay follows an equal inventory comparison for the same invocation.
+The native and bounded replay controls cover skipped census frames, substituted publications, incomplete fork inventory, invalid pack membership and unverified repair media.

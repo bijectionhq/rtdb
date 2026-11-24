@@ -65,12 +65,31 @@ ObservedStep(event) ==
       [] kind = "refuse-transport-answer" -> RefuseTransportAnswer /\ authority.delivery.time = cut /\ publication = "old"
       [] kind = "revoke-key" -> RevokeKey /\ publication = "old"
       [] kind = "read-old-cache" -> ReadOldCachedPage(outcome) /\ query = cut /\ publication = "old"
+      [] kind = "hold-replica-position" -> HoldReplica(cut)
+      [] kind = "release-replica-position" -> ReleaseReplica(cut)
+      [] kind = "lose-historical-journal" -> LoseHistoricalJournal
+      [] kind = "install-body-census" -> InstallBodyCensus /\ cut = BodyPosition
+      [] kind = "redeem-body-hold" -> RedeemBodyHold /\ cut = BodyPosition
+      [] kind = "drain-body-read" -> DrainBodyRead
+      [] kind = "begin-body-upload" -> BeginBodyUpload
+      [] kind = "finish-body-upload" -> FinishBodyUpload
+      [] kind = "grant-detached-body" -> GrantBody(publication) /\ cut = BodyPosition
+      [] kind = "withdraw-body-key" -> DetachedEffect(publication, "granted", "key-withdrawn")
+      [] kind = "remove-detached-body" -> DetachedEffect(publication, "key-withdrawn", "removed")
+      [] kind = "settle-detached-body" -> DetachedEffect(publication, "removed", "settled")
+      [] kind = "select-fork-inventory" -> SelectForkInventory(cut)
+      [] kind = "verify-fork-inventory" -> VerifyForkInventory(cut, publication)
+      [] kind = "verify-fork-replacement" -> VerifyForkReplacement(publication)
+      [] kind = "withdraw-fork-edge" -> WithdrawForkEdge(publication)
+      [] kind = "enroll-repair-inventory" -> EnrollRepairInventory
+      [] kind = "verify-repair-inventory" -> VerifyRepairInventory(publication)
+      [] kind = "replay-repair-inventory" -> ReplayRepairInventory
       [] OTHER -> FALSE
 
 Advance ==
     /\ cursor < Len(Events)
     /\ ObservedStep(Events[cursor + 1])
-    /\ Next
+    /\ (Next \/ (ExtendAuthorities /\ ReachabilityNext))
     /\ cursor' = cursor + 1
 
 Complete ==
@@ -81,7 +100,9 @@ Complete ==
         /\ authority.acknowledged = 1 /\ authority.activationFloor = 1
         /\ authority.recoveryFence = 1 /\ authority.deletion = "old"
         /\ authority.redemption = "expired" /\ authority.captured = 1
-        /\ authority.cacheResult = "erased-under-view" /\ authority.delivery.state = "refused")
+        /\ authority.cacheResult = "erased-under-view" /\ authority.delivery.state = "refused"
+        /\ Reach.body = "settled" /\ ~Reach.historicalJournal
+        /\ Reach.forkInventory = "withdrawn" /\ Reach.repair = "replayed")
     /\ IF DisposalEffectsOnly
         THEN phase = "disposing" /\ fork = 0
         ELSE phase = "disposed" /\ firstRecord = 2 /\ fork = 1

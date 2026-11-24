@@ -867,9 +867,7 @@ impl Service {
                     "hold": region, "residence": residence(&record), "position": position,
                     "key": format!("{}/{}", residence(&record), reference.object()),
                     "publication": reference.publication(), "frame": sealed_frame,
-                    "source_hold": record.storage_regions.get(&ticket)
-                        .filter(|source| matches!(source, StorageRegion::ReplicaReplay { .. }))
-                        .map(|_| serde_json::json!({ "hold": ticket, "residence": record.storage_prefix() })),
+                    "source_hold": source_hold(&record, ticket),
                 }));
                 Ok(payload)
             }).await;
@@ -1008,6 +1006,7 @@ impl Service {
                     "revision": stored.version, "stream": stored.stream("replica"), "epoch": stored.log_epoch,
                     "hold": region, "residence": residence(&stored),
                     "first_required": position, "through": position,
+                    "source_hold": source_hold(&stored, ticket),
                 }));
                 return Ok(stored);
             }
@@ -1154,6 +1153,11 @@ pub(crate) fn residence(record: &DeploymentRecord) -> String {
     format!("replay-bodies/{}/{}", record.storage_prefix(), payload_log_epoch(record))
 }
 
+fn source_hold(record: &DeploymentRecord, ticket: Uuid) -> Option<serde_json::Value> {
+    let interval = record.storage_region_replica_interval(record.storage_regions.get(&ticket)?)?;
+    Some(serde_json::json!({ "hold": ticket, "residence": record.storage_prefix(), "interval": interval }))
+}
+
 pub(crate) fn admits_position(record: &DeploymentRecord, hold: &StorageRegion, position: i64) -> bool {
     record.storage_region_replica_interval(hold).is_some_and(|[first, through]| {
         first >= 0 && (first..=through).contains(&position)
@@ -1289,7 +1293,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_version_settles_under_its_certified_fence_before_physical_trim() {
-        use crate::{hosted_recovery::{ReplicaTrimPlan, observe_checkpoint}, keys::LocalKeyService, lease::LeaseOptions,
+        use crate::{hosted_recovery::{ReplicaTrimPlan, advance_body_fence, observe_checkpoint, replay_start}, keys::LocalKeyService, lease::LeaseOptions,
             logs::JournalUnits, process};
         use rtdb_directory::{Checkpoint, CheckpointDecision, MemberId, MemoryDirectory};
         use rtdb_format::log::proto::NoOp;
@@ -1336,14 +1340,14 @@ mod tests {
         opened.put(&relative, body.clone()).await.unwrap();
         let mut pointer = data_frame.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(0), allocation, &body);
         pointer.bind_offload_publication(version.clone()).unwrap();
-        for (lsn, frame) in [Bytes::from(pointer.encode()), body.clone(), body.clone()].into_iter().enumerate() {
+        for (lsn, frame) in [body.clone(), Bytes::from(pointer.encode()), body.clone(), body.clone()].into_iter().enumerate() {
             let sealed = slots.seed(lsn as i64, frame).await.unwrap();
             let receipt = writer.enqueue(sealed, Timestamp(lsn as i64)).await.unwrap().durable().await.unwrap();
             assert_eq!(receipt.offset, LogOffset(lsn as i64));
         }
         let read = writer.read_index(record.epoch).await.unwrap();
         let decision = read.decision().unwrap();
-        let checkpoint = Checkpoint { block: 0, boundary: 1, source: -1, system_time: 0, root_sha256: Some([9; 32]) };
+        let checkpoint = Checkpoint { block: 0, boundary: 2, source: -1, system_time: 0, root_sha256: Some([9; 32]) };
         let manifest = [7; 32];
         let fingerprint = decision.certificate.statement.fingerprint();
         record.checkpoint = Some(checkpoint);
@@ -1351,27 +1355,39 @@ mod tests {
         record.checkpoint_decision = Some(Box::new(CheckpointDecision {
             checkpoint, manifest, stable: prost::Message::encode_to_vec(decision),
         }));
+        let missing_journal = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        record.replica_journals.insert(rtdb_types::JournalEndpoint::Member {
+            address: missing_journal.local_addr().unwrap().to_string(),
+            journal: Uuid::new_v4().to_string(),
+        });
+        let unrelated = Uuid::new_v4();
+        let affected = Uuid::new_v4();
+        for (hold, position) in [(unrelated, 0), (affected, 1)] {
+            record.storage_regions.insert(hold, StorageRegion::ReplicaReplay {
+                first_required: position, through: position, custody: ReplayCustody::Local,
+            });
+        }
         let installed = directory.replace_deployment(record.clone(), record.version).await.unwrap();
         let Cas::Applied(record) = installed else { panic!("the directory refused the checkpoint"); };
         observe_checkpoint(&record, checkpoint, manifest, Some(fingerprint));
 
-        let mut held = record.clone();
-        held.storage_regions.insert(Uuid::new_v4(), StorageRegion::ReplicaReplay {
-            first_required: 0, through: 0, custody: ReplayCustody::Local,
-        });
-        assert!(ReplicaTrimPlan::new(held, checkpoint.boundary, -1, 0).is_none());
+        assert!(ReplicaTrimPlan::new(record.clone(), checkpoint.boundary, -1, 0).is_none());
         let members = directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
-        let plan = ReplicaTrimPlan::new(record.clone(), checkpoint.boundary, -1, 0).unwrap();
-        let _trim = plan.authorize(directory.as_ref(), &members, keys.as_ref(), true).await.unwrap().unwrap();
+        let record = advance_body_fence(directory.as_ref(), &members, keys.as_ref(), record, checkpoint.boundary)
+            .await.unwrap().unwrap();
+        assert!(replay_start(&record, 0).is_err());
+        let history = History::of(&record).unwrap();
+        let delegated = Uuid::new_v4();
+        let mut attempted = false;
+        broker.admit_read(history, affected, 1, delegated, &mut attempted).await.unwrap();
+        assert!(attempted);
+        broker.release(history, delegated).await;
 
-        let later = Uuid::new_v4();
-        let record = crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
-            record.storage_regions.insert(later, StorageRegion::ReplicaReplay {
-                first_required: 1, through: 1, custody: ReplayCustody::Local,
-            });
-            Ok(())
-        }).await.unwrap();
         let candidate = &record.replica_payload_trim.as_ref().unwrap().candidates[0];
+        broker.settle_candidate(&record, candidate, relative.clone(), key.clone(), |_, _| async {
+            panic!("the affected hold still owns this body")
+        }).await.unwrap();
+        crate::store::release_region(directory.as_ref(), &record.id, affected, true).await.unwrap();
         assert_eq!(candidate.version, version);
         broker.settle_candidate(&record, candidate, relative.clone(), key.clone(), |selected_key, selected_version| {
             let (broker, io, opened, relative) = (&broker, &io, &opened, &relative);
@@ -1386,7 +1402,8 @@ mod tests {
         }).await.unwrap();
         let settled = directory.deployment(&record.id).await.unwrap().unwrap();
         assert!(settled.replica_payload_trim.unwrap().candidates.is_empty());
-        assert_eq!(writer.read_range(LogOffset(0), LogOffset(1)).await.unwrap().len(), 1);
+        assert!(settled.storage_regions.contains_key(&unrelated));
+        assert_eq!(writer.read_range(LogOffset(1), LogOffset(2)).await.unwrap().len(), 1);
         io.close_and_wait().await;
         shutdown.cancel();
         journal.stop().await.unwrap();

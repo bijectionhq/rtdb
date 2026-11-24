@@ -153,7 +153,7 @@ impl ReplicaTrimPlan {
             let Some((first, next_anchor)) = certified_batch(&self.record, &stream, anchor, self.through.0).await?
                 else { return Ok(None); };
             self.through.0 = next_anchor.interval[1];
-            let (journal_units, _) = trim_census(&self.record, &stream, keys, first, self.through.0, false).await?;
+            let (journal_units, _, _) = trim_census(&self.record, &stream, keys, first, self.through.0, false).await?;
             let mut pending = current_work(&self.record);
             pending.through = self.through.0;
             pending.applied = false;
@@ -252,18 +252,19 @@ pub(crate) async fn advance_body_fence(
     let Some(proof) = checkpoint_decision(&record)? else { return Ok(Some(record)); };
     let through = checkpoint.boundary.min(adopted_boundary).saturating_sub(1)
         .min(proof.certificate.statement.prefix.predecessor);
-    let anchor = body_anchor(&record);
+    let anchor = body_anchor(&record).copied();
     if through < 0 || anchor.is_some_and(|anchor| anchor.interval[1] >= through) {
         return Ok(Some(record));
     }
     let stream = replica_stream(&record, members)?;
-    let Some((first, next_anchor)) = certified_batch(&record, &stream, anchor, through).await?
+    let Some((first, next_anchor)) = certified_batch(&record, &stream, anchor.as_ref(), through).await?
         else { return Ok(Some(record)); };
-    let (_, detached) = trim_census(&record, &stream, keys, first, next_anchor.interval[1], true).await?;
+    let (units, detached, range) = trim_census(&record, &stream, keys, first, next_anchor.interval[1], true).await?;
     let mut work = current_work(&record);
     if work.candidates.len().saturating_add(detached.len()) > MAX_PENDING_REPLICA_PAYLOADS {
         return Ok(Some(record));
     }
+    let first_candidate = work.candidates.len();
     work.candidates.extend(detached);
     work.body_anchor = Some(Box::new(next_anchor));
     let version = record.version;
@@ -271,20 +272,33 @@ pub(crate) async fn advance_body_fence(
     next.replica_payload_trim = Some(Box::new(work));
     let Cas::Applied(stored) = directory.replace_deployment(next, version).await? else { return Ok(None); };
     let work = stored.replica_payload_trim.as_ref().expect("the CAS stored the detached census");
-    if !work.candidates.is_empty() {
-        let residence = crate::replay_broker::residence(&stored);
-        crate::residence_trace::record("detached-recovery-fence", || serde_json::json!({
+    let residence = crate::replay_broker::residence(&stored);
+    crate::residence_trace::record("detached-recovery-fence", || {
+        let publication = |candidate: &ReplicaPayloadCandidate| serde_json::json!({
+            "key": format!("{residence}/{}", candidate.key), "publication": candidate.version,
+            "position": candidate.position, "frame": candidate.frame_sha256,
+        });
+        serde_json::json!({
             "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
             "stream": stream.stream, "epoch": stored.log_epoch, "generation": stored.storage_generation,
             "residence": residence, "revision": stored.version, "interval": next_anchor.interval,
             "root_incarnation": next_anchor.root_incarnation, "anchor": next_anchor.digest,
+            "previous": anchor, "batch": range.interval, "batch_digest": range.digest_bytes(),
             "checkpoint": stored.checkpoint, "manifest": stored.recovery_manifest_sha256,
-            "candidates": work.candidates.iter().map(|candidate| serde_json::json!({
-                "key": format!("{residence}/{}", candidate.key), "publication": candidate.version,
-                "position": candidate.position, "frame": candidate.frame_sha256,
+            "decision": proof.certificate.statement.fingerprint(),
+            "active_journals": stream.servers, "known_journals": stored.replica_journals,
+            "holds": stored.storage_regions.iter().filter_map(|(hold, region)| {
+                stored.storage_region_replica_interval(region).map(|interval| serde_json::json!({
+                    "hold": hold, "interval": interval,
+                }))
+            }).collect::<Vec<_>>(),
+            "frames": units.iter().map(|unit| serde_json::json!({
+                "position": unit.position, "frame": unit.frame_sha256,
             })).collect::<Vec<_>>(),
-        }));
-    }
+            "discovered": work.candidates[first_candidate..].iter().map(publication).collect::<Vec<_>>(),
+            "candidates": work.candidates.iter().map(publication).collect::<Vec<_>>(),
+        })
+    });
     Ok(Some(stored))
 }
 
@@ -346,7 +360,7 @@ fn complete_unit_census(units: &[ReplicaJournalUnit], through: i64) -> bool {
 
 async fn trim_census(record: &DeploymentRecord, stream: &StreamConfig,
     keys: &dyn crate::keys::KeyService, first: i64, through: i64, offloads: bool,
-) -> Result<(Vec<ReplicaJournalUnit>, Vec<ReplicaPayloadCandidate>)> {
+) -> Result<(Vec<ReplicaJournalUnit>, Vec<ReplicaPayloadCandidate>, JournalDigest)> {
     let certificate = rtdb_logkeeper::certify_committed_range(stream, first, through).await?;
     let mut reader = rtdb_logkeeper::CertifiedRangeReader::new(stream, &certificate)?;
     let journal = crate::logs::JournalUnits::open(
@@ -370,7 +384,7 @@ async fn trim_census(record: &DeploymentRecord, stream: &StreamConfig,
             candidates.push(ReplicaPayloadCandidate { key: relative, position: entry.lsn, frame_sha256, version, grant: None });
         }
     }
-    Ok((units, candidates))
+    Ok((units, candidates, certificate))
 }
 
 #[cfg(test)]

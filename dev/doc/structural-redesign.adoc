@@ -340,9 +340,12 @@ Hosted PostgreSQL feedback follows the exact published recovery root.
 The bounded replay includes quorum publication before acknowledgement, recovery exclusion before deletion, and refusal of a paused answer at its transport deadline.
 Native replay joins portable T1 decisions to the applied catalog and frontend answer, and checks the covering decision for directory checkpoint publication.
 It correlates broker reads with both replay holds and installed receipt removal with the exact journal fence.
-For detached bodies, it joins the certified replacement checkpoint and persisted recovery census to the broker grant, key withdrawal, exact provider version removal, and directory settlement.
-Detached replay requires the recovery fence and can finish before physical journal trim.
-General reachability beyond the contiguous recovery fence and execution evidence remain open.
+For detached bodies, native replay joins the active-quorum frame census and certified replacement checkpoint to the directory fence, broker grant, key withdrawal, exact provider version removal and directory settlement.
+The bounded model and native fixture cover deletion before physical journal trim with an unrelated finite hold and an unavailable historical journal.
+The broker can redeem a pre-fence hold for its exact position. A grant requires that position's reads and uploads to drain.
+Fork replay compares the selected and verified checkpoint inventories before directory publication, and requires an exact matching loose object or pack member before withdrawing an inherited edge.
+Retained repair and reset replay bind staged primary bytes to the durable enrollment before opening the repair interval.
+The new traces, model and negative controls have source review only.
 Cross-host cutoff checks rely on a consistent wall-clock domain, and remote vault settlement retains its clock-rate margin.
 |===
 

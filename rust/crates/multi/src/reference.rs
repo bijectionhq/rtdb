@@ -49,7 +49,7 @@ impl Base {
         Ok(Self::load_snapshot(bucket, store).await?.map_or_else(Self::default, |(_, base)| base))
     }
 
-    async fn load_snapshot(bucket: &dyn ObjectStore, store: &str) -> Result<Option<(u64, Base)>> {
+    pub(crate) async fn load_snapshot(bucket: &dyn ObjectStore, store: &str) -> Result<Option<(u64, Base)>> {
         for _ in 0..4 {
             let Some((sequence, name)) = latest_manifest(bucket, store).await? else { return Ok(None); };
             let bytes = match bucket.get(&key(&name)?).await {
@@ -98,8 +98,8 @@ impl Base {
     }
 
     /// Withdraws the selected references observed in this manifest. A competing edit can only be rebased onto its own latest snapshot.
-    pub(crate) async fn forget(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<()> {
-        self.withdraw(bucket, store, names).await.map(drop)
+    pub(crate) async fn forget(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<Option<u64>> {
+        self.withdraw(bucket, store, names).await
     }
 
     pub(crate) async fn forget_and_prune_locally(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<()> {

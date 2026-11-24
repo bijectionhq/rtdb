@@ -22,6 +22,7 @@ use rtdb_storage::{
     sealing::ClassicKeyVault,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Timestamp, TransactionKey};
+use rtdb_types::residence_trace::{self, RepairInventory, RepairInventoryTarget};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -133,7 +134,8 @@ impl RetainRepairBase {
         require_offline_lifetime_admission(&base)?;
         base_blocks.verify_primary_inventory(&base, &tables).await?;
         let primary_inventory_sha256 = primary_inventory_digest(base_blocks.object_store(), &base, &tables, memory, cancellation).await?;
-        if primary_inventory_sha256 != primary_inventory_digest(source_body.as_ref(), &serving, &tables, memory, cancellation).await? {
+        let serving_inventory = primary_inventory_digest(source_body.as_ref(), &serving, &tables, memory, cancellation).await?;
+        if primary_inventory_sha256 != serving_inventory {
             return Err(invalid("The detached repair inventory differs from the serving checkpoint"));
         }
         for entry in base.table_entries()? {
@@ -167,8 +169,23 @@ impl RetainRepairBase {
         cancelled(cancellation)?;
         let anchor = LocalRepairAnchor { block: self.base.block, boundary, sha256: self.base.sha256, primary_inventory_sha256 };
         source.install_repair_anchor(anchor).await?;
+        repair_inventory_observation(&source_root.to_string_lossy(), anchor, serving_inventory, None)
+            .observe("repair-inventory-enrolled");
         Ok(anchor)
     }
+}
+
+fn repair_inventory_observation(
+    residence: &str, anchor: LocalRepairAnchor, observed_inventory: [u8; 32], target: Option<RepairInventoryTarget>,
+) -> RepairInventory<'_> {
+    RepairInventory {
+        residence, anchor_block: anchor.block.0, anchor_boundary: anchor.boundary.0,
+        anchor_root: anchor.sha256, inventory: anchor.primary_inventory_sha256, observed_inventory, target,
+    }
+}
+
+fn trace_repair_target(target: RepairCheckpoint, through: ReplicaPosition) -> RepairInventoryTarget {
+    RepairInventoryTarget { invocation: uuid::Uuid::new_v4(), block: target.block.0, boundary: through.0, root: target.sha256 }
 }
 
 impl LocalRepair {
@@ -297,13 +314,20 @@ impl PrimaryReset {
         }
         let staged = Arc::new(LocalStore::open_in(directory.path(), region)?);
         stage_primary_base(&archive, &staged, &base, &tables, memory, cancellation).await?;
-        if primary_inventory_digest(staged.as_ref(), &base, &tables, memory, cancellation).await? != anchor.primary_inventory_sha256 {
+        let observed_inventory = primary_inventory_digest(staged.as_ref(), &base, &tables, memory, cancellation).await?;
+        if observed_inventory != anchor.primary_inventory_sha256 {
             return Err(invalid("The retained primary inventory differs from its enrolled checkpoint"));
         }
+        let residence = local.root().to_string_lossy();
+        let observation = residence_trace::enabled().then(|| repair_inventory_observation(
+            &residence, anchor, observed_inventory, Some(trace_repair_target(target_receipt, through)),
+        ));
+        if let Some(observation) = &observation { observation.observe("repair-inventory-verified"); }
         let staged_blocks = BlockStore::new(staged.clone(), pool(staged.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut rebuilt = staged_blocks.recover(Default::default(), source.source_floor()?, Timestamp(0), BlockDiscovery::At(base.block_index())).await?;
         IoRegion::reading(recovery,
             replay(&source, &staged_blocks, &staged, &mut rebuilt, &base, &target, memory, cancellation)).await?;
+        if let Some(observation) = observation { observation.observe("repair-replayed"); }
         let value = rebuilt.partition.value();
         let catalog = Arc::clone(value.trie_catalog());
         let tables = Arc::clone(value.table_catalog());
@@ -445,15 +469,24 @@ impl RepairRange {
         let stage_io = io_region.child_holding(Some(directory.clone()));
         let destination = Arc::new(LocalStore::open_in(staged.join(root), Arc::clone(&stage_io))?);
         stage_primary_base(&base_storage, &destination, &base, &tables, memory, cancellation).await?;
-        if let Some(anchor) = retained_anchor
-            && primary_inventory_digest(destination.as_ref(), &base, &tables, memory, cancellation).await? != anchor.primary_inventory_sha256
-        {
-            return Err(invalid("The retained primary inventory differs from its enrolled checkpoint"));
-        }
+        let residence = source_root.to_string_lossy();
+        let observation = if let Some(anchor) = retained_anchor {
+            let observed_inventory = primary_inventory_digest(destination.as_ref(), &base, &tables, memory, cancellation).await?;
+            if observed_inventory != anchor.primary_inventory_sha256 {
+                return Err(invalid("The retained primary inventory differs from its enrolled checkpoint"));
+            }
+            residence_trace::enabled().then(|| repair_inventory_observation(
+                &residence, anchor, observed_inventory, Some(trace_repair_target(self.through, through)),
+            ))
+        } else {
+            None
+        };
+        if let Some(observation) = &observation { observation.observe("repair-inventory-verified"); }
 
         let stage_blocks = BlockStore::new(destination.clone(), pool(destination.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut repaired = stage_blocks.recover(Default::default(), logs.source_floor()?, Timestamp(0), BlockDiscovery::At(base_receipt.block)).await?;
         let sha256 = replay(&logs, &stage_blocks, &destination, &mut repaired, &base, &target, memory, cancellation).await?;
+        if let Some(observation) = observation { observation.observe("repair-replayed"); }
         let checkpoint = RepairCheckpoint { block: self.through.block, sha256 };
         drop(stage_blocks);
         drop(destination);

@@ -96,7 +96,7 @@ pub(super) async fn withdraw_inherited_release(
                     .filter(|current| current.storage_prefix() == candidate.storage_prefix()
                         && current.lineage == candidate.lineage && current.org == candidate.org && can_reap(current))
                     else { return Ok(false); };
-                let still_selected = Base::load(bucket, &root).await?;
+                let Some((sequence, still_selected)) = Base::load_snapshot(bucket, &root).await? else { return Ok(false); };
                 if still_selected.objects.get(name) != Some(source_root) || still_selected.publications.get(name) != Some(original) {
                     return Ok(false);
                 }
@@ -105,16 +105,39 @@ pub(super) async fn withdraw_inherited_release(
                         && source_root == &format!("{}/{storage_root}", owner.storage_prefix())
                 });
                 if !source_registered { return Ok(false); }
-                if pack {
-                    if bucket.retirement_publication(&target).await?.as_ref() != Some(&replacement)
-                        || !crate::packing::read_index(bucket, &target).await?.entries.contains_key(&witness.record.key)
-                    {
+                let attempt = crate::residence_trace::enabled().then(Uuid::new_v4);
+                let selection = || serde_json::json!({
+                    "lineage": current.lineage, "child": current.id, "child_incarnation": current.incarnation,
+                    "child_residence": root, "source_residence": source_root, "attempt": attempt,
+                    "name": name, "released": witness.record.key, "original": original, "base_sequence": sequence,
+                });
+                crate::residence_trace::record("fork-edge-selected", || selection());
+                let member = if pack {
+                    if bucket.retirement_publication(&target).await?.as_ref() != Some(&replacement) {
                         return Ok(false);
                     }
-                }
-                if !same_fork_body(bucket, (&source, original), (&target, &replacement)).await? {
-                    return Ok(false);
-                }
+                    let index = observe_pack_index(bucket, &target).await?;
+                    if !observes_fork_publication(index.version.as_ref(), &replacement) {
+                        return Ok(false);
+                    }
+                    let Some(member) = index.value.entries.get(&witness.record.key) else { return Ok(false); };
+                    Some(member.clone())
+                } else {
+                    None
+                };
+                let Some((extent, digest)) = same_fork_body(bucket, (&source, original), (&target, &replacement)).await?
+                    else { return Ok(false); };
+                let observation = || {
+                    let mut fields = selection();
+                    fields["replacement"] = serde_json::json!(replacement);
+                    fields["pack_member"] = serde_json::json!(member.as_ref().map(|range| serde_json::json!({
+                        "key": witness.record.key, "range": range,
+                    })));
+                    fields["extent"] = serde_json::json!(extent);
+                    fields["sha256"] = serde_json::json!(digest);
+                    fields
+                };
+                crate::residence_trace::record("fork-replacement-verified", || observation());
                 if !pack && witness.record.trie_floor.is_some() {
                     let record = witness.record.clone();
                     let release = match replacement {
@@ -128,7 +151,14 @@ pub(super) async fn withdraw_inherited_release(
                     let marker = ObjectKey::new(format!("{markers}/{timestamp:020}-{}{suffix}", id.simple(), suffix = super::TRIE_RETIREMENT_RELEASE))?;
                     bucket.put(&marker, bytes).await?;
                 }
-                still_selected.forget(bucket, &root, &BTreeSet::from([name.clone()])).await?;
+                let sequence = still_selected.forget(bucket, &root, &BTreeSet::from([name.clone()])).await?;
+                if let Some(sequence) = sequence {
+                    crate::residence_trace::record("fork-edge-withdrawn", || {
+                        let mut fields = observation();
+                        fields["sequence"] = serde_json::json!(sequence);
+                        fields
+                    });
+                }
                 Ok(true)
             }).await?;
             if withdrawn { return Ok(()); }
@@ -137,31 +167,51 @@ pub(super) async fn withdraw_inherited_release(
     Ok(())
 }
 
+fn observes_fork_publication(version: Option<&PhysicalObjectVersion>, publication: &PhysicalObjectPublication) -> bool {
+    match publication {
+        PhysicalObjectPublication::Version(expected) => version == Some(expected),
+        PhysicalObjectPublication::Terminal(_) => version.is_none(),
+    }
+}
+
 async fn same_fork_body(bucket: &dyn ObjectStore,
     (source, original): (&ObjectKey, &PhysicalObjectPublication),
     (destination, replacement): (&ObjectKey, &PhysicalObjectPublication),
-) -> Result<bool> {
+) -> Result<Option<(u64, Option<[u8; 32]>)>> {
     use crate::reference::require_publication;
     if bucket.retirement_publication(source).await?.as_ref() != Some(original)
         || bucket.retirement_publication(destination).await?.as_ref() != Some(replacement)
     {
-        return Ok(false);
+        return Ok(None);
     }
-    let extent = bucket.head_fresh(source).await?.size;
-    if bucket.head_fresh(destination).await?.size != extent { return Ok(false); }
+    let source_head = bucket.observe_head(source).await?;
+    let destination_head = bucket.observe_head(destination).await?;
+    let extent = source_head.value.size;
+    if destination_head.value.size != extent
+        || !observes_fork_publication(source_head.version.as_ref(), original)
+        || !observes_fork_publication(destination_head.version.as_ref(), replacement)
+    {
+        return Ok(None);
+    }
+    let mut digest = crate::residence_trace::enabled().then(|| ring::digest::Context::new(&ring::digest::SHA256));
     let mut offset = 0;
     while offset < extent {
         let end = offset.saturating_add(EDGE_COMPARISON_PAGE).min(extent);
-        let source_bytes = bucket.observe_range(source, offset..end).await?.value;
-        let destination_bytes = bucket.observe_range(destination, offset..end).await?.value;
-        if source_bytes.len() as u64 != end - offset || source_bytes != destination_bytes { return Ok(false); }
+        let source_bytes = bucket.observe_range(source, offset..end).await?;
+        let destination_bytes = bucket.observe_range(destination, offset..end).await?;
+        if !observes_fork_publication(source_bytes.version.as_ref(), original)
+            || !observes_fork_publication(destination_bytes.version.as_ref(), replacement)
+            || source_bytes.value.len() as u64 != end - offset || source_bytes.value != destination_bytes.value
+        {
+            return Ok(None);
+        }
+        if let Some(digest) = &mut digest { digest.update(&source_bytes.value); }
         offset = end;
     }
     require_publication(bucket, source, original).await?;
     require_publication(bucket, destination, replacement).await?;
-    Ok(true)
+    Ok(Some((extent, digest.map(|context| context.finish().as_ref().try_into().expect("SHA-256 is 32 bytes")))))
 }
-
 
 #[async_trait]
 pub(super) trait RetirementProvider: Send + Sync {
@@ -962,6 +1012,7 @@ mod tests {
     struct VersionedReleaseStore {
         objects: MemoryStore,
         versions: parking_lot::Mutex<BTreeMap<ObjectKey, String>>,
+        addresses: bool,
     }
 
     impl VersionedReleaseStore {
@@ -976,6 +1027,13 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for VersionedReleaseStore {
+        fn s3_publication_address(&self, key: &ObjectKey) -> Option<(S3ObjectNamespace, String)> {
+            self.addresses.then(|| {
+                let version = self.version(key);
+                (version.namespace, version.key)
+            })
+        }
+
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::object_store::StoredObject> {
             self.objects.head(key).await
         }
@@ -1166,6 +1224,53 @@ mod tests {
         reap(directory.as_ref(), bucket.as_ref(), &inventory, &current, None, None).await.unwrap();
         assert!(bucket.list(Some(&markers)).await.unwrap().is_empty());
         assert!(directory.lineage_state(&record.lineage).await.unwrap().retirement().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fork_pack_edge_withdraws_only_after_its_exact_replacement_contains_the_release() {
+        let directory = MemoryDirectory::new();
+        let bucket: crate::reference::Bucket = std::sync::Arc::new(VersionedReleaseStore {
+            addresses: true, ..Default::default()
+        });
+        let mut parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        parent.lifecycle = Lifecycle::Live;
+        let parent = directory.create_deployment(parent).await.unwrap();
+        let mut child = DeploymentRecord::new("preview", &parent.org, vec![], 0);
+        child.lineage.clone_from(&parent.lineage);
+        child.parent = Some(parent.id.clone());
+        child.lifecycle = Lifecycle::Live;
+        let child = directory.create_deployment(child).await.unwrap();
+        let root = crate::archive::checkpoint_storage_root().unwrap();
+        let source_root = format!("{}/{root}", parent.storage_prefix());
+        let child_root = format!("{}/{root}", child.storage_prefix());
+        let member = ObjectKey::new("tables/orders/blocks/b00.binpb").unwrap();
+        let name = "~packs/b00.pack".to_owned();
+        let source = ObjectKey::new(format!("{source_root}/{name}")).unwrap();
+        let target = ObjectKey::new(format!("{child_root}/{name}")).unwrap();
+        let (pack, _) = crate::packing::encode_pack(
+            &BTreeMap::from([(member.to_string(), Bytes::from_static(b"member"))]), vec![], 0,
+        );
+        bucket.put(&source, pack.clone()).await.unwrap();
+        let original = bucket.retirement_publication(&source).await.unwrap().unwrap();
+        Base {
+            objects: BTreeMap::from([(name.clone(), source_root)]),
+            publications: BTreeMap::from([(name.clone(), original)]),
+        }.initialize(bucket.as_ref(), &child_root).await.unwrap();
+
+        let store = std::sync::Arc::new(crate::reference::PrefixedStore::new(bucket.clone(), &child_root));
+        let garbage = super::super::GarbageStore::open_with_clock(store, std::sync::Arc::new(|| 0)).await.unwrap();
+        garbage.write_release(&ObjectKey::new("tables/orders/blocks/b01.binpb").unwrap(), None, None).await.unwrap();
+        bucket.put(&target, pack).await.unwrap();
+        let task = rtdb_directory::HostedTask::new("arn:aws:ecs:us-east-1:000000000000:cluster/cell",
+            "arn:aws:ecs:us-east-1:000000000000:task/cell/00000000000000000000000000000001").unwrap();
+        withdraw_inherited_release(directory.as_ref(), bucket.as_ref(), &child, &task).await.unwrap();
+        assert!(Base::load(bucket.as_ref(), &child_root).await.unwrap().objects.contains_key(&name));
+
+        garbage.write_release(&member, None, None).await.unwrap();
+        withdraw_inherited_release(directory.as_ref(), bucket.as_ref(), &child, &task).await.unwrap();
+        assert!(Base::load(bucket.as_ref(), &child_root).await.unwrap().objects.is_empty());
+        assert!(bucket.head(&source).await.is_ok());
+        assert!(bucket.head(&target).await.is_ok());
     }
 
     #[tokio::test]

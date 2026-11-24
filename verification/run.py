@@ -12,7 +12,7 @@ import subprocess
 import tarfile
 import tempfile
 
-from residence_trace import project, verify_joined, verify_native
+from residence_trace import FORK_EDGE, FORK_INVENTORY, REPAIR_INVENTORY, project, verify_joined, verify_native
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -3281,6 +3281,22 @@ RESIDENCE_AUTHORITY_CONTROLS = (
 RESIDENCE_AUTHORITY_CASES = (
     ("ResidenceComposition", "residence-authorities",
      ("ExtendAuthorities = FALSE", "ExtendAuthorities = TRUE"), None),
+    ("ResidenceComposition", "residence-reachability",
+     ("SPECIFICATION Spec", "SPECIFICATION ReachabilitySpec"), None),
+    ("ResidenceComposition", "residence-detached-progress",
+     ("SPECIFICATION Spec\nCONSTANT Mutation = \"none\"\nCONSTANT ExtendAuthorities = FALSE\nINVARIANT Safe",
+      "SPECIFICATION ReachabilitySpec\nCONSTANT Mutation = \"none\"\nCONSTANT ExtendAuthorities = TRUE\n"
+      "INVARIANT NeverSettlesBodyAcrossHoldAndMissingJournal"), "NeverSettlesBodyAcrossHoldAndMissingJournal"),
+    *(("ResidenceComposition", f"residence-{mutation.replace('_', '-')}",
+       ('SPECIFICATION Spec\nCONSTANT Mutation = "none"\nCONSTANT ExtendAuthorities = FALSE\nINVARIANT Safe',
+        f'SPECIFICATION ReachabilitySpec\nCONSTANT Mutation = "{mutation}"\nCONSTANT ExtendAuthorities = TRUE\n'
+        f'INVARIANT {invariant}'), invariant)
+      for mutation, invariant in (
+          ("reopen_body_dependency", "ClosedBodyDependencies"),
+          ("grant_held_body", "BodyGrantExcludesRecovery"),
+          ("fork_before_inventory", "PublishedForkHasInventory"),
+          ("replay_unverified_primary", "RepairUsedVerifiedInventory"),
+      )),
     *(("ResidenceComposition", f"residence-{mutation.replace('_', '-')}",
        ('Mutation = "none"\nCONSTANT ExtendAuthorities = FALSE\nINVARIANT Safe',
         f'Mutation = "{mutation}"\nCONSTANT ExtendAuthorities = TRUE\nINVARIANT {invariant}'), invariant)
@@ -3432,6 +3448,11 @@ def verify_composed_residence_trace(args, scratch):
         "retained-catalog": ("advance-floor", "drain-provider-read"),
         "retained-suffix": ("trim", "finish-recovery"),
         "uncopied-fork": ("erase-residence", "copy-fork"),
+        "detached-body-still-reading": ("grant-detached-body", "drain-body-read"),
+        "detached-body-key-still-live": ("remove-detached-body", "withdraw-body-key"),
+        "fork-inventory-unverified": ("publish-fork", "verify-fork-inventory"),
+        "fork-edge-not-replaced": ("withdraw-fork-edge", "verify-fork-replacement"),
+        "unverified-primary": ("replay-repair-inventory", "verify-repair-inventory"),
     }
     for name, (first, second) in swaps.items():
         left, right = positions[first], positions[second]
@@ -3448,12 +3469,21 @@ def verify_composed_residence_trace(args, scratch):
         "stale-loglet": ("capture-fresh", 3, 0),
         "revoked-cache": ("read-old-cache", 4, "page"),
         "wrong-retirement": ("remove-version", 2, "new"),
+        "detached-publication-replaced": ("remove-detached-body", 2, "other"),
+        "incomplete-fork": ("verify-fork-inventory", 2, "subset"),
+        "substituted-primary": ("verify-repair-inventory", 2, "other"),
     }
     for name, (kind, field, value) in replacements.items():
         altered = [event.copy() for event in events]
         index = positions[kind]
         altered[index][field] = value
         check_residence_trace(args, scratch, f"tlc-residence-authorities-{name}", altered, index, extended=True)
+
+    live_upload = [event.copy() for event in events]
+    upload = positions["finish-body-upload"]
+    grant = positions["grant-detached-body"]
+    live_upload[upload:grant + 1] = [events[positions["drain-body-read"]], events[grant], events[upload]]
+    check_residence_trace(args, scratch, "tlc-residence-detached-upload", live_upload, upload + 1, extended=True)
 
     late_write = [event.copy() for event in events]
     index = positions["refuse-transport-answer"]
@@ -4069,6 +4099,43 @@ def verify_checkpoint_table_manifest_replay(args, source):
     print("rust-table-manifest: both replays passed and three manifest controls failed")
 
 
+def capture_inventory_replay(args, source, label, command, test, env, wanted):
+    with tempfile.TemporaryDirectory(prefix="rtdb-inventory-replay-") as temporary:
+        path = Path(temporary) / "inventory.jsonl"
+        result = run_case(command, source / "rust", args.evidence, label, env | {"RTDB_RESIDENCE_TRACE_PATH": str(path)})
+        if result.returncode or f"{test} ... ok" not in result.stdout:
+            raise ValueError(f"{label}: native fixture did not complete")
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        shutil.copyfile(path, args.evidence / f"{label}.jsonl")
+    captures = [[event for event in events if event["event"] == kind] for kind in wanted]
+    verify_joined([[event for event in events if event["event"] in wanted]])
+    verify_joined(captures)
+    return captures
+
+
+def reject_inventory_replay(label, captures, message):
+    try:
+        verify_joined(captures)
+    except ValueError as error:
+        if message not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: expected rejection for {message}")
+
+
+def capture_retained_inventory(args, source, label, command, test, env):
+    import copy
+
+    captures = capture_inventory_replay(args, source, label, command, test, env, sorted(REPAIR_INVENTORY))
+    repaired = copy.deepcopy(captures)
+    event = next(event for capture in repaired for event in capture if event["event"] == "repair-inventory-verified")
+    event["inventory"][0] ^= 1
+    event["observed_inventory"][0] ^= 1
+    reject_inventory_replay(label, repaired, "repair verification lacks its durable enrollment")
+    reject_inventory_replay(label, [capture for capture in captures if capture[0]["event"] != "repair-inventory-verified"],
+                            "repair replay lacks its verified staged inventory")
+
+
 def verify_retained_repair(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -4076,14 +4143,12 @@ def verify_retained_repair(args, source):
     }
     test = "an_installed_repair_base_keeps_older_targets_and_offloaded_replay_through_collection"
     command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
-    baseline = run_case(command, source / "rust", args.evidence, "rust-retained-repair-baseline", env)
-    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
-        raise ValueError("the retained repair replay did not pass")
+    capture_retained_inventory(args, source, "rust-retained-repair-baseline", command, test, env)
     guard = source / "rust/crates/replication/src/repair.rs"
     original = guard.read_bytes()
     try:
-        replace_once(guard, "if !repair_decision::matches_retained_boundary(retained_boundary, after.0) {",
-                     "if false && !repair_decision::matches_retained_boundary(retained_boundary, after.0) {")
+        replace_once(guard, "if !repair_decision::matches_retained_boundary(retained_anchor.map(|anchor| anchor.boundary.0), after.0) {",
+                     "if false && !repair_decision::matches_retained_boundary(retained_anchor.map(|anchor| anchor.boundary.0), after.0) {")
         weakened = run_case(command, source / "rust", args.evidence, "rust-retained-repair-ignore-boundary", env)
     finally:
         guard.write_bytes(original)
@@ -4100,14 +4165,12 @@ def verify_replayed_reset(args, source):
     }
     test = "retained_reset_recovers_compacted_base_and_missing_l0_suffix_in_place"
     command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
-    baseline = run_case(command, source / "rust", args.evidence, "rust-replayed-reset-baseline", env)
-    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
-        raise ValueError("the retained-base reset did not pass")
+    capture_retained_inventory(args, source, "rust-replayed-reset-baseline", command, test, env)
     path = source / "rust/crates/replication/src/repair.rs"
     original = path.read_bytes()
     try:
-        replace_once(path, "for entry in self.view.table_catalog().entries() {",
-                     "for entry in self.view.table_catalog().entries().take(0) {")
+        replace_once(path, "for entry in self.tables.entries() {",
+                     "for entry in self.tables.entries().take(0) {")
         weakened = run_case(command, source / "rust", args.evidence, "rust-replayed-reset-unpublished-files", env)
     finally:
         path.write_bytes(original)
@@ -5097,6 +5160,7 @@ def verify_native_recovery_trace(args, source):
     validate_recovery_revisions(args, label, trace)
     verify_native_payload_replay(args, source)
     verify_native_detached_deletion(args, source)
+    verify_native_fork_inventories(args, source)
 
 
 def verify_native_payload_replay(args, source):
@@ -5177,7 +5241,12 @@ def verify_native_detached_deletion(args, source):
     if not required.issubset(kinds) or "apply-trim" in kinds:
         raise ValueError(f"{label}: expected a complete settlement without a physical trim")
 
-    broker_kinds = {"retirement-recovery-dependency", "withdraw-detached-key"}
+    fence = next(event for event in events if event["event"] == "detached-recovery-fence")
+    grant = next(event for event in events if event["event"] == "retirement-recovery-dependency")
+    if not any(journal not in fence["active_journals"] for journal in fence["known_journals"]) \
+            or [0, 0] not in grant["requires"]:
+        raise ValueError(f"{label}: settlement did not exercise independent reachability")
+    broker_kinds = {"admit-recovery", "retirement-recovery-dependency", "withdraw-detached-key"}
     directory = [event for event in events if event["event"] not in broker_kinds | {"remove-version"}]
     broker = [event for event in events if event["event"] in broker_kinds]
     provider = [event for event in events if event["event"] == "remove-version"]
@@ -5188,12 +5257,22 @@ def verify_native_detached_deletion(args, source):
     held = copy.deepcopy(broker)
     position = next(event["position"] for event in held if event["event"] == "retirement-recovery-dependency")
     next(event for event in held if event["event"] == "retirement-recovery-dependency")["requires"] = [[position, position]]
+    uploading = copy.deepcopy(broker)
+    upload_grant = next(event for event in uploading if event["event"] == "retirement-recovery-dependency")
+    upload_grant["uploads"] = [upload_grant["key"]]
     wrong_checkpoint = copy.deepcopy(broker)
     next(event for event in wrong_checkpoint if event["event"] == "retirement-recovery-dependency")["decision"][0] ^= 1
+    skipped_frame = copy.deepcopy(directory)
+    next(event for event in skipped_frame if event["event"] == "detached-recovery-fence")["frames"].pop(0)
+    stale_origin = copy.deepcopy(broker)
+    next(event for event in stale_origin if event["event"] == "admit-recovery")["source_hold"]["hold"] = "new"
     controls = (
+        (skipped_frame, broker, provider, "detached census skips a certified frame"),
+        (directory, stale_origin, provider, "broker admission reopened a closed recovery dependency"),
         ([event for event in directory if event["event"] != "detached-recovery-fence"], broker, provider,
          "dependent retirement lacks its exact installed census"),
         (directory, held, provider, "detached retirement intersects a live read or upload"),
+        (directory, uploading, provider, "detached retirement intersects a live read or upload"),
         (directory, wrong_checkpoint, provider, "detached retirement lacks its exact certified replacement checkpoint"),
         (directory, broker, replacement, "detached provider removal lacks its exact grant"),
     )
@@ -5205,6 +5284,39 @@ def verify_native_detached_deletion(args, source):
                 raise
         else:
             raise ValueError(f"{label}: expected rejection for {message}")
+
+
+def verify_native_fork_inventories(args, source):
+    import copy
+
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    for kind, test in (
+        ("copy", "a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_its_source"),
+        ("reference", "a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_nothing_readable"),
+    ):
+        label = f"rust-fork-inventory-{kind}"
+        command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell", test, "--", "--exact"]
+        captures = capture_inventory_replay(args, source, label, command, test, env, sorted(FORK_INVENTORY))
+        incomplete = copy.deepcopy(captures)
+        verified = next(event for capture in incomplete for event in capture if event["event"] == "fork-inventory-verified")
+        if verified["kind"] != kind or verified["inventory"]["members"] == 0:
+            raise ValueError(f"{label}: did not exercise the selected fork inventory")
+        verified["inventory"]["members"] -= 1
+        reject_inventory_replay(label, incomplete, "fork destination differs from its selected source inventory")
+        reject_inventory_replay(label, [capture for capture in captures if capture[0]["event"] != "fork-inventory-verified"],
+                                "fork publication lacks its verified inventory")
+
+    label = "rust-fork-pack-edge"
+    test = "store::exact_retirement::tests::a_fork_pack_edge_withdraws_only_after_its_exact_replacement_contains_the_release"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", test, "--", "--exact"]
+    captures = capture_inventory_replay(args, source, label, command, test, env, sorted(FORK_EDGE))
+    wrong_member = copy.deepcopy(captures)
+    edge = next(event for capture in wrong_member for event in capture if event["event"] == "fork-replacement-verified")
+    edge["pack_member"]["key"] = "other"
+    reject_inventory_replay(label, wrong_member, "fork replacement lacks the released pack member")
 
 
 def capture_native_recovery(args, source, label, trace, observations):

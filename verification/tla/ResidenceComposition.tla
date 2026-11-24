@@ -34,7 +34,7 @@ VARIABLES
     fork,
     \* @type: Bool;
     stalePublication,
-    \* @type: {systemTime: Int, rawTime: Int, receiptClock: Int, clockRegressed: Bool, mode: Str, requestedTime: Int, decision: Str, retained: Bool, redemption: Str, redemptionBody: Str, redemptionExpired: Bool, namingEpoch: Int, loglet: Int, indexFor: Int, indexThrough: Int, captured: Int, captureLoglet: Int, confirmed: Int, erasure: Str, cacheResult: Str, certified: Int, publications: Set(Int), acknowledged: Int, activationFloor: Int, recoveryFence: Int, deletion: Str, delivery: {state: Str, time: Int, deadline: Int, lastWrite: Int}};
+    \* @type: {systemTime: Int, rawTime: Int, receiptClock: Int, clockRegressed: Bool, mode: Str, requestedTime: Int, decision: Str, retained: Bool, redemption: Str, redemptionBody: Str, redemptionExpired: Bool, namingEpoch: Int, loglet: Int, indexFor: Int, indexThrough: Int, captured: Int, captureLoglet: Int, confirmed: Int, erasure: Str, cacheResult: Str, certified: Int, publications: Set(Int), acknowledged: Int, activationFloor: Int, recoveryFence: Int, deletion: Str, delivery: {state: Str, time: Int, deadline: Int, lastWrite: Int}, reach: {holds: Set(Int), coverage: Set(Int), oldHolds: Set(Int), releasedHolds: Set(Int), bodyRead: Bool, upload: Bool, historicalJournal: Bool, body: Str, forkCut: Int, forkInventory: Str, repair: Str}};
     authority
 
 vars == <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
@@ -62,6 +62,8 @@ AuthorityInit ==
      captured |-> None, captureLoglet |-> None, confirmed |-> None, erasure |-> "open", cacheResult |-> "",
      certified |-> None, publications |-> {}, acknowledged |-> None, activationFloor |-> 0,
      recoveryFence |-> 0, deletion |-> "",
+     reach |-> [holds |-> {}, coverage |-> {}, oldHolds |-> {}, releasedHolds |-> {}, bodyRead |-> FALSE, upload |-> FALSE,
+                 historicalJournal |-> TRUE, body |-> "", forkCut |-> None, forkInventory |-> "", repair |-> ""],
      delivery |-> [state |-> "", time |-> 0, deadline |-> None, lastWrite |-> None]]
 
 Init ==
@@ -121,6 +123,7 @@ FinishRecovery ==
 Trim ==
     /\ Open /\ firstRecord = 1 /\ checkpoint = 1
     /\ (recovery # 0 \/ Mutation = "trim_ignores_recovery")
+    /\ 1 \notin authority.reach.holds
     /\ (~ExtendAuthorities \/ authority.recoveryFence = 1 \/ Mutation = "trim_without_fence")
     /\ firstRecord' = 2
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery,
@@ -141,6 +144,7 @@ PrepareFork ==
 
 PublishFork ==
     /\ prepared # None /\ fork = None
+    /\ (authority.reach.forkInventory # "selected" \/ Mutation = "fork_before_inventory")
     /\ (phase = "serving" \/ (Mutation = "publish_after_close" /\ phase = "disposing"))
     /\ fork' = prepared /\ prepared' = None /\ stalePublication' = (phase # "serving")
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery, firstRecord, phase, source, forkCopy>>
@@ -354,6 +358,117 @@ ReadOldCachedPage(answer) ==
     /\ authority' = [authority EXCEPT !.cacheResult = answer]
     /\ UNCHANGED vars
 
+Reach == authority.reach
+ReplicaPositions == {1, 2}
+BodyPosition == 2
+
+HoldReplica(position) ==
+    /\ position \in ReplicaPositions \ Reach.holds
+    /\ (position \notin Reach.coverage \/ Mutation = "reopen_body_dependency")
+    /\ authority' = [authority EXCEPT !.reach.holds = @ \cup {position}]
+    /\ UNCHANGED vars
+
+ReleaseReplica(position) ==
+    /\ position \in Reach.holds
+    /\ authority' = [authority EXCEPT !.reach.holds = @ \ {position},
+                     !.reach.releasedHolds = @ \cup ({position} \cap Reach.coverage)]
+    /\ UNCHANGED vars
+
+LoseHistoricalJournal ==
+    /\ Reach.historicalJournal /\ Reach.coverage = {}
+    /\ authority' = [authority EXCEPT !.reach.historicalJournal = FALSE]
+    /\ UNCHANGED vars
+
+InstallBodyCensus ==
+    /\ checkpoint = 1 /\ DecisionVisible /\ Reach.coverage = {}
+    /\ authority' = [authority EXCEPT !.reach.coverage = ReplicaPositions,
+                     !.reach.oldHolds = Reach.holds, !.reach.body = "candidate"]
+    /\ UNCHANGED vars
+
+RedeemBodyHold ==
+    /\ Reach.body = "candidate" /\ ~Reach.bodyRead
+    /\ BodyPosition \in (Reach.holds \cap Reach.oldHolds)
+    /\ authority' = [authority EXCEPT !.reach.bodyRead = TRUE]
+    /\ UNCHANGED vars
+
+DrainBodyRead ==
+    /\ Reach.bodyRead
+    /\ authority' = [authority EXCEPT !.reach.bodyRead = FALSE]
+    /\ UNCHANGED vars
+
+BeginBodyUpload ==
+    /\ Reach.coverage = {} /\ ~Reach.upload
+    /\ authority' = [authority EXCEPT !.reach.upload = TRUE]
+    /\ UNCHANGED vars
+
+FinishBodyUpload ==
+    /\ Reach.upload
+    /\ authority' = [authority EXCEPT !.reach.upload = FALSE]
+    /\ UNCHANGED vars
+
+GrantBody(publication) ==
+    /\ Reach.body = "candidate" /\ publication = "detached"
+    /\ (BodyPosition \notin Reach.holds /\ ~Reach.bodyRead /\ ~Reach.upload \/ Mutation = "grant_held_body")
+    /\ authority' = [authority EXCEPT !.reach.body = "granted"]
+    /\ UNCHANGED vars
+
+DetachedEffect(publication, before, after) ==
+    /\ publication = "detached" /\ Reach.body = before
+    /\ authority' = [authority EXCEPT !.reach.body = after]
+    /\ UNCHANGED vars
+
+SelectForkInventory(cut) ==
+    /\ prepared = cut /\ cut # None /\ Reach.forkInventory = ""
+    /\ authority' = [authority EXCEPT !.reach.forkCut = cut, !.reach.forkInventory = "selected"]
+    /\ UNCHANGED vars
+
+VerifyForkInventory(cut, inventory) ==
+    /\ prepared = cut /\ Reach.forkCut = cut /\ Reach.forkInventory = "selected"
+    /\ inventory = "closure"
+    /\ authority' = [authority EXCEPT !.reach.forkInventory = "verified"]
+    /\ UNCHANGED vars
+
+VerifyForkReplacement(member) ==
+    /\ fork = Reach.forkCut /\ fork # None /\ Reach.forkInventory = "verified"
+    /\ member = "pack-member"
+    /\ authority' = [authority EXCEPT !.reach.forkInventory = "replaced"]
+    /\ UNCHANGED vars
+
+WithdrawForkEdge(member) ==
+    /\ Reach.forkInventory = "replaced" /\ member = "pack-member"
+    /\ authority' = [authority EXCEPT !.reach.forkInventory = "withdrawn"]
+    /\ UNCHANGED vars
+
+EnrollRepairInventory ==
+    /\ Reach.repair = ""
+    /\ authority' = [authority EXCEPT !.reach.repair = "enrolled"]
+    /\ UNCHANGED vars
+
+VerifyRepairInventory(inventory) ==
+    /\ checkpoint = 1 /\ Reach.repair = "enrolled" /\ inventory = "primary"
+    /\ authority' = [authority EXCEPT !.reach.repair = "verified"]
+    /\ UNCHANGED vars
+
+ReplayRepairInventory ==
+    /\ (Reach.repair = "verified" \/ (Mutation = "replay_unverified_primary" /\ Reach.repair = "enrolled"))
+    /\ authority' = [authority EXCEPT !.reach.repair = IF Reach.repair = "verified" THEN "replayed" ELSE "unverified"]
+    /\ UNCHANGED vars
+
+ReachabilityNext ==
+    \/ \E pos \in ReplicaPositions : HoldReplica(pos) \/ ReleaseReplica(pos)
+    \/ LoseHistoricalJournal \/ InstallBodyCensus \/ RedeemBodyHold \/ DrainBodyRead
+    \/ BeginBodyUpload \/ FinishBodyUpload \/ GrantBody("detached")
+    \/ DetachedEffect("detached", "granted", "key-withdrawn")
+    \/ DetachedEffect("detached", "key-withdrawn", "removed")
+    \/ DetachedEffect("detached", "removed", "settled")
+    \/ \E cut \in 0..1 : SelectForkInventory(cut) \/ VerifyForkInventory(cut, "closure")
+    \/ VerifyForkReplacement("pack-member") \/ WithdrawForkEdge("pack-member")
+    \/ EnrollRepairInventory \/ VerifyRepairInventory("primary") \/ ReplayRepairInventory
+
+ReachabilitySpec == Init /\ [][ReachabilityNext \/ Install
+    \/ ((PublishCheckpoint \/ PrepareFork \/ (PublishFork /\ Reach.forkInventory # "")) /\ UNCHANGED authority)
+    \/ CertifyDecision(1) \/ PublishDecision(1, 1) \/ PublishDecision(2, 1)]_allVars
+
 AuthorityNext ==
     \/ \E mode \in {"ordinary", "external"}, requested \in {1, 3}, observed \in {2},
           decision \in {"accepted", "refused"} : AppendAttempt(mode, requested, observed, decision)
@@ -396,6 +511,18 @@ RevokedCacheClosed == authority.cacheResult # "page"
 OnlyLiveTransportWrites == authority.delivery.lastWrite # None =>
     authority.delivery.lastWrite < authority.delivery.deadline
 
+ClosedBodyDependencies ==
+    /\ (Reach.holds \cap Reach.coverage) \subseteq Reach.oldHolds
+    /\ Reach.holds \cap Reach.releasedHolds = {}
+BodyGrantExcludesRecovery == Reach.body \in {"granted", "key-withdrawn", "removed", "settled"} =>
+    BodyPosition \in Reach.coverage /\ BodyPosition \notin Reach.holds /\ ~Reach.bodyRead /\ ~Reach.upload
+PublishedForkHasInventory == fork # None => Reach.forkInventory # "selected"
+RepairUsedVerifiedInventory == Reach.repair # "unverified"
+ReachabilitySafe == ClosedBodyDependencies /\ BodyGrantExcludesRecovery
+                    /\ PublishedForkHasInventory /\ RepairUsedVerifiedInventory
+NeverSettlesBodyAcrossHoldAndMissingJournal == ~(Reach.body = "settled" /\ 1 \in Reach.holds
+    /\ ~Reach.historicalJournal /\ firstRecord = 1)
+
 FloorKeepsHeldCatalogs == ExtendAuthorities => \A cut \in HeldCatalogs : cut >= floor
 RetainedCutsReadable == \A cut \in ServingDependencies : Needs(cut) \subseteq source
 ReplaySurvivesTrim == Open => firstRecord <= checkpoint + 1 /\ (recovery = None \/ firstRecord <= recovery + 1)
@@ -409,7 +536,7 @@ Safe == FloorKeepsHeldCatalogs /\ RetainedCutsReadable /\ ReplaySurvivesTrim /\ 
         /\ BoundedAppend /\ ExternalClamp /\ DistinctNamingEpoch /\ ReceiptExpiry /\ ReceiptReplay
         /\ FreshCapture /\ AcknowledgedClosure /\ ErasureHasSuccessor /\ RevokedCacheClosed
         /\ AcknowledgedDecision /\ FreshIndexHasPublication /\ DecisionSurvivesActivation
-        /\ RecoveryFenceProtectsDeletion /\ OnlyLiveTransportWrites
+        /\ RecoveryFenceProtectsDeletion /\ OnlyLiveTransportWrites /\ ReachabilitySafe
 
 NeverDisposesAfterTrimAndForkCopy ==
     ~(phase = "disposed" /\ head = 1 /\ firstRecord = 2 /\ fork = 1 /\ forkCopy = Needs(1))

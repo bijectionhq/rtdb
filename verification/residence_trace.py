@@ -157,6 +157,31 @@ def detached_fence(event):
             start, through, tuple(event["anchor"]))
 
 
+def detached_census(event):
+    first, through = event["interval"]
+    start, end = event["batch"]
+    previous = event["previous"]
+    require(first <= start <= end == through and digest(event["batch_digest"]) and digest(event["decision"])
+            and event["active_journals"], "detached census lacks its certified batch")
+    if previous is None:
+        require(start == first, "detached census skips the start of its recovery history")
+    else:
+        require(previous["interval"] == [first, start - 1] and digest(previous["digest"])
+                and previous["root_incarnation"] == event["root_incarnation"],
+                "detached census does not extend its preceding anchor")
+    require(len(event["frames"]) == end - start + 1 and all(
+        unit["position"] == position and digest(unit["frame"])
+        for position, unit in enumerate(event["frames"], start)), "detached census skips a certified frame")
+    discovered = {item["position"]: detached_candidate(item, event["residence"]) for item in event["discovered"]}
+    require(len(discovered) == len(event["discovered"]) and all(
+        start <= position <= end and tuple(event["frames"][position - start]["frame"]) == candidate[-1]
+        for position, candidate in discovered.items()), "detached discovery differs from its certified frame")
+    holds = {item["hold"]: item["interval"] for item in event["holds"]}
+    require(len(holds) == len(event["holds"]) and all(first <= last for first, last in holds.values()),
+            "detached census has an invalid originating hold")
+    return holds
+
+
 def detached_attempt(event):
     require(event["retirement"] and event["revision"] > 0, "detached effect lacks its durable grant")
     return (*replica_scope(event), *scope(event, ("lineage", "residence", "generation", "retirement")),
@@ -169,7 +194,139 @@ def detached_checkpoint(event):
                                    "root": checkpoint["root_sha256"]}, event["manifest"])
 
 
-def verify_native(events, *, verify_catalog_history=True, verify_certificate_history=True):
+FORK_INVENTORY = {"fork-source-inventory", "fork-inventory-verified", "fork-directory-published"}
+FORK_EDGE = {"fork-edge-selected", "fork-replacement-verified", "fork-edge-withdrawn"}
+REPAIR_INVENTORY = {"repair-inventory-enrolled", "repair-inventory-verified", "repair-replayed"}
+
+
+def fork_inventory(event):
+    checkpoint = event["checkpoint"]
+    identity = scope(event, ("lineage", "parent", "child", "source_incarnation", "child_incarnation",
+                             "source_epoch", "child_epoch", "source_residence", "child_residence"))
+    require(all(identity[index] for index in (0, 1, 2, 7, 8)) and identity[1] != identity[2]
+            and identity[7] != identity[8] and checkpoint["block"] >= 0 and digest(checkpoint["root_sha256"]),
+            "fork inventory lacks its exact history and checkpoint")
+    return (*identity, json.dumps(checkpoint, sort_keys=True))
+
+
+def fork_publication(publication, path):
+    require(len(publication) == 1, "fork edge has no exact provider publication")
+    kind, record = next(iter(publication.items()))
+    key = unquote(record["key"])
+    require(record["namespace"]["bucket"] and (key == path or key.endswith("/" + path))
+            and ((kind == "version" and record["version"]) or
+                 (kind == "terminal" and record["allocation"] and record["etag"])),
+            "fork edge names another provider publication")
+    return json.dumps(publication, sort_keys=True)
+
+
+def repair_anchor(event):
+    require(event["residence"] and event["anchor_block"] >= 0 and event["anchor_boundary"] >= 0
+            and digest(event["anchor_root"]) and digest(event["inventory"])
+            and event["inventory"] == event["observed_inventory"], "repair inventory differs from its enrolled primary")
+    return (*scope(event, ("residence", "anchor_block", "anchor_boundary")),
+            tuple(event["anchor_root"]), tuple(event["inventory"]))
+
+
+def verify_inventory_shape(event):
+    kind = event["event"]
+    if kind in FORK_INVENTORY:
+        fork_inventory(event)
+        if kind == "fork-directory-published":
+            require(event["revision"] > 0, "fork publication has no directory revision")
+            return
+        inventory = event["inventory"]
+        require(event["kind"] in {"copy", "reference"} and inventory["members"] >= 0 and digest(inventory["sha256"]),
+                "fork has no complete inventory observation")
+        require(event["kind"] == "reference" or not event["edges"], "independent fork inherits a physical edge")
+        for edge in event["edges"]:
+            fork_publication(edge["publication"], edge["owner"] + "/" + edge["name"])
+    elif kind in FORK_EDGE:
+        require(event["lineage"] and event["child"] and event["attempt"] and event["base_sequence"] >= 0
+                and event["source_residence"] != event["child_residence"], "fork edge lacks its selected manifest")
+        fork_publication(event["original"], event["source_residence"] + "/" + event["name"])
+        if kind != "fork-edge-selected":
+            fork_publication(event["replacement"], event["child_residence"] + "/" + event["name"])
+            require(event["extent"] >= 0 and digest(event["sha256"]), "fork replacement lacks the compared bytes")
+            member = event["pack_member"]
+            if event["name"] != event["released"]:
+                require(event["name"].startswith("~packs/") and member is not None and member["key"] == event["released"],
+                        "fork replacement lacks the released pack member")
+                offset, length = scope(member["range"], ("offset", "length"))
+                require(0 <= offset <= offset + length <= event["extent"], "fork pack member exceeds the compared bytes")
+            else:
+                require(member is None, "loose fork edge masquerades as a pack member")
+            if kind == "fork-edge-withdrawn":
+                require(event["sequence"] > event["base_sequence"], "fork withdrawal lacks the new reference manifest")
+    else:
+        repair_anchor(event)
+        target = event["target"]
+        if kind == "repair-inventory-enrolled":
+            require(target is None, "repair enrollment names a replay target")
+        else:
+            require(target["invocation"] and target["block"] > event["anchor_block"] and
+                    target["boundary"] > event["anchor_boundary"] and digest(target["root"]),
+                    "repair replay lacks its exact advancing target")
+
+
+def verify_inventory_joins(captures):
+    sources, destinations, selections, replacements, enrolled, staged = {}, {}, {}, {}, {}, {}
+    effects = []
+    for capture, events in enumerate(captures):
+        for index, event in enumerate(events):
+            kind = event["event"]
+            where = (capture, index)
+            if kind == "fork-source-inventory":
+                sources[fork_inventory(event)] = (event, where)
+            elif kind == "fork-inventory-verified":
+                destinations[fork_inventory(event)] = (event, where)
+            elif kind == "fork-edge-selected":
+                selections[event["attempt"]] = (event, where)
+            elif kind == "fork-replacement-verified":
+                replacements[event["attempt"]] = (event, where)
+            elif kind == "repair-inventory-enrolled":
+                enrolled.setdefault(repair_anchor(event), (event, where))
+            elif kind == "repair-inventory-verified":
+                staged[event["target"]["invocation"]] = (event, where)
+            if kind in FORK_INVENTORY | FORK_EDGE | REPAIR_INVENTORY:
+                effects.append((event, where))
+
+    def prior(observed, where, message):
+        require(observed is not None, message)
+        event, position = observed
+        require(position[0] != where[0] or position[1] < where[1], message)
+        return event
+
+    joined = 0
+    for event, where in effects:
+        kind = event["event"]
+        if kind == "fork-inventory-verified":
+            message = "fork destination differs from its selected source inventory"
+            source = prior(sources.get(fork_inventory(event)), where, message)
+            require(all(source[field] == event[field] for field in ("kind", "inventory", "edges")), message)
+        elif kind == "fork-directory-published":
+            prior(destinations.get(fork_inventory(event)), where, "fork publication lacks its verified inventory")
+        elif kind == "fork-replacement-verified":
+            message = "fork replacement differs from its selected edge"
+            source = prior(selections.get(event["attempt"]), where, message)
+            require(all(event[field] == value for field, value in source.items() if field != "event"), message)
+        elif kind == "fork-edge-withdrawn":
+            message = "fork withdrawal lacks its exact replacement"
+            proof = prior(replacements.get(event["attempt"]), where, message)
+            require(all(event[field] == value for field, value in proof.items() if field != "event"), message)
+        elif kind == "repair-inventory-verified":
+            prior(enrolled.get(repair_anchor(event)), where, "repair verification lacks its durable enrollment")
+        elif kind == "repair-replayed":
+            message = "repair replay lacks its verified staged inventory"
+            proof = prior(staged.get(event["target"]["invocation"]), where, message)
+            require(all(event[field] == value for field, value in proof.items() if field != "event"), message)
+        else:
+            continue
+        joined += 1
+    return joined
+
+
+def verify_native(events, *, verify_catalog_history=True, verify_certificate_history=True, verify_inventory_history=True):
     require(events, "the native trace is empty")
     deletes, trims, catalogs, captures, holds, attempts, reads = {}, set(), {}, {}, {}, {}, set()
     published_decisions, installed_grants, certificates = set(), set(), set()
@@ -199,7 +356,7 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
                 detached_fence(event)
                 require(detached_effect(event) and event["root_incarnation"] == event["incarnation"],
                         "detached fence crosses a recovery history")
-                require(event["candidates"], "detached fence has no recorded publication census")
+                detached_census(event)
                 for candidate in event["candidates"]:
                     detached_candidate(candidate, event["residence"])
                     require(event["interval"][0] <= candidate["position"] <= event["interval"][1],
@@ -301,6 +458,8 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
                         require(holds[event["hold"]] == key, "payload read names another replay scope")
                 elif event["hold"] in holds:
                     require(holds[event["hold"]] == key, "release names another replay scope")
+            elif kind in FORK_INVENTORY | FORK_EDGE | REPAIR_INVENTORY:
+                verify_inventory_shape(event)
             elif kind == "attempt-outcome":
                 require(digest(event["history"]), "attempt lacks its original history")
                 key = (tuple(event["history"]), event["attempt"])
@@ -327,6 +486,8 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
         verify_catalogs(catalogs)
     if verify_certificate_history:
         verify_certified_reads(events)
+    if verify_inventory_history:
+        verify_inventory_joins([events])
 
 
 def replica_scope(event):
@@ -348,11 +509,11 @@ def broker_pointer(event):
 def verify_joined(captures):
     """Join independently captured owner events by immutable identity and authority revision."""
     for events in captures:
-        verify_native(events, verify_catalog_history=False, verify_certificate_history=False)
+        verify_native(events, verify_catalog_history=False, verify_certificate_history=False, verify_inventory_history=False)
     events = [event for capture in captures for event in capture]
     published, published_certified, catalogs, replay_holds, exclusions = {}, {}, {}, {}, {}
     censuses, fences_by_residence, grants, withdrawals, removals = {}, {}, {}, set(), set()
-    certified_pointers = set()
+    certified_pointers, origins, body_grants = set(), {}, {}
     for event in events:
         kind = event["event"]
         if kind == "publish-checkpoint":
@@ -366,7 +527,7 @@ def verify_joined(captures):
         elif kind == "detached-recovery-fence":
             fence = detached_fence(event)
             key = (*replica_scope(event), event["lineage"], event["residence"])
-            fences_by_residence.setdefault(key, []).append((*event["interval"], event["revision"]))
+            fences_by_residence.setdefault(key, []).append(event)
             for candidate in event["candidates"]:
                 entry = (*fence, detached_candidate(candidate, event["residence"]))
                 censuses[entry] = min(event["revision"], censuses.get(entry, event["revision"]))
@@ -376,6 +537,8 @@ def verify_joined(captures):
             key = (*replica_scope(event), event["residence"], event["hold"])
             hold = scope(event, ("first_required", "through", "revision"))
             require(replay_holds.setdefault(key, hold) == hold, "replay hold changed its admitted range")
+            if event.get("source_hold") is not None:
+                require(origins.setdefault(key, event) == event, "broker admission changed its origin")
         elif kind == "retirement-recovery-dependency":
             attempt = detached_attempt(event)
             grant, candidate = attempt[:-2], attempt[-2]
@@ -383,13 +546,47 @@ def verify_joined(captures):
                     "the detached grant changed its sealed frame or publication")
             publication = (*replica_scope(event), event["key"], candidate[1])
             exclusions[publication] = min(event["revision"], exclusions.get(publication, event["revision"]))
+            position = (*replica_scope(event), event["lineage"], event["residence"], event["position"])
+            body_grants[position] = min(event["revision"], body_grants.get(position, event["revision"]))
         elif kind == "withdraw-detached-key":
             withdrawals.add(detached_attempt(event))
         elif kind == "remove-version" and detached_effect(event):
             removals.add(detached_attempt(event))
+    for fences in fences_by_residence.values():
+        discoveries, previous = set(), None
+        fences.sort(key=lambda event: event["revision"])
+        for fence in fences:
+            if previous is not None:
+                require(fence["previous"] == {
+                    "interval": previous["interval"], "digest": previous["anchor"],
+                    "root_incarnation": previous["root_incarnation"],
+                }, "detached census changes its preceding anchor")
+            discoveries.update(detached_candidate(item, fence["residence"]) for item in fence["discovered"])
+            candidates = {detached_candidate(item, fence["residence"]) for item in fence["candidates"]}
+            require(candidates <= discoveries, "detached candidate lacks its exact censused publication")
+            previous = fence
+    for hold, event in origins.items():
+        source = event["source_hold"]
+        source_hold = (*replica_scope(event), source["residence"], source["hold"])
+        first, through, revision = replay_holds[hold]
+        require(event["residence"].rsplit("/", 1)[0] == "replay-bodies/" + source["residence"]
+                and hold != source_hold and source["interval"][0] <= first == through <= source["interval"][1],
+                "broker admission exceeds its originating hold")
+        if source_hold in replay_holds:
+            source_first, source_through, source_revision = replay_holds[source_hold]
+            require([source_first, source_through] == source["interval"] and source_revision < revision,
+                    "broker admission exceeds its originating hold")
+        fence_key = (*replica_scope(event), event["lineage"], event["residence"])
+        require(revision < body_grants.get((*fence_key, first), float("inf")), "broker admission follows the detached grant")
+        closure = next((fence for fence in fences_by_residence.get(fence_key, [])
+                        if fence["revision"] < revision and fence["interval"][0] <= first <= fence["interval"][1]), None)
+        if closure is not None:
+            previous = detached_census(closure).get(source["hold"])
+            require(previous is not None and previous[0] <= first <= previous[1],
+                    "broker admission reopened a closed recovery dependency")
     verify_catalogs(catalogs)
     ordered_fences = {ordered_object_fence(event) for event in events if event["event"] == "ordered-object-fence"}
-    joined = verify_certified_reads(events)
+    joined = verify_certified_reads(events) + verify_inventory_joins(captures)
     attempts = {detached_attempt(event) for event in events if event["event"] == "retirement-recovery-dependency"}
     require(removals <= attempts & withdrawals, "detached provider removal lacks its exact grant and key withdrawal")
     for event in events:
@@ -403,6 +600,8 @@ def verify_joined(captures):
             identity = exact_checkpoint(event, event, event["manifest"])
         elif kind == "detached-recovery-fence":
             identity = detached_checkpoint(event)
+            require(published_certified.get((identity, tuple(event["decision"])), float("inf")) <= event["revision"],
+                    "detached census lacks its exact certified checkpoint")
         elif kind == "retirement-recovery-dependency":
             candidate = detached_candidate(event, event["residence"])
             entry = (*detached_fence(event), candidate)
@@ -433,18 +632,9 @@ def verify_joined(captures):
             if event.get("frame") is not None:
                 require((*broker_pointer(event), event["revision"]) in certified_pointers,
                         "broker read lacks the exact certified pointer")
-            source = event.get("source_hold")
-            if source is not None:
-                require(digest(event["frame"]), "broker read lacks its certified sealed frame")
-                source_hold = (*replica_scope(event), source["residence"], source["hold"])
-                require(source_hold != hold and source_hold in replay_holds, "broker read lacks its originating replay hold")
-                source_first, source_through, source_revision = replay_holds[source_hold]
-                require(source_first <= event["position"] <= source_through and source_revision < revision,
-                        "broker read exceeds its originating replay hold")
-                fence_scope = (*replica_scope(event), event["lineage"], event["residence"])
-                require(all(not first <= event["position"] <= through or source_revision < fence_revision
-                            for first, through, fence_revision in fences_by_residence.get(fence_scope, [])),
-                        "a newly admitted replay hold reopened a recovery dependency")
+            if event.get("frame") is not None:
+                require(hold in origins and origins[hold]["source_hold"] == event.get("source_hold"),
+                        "broker read lacks its originating replay hold")
             if event["publication"] is not None:
                 publication = (*replica_scope(event), event["key"], json.dumps(event["publication"], sort_keys=True))
                 require(publication not in exclusions or event["revision"] < exclusions[publication],
@@ -501,6 +691,23 @@ def project(trace):
             if transport or kind in {"install", "authorize-version", "remove-version", "settle-version", "copy-fork", "erase-residence",
                         "prepare-erasure", "arm-erasure", "revoke-key", "read-old-cache"}:
                 publication = identities[scope(event["publication"], ("key", "version", "epoch"))]
+            if kind in {"install-body-census", "grant-detached-body"}:
+                require(event["recovery_root"] == trace["recovery_root"] and event["decision"] == trace["decision"],
+                        "body census names another committed recovery closure")
+            if kind in {"grant-detached-body", "withdraw-body-key", "remove-detached-body", "settle-detached-body"}:
+                require(event["unit"] == trace["detached_unit"], "detached effect names another publication")
+                publication = "detached"
+            if kind in {"select-fork-inventory", "verify-fork-inventory", "verify-fork-replacement", "withdraw-fork-edge"}:
+                require(event["destination"] == fork, "fork inventory names another residence")
+            if kind in {"select-fork-inventory", "verify-fork-inventory"}:
+                require(event["inventory"] == trace["fork_inventory"], "fork inventory differs from the selected closure")
+                publication = "closure"
+            if kind in {"verify-fork-replacement", "withdraw-fork-edge"}:
+                require(event["pack_member"] == trace["fork_pack_member"], "fork edge names another pack member")
+                publication = "pack-member"
+            if kind in {"enroll-repair-inventory", "verify-repair-inventory", "replay-repair-inventory"}:
+                require(event["inventory"] == trace["repair_inventory"], "repair inventory differs from the enrolled primary")
+                publication = "primary"
             if kind in {"prepare-fork", "publish-fork", "copy-fork"}:
                 require(event["destination"] == fork, "fork observation names a different residence")
             if kind in {"change-loglet", "read-index", "capture-fresh"}:

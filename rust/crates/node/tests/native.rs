@@ -2466,8 +2466,8 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     };
     let anchor_path = objects.join(".tmp/catalog-ledger/repair-anchor");
     let anchor = std::fs::read(&anchor_path).unwrap();
-    let (block, boundary, digest): (i64, i64, [u8; 32]) = serde_json::from_slice(&anchor).unwrap();
-    std::fs::write(&anchor_path, serde_json::to_vec(&(block, boundary + 1, digest)).unwrap()).unwrap();
+    let (block, boundary, digest, inventory): (i64, i64, [u8; 32], [u8; 32]) = serde_json::from_slice(&anchor).unwrap();
+    std::fs::write(&anchor_path, serde_json::to_vec(&(block, boundary + 1, digest, inventory)).unwrap()).unwrap();
     let refusal = repair.rebuild(memory.clone(), &cancellation).await
         .expect_err("a retained base must bind the boundary of the detached export");
     assert_eq!(refusal.message.as_deref(), Some("The retained repair boundary differs from its exported checkpoint"));
