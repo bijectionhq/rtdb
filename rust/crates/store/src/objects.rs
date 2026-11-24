@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use rtdb_crypt::{Context, Generation, Kms, Plaintext};
 use rtdb_format::journal::{Manifest, ObjectId, ObjectKind};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, PhysicalObjectPublication, PhysicalObjectVersion, Result};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -110,6 +110,18 @@ impl PreparedObject {
             .await
             .map_err(Anomaly::from)
     }
+
+    pub async fn put_observed(&self, store: &dyn ObjectStore) -> Result<(usize, Option<PhysicalObjectVersion>)> {
+        let version = match store.put_with_publication(&key(self.id)?, self.bytes.clone()).await? {
+            None => None,
+            Some(PhysicalObjectPublication::Version(version)) => Some(version),
+            Some(PhysicalObjectPublication::Terminal(_)) => {
+                return Err(Anomaly::unsupported("rtdb.store/ranked-publication",
+                    "Ranked catalogue storage requires a matching read-response publication"));
+            }
+        };
+        Ok((self.bytes.len(), version))
+    }
 }
 
 /// A manifest whose ciphertext digest and context were verified on read.
@@ -134,6 +146,17 @@ pub async fn read_file(store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId) -> 
     read(store, kms, id).await
 }
 
+pub async fn read_observed_file(store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId,
+    length: usize, expected_version: Option<&PhysicalObjectVersion>) -> Result<Plaintext> {
+    require_kind(id, ObjectKind::File)?;
+    let observed = store.observe_fresh_exact(&key(id)?, length).await?;
+    if observed.version.as_ref() != expected_version {
+        return Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.store/ranked-publication",
+            "The selected file has a different provider version"));
+    }
+    open(kms, id, &observed.value).await
+}
+
 pub async fn read_manifest(
     store: &dyn ObjectStore,
     kms: &dyn Kms,
@@ -150,14 +173,18 @@ pub async fn read_manifest(
 
 async fn read(store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId) -> Result<Plaintext> {
     let bytes = store.get(&key(id)?).await.map_err(Anomaly::from)?;
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    open(kms, id, &bytes).await
+}
+
+async fn open(kms: &dyn Kms, id: ObjectId, bytes: &[u8]) -> Result<Plaintext> {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
     if id.digest != digest {
         return Err(Anomaly::fault(
             "rtdb.store/object-digest",
             format!("Digest mismatch for object {id}"),
         ));
     }
-    rtdb_crypt::open(kms, id.database, context(id), &bytes).await
+    rtdb_crypt::open(kms, id.database, context(id), bytes).await
 }
 
 pub(super) fn key(id: ObjectId) -> Result<ObjectKey> {

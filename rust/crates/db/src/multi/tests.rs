@@ -84,6 +84,41 @@ fn live(n: u8) -> BTreeSet<IpAddr> {
 }
 
 #[tokio::test]
+async fn ranked_catalog_replays_at_its_exact_cut_and_refuses_a_stale_build() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let first = writer.transact(&put(1, 1, "first")).await.unwrap();
+    let first = rtdb_index::branches::BranchCut { basis: first.basis, system_time: first.system_time };
+    let build = writer.ranked_build().unwrap().unwrap();
+    let memory = rtdb_types::MemoryBudget::new(16 << 20);
+    writer.publish_ranked_catalog(build, vec![1], vec![Bytes::from_static(b"trie")], &memory).await.unwrap();
+
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    follower.fresh_index().await.unwrap();
+    let publication = follower.ranked_publication(first).unwrap();
+    let files = publication.open(&memory).await.unwrap();
+    assert_eq!(files.cut, first);
+    assert_eq!(files.inventory, [1]);
+    assert_eq!(files.files[0].0.as_ref(), b"trie");
+    assert!(writer.ranked_build().unwrap().is_none());
+
+    let second = writer.transact(&put(2, 2, "second")).await.unwrap();
+    let second = rtdb_index::branches::BranchCut { basis: second.basis, system_time: second.system_time };
+    let stale = writer.ranked_build().unwrap().unwrap();
+    writer.transact(&put(3, 3, "third")).await.unwrap();
+    writer.publish_ranked_catalog(stale, vec![2], vec![Bytes::from_static(b"stale")], &memory).await.unwrap();
+    follower.fresh_index().await.unwrap();
+    assert!(follower.ranked_publication(second).is_none());
+    assert!(follower.ranked_publication(first).is_some());
+    assert!(follower.ranked_publication(rtdb_index::branches::BranchCut {
+        system_time: Timestamp(first.system_time.0 + 1), ..first
+    }).is_none());
+}
+
+#[tokio::test]
 async fn assigned_follower_observes_settled_writer_progress_without_admitting_writes() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();

@@ -102,6 +102,14 @@ pub struct Checkpoint {
     pub restore: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RankedCatalog {
+    pub manifest: ObjectId,
+    pub position: u64,
+    pub system_time: i64,
+    pub key_generation: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pin {
     pub id: Uuid,
@@ -120,6 +128,7 @@ pub enum Record {
         objects: Vec<ObjectId>,
     },
     Checkpoint(Checkpoint),
+    RankedCatalog(RankedCatalog),
     Lease {
         until: i64,
     },

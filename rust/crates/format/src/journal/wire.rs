@@ -6,7 +6,7 @@ use super::{ObjectKind, invalid, require_kind};
 
 #[derive(Message)]
 pub(super) struct Record {
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
     kind: Option<Kind>,
 }
 
@@ -34,6 +34,8 @@ enum Kind {
     WriterRelease(Lease),
     #[prost(message, tag = "11")]
     DeploymentRetirement(Lease),
+    #[prost(message, tag = "12")]
+    RankedCatalog(RankedCatalog),
 }
 
 #[derive(Message)]
@@ -54,6 +56,18 @@ struct Checkpoint {
     key_generation: u64,
     #[prost(bool, tag = "4")]
     restore: bool,
+}
+
+#[derive(Message)]
+struct RankedCatalog {
+    #[prost(string, tag = "1")]
+    manifest: String,
+    #[prost(uint64, tag = "2")]
+    position: u64,
+    #[prost(sint64, tag = "3")]
+    system_time: i64,
+    #[prost(uint64, tag = "4")]
+    key_generation: u64,
 }
 
 #[derive(Message)]
@@ -132,6 +146,12 @@ impl TryFrom<&super::Record> for Record {
                 key_generation: checkpoint.key_generation,
                 restore: checkpoint.restore,
             }),
+            RankedCatalog(catalog) => Kind::RankedCatalog(self::RankedCatalog {
+                manifest: require_kind(catalog.manifest, ObjectKind::Manifest)?.to_string(),
+                position: catalog.position,
+                system_time: catalog.system_time,
+                key_generation: catalog.key_generation,
+            }),
             Lease { until } => Kind::Lease(self::Lease { until: *until }),
             Pin(pin) => Kind::Pin(pin.try_into()?),
             Unpin { id } => Kind::Unpin(self::Unpin {
@@ -181,6 +201,12 @@ impl TryFrom<Record> for super::Record {
                     through: checkpoint.through,
                     key_generation: checkpoint.key_generation,
                     restore: checkpoint.restore,
+                }),
+                Kind::RankedCatalog(catalog) => Self::RankedCatalog(super::RankedCatalog {
+                    manifest: require_kind(catalog.manifest.parse()?, ObjectKind::Manifest)?,
+                    position: catalog.position,
+                    system_time: catalog.system_time,
+                    key_generation: catalog.key_generation,
                 }),
                 Kind::Lease(lease) => Self::Lease { until: lease.until },
                 Kind::Pin(pin) => Self::Pin(pin.try_into()?),

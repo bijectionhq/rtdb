@@ -35,6 +35,13 @@ enum Command {
     Transact(Work),
     Workload(workload::Request, Reply<workload::Reply>),
     Tick(BTreeSet<IpAddr>, Reply<Role>),
+    PublishRanked {
+        build: super::RankedBuild,
+        inventory: Vec<u8>,
+        files: Vec<bytes::Bytes>,
+        memory: Arc<rtdb_types::MemoryBudget>,
+        reply: Reply<()>,
+    },
     Export { pin: Uuid, basis: Basis, until: Option<Timestamp>, reply: Reply<Vec<u8>> },
     OpenExport { ticket: Vec<u8>, reply: Reply<PinnedExport> },
     ReleaseExport { ticket: Vec<u8>, reply: Reply<()> },
@@ -88,6 +95,13 @@ pub struct WritePipeline {
 }
 
 impl WritePipeline {
+    pub async fn publish_ranked_catalog(
+        &self, build: super::RankedBuild, inventory: Vec<u8>, files: Vec<bytes::Bytes>,
+        memory: Arc<rtdb_types::MemoryBudget>,
+    ) -> Result<()> {
+        self.request(|reply| Command::PublishRanked { build, inventory, files, memory, reply }).await
+    }
+
     pub fn start(database: Arc<Mutex<MultiDatabase>>) -> Self {
         let (input, receive) = mpsc::channel(CAPACITY);
         let task = tokio::spawn(run(Arc::clone(&database), receive));
@@ -283,6 +297,10 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             }
             Command::Tick(live, reply) => {
                 let result = database.lock().await.tick(&live).await;
+                let _ = reply.send(result);
+            }
+            Command::PublishRanked { build, inventory, files, memory, reply } => {
+                let result = database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await;
                 let _ = reply.send(result);
             }
             Command::Export { pin, basis, until, reply } => {

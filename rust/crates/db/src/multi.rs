@@ -21,10 +21,12 @@ use crate::{
 
 mod pin;
 mod pipeline;
+mod ranked;
 mod rotation;
 mod retirement;
 pub use pin::{NativeCheckpointInstallation, PinnedExport};
 pub use pipeline::WritePipeline;
+pub use ranked::{RankedBuild, RankedFiles, RankedPublication};
 use pipeline::{Append, AttemptError, Planned, receipt_for};
 use rotation::ArmedRotation;
 pub use rotation::RotationReceipt;

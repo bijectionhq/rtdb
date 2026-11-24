@@ -12,6 +12,7 @@ pub struct Reachability {
     epoch: u64,
     objects: BTreeSet<ObjectId>,
     pins: BTreeMap<Uuid, Pin>,
+    rewrite_files: bool,
 }
 
 impl Reachability {
@@ -26,8 +27,10 @@ impl Reachability {
             epoch,
             objects: BTreeSet::new(),
             pins: BTreeMap::new(),
+            rewrite_files: false,
         };
         for id in objects {
+            reachable.rewrite_files |= id.kind == ObjectKind::File;
             reachable.include(id)?;
         }
         Ok(reachable)
@@ -50,6 +53,7 @@ impl Reachability {
             match record {
                 Record::Checkpoint(checkpoint) => {
                     let image = reachable.include_manifest(&manifests, checkpoint.manifest)?;
+                    reachable.rewrite_files |= !image.manifest.files.is_empty();
                     if image.generation.number != checkpoint.key_generation {
                         return Err(Anomaly::fault(
                             "rtdb.store/checkpoint-generation",
@@ -60,8 +64,16 @@ impl Reachability {
                         if index == 0 {
                             reachable.include_pin(&manifests, pin)?;
                         } else {
-                            reachable.include_manifest(&manifests, pin.manifest)?;
+                            let pinned = reachable.include_manifest(&manifests, pin.manifest)?;
+                            reachable.rewrite_files |= !pinned.manifest.files.is_empty();
                         }
+                    }
+                }
+                Record::RankedCatalog(catalog) => {
+                    let image = reachable.include_manifest(&manifests, catalog.manifest)?;
+                    if image.generation.number != catalog.key_generation || !image.manifest.pins.is_empty() {
+                        return Err(Anomaly::fault("rtdb.store/ranked-catalog",
+                            "Ranked catalogue root has an unexpected generation or pin"));
                     }
                 }
                 Record::Pin(pin) => reachable.include_pin(&manifests, pin)?,
@@ -71,9 +83,13 @@ impl Reachability {
                 Record::Tx { objects, .. } => {
                     for &id in objects {
                         match id.kind {
-                            ObjectKind::File => reachable.include(id)?,
+                            ObjectKind::File => {
+                                reachable.include(id)?;
+                                reachable.rewrite_files = true;
+                            }
                             ObjectKind::Manifest => {
-                                reachable.include_manifest(&manifests, id)?;
+                                let image = reachable.include_manifest(&manifests, id)?;
+                                reachable.rewrite_files |= !image.manifest.files.is_empty();
                             }
                         }
                     }
@@ -94,8 +110,8 @@ impl Reachability {
         self.objects.contains(&id)
     }
 
-    pub fn has_files(&self) -> bool {
-        self.objects.iter().any(|id| id.kind == ObjectKind::File)
+    pub fn requires_file_rewrite(&self) -> bool {
+        self.rewrite_files
     }
 
     /// Active pins reconstructed by `from_records`.
@@ -160,7 +176,8 @@ impl Reachability {
         manifests: &BTreeMap<ObjectId, &VerifiedManifest>,
         pin: &Pin,
     ) -> Result<()> {
-        self.include_manifest(manifests, pin.manifest)?;
+        let image = self.include_manifest(manifests, pin.manifest)?;
+        self.rewrite_files |= !image.manifest.files.is_empty();
         if self.pins.insert(pin.id, pin.clone()).is_some() {
             return Err(Anomaly::fault(
                 "rtdb.store/duplicate-pin",

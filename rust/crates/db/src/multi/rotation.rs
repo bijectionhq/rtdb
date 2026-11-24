@@ -28,7 +28,7 @@ impl MultiDatabase {
         if reachable.pins().next().is_some() {
             return Err(rotation_busy("Release drained pins before erasing rows"));
         }
-        if reachable.has_files() {
+        if reachable.requires_file_rewrite() {
             return Err(Anomaly::unsupported("rtdb/erasure-files", "Erasure needs a rewrite of the referenced files"));
         }
         Ok(())

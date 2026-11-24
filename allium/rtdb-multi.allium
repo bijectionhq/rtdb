@@ -916,6 +916,8 @@ contract EpochScopedStorage {
 
     @invariant CommittedReachability
         -- A checkpoint publishes its complete file set and carries the active pins at its cut.
+        -- A ranked catalogue record roots its manifest and complete immutable file set for as long as the record is retained.
+        -- The record binds the writer epoch, database incarnation, applied basis, system clock and storage key generation.
         -- An export or cross-deployment fork is acknowledged after its source pin commits.
         -- The source pin covers the exact manifest and files until ordered release.
         -- A pin deadline closes admission, and admitted work drains before Unpin commits.
@@ -939,6 +941,7 @@ contract EpochScopedStorage {
         -- The incarnation's claims and page continuations use a separate token key wrapped by the same generation custody.
         -- Page resumption preserves its generation and its retirement deadline on every route.
         -- Erasure publishes a clean checkpoint recoverable under the next generation and then commits rotation at its cut.
+        -- A clean checkpoint drops the previous generation's ranked catalogue and its derivative roots.
         -- The writer arms the retiring generation's key-grant deadline and trims to the clean checkpoint.
         -- Key custody refuses old-generation delivery at the deadline and destroys the retiring generation once the deadline has elapsed.
         -- A replacement resumes an incomplete rotation from the adjacent checkpoint and rotation records.

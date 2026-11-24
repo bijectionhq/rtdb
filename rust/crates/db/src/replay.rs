@@ -307,6 +307,20 @@ impl Committed {
                 }
                 checkpoint.key_generation
             }
+            Record::RankedCatalog(catalog) => {
+                if catalog.manifest.database.as_bytes() != &previous.basis.incarnation()
+                    || catalog.manifest.epoch != entry.epoch.0
+                    || self.lease.map(|(epoch, _)| epoch) != Some(entry.epoch)
+                    || catalog.key_generation != self.generation
+                    || catalog.position != previous.basis.position()
+                    || catalog.system_time != previous.system_time.0
+                    || self.transactions.recover_pending().is_some()
+                    || self.transactions.pending_erasure().is_some()
+                {
+                    return Err(invalid("Ranked catalogue does not cover the current fenced cut"));
+                }
+                self.generation
+            }
             Record::KeyRotate { generation, at } => {
                 if *at != self.head.0
                     || !matches!(self.records.last(), Some(Record::Checkpoint(checkpoint))
@@ -517,6 +531,9 @@ impl Committed {
                 Record::Checkpoint(checkpoint) => {
                     roots.insert(checkpoint.manifest);
                     checkpoints.insert(checkpoint.manifest);
+                }
+                Record::RankedCatalog(catalog) => {
+                    roots.insert(catalog.manifest);
                 }
                 Record::Pin(pin) => {
                     roots.insert(pin.manifest);
