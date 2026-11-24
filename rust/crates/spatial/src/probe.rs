@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, StringArray, StructArray, UInt32Array};
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, ListArray, StringArray, StructArray, UInt32Array};
 use arrow_schema::{DataType, Field, Fields};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, selected_cell};
 use rtdb_types::Result;
@@ -81,21 +81,7 @@ fn cell_size(field: &Field, array: &dyn Array, row: usize) -> Option<Option<u32>
             && !fields[0].metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) =>
         {
             let value = array.as_any().downcast_ref::<StructArray>()?.column(0);
-            let Some((field, value, row)) = selected_cell(&fields[0], value.as_ref(), row).ok()? else {
-                return Some(Some(1));
-            };
-            if field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) {
-                return None;
-            }
-            match field.data_type() {
-                DataType::Null | DataType::Boolean => 1,
-                DataType::Int64 | DataType::Float64 => 9,
-                DataType::Utf8 => add(2, u32::try_from(value.as_any()
-                    .downcast_ref::<StringArray>()?.value(row).len()).ok()?)?,
-                DataType::Binary => add(2, u32::try_from(value.as_any()
-                    .downcast_ref::<BinaryArray>()?.value(row).len()).ok()?)?,
-                _ => return None,
-            }
+            typed_value_size(&fields[0], value.as_ref(), row, 0)?.0
         }
         _ => return None,
     };
@@ -107,6 +93,65 @@ fn cell_size(field: &Field, array: &dyn Array, row: usize) -> Option<Option<u32>
 // canonical value size and depth limits of Bijection document fields.
 const MAX_SIZE: u32 = 32 << 20;
 const MAX_DEPTH: usize = 15;
+
+fn typed_value_size(field: &Field, array: &dyn Array, row: usize, depth: usize) -> Option<(u32, bool)> {
+    let Some((field, array, row)) = selected_cell(field, array, row).ok()? else {
+        return Some((1, true));
+    };
+    if field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) {
+        return None;
+    }
+    let size = match field.data_type() {
+        DataType::Null => return Some((1, true)),
+        DataType::Boolean => 1,
+        DataType::Int64 | DataType::Float64 => 9,
+        DataType::Utf8 => add(2, u32::try_from(array.as_any().downcast_ref::<StringArray>()?.value(row).len()).ok()?)?,
+        DataType::Binary => add(2, u32::try_from(array.as_any().downcast_ref::<BinaryArray>()?.value(row).len()).ok()?)?,
+        DataType::List(item) if depth < MAX_DEPTH => {
+            let list = array.as_any().downcast_ref::<ListArray>()?;
+            let offsets = list.value_offsets();
+            let mut entries = usize::try_from(offsets[row]).ok()?..usize::try_from(offsets[row + 1]).ok()?;
+            if entries.len() > 8192 { return None; }
+            entries.try_fold(2, |size, index| add(size, typed_value_size(item, list.values().as_ref(), index, depth + 1)?.0))?
+        },
+        DataType::Struct(fields) if depth < MAX_DEPTH && fields.len() <= 2048 => {
+            let value = array.as_any().downcast_ref::<StructArray>()?;
+            let mut size = 2;
+            let mut previous = None;
+            let mut used = 0;
+            let mut members = 0;
+            for (index, member) in fields.iter().enumerate() {
+                let Some(name) = member.name().strip_prefix("value_") else { continue };
+                if !clear_field_name(name.as_bytes()) || previous.is_some_and(|prior| prior >= name) { return None; }
+                previous = Some(name);
+                used += 1;
+                members += 1;
+                if members > 1024 { return None; }
+                let (bytes, null) = typed_value_size(member, value.column(index).as_ref(), row, depth + 1)?;
+                if let Some((position, presence)) = fields.iter().enumerate().find(|(_, field)| {
+                    field.name().strip_prefix("is_present_") == Some(name)
+                }) {
+                    used += 1;
+                    let flags = value.column(position).as_any().downcast_ref::<BooleanArray>()?;
+                    if flags.is_null(row) || presence.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) { return None; }
+                    if !flags.value(row) {
+                        if !null { return None; }
+                        continue;
+                    }
+                }
+                size = add(add(size, u32::try_from(name.len()).ok()? + 1)?, bytes)?;
+            }
+            if used != fields.len() { return None; }
+            size
+        },
+        _ => return None,
+    };
+    Some((size, false))
+}
+
+fn clear_field_name(key: &[u8]) -> bool {
+    key.len() <= 1024 && key.first() != Some(&b'$') && key.iter().all(|byte| (32..127).contains(byte))
+}
 
 fn clear_image_size(mut image: &[u8]) -> Option<u32> {
     if image.len() > 3 * MAX_SIZE as usize {
@@ -168,8 +213,7 @@ fn value_size(image: &mut &[u8], depth: usize) -> Option<u32> {
                 if record {
                     let end = image.iter().position(|byte| *byte == 0)?;
                     let key = take(image, end)?;
-                    if key.len() > 1024 || key.first() == Some(&b'$')
-                        || !key.iter().all(|byte| (32..127).contains(byte))
+                    if !clear_field_name(key)
                         || previous.is_some_and(|prior: &[u8]| prior >= key)
                         || take(image, 2)? != [0, 1]
                     {
@@ -203,6 +247,31 @@ mod tests {
         assert_eq!(cell_size(&column, &wrapped, 0), Some(Some(6)));
         assert_eq!(cell_size(&column, &wrapped, 1), Some(Some(1)));
         assert_eq!(cell_size(&column, &wrapped, 2), Some(None));
+    }
+
+    #[test]
+    fn typed_compound_sizes_match_canonical_missing_and_null_members() {
+        let object = StructArray::new(
+            vec![Field::new("value_note", DataType::Utf8, true), Field::new("is_present_note", DataType::Boolean, false)].into(),
+            vec![
+                Arc::new(StringArray::from(vec![None, None, Some("x"), Some("hidden")])),
+                Arc::new(BooleanArray::from(vec![false, true, true, false])),
+            ], None,
+        );
+        let items = Arc::new(Field::new("item", object.data_type().clone(), false));
+        let list = ListArray::new(items, arrow_buffer::OffsetBuffer::new(vec![0, 1, 2, 3, 4].into()), Arc::new(object), None);
+        let wrapped = StructArray::new(
+            vec![Field::new("v2_value", list.data_type().clone(), true)].into(), vec![Arc::new(list)], None,
+        );
+        let field = Field::new("c_list", wrapped.data_type().clone(), true);
+        for (row, canonical) in [
+            &[12, 13, 0, 0, 0, 0][..],
+            &[12, 13, b'n', b'o', b't', b'e', 0, 1, 2, 0, 0, 0, 0],
+            &[12, 13, b'n', b'o', b't', b'e', 0, 1, 9, b'x', 0, 1, 0, 0, 0, 0],
+        ].into_iter().enumerate() {
+            assert_eq!(cell_size(&field, &wrapped, row), Some(clear_image_size(canonical)));
+        }
+        assert_eq!(cell_size(&field, &wrapped, 3), None);
     }
 
     #[test]
