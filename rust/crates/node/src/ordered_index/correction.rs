@@ -9,7 +9,7 @@ use super::{
     PAGE_LAYOUT_VERSION, format_error,
     key::arrow,
     postings::{BatchKind, KeyBatch, ProjectedKeys},
-    tree::{Address, Entry, Item, Key, Span},
+    tree::{AddressRef, Entry, Item, Key, Span},
 };
 
 pub(super) const HEADER: [u8; 16] = {
@@ -36,6 +36,7 @@ pub(super) fn encode(entries: &[Entry]) -> Result<Vec<u8>> {
         if spans.is_empty() {
             return Err(invalid());
         }
+        let address = address.view();
         groups.extend_from_slice(address.iid.as_bytes());
         groups.extend_from_slice(
             &u32::try_from(spans.len())
@@ -43,7 +44,7 @@ pub(super) fn encode(entries: &[Entry]) -> Result<Vec<u8>> {
                 .to_le_bytes(),
         );
         groups.extend_from_slice(&u32::try_from(address.key.len()).map_err(format_error)?.to_le_bytes());
-        groups.extend_from_slice(&address.key);
+        groups.extend_from_slice(address.key);
         for span in spans.iter() {
             from.push(span.valid.lower().0);
             to.push(span.valid.upper().0);
@@ -119,7 +120,7 @@ pub(super) fn decode(
             });
         }
         entries.push(Entry {
-            key: Key::Row(Address { iid, key: key.to_vec() }),
+            key: Key::Row(AddressRef { iid, key: key.as_ref() }.owned()),
             item: Item::Row(spans.into()),
         });
         offset = end;
@@ -154,8 +155,9 @@ mod tests {
             valid: Interval::from_micros(12, 40).unwrap(),
             tuple: keys.row(0),
         };
+        let address = AddressRef { iid: Iid::MIN, key: &[] }.owned();
         let entry = Entry {
-            key: Key::Row(Address { iid: Iid::MIN, key: Vec::new() }),
+            key: Key::Row(address.clone()),
             item: Item::Row(Arc::from([span.clone()])),
         };
         let bytes = encode(&[entry]).unwrap();
@@ -165,7 +167,7 @@ mod tests {
                 .any(|slice| slice == b"omitted-key")
         );
         let entries = decode(bytes.into(), 64, &reservation).unwrap();
-        assert_eq!(entries[0].key, Key::Row(Address { iid: Iid::MIN, key: Vec::new() }));
+        assert_eq!(entries[0].key, Key::Row(address));
         let Item::Row(decoded) = &entries[0].item else {
             panic!("Expected correction spans");
         };
