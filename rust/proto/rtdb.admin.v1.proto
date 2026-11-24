@@ -1,0 +1,21 @@
+syntax = "proto3";
+package rtdb.admin.v1;
+
+import "rtdb.v1.proto";
+
+// DoAction types use rtdb.admin.v1.<verb> with serialized protobuf request and result bodies.
+service Admin {
+  rpc CreateDeployment(CreateDeploymentRequest) returns (Deployment);
+  rpc DeleteDeployment(DeleteDeploymentRequest) returns (ErasureProof);
+  rpc ForkDeployment(ForkDeploymentRequest) returns (Deployment);
+  rpc ExportCheckpoint(ExportCheckpointRequest) returns (CheckpointExport);
+  rpc RestoreDeployment(RestoreDeploymentRequest) returns (Deployment);
+}
+message CreateDeploymentRequest { string deployment = 1; }
+message Deployment { string deployment = 1; }
+message DeleteDeploymentRequest { string deployment = 1; }
+message ErasureProof { string deployment = 1; bytes proof = 2; sint64 unreadable_by_micros = 3; }
+message ForkDeploymentRequest { string deployment = 1; string from = 2; rtdb.v1.Basis basis = 3; }
+message ExportCheckpointRequest { string deployment = 1; rtdb.v1.Basis basis = 2; }
+message CheckpointExport { bytes checkpoint = 1; rtdb.v1.Basis basis = 2; }
+message RestoreDeploymentRequest { string deployment = 1; bytes checkpoint = 2; }

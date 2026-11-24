@@ -21,6 +21,7 @@
 -- EpochScopedStorage describes the storage shared by default and Multi mode.
 -- The directory-managed storage and reaper rules describe the deployment path still in service.
 -- The opt-in stream driver uses the Logkeeper `journal-contract` boundary specified in Logkeeper's verification/target-journal.md.
+-- dev/doc/rtdb-v1.allium defines the stateless consumer surface shared with default mode.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- The target serving protocol uses scoped attempt receipts and a loglet read index.
 -- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.

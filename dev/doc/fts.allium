@@ -1,4 +1,5 @@
 -- allium: 3
+-- rtdb-v1.allium specifies the consumer-facing ranked read over this search path.
 -- fts.allium
 --
 -- Full-text search over a table's documents, answered at any valid time and system time.

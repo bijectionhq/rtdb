@@ -141,6 +141,27 @@ impl QueryContext {
         Ok(self)
     }
 
+    /// Caps the captured database at `system_time` and fixes the SQL clock at `current_time`.
+    /// The context must have one partition, and a nonempty partition must cover the cut.
+    pub fn with_wire_cut(mut self: Arc<Self>, system_time: Timestamp, current_time: Instant) -> Result<Arc<Self>> {
+        let database = self.catalog.default_database.clone();
+        let [snapshot] = self.catalog.database(&database)?.partitions.as_slice() else {
+            return Err(invalid("wire-cut", "The read requires one partition"));
+        };
+        let cut = snapshot.tx_basis().map(|_| system_time);
+        let times = TimeBasis { databases: BTreeMap::from([(database.clone(), vec![cut.map(Into::into)])]) };
+        self = self.with_read_options(&times, Some(system_time), current_time)?;
+        let context = Arc::make_mut(&mut self);
+        let database = Arc::make_mut(&mut context.catalog.databases).get_mut(&database)
+            .ok_or_else(|| invalid("wire-cut", "The read requires its captured database"))?;
+        let [snapshot] = database.partitions.as_mut_slice() else {
+            return Err(invalid("wire-cut", "The read requires one partition"));
+        };
+        *snapshot = snapshot.clone().with_system_time_cap(cut)?;
+        context.current_time = current_time;
+        Ok(self)
+    }
+
     /// Reuses the captured store generation and lease while lowering one owned read's system cap.
     pub fn with_owned_system_cut(
         &self, system_time: Timestamp, cancellation: &tokio_util::sync::CancellationToken,

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+runner=${RTDB_CARGO_GUARD:-"$root/../codesign-agents/guarded-cargo.py"}
+export RUST_MIN_STACK=${RUST_MIN_STACK:-16777216}
+cd "$root/rust"
+if [[ -n ${RTDB_CONFORMANCE_ENDPOINT:-} ]]; then
+    exec "$runner" rtdb test --locked -p rtdb-flight-sql --test flight rtdb_v1_remote_consumer -- --ignored "$@"
+fi
+exec "$runner" rtdb test --locked -p rtdb-flight-sql --test flight rtdb_v1 "$@"

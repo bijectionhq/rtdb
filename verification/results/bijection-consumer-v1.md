@@ -2,7 +2,7 @@
 
 Proof input commit `0489dad3a35f70c5076575f05f979d2e6c608360`.
 Contract SHA-256 `80c284d4a02f90f44b3e9fe8a7b1468207a8ea2b977a6013ea5bed6750bcac99`.
-The published clauses and each named proof owner are in [the contract](../contracts/rtdb-consumer-v1.json) and [the proof mapping](../contracts/rtdb-consumer-v1.proofs.json).
+The former published clauses and proof mapping are in commit `4f2c8cab4c` under `verification/contracts/`.
 
 `verification/check_consumer_contract.py` ran with Verus 0.2026.11.05.31e44e6, Rust 1.99.1, and Lean 4.24.0.
 Verus checked each named original function and rejected every declared mutant at its expected diagnostic.

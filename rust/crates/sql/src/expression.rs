@@ -584,7 +584,7 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
     })
 }
 
-fn call(name: String, args: Vec<Expr>) -> Result<Expr> {
+pub(crate) fn call(name: String, args: Vec<Expr>) -> Result<Expr> {
     let return_type = rtdb_plan::function_type_with_args(&name, &args)?;
     Ok(Expr::Call { name, args, return_type })
 }

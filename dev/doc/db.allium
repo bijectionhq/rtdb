@@ -1,4 +1,5 @@
 -- allium: 3
+-- rtdb-v1.allium defines the stateless consumer surface shared with Multi mode.
 -- db.allium
 --
 -- The processing model of a single database within an XTDB node: transaction submission → log processing → block flushing → query.
