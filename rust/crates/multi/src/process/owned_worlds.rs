@@ -165,7 +165,7 @@ impl OwnedWorldHost for PlacedWorldHost {
             let deployment = self.deployment(&call)?;
             let record = self.directory.deployment(&deployment.to_string()).await?
                 .ok_or_else(OwnedWorld::unavailable)?;
-            assertion_families::serve(self.keys.as_ref(), deployment, record.incarnation, request).await
+            assertion_families::serve(self.keys.as_ref(), call.session, deployment, &record, request).await
         })
     }
 }

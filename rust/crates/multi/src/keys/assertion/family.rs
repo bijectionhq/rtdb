@@ -190,18 +190,46 @@ struct AcceptedLanding {
     placement_digest: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrolledWorldRow {
+    pub world: Uuid,
+    #[serde(with = "assertion_id")]
+    pub assertion: AssertionId,
+    pub capability: AssertionStage,
+    pub scope_commitment: [u8; 32],
+    pub codec: u32,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct OriginalPosition(#[serde(with = "position")] Position);
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorldRewrite {
+    #[serde(with = "assertion_id")]
+    member: AssertionId,
+    row: EnrolledWorldRow,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Family {
-    original: FamilyOccurrence,
+    original: EnrolledWorldRow,
+    original_position: Option<OriginalPosition>,
+    rewrites: Vec<WorldRewrite>,
     landings: Vec<Landing>,
     derived: Vec<DerivedRow>,
     fenced: Option<Uuid>,
 }
 
 impl Family {
+    fn original_at(&self, position: Position) -> bool {
+        self.original_position.is_some_and(|original| original.0 == position)
+    }
+
     fn contains(&self, position: Position) -> bool {
-        self.original.position == position
+        self.original_at(position)
             || self.landings.iter().any(|landing| landing.accepted.as_ref().is_some_and(|accepted| accepted.position == position))
     }
 
@@ -213,24 +241,22 @@ impl Family {
     fn stage_used(&self, stage: AssertionStage) -> bool {
         self.original.capability == stage || self.landings.iter().any(|landing| {
             landing.reservation.capability == stage || landing.reservation.link_capability == stage
-        }) || self.derived.iter().any(|row| row.capability == Some(stage))
+        }) || self.rewrites.iter().any(|rewrite| rewrite.row.capability == stage)
+            || self.derived.iter().any(|row| row.capability == Some(stage))
     }
 
-    fn row_capability(&self, stage: AssertionStage, assertion: AssertionId, slot: WorldRowSlot<'_>) -> bool {
-        (self.original.capability == stage && self.original.assertion == assertion)
-            || self.landings.iter().any(|landing| {
-                landing.reservation.capability == stage && landing.reservation.destination == assertion
-            })
-            || self.derived.iter().any(|row| {
-                row.capability == Some(stage) && row.member == assertion && row.world == Some(slot.world)
-                    && row.relation == slot.relation && row.key == slot.key
-            })
+    fn derived_capability(&self, stage: AssertionStage, assertion: AssertionId, slot: WorldRowSlot<'_>) -> bool {
+        self.derived.iter().any(|row| {
+            row.capability == Some(stage) && row.member == assertion && row.world == Some(slot.world)
+                && row.relation == slot.relation && row.key == slot.key
+        })
     }
 
     fn fence_inventory(&self, order: Uuid) -> FamilyFence {
-        let mut positions = BTreeSet::from([self.original.position]);
+        let mut positions = self.original_position.map(|position| position.0).into_iter().collect::<BTreeSet<_>>();
         let mut assertion_capabilities = BTreeSet::from([self.original.capability]);
         let mut link_capabilities = BTreeSet::new();
+        assertion_capabilities.extend(self.rewrites.iter().map(|rewrite| rewrite.row.capability));
         for landing in &self.landings {
             positions.extend(landing.accepted.as_ref().map(|accepted| accepted.position));
             assertion_capabilities.insert(landing.reservation.capability);
@@ -297,21 +323,55 @@ impl<'a> AssertionFamilies<'a> {
         Self { journal, region }
     }
 
-    pub async fn register(&self, family: Uuid, original: FamilyOccurrence) -> Result<()> {
-        self.require_position_open(original.position).await?;
+    pub async fn enroll_original(&self, family: Uuid, original: EnrolledWorldRow) -> Result<()> {
         for _ in 0..ATTEMPTS {
             if let Some((prior, _)) = self.read(family).await? {
-                if prior.original != original {
-                    return Err(conflict());
-                }
-                return prior.require_live();
+                prior.require_live()?;
+                return if prior.original == original { Ok(()) } else { Err(conflict()) };
             }
-            let record = Family { original, landings: Vec::new(), derived: Vec::new(), fenced: None };
+            let record = Family {
+                original, original_position: None, rewrites: Vec::new(),
+                landings: Vec::new(), derived: Vec::new(), fenced: None,
+            };
             if self.write(family, None, &record).await? {
                 return Ok(());
             }
         }
         Err(contention())
+    }
+
+    pub async fn register(&self, family: Uuid, original: FamilyOccurrence) -> Result<()> {
+        self.require_position_open(original.position).await?;
+        self.update(family, |record| {
+            record.require_live()?;
+            if record.original.assertion != original.assertion || record.original.capability != original.capability
+                || record.original.world.as_bytes() != &original.position.line_generation
+            {
+                return Err(conflict());
+            }
+            if record.original_position.is_some() {
+                return if record.original_at(original.position) { Ok(((), false)) } else { Err(conflict()) };
+            }
+            if record.contains(original.position) {
+                return Err(conflict());
+            }
+            record.original_position = Some(OriginalPosition(original.position));
+            Ok(((), true))
+        }).await
+    }
+
+    pub async fn enroll_rewrite(&self, family: Uuid, member: AssertionId, row: EnrolledWorldRow) -> Result<()> {
+        self.update(family, |record| {
+            record.require_live()?;
+            if let Some(prior) = record.rewrites.iter().find(|prior| prior.row.capability == row.capability) {
+                return if prior.row == row && prior.member == member { Ok(((), false)) } else { Err(conflict()) };
+            }
+            if !record.has_member(member) || record.stage_used(row.capability) {
+                return Err(conflict());
+            }
+            record.rewrites.push(WorldRewrite { member, row });
+            Ok(((), true))
+        }).await
     }
 
     /// Enroll both destination and link stages before either can be provisioned.
@@ -382,7 +442,8 @@ impl<'a> AssertionFamilies<'a> {
         self.require_position_open(occurrence.position).await?;
         let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
         record.require_live()?;
-        if record.original == occurrence || record.landings.iter().any(|landing| {
+        if (record.original_at(occurrence.position) && record.original.assertion == occurrence.assertion
+            && record.original.capability == occurrence.capability) || record.landings.iter().any(|landing| {
             landing.reservation.destination == occurrence.assertion
                 && landing.reservation.capability == occurrence.capability
                 && landing.accepted.as_ref().is_some_and(|accepted| accepted.position == occurrence.position)
@@ -406,8 +467,12 @@ impl<'a> AssertionFamilies<'a> {
                 if !row.well_formed() || !record.has_member(row.member) {
                     return Err(conflict());
                 }
-                if let Some(prior) = record.derived.iter().find(|prior| prior.same_row(row)) {
-                    if prior == row { continue; }
+                if record.derived.contains(row) {
+                    continue;
+                }
+                if record.derived.iter().any(|prior| prior.same_row(row)
+                    && (row.world.is_none() || prior.member != row.member))
+                {
                     return Err(conflict());
                 }
                 if row.capability.is_some_and(|stage| record.stage_used(stage)) {
@@ -423,14 +488,29 @@ impl<'a> AssertionFamilies<'a> {
         }).await
     }
 
-    /// Admits sealing or opening one world overlay row while the family is live.
-    /// A seal is one-use per capability, so the first row a capability seals is its only row.
     pub async fn require_row_capability(
-        &self, family: Uuid, stage: AssertionStage, assertion: AssertionId, slot: WorldRowSlot<'_>,
+        &self, family: Uuid, row: EnrolledWorldRow, slot: WorldRowSlot<'_>,
     ) -> Result<()> {
         let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
         record.require_live()?;
-        if record.row_capability(stage, assertion, slot) { Ok(()) } else { Err(conflict()) }
+        if record.original == row || record.rewrites.iter().any(|rewrite| rewrite.row == row)
+            || record.landings.iter().any(|landing| {
+                landing.reservation.capability == row.capability && landing.reservation.destination == row.assertion
+            })
+            || record.derived_capability(row.capability, row.assertion, slot)
+        {
+            Ok(())
+        } else {
+            Err(conflict())
+        }
+    }
+
+    pub async fn require_derived_capability(
+        &self, family: Uuid, stage: AssertionStage, member: AssertionId, slot: WorldRowSlot<'_>,
+    ) -> Result<()> {
+        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        if record.derived_capability(stage, member, slot) { Ok(()) } else { Err(conflict()) }
     }
 
     /// Admits sealing the private link of an enrolled reservation.
@@ -648,6 +728,14 @@ mod tests {
         AssertionStage::new(realm, NonZeroU64::MIN, Uuid::new_v4()).unwrap()
     }
 
+    fn enrolment(original: FamilyOccurrence) -> EnrolledWorldRow {
+        EnrolledWorldRow {
+            world: Uuid::from_bytes(original.position.line_generation),
+            assertion: original.assertion, capability: original.capability,
+            scope_commitment: [9; 32], codec: 1,
+        }
+    }
+
     fn placement(reservation: LandingReservation) -> PlacementBinding {
         PlacementBinding {
             assertion: reservation.destination,
@@ -693,6 +781,7 @@ mod tests {
             let copy = FamilyOccurrence {
                 position: binding.position, assertion: first.destination, capability: first.capability,
             };
+            families.enroll_original(family, enrolment(original)).await?;
             families.register(family, original).await?;
             families.reserve_landing(family, first).await?;
             assert!(families.require_live_occurrence(family, copy).await.is_err());
@@ -737,8 +826,10 @@ mod tests {
         let original = FamilyOccurrence {
             position: position(1), assertion: AssertionId::from_bytes([1; 32]), capability: stage(realm),
         };
-        families.register(family, original).await?;
-        let world = Uuid::new_v4();
+        let enrolled = enrolment(original);
+        families.enroll_original(family, enrolled).await?;
+        assert!(families.require_live_occurrence(family, original).await.is_err());
+        let world = enrolled.world;
         let derived = DerivedRow {
             member: original.assertion, world: Some(world), relation: "fact_l1_search".into(),
             key: b"row".to_vec(), capability: Some(stage(realm)),
@@ -756,15 +847,33 @@ mod tests {
 
         let slot = WorldRowSlot { world, relation: &derived.relation, key: &derived.key };
         let capability = derived.capability.unwrap();
-        families.require_row_capability(family, capability, original.assertion, slot).await?;
-        families.require_row_capability(family, original.capability, original.assertion, slot).await?;
+        families.require_derived_capability(family, capability, original.assertion, slot).await?;
+        families.require_row_capability(family, enrolled, slot).await?;
         let elsewhere = WorldRowSlot { world: Uuid::new_v4(), ..slot };
-        assert!(families.require_row_capability(family, capability, original.assertion, elsewhere).await.is_err());
+        assert!(families.require_derived_capability(family, capability, original.assertion, elsewhere).await.is_err());
 
+        let rewrite = EnrolledWorldRow {
+            assertion: AssertionId::from_bytes([2; 32]), capability: stage(realm), ..enrolled
+        };
+        families.enroll_rewrite(family, original.assertion, rewrite).await?;
+        families.enroll_rewrite(family, original.assertion, rewrite).await?;
+        families.require_row_capability(family, rewrite, slot).await?;
+        let other_slot = EnrolledWorldRow { scope_commitment: [10; 32], ..rewrite };
+        assert!(families.require_row_capability(family, other_slot, slot).await.is_err());
+
+        let rewritten = DerivedRow { capability: Some(stage(realm)), ..derived.clone() };
+        families.register_derived(family, std::slice::from_ref(&rewritten)).await?;
+        let forged = FamilyOccurrence { position: Position { line_generation: [7; 16], ..original.position }, ..original };
+        assert!(families.register(family, forged).await.is_err());
+        families.register(family, original).await?;
+        families.register(family, original).await?;
+        families.require_live_occurrence(family, original).await?;
         let fence = families.fence(family, original.position, Uuid::new_v4()).await?;
         assert!(fence.assertion_capabilities.contains(&capability));
-        assert_eq!(fence.derived, BTreeSet::from([derived.clone(), root]));
-        assert!(families.require_row_capability(family, capability, original.assertion, slot).await.is_err());
+        assert!(fence.assertion_capabilities.contains(&rewrite.capability));
+        assert_eq!(fence.derived, BTreeSet::from([derived.clone(), rewritten, root]));
+        assert!(families.require_derived_capability(family, capability, original.assertion, slot).await.is_err());
+        assert!(families.require_row_capability(family, rewrite, slot).await.is_err());
         assert!(families.register_derived(family, &[derived]).await.is_err());
         Ok(())
     }

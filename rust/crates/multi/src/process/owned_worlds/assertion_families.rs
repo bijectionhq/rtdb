@@ -2,7 +2,7 @@
 //! Families are addressed within the attached deployment, and every capability
 //! must name that deployment's current incarnation before the vault is touched.
 
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc};
 
 use bytes::Bytes;
 use ring::digest::{Context, SHA256};
@@ -10,21 +10,80 @@ use rtdb_flight_sql::{
     FamilyDerivedRow, FamilyFenceReply, FamilyOccurrenceWire, FamilyReply, FamilyRequest, FamilyReservationWire,
     FamilyStage, WorldRowAuthoring,
 };
+use rtdb_directory::DeploymentRecord;
+use rtdb_node::NativeSession;
 use rtdb_storage::IoRegion;
-use rtdb_types::{Anomaly, AnomalyCategory, OwnedWorld, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, PlacedAttemptScope, Result, WorldClockMode};
 use uuid::Uuid;
 
 use crate::keys::{
-    AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DerivedRow, FamilyOccurrence, KeyService, LandingLink,
+    AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DerivedRow, EnrolledWorldRow, FamilyOccurrence, KeyService, LandingLink,
     LandingReservation, WorldRowSlot,
 };
 
 struct Scope {
     deployment: Uuid,
-    incarnation: u64,
+    incarnation: NonZeroU64,
+    root_line: [u8; 16],
 }
 
 impl Scope {
+    fn new(deployment: Uuid, record: &DeploymentRecord) -> Result<Self> {
+        let incarnation = NonZeroU64::new(record.incarnation).ok_or_else(OwnedWorld::unavailable)?;
+        let mut line = Context::new(&SHA256);
+        line.update(b"rtdb.owned/assertion-line/v1\0");
+        line.update(deployment.as_bytes());
+        line.update(&record.log_epoch.to_be_bytes());
+        let mut root_line = [0; 16];
+        root_line.copy_from_slice(&line.finish().as_ref()[..16]);
+        Ok(Self { deployment, incarnation, root_line })
+    }
+
+    async fn admit_lines(&self, session: &mut NativeSession, request: &FamilyRequest) -> Result<()> {
+        let mut positions = [None; 2];
+        let world = match request {
+            FamilyRequest::Register { original, .. } => {
+                positions[0] = Some(original.position);
+                None
+            }
+            FamilyRequest::RequireLiveOccurrence { occurrence, .. } => {
+                positions[0] = Some(occurrence.position);
+                None
+            }
+            FamilyRequest::RequirePositionOpen(position) | FamilyRequest::Fence { selected: position, .. } => {
+                positions[0] = Some(*position);
+                None
+            }
+            FamilyRequest::ReserveLanding { reservation, .. } => {
+                positions[0] = Some(reservation.source);
+                None
+            }
+            FamilyRequest::ActivateLanding { placement, reservation, .. }
+            | FamilyRequest::SealLandingLink { placement, reservation, .. } => {
+                positions = [Some(reservation.source), Some(placement.position)];
+                None
+            }
+            FamilyRequest::EnrollOriginal(row) => Some((row.world, true)),
+            FamilyRequest::EnrollWorldRow { row, .. } => Some((row.world, false)),
+            FamilyRequest::Scope | FamilyRequest::RegisterDerived { .. } | FamilyRequest::SealWorldRow { .. }
+            | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
+        };
+        let mut worlds = positions.into_iter().flatten()
+            .filter(|position| position.line_generation != self.root_line)
+            .map(|position| (Uuid::from_bytes(position.line_generation), false))
+            .chain(world);
+        let Some(first) = worlds.next() else { return Ok(()); };
+        let snapshot = session.open_owned_read().await?;
+        for (world, proposal) in std::iter::once(first).chain(worlds) {
+            if world.is_nil() || snapshot.world_registration(Iid(*world.as_bytes())).await?
+                .is_none_or(|(record, _)| !record.mode.is_writable() || (proposal && record.mode != WorldClockMode::Proposal))
+            {
+                return Err(scope_mismatch("The assertion position or authoring world belongs to another line"));
+            }
+        }
+        Ok(())
+    }
+
     fn family(&self, family: Uuid) -> Uuid {
         let mut address = Context::new(&SHA256);
         address.update(b"rtdb.owned/assertion-family/v1\0");
@@ -36,13 +95,17 @@ impl Scope {
     }
 
     fn stage(&self, stage: FamilyStage) -> Result<AssertionStage> {
-        if stage.deployment != self.deployment || stage.incarnation.get() != self.incarnation {
-            return Err(Anomaly::new(
-                AnomalyCategory::Forbidden, "rtdb.owned/assertion-family-scope",
-                "The assertion capability belongs to another deployment or incarnation",
-            ));
+        if stage.deployment != self.deployment || stage.incarnation != self.incarnation {
+            return Err(scope_mismatch("The assertion capability belongs to another deployment or incarnation"));
         }
         AssertionStage::new(stage.deployment, stage.incarnation, stage.stage)
+    }
+
+    fn enrolled_row(&self, row: &WorldRowAuthoring) -> Result<EnrolledWorldRow> {
+        Ok(EnrolledWorldRow {
+            world: row.world, assertion: row.assertion, capability: self.stage(row.stage)?,
+            scope_commitment: row_scope(row), codec: row.codec,
+        })
     }
 
     fn occurrence(&self, occurrence: FamilyOccurrenceWire) -> Result<FamilyOccurrence> {
@@ -67,6 +130,10 @@ impl Scope {
             capability: row.capability.map(|stage| self.stage(stage)).transpose()?,
         })
     }
+}
+
+fn scope_mismatch(message: &'static str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/assertion-family-scope", message)
 }
 
 fn wire_stage(stage: AssertionStage) -> FamilyStage {
@@ -96,13 +163,30 @@ fn row_scope(row: &WorldRowAuthoring) -> [u8; 32] {
 }
 
 pub(super) async fn serve(
-    keys: &dyn KeyService, deployment: Uuid, incarnation: u64, request: FamilyRequest,
+    keys: &dyn KeyService, session: &mut NativeSession, deployment: Uuid,
+    record: &DeploymentRecord, request: FamilyRequest,
 ) -> Result<FamilyReply> {
-    let scope = Scope { deployment, incarnation };
+    let expected = PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
+    if session.placed_history()? != Some(expected) || record.writer_pool().is_none() {
+        return Err(OwnedWorld::unavailable());
+    }
+    let scope = Scope::new(deployment, record)?;
+    scope.admit_lines(session, &request).await?;
     let region = IoRegion::new();
     let families = keys.assertion_families(Arc::clone(&region)).ok_or_else(OwnedWorld::unavailable)?;
     let vault = || keys.assertion_keys().ok_or_else(OwnedWorld::unavailable);
     Ok(match request {
+        FamilyRequest::Scope => FamilyReply::Scope {
+            deployment, incarnation: scope.incarnation, root_line: scope.root_line,
+        },
+        FamilyRequest::EnrollOriginal(row) => {
+            families.enroll_original(scope.family(row.family), scope.enrolled_row(&row)?).await?;
+            FamilyReply::Done
+        }
+        FamilyRequest::EnrollWorldRow { row, member } => {
+            families.enroll_rewrite(scope.family(row.family), member, scope.enrolled_row(&row)?).await?;
+            FamilyReply::Done
+        }
         FamilyRequest::Register { family, original } => {
             families.register(scope.family(family), scope.occurrence(original)?).await?;
             FamilyReply::Done
@@ -168,8 +252,10 @@ pub(super) async fn serve(
 async fn admit_row(
     scope: &Scope, families: &crate::keys::AssertionFamilies<'_>, row: &WorldRowAuthoring,
 ) -> Result<(AssertionStage, AssertionAuthoring)> {
-    let stage = scope.stage(row.stage)?;
+    let enrolled = scope.enrolled_row(row)?;
     let slot = WorldRowSlot { world: row.world, relation: &row.relation, key: &row.key };
-    families.require_row_capability(scope.family(row.family), stage, row.assertion, slot).await?;
-    Ok((stage, AssertionAuthoring { assertion_id: row.assertion, scope_commitment: row_scope(row), codec: row.codec }))
+    families.require_row_capability(scope.family(row.family), enrolled, slot).await?;
+    Ok((enrolled.capability, AssertionAuthoring {
+        assertion_id: enrolled.assertion, scope_commitment: enrolled.scope_commitment, codec: enrolled.codec,
+    }))
 }

@@ -778,6 +778,10 @@ mod tests {
             link_capability: stage()?,
             review_commitment: [5; 32],
         };
+        families.enroll_original(family, crate::keys::EnrolledWorldRow {
+            world: Uuid::from_bytes(original.position.line_generation), assertion: original.assertion,
+            capability: original.capability, scope_commitment: [9; 32], codec: 1,
+        }).await?;
         families.register(family, original).await?;
         families.reserve_landing(family, pending).await?;
         let form = AssertionAuthoring { assertion_id: original.assertion, scope_commitment: [9; 32], codec: 1 };

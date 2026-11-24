@@ -28,7 +28,7 @@ mod unit;
 pub use rtdb_storage::sealing::{UnitOperation, UnitOutput};
 pub use unit::{UnitScope, UnitSlot};
 pub(crate) use unit::UnitLedger;
-pub use assertion::family::{AssertionFamilies, DerivedRow, FamilyFence, FamilyOccurrence, LandingLink, LandingReservation, WorldRowSlot};
+pub use assertion::family::{AssertionFamilies, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, LandingLink, LandingReservation, WorldRowSlot};
 pub use assertion::issuer::{AssertionIngressTicket, AssertionIssuerScope, AssertionIssuers};
 pub use assertion::{AssertionAuthoring, AssertionBackup, AssertionEnvelope, AssertionKeyService, AssertionStage};
 pub use journal::JournalKey;

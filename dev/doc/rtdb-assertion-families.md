@@ -3,14 +3,15 @@
 This is the Flight contract a placed writer's client uses to keep per-copy custody of a protected row.
 The vault owner is `AssertionFamilies` in `rust/crates/multi/src/keys/assertion/family.rs`.
 The Flight decoding lives in `rust/crates/flight-sql/src/owned_family.rs` and the placed host in `rust/crates/multi/src/process/owned_worlds/assertion_families.rs`.
-Hosted protocol 214 introduces every action below.
+Hosted protocol 215 adds the scope and enrolment actions and position admission.
 
 ## Model
 
 A family is the private custody record of one protected row's Proposal original and all of its copies.
 Its members are:
 
-* the original occurrence, registered with its position, assertion identity and assertion capability;
+* the original occurrence, enrolled with its assertion and row capability before ordering and bound to its position after publication;
+* later world rewrites, each enrolled under a fresh stage of an existing member at its exact world slot;
 * each landing, reserved with a fresh destination capability and a distinct link capability, then activated at its ordered placement;
 * each derived row, the search projection of a member into a derived search relation (`<partition>_search`), in the Root or in a world overlay.
 
@@ -35,6 +36,14 @@ A client cannot name another deployment's family, and a dependent fork, which ha
 
 Every capability in a request must name the attached deployment and its current incarnation.
 Any other capability is refused with `rtdb.owned/assertion-family-scope` before the vault is touched.
+The Root line is the first 16 bytes of `SHA-256("rtdb.owned/assertion-line/v1\0" ‖ deployment UUID ‖ directory log epoch (signed i32 big-endian))`.
+World positions identify the authoring world, including winners inherited by a child world.
+A request position must name the Root line or a writable world registered for the authenticated principal in the attached deployment.
+The original position must name its enrolled world.
+The winning point supplies publication via its system revision in microseconds and the ordinal via `rtdb.owned.assertion_ordinal`.
+World winners carry their physical authoring world in `rtdb.owned.assertion_line`.
+Root point evidence uses an all-zero metadata line, which the client maps to the Root line in the scope reply.
+A position outside the deployment's admitted lines is refused with `rtdb.owned/assertion-family-scope` before vault access.
 
 ## Encodings
 
@@ -58,11 +67,33 @@ A successful action that returns no data replies with the single byte `0x01`.
 
 ## Actions
 
+### `rtdb.owned.AssertionFamilyScope.v1`
+
+Request: empty.
+
+Reply: deployment `uuid`, current incarnation (u64, nonzero), Root line (16).
+
+### `rtdb.owned.EnrollAssertionFamily.v1`
+
+Request: the authoring prefix of `SealWorldOverlayRow.v1`, with no plaintext.
+
+Enrols the original assertion and capability at the exact authoring slot of a registered Proposal world.
+An enrolled original can seal and register derived rows before it has a position.
+An exact retry succeeds and a conflicting enrolment is refused.
+
+### `rtdb.owned.EnrollFamilyWorldRow.v1`
+
+Request: the authoring prefix of `SealWorldOverlayRow.v1`, then the existing member's `assertion`.
+
+Enrols a fresh assertion and capability for a later world rewrite at the exact authoring slot.
+An exact retry succeeds and conflicting reuse of a stage is refused.
+The member retains its position, and every enrolled rewrite stage stays in the fence inventory.
+
 ### `rtdb.owned.RegisterAssertionFamily.v1`
 
 Request: family `uuid`, original `occurrence`.
 
-Registers the Proposal original.
+Binds the enrolled Proposal original to its position after the placed writer observes the ordered publication, including when recovering a successful attempt.
 An exact retry succeeds.
 A different original under the same family is refused with `rtdb.multi/assertion-family-mismatch`.
 A fenced family refuses with `rtdb/erased-under-view`, and a position with a durable denial refuses the same way.
@@ -115,7 +146,9 @@ Records the derived search rows of a member in the family inventory.
 The member must be the original's assertion or a reserved landing's destination.
 A world entry must carry a capability, which the registration enrolls; that capability then seals exactly that derived row.
 A Root entry carries no capability, because Root derived relations are sealed under the broker-owned R6 slots of their relation.
-Entries are deduplicated by scope, relation and key; re-registering an identical entry succeeds and a conflicting one is refused.
+Root entries are deduplicated by relation and key.
+A world slot can enrol multiple fresh stages for the same member across rewrites.
+An exact retry succeeds and conflicting reuse of a stage or slot is refused.
 A family holds at most 2048 derived entries; the next registration is refused with `rtdb.multi/assertion-family-size`.
 
 ### `rtdb.owned.SealWorldOverlayRow.v1`
@@ -124,7 +157,7 @@ Request: family `uuid`, `stage`, `assertion`, codec (u32), disclosure scope (32)
 
 Reply: the `RTAS` assertion envelope.
 
-The stage must be enrolled in the live family for the named assertion: the original capability with the original assertion, a reservation's destination capability with its destination, or a derived capability registered for exactly this world, relation and key.
+The stage must be enrolled in the live family for the named assertion: the original or a rewrite at its enrolled authoring slot, a reservation's destination capability with its destination, or a derived capability registered for exactly this world, relation and key.
 The vault binds the envelope to its row: the authoring scope commitment is `SHA-256("rtdb.owned/world-overlay-row/v1\0" ‖ world ‖ u16 relation length ‖ relation ‖ u16 key length ‖ key ‖ disclosure scope)`.
 An envelope therefore opens only under the same world, relation, key and disclosure scope.
 The client writes the envelope as the overlay row's sealed payload in its world batch.
@@ -182,6 +215,6 @@ Ciphertext then ages out with its world or archive.
 | `rtdb.multi/assertion-family-mismatch` | Conflict | The request does not match the recorded family. |
 | `rtdb.multi/assertion-family-contention` | Conflict | The record changed concurrently through every retry; the client retries. |
 | `rtdb.multi/assertion-family-size` | Incorrect | The family record or its derived inventory exceeds its limit. |
-| `rtdb.owned/assertion-family-scope` | Forbidden | A capability names another deployment or incarnation. |
+| `rtdb.owned/assertion-family-scope` | Forbidden | A capability names another deployment or incarnation, or a position names a foreign line. |
 | `rtdb.owned/assertion-profile-uninstalled` | Unsupported | Settlement requires the fixed assertion profile. |
 | `rtdb.world/unavailable` | Incorrect | The session is not the placed writer or the host has no family vault. |

@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 use crate::{error::{invalid, status, unsupported}, service::{Call, Service}, wire};
 
+pub(crate) const ASSERTION_FAMILY_SCOPE_V1: &str = "rtdb.owned.AssertionFamilyScope.v1";
+pub(crate) const ENROLL_ASSERTION_FAMILY_V1: &str = "rtdb.owned.EnrollAssertionFamily.v1";
+pub(crate) const ENROLL_FAMILY_WORLD_ROW_V1: &str = "rtdb.owned.EnrollFamilyWorldRow.v1";
 pub(crate) const REGISTER_ASSERTION_FAMILY_V1: &str = "rtdb.owned.RegisterAssertionFamily.v1";
 pub(crate) const RESERVE_FAMILY_LANDING_V1: &str = "rtdb.owned.ReserveFamilyLanding.v1";
 pub(crate) const ACTIVATE_FAMILY_LANDING_V1: &str = "rtdb.owned.ActivateFamilyLanding.v1";
@@ -24,7 +27,8 @@ pub(crate) const FENCE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.FenceAssertionFam
 pub(crate) const SETTLE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.SettleAssertionFamily.v1";
 
 pub(crate) fn is_family_action(action: &str) -> bool {
-    matches!(action, REGISTER_ASSERTION_FAMILY_V1 | RESERVE_FAMILY_LANDING_V1 | ACTIVATE_FAMILY_LANDING_V1
+    matches!(action, ASSERTION_FAMILY_SCOPE_V1 | ENROLL_ASSERTION_FAMILY_V1 | ENROLL_FAMILY_WORLD_ROW_V1
+        | REGISTER_ASSERTION_FAMILY_V1 | RESERVE_FAMILY_LANDING_V1 | ACTIVATE_FAMILY_LANDING_V1
         | SEAL_FAMILY_LANDING_LINK_V1 | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
         | FENCE_ASSERTION_FAMILY_V1 | SETTLE_ASSERTION_FAMILY_V1)
@@ -84,6 +88,9 @@ pub struct WorldRowAuthoring {
 }
 
 pub enum FamilyRequest {
+    Scope,
+    EnrollOriginal(WorldRowAuthoring),
+    EnrollWorldRow { row: WorldRowAuthoring, member: AssertionId },
     Register { family: Uuid, original: FamilyOccurrenceWire },
     ReserveLanding { family: Uuid, reservation: FamilyReservationWire },
     ActivateLanding { family: Uuid, placement: PlacementBinding, reservation: FamilyReservationWire },
@@ -110,6 +117,7 @@ pub struct FamilyFenceReply {
 }
 
 pub enum FamilyReply {
+    Scope { deployment: Uuid, incarnation: NonZeroU64, root_line: [u8; 16] },
     Done,
     Sealed(Bytes),
     Opened(Bytes),
@@ -230,6 +238,11 @@ impl<'a> Frame<'a> {
 fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
     let mut frame = Frame(body.as_ref());
     let request = match action {
+        ASSERTION_FAMILY_SCOPE_V1 => FamilyRequest::Scope,
+        ENROLL_ASSERTION_FAMILY_V1 => FamilyRequest::EnrollOriginal(frame.world_row()?),
+        ENROLL_FAMILY_WORLD_ROW_V1 => FamilyRequest::EnrollWorldRow {
+            row: frame.world_row()?, member: frame.assertion()?,
+        },
         REGISTER_ASSERTION_FAMILY_V1 => FamilyRequest::Register { family: frame.uuid("family")?, original: frame.occurrence()? },
         RESERVE_FAMILY_LANDING_V1 => FamilyRequest::ReserveLanding { family: frame.uuid("family")?, reservation: frame.reservation()? },
         ACTIVATE_FAMILY_LANDING_V1 => FamilyRequest::ActivateLanding {
@@ -332,6 +345,13 @@ impl Service {
             request,
         ).await.map_err(status)?;
         let body = match reply {
+            FamilyReply::Scope { deployment, incarnation, root_line } => {
+                let mut out = BytesMut::with_capacity(40);
+                out.extend_from_slice(deployment.as_bytes());
+                out.extend_from_slice(&incarnation.get().to_be_bytes());
+                out.extend_from_slice(&root_line);
+                out.freeze()
+            }
             FamilyReply::Done => Bytes::from_static(b"\x01"),
             FamilyReply::Sealed(bytes) | FamilyReply::Opened(bytes) => {
                 let charge = call.reserve(bytes.len())?;
