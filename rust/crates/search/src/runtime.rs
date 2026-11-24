@@ -473,7 +473,6 @@ pub struct SearchRuntime {
     serving_admission: Arc<MemoryBudget>,
     serving_gaps: std::sync::atomic::AtomicU64,
     logical_run_reads: std::sync::atomic::AtomicU64,
-    tree_conversions: Mutex<BTreeMap<OpenedTreeKey, Arc<tokio::sync::OnceCell<Arc<SearchFile>>>>>,
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<LivePostings>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
@@ -492,7 +491,7 @@ impl SearchRuntime {
     /// `file_bytes` weights retained recorded files by whole-object or remote metadata size.
     /// Locally built files have half the allowance and mapped compatibility files have 32 times the allowance.
     /// The format 14 page cache has one quarter of the allowance, and the opened tree cache has eight times the allowance for roots and mapped objects.
-    /// Compatibility conversion shares a separate allowance of `file_bytes`.
+    /// Compatibility conversion and exact tree views share a separate allowance of `file_bytes`.
     pub fn new(file_bytes: usize) -> Arc<Self> {
         Self::with_paged_files(file_bytes, true)
     }
@@ -521,7 +520,7 @@ impl SearchRuntime {
             routing: Mutex::new(Bounded::new(file_bytes / 16)),
             file_admission, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
             logical_run_reads: Default::default(),
-            tree_conversions: Default::default(), definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(LIVE_POSTING_BYTES)),
+            definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(LIVE_POSTING_BYTES)),
             files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)),
             mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(),
             match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), suspect_runs: Default::default(),
@@ -663,39 +662,16 @@ impl SearchRuntime {
         })
     }
 
-    pub(crate) async fn materialized_tree(
-        &self, database: &str, storage: &Arc<BufferPool>, key: &ObjectKey, columns: &[String], identity: &str,
-        version: i64, locator: &crate::file::TreeLocator,
+    pub(crate) async fn exact_tree(
+        &self, storage: &Arc<BufferPool>, key: &ObjectKey, columns: &[String], identity: &str,
+        version: i64, locator: &crate::file::TreeLocator, column: usize, queries: &[&rtdb_text::Query], all_runs: bool,
     ) -> std::result::Result<Arc<SearchFile>, FileError> {
         let weight = usize::try_from(locator.length).unwrap_or(usize::MAX).saturating_mul(3);
-        if let Some(memory) = storage.prepaid_metadata_budget() {
-            let reservation = memory.reserve(weight).map_err(FileError::from_anomaly)?;
-            let tree = self.tree_file(storage, key, locator, columns, identity, version, false).await?;
-            return tree.materialize(columns, reservation).await.map(Arc::new).map_err(FileError::from_anomaly);
-        }
-        let cache_key = (database.to_owned(), key.as_str().to_owned());
-        if let Some((pool, file)) = self.files.lock().get(&cache_key)
-            && pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) {
-            return Ok(file);
-        }
-        let conversion_key = (Arc::as_ptr(storage) as usize, key.clone(), locator.digest());
-        let cell = Arc::clone(self.tree_conversions.lock().entry(conversion_key.clone()).or_default());
-        let converted = cell.get_or_try_init(|| async {
-            let tree = self.tree_file(storage, key, locator, columns, identity, version, false).await?;
-            let reservation = match self.file_admission.reserve(weight) {
-                Err(_) if self.files.lock().weight > 0 => {
-                    self.release_file_cache();
-                    self.file_admission.reserve(weight)
-                }
-                value => value,
-            }.map_err(FileError::from_anomaly)?;
-            let file = Arc::new(tree.materialize(columns, reservation).await.map_err(FileError::from_anomaly)?);
-            self.files.lock().insert(cache_key.clone(), (Arc::downgrade(storage), Arc::clone(&file)), weight);
-            Ok(file)
-        }).await.map(Arc::clone);
-        let mut building = self.tree_conversions.lock();
-        if building.get(&conversion_key).is_some_and(|current| Arc::ptr_eq(current, &cell)) { building.remove(&conversion_key); }
-        converted
+        let memory = storage.prepaid_metadata_budget().unwrap_or(&self.file_admission);
+        let reservation = memory.reserve(weight).map_err(FileError::from_anomaly)?;
+        let tree = self.tree_file(storage, key, locator, columns, identity, version, false).await?;
+        Box::pin(tree.exact(columns, column, queries, all_runs, reservation)).await
+            .map(Arc::new).map_err(FileError::from_anomaly)
     }
 
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
@@ -801,7 +777,9 @@ impl SearchRuntime {
             return Ok(Arc::new(trie.file.match_selected_iids(column, query, iids)?));
         }
         let set = Arc::new(trie.file.match_set(column, query)?);
-        self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), set.bytes());
+        if !trie.file.is_query_tree() {
+            self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), set.bytes());
+        }
         Ok(set)
     }
 

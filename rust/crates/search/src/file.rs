@@ -422,7 +422,8 @@ impl SearchFile {
                     if positions { pages.push(block.page + 1); }
                 }
             } else {
-                pages.push(term.page);
+                let (page, _) = term.legacy_location.ok_or_else(|| corrupt("Search term has no posting location"))?;
+                pages.push(page);
             }
         }
         self.reader.prefetch(pages).await
@@ -437,9 +438,15 @@ impl SearchFile {
 
     fn open_reader(reader: Reader, columns: &[String]) -> Result<Self> {
         let manifest = Manifest::read(&reader, columns)?;
-        let validated_postings = (0..manifest.terms().len()).map(|_| OnceLock::new()).collect();
-        Ok(Self { reader, columns: columns.to_vec(), manifest, validated_postings, _reservation: None })
+        Ok(Self::with_manifest(reader, columns, manifest))
     }
+
+    fn with_manifest(reader: Reader, columns: &[String], manifest: Manifest) -> Self {
+        let validated_postings = (0..manifest.terms().len()).map(|_| OnceLock::new()).collect();
+        Self { reader, columns: columns.to_vec(), manifest, validated_postings, _reservation: None }
+    }
+
+    pub(crate) fn is_query_tree(&self) -> bool { self.reader.format >= TREE_FORMAT_VERSION }
 
     fn column(&self, column: &str) -> Option<usize> { self.columns.iter().position(|candidate| candidate == column) }
 
@@ -719,13 +726,14 @@ impl<'a> PostingPages<'a> {
         let postings = if let Some(blocks) = self.file.manifest.blocks(&term) {
             paged::postings(&self.file.reader, &blocks, self.file.manifest.documents, positions)?
         } else {
-            let page = match self.pages.entry(term.page) {
+            let (page, slot) = term.legacy_location.ok_or_else(|| corrupt("Search term has no posting location"))?;
+            let page = match self.pages.entry(page) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(postings_table(&self.file.reader.page(term.page)?))
+                    entry.insert(postings_table(&self.file.reader.page(page)?))
                 }
             };
-            Postings::from_table(page, term.index)?
+            Postings::from_table(page, slot)?
         };
         let validity = &self.file.validated_postings[term.ordinal];
         if validity.get().is_none() {
@@ -963,6 +971,26 @@ mod tests {
         let mut encoded = Vec::new();
         legacy11::decode_to(bundle.clone(), &columns, &mut encoded, None)?;
         compare(&SearchFile::open(bundle, &columns)?, &SearchFile::open(encoded, &columns)?)
+    }
+
+    #[test]
+    fn query_batches_preserve_durable_phrase_matches_temporal_scores_and_row_answers() -> Result<()> {
+        let columns = columns();
+        let rows = rows();
+        let memory = rtdb_columnar::MemoryBudget::new(8 << 20);
+        let (built, _) = build_query_pages(&columns, [Ok(rows.clone())], None, memory.reserve(4 << 20)?)?;
+        let durable = SearchFile::open(build_search_file(&columns, &rows, "durable")?, &columns)?;
+        let matching = Query::parse("\"invoice is overdue\"");
+        let scoring = Query::parse("invoice overdue");
+        for system in [15, 25, 35] {
+            let scored = |file: &SearchFile| file.scored("body", &matching, &scoring, None, at(0, system))
+                .map(|scores| scores.into_iter().map(|(doc, score)| (doc, score.to_bits())).collect::<Vec<_>>());
+            assert_eq!(scored(&built)?, scored(&durable)?);
+        }
+        let matches = Arc::new(built).match_set("body", &matching)?;
+        assert_eq!(matches.value(0, 0)?, Some(true));
+        assert_eq!(matches.value(0, 1)?, Some(false));
+        Ok(())
     }
 
     #[tokio::test]

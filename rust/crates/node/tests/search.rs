@@ -198,6 +198,11 @@ async fn an_owned_corpus_reads_a_published_format_fourteen_tree() {
     verify_owned_search_artefacts(14).await;
 }
 
+#[tokio::test]
+async fn an_owned_corpus_reads_a_published_format_fifteen_tree() {
+    verify_owned_search_artefacts(15).await;
+}
+
 async fn verify_owned_search_artefacts(format: u32) {
     use rtdb_types::{EntityId, OwnedRelation, StructFields};
 
@@ -208,6 +213,7 @@ async fn verify_owned_search_artefacts(format: u32) {
     let runtime = match format {
         11 => rtdb_search::SearchRuntime::with_tantivy_files(16 << 20),
         14 => rtdb_search::SearchRuntime::with_tree_files(16 << 20),
+        15 => rtdb_search::SearchRuntime::with_search_packs(16 << 20),
         _ => rtdb_search::SearchRuntime::new(16 << 20),
     };
     let services = NodeServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()], ..services() };
@@ -251,6 +257,7 @@ async fn verify_owned_search_artefacts(format: u32) {
     assert_eq!(uncovered_rank.total, 18);
     assert_eq!(uncovered_rank.hits[0].id, EntityId::String("1".into()));
     assert_eq!(uncovered_rank.hits[1].id, EntityId::Integer(3));
+    let (uncovered_phrase, _) = uncovered.ranked_search_page(&partitions, "\"an invoice\"", 1, 2, false).await.unwrap();
     drop(uncovered);
     let private_catalog = OwnedRelation::search_catalog("xtdb");
     let direct = format!("SELECT _id FROM {}.\"{}\"", private_catalog.schema, private_catalog.table);
@@ -281,6 +288,9 @@ async fn verify_owned_search_artefacts(format: u32) {
     ).await.unwrap();
     assert_eq!(covered_rank.total, uncovered_rank.total);
     assert_eq!(covered_rank.hits, uncovered_rank.hits);
+    let (covered_phrase, _) = held.ranked_search_page(&partitions, "\"an invoice\"", 1, 2, false).await.unwrap();
+    assert_eq!(covered_phrase.total, uncovered_phrase.total);
+    assert_eq!(covered_phrase.hits, uncovered_phrase.hits);
     let (hits, _) = held.ranked_search(&partitions, "invoice", 2, false).await.unwrap();
     assert_eq!(hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
         [rtdb_types::EntityId::Integer(1), rtdb_types::EntityId::Integer(2)]);

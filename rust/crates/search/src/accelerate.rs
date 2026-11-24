@@ -356,14 +356,21 @@ impl SearchAccelerator {
             .filter(|locator| locator.format() == format && i64::try_from(locator.length).ok() == record.file_size);
         Ok(Some(Recorded {
             key: ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?,
-            artefact_id: record.definition_id().to_owned(), owner, member, locator, tree, sections,
+            artefact_id: record.definition_id().to_owned(), owner, member, format, locator, tree, sections,
         }))
     }
 
     async fn open_recorded(runtime: &crate::SearchRuntime, database: &str, storage: &Arc<rtdb_storage::cache::BufferPool>,
-        recorded: &Recorded, definition: &SearchDefinition, identity: &str) -> std::result::Result<Arc<SearchFile>, crate::runtime::FileError> {
-        if let Some(locator) = &recorded.tree {
-            return runtime.materialized_tree(database, storage, &recorded.key, &definition.columns, identity, definition.version, locator).await;
+        recorded: &Recorded, definition: &SearchDefinition, identity: &str, column: &str, queries: &[&Query], load: LoadSearch,
+    ) -> std::result::Result<Arc<SearchFile>, crate::runtime::FileError> {
+        if recorded.format >= crate::file::TREE_FORMAT_VERSION {
+            use crate::runtime::FileError;
+            let locator = recorded.tree.as_ref().ok_or_else(|| FileError::Corrupt(
+                Anomaly::fault("rtdb.search/corrupt-file", "Recorded search tree has no matching root locator")))?;
+            let field = definition.columns.iter().position(|indexed| indexed == column).ok_or_else(|| FileError::Corrupt(
+                Anomaly::fault("rtdb.search/corrupt-file", "Recorded search definition omits its indexed column")))?;
+            return Box::pin(runtime.exact_tree(storage, &recorded.key, &definition.columns, identity, definition.version,
+                locator, field, queries, load.needs_all_runs())).await;
         }
         runtime.file_with_locator(database, storage, &recorded.key, &definition.columns, recorded.locator.as_ref()).await
     }
@@ -376,7 +383,10 @@ impl SearchAccelerator {
         let table = &request.scan.table.name.table;
         let entry = request.snapshot.table_entry(table).ok_or_else(uncovered_owned_search)?;
         let identity = crate::file::artefact_identity(entry.slug.as_str(), &recorded.owner, &recorded.artefact_id, definition.version);
-        let error = match Self::open_recorded(&self.runtime, request.database, request.storage, recorded, definition, &identity).await {
+        let opened = request.cancellation.run_until_cancelled(Box::pin(Self::open_recorded(
+            &self.runtime, request.database, request.storage, recorded, definition, &identity, column, queries, load,
+        ))).await.ok_or_else(search_cancelled)?;
+        let error = match opened {
             Ok(file) if file.matches_artefact(&identity, definition.version) => {
                 if matches!(load, LoadSearch::Rank { .. }) && !file.needs_ranked_postings() { return Ok(Some(file)); }
                 match file.prepare_terms(column, queries).await.and_then(|()| file.check_terms(column, queries)) {
@@ -480,13 +490,31 @@ struct Recorded {
     owner: ArtefactOwner,
     member: u32,
     artefact_id: String,
+    format: i32,
     locator: Option<crate::file::FooterLocator>,
     tree: Option<crate::file::TreeLocator>,
     sections: Option<Vec<crate::file::Section>>,
 }
 
 #[derive(Clone, Copy)]
-enum LoadSearch { Match, Rank { prefer_paged: bool } }
+enum LoadSearch {
+    Match,
+    Rank { prefer_paged: bool },
+    Owned,
+    #[cfg(feature = "experiments")]
+    Experiment,
+}
+
+impl LoadSearch {
+    fn needs_all_runs(self) -> bool {
+        match self {
+            Self::Owned => true,
+            #[cfg(feature = "experiments")]
+            Self::Experiment => true,
+            Self::Match | Self::Rank { .. } => false,
+        }
+    }
+}
 
 /// A shared file's selected members and their positions in the scan's trie list.
 struct FileMembers { file: Arc<SearchFile>, members: BTreeMap<u32, usize> }
@@ -568,8 +596,10 @@ async fn covered_owned_corpus(
             Arc::clone(file)
         } else {
             let identity = crate::file::artefact_identity(entry.slug.as_str(), &recorded.owner, &recorded.artefact_id, definition.version);
-            let file = SearchAccelerator::open_recorded(&runtime, database, &captured.storage, &recorded, &definition, &identity).await
-                .map_err(|_| uncovered_owned_search())?;
+            let queries = [query];
+            let file = context.cancellation.run_until_cancelled(Box::pin(SearchAccelerator::open_recorded(
+                &runtime, database, &captured.storage, &recorded, &definition, &identity, column, &queries, LoadSearch::Owned,
+            ))).await.ok_or_else(search_cancelled)?.map_err(|_| uncovered_owned_search())?;
             file.prepare_terms(column, &[query]).await.map_err(|_| uncovered_owned_search())?;
             if !file.matches_artefact(&identity, definition.version) {
                 return Err(uncovered_owned_search());

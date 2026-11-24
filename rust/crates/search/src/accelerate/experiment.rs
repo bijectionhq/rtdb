@@ -71,7 +71,7 @@ impl PointRanking {
         if limit == 0 { return Ok((Ok(Vec::new()), work)); }
         let Some(definition) = accelerator.definition(request, column).await? else { return Ok((Err(Fallback::IndexCoverage), work)) };
         let scoring = Query::parse(scoring);
-        let TrieFiles::Complete(Found { files, skipped }) = accelerator.trie_files(request, &definition, column, &[matching, &scoring], super::LoadSearch::Match, None).await?
+        let TrieFiles::Complete(Found { files, skipped }) = accelerator.trie_files(request, &definition, column, &[matching, &scoring], super::LoadSearch::Experiment, None).await?
             else { return Ok((Err(Fallback::IndexCoverage), work)) };
         let scoring = Arc::new(rtdb_text::Scorer::new(scoring, None));
         let Some(rank_scorer) = scoring.for_ranking() else { return Ok((Err(Fallback::ScoreDomain), work)); };

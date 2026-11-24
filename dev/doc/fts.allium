@@ -186,7 +186,9 @@ rule SearchJobRuns {
     -- The projected decoder selects event headers, the document ID and the indexed children of the put struct.
     -- The analyzer writes token bytes and offsets directly into Arrow string builders and offers a term visitor for consumers of ordered tokens.
     -- An on-demand build decodes page buffers from its retained data-file cache lease and serves the typed search pages it builds.
-    -- Both reserve the segment's indexing heap up front in proportion to the input size, build the segment on disk, and stream the bundle to the object store.
+    -- Each build reserves the indexing heap up front in proportion to its input size.
+    -- A durable build writes the segment on disk and streams it to the object store.
+    -- An on-demand build retains its checked Arrow batches for the query.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.
     -- The format 15 lane fills missing coverage and can replace committed singleton files with one pack independently of primary compaction.
@@ -307,6 +309,8 @@ rule RepairUnreadableSearchFile {
 --      The scan reads a shared file once and uses the runs of selected members alone for candidates and ranking.
 --      When a trie records several formats for the same definition version, ordinary and held reads prefer the newest Arrow format and can still open a format 11 record on its own.
 --      A ranked phrase scan can use an existing format 13 sidecar when all selected format 14 sources also have that sidecar.
+--      Exact reads of formats 14 and 15 use authenticated pages for the queried terms and retain the event pages needed for row answers and temporal cuts.
+--      Public reads need document pages only for the relevant scoring windows, and an exact held corpus visits every covered document page because nonmatching runs contribute to its statistics.
 --   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
 --      A data file never changes, so a kept one serves every later query of the trie.
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.

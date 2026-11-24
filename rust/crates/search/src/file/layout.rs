@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
@@ -418,6 +419,7 @@ impl FooterLocator {
 enum ReadPages {
     Local(Box<dyn Fn(Range<usize>) -> Result<Buffer> + Send + Sync>),
     Remote { storage: Weak<BufferPool>, key: ObjectKey },
+    Checked(BTreeMap<usize, RecordBatch>),
 }
 
 pub(super) struct Reader {
@@ -435,6 +437,12 @@ impl Reader {
         Self { read: ReadPages::Local(Box::new(|_| Err(corrupt("Search page was not materialized")))),
             decoder: FileDecoder::new(Arc::clone(schema(format)), arrow_ipc::MetadataVersion::V5),
             blocks: Vec::new(), hashes: String::new(), pages: batches.into_iter().map(OnceLock::from).collect(), format, length: 0 }
+    }
+
+    pub(super) fn from_sparse_checked_batches(batches: BTreeMap<usize, RecordBatch>, format: i32) -> Self {
+        Self { read: ReadPages::Checked(batches),
+            decoder: FileDecoder::new(Arc::clone(schema(format)), arrow_ipc::MetadataVersion::V5),
+            blocks: Vec::new(), hashes: String::new(), pages: Vec::new(), format, length: 0 }
     }
 
     pub(super) fn from_source(source: Source) -> Result<Self> {
@@ -496,7 +504,12 @@ impl Reader {
         Ok(Self { read, decoder: FileDecoder::new(Arc::clone(schema(format)), footer.version()), blocks, hashes, pages, format, length })
     }
 
-    pub(super) fn len(&self) -> usize { self.pages.len() }
+    pub(super) fn len(&self) -> usize {
+        match &self.read {
+            ReadPages::Checked(pages) => pages.len(),
+            _ => self.pages.len(),
+        }
+    }
 
     pub(super) fn metadata_bytes(&self) -> usize {
         self.blocks.iter().take(if self.format == FORMAT_VERSION { 2 } else { 1 })
@@ -514,6 +527,9 @@ impl Reader {
     }
 
     pub(super) fn page(&self, page: usize) -> Result<RecordBatch> {
+        if let ReadPages::Checked(pages) = &self.read {
+            return pages.get(&page).cloned().ok_or_else(|| corrupt("Search page was not prepared"));
+        }
         let slot = self.pages.get(page).ok_or_else(|| corrupt("Search file has no such record batch"))?;
         if let Some(batch) = slot.get() { return Ok(batch.clone()); }
         let block = self.blocks.get(page).ok_or_else(|| corrupt("Search file has no such record batch"))?;

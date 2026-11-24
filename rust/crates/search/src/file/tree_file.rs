@@ -8,7 +8,7 @@ use arrow_buffer::Buffer;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
 use sha2::{Digest, Sha256};
-use crate::rank_windows::window_of;
+use crate::rank_windows::{document_range, window_of};
 use crate::term_directory::TermSummaries;
 
 use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
@@ -474,45 +474,85 @@ impl TreeFile {
         Ok(())
     }
 
-    pub async fn materialize(&self, columns: &[String], reservation: Arc<rtdb_columnar::MemoryReservation>) -> Result<super::SearchFile> {
-        let terms = self.all(TERM).await?;
-        let documents = self.all(DOCUMENT).await?;
-        let visibility = self.all(VISIBILITY).await?;
-        let pages = self.find(PAGE_ROWS, &ordinal(0)).await?.ok_or_else(|| corrupt("Search tree has no primary page starts"))?;
-        let row_maps = visibility.iter().map(|batch| table(batch, Table::RowRuns)).collect::<Vec<_>>();
-        let mut rows = Vec::new();
-        let mut lengths = Vec::new();
-        for column in 0..columns.len() {
-            let start = rows.len();
-            for map in &row_maps {
-                let entries = map.column(0).as_list::<i64>();
-                if column >= entries.len() { return Err(corrupt("Search row map has the wrong column count")); }
-                let entries = entries.value(column);
-                rows.extend_from_slice(entries.as_primitive::<UInt32Type>().values());
-            }
-            lengths.push(rows.len() - start);
+    pub(crate) async fn exact(&self, columns: &[String], column: usize, queries: &[&rtdb_text::Query], all_runs: bool,
+        reservation: Arc<MemoryReservation>) -> Result<super::SearchFile> {
+        use super::manifest::{Manifest, validate_term_blocks, window_count};
+
+        if !matches!(self.format, TREE_FORMAT_VERSION | PACKED_FORMAT_VERSION) {
+            return Err(corrupt("Exact trie search requires a combined search tree"));
         }
-        let row_maps = Table::RowRuns.array(vec![list(Arc::new(arrow_array::UInt32Array::from(rows)), lengths,
-            item_of(&Table::RowRuns.fields()[0]))?])?;
-        let layout = super::layout::record(self.format, [
-            (Table::Header, table(&self.root, Table::Header)),
-            (Table::Columns, table(&self.root, Table::Columns)),
-            (Table::Members, table(&self.root, Table::Members)),
-            (Table::Sections, table(&self.root, Table::Sections)),
-            (Table::Pages, table(&pages, Table::Pages)),
-            (Table::Terms, concat(&terms, Table::Terms)?),
-            (Table::Blocks, rank_tree::materialize_blocks(&self.reader, &terms).await?),
-            (Table::Windows, concat(&documents, Table::Windows)?),
-        ])?;
-        let visibility = super::layout::record(self.format, [
-            (Table::Events, concat(&visibility, Table::Events)?),
-            (Table::Runs, concat(&documents, Table::Runs)?),
-            (Table::RowRuns, row_maps),
-        ])?;
-        let mut pages = vec![layout, visibility];
-        pages.extend(self.all(POSTING).await?);
-        super::SearchFile::open_reader(super::layout::Reader::from_checked_batches(pages, self.format), columns)
-            .map(|file| file.with_reservation(reservation))
+        let counts = table(&self.root, Table::Pages);
+        if counts.len() != 2 || counts.column(0).null_count() != 0 {
+            return Err(corrupt("Search tree has no row and document counts"));
+        }
+        let documents = counts.column(0).as_primitive::<UInt32Type>().value(1);
+        if documents >= super::NULL_DOC { return Err(corrupt("Search tree has too many documents")); }
+
+        let terms = queries.iter().flat_map(|query| query.terms()).cloned().collect::<BTreeSet<_>>()
+            .into_iter().collect::<Vec<_>>();
+        let term_pages = self.term_pages(column as u32, &terms).await?;
+        let mut selected = Vec::new();
+        let mut posting_ordinals = BTreeSet::new();
+        let mut document_ordinals = BTreeSet::new();
+        let mut slots = BTreeSet::new();
+        for (name, page) in terms.into_iter().zip(term_pages) {
+            let Some(page) = page else { continue; };
+            let Some(term) = self.exact_term(&page, column as u32, name, documents).await? else { continue; };
+            validate_term_blocks(&term.blocks, term.frequency, window_count(documents), &mut slots)?;
+            let positions = queries.iter().any(|query| super::needs_positions(query, &term.name));
+            for block in &term.blocks {
+                posting_ordinals.insert(block.page);
+                if positions { posting_ordinals.insert(block.page + 1); }
+                if !all_runs {
+                    document_ordinals.extend(block.impacts.iter().map(|impact| {
+                        (document_range(impact.window).0 as usize / DOCUMENT_ROWS) * DOCUMENT_ROWS
+                    }));
+                }
+            }
+            selected.push(term);
+        }
+        if all_runs { document_ordinals.extend((0..documents as usize).step_by(DOCUMENT_ROWS)); }
+        let postings = self.find_ordinals(POSTING, posting_ordinals.clone()).await?;
+        let runs = self.find_ordinals(DOCUMENT, document_ordinals.clone()).await?;
+        if !postings.keys().copied().eq(posting_ordinals) || !runs.keys().copied().eq(document_ordinals) {
+            return Err(corrupt("Search tree omits a requested posting or document page"));
+        }
+
+        // Other tries use these events to cut visibility, even when this tree has no queried term.
+        let events = self.all(VISIBILITY).await?;
+        let primary = self.find(PAGE_ROWS, &ordinal(0)).await?.ok_or_else(|| corrupt("Search tree has no primary page starts"))?;
+        let manifest = Manifest::read_tree(&self.root, &primary, documents, column, selected, events, runs)?;
+        let reader = super::layout::Reader::from_sparse_checked_batches(postings, self.format);
+        Ok(super::SearchFile::with_manifest(reader, columns, manifest).with_reservation(reservation))
+    }
+
+    async fn exact_term(&self, page: &RecordBatch, column: u32, name: String, documents: u32) -> Result<Option<super::manifest::ScopedTerm>> {
+        let terms = table(page, Table::Terms);
+        let columns = terms.column(0).as_primitive::<UInt32Type>();
+        let names = terms.column(1).as_string::<i32>();
+        let frequencies = terms.column(4).as_primitive::<UInt32Type>();
+        let mut entries = (0..terms.len()).filter(|&row| columns.value(row) == column && names.value(row) == name.as_str());
+        let Some(row) = entries.next() else { return Ok(None); };
+        let frequency = frequencies.value(row);
+        if entries.next().is_some() || !(1..=documents).contains(&frequency) {
+            return Err(corrupt("Search tree term directory is invalid"));
+        }
+        let node = rank_tree::node_at(&table(page, Table::RankNodes), row)?;
+        let mut blocks = Vec::new();
+        if node.page.is_some() {
+            for leaf in rank_tree::leaves(&self.reader, node, node.first, node.last).await? {
+                let (table, _) = rank_tree::leaf_arrays(&self.reader, leaf).await?;
+                let entries = table.column(0).as_list::<i64>();
+                if entries.len() != 1 || entries.is_null(0) { return Err(corrupt("Search term has an invalid rank leaf")); }
+                blocks.extend(super::paged::blocks(entries, 0));
+            }
+        } else {
+            let table = table(page, Table::Blocks);
+            let entries = table.column(0).as_list::<i64>();
+            if row >= entries.len() || entries.is_null(row) { return Err(corrupt("Search term has no inline blocks")); }
+            blocks = super::paged::blocks(entries, row);
+        }
+        Ok(Some(super::manifest::ScopedTerm { name, frequency, blocks }))
     }
 
     #[cfg(test)]
@@ -736,16 +776,6 @@ fn lower_bound(len: usize, before: impl Fn(usize) -> bool) -> usize {
     from
 }
 
-fn concat(batches: &[RecordBatch], shape: Table) -> Result<StructArray> {
-    if batches.is_empty() {
-        let empty = arrow_array::new_empty_array(&arrow_schema::DataType::Struct(shape.fields()));
-        return Ok(empty.as_struct().clone());
-    }
-    let parts: Vec<_> = batches.iter().map(|batch| table(batch, shape)).collect();
-    let arrays: Vec<&dyn Array> = parts.iter().map(|part| part as &dyn Array).collect();
-    Ok(arrow_select::concat::concat(&arrays).map_err(fault)?.as_struct().clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,11 +822,61 @@ mod tests {
         while rank.bound().is_some() {
             for hit in rank.expand(None, &mut 0).await.unwrap() { actual.insert(hit.iid.0, hit.key.score.to_bits()); }
         }
-        let dense = tree.materialize(&columns, rtdb_columnar::MemoryBudget::new(32 << 20).reserve(16 << 20).unwrap()).await.unwrap();
-        let expected = dense.scored("body", &matching, &scoring, None, bounds).unwrap().into_iter()
+        let flat = super::super::build_search_file(&columns, &rows, "flat").unwrap();
+        let flat = super::super::SearchFile::open(flat, &columns).unwrap();
+        let expected = flat.scored("body", &matching, &scoring, None, bounds).unwrap().into_iter()
             .map(|(doc, score)| (doc.iid, score.to_bits())).collect::<BTreeMap<_, _>>();
         assert_eq!(actual.len(), rows.len());
         assert_eq!(actual, expected);
+        let exact = tree.exact(&columns, 0, &[&matching, &scoring], false, MemoryBudget::new(32 << 20).reserve(16 << 20).unwrap()).await.unwrap();
+        let scored = exact.scored("body", &matching, &scoring, None, bounds).unwrap().into_iter()
+            .map(|(doc, score)| (doc.iid, score.to_bits())).collect::<BTreeMap<_, _>>();
+        assert_eq!(scored, expected);
+    }
+
+    #[tokio::test]
+    async fn sparse_phrase_answers_skip_unrelated_documents_but_corpus_requires_them() -> Result<()> {
+        let columns = ["body".to_owned()];
+        let iid = |id: u32| {
+            let mut iid = [0u8; 16];
+            iid[..4].copy_from_slice(&id.to_be_bytes());
+            iid
+        };
+        let rows = (0..1026).map(|id| super::super::SearchRow {
+            position: None, iid: iid(id), identity: None, system_from: 1, valid_from: 0, valid_to: i64::MAX,
+            op: EventOp::Put, values: vec![match id {
+                0 => Some(tokens("overdue invoice")),
+                1 => Some(tokens("invoice overdue")),
+                1025 => None,
+                _ => Some(tokens("unrelated")),
+            }],
+        }).collect::<Vec<_>>();
+        let mut file = tempfile::tempfile().unwrap();
+        super::super::write_versioned_group(&columns, [[Ok(rows)]], "sparse", 1, None, &mut file, None, PACKED_FORMAT_VERSION)?;
+        let locator = TreeLocator::read(&mut file, PACKED_FORMAT_VERSION)?;
+        file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let tree = TreeFile::local(Buffer::from_vec(bytes.clone()), None, &locator, &columns, "sparse", 1).await?;
+        let skipped = tree.page_reference_for_test(DOCUMENT, &ordinal(DOCUMENT_ROWS)).await?.unwrap();
+        bytes[skipped.range()?.start as usize] ^= 1;
+        let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "sparse", 1).await?;
+        let query = Query::parse("\"overdue invoice\"");
+        let memory = MemoryBudget::new(16 << 20);
+        let exact = Arc::new(tree.exact(&columns, 0, &[&query], false, memory.reserve(4 << 20)?).await?);
+        let bounds = TemporalBounds { valid_time: Interval::at(Timestamp(2))?, system_time: Interval::at(Timestamp(2))? };
+        assert_eq!(exact.matches("body", &query, bounds)?.iter().map(|doc| doc.iid).collect::<Vec<_>>(), [iid(0)]);
+        assert_eq!(exact.events(&iid(1024))?.len(), 1);
+        let set = Arc::new(exact.match_set("body", &query)?);
+        let member = set.member(0)?;
+        use rtdb_query::FileMatches;
+        assert_eq!(member.value(0, 0)?, Some(true));
+        assert_eq!(member.value(0, 1)?, Some(false));
+        assert_eq!(member.value(0, 1024)?, Some(false));
+        assert_eq!(member.value(0, 1025)?, None);
+        let corpus = tree.exact(&columns, 0, &[&query], true, memory.reserve(4 << 20)?).await;
+        assert_eq!(corpus.err().unwrap().code, "rtdb.search/corrupt-file");
+        Ok(())
     }
 
     #[tokio::test]
