@@ -115,7 +115,7 @@ impl RetainRepairBase {
     ) -> Result<LocalRepairAnchor> {
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
         let cache = CacheBudget::new(CACHE_BYTES);
-        let source = Arc::new(LocalStore::open_in(source_root, region.clone())?);
+        let source = Arc::new(LocalStore::open_in(&source_root, region.clone())?);
         let base_store = Arc::new(LocalStore::open_in(&base_root, region.clone())?);
         let source_body = repair_body(source.clone(), vault, region).await?;
         let base_body = repair_body(base_store.clone(), vault, region).await?;

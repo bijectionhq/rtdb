@@ -123,6 +123,7 @@ impl OwnedReadSession {
             database: self.database.clone(),
             owner: self.owner.clone(),
             present: self.present,
+            receiver_observation: None,
             witness_scope: None,
             applied_scope: None,
             applied_preparation: None,

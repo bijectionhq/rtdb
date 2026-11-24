@@ -1465,6 +1465,7 @@ impl OwnedReadSession {
         Ok(Self {
             context, node: self.node.clone(), identity: Arc::clone(&self.identity),
             database: self.database.clone(), owner: self.owner.clone(), present: self.present,
+            receiver_observation: self.receiver_observation,
             witness_scope: self.witness_scope, applied_scope: None, applied_preparation: None, witness_until: self.witness_until, fork_until: self.fork_until,
             cancellation, session_cancellation: self.session_cancellation.clone(),
             historical: None, scoped_root: Some(relations), attachment: self.attachment.clone(),
