@@ -64,6 +64,18 @@ impl ServingDriver for MultiServing {
         self.database.lock().await.destroy_retired_token_key(generation).await
     }
 
+    async fn export_checkpoint(&self, pin: uuid::Uuid, basis: Basis, until: Option<Timestamp>, cancellation: &CancellationToken) -> Result<Vec<u8>> {
+        cancellation.run_until_cancelled(self.writes.export(pin, basis, until)).await.ok_or_else(interrupted)?
+    }
+
+    async fn open_checkpoint_export(&self, ticket: Vec<u8>, cancellation: &CancellationToken) -> Result<rtdb_db::PinnedExport> {
+        cancellation.run_until_cancelled(self.writes.open_export(ticket)).await.ok_or_else(interrupted)?
+    }
+
+    async fn restore_checkpoint(&self, export: rtdb_db::PinnedExport, cancellation: &CancellationToken) -> Result<BranchCut> {
+        cancellation.run_until_cancelled(self.writes.restore(export)).await.ok_or_else(interrupted)?
+    }
+
     fn features(&self) -> &[&str] {
         &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, COUNT_RANGE_CONSTRAINT, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
           "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history",

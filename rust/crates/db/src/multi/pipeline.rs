@@ -12,7 +12,8 @@ use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, Decision, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
     TransactPipeline, TransactState, TransactionRecord, TxKey,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{ClaimVerifier, LabelScope}};
+use rtdb_index::branches::BranchCut;
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
 use tokio::{
     sync::{Mutex, OnceCell, mpsc, oneshot},
     task::JoinHandle,
@@ -21,7 +22,7 @@ use tokio::{
 use crate::replay::JournalCoordinates;
 
 use super::{
-    Entry, Lease, MultiDatabase, Role, Stream, missing_receipt, next, no_writer,
+    Entry, Lease, MultiDatabase, PinnedExport, Role, Stream, Uuid, missing_receipt, next, no_writer,
 };
 
 const CAPACITY: usize = 64;
@@ -32,6 +33,9 @@ type Reply<T> = oneshot::Sender<Result<T>>;
 enum Command {
     Transact(Work),
     Tick(BTreeSet<IpAddr>, Reply<Role>),
+    Export { pin: Uuid, basis: Basis, until: Option<Timestamp>, reply: Reply<Vec<u8>> },
+    OpenExport { ticket: Vec<u8>, reply: Reply<PinnedExport> },
+    Restore { export: PinnedExport, reply: Reply<BranchCut> },
 }
 
 struct Scope {
@@ -128,11 +132,24 @@ impl WritePipeline {
     }
 
     pub async fn tick(&self, live: BTreeSet<IpAddr>) -> Result<Role> {
+        self.request(|reply| Command::Tick(live, reply)).await
+    }
+
+    pub async fn export(&self, pin: Uuid, basis: Basis, until: Option<Timestamp>) -> Result<Vec<u8>> {
+        self.request(|reply| Command::Export { pin, basis, until, reply }).await
+    }
+
+    pub async fn open_export(&self, ticket: Vec<u8>) -> Result<PinnedExport> {
+        self.request(|reply| Command::OpenExport { ticket, reply }).await
+    }
+
+    pub async fn restore(&self, export: PinnedExport) -> Result<BranchCut> {
+        self.request(|reply| Command::Restore { export, reply }).await
+    }
+
+    async fn request<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T> {
         let (reply, result) = oneshot::channel();
-        self.input
-            .send(Command::Tick(live, reply))
-            .await
-            .map_err(|_| pipeline_closed())?;
+        self.input.send(command(reply)).await.map_err(|_| pipeline_closed())?;
         result.await.map_err(|_| pipeline_closed())?
     }
 }
@@ -241,6 +258,18 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             }
             Command::Tick(live, reply) => {
                 let result = database.lock().await.tick(&live).await;
+                let _ = reply.send(result);
+            }
+            Command::Export { pin, basis, until, reply } => {
+                let result = database.lock().await.export_ticket(pin, basis, until).await;
+                let _ = reply.send(result);
+            }
+            Command::OpenExport { ticket, reply } => {
+                let result = database.lock().await.open_export_ticket(&ticket).await;
+                let _ = reply.send(result);
+            }
+            Command::Restore { export, reply } => {
+                let result = database.lock().await.restore_export(&export).await;
                 let _ = reply.send(result);
             }
         }
