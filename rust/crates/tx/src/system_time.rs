@@ -76,11 +76,16 @@ pub fn clock_slot_reading(observed: rtdb_types::Timestamp) -> Option<rtdb_types:
 pub(crate) fn clock_slot_admits(
     through: i64, predecessor: i64, reading: i64, appended: i64, observed: i64,
 ) -> bool {
+    through <= predecessor && reading <= appended && clock_slot_contains(reading, observed)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(admitted =>
+    ensures admitted == (reading <= observed && reading as int + 1000000 <= i64::MAX as int
+        && (observed as int) < reading as int + 1000000),
+))]
+pub(crate) fn clock_slot_contains(reading: i64, observed: i64) -> bool {
     let Some(until) = reading.checked_add(1_000_000) else { return false; };
-    through <= predecessor
-        && reading <= appended
-        && reading <= observed
-        && observed < until
+    reading <= observed && observed < until
 }
 
 #[cfg(not(verus_keep_ghost))]

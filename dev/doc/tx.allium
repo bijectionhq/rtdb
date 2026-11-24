@@ -162,6 +162,7 @@
 -- The receiver derives the staged generation's event position from the admitted source command.
 -- The receiver derives its SQL history coordinate independently of the clock offer.
 -- Prepared effects and terminal metadata install only under the exact assigned source position and predecessor.
+-- Committed clock-slot receipts retain the original offered reading and through-position with the receiver sample.
 -- The clock target must be at or before source append.
 -- An ordered receipt reads the assigned transaction position from its winning assertion after publication.
 -- Attempt recovery can join that position to its original receiver observation on the retained Root cut.

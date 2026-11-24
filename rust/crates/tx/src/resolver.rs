@@ -538,6 +538,7 @@ impl TxResolver {
             attempt, retirement: context.placed_receipt_retirement,
         });
         let selected = if settled { refusal } else { primary };
+        if result.committed() { tx.clock_slot = slot; }
         let mut resolved = tx.finish_source(result, input, log_time, clock, selected, prepared_writes).await?;
         if resolved.result().committed() && let Some((until, journal_before)) = staging_deadline
             && let Err(error) = resolved.prepare_inline_replica(writer.as_ref(), until, journal_before, &context.memory)
@@ -715,11 +716,12 @@ pub struct OpenTransaction<'a> {
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
     decision: Option<crate::DecisionObservation>,
+    clock_slot: Option<crate::OwnedClockSlot>,
     terms_time: Timestamp,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, decision: None, terms_time: key.system_time })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, decision: None, clock_slot: None, terms_time: key.system_time })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -3278,7 +3280,9 @@ impl<'a> OpenTransaction<'a> {
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         if let Some(sample) = self.decision {
-            document.insert("decision_clock".into(), Value::Binary(sample.encode().to_vec()));
+            document.insert("decision_clock".into(), Value::Binary(crate::OrderedClockEvidence {
+                observation: sample, slot: self.clock_slot,
+            }.encode().to_vec()));
         }
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
         self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &metadata_type)])

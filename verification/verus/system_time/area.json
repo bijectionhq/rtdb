@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 18,
+  "min_verified_functions": 19,
   "controls": {
     "reuse_the_previous_tick": {
       "mutate": [
@@ -204,8 +204,8 @@
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
-          "find": "&& reading <= observed\n        && observed < until",
-          "replace": "&& reading <= appended\n        && appended < until"
+          "find": "&& clock_slot_contains(reading, observed)",
+          "replace": "&& clock_slot_contains(reading, appended)"
         }
       ],
       "expect": [
@@ -227,7 +227,7 @@
       "expect": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
-          "function": "clock_slot_admits",
+          "function": "clock_slot_contains",
           "category": "postcondition not satisfied"
         }
       ]
@@ -236,8 +236,8 @@
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
-          "find": "&& reading <= appended\n        && reading <= observed",
-          "replace": "&& reading <= observed"
+          "find": "through <= predecessor && reading <= appended && clock_slot_contains",
+          "replace": "through <= predecessor && clock_slot_contains"
         }
       ],
       "expect": [

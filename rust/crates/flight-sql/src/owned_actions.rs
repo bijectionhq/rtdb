@@ -1669,7 +1669,7 @@ impl Service {
 
     async fn owned_tx_reply(&self, native: &NativeSession, tx: rtdb_types::TransactionKey) -> Result<ActionResult, Status> {
         let original = native.owned_commit_observation(tx).await.map_err(status)?;
-        let mut clock = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(1, rtdb_tx::DecisionObservation::WIDTH);
+        let mut clock = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(1, rtdb_tx::OrderedClockEvidence::WIDTH);
         match original {
             Some(sample) => clock.append_value(sample.encode()).map_err(arrow)?,
             None => clock.append_null(),
@@ -1677,7 +1677,7 @@ impl Service {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tx_id", DataType::Int64, false),
             Field::new("system_time_micros", DataType::Int64, false),
-            Field::new("decision_clock", DataType::FixedSizeBinary(rtdb_tx::DecisionObservation::WIDTH), true),
+            Field::new("decision_clock", DataType::FixedSizeBinary(rtdb_tx::OrderedClockEvidence::WIDTH), true),
         ]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
             Arc::new(Int64Array::from(vec![tx.tx_id.0])),
@@ -4680,7 +4680,7 @@ impl Service {
                 let mut metadata = schema.metadata().clone();
                 metadata.insert("rtdb.owned.receipt_tx_id".into(), tx_id.0.to_string());
                 if let Some(observation) = attempt.owned_attempt_observation(key).await.map_err(status)? {
-                    let mut encoded = String::with_capacity(rtdb_tx::DecisionObservation::WIDTH as usize * 2);
+                    let mut encoded = String::with_capacity(rtdb_tx::OrderedClockEvidence::WIDTH as usize * 2);
                     for byte in observation.encode() {
                         write!(encoded, "{byte:02x}").expect("String writes are infallible");
                     }

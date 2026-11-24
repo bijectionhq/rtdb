@@ -1,5 +1,5 @@
 mod decision_clock;
-pub use decision_clock::{DecisionClock, DecisionObservation};
+pub use decision_clock::{DecisionClock, DecisionObservation, OrderedClockEvidence};
 
 mod values;
 mod ipc;
