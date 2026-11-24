@@ -118,13 +118,11 @@ async fn run() -> Result<()> {
 
 async fn run_standalone(launch: rtdb_server::standalone::Launch) -> Result<()> {
     let stop = tokio_util::sync::CancellationToken::new();
-    if launch.parent_stdin {
-        let parent = stop.clone();
-        std::thread::Builder::new().name("rtdb-parent-stdin".into()).spawn(move || {
-            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-            parent.cancel();
-        }).map_err(signal_error)?;
-    }
+    let parent = stop.clone();
+    std::thread::Builder::new().name("rtdb-parent-stdin".into()).spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        parent.cancel();
+    }).map_err(signal_error)?;
     let serving = rtdb_server::standalone::serve(launch, stop.clone());
     tokio::pin!(serving);
     tokio::select! {

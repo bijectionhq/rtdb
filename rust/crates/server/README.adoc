@@ -58,7 +58,7 @@ Supply a certificate valid for `127.0.0.1`, its matching PEM key, and a private 
 Select the installed name in the PostgreSQL startup packet and the Flight database header.
 The launcher atomically publishes a private protocol 3 receipt containing `database`, `installation`, `host`, `port` and `native_flight_port` after the exact writer has applied the retained startup positions.
 `rtdb --build-info` advertises the same version as `standalone_protocol`.
-With `--parent-stdin`, EOF initiates the same shutdown and resource drain as a termination signal.
+The launcher requires `--parent-stdin` and drains on EOF or a termination signal.
 
 Use `--custody-provider-config FILE` to supply the existing Original provider projection for this name and incarnation.
 The native listener authenticates the configured Original's caller and resolves release authority through the applied writer and provider evidence.

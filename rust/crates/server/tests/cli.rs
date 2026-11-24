@@ -172,9 +172,10 @@ fn installed_standalone_requires_the_canonical_uuid_and_rejects_legacy_action_fl
         "--custody-provider-config", "provider.yaml",
     ];
     let Command::Standalone(options) = parse(&launch) else { panic!("expected standalone launch") };
-    assert!(options.parent_stdin);
     assert_eq!(options.custody_provider_config.as_deref(), Some(std::path::Path::new("provider.yaml")));
+    assert!(cli::parse(launch.into_iter().filter(|flag| *flag != "--parent-stdin").map(str::to_owned), &|_| None).is_err());
     assert!(cli::parse(launch.into_iter().chain(["--owned-flight"]).map(str::to_owned), &|_| None).is_err());
+    assert!(cli::parse(init.into_iter().chain(["--mode", "default"]).map(str::to_owned), &|_| None).is_err());
 }
 
 #[test]

@@ -68,7 +68,6 @@ pub struct Launch {
     pub private_key: PathBuf,
     pub password_file: PathBuf,
     pub ready_file: PathBuf,
-    pub parent_stdin: bool,
     pub custody_provider_config: Option<PathBuf>,
 }
 
