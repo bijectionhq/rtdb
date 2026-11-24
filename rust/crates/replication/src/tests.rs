@@ -1386,6 +1386,22 @@ async fn default_orders_an_exact_pin_and_reopens_independent_backing() {
         let blocks = BlockStore::new(store.clone(), Arc::new(BufferPool::new(store, 1 << 24)), Arc::clone(&fixture.memory), 100_000_000).unwrap();
         let recovered = blocks.recover(Default::default(), copy.source, Timestamp(0), crate::BlockDiscovery::AtPublished(copy.checkpoint)).await.unwrap();
         assert_eq!(recovered.block.unwrap().boundary_replica_position(), Some(copy.checkpoint.boundary));
+        let destination = Arc::new(LocalStore::open(target.path().join("destination")).unwrap());
+        let seed = copy.seed_local(destination, [8; 16], &fixture.memory, &cancellation).await.unwrap();
+        assert_eq!(seed.basis, rtdb_types::rtdb_v1::Basis::new([8; 16], committed.basis.position()));
+        assert_eq!(seed.original_replica, copy.checkpoint.boundary);
+        assert_eq!(seed.original_source, copy.source);
+        seed.validate_original_receipt(&ticket).unwrap();
+
+        let archive = ObjectKey::new(format!("db/{}/checkpoint-exports/{pin}", uuid::Uuid::from_bytes([7; 16]))).unwrap();
+        assert!(!fixture.logs.store().list(Some(&archive)).await.unwrap().is_empty());
+        serving.release_checkpoint_export(&ticket, &cancellation).await.unwrap();
+        assert_eq!(fixture.handle.progress().current().source_position, source_position);
+        assert!(fixture.logs.store().list(Some(&archive)).await.unwrap().is_empty());
+        serving.release_checkpoint_export(&ticket, &cancellation).await.unwrap();
+        assert_eq!(serving.materialize_checkpoint_export(&ticket, target.path(), &cancellation).await.unwrap_err().code,
+            "rtdb/checkpoint-pin-released");
+        assert!(copy.path.join("checkpoint-restore-receipt").is_file());
     }).await.unwrap();
     fixture.handle.shutdown();
     running.await.unwrap().unwrap();

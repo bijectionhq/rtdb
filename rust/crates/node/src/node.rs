@@ -6,6 +6,7 @@ mod transaction_evidence;
 mod funded_mutation_clock;
 pub use funded_mutation_clock::{FundedMutationClock, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};
 mod durable_range;
+pub(crate) mod default_restore;
 pub use durable_range::{DurableRange, MAX_DURABLE_RANGE_BYTES};
 pub use hosted_observation::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
 use hosted_observation::PreparedAppliedCatalog;
@@ -1415,10 +1416,15 @@ impl NodeDriver {
     }
     async fn attach(&mut self, name: String, configuration: DatabaseConfig, local: bool, tasks: &mut JoinSet<DatabaseCompletion>) -> Result<Option<Arc<Database>>> {
         if local { self.node.catalog.check_local_attach(&name, &configuration)?; } else { self.node.catalog.check_attach(&name, &configuration)?; }
+        if local && default_restore::read_install(&name, &configuration)?.is_some() { return Err(default_restore::unsupported()); }
         if self.node.catalog.skipped(&name) { self.node.catalog.insert_skipped(name, configuration)?; return Ok(None); }
         let opened = self.node.factory.open(name, configuration, Arc::clone(&self.node.catalog), self.node.commands.clone(), &self.node.cancellation).await?;
         let database = Arc::clone(&opened.database);
-        if let Err(error) = self.node.catalog.insert_open(Arc::clone(&database)) {
+        let published = async {
+            if !local { default_restore::mark_ordered_attachment(&database).await?; }
+            self.node.catalog.insert_open(Arc::clone(&database))
+        }.await;
+        if let Err(error) = published {
             drop(opened);
             database.close_io().await;
             return Err(error);

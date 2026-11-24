@@ -170,7 +170,7 @@ impl PartitionLogs {
     }
     pub(crate) fn fences_writer_terms(&self) -> bool { self.replica.fences_writer_terms() }
     pub(crate) async fn holds_writer_grant(&self) -> Result<bool> { Ok(self.replica.holds_writer_grant().await?) }
-    pub(crate) fn retains_recovery_history(&self) -> bool {
+    pub fn retains_recovery_history(&self) -> bool {
         self.source.retains_synced_history() && self.replica.retains_synced_history() && self.store.syncs_checkpoints()
     }
     pub fn source_position(&self, metadata: LogMetadata) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, metadata.offset.0) }

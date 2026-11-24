@@ -276,7 +276,13 @@ impl DatabaseEffects for CatalogEffects {
     fn check_db_op(&self, operation: &DbOp) -> Result<()> {
         if !self.primary { return Ok(()); }
         match operation {
-            DbOp::AttachDatabase(attach) => self.catalog.check_attach(attach.db_name.as_deref().unwrap_or_default(), attach.config.as_ref().unwrap_or(&DatabaseConfig::default())),
+            DbOp::AttachDatabase(attach) => {
+                let name = attach.db_name.as_deref().unwrap_or_default();
+                let default = DatabaseConfig::default();
+                let configuration = attach.config.as_ref().unwrap_or(&default);
+                self.catalog.check_attach(name, configuration)?;
+                crate::node::default_restore::check_pending_attachment(name, configuration)
+            }
             DbOp::DetachDatabase(detach) => self.catalog.check_detach(detach.db_name.as_deref().unwrap_or_default()),
         }
     }

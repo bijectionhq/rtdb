@@ -258,6 +258,11 @@ impl BranchIndex {
 
     pub fn head(&self) -> BranchCut { self.head }
 
+    /// Retained definitions also carry visibility rules for historical reads.
+    pub fn has_visibility_history(&self) -> bool {
+        self.catalog.values().any(|history| history.iter().any(|(_, definition)| definition.visibility.is_some()))
+    }
+
     /// Select an exact settled prefix for checkpoint export. Erasure fences
     /// constrain export even when a historical cut is still queryable.
     pub fn checkpoint_at(&self, at: Basis) -> Result<Self> {
@@ -299,6 +304,7 @@ impl BranchIndex {
         }
         let rebase = |basis: Basis| Basis::new(incarnation, basis.position());
         self.head.basis = rebase(self.head.basis);
+        self.classic_checkpoint = self.classic_checkpoint.map(rebase);
         self.erased = self.erased.map(rebase);
         self.changed_catalog = self.changed_catalog.map(rebase);
         self.writes = Arc::default();

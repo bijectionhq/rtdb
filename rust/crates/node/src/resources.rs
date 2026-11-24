@@ -156,6 +156,7 @@ pub enum DeploymentTransfer {
 
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
+    fn supports_default_local_restore(&self) -> bool { false }
     /// Provisions or recovers an ordered registration before the node attaches it.
     async fn provision_managed_database(&self, _name: &str) -> Result<DatabaseConfig> {
         Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"))
@@ -351,6 +352,7 @@ pub(crate) fn validate_database_shape(name: &str, configuration: &DatabaseConfig
 
 #[async_trait]
 impl ResourceFactory for NativeResources {
+    fn supports_default_local_restore(&self) -> bool { self.classic_vault.is_none() && self.native_checkpoint_kms.is_none() }
     fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { self.token_kms.clone() }
 
     fn native_checkpoint_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { self.native_checkpoint_kms.clone() }

@@ -3315,6 +3315,57 @@ fn local_database(directory: &std::path::Path) -> DatabaseConfig {
 }
 
 #[tokio::test]
+async fn default_local_restore_activates_an_independent_branch_and_recovers_its_terminal() {
+    use rtdb_node::serving::QuerySource;
+    use rtdb_types::rtdb_v1::{At, Layer, MAIN_BRANCH};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let original = tempfile::tempdir().unwrap();
+        let provisioned = tempfile::tempdir().unwrap();
+        let mut settings = options();
+        settings.default_v1_serving = true;
+        settings.membership = Membership::Durable { primary: local_database(original.path()), skipped: BTreeSet::new() };
+        let runtime = services();
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+        let cancellation = CancellationToken::new();
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        index_sql(&mut session, "INSERT INTO restore_rows (_id, value) VALUES (1, 10)").await;
+        let primary = node.catalog().database("xtdb").unwrap();
+        index_flush(&node, &primary).await;
+        let at = |at| QuerySource { branch: MAIN_BRANCH.into(), at, layer: Layer::Merged };
+        let source = primary.serving_driver().unwrap().query(at(At::Linearizable), false, node.now(), &cancellation).await.unwrap().cut.basis;
+        let ticket = node.export_default_checkpoint("xtdb", uuid::Uuid::new_v4(), source, None, None, &cancellation).await.unwrap();
+        let restored = node.restore_default_checkpoint("xtdb", "restored", &ticket, provisioned.path(), &cancellation).await.unwrap();
+        assert_ne!(restored.incarnation(), source.incarnation());
+        assert_eq!(restored.position(), source.position());
+        let destination = node.catalog().database("restored").unwrap();
+        assert_eq!(destination.serving_driver().unwrap().query(at(At::Exactly(restored)), false, node.now(), &cancellation).await.unwrap().cut.basis, restored);
+        let mut copy = node.session("restored", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(copy.query_sql("SELECT value FROM restore_rows WHERE _id = 1", vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+        index_sql(&mut copy, "INSERT INTO restore_rows (_id, value) VALUES (2, 20)").await;
+        index_flush(&node, &destination).await;
+        assert!(rows(session.query_sql("SELECT value FROM restore_rows WHERE _id = 2", vec![]).await.unwrap()).await.is_empty());
+        node.release_default_checkpoint("xtdb", &ticket, &cancellation).await.unwrap();
+        drop(copy);
+        drop(session);
+        drop(destination);
+        drop(primary);
+        stop(&node, driver).await;
+        drop(node);
+
+        let (node, driver) = running(settings, fresh_local_services(&runtime)).await;
+        assert_eq!(node.restore_default_checkpoint("xtdb", "restored", &ticket, provisioned.path(), &cancellation).await.unwrap(), restored);
+        let mut copy = node.session("restored", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(copy.query_sql("SELECT value FROM restore_rows WHERE _id = 2", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
+        drop(copy);
+        assert!(node.detach_database("restored".into(), &Authority, &cancellation).await.unwrap().committed());
+        assert_eq!(node.restore_default_checkpoint("xtdb", "restored", &ticket, provisioned.path(), &cancellation).await.unwrap_err().code,
+            "rtdb/default-restore-retired");
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn detach_holds_the_name_until_cancelled_io_drains_for_running_and_failed_workers() {
     tokio::time::timeout(Duration::from_secs(30), async {
         for fail_worker in [false, true] {

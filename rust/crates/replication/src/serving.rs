@@ -888,6 +888,22 @@ pub(crate) fn decode_checkpoint_image(image: &[u8], incarnation: [u8; 16]) -> Re
     Ok((fold, position, shared))
 }
 
+pub(crate) fn restore_plain_checkpoint_image(image: &[u8], source: [u8; 16], destination: [u8; 16]) -> Result<Bytes> {
+    if source == destination { return Err(invalid()); }
+    let (mut fold, position, shared) = decode_checkpoint_image(image, source)?;
+    if !shared { return Err(invalid()); }
+    fold.restore_in(destination)?;
+    let cut = fold.index().head();
+    let state = fold.encode_checkpoint()?;
+    let mut frame = BytesMut::with_capacity(CHECKPOINT_HEADER_BYTES + 1 + state.len());
+    frame.put_u64(position);
+    frame.extend_from_slice(&cut.basis.to_bytes());
+    frame.put_i64(cut.system_time.0);
+    frame.put_u8(SHARED_CHECKPOINT);
+    frame.extend_from_slice(&state);
+    Ok(frame.freeze())
+}
+
 pub(crate) fn checkpoint_rewrite(image: &[u8]) -> Result<Option<RewriteEvidence>> {
     if image.get(CHECKPOINT_HEADER_BYTES) != Some(&SHARED_CHECKPOINT) { return Ok(None); }
     RewriteEvidence::read(&image[CHECKPOINT_HEADER_BYTES + 1..]).map(|(evidence, _)| evidence)

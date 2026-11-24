@@ -41,7 +41,7 @@ pub fn verify_archived_transaction(
 }
 pub use admission_step::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, NativeErasureCut, ProducedBlock, PublishedCheckpoint, RecoveredPartition, VerifiedNativeErasureCheckpoint};
-pub use checkpoint_admin::DetachedDefaultCheckpoint;
+pub use checkpoint_admin::{DetachedDefaultCheckpoint, LocalDefaultRestoreSeed};
 pub use driver::{CommittedErasure, ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, RecoverableExternalToken, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
 pub use snapshot_replay::{ErasureTarget, SnapshotReplay, SqlErasureSource};

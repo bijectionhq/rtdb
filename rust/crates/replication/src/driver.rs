@@ -25,7 +25,7 @@ use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
 use crate::state::fail_pending;
 use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, SourceRequest};
-use crate::checkpoint_admin::PinControl;
+use crate::checkpoint_admin::{PinControl, ReleaseControl};
 use rtdb_tx::transact::{Erasure, Outcome as ServingOutcome, Receipt as ServingReceipt};
 use crate::default_erasure::{self, AppliedErasure, DefaultErasure, ErasureCut};
 
@@ -251,6 +251,16 @@ impl TermHandle {
         }
     }
 
+    pub(crate) async fn release_checkpoint(&self, release: ReleaseControl, cancellation: &CancellationToken) -> Result<()> {
+        let (completion, receipt) = oneshot::channel();
+        cancellation.run_until_cancelled(self.handle.commands.send(Command::ReleaseCheckpoint { term: self.term, release, completion }))
+            .await.ok_or_else(serving::interrupted)?.map_err(|_| term_ended())?;
+        match cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| term_ended())?? {
+            Applied::Control => Ok(()),
+            _ => Err(invalid("A checkpoint release received a different replica result")),
+        }
+    }
+
     pub fn term(&self) -> Term { self.term }
     /// The applied resume token covered by the store and the retained durable journal.
     pub fn recoverable_external_token(&self) -> Option<RecoverableExternalToken> {
@@ -329,6 +339,7 @@ impl ExternalReceipt {
 
 enum Command {
     PinCheckpoint { term: Term, pin: PinControl, completion: oneshot::Sender<Result<Applied>> },
+    ReleaseCheckpoint { term: Term, release: ReleaseControl, completion: oneshot::Sender<Result<Applied>> },
     ServingValidate { term: Term, request: NativeRequest, completion: serving::Completion },
     ServingStatus { key: Vec<u8>, lookup: serving::ReceiptLookup, completion: serving::Completion },
     ResetCompactor { term: Term, primary: PublishedPrimaryReset, reservations: Arc<[Arc<MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
@@ -337,10 +348,10 @@ enum Command {
     External { term: Term, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>, completion: oneshot::Sender<Result<Applied>> },
 }
 impl Command {
-    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::Retire { term, .. } | Self::External { term, .. } | Self::ResetCompactor { term, .. } | Self::ServingValidate { term, .. } | Self::PinCheckpoint { term, .. } => *term, Self::ServingStatus { .. } => Term(0) } }
+    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::Retire { term, .. } | Self::External { term, .. } | Self::ResetCompactor { term, .. } | Self::ServingValidate { term, .. } | Self::PinCheckpoint { term, .. } | Self::ReleaseCheckpoint { term, .. } => *term, Self::ServingStatus { .. } => Term(0) } }
     fn fail(self, error: Anomaly) {
         match self {
-            Self::Delete { completion, .. } | Self::Retire { completion, .. } | Self::External { completion, .. } | Self::PinCheckpoint { completion, .. } => { let _ = completion.send(Err(error)); }
+            Self::Delete { completion, .. } | Self::Retire { completion, .. } | Self::External { completion, .. } | Self::PinCheckpoint { completion, .. } | Self::ReleaseCheckpoint { completion, .. } => { let _ = completion.send(Err(error)); }
             Self::ResetCompactor { completion, .. } => { let _ = completion.send(Err(error)); }
             Self::ServingValidate { completion, .. } => { let _ = completion.send(Err(serving::interrupted())); }
             Self::ServingStatus { completion, .. } => { let _ = completion.send(Err(error)); }
@@ -1558,6 +1569,14 @@ impl ReplicationDriver {
                         self.complete_control(&record);
                         continue;
                     }
+                    if let Some(release) = ReleaseControl::decode(message)? {
+                        if self.placed_slot.is_some() { return Err(invalid("A checkpoint release cannot cross an open receiver slot")); }
+                        let serving = self.serving.as_ref().ok_or_else(serving::unavailable)?;
+                        release.check_predecessor(serving.incarnation(), record.metadata.position)?;
+                        release.apply(self.logs.store().as_ref(), record.metadata.position, record.envelope.term).await?;
+                        self.complete_control(&record);
+                        continue;
+                    }
                     let mut released_checkpoint = false;
                     if message.serving_record.is_some() {
                         if message.placed_slot_reservation.is_some() || self.placed_slot.is_some() {
@@ -2201,6 +2220,16 @@ impl ReplicationDriver {
                     pin.check_predecessor(serving.incarnation(), &self.logs, installed.replica, installed.source)?;
                     pin.check_lifetime((self.clock)())?;
                     pin.encode_record()
+                })();
+                let message = match validated { Ok(message) => message, Err(error) => { let _ = completion.send(Err(error)); return Ok(()); } };
+                leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)
+            }
+            Command::ReleaseCheckpoint { release, completion, .. } => {
+                let validated = (|| {
+                    let serving = self.serving.as_ref().filter(|serving| serving.shares_main()).ok_or_else(serving::unavailable)?;
+                    let installed = self.installed.filter(|_| leader.confirmed && !self.config.external_source).ok_or_else(serving::unavailable)?;
+                    release.check_predecessor(serving.incarnation(), installed.replica)?;
+                    release.encode_record()
                 })();
                 let message = match validated { Ok(message) => message, Err(error) => { let _ = completion.send(Err(error)); return Ok(()); } };
                 leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)

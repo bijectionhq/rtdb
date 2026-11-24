@@ -48,6 +48,7 @@ pub struct Database {
     pub(crate) replication: ReplicationHandle,
     serving: Option<Arc<dyn crate::serving::ServingDriver>>,
     pub(crate) native_serving_authority: Option<crate::serving::NativeServingAuthority>,
+    pub(crate) default_native_handle: Option<rtdb_replication::NativeServingHandle>,
     pub(crate) custody_provider: crate::serving::custody_release::CustodyProviderSlot,
     replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
     pub(crate) await_authority: crate::AwaitAuthority,
@@ -456,6 +457,10 @@ impl DatabaseFactory {
     }
     pub async fn open(&self, name: String, configuration: DatabaseConfig, catalog: Arc<DatabaseCatalog>, commands: mpsc::Sender<CatalogCommand>, parent: &CancellationToken) -> Result<OpenedDatabase> {
         self.validate(&name, &configuration)?;
+        let default_restore = crate::node::default_restore::read_install(&name, &configuration)?;
+        if default_restore.is_some() && (!self.resources.supports_default_local_restore() || !self.options.replication.enabled) {
+            return Err(crate::node::default_restore::unsupported());
+        }
         let read_only = self.options.read_only || configuration.mode.unwrap_or(0) == 1;
         let cancellation = parent.child_token();
         let log_cancellation = CancellationToken::new();
@@ -477,6 +482,9 @@ impl DatabaseFactory {
             } else {
                 self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?
             };
+            if default_restore.is_some() && (opened_logs.placed_transfer.is_some() || opened_logs.source.checkpoint_key_retirement().is_some()
+                || opened_logs.replica.checkpoint_key_retirement().is_some())
+            { return Err(crate::node::default_restore::unsupported()); }
             let journal_lineage = opened_logs.replica.journal_lineage();
             if let crate::AwaitAuthority::Checkpoint { block, through, root, .. } = &opened_logs.await_authority
                 && (!read_only || through.0 < 0 || through.epoch() != opened_logs.replica_epoch
@@ -508,6 +516,11 @@ impl DatabaseFactory {
                 }
                 recovered.with_source_floor(logs.source_floor()?)
             };
+            if let Some(install) = &default_restore {
+                let block = recovered.block.as_ref().ok_or_else(crate::node::default_restore::unsupported)?;
+                install.seed.validate_cursor(block, logs.source_epoch, logs.replica_epoch)?;
+                install.seed.validate_journal_heads(block, logs.latest_source_position()?, logs.latest_replica_position()?)?;
+            }
             logs.install_replica_reference_source(recovered.block.clone(), self.options.file_size_target)?;
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
@@ -603,6 +616,7 @@ impl DatabaseFactory {
             });
             let mut serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
             let can_attach_native = serving.is_none() && self.options.replication.enabled && configuration.external_source.is_none();
+            if default_restore.is_some() && !can_attach_native { return Err(crate::node::default_restore::unsupported()); }
             let native_authority = if can_attach_native {
                 self.resources.native_serving_authority(&name, &configuration)?
             } else {
@@ -610,10 +624,17 @@ impl DatabaseFactory {
             };
             let incarnation = serving.as_ref().map(|driver| driver.incarnation())
                 .or_else(|| native_authority.as_ref().map(|authority| authority.incarnation))
+                .or_else(|| default_restore.as_ref().map(|install| install.seed.basis.incarnation()))
                 .map(uuid::Uuid::from_bytes);
             let tokens = Arc::new(tokens::DatabaseTokens::new(&name, &configuration, read_only, Arc::clone(storage.object_store()),
                 self.resources.token_kms(), Arc::clone(&self.clock), incarnation));
             let native_authority = match native_authority {
+                Some(authority) if default_restore.as_ref().is_some_and(|install| authority.incarnation != install.seed.basis.incarnation() || authority.checkpoints.is_some()) => {
+                    return Err(crate::node::default_restore::unsupported());
+                }
+                None if default_restore.is_some() => default_restore.as_ref().map(|install| crate::serving::NativeServingAuthority {
+                    incarnation: install.seed.basis.incarnation(), checkpoints: None,
+                }),
                 None if can_attach_native && self.options.default_v1_serving && name == "xtdb" => {
                     let incarnation = *tokens.incarnation().await?.as_bytes();
                     let checkpoints = self.resources.native_checkpoint_kms().map(|kms|
@@ -624,6 +645,7 @@ impl DatabaseFactory {
                 }
                 authority => authority,
             };
+            let mut default_native_handle = None;
             if let Some(authority) = &native_authority {
                 if authority.checkpoints.is_some() && !read_only {
                     let garbage = &self.options.garbage;
@@ -632,6 +654,7 @@ impl DatabaseFactory {
                     replica_driver = replica_driver.with_default_erasure_grant(grant as u64);
                 }
                 let handle = replica_driver.attach_native_serving(replication.clone(), authority.clone(), self.options.automatic_gc).await?;
+                default_native_handle = Some(handle.clone());
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {
                     handle, memory: Arc::clone(&self.memory), storage: Arc::clone(&storage),
                     clock: Arc::clone(&self.clock), tokens: Arc::clone(&tokens),
@@ -639,7 +662,7 @@ impl DatabaseFactory {
                 }));
             }
             let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
-                audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority,
+                audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),

@@ -101,7 +101,7 @@ pub(crate) fn apply(
     term: Term,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<AppliedDecision>> {
-    if crate::checkpoint_admin::PinControl::decode(message)?.is_some() { return Ok(None); }
+    if crate::checkpoint_admin::PinControl::decode(message)?.is_some() || crate::checkpoint_admin::ReleaseControl::decode(message)?.is_some() { return Ok(None); }
     if ErasureRetirement::decode(message)?.is_some() || crate::default_erasure::ErasureCompleted::decode(message)?.is_some() {
         return Err(erasure_recovery_required());
     }
