@@ -1754,8 +1754,7 @@ fn prepare_checkpoint_transfer_bootstrap(
 ) -> Result<DeploymentRecord> {
     let terminal = &bootstrap.terminal;
     let stage = &terminal.fence.destination;
-    if stage.intent.classic_migration.is_some()
-        || source.id != stage.intent.source.to_string() || destination.id != stage.intent.destination.to_string()
+    if source.id != stage.intent.source.to_string() || destination.id != stage.intent.destination.to_string()
         || source.checkpoint_transfer_terminal.as_deref() != Some(terminal)
         || source.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
         || source.lifecycle != Lifecycle::Restoring || source.epoch != terminal.fence.fenced_writer_epoch
@@ -1778,7 +1777,8 @@ fn prepare_checkpoint_transfer_bootstrap(
 fn prepare_checkpoint_transfer_replica(
     source: &DeploymentRecord, destination: &DeploymentRecord, replica: &CheckpointTransferReplica,
 ) -> Result<DeploymentRecord> {
-    if destination.checkpoint_transfer_bootstrap.as_deref() != Some(&replica.bootstrap)
+    if replica.bootstrap.terminal.fence.destination.intent.classic_migration.is_some()
+        || destination.checkpoint_transfer_bootstrap.as_deref() != Some(&replica.bootstrap)
         || prepare_checkpoint_transfer_bootstrap(source, destination, &replica.bootstrap)?.version != destination.version
         || replica.ensemble.is_empty() || replica.ensemble.len() != replica.journals.len()
         || replica.ensemble.iter().collect::<BTreeSet<_>>().len() != replica.ensemble.len()
@@ -2335,8 +2335,16 @@ mod tests {
         let mut discarded = sealed.clone();
         discarded.checkpoint_captures.remove(&capture);
         assert!(require_transfer_update(&sealed, &discarded).is_err());
-        let classic_bootstrap = CheckpointTransferBootstrap { terminal, ciphertext_sha256: [5; 32] };
-        assert!(prepare_checkpoint_transfer_bootstrap(&sealed, &held, &classic_bootstrap).is_err());
+        let bootstrap = CheckpointTransferBootstrap { terminal, ciphertext_sha256: [5; 32] };
+        let staged = prepare_checkpoint_transfer_bootstrap(&sealed, &held, &bootstrap).unwrap();
+        assert_eq!(prepare_checkpoint_transfer_bootstrap(&sealed, &staged, &bootstrap).unwrap(), staged);
+        let replica = CheckpointTransferReplica {
+            bootstrap, ensemble: vec![MemberId::fresh()],
+            journals: vec![JournalEndpoint::Member {
+                address: "keeper:5000".into(), journal: uuid::Uuid::new_v4().to_string(),
+            }],
+        };
+        assert!(prepare_checkpoint_transfer_replica(&sealed, &staged, &replica).is_err());
     }
 
     #[tokio::test]

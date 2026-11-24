@@ -418,6 +418,12 @@ The Classic writer closes its submission gate, drains admitted transactions and 
 The source terminal includes the drained source frontier, exact source and replica offsets, original transaction key, certified suffix digest where present, lifetime-floor digest and any outstanding placed debt.
 The selected capture and private scratch stage remain available for recovery.
 
+After sealing, `verify_checkpoint_transfer_target` can retain the certified suffix under the scratch stage's key.
+For this action, both `destination` and `stage_operation` are the scratch UUID, and `staged_manifest_sha256` is the value in the sealed fence's `destination` stage.
+The returned `transfer_target_verified` receipt carries the same terminal and the ciphertext digest of the exact scratch replay artifact.
+The verifier replays from the copied checkpoint and checks the terminal transaction, source frontier, placed debt and lifetime floors before accepting the artifact.
+The scratch stage can hold replay data for native import while its Classic replica and writer admission stay closed.
+
 The attempt UUID identifies a private Classic scratch stage independently of the native destination UUID.
 Current Classic staging requires an active source holder and the current captured checkpoint.
 An active retained World or replica suffix pin blocks this source fence.

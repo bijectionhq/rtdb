@@ -595,6 +595,7 @@ contract LogService {
         -- The directory retains the applied source frontier with the fence and keeps the selected capture and scratch stage pinned.
         -- The source recovery owner drains admitted storage and catalog readers, seals the original replica journal and verifies the checkpoint and certified suffix through the drained source frontier.
         -- An identical retry observes the same retained source terminal.
+        -- The verifier can retain independently sealed replay frames and detached bodies under the exact scratch stage with the terminal transaction and lifetime floors preserved.
         -- The migration scratch stage stays private and cannot seed a Classic target writer.
 
     @invariant InstalledJournalErasureCommit

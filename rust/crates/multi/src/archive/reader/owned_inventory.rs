@@ -88,9 +88,6 @@ pub(crate) async fn verify_checkpoint_transfer_target(
             && terminal.fence.destination.staged_manifest_sha256.as_deref() == Some(selector.manifest_sha256.as_str()))
         .ok_or_else(|| inconsistent("The source has no terminal receipt for the exact target attempt"))?
         .clone();
-    if terminal.fence.destination.intent.classic_migration.is_some() {
-        return Err(inconsistent("A native migration cannot seed a Classic target writer"));
-    }
     let replay_directory = Arc::clone(&directory);
     let hosted_task_for_write = hosted_task.clone();
     with_stage(directory, storage, keys, selector, hosted_task, |authority, record, verified| async move {
@@ -237,6 +234,9 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     ).await?;
     let terminal = &bootstrap.terminal;
     let stage = &terminal.fence.destination;
+    if stage.intent.classic_migration.is_some() {
+        return Err(inconsistent("A native migration cannot seed a Classic target writer"));
+    }
     let target_id = stage.intent.destination.to_string();
     let owner = directory.as_ref();
     let source = owner.deployment(&stage.intent.source.to_string()).await?
