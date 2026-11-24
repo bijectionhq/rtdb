@@ -528,9 +528,10 @@ pub(crate) fn track_checkpoint_stage_publications(
     deployment: String,
     region: Uuid,
     operation: Uuid,
+    bootstrap: Option<[u8; 32]>,
 ) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointStage(operation) },
+        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointStage { operation, bootstrap } },
     ));
 }
 
@@ -555,7 +556,7 @@ pub(crate) fn track_hosted_fork_publications(io: &mut Arc<IoRegion>, directory: 
 enum PublicationOwner {
     Serving,
     Transfer,
-    CheckpointStage(Uuid),
+    CheckpointStage { operation: Uuid, bootstrap: Option<[u8; 32]> },
     CheckpointTransfer(Uuid),
     HostedFork,
 }
@@ -579,9 +580,22 @@ impl PublicationJournal for DirectoryPublications {
             let accepts_writes = match &self.owner {
                 PublicationOwner::Serving => matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
                 PublicationOwner::Transfer => record.lifecycle == Lifecycle::Moving && record.move_from.is_some(),
-                PublicationOwner::CheckpointStage(operation) => record.lifecycle == Lifecycle::Restoring
-                    && record.checkpoint_stage.as_ref().is_some_and(|stage| {
-                        stage.intent.operation == *operation && stage.staged_manifest_sha256.is_none()
+                PublicationOwner::CheckpointStage { operation, bootstrap } => record.lifecycle == Lifecycle::Restoring
+                    && record.checkpoint_stage.as_deref().is_some_and(|stage| {
+                        if stage.intent.operation != *operation { return false; }
+                        match bootstrap {
+                            None => stage.staged_manifest_sha256.is_none()
+                                && ObjectKey::new(crate::archive::stage::staged_storage_root(record))
+                                    .is_ok_and(|root| key.is_under(&root)),
+                            Some(digest) => record.checkpoint_transfer_replica.as_deref().is_some_and(|replica| {
+                                replica.bootstrap.ciphertext_sha256 == *digest
+                                    && &replica.bootstrap.terminal.fence.destination == stage
+                                    && crate::archive::checkpoint_storage_root().is_ok_and(|version| {
+                                        ObjectKey::new(format!("{}/{version}", record.storage_prefix()))
+                                            .is_ok_and(|root| key.is_under(&root))
+                                    })
+                            }),
+                        }
                     }),
                 PublicationOwner::CheckpointTransfer(operation) => record.lifecycle == Lifecycle::Restoring
                     && record.checkpoint_transfer_fence.as_deref().is_some_and(|fence| {

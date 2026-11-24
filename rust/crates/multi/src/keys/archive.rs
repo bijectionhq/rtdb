@@ -267,14 +267,6 @@ pub(super) fn tracked_archive_key(key: impl CaptureCryptography + 'static) -> Ar
     Arc::new(TrackedArchiveKey { inner: key.clone(), delivery: key })
 }
 
-pub(crate) fn tracked_deployment_archive_key(
-    keys: &dyn super::KeyService, id: String, material: &[u8; KEY_BYTES],
-) -> Result<Arc<dyn ArchiveKey>> {
-    let inner = legacy_archive_key(material)?;
-    let delivery = keys.retain_deployment_delivery(id, material)?;
-    Ok(Arc::new(TrackedArchiveKey { inner, delivery }))
-}
-
 struct TrackedArchiveKey {
     inner: Arc<dyn ArchiveKey>,
     delivery: Arc<dyn ObjectCipher>,

@@ -171,12 +171,6 @@ impl S3KeyService {
 
 #[async_trait::async_trait]
 impl KeyService for S3KeyService {
-    fn retain_deployment_delivery(&self, id: String, material: &[u8; KEY_BYTES])
-        -> Result<std::sync::Arc<dyn rtdb_storage::sealing::ObjectCipher>>
-    {
-        Ok(super::DeploymentDelivery::new(std::sync::Arc::new(self.clone()), id, material))
-    }
-
     async fn grant_deployment_key(&self, id: &str, binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<super::UnitOutput> {
         let material = self.existing_key(id).await.map_err(super::journal::key_error)?;
         super::delivery::require_deployment_key(material, binding)?;

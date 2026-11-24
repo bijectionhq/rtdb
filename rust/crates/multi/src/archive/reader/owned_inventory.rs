@@ -223,7 +223,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
         admin::{choose_ensemble, replica_servers},
         archive::{checkpoint_storage_root, replica_suffix, stage::with_region, verify_cut},
         reference::{PrefixedStore, key},
-        store::{EncryptingStore, ROOT_MARKER},
+        store::check_root,
     };
     use rtdb_directory::CheckpointTransferReplica;
     use rtdb_storage::log::LogOffset;
@@ -261,16 +261,11 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             let through = terminal.replica_through;
             let root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
             let files = PrefixedStore::new(Arc::clone(&bucket), root);
-            let marker = files.observe_fresh_exact(&key(ROOT_MARKER)?, target.id.len()).await?;
-            if marker.value.as_ref() != target.id.as_bytes() {
-                return Err(inconsistent("The staged checkpoint has another target owner"));
-            }
-            let media = keys.existing_key(&target.key_id()).await?
-                .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
-            let serving = EncryptingStore::new(Arc::new(files), &media)?;
+            check_root(&files, &target.id, true).await?;
+            let staged = super::open_inventory(storage, keys, &target, stage, Arc::clone(&region)).await?;
             let initial_fence = {
                 let root_key = key(&block_key(BlockIndex(stage.checkpoint.block))?)?;
-                let bytes = PayloadBytes::read(&serving, &root_key, &memory).await?;
+                let bytes = PayloadBytes::read(staged.store.as_ref(), &root_key, &memory).await?;
                 let catalog = BlockCatalog::decode(&bytes.bytes)?;
                 verify_cut(&catalog, stage.checkpoint, StorageEpoch(stage.source_log_epoch))?;
                 TermFence::from_catalog(&catalog)?
@@ -337,7 +332,9 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                         entry.payload = control;
                     } else if let Some(payload) = offloaded.as_ref() {
                         let broker = broker.ok_or_else(|| unavailable("Detached replay transfer requires its installed broker"))?;
-                        let publication = broker.seed(&target, &reserved, entry.lsn, &payload.path, payload.body.bytes.clone()).await?;
+                        let publication = payload.body.retaining(
+                            broker.seed(&target, &reserved, entry.lsn, &payload.path, payload.body.bytes.clone()),
+                        ).await?;
                         entry.payload = target_payload_proxy(&envelope, resolved, &payload.body.bytes, publication)?;
                     }
                 }
@@ -410,9 +407,9 @@ pub(crate) async fn activate_checkpoint_transfer_target(
     hosted_task: Option<HostedTask>,
 ) -> Result<rtdb_directory::CheckpointTransferActivation> {
     use crate::{
-        archive::{checkpoint_storage_root, recovery_manifest_sha256, stage::with_region},
+        archive::{checkpoint_storage_root, recovery_manifest_sha256, stage::{RegionPublication, staged_key_id, with_region}},
         packing::PackDiscovery,
-        reference::key,
+        reference::{PrefixedStore, key},
         store::{EncryptingStore, ROOT_MARKER, open_deployment_store, wall_clock},
     };
     use rtdb_directory::CheckpointTransferActivation;
@@ -429,6 +426,10 @@ pub(crate) async fn activate_checkpoint_transfer_target(
         {
             return Err(inconsistent("The target already activated another transfer"));
         }
+        if crate::admin::cell_media(storage, keys)? != stage.media {
+            return Err(inconsistent("The activated stage belongs to different storage or keys"));
+        }
+        keys.destroy(&staged_key_id(&target)).await?;
         return Ok(accepted.clone());
     }
     let replica = seed_checkpoint_transfer_target(
@@ -436,8 +437,10 @@ pub(crate) async fn activate_checkpoint_transfer_target(
     ).await?;
     let terminal = &replica.bootstrap.terminal;
     let stage = &terminal.fence.destination;
+    let publication = RegionPublication::InstallStage(Arc::clone(&directory), stage.intent.operation, replica.bootstrap.ciphertext_sha256);
+    let task = hosted_task.as_ref();
     let recovery_manifest_sha256 = with_region(
-        directory.as_ref(), keys, &target_id, storage, hosted_task.as_ref(), None, None,
+        directory.as_ref(), keys, &target_id, storage, task, None, Some(publication),
         |record| {
             if record.lifecycle != Lifecycle::Restoring || record.holder.is_some()
                 || record.checkpoint_stage.as_deref() != Some(stage)
@@ -449,13 +452,29 @@ pub(crate) async fn activate_checkpoint_transfer_target(
         },
         |record, _, region| async move {
             let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
-            let bucket = storage.bucket(region).await?;
+            let bucket = storage.bucket(Arc::clone(&region)).await?;
             let owner = bucket.get_fresh(&key(&format!("{root}/{ROOT_MARKER}"))?).await?;
             if owner.as_ref() != record.id.as_bytes() {
                 return Err(inconsistent("The durable serving root has another owner"));
             }
+            let staged = super::open_inventory(storage, keys, &record, stage, Arc::clone(&region)).await?;
+            staged.require_serving_envelope()?;
+            let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
             let material = keys.existing_key(&record.key_id()).await?
                 .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
+            let raw = Arc::new(PrefixedStore::new(Arc::clone(&bucket), root.clone()));
+            let loose = EncryptingStore::new(raw.clone(), &material)?;
+            let mut expected = std::collections::BTreeSet::from([key(ROOT_MARKER)?]);
+            for member in staged.store.list(None).await? {
+                let body = PayloadBytes::read(staged.store.as_ref(), &member.key, &memory).await?;
+                body.retaining(loose.put_with_publication(&member.key, body.bytes.clone())).await?;
+                expected.insert(member.key);
+            }
+            let observed = raw.list(None).await?.into_iter().map(|object| object.key)
+                .collect::<std::collections::BTreeSet<_>>();
+            if observed != expected {
+                return Err(inconsistent("The durable serving root differs from its staged inventory"));
+            }
             let store = open_deployment_store(
                 bucket, &root, PackDiscovery::From(stage.checkpoint.block), wall_clock(),
             ).await?;
@@ -463,7 +482,9 @@ pub(crate) async fn activate_checkpoint_transfer_target(
             recovery_manifest_sha256(&plaintext, stage.checkpoint, StorageEpoch(stage.source_log_epoch)).await
         },
     ).await?;
-    directory.activate_checkpoint_transfer(&CheckpointTransferActivation { replica, recovery_manifest_sha256 }).await
+    let accepted = directory.activate_checkpoint_transfer(&CheckpointTransferActivation { replica, recovery_manifest_sha256 }).await?;
+    keys.destroy(&staged_key_id(&target)).await?;
+    Ok(accepted)
 }
 
 pub(crate) async fn stream_staged_owned_event_files(

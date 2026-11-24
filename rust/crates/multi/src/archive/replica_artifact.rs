@@ -25,6 +25,10 @@ pub(super) struct PayloadBytes {
 }
 
 impl PayloadBytes {
+    pub(super) async fn retaining<F: std::future::Future>(&self, work: F) -> F::Output {
+        IoRegion::retaining(Arc::clone(&self._reservation), work).await
+    }
+
     pub(super) async fn read(
         store: &dyn ObjectStore,
         key: &ObjectKey,

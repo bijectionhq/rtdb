@@ -28,7 +28,7 @@ pub use assertion::{AssertionEnvelope, AssertionKeyService, AssertionStage};
 pub use journal::JournalKey;
 pub use archive::ArchiveKey;
 pub use crate::cipher::object::FramedObject;
-pub(crate) use archive::{legacy_archive_key, tracked_deployment_archive_key};
+pub(crate) use archive::legacy_archive_key;
 
 /// The trim owner recorded these names before the certified ciphertext disappeared.
 pub(crate) async fn withdraw_archive_records(
@@ -81,11 +81,6 @@ pub trait KeyService: Send + Sync {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
     /// Read current custody without creating a key.
     async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>>;
-    fn retain_deployment_delivery(&self, _id: String, _material: &[u8; KEY_BYTES])
-        -> Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>>
-    {
-        Err(Anomaly::unsupported("rtdb.multi/key-delivery", "The deployment key owner cannot be retained"))
-    }
     /// Confirms the original key and keeps the authority live through delivery.
     async fn grant_deployment_key(&self, _id: &str, _binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<UnitOutput> {
         Err(rtdb_storage::Error::Closed("The deployment key owner cannot grant delivery".into()))
@@ -352,12 +347,6 @@ impl LocalKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for LocalKeyService {
-    fn retain_deployment_delivery(&self, id: String, material: &[u8; KEY_BYTES])
-        -> Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>>
-    {
-        Ok(DeploymentDelivery::new(Arc::new(self.clone()), id, material))
-    }
-
     async fn grant_deployment_key(&self, id: &str, binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<UnitOutput> {
         let vault = self.clone();
         let id = id.to_owned();

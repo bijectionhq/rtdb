@@ -191,18 +191,6 @@ impl DynamoKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for DynamoKeyService {
-    fn retain_deployment_delivery(
-        &self,
-        id: String,
-        material: &[u8; KEY_BYTES],
-    ) -> Result<std::sync::Arc<dyn rtdb_storage::sealing::ObjectCipher>> {
-        Ok(super::DeploymentDelivery::new(
-            std::sync::Arc::new(self.clone()),
-            id,
-            material,
-        ))
-    }
-
     async fn grant_deployment_key(
         &self,
         id: &str,

@@ -1939,6 +1939,9 @@ async fn sign_disposal(
     fenced: &DeploymentRecord, keys: &dyn KeyService, namespaces: StorageNamespaces,
     inventory: DeletionInventory, first_empty_observed_at_ms: Option<i64>, objects_erased_at_ms: i64,
 ) -> Result<DeletionRecord> {
+    if fenced.checkpoint_stage.is_some() || fenced.checkpoint_transfer_activation.is_some() {
+        keys.destroy(&crate::archive::stage::staged_key_id(fenced)).await?;
+    }
     keys.destroy(&fenced.key_id()).await?;
     keys.sign_deletion(DeletionFacts {
         deployment: fenced.id.clone(), name: fenced.name.clone(), epoch: fenced.epoch,

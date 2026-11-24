@@ -27,7 +27,7 @@ use super::{
     CapturePoint, MAXIMUM_MANIFEST_BYTES, checkpoint_objects, checkpoint_storage_root, digest,
     inconsistent,
     read_world::CapturedObjects,
-    stage::{STAGED_MANIFEST, StageInventory, with_region},
+    stage::{STAGED_MANIFEST, StageInventory, staged_key_id, staged_storage_root, with_region},
     unavailable,
 };
 use crate::{
@@ -319,24 +319,22 @@ async fn open_inventory(
     stage: &CheckpointStage,
     region: Arc<IoRegion>,
 ) -> Result<VerifiedStage> {
-    let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
     let bucket = storage.bucket(Arc::clone(&region)).await?;
-    let files = PrefixedStore::new(Arc::clone(&bucket), &root);
+    let files = PrefixedStore::new(bucket, staged_storage_root(record));
     if files.get(&key(ROOT_MARKER)?).await?.as_ref() != record.id.as_bytes() {
         return Err(inconsistent(
             "The staged storage root belongs to another installation",
         ));
     }
     let manifest_path = key(STAGED_MANIFEST)?;
-    let media_id = record.key_id();
-    let stage_key = keys.scoped_unit_key(&media_id, Arc::clone(&region)).await?;
+    let cipher = keys.scoped_unit_key(&staged_key_id(record), region).await?;
     let maximum = crate::cipher::object::sealed_size(&manifest_path, MAXIMUM_MANIFEST_BYTES as usize)?;
     let head = files.head_fresh(&manifest_path).await?;
     let length = usize::try_from(head.size)
         .ok().filter(|length| *length <= maximum)
         .ok_or_else(|| inconsistent("Staged checkpoint inventory exceeds its bound"))?;
     let sealed = files.get_fresh_exact(&manifest_path, length).await?;
-    let bytes = stage_key.open_object(&manifest_path, sealed).await?;
+    let bytes = cipher.open_object(&manifest_path, sealed).await?;
     if stage.staged_manifest_sha256.as_deref() != Some(digest(&bytes).as_str()) {
         return Err(inconsistent(
             "The staged inventory differs from its accepted digest",
@@ -377,16 +375,7 @@ async fn open_inventory(
             "The staged storage root differs from its accepted inventory",
         ));
     }
-    let material = match contents {
-        CheckpointContents::Primary => None,
-        CheckpointContents::Replay => Some(keys.existing_key(&media_id).await?
-            .ok_or_else(|| unavailable("The staged checkpoint key is unavailable"))?),
-    };
     let legacy_trie_data = objects.iter().any(|(name, object)| object.is_legacy_trie(name));
-    let cipher = match &material {
-        None => stage_key,
-        Some(material) => crate::keys::tracked_deployment_archive_key(keys, media_id, material)?,
-    };
     let plaintext = Arc::new(CapturedObjects { files, objects, cipher });
     let point = CapturePoint {
         operation: stage.intent.capture,
