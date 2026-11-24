@@ -178,8 +178,6 @@ pub fn hosted_replay_controls<'a>(
         || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
         || u64::try_from(source.system_time.0).ok().and_then(|time| time.checked_mul(1_000))
             .is_none_or(|time| time < replay.logical_at || time > replay.through)
-        || replay.previous.is_some_and(|previous| previous.tx_id.0 < 0 || previous.tx_id >= source.tx_id
-            || previous.system_time.0 <= 0 || previous.system_time >= source.system_time)
         || !replay.matches_coordinates(coordinates)
     {
         return Err(replay_invalid());
@@ -269,7 +267,7 @@ fn replay_constraint_mismatch() -> Anomaly {
 fn original_prefix(event: rtdb_types::TransactionKey, captured: rtdb_types::TransactionKey) -> bool {
     event.tx_id.0 >= 0 && event.system_time.0 > 0
         && (event == captured
-            || (event.tx_id < captured.tx_id && event.system_time < captured.system_time))
+            || (event.tx_id < captured.tx_id && event.system_time <= captured.system_time))
 }
 
 /// Recognize an exact archived transaction through its accepted held receipt.
@@ -383,6 +381,9 @@ impl HostedReplay {
             && u64::try_from(self.captured.system_time.0).ok()
                 .and_then(|micros| micros.checked_mul(1_000)) == Some(self.through)
             && original_prefix(self.source, self.captured)
+            && self.previous.is_none_or(|previous| {
+                previous.tx_id < self.source.tx_id && original_prefix(previous, self.source)
+            })
             && self.handoff.as_ref().is_none_or(|seal| {
                 seal.handoff != [0; 32]
                     && original_prefix(seal.through, self.captured)
@@ -463,7 +464,7 @@ impl HostedReplay {
                 if bytes.len() > 4096 { return Err(replay_invalid()); }
                 let previous: Self = serde_json::from_slice(bytes).map_err(|_| replay_invalid())?;
                 self.same_original_capture(&previous) && previous.has_original_prefix()
-                    && Some(previous.source) == self.previous && previous.logical_at < self.logical_at
+                    && Some(previous.source) == self.previous && previous.logical_at <= self.logical_at
             }
             _ => true,
         };
@@ -929,6 +930,19 @@ mod world_read_tests {
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+
+    #[test]
+    fn original_capture_preserves_distinct_transactions_at_the_same_sql_time() {
+        use rtdb_types::{TransactionKey, TxId};
+        let first = TransactionKey { tx_id: TxId(8), system_time: Timestamp(13) };
+        let second = TransactionKey { tx_id: TxId(11), system_time: Timestamp(13) };
+        assert!(original_prefix(first, second));
+        assert!(original_prefix(second, second));
+        assert!(!original_prefix(second, first));
+        assert!(!original_prefix(
+            TransactionKey { tx_id: second.tx_id, system_time: Timestamp(12) }, second,
+        ));
+    }
 
     #[test]
     fn replay_requires_the_hold_and_identical_create_only_receipt() -> Result<()> {
