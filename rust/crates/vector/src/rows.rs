@@ -123,6 +123,15 @@ impl IndexedRows {
     pub(crate) fn rows(&self) -> &[IndexedRow] { &self.rows }
     pub(crate) fn unit(&self, row: &IndexedRow) -> &[f32] { &self.units[row.unit_offset..row.unit_offset + self.dimensions] }
 
+    pub(crate) fn contiguous_units(&self, selected: &[&IndexedRow]) -> Option<&[f32]> {
+        let start = selected.first()?.unit_offset;
+        let end = selected.last()?.unit_offset + self.dimensions;
+        if !selected.windows(2).all(|pair| pair[1].unit_offset == pair[0].unit_offset + self.dimensions) {
+            return None;
+        }
+        self.units.get(start..end)
+    }
+
     pub(crate) fn sort(&mut self) {
         self.rows.sort_by_key(|row| (row.partition, row.iid, row.system_from, row.valid_from, row.valid_to));
     }

@@ -5,6 +5,7 @@
 //! The artefact record's stats carry the footer and the directory digest, so a reader opens the directory
 //! with one range read and checks every byte it uses.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,9 +14,10 @@ use arrow_array::{
     Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array,
     builder::FixedSizeBinaryBuilder,
 };
-use arrow_buffer::Buffer;
+use arrow_buffer::{Buffer, ToByteSlice};
 use arrow_ipc::{Message, convert::fb_to_schema, reader::read_record_batch, root_as_message, writer::StreamWriter};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use rtdb_format::ipc::write_uncompressed_stream_from_buffers;
 use rtdb_types::{Anomaly, Iid, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -118,18 +120,18 @@ pub(crate) fn write_generation(mut rows: IndexedRows, output: &mut impl Write, c
         for (centroid, selected) in centroids_by_cluster.zip(selections) {
             if selected.is_empty() { continue; }
             if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
+            let count = u32::try_from(selected.len()).map_err(|_| corrupt("A cluster exceeds the row count the format records"))?;
             let padding = ((ALIGNMENT - written % ALIGNMENT) % ALIGNMENT) as usize;
             output.write_all(&[0u8; ALIGNMENT as usize][..padding]).map_err(io)?;
             written += padding as u64;
-            let bytes = encode(&block, block_batch(&block, &rows, &selected)?)?;
-            output.write_all(&bytes).map_err(io)?;
+            let (length, digest) = write_block(output, &block, &rows, &selected)?;
             partitions.push(partition);
             centroids.extend_from_slice(centroid);
             offsets.push(written);
-            lengths.push(bytes.len() as u64);
-            counts.push(u32::try_from(selected.len()).map_err(|_| corrupt("A cluster exceeds the row count the format records"))?);
-            digests.push(<[u8; 32]>::from(Sha256::digest(&bytes)));
-            written += bytes.len() as u64;
+            lengths.push(length);
+            counts.push(count);
+            digests.push(digest);
+            written += length;
         }
         start = end;
     }
@@ -156,20 +158,60 @@ pub(crate) fn write_generation(mut rows: IndexedRows, output: &mut impl Write, c
     Ok(Written { size: written, locator })
 }
 
-fn block_batch(schema: &SchemaRef, rows: &IndexedRows, selected: &[&IndexedRow]) -> Result<RecordBatch> {
-    let mut iids = FixedSizeBinaryBuilder::with_capacity(selected.len(), 16);
-    let mut units = Vec::with_capacity(selected.len() * rows.dimensions());
+fn write_block(
+    output: &mut impl Write, schema: &Schema, rows: &IndexedRows, selected: &[&IndexedRow],
+) -> Result<(u64, [u8; 32])> {
+    let count = selected.len();
+    let mut iids = Vec::with_capacity(count * 16);
+    let mut valid_from = Vec::with_capacity(count);
+    let mut valid_to = Vec::with_capacity(count);
+    let mut system_from = Vec::with_capacity(count);
     for row in selected {
-        iids.append_value(row.iid.0).map_err(arrow)?;
-        units.extend_from_slice(rows.unit(row));
+        iids.extend_from_slice(&row.iid.0);
+        valid_from.push(row.valid_from);
+        valid_to.push(row.valid_to);
+        system_from.push(row.system_from);
     }
-    RecordBatch::try_new(Arc::clone(schema), vec![
-        Arc::new(iids.finish()),
-        Arc::new(Int64Array::from_iter_values(selected.iter().map(|row| row.valid_from))),
-        Arc::new(Int64Array::from_iter_values(selected.iter().map(|row| row.valid_to))),
-        Arc::new(Int64Array::from_iter_values(selected.iter().map(|row| row.system_from))),
-        Arc::new(unit_list(units, rows.dimensions())?),
-    ]).map_err(arrow)
+    let units = match rows.contiguous_units(selected) {
+        Some(units) => Cow::Borrowed(units),
+        None => {
+            let mut units = Vec::with_capacity(count * rows.dimensions());
+            for row in selected { units.extend_from_slice(rows.unit(row)); }
+            Cow::Owned(units)
+        }
+    };
+    let mut output = HashingWriter { output, length: 0, digest: Sha256::new() };
+    let buffers: [&[u8]; 11] = [
+        &[], &iids,
+        &[], valid_from.to_byte_slice(),
+        &[], valid_to.to_byte_slice(),
+        &[], system_from.to_byte_slice(),
+        &[], &[], units.as_ref().to_byte_slice(),
+    ];
+    write_uncompressed_stream_from_buffers(
+        &mut output, schema, count, &[count, count, count, count, count, units.len()], &buffers,
+    ).map_err(|error| match error {
+        ArrowError::IoError(_, error) => io(error),
+        error => arrow(error),
+    })?;
+    Ok((output.length, output.digest.finalize().into()))
+}
+
+struct HashingWriter<'a, W> {
+    output: &'a mut W,
+    length: u64,
+    digest: Sha256,
+}
+
+impl<W: Write> Write for HashingWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = self.output.write(bytes)?;
+        self.length += count as u64;
+        self.digest.update(&bytes[..count]);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { self.output.flush() }
 }
 
 fn unit_list(values: Vec<f32>, dimensions: usize) -> Result<FixedSizeListArray> {
@@ -349,8 +391,17 @@ mod tests {
         let directory = Directory::read(bytes.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize), &locator).unwrap();
         let total: u32 = directory.clusters.iter().map(|cluster| cluster.rows).sum();
         assert_eq!(total, 1_000);
+        let schema = block_schema(2).unwrap();
+        let mut previous_end = 0u64;
         for cluster in &directory.clusters {
-            let block = Block::read(bytes.slice_with_length(cluster.range.start as usize, (cluster.range.end - cluster.range.start) as usize), cluster, 2).unwrap();
+            let start = cluster.range.start;
+            assert_eq!(start, previous_end.next_multiple_of(ALIGNMENT));
+            assert!(first[previous_end as usize..start as usize].iter().all(|&byte| byte == 0));
+            previous_end = cluster.range.end;
+            let range = bytes.slice_with_length(start as usize, (cluster.range.end - start) as usize);
+            let batch = decode(range.clone(), &schema, Some(cluster.rows as usize)).unwrap();
+            assert_eq!(range.as_slice(), encode(&schema, batch).unwrap().as_slice());
+            let block = Block::read(range, cluster, 2).unwrap();
             assert_eq!(block.len(), cluster.rows as usize);
             for row in 0..block.len() {
                 let (_, _, seed) = block.extent(row);
@@ -358,6 +409,67 @@ mod tests {
                 assert_eq!(block.unit(row), &[angle.cos() as f32, angle.sin() as f32]);
             }
         }
+        assert_eq!(locator.directory.0, previous_end);
+        assert_eq!(&first[written.size as usize - FOOTER_BYTES..], &locator.encode()[..FOOTER_BYTES]);
+    }
+
+    #[test]
+    fn cluster_stream_uses_the_selected_unit_order() {
+        let rows = rows([0, 2, 4, 6]);
+        let source = rows.rows();
+        let contiguous = [&source[1], &source[2]];
+        let reordered = [&source[2], &source[1]];
+        let gapped = [&source[1], &source[3]];
+        let units = rows.contiguous_units(&contiguous).unwrap();
+        assert_eq!(units.as_ptr(), rows.unit(&source[1]).as_ptr());
+        assert_eq!(units.len(), 4);
+        assert!(rows.contiguous_units(&reordered).is_none());
+        assert!(rows.contiguous_units(&gapped).is_none());
+
+        let schema = block_schema(2).unwrap();
+        for selected in [contiguous, reordered, gapped] {
+            let mut bytes = Vec::new();
+            let (length, digest) = write_block(&mut bytes, &schema, &rows, &selected).unwrap();
+            let cluster = Cluster { partition: source[0].partition, centroid: 0..2, range: 0..length, rows: 2, digest };
+            let buffer = Buffer::from_vec(bytes);
+            let batch = decode(buffer.clone(), &schema, Some(selected.len())).unwrap();
+            assert_eq!(buffer.as_slice(), encode(&schema, batch).unwrap().as_slice());
+            let block = Block::read(buffer, &cluster, 2).unwrap();
+            for (index, row) in selected.into_iter().enumerate() {
+                assert_eq!(block.iid(index).unwrap(), row.iid);
+                assert_eq!(block.extent(index), (row.valid_from, row.valid_to, row.system_from));
+                assert_eq!(block.unit(index), rows.unit(row));
+            }
+        }
+    }
+
+    #[test]
+    fn short_cluster_writes_keep_the_digest_and_io_failure_stops_before_the_directory() {
+        struct ShortOutput { bytes: Vec<u8>, limit: usize }
+        impl Write for ShortOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = bytes.len().min(11).min(self.limit - self.bytes.len());
+                if count == 0 && !bytes.is_empty() { return Err(std::io::Error::other("sink failed")); }
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let token = CancellationToken::new();
+        let mut expected = Vec::new();
+        let written = write_generation(rows(0..4), &mut expected, &token).unwrap();
+        let mut output = ShortOutput { bytes: Vec::new(), limit: expected.len() };
+        let actual = write_generation(rows(0..4), &mut output, &token).unwrap();
+        assert_eq!(actual.locator, written.locator);
+        assert_eq!(actual.size, written.size);
+        assert_eq!(output.bytes, expected);
+
+        let limit = written.locator.directory.0 as usize - END.len() - 1;
+        let mut output = ShortOutput { bytes: Vec::new(), limit };
+        let error = write_generation(rows(0..4), &mut output, &token).err().unwrap();
+        assert_eq!(error.code, "rtdb.vector/io");
+        assert_eq!(output.bytes.as_slice(), &expected[..limit]);
     }
 
     #[tokio::test]
