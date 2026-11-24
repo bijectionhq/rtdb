@@ -5,7 +5,7 @@ use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::log::proto;
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{Admission, Decision, LINEARIZABLE, Receipt, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
+use rtdb_tx::transact::{Admission, Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis}};
@@ -23,7 +23,7 @@ const FRAME_HEADER_BYTES: usize = 65;
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", LINEARIZABLE, "branches",
-    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, "tx-status", "sql.history",
+    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, "tx-status", "sql.history",
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", "branches",

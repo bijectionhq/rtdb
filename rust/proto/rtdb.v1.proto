@@ -121,9 +121,16 @@ message Cell {
     bytes arrow_ipc = 1;
     google.protobuf.Empty tx_time = 2;
     google.protobuf.Empty tx_basis = 3;
+    // A signed offset from the transaction time, used in Put valid-time bounds.
+    sint64 tx_time_offset_micros = 4;
   }
 }
-message Interval { optional sint64 from_micros = 1; optional sint64 to_micros = 2; }
+message Interval {
+  optional sint64 from_micros = 1;
+  optional sint64 to_micros = 2;
+  optional sint64 from_tx_offset_micros = 3;
+  optional sint64 to_tx_offset_micros = 4;
+}
 message Row {
   map<string, Cell> cells = 1;
   // A 16-byte nonzero database-local custody group. Empty leaves the row unbound.

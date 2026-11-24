@@ -23,7 +23,7 @@ impl Candidate<'_> {
                         {
                             return Err(invalid_label());
                         }
-                        if definition.visibility.is_some() && (row.valid.is_none()
+                        if definition.visibility.is_some() && (!row.valid.is_some_and(ValidTime::is_literal)
                             || row.cells.values().any(|cell| !matches!(cell, Cell::Value(_))))
                         {
                             return Err(labelled_time_error());
@@ -49,7 +49,7 @@ impl Candidate<'_> {
                     self.require_write_branch(branch)?;
                     self.index.writable(branch)?;
                     let definition = self.write_definition(table)?;
-                    if definition.visibility.is_some() && valid.is_none() {
+                    if definition.visibility.is_some() && !valid.is_some_and(ValidTime::is_literal) {
                         return Err(labelled_time_error());
                     }
                     let valid = effective_valid(*valid, cut.system_time)?;
@@ -389,8 +389,8 @@ fn endpoints(history: &[&BranchEvent], within: Interval) -> Vec<Timestamp> {
     boundaries.into_iter().collect()
 }
 
-fn effective_valid(valid: Option<Interval>, time: Timestamp) -> Result<Interval> {
-    let valid = valid.unwrap_or(Interval::new(time, Timestamp::MAX)?);
+fn effective_valid(valid: Option<ValidTime>, time: Timestamp) -> Result<Interval> {
+    let valid = valid.map_or_else(|| Interval::new(time, Timestamp::MAX), |valid| valid.resolve(time))?;
     if valid.is_empty() {
         return Err(Anomaly::incorrect("rtdb/empty-valid-time", "A row write needs a nonempty valid interval"));
     }

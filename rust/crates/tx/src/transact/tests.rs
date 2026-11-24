@@ -48,6 +48,29 @@ fn visible(state: &TransactState, branch: &str, layer: Layer, at: i64) -> Vec<i6
 }
 
 #[test]
+fn put_and_delete_resolve_relative_intervals_at_the_receipt_time() {
+    let mut state = TransactState::new(INCARNATION);
+    let interval = |from, to| Some(ValidTime::new(
+        ValidTimeBound::TransactionMicros(from), ValidTimeBound::TransactionMicros(to),
+    ).unwrap());
+    let mut put = put(MAIN_BRANCH, 1, "relative");
+    let Op::Put { rows, .. } = &mut put else { unreachable!() };
+    rows[0].valid = interval(-5, 5);
+    let first = commit(&mut state, 1, &request(1, vec![put]));
+    assert_eq!(first.system_time, Timestamp(10));
+    assert!(visible(&state, MAIN_BRANCH, Layer::Merged, 4).is_empty());
+    assert_eq!(visible(&state, MAIN_BRANCH, Layer::Merged, 5), [1]);
+    assert_eq!(visible(&state, MAIN_BRANCH, Layer::Merged, 14), [1]);
+    assert!(visible(&state, MAIN_BRANCH, Layer::Merged, 15).is_empty());
+    let delete = Op::Delete {
+        branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(1)], valid: interval(-10, 5),
+    };
+    assert_eq!(commit(&mut state, 2, &request(2, vec![delete])).system_time, Timestamp(20));
+    assert_eq!(visible(&state, MAIN_BRANCH, Layer::Merged, 9), [1]);
+    assert!(visible(&state, MAIN_BRANCH, Layer::Merged, 10).is_empty());
+}
+
+#[test]
 fn custody_revocation_masks_prior_and_inherited_members_after_checkpoint() {
     let group = [8; 16];
     let features = [LINEARIZABLE, ROW_CUSTODY];
@@ -91,7 +114,7 @@ fn custody_revocation_masks_prior_and_inherited_members_after_checkpoint() {
 
 fn labelled_put(branch: &str, id: i64, label: u8, valid: Interval) -> Op {
     let Op::Put { branch, table, mut rows, if_absent } = put(branch, id, "value") else { unreachable!() };
-    rows[0].valid = Some(valid);
+    rows[0].valid = Some(valid.into());
     rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![label])));
     Op::Put { branch, table, rows, if_absent }
 }
@@ -122,7 +145,7 @@ fn row_visibility_checks_incoming_and_affected_labels() {
     let mut state = TransactState::new(INCARNATION);
     commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 2, Interval::ALL)]));
     let write = LabelScope { read: BTreeSet::from([vec![2]]), write: BTreeSet::from([vec![1]]) };
-    let delete = |id| Op::Delete { branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(id)], valid: Some(Interval::ALL) };
+    let delete = |id| Op::Delete { branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(id)], valid: Some(Interval::ALL.into()) };
     let erase = Op::Erase { branch: None, table: table(), ids: vec![EntityId::Integer(1)] };
     for op in [labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL), labelled_put(MAIN_BRANCH, 2, 2, Interval::ALL),
         delete(1), delete(2), erase] {

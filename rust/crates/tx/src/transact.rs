@@ -91,16 +91,59 @@ impl Cell {
 #[derive(Clone, Debug, Serialize)]
 pub struct Row {
     pub id: EntityId,
-    pub valid: Option<Interval>,
+    pub valid: Option<ValidTime>,
     pub cells: StructFields<Cell>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_group: Option<CustodyGroupId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ValidTime {
+    Literal(Interval),
+    Relative { from: ValidTimeBound, to: ValidTimeBound },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ValidTimeBound {
+    Instant(Timestamp),
+    TransactionMicros(i64),
+}
+
+impl ValidTime {
+    pub fn new(from: ValidTimeBound, to: ValidTimeBound) -> Result<Self> {
+        match (from, to) {
+            (ValidTimeBound::Instant(from), ValidTimeBound::Instant(to)) => {
+                Ok(Self::Literal(Interval::new(from, to)?))
+            }
+            (from, to) => Ok(Self::Relative { from, to }),
+        }
+    }
+
+    pub fn resolve(self, time: Timestamp) -> Result<Interval> {
+        let bound = |bound| match bound {
+            ValidTimeBound::Instant(at) => Ok(at),
+            ValidTimeBound::TransactionMicros(offset) => time.0.checked_add(offset).map(Timestamp).ok_or_else(|| {
+                Anomaly::incorrect("rtdb/invalid-valid-time", "The transaction-relative valid time is out of range")
+            }),
+        };
+        match self {
+            Self::Literal(interval) => Ok(interval),
+            Self::Relative { from, to } => Interval::new(bound(from)?, bound(to)?),
+        }
+    }
+
+    fn is_literal(self) -> bool { matches!(self, Self::Literal(_)) }
+}
+
+impl From<Interval> for ValidTime {
+    fn from(interval: Interval) -> Self { Self::Literal(interval) }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub enum Op {
     Put { branch: Branch, table: TableRef, rows: Vec<Row>, if_absent: bool },
-    Delete { branch: Branch, table: TableRef, ids: Vec<EntityId>, valid: Option<Interval> },
+    Delete { branch: Branch, table: TableRef, ids: Vec<EntityId>, valid: Option<ValidTime> },
     Erase { branch: Option<Branch>, table: TableRef, ids: Vec<EntityId> },
     Declare { table: TableRef, change: Declaration },
     Fork { child: Branch, from: (Branch, Basis), writable: bool, expires_at: Option<Timestamp> },
@@ -151,6 +194,7 @@ pub struct Receipt {
 pub const TIMED_TRANSACT: &str = "timed-transact";
 pub const LINEARIZABLE: &str = "linearizable";
 pub const TRANSACT_REQUIRES: &str = "transact.requires";
+pub const RELATIVE_VALID_TIME: &str = "transact.relative-valid-time";
 pub const ROW_CUSTODY: &str = "row-custody";
 pub const REQUIREMENT_FAILED: &str = "rtdb/requirement-failed";
 

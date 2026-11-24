@@ -3,10 +3,10 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_tx::transact::{
     self as tx, Cell, CountRange, Declaration, Guard, IndexDefinition, Op, Row, Transact, Version,
-    When, Window,
+    ValidTime, ValidTimeBound, When, Window,
 };
 use rtdb_types::{
-    EntityId, Interval, TableRef, Timestamp, Value,
+    EntityId, TableRef, Timestamp, Value,
     rtdb_v1::{Basis, Branch, Claim, valid_branch_name},
 };
 use tonic::Status;
@@ -238,12 +238,10 @@ fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status
     let from = fields.remove("_valid_from");
     let to = fields.remove("_valid_to");
     let valid = if from.is_some() || to.is_some() {
-        let bound = |field: Option<proto::Cell>, default| match field.map(|field| cell(field, memory)).transpose()? {
-            None => Ok(default),
-            Some(Cell::Value(value)) => valid_bound(value),
-            Some(Cell::TxTime | Cell::TxBasis) => Err(error::incorrect("Valid-time bounds must be literal")),
-        };
-        Some(Interval::new(bound(from, Timestamp::MIN)?, bound(to, Timestamp::MAX)?).map_err(error::anomaly)?)
+        Some(ValidTime::new(
+            put_valid_bound(from, Timestamp::MIN, memory)?,
+            put_valid_bound(to, Timestamp::MAX, memory)?,
+        ).map_err(error::anomaly)?)
     } else { None };
     let cells = fields
         .into_iter()
@@ -265,6 +263,16 @@ fn custody_group(bytes: &[u8]) -> Result<[u8; 16], Status> {
     Ok(group)
 }
 
+fn put_valid_bound(field: Option<proto::Cell>, default: Timestamp, memory: &Arc<MemoryBudget>) -> Result<ValidTimeBound, Status> {
+    use proto::cell::Value as WireValue;
+    match field {
+        None => Ok(ValidTimeBound::Instant(default)),
+        Some(proto::Cell { value: Some(WireValue::TxTime(_)) }) => Ok(ValidTimeBound::TransactionMicros(0)),
+        Some(proto::Cell { value: Some(WireValue::TxTimeOffsetMicros(offset)) }) => Ok(ValidTimeBound::TransactionMicros(offset)),
+        Some(field) => valid_bound(literal(field, memory)?).map(ValidTimeBound::Instant),
+    }
+}
+
 /// A bound is signed microseconds, or a zoned Arrow timestamp; a naive timestamp names no instant.
 fn valid_bound(value: Value) -> Result<Timestamp, Status> {
     match value {
@@ -282,12 +290,16 @@ fn valid_bound(value: Value) -> Result<Timestamp, Status> {
     }
 }
 
-fn interval(valid: proto::Interval) -> Result<Interval, Status> {
-    Interval::new(
-        valid.from_micros.map_or(Timestamp::MIN, Timestamp),
-        valid.to_micros.map_or(Timestamp::MAX, Timestamp),
-    )
-    .map_err(error::anomaly)
+fn interval(valid: proto::Interval) -> Result<ValidTime, Status> {
+    let bound = |instant, offset, default| match (instant, offset) {
+        (Some(_), Some(_)) => Err(error::incorrect("A bound cannot be both literal and transaction-relative")),
+        (None, Some(offset)) => Ok(ValidTimeBound::TransactionMicros(offset)),
+        (instant, None) => Ok(ValidTimeBound::Instant(instant.map_or(default, Timestamp))),
+    };
+    ValidTime::new(
+        bound(valid.from_micros, valid.from_tx_offset_micros, Timestamp::MIN)?,
+        bound(valid.to_micros, valid.to_tx_offset_micros, Timestamp::MAX)?,
+    ).map_err(error::anomaly)
 }
 
 fn cell(cell: proto::Cell, memory: &Arc<MemoryBudget>) -> Result<Cell, Status> {
@@ -299,6 +311,7 @@ fn cell(cell: proto::Cell, memory: &Arc<MemoryBudget>) -> Result<Cell, Status> {
         {
             WireValue::TxTime(_) => Cell::TxTime,
             WireValue::TxBasis(_) => Cell::TxBasis,
+            WireValue::TxTimeOffsetMicros(_) => return Err(error::incorrect("A transaction offset can only be used as a valid-time bound")),
             WireValue::ArrowIpc(bytes) => {
                 let stream =
                     rtdb_format::ipc::OwnedStream::read(&bytes, memory).map_err(error::anomaly)?;
@@ -387,6 +400,7 @@ pub(super) fn receipt(receipt: tx::Receipt) -> proto::Receipt {
 #[cfg(test)]
 mod tests {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray};
+    use rtdb_types::Interval;
 
     use super::*;
 
@@ -417,17 +431,35 @@ mod tests {
             ("_valid_from", Arc::new(Int64Array::from(vec![10])) as ArrayRef),
             ("_valid_to", Arc::new(Int64Array::from(vec![20]))),
         ]).unwrap();
-        assert_eq!(micros.valid, Some(Interval::new(Timestamp(10), Timestamp(20)).unwrap()));
+        assert_eq!(micros.valid, Some(Interval::new(Timestamp(10), Timestamp(20)).unwrap().into()));
         assert!(!micros.cells.contains_key("_valid_from") && !micros.cells.contains_key("_valid_to"));
 
         let open_ended = row([("_valid_from", Arc::new(TimestampMicrosecondArray::from(vec![30]).with_timezone("UTC")) as ArrayRef)]).unwrap();
-        assert_eq!(open_ended.valid, Some(Interval::new(Timestamp(30), Timestamp::MAX).unwrap()));
+        assert_eq!(open_ended.valid, Some(Interval::new(Timestamp(30), Timestamp::MAX).unwrap().into()));
 
         let units = row([
             ("_valid_from", Arc::new(TimestampMillisecondArray::from(vec![2]).with_timezone("UTC")) as ArrayRef),
             ("_valid_to", Arc::new(TimestampNanosecondArray::from(vec![5_000_999]).with_timezone("+01:00"))),
         ]).unwrap();
-        assert_eq!(units.valid, Some(Interval::new(Timestamp(2_000), Timestamp(5_000)).unwrap()));
+        assert_eq!(units.valid, Some(Interval::new(Timestamp(2_000), Timestamp(5_000)).unwrap().into()));
+    }
+
+    #[test]
+    fn put_and_delete_decode_transaction_relative_valid_time() {
+        let memory = MemoryBudget::new(1 << 20);
+        let row = decode_row(proto::Row {
+            cells: [
+                ("_id".into(), wire(Arc::new(Int64Array::from(vec![1])))),
+                ("_valid_from".into(), proto::Cell { value: Some(proto::cell::Value::TxTime(())) }),
+                ("_valid_to".into(), proto::Cell { value: Some(proto::cell::Value::TxTimeOffsetMicros(60)) }),
+            ].into_iter().collect(),
+            custody_group: Vec::new(),
+        }, &memory).unwrap();
+        assert_eq!(row.valid.unwrap().resolve(Timestamp(20)).unwrap(), Interval::new(Timestamp(20), Timestamp(80)).unwrap());
+        let delete = interval(proto::Interval { from_tx_offset_micros: Some(-10), to_micros: Some(50), ..Default::default() }).unwrap();
+        assert_eq!(delete.resolve(Timestamp(20)).unwrap(), Interval::new(Timestamp(10), Timestamp(50)).unwrap());
+        assert!(delete.resolve(Timestamp(i64::MIN)).is_err());
+        assert!(interval(proto::Interval { from_tx_offset_micros: Some(0), from_micros: Some(50), ..Default::default() }).is_err());
     }
 
     #[test]

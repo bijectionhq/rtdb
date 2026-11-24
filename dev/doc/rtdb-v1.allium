@@ -58,6 +58,11 @@ surface StatelessDatabase {
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.
         -- A binary or text range guard can name a single-column index, and an unbounded count can name a compound index.
 
+    @guarantee TransactionRelativeValidTime
+        -- Put and Delete on unlabelled tables may name a valid-time endpoint as a signed offset from the transaction time.
+        -- The writer resolves both endpoints against the receipt's system time and records the resolved interval.
+        -- Overflow, a reversed interval and an empty interval fail before any row effect is applied.
+
     @guarantee TokenAuthority
         -- All routes to an incarnation use the same wrapped token key for each published generation.
         -- New queries use the latest published generation.

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
-use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
@@ -62,7 +62,7 @@ impl ServingDriver for MultiServing {
     }
 
     fn features(&self) -> &[&str] {
-        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, ROW_VISIBILITY, "query", "query.track", "query.page",
+        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, ROW_VISIBILITY, "query", "query.track", "query.page",
           "query.linearizable", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
     }
 
@@ -597,7 +597,7 @@ mod tests {
             let mut submission = write(key, "row", None);
             let Op::Put { rows, .. } = &mut submission.transaction.ops[0] else { unreachable!() };
             rows[0].id = EntityId::Integer(id);
-            rows[0].valid = Some(Interval::ALL);
+            rows[0].valid = Some(Interval::ALL.into());
             rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![label])));
             submission
         };
