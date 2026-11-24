@@ -6,10 +6,11 @@ use std::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, LargeBinaryArray,
+    LargeStringArray, NullArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray, downcast_primitive, types::ArrowPrimitiveType,
 };
-use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer, ToByteSlice};
 use arrow_flight::FlightData;
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit as ArrowTime};
 use prost::Message;
@@ -45,6 +46,7 @@ const MAX_DEFERRED_IMAGE_NODES: usize = 8;
 const MAX_DEFERRED_IMAGE_BYTES: usize = 1024;
 const MAX_DEFERRED_IMAGE_SCRATCH: usize = 24 << 10;
 const MAX_DEFERRED_VARIABLE_BYTES: usize = 256;
+const MAX_PRIMITIVE_BYTES: usize = 32;
 const MIN_DEFERRED_IMAGE_ROW_BOUND: usize =
     MAX_DEFERRED_IMAGE_SCRATCH + 8 * MAX_DEFERRED_IMAGE_BYTES;
 
@@ -117,7 +119,7 @@ enum Image {
         stream: Arc<RowStreamEncoder>,
         row: PreparedStreamRow,
     },
-    Deferred(DeferredImage),
+    Deferred(Box<DeferredImage>),
 }
 
 impl Image {
@@ -155,8 +157,10 @@ impl Image {
 
 #[derive(Clone, Copy)]
 enum ImageValue<B> {
-    Fixed(i64),
+    Primitive([u8; MAX_PRIMITIVE_BYTES]),
+    Boolean(u8),
     Bytes(B),
+    Null,
     Struct,
 }
 
@@ -171,28 +175,29 @@ struct ImageCandidate<'a> {
     len: usize,
     scratch: usize,
     padded_value_bytes: usize,
+    has_fixed_body: bool,
 }
 
 impl<'a> ImageCandidate<'a> {
-    fn new(batch: &'a RecordBatch, schema_bound: usize) -> Option<Self> {
+    fn new(batch: &'a RecordBatch, row: usize, schema_bound: usize) -> Option<Self> {
         let schema = batch.schema_ref();
         if !(1..=MAX_DEFERRED_IMAGE_FIELDS).contains(&batch.num_columns())
             || schema_bound > MAX_DEFERRED_IMAGE_SCRATCH
-            || !schema.metadata().is_empty()
         {
             return None;
         }
         let mut candidate = Self {
             cells: [ImageCell {
-                value: ImageValue::Fixed(0),
+                value: ImageValue::Null,
                 null_byte: None,
             }; MAX_DEFERRED_IMAGE_NODES],
             len: 0,
             scratch: schema_bound,
             padded_value_bytes: 0,
+            has_fixed_body: false,
         };
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
-            candidate.capture(field, array.as_ref(), None)?;
+            candidate.capture(field, array.as_ref(), row, None)?;
         }
         (candidate.scratch <= MAX_DEFERRED_IMAGE_SCRATCH
             && candidate.padded_value_bytes <= MAX_DEFERRED_VARIABLE_BYTES)
@@ -203,90 +208,143 @@ impl<'a> ImageCandidate<'a> {
         &mut self,
         field: &Field,
         array: &'a dyn Array,
+        row: usize,
         parent_is_null: Option<bool>,
     ) -> Option<()> {
         if self.len == self.cells.len()
-            || array.len() != 1
+            || row >= array.len()
             || array.data_type() != field.data_type()
-            || !field.metadata().is_empty()
         {
             return None;
         }
         let null_byte = array
             .nulls()
-            .filter(|nulls| nulls.null_count() != 0)
-            .map(|nulls| {
-                let offset = nulls.offset();
-                // Arrow writes the entire source byte for a byte-aligned singleton validity slice.
-                if offset.is_multiple_of(8) {
-                    nulls.buffer()[offset / 8]
-                } else {
-                    0
-                }
-            });
-        if null_byte.is_some() && !field.is_nullable() && parent_is_null != Some(true) {
+            .filter(|nulls| nulls.is_null(row))
+            .map(|nulls| singleton_bit_byte(nulls.inner(), row));
+        let is_null = null_byte.is_some() || matches!(field.data_type(), DataType::Null);
+        if is_null && !field.is_nullable() && parent_is_null != Some(true) {
             return None;
         }
 
         let index = self.len;
         self.len += 1;
-        let (value, array_bytes) = match field.data_type() {
-            DataType::Int64 => (
-                ImageValue::Fixed(array.as_any().downcast_ref::<Int64Array>()?.value(0)),
-                size_of::<Int64Array>(),
-            ),
-            DataType::Timestamp(ArrowTime::Microsecond, _) => (
-                ImageValue::Fixed(
-                    array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()?
-                        .value(0),
-                ),
-                size_of::<TimestampMicrosecondArray>(),
-            ),
-            DataType::Utf8 => (
-                ImageValue::Bytes(
-                    array
-                        .as_any()
-                        .downcast_ref::<StringArray>()?
-                        .value(0)
-                        .as_bytes(),
-                ),
-                size_of::<StringArray>(),
-            ),
-            DataType::Binary => (
-                ImageValue::Bytes(array.as_any().downcast_ref::<BinaryArray>()?.value(0)),
-                size_of::<BinaryArray>(),
-            ),
+        let (value, array_bytes, fixed_body_bytes) = match field.data_type() {
+            DataType::Null => {
+                array.as_any().downcast_ref::<NullArray>()?;
+                (ImageValue::Null, size_of::<NullArray>(), 0)
+            }
+            DataType::Boolean => {
+                let array = array.as_any().downcast_ref::<BooleanArray>()?;
+                (
+                    ImageValue::Boolean(singleton_bit_byte(array.values(), row)),
+                    size_of::<BooleanArray>(),
+                    1,
+                )
+            }
+            DataType::Utf8 => {
+                let array = array.as_any().downcast_ref::<StringArray>()?;
+                (
+                    ImageValue::Bytes(array.value(row).as_bytes()),
+                    size_of::<StringArray>(),
+                    2 * size_of::<i32>(),
+                )
+            }
+            DataType::Binary => {
+                let array = array.as_any().downcast_ref::<BinaryArray>()?;
+                (
+                    ImageValue::Bytes(array.value(row)),
+                    size_of::<BinaryArray>(),
+                    2 * size_of::<i32>(),
+                )
+            }
+            DataType::LargeUtf8 => {
+                let array = array.as_any().downcast_ref::<LargeStringArray>()?;
+                (
+                    ImageValue::Bytes(array.value(row).as_bytes()),
+                    size_of::<LargeStringArray>(),
+                    2 * size_of::<i64>(),
+                )
+            }
+            DataType::LargeBinary => {
+                let array = array.as_any().downcast_ref::<LargeBinaryArray>()?;
+                (
+                    ImageValue::Bytes(array.value(row)),
+                    size_of::<LargeBinaryArray>(),
+                    2 * size_of::<i64>(),
+                )
+            }
+            DataType::FixedSizeBinary(width) if *width > 0 => {
+                let width = *width as usize;
+                if width > MAX_DEFERRED_VARIABLE_BYTES {
+                    return None;
+                }
+                let array = array.as_any().downcast_ref::<FixedSizeBinaryArray>()?;
+                let offset = row.checked_mul(width)?;
+                let value = array.value_data().get(offset..offset.checked_add(width)?)?;
+                (
+                    ImageValue::Bytes(value),
+                    size_of::<FixedSizeBinaryArray>(),
+                    width,
+                )
+            }
             DataType::Struct(fields) if parent_is_null.is_none() && !fields.is_empty() => {
                 let children = array.as_any().downcast_ref::<StructArray>()?.columns();
                 if children.len() != fields.len() {
                     return None;
                 }
                 for (field, child) in fields.iter().zip(children) {
-                    self.capture(field, child.as_ref(), Some(null_byte.is_some()))?;
+                    self.capture(field, child.as_ref(), row, Some(is_null))?;
                 }
                 (
                     ImageValue::Struct,
                     size_of::<StructArray>() + children.len() * size_of::<ArrayRef>(),
+                    0,
                 )
             }
-            _ => return None,
+            data_type => {
+                macro_rules! capture_primitive {
+                    ($ty:ty) => {
+                        Self::primitive::<$ty>(array, row)?
+                    };
+                }
+                downcast_primitive!(data_type => (capture_primitive), _ => return None)
+            }
         };
-        let buffer_bytes = match value {
-            ImageValue::Fixed(_) => size_of::<i64>(),
+        let compact_buffer_bytes = match value {
+            ImageValue::Primitive(_) => 64,
             ImageValue::Bytes(bytes) => {
                 if bytes.len() > MAX_DEFERRED_VARIABLE_BYTES {
                     return None;
                 }
-                self.padded_value_bytes += bytes.len().next_multiple_of(8);
-                2 * size_of::<i32>() + bytes.len()
+                if !matches!(field.data_type(), DataType::FixedSizeBinary(_)) {
+                    self.padded_value_bytes += bytes.len().next_multiple_of(8);
+                    fixed_body_bytes + bytes.len()
+                } else {
+                    fixed_body_bytes
+                }
             }
-            ImageValue::Struct => 0,
+            _ => fixed_body_bytes,
         };
-        self.scratch += 4 * (array_bytes + buffer_bytes + usize::from(null_byte.is_some()));
+        self.scratch += 4 * (array_bytes + compact_buffer_bytes + usize::from(null_byte.is_some()));
+        self.has_fixed_body |= fixed_body_bytes != 0;
         self.cells[index] = ImageCell { value, null_byte };
         Some(())
+    }
+
+    fn primitive<T: ArrowPrimitiveType>(
+        array: &'a dyn Array,
+        row: usize,
+    ) -> Option<(ImageValue<&'a [u8]>, usize, usize)> {
+        let array = array.as_any().downcast_ref::<PrimitiveArray<T>>()?;
+        let value = array.value(row);
+        let bytes = value.to_byte_slice();
+        let mut fixed = [0; MAX_PRIMITIVE_BYTES];
+        fixed.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some((
+            ImageValue::Primitive(fixed),
+            size_of::<PrimitiveArray<T>>(),
+            bytes.len(),
+        ))
     }
 
     fn varying_body_bytes(&self) -> usize {
@@ -295,6 +353,16 @@ impl<'a> ImageCandidate<'a> {
             .filter(|cell| cell.null_byte.is_some())
             .count();
         self.padded_value_bytes + 8 * nulls
+    }
+}
+
+fn singleton_bit_byte(bits: &BooleanBuffer, row: usize) -> u8 {
+    let offset = bits.offset() + row;
+    // Arrow writes the entire source byte for byte-aligned slices and shifts and masks other slices.
+    if offset.is_multiple_of(8) {
+        bits.inner()[offset / 8]
+    } else {
+        u8::from(bits.value(row))
     }
 }
 
@@ -328,14 +396,25 @@ impl DeferredImage {
             .null_byte
             .and_then(|byte| NullBuffer::from_unsliced_buffer(Buffer::from_vec(vec![byte]), 1));
         let array: ArrayRef = match (field.data_type(), &cell.value) {
-            (DataType::Int64, ImageValue::Fixed(value)) => {
-                Arc::new(Int64Array::new(vec![*value].into(), nulls))
+            (data_type, ImageValue::Primitive(bytes)) => {
+                let width = data_type
+                    .primitive_width()
+                    .expect("deferred primitive width");
+                let buffer = Buffer::from_slice_ref(&bytes[..width]);
+                macro_rules! primitive_column {
+                    ($ty:ty) => {{
+                        let column: ArrayRef = Arc::new(
+                            PrimitiveArray::<$ty>::new(ScalarBuffer::new(buffer, 0, 1), nulls)
+                                .with_data_type(data_type.clone()),
+                        );
+                        column
+                    }};
+                }
+                downcast_primitive!(data_type => (primitive_column), _ => unreachable!("deferred primitive type"))
             }
-            (DataType::Timestamp(ArrowTime::Microsecond, timezone), ImageValue::Fixed(value)) => {
-                Arc::new(
-                    TimestampMicrosecondArray::new(vec![*value].into(), nulls)
-                        .with_timezone_opt(timezone.clone()),
-                )
+            (DataType::Boolean, ImageValue::Boolean(byte)) => {
+                let values = BooleanBuffer::new(Buffer::from_vec(vec![*byte]), 0, 1);
+                Arc::new(BooleanArray::new(values, nulls))
             }
             (data_type @ (DataType::Utf8 | DataType::Binary), ImageValue::Bytes(bytes)) => {
                 let offsets = OffsetBuffer::new(vec![0, bytes.len() as i32].into());
@@ -345,6 +424,21 @@ impl DeferredImage {
                     Arc::new(BinaryArray::try_new(offsets, bytes.clone(), nulls)?)
                 }
             }
+            (
+                data_type @ (DataType::LargeUtf8 | DataType::LargeBinary),
+                ImageValue::Bytes(bytes),
+            ) => {
+                let offsets = OffsetBuffer::new(vec![0, bytes.len() as i64].into());
+                if *data_type == DataType::LargeUtf8 {
+                    Arc::new(LargeStringArray::try_new(offsets, bytes.clone(), nulls)?)
+                } else {
+                    Arc::new(LargeBinaryArray::try_new(offsets, bytes.clone(), nulls)?)
+                }
+            }
+            (DataType::FixedSizeBinary(width), ImageValue::Bytes(bytes)) => {
+                Arc::new(FixedSizeBinaryArray::try_new(*width, bytes.clone(), nulls)?)
+            }
+            (DataType::Null, ImageValue::Null) => Arc::new(NullArray::new(1)),
             (DataType::Struct(fields), ImageValue::Struct) => {
                 let children = fields
                     .iter()
@@ -363,23 +457,46 @@ enum ImageEncoding {
     Stream(Option<Arc<RowStreamEncoder>>),
 }
 
+#[derive(Default)]
+struct ImageLayout {
+    schema: Option<SchemaRef>,
+    base_wire_lengths: [Option<usize>; 2],
+}
+
+impl ImageLayout {
+    fn base_wire_len(&mut self, schema: &SchemaRef, has_body: bool) -> &mut Option<usize> {
+        if self.schema.as_ref() != Some(schema) {
+            self.schema = Some(Arc::clone(schema));
+            self.base_wire_lengths = [None; 2];
+        }
+        &mut self.base_wire_lengths[usize::from(has_body)]
+    }
+}
+
 struct ImageProjection<'a> {
     source: &'a RecordBatch,
     columns: &'a [usize],
     projected: Option<RecordBatch>,
+    array_bytes: Option<usize>,
     schema_bound: Option<usize>,
-    base_wire_len: Option<usize>,
+    layout: &'a mut ImageLayout,
     encoding: ImageEncoding,
 }
 
 impl<'a> ImageProjection<'a> {
-    fn new(source: &'a RecordBatch, columns: &'a [usize], shared_images: bool) -> Self {
+    fn new(
+        source: &'a RecordBatch,
+        columns: &'a [usize],
+        shared_images: bool,
+        layout: &'a mut ImageLayout,
+    ) -> Self {
         Self {
             source,
             columns,
             projected: None,
+            array_bytes: None,
             schema_bound: None,
-            base_wire_len: None,
+            layout,
             encoding: if shared_images {
                 ImageEncoding::Stream(None)
             } else {
@@ -399,16 +516,28 @@ impl<'a> ImageProjection<'a> {
                 .projected
                 .insert(self.source.project(self.columns).map_err(batch_error)?),
         };
-        let batch = projected.slice(row, 1);
-        let arrays = wire::mul(batch.get_array_memory_size(), 4).map_err(error::map_status)?;
+        let schema = projected.schema_ref();
         let schema_bound = match self.schema_bound {
             Some(bound) => bound,
             None => {
-                let bound = wire::schema_bound(batch.schema_ref()).map_err(error::map_status)?;
+                let bound = wire::schema_bound(schema).map_err(error::map_status)?;
                 self.schema_bound = Some(bound);
                 bound
             }
         };
+        let candidate = ImageCandidate::new(projected, row, schema_bound);
+        let mut slice = None;
+        let array_bytes = if candidate.is_some() {
+            // Supported slices keep every backing capacity, even for a row with no nulls.
+            *self
+                .array_bytes
+                .get_or_insert_with(|| projected.get_array_memory_size())
+        } else {
+            slice
+                .insert(projected.slice(row, 1))
+                .get_array_memory_size()
+        };
+        let arrays = wire::mul(array_bytes, 4).map_err(error::map_status)?;
         let size = wire::add(arrays, schema_bound).map_err(error::map_status)?;
         let charge = memory.reserve(size).map_err(error::anomaly)?;
         let stream = match &mut self.encoding {
@@ -417,44 +546,51 @@ impl<'a> ImageProjection<'a> {
                 let encoder = match encoder {
                     Some(encoder) => encoder,
                     None => encoder.insert(Arc::new(
-                        RowStreamEncoder::new(batch.schema_ref()).map_err(error::anomaly)?,
+                        RowStreamEncoder::new(schema).map_err(error::anomaly)?,
                     )),
                 };
                 Some(&*encoder)
             }
         };
-        let candidate = ImageCandidate::new(&batch, schema_bound);
-        if let (Some(candidate), Some(base_len)) = (&candidate, self.base_wire_len)
-            && let Some(legacy_len) = base_len.checked_add(candidate.varying_body_bytes())
-            && legacy_len <= MAX_DEFERRED_IMAGE_BYTES
-        {
-            return Ok((
-                Image::Deferred(DeferredImage {
-                    schema: batch.schema(),
-                    cells: candidate.cells.map(|cell| ImageCell {
-                        null_byte: cell.null_byte,
-                        value: match cell.value {
-                            ImageValue::Fixed(value) => ImageValue::Fixed(value),
-                            ImageValue::Bytes(bytes) => {
-                                ImageValue::Bytes(Buffer::from(bytes.to_vec()))
-                            }
-                            ImageValue::Struct => ImageValue::Struct,
-                        },
-                    }),
-                    stream: stream.cloned(),
-                    legacy_len,
-                }),
-                charge,
-            ));
+        if let Some(candidate) = candidate {
+            let varying_bytes = candidate.varying_body_bytes();
+            // A zero-length IPC body omits the FlatBuffer body-length slot.
+            let base = self
+                .layout
+                .base_wire_len(schema, candidate.has_fixed_body || varying_bytes != 0);
+            if let Some(legacy_len) = (*base).and_then(|len| len.checked_add(varying_bytes))
+                && legacy_len <= MAX_DEFERRED_IMAGE_BYTES
+            {
+                return Ok((
+                    Image::Deferred(Box::new(DeferredImage {
+                        schema: Arc::clone(schema),
+                        cells: candidate.cells.map(|cell| ImageCell {
+                            null_byte: cell.null_byte,
+                            value: match cell.value {
+                                ImageValue::Primitive(bytes) => ImageValue::Primitive(bytes),
+                                ImageValue::Boolean(byte) => ImageValue::Boolean(byte),
+                                ImageValue::Bytes(bytes) => {
+                                    ImageValue::Bytes(Buffer::from_vec(bytes.to_vec()))
+                                }
+                                ImageValue::Null => ImageValue::Null,
+                                ImageValue::Struct => ImageValue::Struct,
+                            },
+                        }),
+                        stream: stream.cloned(),
+                        legacy_len,
+                    })),
+                    charge,
+                ));
+            }
+            let image = Image::encode(&projected.slice(row, 1), stream)?;
+            // These layouts have fixed node and buffer counts. Only validity and padded
+            // variable values change the wire length within each body-length case.
+            if base.is_none() {
+                *base = image.legacy_len().checked_sub(varying_bytes);
+            }
+            return Ok((image, charge));
         }
-        let image = Image::encode(&batch, stream)?;
-        // A nonempty body keeps the FlatBuffer body-length slot present.
-        // Fixed-width nodes and buffer descriptors leave only padded validity and variable values to measure.
-        if let (None, Some(candidate)) = (self.base_wire_len, candidate) {
-            self.base_wire_len = image
-                .legacy_len()
-                .checked_sub(candidate.varying_body_bytes());
-        }
+        let image = Image::encode(slice.as_ref().expect("eager image slice"), stream)?;
         Ok((image, charge))
     }
 }
@@ -724,6 +860,8 @@ async fn change_page(
             let mut reader_groups = 0;
             let mut last_time = None;
             let mut more = false;
+            let mut key_layout = ImageLayout::default();
+            let mut image_layout = ImageLayout::default();
             while !more
                 && let Some(()) = cursor
                     .encode_next_batch(|batch| -> Result<(), Status> {
@@ -745,10 +883,20 @@ async fn change_page(
                             Vec::new()
                         };
                         let mut key_writer = key_projection.as_ref().map(|columns| {
-                            ImageProjection::new(batch, columns, request.shared_images)
+                            ImageProjection::new(
+                                batch,
+                                columns,
+                                request.shared_images,
+                                &mut key_layout,
+                            )
                         });
                         let mut image_writer = image.then(|| {
-                            ImageProjection::new(batch, &image_projection, request.shared_images)
+                            ImageProjection::new(
+                                batch,
+                                &image_projection,
+                                request.shared_images,
+                                &mut image_layout,
+                            )
                         });
                         for row in 0..batch.num_rows() {
                             let value = rtdb_columnar::read_value(
@@ -1058,8 +1206,10 @@ fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, Arrow
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{builder::StringDictionaryBuilder, types::Int32Type};
-    use arrow_buffer::BooleanBuffer;
+    use arrow_array::{
+        Decimal128Array, Float32Array, Int64Array, builder::StringDictionaryBuilder,
+        types::Int32Type,
+    };
 
     #[test]
     fn fixed_images_preserve_scratch_admission_and_singleton_bytes_when_deferred() {
@@ -1089,7 +1239,8 @@ mod tests {
                 .unwrap();
 
         for shared in [false, true] {
-            let mut projection = ImageProjection::new(&batch, &[0, 1], shared);
+            let mut layout = ImageLayout::default();
+            let mut projection = ImageProjection::new(&batch, &[0, 1], shared, &mut layout);
             let (first, first_scratch) = projection.prepare(0, &memory).unwrap();
             assert!(!matches!(&first, Image::Deferred(_)));
             drop(first_scratch);
@@ -1164,7 +1315,8 @@ mod tests {
         let table: Arc<str> = Arc::from("public.rows");
         let base = singleton_base(&Arc::new(schema()), &table).unwrap();
         for shared in [false, true] {
-            let mut projection = ImageProjection::new(&batch, &[0, 1, 2], shared);
+            let mut layout = ImageLayout::default();
+            let mut projection = ImageProjection::new(&batch, &[0, 1, 2], shared, &mut layout);
             for (index, deferred) in [false, true, true, true, false, true]
                 .into_iter()
                 .enumerate()
@@ -1265,7 +1417,8 @@ mod tests {
             let columns = (0..batch.num_columns()).collect::<Vec<_>>();
             let slices = indices.map(|index| batch.slice(index, 1));
             for shared in [false, true] {
-                let mut projection = ImageProjection::new(&batch, &columns, shared);
+                let mut layout = ImageLayout::default();
+                let mut projection = ImageProjection::new(&batch, &columns, shared, &mut layout);
                 let mut rows = Vec::new();
                 for (position, (index, slice)) in indices.into_iter().zip(&slices).enumerate() {
                     let (image, scratch) = projection.prepare(index, &memory).unwrap();
@@ -1307,6 +1460,135 @@ mod tests {
     }
 
     #[test]
+    fn bounded_scalar_and_metadata_images_keep_sliced_wire_bytes() {
+        let validity = || {
+            Some(NullBuffer::new(BooleanBuffer::new(
+                Buffer::from([0xff, 0xfe]),
+                0,
+                10,
+            )))
+        };
+        let flags = Arc::new(BooleanArray::new(
+            BooleanBuffer::new(Buffer::from([0x5a, 0xa5]), 0, 10),
+            validity(),
+        ));
+        let floats = Arc::new(Float32Array::new(
+            vec![f32::from_bits(0x7fc0_0042); 10].into(),
+            validity(),
+        ));
+        let uuid = Arc::new(
+            FixedSizeBinaryArray::try_new(16, Buffer::from_vec((0_u8..160).collect()), validity())
+                .unwrap(),
+        );
+        let uuid_field = rtdb_columnar::to_field(
+            "_id",
+            &rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid).maybe(),
+        )
+        .unwrap();
+        let annotated = RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                vec![
+                    uuid_field,
+                    Field::new("flag", DataType::Boolean, true),
+                    Field::new("float", DataType::Float32, true),
+                ],
+                [("image-metadata".into(), "preserved".into())].into(),
+            )),
+            vec![uuid, flags, floats],
+        )
+        .unwrap();
+
+        let decimal_type = DataType::Decimal128(12, 1);
+        let decimals = Arc::new(
+            Decimal128Array::new((1_i128..=10).collect::<Vec<_>>().into(), validity())
+                .with_data_type(decimal_type.clone()),
+        );
+        let decimal = rtdb_columnar::with_decimal_parameters(
+            Field::new("decimal", decimal_type, true),
+            rtdb_columnar::DecimalParameters {
+                precision: 12,
+                scale: -400,
+                bit_width: 128,
+            },
+        )
+        .unwrap();
+        let text = Arc::new(LargeStringArray::from(vec![
+            "",
+            "",
+            "",
+            "a longer prefix",
+            "",
+            "",
+            "",
+            "seed",
+            "été",
+            "",
+        ]));
+        let payloads = Arc::new(LargeBinaryArray::from_iter_values(
+            (0..10).map(|row| &b"123456789"[..row]),
+        ));
+        let wide = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                decimal,
+                Field::new("large_text", DataType::LargeUtf8, false),
+                Field::new("large_binary", DataType::LargeBinary, false),
+            ])),
+            vec![decimals, text, payloads],
+        )
+        .unwrap();
+
+        let null_doc = Arc::new(
+            StructArray::try_new(
+                vec![Field::new("null", DataType::Null, true)].into(),
+                vec![Arc::new(NullArray::new(10))],
+                Some(NullBuffer::new(BooleanBuffer::new(
+                    Buffer::from([0x7f, 0x01]),
+                    0,
+                    10,
+                ))),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let nulls = RecordBatch::try_from_iter([("doc", null_doc)]).unwrap();
+
+        for shared in [false, true] {
+            let memory = MemoryBudget::new(1 << 20);
+            let mut layout = ImageLayout::default();
+            for (batch, deferred) in [
+                (&annotated, [false, true, true]),
+                (&wide, [false, true, true]),
+                (&nulls, [false, false, true]),
+            ] {
+                let batch = batch.slice(7, 3);
+                let columns = (0..batch.num_columns()).collect::<Vec<_>>();
+                let mut projection = ImageProjection::new(&batch, &columns, shared, &mut layout);
+                for (index, deferred) in deferred.into_iter().enumerate() {
+                    let slice = batch.slice(index, 1);
+                    let expected = rtdb_format::ipc::write_stream(
+                        slice.schema_ref(),
+                        std::slice::from_ref(&slice),
+                    ).unwrap();
+                    let (image, charge) = projection.prepare(index, &memory).unwrap();
+                    assert_eq!(charge.bytes(), wire::batch_bound(&slice).unwrap());
+                    assert_eq!(matches!(&image, Image::Deferred(_)), deferred);
+                    assert_eq!(image.legacy_len(), expected.len());
+                    let mut row = ReservedRow {
+                        table: Arc::from("public.rows"),
+                        time: Timestamp(1),
+                        opened: true,
+                        images: [None, None, Some(image)],
+                        charge,
+                    };
+                    row.finish_images().unwrap();
+                    let encoded = image_array(std::slice::from_ref(&row), 2).unwrap();
+                    assert_eq!(encoded.value(0), expected.as_slice());
+                }
+            }
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn shared_images_keep_the_released_bytes_across_input_batches() {
         let long = "value".repeat(500);
         let batch = RecordBatch::try_from_iter([
@@ -1316,12 +1598,15 @@ mod tests {
             ),
             (
                 "value",
-                Arc::new(StringArray::from(vec![Some("short"), None, Some(long.as_str())]))
-                    as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("short"),
+                    None,
+                    Some(long.as_str()),
+                ])) as ArrayRef,
             ),
         ])
         .unwrap();
-        let inputs = [batch.slice(0, 2), batch.slice(2, 1)];
+        let inputs = [batch.slice(0, 1), batch.slice(1, 2)];
         let memory = MemoryBudget::new(1 << 20);
         let outer_schema = Arc::new(schema());
         let table: Arc<str> = Arc::from("public.rows");
@@ -1329,9 +1614,11 @@ mod tests {
         let released = RowStreamEncoder::new(batch.schema_ref()).unwrap();
         let mut expected = released.schema_frame().to_vec();
         let mut rows = Vec::new();
+        let mut shared_layout = ImageLayout::default();
+        let mut ordinary_layout = ImageLayout::default();
         for input in &inputs {
-            let mut shared = ImageProjection::new(input, &[0, 1], true);
-            let mut ordinary = ImageProjection::new(input, &[0, 1], false);
+            let mut shared = ImageProjection::new(input, &[0, 1], true, &mut shared_layout);
+            let mut ordinary = ImageProjection::new(input, &[0, 1], false, &mut ordinary_layout);
             for index in 0..input.num_rows() {
                 let candidate = input.slice(index, 1);
                 let legacy = rtdb_format::ipc::write_stream(
@@ -1341,6 +1628,9 @@ mod tests {
                 .unwrap();
                 let (image, scratch) = shared.prepare(index, &memory).unwrap();
                 let (binary, binary_scratch) = ordinary.prepare(index, &memory).unwrap();
+                let deferred = rows.len() == 1;
+                assert_eq!(matches!(&image, Image::Deferred(_)), deferred);
+                assert_eq!(matches!(&binary, Image::Deferred(_)), deferred);
                 let image_bound = wire::batch_bound(&candidate).unwrap();
                 assert_eq!(scratch.bytes(), image_bound);
                 assert_eq!(binary_scratch.bytes(), image_bound);
@@ -1383,15 +1673,18 @@ mod tests {
     #[test]
     fn image_scratch_admission_precedes_a_schema_encoding_error() {
         let values: ArrayRef = Arc::new(StringArray::from(vec!["one"]));
-        let mut batch = RecordBatch::try_from_iter([("_id", values)]).unwrap();
-        batch.schema_metadata_mut().insert(
-            rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY.into(),
-            "0".into(),
-        );
+        let valid = RecordBatch::try_from_iter([("_id", values)]).unwrap();
+        let mut batch = valid.clone();
+        batch
+            .schema_metadata_mut()
+            .insert(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY.into(), "0".into());
         let candidate = batch.slice(0, 1).project(&[0]).unwrap();
         let bound = wire::batch_bound(&candidate).unwrap();
         for shared in [false, true] {
-            let mut images = ImageProjection::new(&batch, &[0], shared);
+            let mut layout = ImageLayout::default();
+            let mut valid_images = ImageProjection::new(&valid, &[0], shared, &mut layout);
+            valid_images.prepare(0, &MemoryBudget::new(bound)).unwrap();
+            let mut images = ImageProjection::new(&batch, &[0], shared, &mut layout);
             let memory = MemoryBudget::new(bound - 1);
             let expected = error::anomaly(memory.reserve(bound).err().unwrap());
             let rejection = images.prepare(0, &memory).err().unwrap();
@@ -1401,8 +1694,11 @@ mod tests {
 
             let memory = MemoryBudget::new(bound);
             let expected = error::anomaly(
-                rtdb_format::ipc::write_stream(candidate.schema_ref(), std::slice::from_ref(&candidate))
-                    .unwrap_err(),
+                rtdb_format::ipc::write_stream(
+                    candidate.schema_ref(),
+                    std::slice::from_ref(&candidate),
+                )
+                .unwrap_err(),
             );
             let rejection = images.prepare(0, &memory).err().unwrap();
             assert_eq!(rejection.code(), expected.code());
@@ -1480,8 +1776,10 @@ mod tests {
         let values: ArrayRef = Arc::new(dictionary.finish());
         let batch = RecordBatch::try_from_iter([("_id", values)]).unwrap();
         let memory = MemoryBudget::new(1 << 20);
-        let mut shared = ImageProjection::new(&batch, &[0], true);
-        let mut legacy = ImageProjection::new(&batch, &[0], false);
+        let mut shared_layout = ImageLayout::default();
+        let mut legacy_layout = ImageLayout::default();
+        let mut shared = ImageProjection::new(&batch, &[0], true, &mut shared_layout);
+        let mut legacy = ImageProjection::new(&batch, &[0], false, &mut legacy_layout);
         let mut make_row = |row| {
             let (image, charge) = shared.prepare(row, &memory).unwrap();
             let (legacy, _) = legacy.prepare(row, &memory).unwrap();
