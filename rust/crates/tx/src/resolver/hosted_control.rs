@@ -156,12 +156,10 @@ impl OpenTransaction<'_> {
     async fn assertion_fence_world_winner(
         &self, owner: &str, operations: &[Operation], world: Iid, id: &EntityId, winner: rtdb_types::Position,
     ) -> Result<OwnedBatch> {
-        use rtdb_types::WorldClockMode;
-
         let invalid = invalid_family_fence;
         let (record, _) = self.owned_worlds.get(&world).ok_or_else(invalid)?;
         let relation = OwnedRelation::new("fact_unit_column_payloads")?.in_world(world)?;
-        if winner.line_generation != world.0 || record.dropped
+        if winner.line_generation != world.0 || record.dropped || !record.mode.is_writable()
             || !operations.iter().any(|operation| matches!(operation,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation: checked, pin, .. })
                     if checked == &relation && *pin == record.pin))
@@ -171,16 +169,20 @@ impl OpenTransaction<'_> {
         {
             return Err(invalid());
         }
-        let reading = match record.mode {
-            WorldClockMode::Held { .. } => self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock()),
-            WorldClockMode::Proposal => self.terms_time,
-            WorldClockMode::Retained => return Err(invalid()),
-        };
+        let mut witnesses = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedCheck { relation: checked, id: selected, valid_at, expected: Some(expected) })
+                if checked == &relation && selected == id => Some((*valid_at, *expected)),
+            _ => None,
+        });
+        let (valid_at, expected) = witnesses.next().ok_or_else(invalid)?;
+        if witnesses.next().is_some() {
+            return Err(invalid());
+        }
         let context = self.context.query_context(
             self.buffer.base_snapshot().clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
         )?;
         let mut cursor = rtdb_query::open_owned_assertion_point(
-            context, owner, &relation, id, Some(Interval::at(reading)?), false,
+            context, owner, &relation, id, Some(Interval::at(valid_at)?), false,
         ).await?.ok_or_else(invalid)?;
         let mut winner_row = None;
         while let Some(rows) = cursor.next_batch().await? {
@@ -196,9 +198,7 @@ impl OpenTransaction<'_> {
         let position = rtdb_query::owned_row_event_position(row, 0)?;
         let ordinal = rtdb_query::owned_row_assertion_ordinal(row, 0)?.ok_or_else(invalid)?;
         if u64::try_from(history.0).ok() != Some(winner.publication) || u64::from(ordinal.get()) != winner.ordinal.get()
-            || !operations.iter().any(|operation| matches!(operation,
-                Operation::Public(TxOp::OwnedCheck { relation: checked, id: selected, expected: Some(expected), .. })
-                    if checked == &relation && selected == id && expected.history == history && expected.position == position))
+            || expected.history != history || expected.position != position
         {
             return Err(invalid());
         }

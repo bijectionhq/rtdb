@@ -199,8 +199,9 @@ Each erased Root relation requires its `fact_sealed_search_erasures` marker.
 Only selectors authenticated by the family claim can erase a live indexed Root search relation through this route.
 The resulting purge frontier revokes older held ranked reads, while physical search-run withdrawal follows the existing retention path.
 The same transaction carries an all-time `fact_unit_fences` row on the winning carrier's line with `unit_phase` set to the erasing state and `assertion_vault_inventory` set to the same digest.
-For a world retirement, the transaction supplies an observed point check for the same key in its local `fact_unit_column_payloads` overlay.
-At the ordered base the resolver authenticates the winning carrier's physical world, publication and positive ordinal, the observed point version, and its sealed payload at the enrolled slot.
+For a world retirement, the transaction supplies one present observed point check for the same key in its local `fact_unit_column_payloads` overlay.
+The resolver rereads that exact witnessed valid instant against the current ordered base.
+It rejects ambiguous present witnesses and authenticates the winning carrier's physical world, publication and positive ordinal, the observed point version, and its sealed payload at the enrolled slot.
 The original vault checks that the carrier belongs to the stable bound member from `ResolveFamilyMember.v1`.
 A rewrite can have a different authoring line from its registered member. A Root retirement supplies the active Root member in both position fields.
 The source refuses world winners that exist only in an inherited layer.
