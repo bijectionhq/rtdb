@@ -104,7 +104,7 @@ The operator enables assignment on the intended Multi service by adding the trus
 [source,yaml]
 ----
     assignment:
-      relation: public.bj_installation
+      relation: public.installation_authority
       rowId: authority
       validAtMicros: 0
 ----
