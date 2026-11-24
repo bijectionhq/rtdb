@@ -249,7 +249,7 @@ impl NativeServing {
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
         let records = requests.iter().map(|(request, _)| request.transaction.clone()).collect::<Vec<_>>();
-        let decisions = pipeline.decide_batch(&records, now, NATIVE_WRITE_FEATURES, &self.authority.claims);
+        let decisions = pipeline.decide_batch(&records, now, NATIVE_WRITE_FEATURES, self.authority.claims.as_ref());
         if decisions.len() != requests.len() { return Err(invalid()); }
         let mut messages = Vec::new();
         for ((request, completion), decision) in requests.into_iter().zip(decisions) {

@@ -7,6 +7,8 @@
 //! no re-apply). The write path's target is a flat curve at 50 µs or less per commit.
 use std::time::{Duration, Instant};
 
+use rtdb_types::rtdb_v1::ClaimSealer;
+
 use super::*;
 
 const INCARNATION: [u8; 16] = [7; 16];

@@ -110,6 +110,7 @@ fn row_visibility_declarations_and_single_label_are_ordered_and_recoverable() {
     assert!(visible(&state, MAIN_BRANCH, Layer::Merged, 30).is_empty());
     let same = request(4, vec![labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL), labelled_put(MAIN_BRANCH, 2, 1, Interval::ALL)]);
     assert_eq!(commit(&mut state, 4, &same).outcome, Outcome::Then);
+}
 
 fn evidence(position: u64, regions: impl IntoIterator<Item = ClaimRegion>) -> ClaimEvidence {
     ClaimEvidence {
