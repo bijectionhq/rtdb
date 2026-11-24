@@ -3740,13 +3740,10 @@ mod tests {
             "rtdb.storage/memory-limit");
 
         assert_eq!(visit_trie_iids(&context, Arc::clone(&storage), &slug, &trie, 3, &mut visit).await.unwrap(), Some(3));
-        let mut file = DataFile {
-            storage: Arc::clone(&storage), key: key.clone(),
-            metadata: ObjectKey::new(slug.metadata_key(&trie)).unwrap(), opened: None,
-        };
+        let mut reader = DataFileReader::new(&storage, key.clone());
         let warmup = MemoryBudget::new(16 << 20);
         for page in 0..2 {
-            let (batch, charged) = file.decode_page(page, &warmup).await.unwrap();
+            let (batch, charged) = reader.decode_page(page, &warmup).await.unwrap();
             let bound = charged.bytes();
             if page == 1 { assert!(bound > context.memory.limit_bytes()); }
             let headers = storage.admit(IndexBatch::header_bytes(batch.num_rows()).unwrap()).unwrap();

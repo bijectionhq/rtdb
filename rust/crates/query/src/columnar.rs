@@ -1260,7 +1260,8 @@ pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBa
 }
 
 pub(crate) fn gather_with_funded_columns(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBatch>], columns: &[Field],
-    memory: &Arc<MemoryBudget>, mut derived: impl FnMut(usize) -> Result<Option<(Column, Option<Arc<MemoryReservation>>)>) -> Result<ColumnBatch> {
+    memory: &Arc<MemoryBudget>,
+    mut derived: impl FnMut(usize) -> Result<Option<(Column, Option<Arc<MemoryReservation>>)>>) -> Result<ColumnBatch> {
     let mut sources: Vec<Source> = Vec::new();
     // Each batch's operation union, and the sources its put legs became, found once per batch rather than per row.
     let mut batches: Vec<(UnionArray, Vec<(i8, usize)>)> = Vec::new();
