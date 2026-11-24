@@ -539,7 +539,7 @@ async fn either_old_selectable_slot_blocks_commit_and_leaves_the_view_readable()
 }
 
 #[tokio::test]
-async fn clean_slot_gate_rejects_a_short_quorum_and_stale_generation() -> Result<()> {
+async fn clean_slot_gate_requires_exact_quorum_generation_and_recovery_hold() -> Result<()> {
     let fixture = Fixture::new().await?;
     let ErasureProgress::Prepared(prepared) = fixture.custody.prepare(fixture.erasure).await? else {
         panic!("expected a new erasure attempt");
@@ -558,6 +558,20 @@ async fn clean_slot_gate_rejects_a_short_quorum_and_stale_generation() -> Result
     let evidence = decision.rotation.unwrap().evidence;
     assert!(evidence.covers(receipt));
     assert!(covers_clean_rotation(&evidence, receipt));
+
+    let Ok(Outcome::Granted { grant, mut recovery }) = receipt.outcome else {
+        panic!("expected a rotation grant");
+    };
+    recovery.id.nonce = Uuid::new_v4();
+    let foreign_request = Receipt { outcome: Ok(Outcome::Granted { grant, recovery }), ..receipt };
+    assert!(!covers_clean_rotation(&evidence, foreign_request));
+    assert!(!evidence.covers(foreign_request));
+
+    recovery.id = receipt.request;
+    recovery.owner.serial += 1;
+    let foreign_owner = Receipt { outcome: Ok(Outcome::Granted { grant, recovery }), ..receipt };
+    assert!(!covers_clean_rotation(&evidence, foreign_owner));
+    assert!(!evidence.covers(foreign_owner));
 
     let mut short_quorum = evidence.clone();
     short_quorum.voters.pop();

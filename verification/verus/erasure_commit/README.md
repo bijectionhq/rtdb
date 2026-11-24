@@ -17,7 +17,7 @@ This package pins a Logkeeper revision that exports the rotation evidence defini
 
 The installed Logkeeper client authenticates the signed rotation response against the installed group and exact receipt before the coordinator sees it.
 The slot-pair decision checks the two physical image descriptors.
-The successor-generation decision separately checks the payload-key generation.
+The successor-generation decision separately checks the payload-key generation, original rotation request and successor enrollment.
 The mapping to `SelectionFence.MirrorsFence` relies on the issuer signing both actual readbacks at its named ballot and prefix.
 The Lean composition uses the reference majority theorem and Study 112's recovery theorem.
 It takes as premises that selectable recovery images inherit the attested clean cut and the suffix obeys the generation fence.
