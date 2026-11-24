@@ -175,6 +175,10 @@ impl RemoteStore {
 
 #[async_trait]
 impl ObjectStore for RemoteStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(S3ObjectNamespace, String)> {
+        Some((self.s3_namespace()?.clone(), self.objects.path(key).to_string()))
+    }
+
     fn permits_shared_read_cache(&self) -> bool { true }
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let Some(ledger) = &self.catalog else { return Ok(None); };

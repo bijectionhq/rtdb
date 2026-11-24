@@ -146,6 +146,9 @@ pub trait IndexPageLifecycle: Send + Sync {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Identifies a loose allocation by the S3 address this owner will use,
+    /// including for names reserved before the first provider write.
+    fn s3_publication_address(&self, _key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> { None }
     /// Whether returned bytes may be reused across reads without returning to this owner.
     fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }

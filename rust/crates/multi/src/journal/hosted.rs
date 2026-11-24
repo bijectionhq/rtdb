@@ -510,11 +510,11 @@ impl Placement {
                 let source =
                     storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
                         .await?;
-                provider
+                let references = provider
                     .preflight(&reservation, origin, source.as_ref())
                     .await?;
                 custodian
-                    .prepare_checkpoint(&current, origin.ordered(reservation)?)
+                    .prepare_checkpoint(&current, origin.ordered(reservation)?, references)
                     .await?;
             }
             let origin = provider.begin(&reservation, origin).await?;

@@ -6,7 +6,7 @@ use crate::{cipher::SEALED_OVERHEAD, keys::{JournalKey, KeyService}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, Request, RequestId,
+    APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, ObjectName, Request, RequestId,
     service::Route,
 };
 use rtdb_node::{ProtectedReadIndex, ReplicaReadIndex};
@@ -217,6 +217,7 @@ impl JournalLog {
             return Err(deposed(writer.grant, &current));
         }
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
+        let references = inline_references(&payload)?;
         let key = JournalKey::new(current.placement, writer.grant.key_generation);
         let payload = self.reads.keys.seal_journal_payload(key, &self.reads.io, payload).await?;
         let timestamp = sample()?;
@@ -226,7 +227,7 @@ impl JournalLog {
             expected_next: writer.head.next_lsn,
             timestamp: timestamp.0,
             payload,
-            references: None,
+            references,
         };
         writer.pending = Some(
             self.reads
@@ -317,6 +318,17 @@ impl JournalLog {
         }
         *reads = unsettled;
     }
+}
+
+fn inline_references(payload: &[u8]) -> Result<Option<Vec<ObjectName>>> {
+    use rtdb_format::envelope::{ReplicaBody, ReplicaFrame};
+    let frame = ReplicaFrame::decode(payload).map_err(storage)?;
+    Ok(frame.into_envelope().and_then(|envelope| match envelope.message {
+        ReplicaBody::ResolvedTx(_) | ReplicaBody::NoOp(_) | ReplicaBody::BlockBoundary(_)
+        | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsRemoved(_) => Some(Vec::new()),
+        ReplicaBody::BlockUploaded(_) | ReplicaBody::TriesAdded(_) | ReplicaBody::ArtefactsAdded(_)
+        | ReplicaBody::OversizedMessage(_) => None,
+    }))
 }
 
 #[async_trait]

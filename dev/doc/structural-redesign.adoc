@@ -198,6 +198,8 @@ Checkpoint transfer seeds detached bodies through a separate transfer credential
 Cross-cell handoff retains the original replay interval and republishes each detached body under the destination broker before seeding its journal.
 The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
 Independent payload settlement still requires complete installed references and a recovery dependency fence.
+Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.
+Inline appends without new provider dependencies publish an empty reference set. Upload, trie, artefact and detached-body appends still need complete references.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.

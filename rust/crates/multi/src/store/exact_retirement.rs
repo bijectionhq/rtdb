@@ -292,17 +292,14 @@ impl InstalledPublication {
         use ring::digest::{SHA256, digest};
 
         let exact = serde_json::to_vec(self).map_err(|error| Error::Task(error.to_string()))?;
-        let name = self.serialized_address()?;
-        let hashed = |bytes: &[u8]| digest(&SHA256, bytes).as_ref().try_into().expect("SHA-256 width");
-        Ok(ordered_logkeeper::ordered::ObjectWithdrawal { name: hashed(&name), version: hashed(&exact) })
-    }
-
-    fn serialized_address(&self) -> Result<Vec<u8>> {
-        let position = match self {
+        let (namespace, key) = match self {
             Self::Version { version } => (&version.namespace, &version.key),
             Self::Terminal { terminal } => (&terminal.namespace, &terminal.key),
         };
-        serde_json::to_vec(&position).map_err(|error| Error::Task(error.to_string()).into())
+        Ok(ordered_logkeeper::ordered::ObjectWithdrawal {
+            name: installed_object_name(namespace, key)?,
+            version: digest(&SHA256, &exact).as_ref().try_into().expect("SHA-256 width"),
+        })
     }
 
     pub(crate) async fn available(&self, key: &ObjectKey, provider: &rtdb_s3::VersionedInventory) -> Result<bool> {
@@ -317,6 +314,13 @@ impl InstalledPublication {
             }
         }
     }
+}
+
+pub(crate) fn installed_object_name(
+    namespace: &rtdb_types::S3ObjectNamespace, key: &str,
+) -> Result<ordered_logkeeper::ordered::ObjectName> {
+    let address = serde_json::to_vec(&(namespace, key)).map_err(|error| Error::Task(error.to_string()))?;
+    Ok(ring::digest::digest(&ring::digest::SHA256, &address).as_ref().try_into().expect("SHA-256 width"))
 }
 
 fn installed_publication_token(withdrawal: ordered_logkeeper::ordered::ObjectWithdrawal) -> Uuid {

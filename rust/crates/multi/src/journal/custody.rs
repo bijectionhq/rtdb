@@ -4,11 +4,12 @@ mod local;
 
 use super::InstalledJournal;
 use crate::keys::{KeyService, UnitLedger, UnitScope};
-use crate::store::EncryptingStore;
+use crate::store::{EncryptingStore, exact_retirement::installed_object_name};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, Placement, service::Route,
+    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, MAX_OBJECT_REFERENCES,
+    ObjectName, Placement, service::Route,
 };
 use ring::digest::{SHA256, digest};
 use rtdb_directory::Checkpoint as RtdbCheckpoint;
@@ -307,19 +308,41 @@ impl CheckpointCustody {
         reservation: &Reservation,
         origin: Preparation,
         source: &dyn ObjectStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<ObjectName>> {
         self.require_provider(reservation.custody)?;
         let budget = Self::copy_budget(reservation)?;
         // A permanent size refusal must precede the first provider effect
         // and the ordered binding of a reservation to a source.
-        let _ = crate::archive::ordered_checkpoint_sources(
+        let members = crate::archive::ordered_checkpoint_sources(
             source,
             origin.checkpoint,
             self.epoch,
             budget,
         )
         .await?;
-        Ok(())
+        let mut references = Vec::with_capacity(members.len().saturating_add(2));
+        let custody = reservation.custody;
+        references.push(self.object_name(&self.intent(custody)?)?);
+        references.push(self.object_name(&self.manifest(custody)?)?);
+        for member in members {
+            references.push(self.object_name(&self.member(custody, &member.name)?)?);
+        }
+        references.sort_unstable();
+        references.dedup();
+        if references.len() > MAX_OBJECT_REFERENCES {
+            return Err(invalid("The checkpoint closure exceeds the journal's object reference bound"));
+        }
+        Ok(references)
+    }
+
+    fn object_name(&self, key: &ObjectKey) -> Result<ObjectName> {
+        if let Some((namespace, name)) = self.bucket.s3_publication_address(key) {
+            return installed_object_name(&namespace, &name);
+        }
+        if self.local.is_some() {
+            return Ok(fingerprint(&serde_json::to_vec(&("local-checkpoint", self.provider, key.as_str())).map_err(serialization)?));
+        }
+        Err(invalid("The checkpoint archive cannot identify an immutable allocation"))
     }
 
     pub(crate) async fn prepared(

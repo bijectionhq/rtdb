@@ -414,12 +414,13 @@ impl InstalledJournal {
         &self,
         route: &Route,
         preparation: CheckpointPreparation,
+        references: Vec<ordered_logkeeper::ordered::ObjectName>,
     ) -> Result<()> {
         let request = self.request(
             route,
             Command::PrepareCheckpoint {
                 preparation,
-                references: None,
+                references: Some(references),
             },
         )?;
         let decision = self.execute(&request).await?;
