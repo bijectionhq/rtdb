@@ -600,7 +600,7 @@ impl FlightService for Service {
         let ticket = &request.get_ref().ticket;
         if let Some(command) = crate::v1::ticket(ticket) {
             let call = self.call(&request, request.get_ref().encoded_len()).await.map_err(crate::v1::error::map_status)?;
-            return self.v1_get(call, command).await;
+            return self.v1_get(call, command, request.metadata()).await;
         }
         let call = self.call(&request, request.get_ref().encoded_len()).await?;
         let command = command(&request.into_inner().ticket).map_err(|error| call.error(error))?;

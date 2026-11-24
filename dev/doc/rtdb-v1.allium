@@ -56,4 +56,10 @@ surface StatelessDatabase {
     @guarantee ChangesProgress
         -- Where advertised, progress-only Changes returns the schema and coverage trailer for the request.
         -- The same table admission, group limits, wait and coverage rules apply to a progress-only request.
+
+    @guarantee ChangesImages
+        -- Changes image columns carry individual Arrow IPC streams by default.
+        -- A route advertising changes.images.stream-v1 accepts an explicit request for shared image streams and acknowledges the selected representation in the response.
+        -- In the shared representation each present image column carries one Arrow IPC stream in its first cell, with one image per result row in that batch's order.
+        -- Image selection, change ordering and covered intervals apply equally to both representations.
 }

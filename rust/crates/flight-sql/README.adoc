@@ -1256,6 +1256,16 @@ A cursor below the retained checkpoint floor returns `rtdb/cursor-expired`.
 With the `changes.progress-only` capability, a request can set `progress_only` with `IMAGES_NONE` to receive only the schema and normal coverage trailer.
 Progress-only requests use the same table readers, group limits, interval bounds, and wait conditions.
 
+By default, a present `key_ipc`, `before_ipc`, or `after_ipc` cell is a standalone one-row Arrow IPC stream.
+When the route advertises `changes.images.stream-v1`, a client that supports shared image streams can send the `x-rtdb-changes-images: stream-v1` metadata header with an image-bearing `Changes` DoGet.
+The response echoes that header when it selects the shared carrier.
+For an offered carrier without an exact acknowledgement, retry without the request header to obtain the default representation.
+In a shared response, read each image column separately for each outer record batch.
+If row zero is null, that image is absent throughout the batch.
+Otherwise row zero holds an Arrow IPC stream with one single-row record batch per outer row, in the same order, and remaining cells in that column are null.
+A shared response can include single-row outer batches, for example when the image schemas or presence differ between adjacent changes.
+Both carriers use the same image projections, whole-group limit, and coverage trailer.
+
 Default mode serves the same wire operations on local or shared logs.
 The route advertises `query.linearizable` when it can establish a fresh barrier.
 Branch selectors, timed writes and administrative actions require their corresponding feature implementations.

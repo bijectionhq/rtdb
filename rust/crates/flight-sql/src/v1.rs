@@ -6,7 +6,7 @@ use prost::{Message, Name};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::QueryContext;
 use rtdb_types::Timestamp;
-use tonic::{Response, Status};
+use tonic::{Response, Status, metadata::MetadataMap};
 
 use crate::{
     rtdb::v1 as proto,
@@ -73,6 +73,7 @@ impl Service {
                             "query.page",
                             "changes",
                             changes::PROGRESS_ONLY,
+                            changes::SHARED_IMAGES,
                             "sql.history",
                             "sql.search",
                             "sql.search-table",
@@ -138,6 +139,7 @@ impl Service {
         &self,
         call: Call,
         ticket: Ticket,
+        metadata: &MetadataMap,
     ) -> Result<Response<Output<FlightData>>, Status> {
         match ticket {
             Ticket::Query(body) => match decode(body) {
@@ -145,7 +147,7 @@ impl Service {
                 Err(status) => Err(call.error(status)),
             },
             Ticket::Changes(body) => match decode(body) {
-                Ok(request) => self.v1_changes(call, request).await,
+                Ok(request) => self.v1_changes(call, request, metadata).await,
                 Err(status) => Err(call.error(status)),
             },
         }

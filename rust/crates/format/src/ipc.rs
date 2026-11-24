@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_ipc::reader::FileDecoder;
-use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter, write_message};
+use arrow_ipc::writer::{
+    CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter,
+    write_message,
+};
 use arrow_schema::{DataType, Schema, SchemaRef, UnionMode};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
@@ -1066,6 +1069,64 @@ pub fn write_stream(schema: &Schema, pages: &[RecordBatch]) -> Result<Vec<u8>> {
     let end = bytes.len();
     jvm_end_marker(&mut bytes, end)?;
     Ok(bytes)
+}
+
+/// Prepares the schema frame for independently encoded single-row stream messages.
+/// The caller reserves codec scratch and accounts for the retained frames.
+pub struct RowStreamEncoder {
+    schema: SchemaRef,
+    schema_frame: Vec<u8>,
+    dictionaries: usize,
+    options: IpcWriteOptions,
+}
+
+impl RowStreamEncoder {
+    pub fn new(schema: &SchemaRef) -> Result<Self> {
+        let options = write_options()?;
+        let decimal_schema = crate::ipc_decimal::DecimalSchema::new(schema)?;
+        let mut tracker = DictionaryTracker::new(false);
+        let mut message = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+            &decimal_schema.wire,
+            &mut tracker,
+            &options,
+        );
+        decimal_schema.patch_message(&mut message.ipc_message)?;
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, message, &options).map_err(invalid)?;
+        Ok(Self {
+            schema: Arc::clone(schema),
+            schema_frame: bytes,
+            dictionaries: tracker.dict_id().len(),
+            options,
+        })
+    }
+
+    pub fn schema_frame(&self) -> &[u8] {
+        &self.schema_frame
+    }
+
+    pub fn has_dictionaries(&self) -> bool {
+        self.dictionaries != 0
+    }
+
+    /// Encodes a row's dictionary and record frames. A complete stream also needs its schema and end marker.
+    pub fn encode(&self, row: &RecordBatch) -> Result<Vec<u8>> {
+        if row.num_rows() != 1 || row.schema_ref() != &self.schema {
+            return Err(invalid("Arrow row differs from its declared stream schema or row count"));
+        }
+        let mut tracker = DictionaryTracker::new(false);
+        for _ in 0..self.dictionaries {
+            tracker.next_dict_id();
+        }
+        let (dictionaries, record) = IpcDataGenerator::default()
+            .encode(row, &mut tracker, &self.options, &mut CompressionContext::default())
+            .map_err(invalid)?;
+        let mut bytes = Vec::new();
+        for message in dictionaries.into_iter().chain(std::iter::once(record)) {
+            write_message(&mut bytes, message, &self.options).map_err(invalid)?;
+        }
+        Ok(bytes)
+    }
 }
 
 /// Encodes a standard Arrow stream, retaining the caller's alignment and end-marker convention.
