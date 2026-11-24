@@ -13,15 +13,15 @@ mod seek;
 mod tree;
 mod usage;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, future::Future, mem::size_of, ops::Deref, sync::Arc};
 
 use arrow_array::RecordBatch;
-use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_entity_id, read_value};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_entity_id};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, Instant, LogicalType, Result, ScalarType, TableRef, Value};
+use rtdb_types::{Anomaly, Instant, LogicalType, Result, ScalarType, TableRef};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -62,73 +62,158 @@ impl Definition {
         ))?)
     }
 
-    fn from_row(batch: &RecordBatch, row: usize) -> Result<Self> {
-        let cell = |name| ArrowCell::named(batch, name, row);
-        let text = |name| {
-            cell(name)
-                .and_then(ArrowCell::utf8)
-                .ok_or_else(|| format_error("Expected an index name or column"))
-        };
-        let columns = cell("columns")
-            .and_then(ArrowCell::list)
-            .ok_or_else(|| format_error("Expected index columns"))?;
-        let version = cell("version")
-            .and_then(ArrowCell::int64)
-            .ok_or_else(|| format_error("Expected an index version"))?;
-        Ok(Self {
-            name: text("_id")?.to_owned(),
-            table: TableRef::new(text("schema_name")?, text("table_name")?),
-            columns: columns
-                .map(|cell| {
-                    cell.utf8()
-                        .map(str::to_owned)
-                        .ok_or_else(|| format_error("Expected an index name or column"))
-                })
-                .collect::<Result<_>>()?,
-            version,
-        })
+    fn payload_bytes_for(&self, table: &TableRef) -> Result<usize> {
+        definition_payload_bytes(
+            &self.name, &table.schema, &table.table,
+            self.columns.iter().map(|column| Ok(column.as_str())),
+        )
     }
 }
 
-#[derive(Default)]
-struct DefinitionCache {
-    tables: parking_lot::Mutex<BTreeMap<(String, Instant, usize), Arc<tokio::sync::OnceCell<CachedDefinitions>>>>,
+struct DefinitionSet {
+    rows: Vec<Definition>,
+    reservation: Arc<MemoryReservation>,
 }
 
-type CachedDefinitions = (Arc<[Definition]>, Option<Arc<MemoryReservation>>);
+impl DefinitionSet {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { rows: Vec::new(), reservation: memory.reserve(256)? })
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, Definition> {
+        self.rows.iter()
+    }
+
+    fn push_row(&mut self, batch: &RecordBatch, row: usize) -> Result<()> {
+        let cell = |column: usize| Some(ArrowCell {
+            field: batch.schema_ref().fields().get(column)?.as_ref(),
+            array: batch.columns().get(column)?.as_ref(),
+            row,
+        });
+        let text = |column| cell(column).ok_or_else(definition_text_error).and_then(definition_text);
+        let columns = || cell(3).and_then(ArrowCell::list)
+            .ok_or_else(|| format_error("Expected index columns"));
+        let version = cell(4).and_then(ArrowCell::int64)
+            .ok_or_else(|| format_error("Expected an index version"))?;
+        let (name, schema, table) = (text(0)?, text(1)?, text(2)?);
+        let bytes = definition_payload_bytes(name, schema, table, columns()?.map(definition_text))?;
+        self.reserve_row(bytes)?;
+        let columns = columns()?;
+        let mut names = Vec::with_capacity(columns.len());
+        for cell in columns {
+            names.push(definition_text(cell)?.to_owned());
+        }
+        self.rows.push(Definition {
+            name: name.to_owned(),
+            table: TableRef::new(schema, table),
+            columns: names,
+            version,
+        });
+        Ok(())
+    }
+
+    fn push_overlay(&mut self, source: usize, table: &TableRef) -> Result<()> {
+        self.reserve_row(self.rows[source].payload_bytes_for(table)?)?;
+        let definition = &self.rows[source];
+        self.rows.push(Definition {
+            name: definition.name.clone(),
+            table: table.clone(),
+            columns: definition.columns.clone(),
+            version: definition.version,
+        });
+        Ok(())
+    }
+
+    fn reserve_row(&mut self, bytes: usize) -> Result<()> {
+        let capacity = self.rows.capacity();
+        let lease = Arc::get_mut(&mut self.reservation).expect("The catalog builder owns its reservation");
+        let retained = lease.bytes().checked_add(bytes).ok_or_else(definition_allocation_overflow)?;
+        if self.rows.len() == capacity {
+            let next = capacity.checked_mul(2).ok_or_else(definition_allocation_overflow)?.max(1);
+            let allocation = next.checked_mul(size_of::<Definition>()).ok_or_else(definition_allocation_overflow)?;
+            lease.grow_to(retained.checked_add(allocation).ok_or_else(definition_allocation_overflow)?)?;
+            self.rows.try_reserve_exact(next - capacity).map_err(format_error)?;
+            lease.shrink_to(lease.bytes() - capacity * size_of::<Definition>())?;
+        } else {
+            lease.grow_to(retained)?;
+        }
+        Ok(())
+    }
+}
+
+fn definition_payload_bytes<'a>(
+    name: &str, schema: &str, table: &str,
+    mut columns: impl ExactSizeIterator<Item = Result<&'a str>>,
+) -> Result<usize> {
+    let bytes = columns.len().checked_mul(size_of::<String>())
+        .and_then(|bytes| bytes.checked_add(name.len()))
+        .and_then(|bytes| bytes.checked_add(schema.len()))
+        .and_then(|bytes| bytes.checked_add(table.len()))
+        .ok_or_else(definition_allocation_overflow)?;
+    columns.try_fold(bytes, |bytes, column| {
+        bytes.checked_add(column?.len()).ok_or_else(definition_allocation_overflow)
+    })
+}
+
+fn definition_text(cell: ArrowCell<'_>) -> Result<&str> {
+    cell.utf8().ok_or_else(definition_text_error)
+}
+
+fn definition_text_error() -> Anomaly {
+    format_error("Expected an index name or column")
+}
+
+fn definition_allocation_overflow() -> Anomaly {
+    Anomaly::incorrect("rtdb/allocation-overflow", "Ordered index definitions exceed addressable memory")
+}
+
+type DefinitionEntry = Arc<tokio::sync::OnceCell<Arc<DefinitionSet>>>;
+
+#[derive(Default)]
+struct DefinitionCache {
+    tables: parking_lot::Mutex<BTreeMap<(String, Instant, usize), DefinitionEntry>>,
+}
+
+impl DefinitionCache {
+    async fn get_or_load(
+        &self, database: &str, now: Instant, budget: &Arc<MemoryBudget>,
+        cancellation: &CancellationToken, load: impl Future<Output = Result<DefinitionSet>>,
+    ) -> Result<Option<Arc<DefinitionSet>>> {
+        let entry = {
+            let mut tables = self.tables.lock();
+            let key = (database.to_owned(), now, Arc::as_ptr(budget) as usize);
+            if !tables.contains_key(&key) && tables.len() >= 4 {
+                tables.pop_first();
+            }
+            Arc::clone(tables.entry(key).or_default())
+        };
+        let loaded = entry.get_or_try_init(|| async { load.await.map(Arc::new) });
+        match cancellation.run_until_cancelled(loaded).await.ok_or_else(maintenance::cancelled)? {
+            Ok(definitions) => Ok(Some(Arc::clone(definitions))),
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 async fn definitions(
     database: &str, snapshot: &Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>,
     now: Instant, cancellation: &CancellationToken,
-) -> Result<Arc<[Definition]>> {
-    let load = || load_definitions(database, snapshot, storage, memory, now, cancellation);
-    let Some(budget) = memory.snapshot_budget() else { return load().await.map(Into::into); };
+) -> Result<Option<Arc<DefinitionSet>>> {
     if !snapshot.contains_table(&TableRef::new(CATALOG.0, CATALOG.1)) {
-        return Ok(Arc::from([]));
+        return Ok(None);
     }
     if cancellation.is_cancelled() { return Err(maintenance::cancelled()); }
-    let cache = snapshot.memo::<DefinitionCache>();
-    let entry = {
-        let mut tables = cache.tables.lock();
-        let key = (database.to_owned(), now, Arc::as_ptr(budget) as usize);
-        if !tables.contains_key(&key) && tables.len() >= 4 {
-            tables.pop_first();
+    if let Some(budget) = memory.snapshot_budget() {
+        let cache = snapshot.memo::<DefinitionCache>();
+        let load = load_definitions(database, snapshot, storage, memory, budget, now, cancellation);
+        if let Some(definitions) = cache.get_or_load(database, now, budget, cancellation, load).await? {
+            return Ok(Some(definitions));
         }
-        Arc::clone(tables.entry(key).or_default())
-    };
-    let loaded = entry.get_or_try_init(|| async {
-        let definitions = load().await?;
-        let bytes = definitions.iter().fold(256usize, |bytes, definition| {
-            bytes.saturating_add(256 + definition.name.len() + definition.table.schema.len() + definition.table.table.len())
-                .saturating_add(definition.columns.iter().map(|column| 32 + column.len()).sum::<usize>())
-        });
-        Ok::<_, Anomaly>((definitions.into(), budget.reserve(bytes).ok()))
-    });
-    let (definitions, charge) = cancellation.run_until_cancelled(loaded).await.ok_or_else(maintenance::cancelled)??;
-    if charge.is_none() {
-        cache.tables.lock().retain(|_, candidate| !Arc::ptr_eq(candidate, &entry));
     }
-    Ok(Arc::clone(definitions))
+    let load = load_definitions(database, snapshot, storage, memory, memory, now, cancellation);
+    let definitions = cancellation.run_until_cancelled(load).await.ok_or_else(maintenance::cancelled)??;
+    Ok(Some(Arc::new(definitions)))
 }
 
 async fn load_definitions(
@@ -136,16 +221,15 @@ async fn load_definitions(
     snapshot: &Snapshot,
     storage: &Arc<BufferPool>,
     memory: &Arc<MemoryBudget>,
+    definition_budget: &Arc<MemoryBudget>,
     now: Instant,
     cancellation: &CancellationToken,
-) -> Result<Vec<Definition>> {
+) -> Result<DefinitionSet> {
+    let mut definitions = DefinitionSet::new(definition_budget)?;
     let name = QualifiedTable {
         database: database.to_owned(),
         table: TableRef::new(CATALOG.0, CATALOG.1),
     };
-    if !snapshot.contains_table(&name.table) {
-        return Ok(Vec::new());
-    }
     let catalog = CatalogSnapshot::new(
         database,
         BTreeMap::from([(
@@ -183,16 +267,18 @@ async fn load_definitions(
     })?;
     let cursor = PreparedQuery::new_in(Arc::new(scan), memory)?
         .execute_columns(context, Vec::new()).await?;
-    read_definitions(cursor).await
+    read_definitions(cursor, &mut definitions).await?;
+    Ok(definitions)
 }
 
 async fn owned_definitions(
     database: &str, snapshot: &Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>,
     now: Instant, cancellation: &CancellationToken,
-) -> Result<Vec<Definition>> {
+) -> Result<Option<DefinitionSet>> {
+    if !snapshot.table_names().any(TableRef::is_owned_path_catalog) {
+        return Ok(None);
+    }
     let tables = snapshot.tables();
-    let owned_catalogs: Vec<_> = tables.iter().filter(|table| table.is_owned_path_catalog()).collect();
-    if owned_catalogs.is_empty() { return Ok(Vec::new()); }
     let catalog = CatalogSnapshot::new(database, BTreeMap::from([(
         database.to_owned(), DatabaseSnapshot { partitions: vec![snapshot.clone()], storage: Arc::clone(storage) },
     )]), false)?;
@@ -203,58 +289,38 @@ async fn owned_definitions(
             world_tables.entry(root).or_default().push(table);
         }
     }
-    let mut definitions = Vec::new();
-    for table in owned_catalogs {
+    let mut definitions = DefinitionSet::new(memory)?;
+    for table in tables.iter().filter(|table| table.is_owned_path_catalog()) {
         if let Some(cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), table, None).await? {
-            for definition in read_definitions(cursor).await? {
-                if !table.owns_path_target(&definition.table) {
+            let start = definitions.rows.len();
+            read_definitions(cursor, &mut definitions).await?;
+            for source in start..definitions.rows.len() {
+                let target = &definitions.rows[source].table;
+                if !table.owns_path_target(target) {
                     return Err(format_error("Owned path definition refers to another owner or an internal catalog"));
                 }
-                if let Some(overlays) = world_tables.get(&definition.table) {
-                    definitions.extend(overlays.iter().map(|table| Definition {
-                        table: (**table).clone(),
-                        ..definition.clone()
-                    }));
+                if let Some(overlays) = world_tables.get(target) {
+                    for overlay in overlays {
+                        definitions.push_overlay(source, overlay)?;
+                    }
                 }
-                definitions.push(definition);
             }
         }
     }
-    definitions.sort();
-    Ok(definitions)
+    definitions.rows.sort_unstable();
+    Ok(Some(definitions))
 }
 
-async fn read_definitions(mut cursor: rtdb_query::QueryCursor) -> Result<Vec<Definition>> {
-    let mut definitions = Vec::new();
+async fn read_definitions(mut cursor: rtdb_query::QueryCursor, definitions: &mut DefinitionSet) -> Result<()> {
+    let start = definitions.rows.len();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         for row in 0..batch.num_rows() {
-            if let Ok(definition) = Definition::from_row(batch, row) {
-                definitions.push(definition);
-                continue;
-            }
-            let schema = batch.schema_ref();
-            let cell = |column| read_value(schema.field(column), batch.column(column).as_ref(), row);
-            let text = |value| match value {
-                Value::Utf8(value) => Ok(value),
-                _ => Err(format_error("Expected an index name or column")),
-            };
-            let Value::List(columns) = cell(3)? else {
-                return Err(format_error("Expected index columns"));
-            };
-            let Value::I64(version) = cell(4)? else {
-                return Err(format_error("Expected an index version"));
-            };
-            definitions.push(Definition {
-                name: text(cell(0)?)?,
-                table: TableRef::new(text(cell(1)?)?, text(cell(2)?)?),
-                columns: columns.into_values().into_iter().map(text).collect::<Result<_>>()?,
-                version,
-            });
+            definitions.push_row(batch, row)?;
         }
     }
-    definitions.sort();
-    Ok(definitions)
+    definitions.rows[start..].sort_unstable();
+    Ok(())
 }
 
 pub struct OwnedRangePage {
@@ -547,8 +613,8 @@ async fn owned_projection(
 pub async fn path_columns_at_cut(
     context: &Arc<QueryContext>, owner: &str,
     relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
-) -> Result<Vec<String>> {
-    Ok(owned_definition(context, owner, relation, path).await?.columns)
+) -> Result<OwnedPathColumns> {
+    Ok(owned_definition(context, owner, relation, path).await?.into_columns())
 }
 
 pub async fn stable_owned_path_columns(
@@ -557,12 +623,46 @@ pub async fn stable_owned_path_columns(
     owner: &str,
     relation: &rtdb_types::OwnedRelation,
     path: &rtdb_types::OwnedRelation,
-) -> Result<Vec<String>> {
+) -> Result<OwnedPathColumns> {
     let definition = owned_definition(before, owner, relation, path).await?;
-    if definition != owned_definition(after, owner, relation, path).await? {
+    if definition.definition != owned_definition(after, owner, relation, path).await?.definition {
         return Err(uncovered_owned_range());
     }
-    Ok(definition.columns)
+    Ok(definition.into_columns())
+}
+
+#[derive(Debug)]
+pub struct OwnedPathColumns {
+    columns: Vec<String>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl Deref for OwnedPathColumns {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.columns
+    }
+}
+
+struct HeldDefinition {
+    definition: Definition,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl HeldDefinition {
+    fn into_columns(self) -> OwnedPathColumns {
+        let Self { definition: Definition { columns, .. }, reservation } = self;
+        OwnedPathColumns { columns, _reservation: reservation }
+    }
+}
+
+impl Deref for HeldDefinition {
+    type Target = Definition;
+
+    fn deref(&self) -> &Self::Target {
+        &self.definition
+    }
 }
 
 async fn owned_definition(
@@ -570,7 +670,7 @@ async fn owned_definition(
     owner: &str,
     relation: &rtdb_types::OwnedRelation,
     path: &rtdb_types::OwnedRelation,
-) -> Result<Definition> {
+) -> Result<HeldDefinition> {
     let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
     let root = relation.root_relation();
     let target = root.as_ref().unwrap_or(relation).table(owner);
@@ -578,17 +678,26 @@ async fn owned_definition(
         rtdb_query::open_owned_path_catalog(Arc::clone(context), &catalog, Some(path.name()))
             .await?
             .ok_or_else(uncovered_owned_range)?;
-    let mut definitions = read_definitions(cursor).await?.into_iter();
-    let mut definition = definitions
-        .next()
-        .filter(|definition| {
-            definition.name == path.name()
-                && definition.table == target
-                && definitions.next().is_none()
-        })
-        .ok_or_else(uncovered_owned_range)?;
-    definition.table = relation.table(owner);
-    Ok(definition)
+    let mut definitions = DefinitionSet::new(&context.memory)?;
+    read_definitions(cursor, &mut definitions).await?;
+    let [definition] = definitions.rows.as_mut_slice() else { return Err(uncovered_owned_range()); };
+    if definition.name != path.name() || definition.table != target {
+        return Err(uncovered_owned_range());
+    }
+    if let Some(root) = root {
+        let table_bytes = (target.table.len() - root.name().len())
+            .checked_add(relation.name().len())
+            .and_then(|bytes| bytes.checked_add(target.schema.len()))
+            .ok_or_else(definition_allocation_overflow)?;
+        let lease = Arc::get_mut(&mut definitions.reservation).expect("The held definition owns its reservation");
+        let retained = lease.bytes().checked_add(table_bytes).ok_or_else(definition_allocation_overflow)?;
+        lease.grow_to(retained)?;
+        definition.table = relation.table(owner);
+    }
+    let definition = definitions.rows.pop().ok_or_else(uncovered_owned_range)?;
+    let DefinitionSet { rows, reservation } = definitions;
+    drop(rows);
+    Ok(HeldDefinition { definition, reservation })
 }
 
 fn format_error(error: impl std::fmt::Display) -> Anomaly {
@@ -598,9 +707,9 @@ fn format_error(error: impl std::fmt::Display) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_types::Value;
 
-    #[test]
-    fn ordered_definition_admits_text_and_i64_from_selected_union_legs() -> Result<()> {
+    fn definition_batch() -> Result<RecordBatch> {
         let cells = [
             ("_id", [Value::Utf8("by_key".into()), Value::Utf8("bad_columns".into()), Value::I64(0)]),
             ("schema_name", std::array::from_fn(|_| Value::Utf8("public".into()))),
@@ -619,19 +728,75 @@ mod tests {
             fields.push(rtdb_columnar::to_field(name, &ty)?);
             columns.push(rtdb_columnar::build_array(&ty, &values)?);
         }
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
-            .map_err(format_error)?;
+        RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).map_err(format_error)
+    }
+
+    #[test]
+    fn ordered_definition_admits_text_and_i64_from_selected_union_legs() -> Result<()> {
+        let batch = definition_batch()?;
+        let memory = MemoryBudget::new(4096);
+        let mut definitions = DefinitionSet::new(&memory)?;
+        definitions.push_row(&batch, 0)?;
         assert_eq!(
-            Definition::from_row(&batch, 0)?,
-            Definition {
+            definitions.rows.as_slice(),
+            &[Definition {
                 name: "by_key".into(),
                 table: TableRef::new("public", "events"),
                 columns: vec!["key".into(), "_id".into()],
                 version: 12,
-            },
+            }],
         );
-        assert!(Definition::from_row(&batch, 1).is_err());
-        assert!(Definition::from_row(&batch, 2).is_err());
+        assert!(definitions.push_row(&batch, 1).is_err());
+        assert!(definitions.push_row(&batch, 2).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_definition_caller_retains_reservation_after_memo_eviction() -> Result<()> {
+        let batch = definition_batch()?;
+        let memory = MemoryBudget::new(4096);
+        let cache = DefinitionCache::default();
+        let cancellation = CancellationToken::new();
+        let load = || async {
+            let mut definitions = DefinitionSet::new(&memory)?;
+            definitions.push_row(&batch, 0)?;
+            Ok(definitions)
+        };
+        let caller = cache.get_or_load("database", rtdb_types::Timestamp(0).into(), &memory, &cancellation, load())
+            .await?.unwrap();
+        let charged = memory.used_bytes();
+        for micros in 1..=4 {
+            let now = rtdb_types::Timestamp(micros).into();
+            assert!(cache.get_or_load("database", now, &memory, &cancellation, load()).await?.is_some());
+        }
+        assert_eq!(memory.used_bytes(), 5 * charged);
+        assert!(caller.rows[0].columns.iter().map(String::as_str).eq(["key", "_id"]));
+        drop(caller);
+        assert_eq!(memory.used_bytes(), 4 * charged);
+        drop(cache);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_ordered_definition_memo_does_not_publish_unfunded_rows() -> Result<()> {
+        let batch = definition_batch()?;
+        let memory = MemoryBudget::new(4096);
+        let occupied = memory.reserve(memory.limit_bytes() - 256)?;
+        let cache = DefinitionCache::default();
+        let cancellation = CancellationToken::new();
+        let now = rtdb_types::Timestamp(0).into();
+        let load = || async {
+            let mut definitions = DefinitionSet::new(&memory)?;
+            definitions.push_row(&batch, 0)?;
+            Ok(definitions)
+        };
+        assert!(cache.get_or_load("database", now, &memory, &cancellation, load()).await?.is_none());
+        assert_eq!(memory.used_bytes(), occupied.bytes());
+        drop(occupied);
+        let caller = cache.get_or_load("database", now, &memory, &cancellation, load()).await?.unwrap();
+        assert_eq!(caller.rows[0].name, "by_key");
+        assert_eq!(memory.used_bytes(), caller.reservation.bytes());
         Ok(())
     }
 

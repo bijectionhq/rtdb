@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use rtdb_flight_sql::FrozenWorldWinner;
-use rtdb_node::{NodeOptions, OwnedChangeEdge, OwnedCountRequest, OwnedKeyBound, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
+use rtdb_node::{NodeOptions, OwnedChangeEdge, OwnedCountRequest, OwnedKeyBound, OwnedPathColumns, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
 use rtdb_plan::Catalog;
 use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
 use tokio::sync::{mpsc, oneshot};
@@ -275,7 +275,7 @@ enum ArchiveRead {
         path: OwnedRelation,
         expected_schema: Option<rtdb_types::OwnedSchema>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
-        reply: oneshot::Sender<Result<Vec<String>>>,
+        reply: oneshot::Sender<Result<OwnedPathColumns>>,
     },
     Search {
         partitions: Vec<(OwnedRelation, OwnedRelation)>,
@@ -598,7 +598,7 @@ impl HeldCheckpointWorld {
         let parent_columns = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
-        if parent_columns.as_slice() != columns || columns.last().is_none_or(|column| column != "_id")
+        if &*parent_columns != columns || columns.last().is_none_or(|column| column != "_id")
             || columns[..columns.len() - 1].iter().any(|column| schema.path_column_type(column).is_none())
         {
             return Err(OwnedWorld::unavailable());

@@ -315,57 +315,63 @@ impl RegionGeometry {
 
 impl PreparedRegion {
     pub fn new(region_bytes: &[u8], predicate: Predicate, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let mut reservation = memory.reserve(kernel::WORK_BYTES)?;
-        let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-        let region = if matches!(predicate, Predicate::All) {
+        const METADATA_BYTES: usize = 512;
+        const FULL_RANGE: KeyRange = KeyRange { start: i64::MIN, end: i64::MAX };
+
+        if matches!(predicate, Predicate::All) {
             if !region_bytes.is_empty() {
                 return Err(kernel::invalid(
                     "An unrestricted spatial read takes no region",
                 ));
             }
-            None
+            let reservation = memory.reserve(METADATA_BYTES + std::mem::size_of::<KeyRange>())?;
+            return Ok(Self {
+                predicate,
+                location: None,
+                point_geometry: false,
+                ranges: vec![FULL_RANGE],
+                steps: 0,
+                _reservation: reservation,
+            });
+        }
+
+        let mut reservation = memory.reserve(kernel::WORK_BYTES)?;
+        let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
+        let region = Location::decode(region_bytes, &mut work)?;
+        predicate.validate_region(&region)?;
+        let point_geometry = region.is_point_geometry();
+        let (geometry, ranges) = if !region.geometry.is_empty() && predicate.cover_predicate().is_some() {
+            work.scoped(|work| {
+                let geometry = predicate.prepare_geometry(&region.geometry, work)?;
+                let ranges = predicate.cover(&geometry, work)?;
+                Ok::<_, Anomaly>((RegionGeometry::Prepared(geometry), ranges))
+            })?
         } else {
-            let region = Location::decode(region_bytes, &mut work)?;
-            predicate.validate_region(&region)?;
-            Some(region)
+            // An uncovered predicate only spends topology work when it reaches a candidate.
+            let geometry = if region.geometry.is_empty()
+                || matches!(predicate, Predicate::Classification(crate::Classification::Unknown))
+            {
+                RegionGeometry::Plain(region.geometry)
+            } else {
+                let mut preparation = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
+                match predicate.prepare_geometry(&region.geometry, &mut preparation) {
+                    Ok(geometry) => RegionGeometry::Prepared(geometry),
+                    Err(_) => RegionGeometry::Plain(region.geometry),
+                }
+            };
+            (geometry, None)
         };
-        let point_geometry = region.as_ref().is_some_and(Location::is_point_geometry);
-        let (region, ranges) = match region {
-            Some(region) if !region.geometry.is_empty() && predicate.cover_predicate().is_some() => {
-                work.scoped(|work| {
-                    let geometry = predicate.prepare_geometry(&region.geometry, work)?;
-                    let ranges = predicate.cover(&geometry, work)?;
-                    Ok::<_, Anomaly>((Some(RegionGeometry::Prepared(geometry)), ranges))
-                })?
-            }
-            Some(region) => {
-                // An uncovered predicate only spends topology work when it reaches a candidate.
-                let geometry = if region.geometry.is_empty()
-                    || matches!(predicate, Predicate::Classification(crate::Classification::Unknown))
-                {
-                    RegionGeometry::Plain(region.geometry)
-                } else {
-                    let mut preparation = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-                    match predicate.prepare_geometry(&region.geometry, &mut preparation) {
-                        Ok(geometry) => RegionGeometry::Prepared(geometry),
-                        Err(_) => RegionGeometry::Plain(region.geometry),
-                    }
-                };
-                (Some(geometry), None)
-            }
-            None => (None, None),
-        };
-        let ranges = ranges.unwrap_or_else(|| vec![KeyRange { start: i64::MIN, end: i64::MAX }]);
-        let bytes = region.as_ref().map_or(0, RegionGeometry::retained_bytes)
+        let ranges = ranges.unwrap_or_else(|| vec![FULL_RANGE]);
+        let bytes = geometry.retained_bytes()
             .checked_add(ranges.capacity() * std::mem::size_of::<KeyRange>())
-            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(postings::work_limit)?;
+            .and_then(|bytes| bytes.checked_add(METADATA_BYTES)).ok_or_else(postings::work_limit)?;
         let lease = Arc::get_mut(&mut reservation).expect("geometry construction owns the reservation");
         if bytes > lease.bytes() {
             lease.grow_to(bytes)?;
         } else {
             lease.shrink_to(bytes)?;
         }
-        Ok(Self { predicate, location: region, point_geometry, ranges, steps: work.usage().steps, _reservation: reservation })
+        Ok(Self { predicate, location: Some(geometry), point_geometry, ranges, steps: work.usage().steps, _reservation: reservation })
     }
 }
 
@@ -660,7 +666,6 @@ pub(super) async fn visit_matches(
         && request.partition.len() == definition.partition.len()
         && matches!(region.predicate, Predicate::Topology(geometry::predicates::TopologyPredicate::Intersects))
         && region.point_geometry;
-    let _geometry_memory = context.memory.reserve(kernel::WORK_BYTES)?;
     let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
     work.charge(region.steps).map_err(kernel::geometry_error)?;
     let partition = (request.partition.len() == definition.partition.len())
@@ -775,6 +780,7 @@ pub(super) async fn visit_matches(
         } else {
             None
         };
+        let mut geometry_workspace = None;
         for row in 0..batch.num_rows() {
             context.check_cancelled_at(row)?;
             if !partition_matches(batch, row, partition_start, &request.partition)? {
@@ -797,6 +803,9 @@ pub(super) async fn visit_matches(
                 else {
                     continue;
                 };
+                if geometry_workspace.is_none() {
+                    geometry_workspace = Some(context.memory.reserve(kernel::WORK_BYTES)?);
+                }
                 work.scoped(|work| {
                     let Some(location) = Location::decode_stored(bytes, definition.encoding, work)? else {
                         return Ok(None);

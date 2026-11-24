@@ -508,6 +508,32 @@ async fn unindexed_spatial_reads_decode_only_geometry_visible_at_the_held_cut() 
     let error = held.spatial(&relation, &path, request(5), false).await.err().unwrap();
     assert_eq!(error.code, "rtdb.spatial/invalid");
     drop(held);
+
+    let mut limited = session.query_context().await.unwrap();
+    let filtered = request(25);
+    let prepared = rtdb_spatial::PreparedRegion::new(&filtered.region, filtered.predicate, &limited.memory).unwrap();
+    let memory = limited.memory.scope_with_limit(4 << 20);
+    Arc::make_mut(&mut limited).memory = memory;
+    let unrestricted = Request { region: Default::default(), predicate: Predicate::All, ..request(5) };
+    let read = rtdb_spatial::read_held(Arc::clone(&limited), "xtdb", &relation, &path, unrestricted,
+        rtdb_spatial::Projection::Identities);
+    let page = limited.reading(read).await.unwrap();
+    assert_eq!(spatial_ids(&page), [EntityId::Integer(1)]);
+    drop(page);
+
+    let read = rtdb_spatial::read_prepared(Arc::clone(&limited), "xtdb", &relation, &path, &prepared, filtered,
+        rtdb_spatial::Projection::Identities);
+    let error = limited.reading(read).await.err().unwrap();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    let skipped = Request {
+        page: PageOrder::Identity { after: Some(rtdb_columnar::EntityIdRef::Integer(1)) },
+        ..request(25)
+    };
+    let read = rtdb_spatial::read_prepared(Arc::clone(&limited), "xtdb", &relation, &path, &prepared, skipped,
+        rtdb_spatial::Projection::Identities);
+    let page = limited.reading(read).await.unwrap();
+    assert!(spatial_ids(&page).is_empty());
+
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

@@ -18,7 +18,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, Iid, Result,
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Definition, INDEX_ROOT, checkpoint, definitions, format_error,
+    Definition, DefinitionSet, INDEX_ROOT, checkpoint, definitions, format_error,
     projection::{Changes, EventOrder, KeyLayout, RevisionRoots},
     replay_coverage::{classify_replay_block, replay_complete},
     tree::{AddressRef, Root, Tree},
@@ -74,7 +74,9 @@ impl OrderedIndexMaintenance {
         let owned = super::owned_definitions(
             &self.database, snapshot, &self.storage, &self.memory, now.into(), cancellation,
         ).await?;
-        let active = definitions.iter().chain(&owned);
+        let active = definitions.as_deref().into_iter()
+            .chain(owned.as_ref())
+            .flat_map(DefinitionSet::iter);
         let directories = active.clone()
             .map(Definition::directory)
             .collect::<Result<BTreeSet<_>>>()?;

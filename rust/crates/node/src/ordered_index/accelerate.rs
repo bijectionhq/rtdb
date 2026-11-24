@@ -115,7 +115,7 @@ async fn seek(
     window: Option<RowRange<usize>>,
     projection: &[usize],
 ) -> Result<Option<OrderedScan>> {
-    let definitions = definitions(
+    let Some(definitions) = definitions(
         request.database,
         request.snapshot,
         request.storage,
@@ -123,7 +123,9 @@ async fn seek(
         request.current_time,
         request.cancellation,
     )
-    .await?;
+    .await? else {
+        return Ok(None);
+    };
     let constants = Constants { evaluator: request.constants, atoms: Default::default() };
     for definition in definitions
         .iter()
