@@ -4562,6 +4562,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtdb-db"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86)",
+ "rtdb-crypt",
+ "rtdb-format",
+ "rtdb-index",
+ "rtdb-logkeeper",
+ "rtdb-store",
+ "rtdb-tx",
+ "rtdb-types",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "rtdb-directory"
 version = "0.1.0"
 dependencies = [
