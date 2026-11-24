@@ -313,12 +313,12 @@ The local volume lock fences a rejected stage until Directory can order disposal
 The broker binds the inherited checkpoint and original resolved suffix to the member before Directory publication.
 It promotes the member after publication and removes a rejected reservation after disposal.
 The broker records the stable origins and paired coordinates of inherited events with the fork basis.
-An installed source signs its committed erase selectors at the certified head.
-The broker verifies the recorded fork maps and projects the selected origins into each dependent history.
-A dependent writer rewrites its own exact head and drops only those inherited origins.
-The coordinator waits for every enrolled root to sign its staged successor before requesting rotation.
-Directory-only histories need the ordered erasure attachment before they can drive this switch.
-Overlapping SQL erasures on different enrolled roots wait for a single coordinated selection.
+Every enrolled installed root signs its local erase selectors after the broker closes admission and its admitted submissions apply.
+The broker selects the complete set of signed cuts for one operation and projects the union of inherited event origins into each root through the authenticated fork maps.
+Each root verifies its local selectors at the exact head it rewrites, then applies both the local and projected erases.
+Successor signatures bind the same selection before the coordinator requests rotation.
+Directory-only histories still need an ordered attachment that adopts their selected recovery closure and covers their original custody.
+The installed profile keeps the 120-second operational target.
 
 |8
 |Transaction metadata retention.

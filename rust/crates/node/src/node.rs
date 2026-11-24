@@ -627,26 +627,10 @@ impl Node {
             .map(|context| context.with_query_cpu(query_cpu))
     }
 
-    /// Replays an original committed erase in the exact ordered snapshot store.
+    /// Reads every local erase marker from the exact protected snapshot.
     pub async fn sql_erasure_source(
         &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
-        transaction: TransactionKey, position: ReplicaPosition, cancellation: &CancellationToken,
-    ) -> Result<rtdb_replication::SqlErasureSource> {
-        self.erasure_source(database, cut, checkpoint, transaction, Some(position), None, cancellation).await
-    }
-
-    pub async fn dependent_erasure_source(
-        &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
-        transaction: TransactionKey, origins: std::collections::BTreeSet<rtdb_types::EventOrigin>,
         cancellation: &CancellationToken,
-    ) -> Result<rtdb_replication::SqlErasureSource> {
-        self.erasure_source(database, cut, checkpoint, transaction, None, Some(origins), cancellation).await
-    }
-
-    async fn erasure_source(
-        &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
-        transaction: TransactionKey, position: Option<ReplicaPosition>,
-        origins: Option<std::collections::BTreeSet<rtdb_types::EventOrigin>>, cancellation: &CancellationToken,
     ) -> Result<rtdb_replication::SqlErasureSource> {
         let replay = cancellation.run_until_cancelled(
             rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
@@ -664,15 +648,7 @@ impl Node {
                     .await.ok_or_else(cancelled)??,
                 None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
             };
-            match (position, origins) {
-                (Some(position), None) => recovered.replay_sql_erasure(
-                    &database.logs, replay, transaction, position, store, cancellation,
-                ).await,
-                (None, Some(origins)) => recovered.replay_dependent_erasure(
-                    &database.logs, replay, transaction, origins, store, cancellation,
-                ).await,
-                _ => Err(crate::sql_snapshots::unretained()),
-            }
+            recovered.replay_sql_erasure(&database.logs, replay, store, cancellation).await
         }).await
     }
 
@@ -763,13 +739,15 @@ impl Node {
             return Err(owned_relations_disabled());
         }
         let database = self.attached_database(database, placement)?;
+        let admission = if self.catalog.is_placed() {
+            Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
+        } else { None };
+        // Enter broker custody while holding the local submission gate. After
+        // the broker closes, pausing this gate drains every admitted submit.
         let _custody = match &self.read_fence {
             Some(fence) => fence.hold_transaction_custody(&database).await?,
             None => None,
         };
-        let admission = if self.catalog.is_placed() {
-            Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
-        } else { None };
         let replay = permit.map(|permit| {
             let key = options.user_metadata.as_ref().and_then(|metadata| idempotency_key(metadata.value()));
             if key.is_some_and(|key| key != permit.key) {

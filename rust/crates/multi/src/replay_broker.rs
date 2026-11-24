@@ -117,7 +117,7 @@ enum Response {
     Domain { view: domain::View },
     ForkEnrolled,
     ErasureSelectionPending,
-    ErasureProjection { transaction: rtdb_types::TransactionKey, count: usize },
+    ErasureProjection { count: usize },
     Refused { category: AnomalyCategory, code: String },
 }
 
@@ -263,16 +263,16 @@ impl Client {
 
     pub(crate) async fn projected_erasure(
         &self, operation: domain::Operation, root: Uuid, history: [u8; 32],
-    ) -> Result<Option<(rtdb_types::TransactionKey, BTreeSet<rtdb_types::EventOrigin>)>> {
+    ) -> Result<Option<BTreeSet<rtdb_types::EventOrigin>>> {
         if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
             let service = Arc::clone(service);
             return tasks.spawn(async move { service.project_erasure(operation, root, history).await }).await.map_err(transport)?;
         }
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
         let mut socket = remote.connect(None, Action::ProjectErasure { operation, root, history }).await?;
-        let (transaction, count) = match socket_work(read_response(&mut socket)).await? {
+        let count = match socket_work(read_response(&mut socket)).await? {
             Response::ErasureSelectionPending => return Ok(None),
-            Response::ErasureProjection { transaction, count } => (transaction, count),
+            Response::ErasureProjection { count } => count,
             _ => return Err(invalid_frame()),
         };
         let length = count.checked_mul(32).filter(|length| *length <= MAX_BODY).ok_or_else(invalid_frame)?;
@@ -284,7 +284,7 @@ impl Client {
                 return Err(invalid_frame());
             }
         }
-        Ok(Some((transaction, origins)))
+        Ok(Some(origins))
     }
 
     pub(crate) async fn read(
@@ -691,7 +691,7 @@ impl Service {
             }
             Action::ProjectErasure { operation, root, history: selected } if history.is_none() => {
                 let projection = self.project_erasure(operation, root, selected).await?;
-                let Some((transaction, origins)) = projection else {
+                let Some(origins) = projection else {
                     return socket_work(send_header(socket, &Response::ErasureSelectionPending)).await;
                 };
                 let length = origins.len().checked_mul(32).filter(|length| *length <= MAX_BODY)
@@ -700,7 +700,7 @@ impl Service {
                 let mut frame = Vec::with_capacity(length);
                 for origin in &origins { frame.extend_from_slice(&origin.0); }
                 return socket_work(async {
-                    send_header(socket, &Response::ErasureProjection { transaction, count: origins.len() }).await?;
+                    send_header(socket, &Response::ErasureProjection { count: origins.len() }).await?;
                     socket.write_all(&frame).await.map_err(transport)
                 }).await;
             }
@@ -882,13 +882,15 @@ impl Service {
         if rtdb_format::catalog::publication_digest(&selectors) != source.selectors {
             return Err(refused());
         }
-        decode_erasure_selectors(&selectors)?;
+        if decode_erasure_selectors(&selectors)?.is_empty() != source.first_marker.is_none() {
+            return Err(refused());
+        }
         let io = IoRegion::new();
         let bucket = self.storage.bucket(io.clone()).await?;
         let result = async {
             domain::verify_source_erasure(bucket.as_ref(), &source).await?;
             let authority = source.operation.domain;
-            let store = self.fork_event_store(Arc::clone(&bucket), &io, authority, source.source)?;
+            let store = self.fork_event_store(Arc::clone(&bucket), &io, authority, source.placement.deployment)?;
             store.put(&source_erasure_key(&source)?, selectors).await?;
             domain::execute(bucket.as_ref(), authority, domain::Action::SelectSourceErasure { source }).await
         }.await;
@@ -898,29 +900,39 @@ impl Service {
 
     async fn project_erasure(
         &self, operation: domain::Operation, root: Uuid, history: [u8; 32],
-    ) -> Result<Option<(rtdb_types::TransactionKey, BTreeSet<rtdb_types::EventOrigin>)>> {
+    ) -> Result<Option<BTreeSet<rtdb_types::EventOrigin>>> {
         let io = IoRegion::new();
         let store = self.storage.bucket(io.clone()).await?;
         let result = async {
             let Some(projection) = domain::erasure_projection(store.as_ref(), operation, root, history).await?
                 else { return Ok(None); };
-            let source_store = self.fork_event_store(Arc::clone(&store), &io, operation.domain, projection.source.source)?;
-            let (selectors, _selector_charge) = self.read_projection_record(
-                &source_store, &source_erasure_key(&projection.source)?, projection.source.selectors,
-            ).await?;
-            let targets = decode_erasure_selectors(&selectors)?;
-            let mut source = Vec::new();
-            for (child, basis, side) in projection.source_edges {
-                source.push((self.read_fork_events(Arc::clone(&store), &io, operation.domain, child, basis).await?, side));
-            }
             let mut dependent = Vec::new();
-            for (child, basis, _) in projection.dependent_edges {
-                dependent.push(self.read_fork_events(Arc::clone(&store), &io, operation.domain, child, basis).await?);
+            if !projection.sources.is_empty() {
+                for (child, basis, _) in projection.dependent_edges {
+                    dependent.push(self.read_fork_events(Arc::clone(&store), &io, operation.domain, child, basis).await?);
+                }
             }
-            let origins = rtdb_replication::project_erasure_origins(
-                &targets, source.iter().map(|((map, _), side)| (map, *side)), dependent.iter().map(|(map, _)| map),
-            );
-            Ok(Some((projection.source.transaction, origins)))
+            let mut origins = BTreeSet::new();
+            for (selection, edges) in projection.sources {
+                let source_store = self.fork_event_store(
+                    Arc::clone(&store), &io, operation.domain, selection.placement.deployment,
+                )?;
+                let (selectors, _selector_charge) = self.read_projection_record(
+                    &source_store, &source_erasure_key(&selection)?, selection.selectors,
+                ).await?;
+                let targets = decode_erasure_selectors(&selectors)?;
+                let mut source = Vec::new();
+                for (child, basis, side) in edges {
+                    source.push((self.read_fork_events(Arc::clone(&store), &io, operation.domain, child, basis).await?, side));
+                }
+                for origin in rtdb_replication::project_erasure_origins(
+                    &targets, source.iter().map(|((map, _), side)| (map, *side)), dependent.iter().map(|(map, _)| map),
+                ) {
+                    origins.insert(origin);
+                    if origins.len() > MAX_BODY / 32 { return Err(invalid_frame()); }
+                }
+            }
+            Ok(Some(origins))
         }.await;
         io.close_and_wait().await;
         result
@@ -1467,7 +1479,7 @@ pub(crate) fn encode_erasure_selectors(source: &rtdb_replication::SqlErasureSour
         let subject = rtdb_replication::erasure_subject(&target.table, target.iid);
         selected.entry(subject).and_modify(|cut| *cut = (*cut).max(target.before)).or_insert(target.before);
     }
-    let mut encoded = Vec::new();
+    let mut encoded = vec![1];
     for (subject, position) in selected {
         encoded.extend_from_slice(&subject);
         encoded.extend_from_slice(&position.to_bytes());
@@ -1478,7 +1490,7 @@ pub(crate) fn encode_erasure_selectors(source: &rtdb_replication::SqlErasureSour
 
 fn decode_erasure_selectors(input: &[u8]) -> Result<ErasureSelectors> {
     let mut selected = ErasureSelectors::new();
-    if input.is_empty() || input.len() % 48 != 0 { return Err(invalid_frame()); }
+    let input = input.strip_prefix(&[1]).filter(|bytes| bytes.len() % 48 == 0).ok_or_else(invalid_frame)?;
     let mut previous = None;
     for record in input.chunks_exact(48) {
         let (subject, position) = record.split_first_chunk::<32>().ok_or_else(invalid_frame)?;
@@ -1490,8 +1502,9 @@ fn decode_erasure_selectors(input: &[u8]) -> Result<ErasureSelectors> {
 }
 
 fn source_erasure_key(proof: &domain::SourceErasure) -> Result<ObjectKey> {
-    Ok(ObjectKey::new(format!("~custody-erasure-selections/{}/{}/{}",
-        proof.operation.domain, proof.operation.erase, URL_SAFE_NO_PAD.encode(proof.selectors)))?)
+    Ok(ObjectKey::new(format!("~custody-erasure-selections/{}/{}/{}/{}",
+        proof.operation.domain, proof.operation.erase, proof.placement.deployment,
+        URL_SAFE_NO_PAD.encode(proof.selectors)))?)
 }
 
 fn fork_events_key(authority: Uuid, child: Uuid, digest: [u8; 32]) -> Result<ObjectKey> {

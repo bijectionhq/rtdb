@@ -4,7 +4,7 @@ use rtdb_format::{catalog::legacy_table_ref, envelope::{ReplicaBody, decode_repl
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::{Snapshot, StagedWrite};
 use rtdb_storage::{ObjectStore, object_store::ReadReservation};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EventOp, EventOrigin, EventPosition, Iid, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EventOp, EventOrigin, EventPosition, Iid, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, RecoveredPartition, blocks::{matches_confirmation, validate_uploaded_root}, driver::{additions, artefact_entries}};
@@ -63,7 +63,7 @@ pub struct SqlErasureSource {
     cut: CatalogCut,
     checkpoint: Option<crate::PublishedCheckpoint>,
     source_position: SourcePosition,
-    transaction: TransactionKey,
+    first_marker: Option<crate::CommittedErasure>,
     targets: Vec<ErasureTarget>,
     pub(crate) inherited_erasure: Option<BTreeSet<EventOrigin>>,
     pub(crate) custody: Arc<dyn Send + Sync>,
@@ -79,7 +79,12 @@ impl SqlErasureSource {
     pub fn cut(&self) -> CatalogCut { self.cut }
     pub fn checkpoint(&self) -> Option<crate::PublishedCheckpoint> { self.checkpoint }
     pub fn source_position(&self) -> SourcePosition { self.source_position }
-    pub fn transaction(&self) -> TransactionKey { self.transaction }
+    pub fn first_marker(&self) -> Option<crate::CommittedErasure> { self.first_marker }
+
+    pub fn with_inherited_erasure(mut self, origins: BTreeSet<EventOrigin>) -> Self {
+        if !origins.is_empty() { self.inherited_erasure = Some(origins); }
+        self
+    }
     pub fn targets(&self) -> &[ErasureTarget] { &self.targets }
     pub fn snapshot(&self) -> &Snapshot { &self.snapshot }
 }
@@ -93,65 +98,33 @@ impl RecoveredPartition {
         self.replay_snapshot_suffix_with(logs, replay, cancellation, |_, _, _| Ok(()), false).await
     }
 
-    /// Resolve the exact erasing transaction in the protected replica interval,
-    /// then apply the remaining certified effects through the selected head.
+    /// Collect every committed erase on this exact certified head, including
+    /// markers that applied while the broker was closing admission.
     pub async fn replay_sql_erasure(
-        &mut self,
-        logs: &PartitionLogs,
-        replay: SnapshotReplay,
-        transaction: TransactionKey,
-        position: ReplicaPosition,
-        store: Arc<dyn ObjectStore>,
+        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, store: Arc<dyn ObjectStore>,
         cancellation: &CancellationToken,
     ) -> Result<SqlErasureSource> {
-        if position <= replay.after || position > replay.cut.through {
-            return Err(missing_erasure());
-        }
         let authenticated_head = replay.protected.suffix.as_ref().and_then(|range| range.authenticated_head)
             .ok_or_else(missing_erasure)?;
         let cut = replay.cut;
         let checkpoint = replay.checkpoint;
-        let mut selected = false;
+        let mut first_marker = None;
         let mut targets = Vec::new();
         let memory = logs.memory();
-        let custody = self.replay_snapshot_suffix_with(logs, replay, cancellation, |original, write, committed| {
-            let marker = if committed { erasure_targets(write, memory)? } else { Vec::new() };
-            if original == position {
-                if marker.is_empty() || write.tx_key() != transaction { return Err(missing_erasure()); }
-                selected = true;
+        let custody = self.replay_snapshot_suffix_with(logs, replay, cancellation, |position, write, committed| {
+            if committed {
+                let marker = erasure_targets(write, memory)?;
+                if !marker.is_empty() {
+                    first_marker.get_or_insert(crate::CommittedErasure { transaction: write.tx_key(), position });
+                    targets.extend(marker);
+                }
             }
-            targets.extend(marker);
             Ok(())
         }, true).await?.ok_or_else(missing_erasure)?;
-        if !selected { return Err(missing_erasure()); }
         Ok(SqlErasureSource {
-            authenticated_head, cut, checkpoint, source_position: self.progress.source_position, transaction,
+            authenticated_head, cut, checkpoint, source_position: self.progress.source_position, first_marker,
             targets, inherited_erasure: None, custody, snapshot: self.partition.snapshot(),
             store, memory: Arc::clone(memory),
-            fence: self.fence.clone(), external_token: self.progress.external_token.clone(),
-        })
-    }
-
-    /// Opens another root's certified head with the origins selected for that root.
-    pub async fn replay_dependent_erasure(
-        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, source: TransactionKey,
-        origins: BTreeSet<EventOrigin>, store: Arc<dyn ObjectStore>, cancellation: &CancellationToken,
-    ) -> Result<SqlErasureSource> {
-        let authenticated_head = replay.protected.suffix.as_ref().and_then(|range| range.authenticated_head)
-            .ok_or_else(missing_erasure)?;
-        let cut = replay.cut;
-        let checkpoint = replay.checkpoint;
-        let custody = self.replay_snapshot_suffix_with(logs, replay, cancellation, |_, write, committed| {
-            if committed && !erasure_targets(write, logs.memory())?.is_empty() {
-                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/dependent-erasure-overlap",
-                    "The dependent root has an unresolved local erase at its cut"));
-            }
-            Ok(())
-        }, true).await?.ok_or_else(missing_erasure)?;
-        Ok(SqlErasureSource {
-            authenticated_head, cut, checkpoint, source_position: self.progress.source_position,
-            transaction: source, targets: Vec::new(), inherited_erasure: Some(origins),
-            custody, snapshot: self.partition.snapshot(), store, memory: Arc::clone(logs.memory()),
             fence: self.fence.clone(), external_token: self.progress.external_token.clone(),
         })
     }

@@ -42,6 +42,7 @@ impl Signer {
 pub(in crate::journal::hosted) struct Staged {
     pub prepared: PreparedErasure,
     pub base: Checkpoint,
+    pub selection: [u8; 32],
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

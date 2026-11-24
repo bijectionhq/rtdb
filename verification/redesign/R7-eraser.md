@@ -112,8 +112,14 @@ The broker commits the complete domain drain only after it verifies those root s
 Each root then attests its original provider's disposition against that domain drain.
 The broker retains the aggregate completion and opens the next generation after all enlisted roots settle.
 With custody control enabled, a detached broker request registers before accepting plaintext and signs its terminal observation after provider and socket drain.
-The installed writer's staging call checks the broker's target and enrolled root, pauses user submissions, and replays the original committed erase marker through the exact certified head.
-It builds the successor from the protected snapshot store.
+The first recorded SQL marker triggers one broker closure for the enrolled domain.
+SQL submission holds a local gate while registering with the broker and entering intake.
+After closure, each installed writer pauses that gate, drains admitted submissions through apply and signs every local erase selector from its certified head.
+A root with an empty local selector set signs its cut as well.
+The broker records one immutable signed cut per root and waits for the whole enrolled cohort.
+It projects the union of the other roots' selectors through authenticated fork bases to stable inherited event origins.
+Each writer checks its local selector digest again against the exact head it stages and builds the successor from the protected snapshot store.
+Every successor attests to the same complete broker selection.
 The ordered erasure preparation keeps that head stable across normal appends and grants.
 The placement coordinator submits its joined root witness to the broker and requires the completed domain drain before it arms key retirement.
 It binds the verified provider disposition to the same drain when reporting root completion.

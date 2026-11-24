@@ -66,18 +66,18 @@ impl SqlIntent {
 #[serde(deny_unknown_fields)]
 pub struct SourceErasure {
     pub operation: Operation,
-    pub source: Uuid,
+    pub placement: ordered_logkeeper::ordered::Placement,
     pub history: [u8; 32],
     pub original_head: [u8; 32],
     pub selectors: [u8; 32],
-    pub transaction: rtdb_types::TransactionKey,
+    pub first_marker: Option<(rtdb_types::TransactionKey, rtdb_types::ReplicaPosition)>,
     pub signature: Vec<u8>,
 }
 
 impl SourceErasure {
     pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        statement(b"rtdb.custody/erasure-projection/v1\0",
-            &(self.operation, self.source, self.history, self.original_head, self.selectors, self.transaction))
+        statement(b"rtdb.custody/erasure-projection/v2\0",
+            &(self.operation, self.placement, self.history, self.original_head, self.selectors, self.first_marker))
     }
 }
 
@@ -86,11 +86,12 @@ impl SourceErasure {
 pub struct RootPrepared {
     pub original_head: [u8; 32],
     pub successor: [u8; 32],
+    pub selection: Option<[u8; 32]>,
 }
 
 impl RootPrepared {
     pub fn signing_bytes(self, operation: Operation, root: Uuid, history: [u8; 32]) -> Result<Vec<u8>> {
-        statement(b"rtdb.custody/root-prepared/v1\0", &(operation, root, history, self))
+        statement(b"rtdb.custody/root-prepared/v2\0", &(operation, root, history, self))
     }
 }
 
@@ -236,7 +237,9 @@ struct State {
     roots: BTreeMap<Uuid, Root>,
     duties: BTreeMap<Uuid, Work>,
     operation: Option<Operation>,
-    selection: Option<SourceErasure>,
+    sql_trigger: Option<SqlIntent>,
+    selections: BTreeMap<Uuid, SourceErasure>,
+    completed_sql: BTreeMap<Uuid, SqlIntent>,
     sql_intents: BTreeMap<Uuid, SqlIntent>,
     forks: BTreeMap<Uuid, ForkEnrollment>,
     pending_bases: BTreeMap<Uuid, ForkBasis>,
@@ -258,7 +261,9 @@ impl State {
             roots: BTreeMap::new(),
             duties: BTreeMap::new(),
             operation: None,
-            selection: None,
+            sql_trigger: None,
+            selections: BTreeMap::new(),
+            completed_sql: BTreeMap::new(),
             sql_intents: BTreeMap::new(),
             forks: BTreeMap::new(),
             pending_bases: BTreeMap::new(),
@@ -294,6 +299,13 @@ impl State {
         !self.roots.is_empty() && self.roots.keys().all(|member| reachable.contains(member))
     }
 
+    fn selection(&self) -> Result<Option<[u8; 32]>> {
+        if self.sql_trigger.is_some() && self.selections.len() == self.roots.len() {
+            return fingerprint(b"rtdb.custody/sql-selection/v1\0", &self.selections).map(Some);
+        }
+        Ok(None)
+    }
+
     fn view(&self) -> Result<View> {
         let membership = fingerprint(b"rtdb.custody/domain-roots/v2\0", &(&self.roots, &self.ancestry, &self.installed_forks))?;
         let roster = self
@@ -323,14 +335,15 @@ impl State {
         Ok(View {
             generation: self.generation,
             operation: self.operation,
+            selecting_sql: self.sql_trigger.is_some(),
             next_sql: self.sql_intents.values().copied().find(|intent| self.operation.is_none_or(|operation|
                 intent.target().ok() == Some(operation.target))),
-            source_root: self.selection.as_ref().map(|source| source.source),
+            selection: self.selection()?,
+            local_selectors: None,
             automatic_sql_source: self.sql_intents.keys().next().copied()
-                .filter(|source| self.sql_intents.len() == 1 && self.can_start_sql(*source)),
+                .filter(|source| self.can_start_sql(*source)),
             successors_ready: self.operation.is_some() && self.root_preparations.len() == self.roots.len(),
             ready_to_complete: self.operation.is_some() && self.destruction.len() == self.roots.len(),
-            sole_root: self.roots.first_key_value().filter(|_| self.roots.len() == 1).map(|(root, _)| *root),
             membership,
             roster,
             drained,
@@ -338,24 +351,26 @@ impl State {
         })
     }
 
+    fn authorize_root(&self, operation: Operation, root: Uuid, history: [u8; 32]) -> Result<()> {
+        if self.operation != Some(operation) || self.roots.get(&root).is_none_or(|enrolled| enrolled.history != history) {
+            return Err(conflict("The root is outside the closing custody operation"));
+        }
+        Ok(())
+    }
+
+    fn view_for(&self, action: &Action) -> Result<View> {
+        let mut view = self.view()?;
+        if let Action::AuthorizeRoot { root, .. } = action {
+            view.local_selectors = self.selections.get(root).map(|selected| selected.selectors);
+        }
+        Ok(view)
+    }
+
     fn apply(&mut self, action: &Action) -> Result<()> {
         match action {
             Action::Status => (),
-            Action::AuthorizeRoot {
-                operation,
-                root,
-                history,
-            } => {
-                if self.operation != Some(*operation)
-                    || self
-                        .roots
-                        .get(root)
-                        .is_none_or(|enrolled| enrolled.history != *history)
-                {
-                    return Err(conflict(
-                        "The root is outside the closing custody operation",
-                    ));
-                }
+            Action::AuthorizeRoot { operation, root, history } => {
+                self.authorize_root(*operation, *root, *history)?;
             }
             Action::Enroll {
                 generation,
@@ -476,9 +491,15 @@ impl State {
                     return Err(conflict("The committed erase addresses a different root history"));
                 }
                 verify(enrollment.admission_key, &intent.signing_bytes(self.domain, *generation)?, signature)?;
-                let target = intent.target()?;
-                if self.last_completed.is_some_and(|done| done.operation.target == target) {
+                if self.completed_sql.get(&root).is_some_and(|prior|
+                    prior.placement == intent.placement && prior.position >= intent.position)
+                {
                     return Ok(());
+                }
+                if self.selections.get(&root).is_some_and(|cut|
+                    cut.first_marker != Some((intent.transaction, intent.position)))
+                {
+                    return Err(conflict("The committed SQL marker differs from the selected root cut"));
                 }
                 if let Some(prior) = self.sql_intents.get(&root) {
                     if *prior != *intent {
@@ -491,14 +512,18 @@ impl State {
             Action::BeginSql { operation, intent, verification_key } => {
                 if operation.target != intent.target()? || operation.domain != self.domain
                     || self.sql_intents.get(&intent.placement.deployment) != Some(intent)
-                    || self.sql_intents.len() != 1 || !self.can_start_sql(intent.placement.deployment) || self.roots.get(&intent.placement.deployment)
+                    || !self.can_start_sql(intent.placement.deployment) || self.roots.get(&intent.placement.deployment)
                         .is_none_or(|root| root.verification_key != *verification_key)
                 {
                     return Err(conflict("The committed SQL erase has a different source or incomplete installed ancestry"));
                 }
+                if self.operation == Some(*operation) && self.sql_trigger != Some(*intent) {
+                    return Err(conflict("The closed operation was not initiated by this SQL marker"));
+                }
                 self.apply(&Action::Begin {
                     operation: operation.erase, target: operation.target, generation: operation.generation,
                 })?;
+                self.sql_trigger = Some(*intent);
             }
             Action::Begin {
                 operation,
@@ -528,24 +553,26 @@ impl State {
                 self.operation = Some(closing);
             }
             Action::SelectSourceErasure { source } => {
-                if self.operation != Some(source.operation) || source.original_head == [0; 32]
-                    || source.selectors == [0; 32]
+                if self.operation != Some(source.operation) || self.sql_trigger.is_none()
+                    || source.original_head == [0; 32] || source.selectors == [0; 32]
                 {
                     return Err(conflict("The authenticated SQL selection belongs to another operation"));
                 }
-                let root = self.roots.get(&source.source)
-                    .filter(|root| root.history == source.history)
+                let deployment = source.placement.deployment;
+                let history = installed_history(source.placement)?;
+                let root = self.roots.get(&deployment)
+                    .filter(|root| root.history == source.history && root.history == history)
                     .ok_or_else(|| conflict("The SQL selection belongs to a different root history"))?;
-                if self.sql_intents.get(&source.source).is_some_and(|intent|
-                    intent.transaction != source.transaction || intent.target().ok() != Some(source.operation.target))
+                if self.sql_intents.get(&deployment).is_some_and(|intent|
+                    source.first_marker != Some((intent.transaction, intent.position)))
                 {
-                    return Err(conflict("The SQL selection differs from the committed marker"));
+                    return Err(conflict("The SQL selection differs from the first committed marker"));
                 }
                 verify(root.verification_key, &source.signing_bytes()?, &source.signature)?;
-                if self.selection.as_ref().is_some_and(|selected| selected != source) {
-                    return Err(conflict("A different source cut already owns this operation"));
+                if self.selections.get(&deployment).is_some_and(|selected| selected != source) {
+                    return Err(conflict("A different source cut already owns this root's selection"));
                 }
-                self.selection = Some(source.clone());
+                self.selections.insert(deployment, source.clone());
             }
             Action::Admit {
                 generation,
@@ -640,8 +667,8 @@ impl State {
                 let member = self.roots.get(root).ok_or_else(|| conflict("The prepared root is outside the custody membership"))?;
                 if self.operation != Some(*operation) || prepared.original_head == [0; 32]
                     || prepared.successor == [0; 32]
-                    || self.selection.as_ref().is_some_and(|source|
-                        source.source == *root && source.original_head != prepared.original_head)
+                    || self.selection()? != prepared.selection
+                    || (self.sql_trigger.is_some() && prepared.selection.is_none())
                 {
                     return Err(conflict("The prepared successor belongs to another ordered cut"));
                 }
@@ -743,14 +770,17 @@ impl State {
                         "The provider has not settled every root in the domain",
                     ));
                 }
-                let mut source = None;
-                for (root, intent) in &self.sql_intents {
-                    if intent.target()? == operation.target {
-                        source = Some(*root);
-                        break;
+                for (root, selected) in &self.selections {
+                    if let Some(intent) = self.sql_intents.remove(root) {
+                        self.completed_sql.insert(*root, intent);
+                    } else if let Some((transaction, position)) = selected.first_marker {
+                        // A root may have applied its first erase after closure
+                        // and signed it before the driver reported the marker.
+                        self.completed_sql.insert(*root, SqlIntent {
+                            placement: selected.placement, transaction, position,
+                        });
                     }
                 }
-                if let Some(source) = source { self.sql_intents.remove(&source); }
                 let evidence = fingerprint(
                     b"rtdb.custody/domain-destruction/v1\0",
                     &(*operation, &self.destruction),
@@ -765,7 +795,8 @@ impl State {
                     .checked_add(1)
                     .ok_or_else(|| conflict("The custody generation space is exhausted"))?;
                 self.operation = None;
-                self.selection = None;
+                self.sql_trigger = None;
+                self.selections.clear();
                 self.duties.clear();
                 self.root_preparations.clear();
                 self.root_drains.clear();
@@ -869,12 +900,13 @@ impl Action {
 pub struct View {
     pub generation: u64,
     pub operation: Option<Operation>,
+    pub selecting_sql: bool,
     pub next_sql: Option<SqlIntent>,
-    pub source_root: Option<Uuid>,
+    pub selection: Option<[u8; 32]>,
+    pub local_selectors: Option<[u8; 32]>,
     pub automatic_sql_source: Option<Uuid>,
     pub successors_ready: bool,
     pub ready_to_complete: bool,
-    pub sole_root: Option<Uuid>,
     pub membership: [u8; 32],
     pub roster: [u8; 32],
     pub drained: Option<[u8; 32]>,
@@ -1014,23 +1046,19 @@ pub(super) async fn verify_source_erasure(store: &dyn ObjectStore, source: &Sour
     state.apply(&Action::SelectSourceErasure { source: source.clone() })
 }
 
+type ForkEdge = (Uuid, [u8; 32], rtdb_replication::ForkSide);
+
 pub(super) struct ErasureProjection {
-    pub source: SourceErasure,
-    pub source_edges: Vec<(Uuid, [u8; 32], rtdb_replication::ForkSide)>,
-    pub dependent_edges: Vec<(Uuid, [u8; 32], rtdb_replication::ForkSide)>,
+    pub sources: Vec<(SourceErasure, Vec<ForkEdge>)>,
+    pub dependent_edges: Vec<ForkEdge>,
 }
 
 pub(super) async fn erasure_projection(
     store: &dyn ObjectStore, operation: Operation, dependent: Uuid, history: [u8; 32],
 ) -> Result<Option<ErasureProjection>> {
     let state = load(store, operation.domain).await?;
-    if state.operation != Some(operation) || state.roots.get(&dependent).is_none_or(|root| root.history != history) {
-        return Err(conflict("The dependent root is outside the ordered erasure membership"));
-    }
-    let Some(source) = state.selection else { return Ok(None); };
-    if source.source == dependent {
-        return Err(conflict("The source root uses its original SQL selection"));
-    }
+    state.authorize_root(operation, dependent, history)?;
+    if state.selection()?.is_none() { return Ok(None); }
     let side = |root, child| if root == child { rtdb_replication::ForkSide::Child } else { rtdb_replication::ForkSide::Parent };
     let incident = |root| state.ancestry.values()
         .filter(|(fork, _)| fork.parent.deployment == root || fork.child.deployment == root)
@@ -1039,12 +1067,17 @@ pub(super) async fn erasure_projection(
             .filter(|fork| fork.parent.deployment == root || fork.child.deployment == root)
             .map(|fork| (fork.child.deployment, fork.event_map, side(root, fork.child.deployment))))
         .collect::<Vec<_>>();
-    let source_edges = incident(source.source);
     let dependent_edges = incident(dependent);
-    if source_edges.is_empty() || dependent_edges.is_empty() {
-        return Err(conflict("The enrolled root has no authenticated inherited event inventory"));
+    let mut sources = Vec::new();
+    for (root, selected) in state.selections {
+        if root == dependent || selected.first_marker.is_none() { continue; }
+        let source_edges = incident(root);
+        if source_edges.is_empty() || dependent_edges.is_empty() {
+            return Err(conflict("The enrolled root has no authenticated inherited event inventory"));
+        }
+        sources.push((selected, source_edges));
     }
-    Ok(Some(ErasureProjection { source, source_edges, dependent_edges }))
+    Ok(Some(ErasureProjection { sources, dependent_edges }))
 }
 
 pub(super) async fn pending_forks(store: &dyn ObjectStore, domain: Uuid) -> Result<Vec<ForkEnrollment>> {
@@ -1060,7 +1093,7 @@ pub(super) async fn execute(store: &dyn ObjectStore, domain: Uuid, action: Actio
         let mut next = state.clone();
         next.apply(&action)?;
         if next == state {
-            return next.view();
+            return next.view_for(&action);
         }
         next.revision = state
             .revision
@@ -1076,7 +1109,7 @@ pub(super) async fn execute(store: &dyn ObjectStore, domain: Uuid, action: Actio
             ));
         }
         match store.put(&key, Bytes::from(bytes)).await {
-            Ok(()) => return next.view(),
+            Ok(()) => return next.view_for(&action),
             Err(Error::ConflictingObject(_)) => (),
             Err(error) => return Err(error.into()),
         }
