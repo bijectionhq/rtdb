@@ -107,6 +107,15 @@ impl CustodyGroup {
 impl BranchIndex {
     pub fn has_custody_groups(&self) -> bool { !self.custody.is_empty() }
 
+    pub fn require_classic_write(&self, table: &TableRef) -> Result<()> {
+        if self.definition(table, self.head().basis).is_some_and(|definition| definition.visibility.is_some())
+            || self.custody.values().any(|group| group.members.iter().any(|member| &member.table == table))
+        {
+            return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb/protected-relation", "A protected relation requires canonical writer admission"));
+        }
+        Ok(())
+    }
+
     pub fn custody_group_live(&self, group: CustodyGroupId) -> Result<bool> {
         self.custody.get(&group).map(|group| group.revoked.is_none()).ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb/custody-group-unknown", "Unknown custody group")

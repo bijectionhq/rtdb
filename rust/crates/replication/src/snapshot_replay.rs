@@ -3,11 +3,11 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_format::{catalog::legacy_table_ref, envelope::{ReplicaBody, decode_replica_outcome_attempt}};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::{Snapshot, StagedWrite};
-use rtdb_storage::{ObjectStore, object_store::ReadReservation};
+use rtdb_storage::{ObjectStore, cache::BufferPool, object_store::ReadReservation};
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EventOp, EventOrigin, EventPosition, Iid, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-use crate::{PartitionLogs, RecoveredPartition, blocks::{matches_confirmation, validate_uploaded_root}, driver::{additions, artefact_entries}};
+use crate::{NativeServingAuthority, PartitionLogs, RecoveredPartition, blocks::{matches_confirmation, validate_uploaded_root}, driver::{additions, artefact_entries}, serving::retained};
 
 /// Owns the original checkpoint boundary and protected replica interval.
 pub struct SnapshotReplay {
@@ -15,6 +15,7 @@ pub struct SnapshotReplay {
     after: ReplicaPosition,
     checkpoint: Option<crate::PublishedCheckpoint>,
     protected: rtdb_storage::log::ProtectedLogSnapshot,
+    serving: Option<(Option<NativeServingAuthority>, Arc<BufferPool>)>,
 }
 
 impl SnapshotReplay {
@@ -42,7 +43,12 @@ impl SnapshotReplay {
         };
         let root = checkpoint.and_then(|checkpoint| checkpoint.root_sha256).unwrap_or([0; 32]);
         let protected = logs.protected_snapshot_range(after, cut.through, root).await?;
-        Ok(Self { cut, after, checkpoint, protected })
+        Ok(Self { cut, after, checkpoint, protected, serving: None })
+    }
+
+    pub fn with_serving(mut self, authority: Option<NativeServingAuthority>, storage: Arc<BufferPool>) -> Self {
+        self.serving = Some((authority, storage));
+        self
     }
 }
 
@@ -134,7 +140,7 @@ impl RecoveredPartition {
         mut observe: impl FnMut(ReplicaPosition, &StagedWrite, bool) -> Result<()> + Send,
         require_complete_transactions: bool,
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
-        let SnapshotReplay { cut, after, checkpoint, protected } = replay;
+        let SnapshotReplay { cut, after, checkpoint, protected, serving } = replay;
         let base = self.replica_start(logs)?;
         let loaded = self.block.as_ref().and_then(|block| Some(crate::PublishedCheckpoint {
             block: block.block_index(),
@@ -161,6 +167,10 @@ impl RecoveredPartition {
         let mut range = protected.range;
         let bound = range.allocation_bound();
         let memory = logs.memory();
+        let mut serving = match serving {
+            Some((authority, storage)) => retained::open(authority, self.block.as_ref(), self.partition.snapshot(), &storage, memory, cancellation).await?,
+            None => None,
+        };
         let mut reached = after;
         let mut slot: Option<(PlacedReservation, Term)> = None;
         while let Some(raw) = cancellation.run_until_cancelled(range.next(ReadReservation::new(bound, memory.reserve(bound)?)))
@@ -207,11 +217,26 @@ impl RecoveredPartition {
                         }
                         _ => return Err(unretained()),
                     }
-                    self.apply_snapshot_transaction(message, memory, |write, committed| observe(position, write, committed))?;
+                    self.apply_snapshot_transaction(message, memory, |write, committed| {
+                        if let Some(serving) = &mut serving { serving.observe_classic(write, position, memory)?; }
+                        observe(position, write, committed)
+                    })?;
                 }
                 ReplicaBody::NoOp(message) => {
-                    crate::serving::require_physical_replay_support(message)?;
-                    if let Some(wire) = message.placed_slot_reservation.as_deref() {
+                    if message.serving_record.is_some() {
+                        if slot.is_some() || message.placed_slot_reservation.is_some() { return Err(unretained()); }
+                        if let Some(applied) = retained::apply(serving.as_mut(), message, self.partition.snapshot(),
+                            self.progress.source_position, position, term, memory)?
+                        {
+                            if let Some((write, committed)) = applied.write {
+                                observe(position, &write, committed)?;
+                                self.partition.apply(&write)?;
+                                self.progress.tx_key = Some(write.tx_key());
+                                self.progress.latest_result = None;
+                            }
+                            self.advance_snapshot_source(Some(applied.source.0), false)?;
+                        }
+                    } else if let Some(wire) = message.placed_slot_reservation.as_deref() {
                         let reservation = PlacedReservation::decode(wire)?;
                         if slot.is_some() || message.src_msg_id.is_some()
                             || reservation.attempt.position() <= self.progress.source_position
@@ -260,7 +285,7 @@ impl RecoveredPartition {
                     return Err(unretained()),
             }
         }
-        if (require_complete_transactions && slot.is_some())
+        if (require_complete_transactions && (slot.is_some() || serving.as_ref().is_some_and(|serving| serving.holds_checkpoint())))
             || !crate::catalog_cut::completes_snapshot_replay(base.0, after.0, reached.0, cut.through.0, true)
         {
             return Err(unretained());

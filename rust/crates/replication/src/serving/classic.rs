@@ -4,7 +4,8 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut, BranchEffect, BranchIndex, BranchTable}};
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
-use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, StructFields, TableRef, Timestamp, TransactionKey,
+use rtdb_tx::transact::Receipt;
+use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId,
     rtdb_v1::{At, Basis, Layer, MAIN_BRANCH}};
 use tokio_util::sync::CancellationToken;
 
@@ -107,19 +108,22 @@ fn advance(index: &mut BranchIndex, system_time: Timestamp) -> Result<()> {
     index.advance_classic(BranchCut { basis: Basis::new(head.incarnation(), position), system_time })
 }
 
-pub(crate) fn stage_main(snapshot: Snapshot, prior: &BranchIndex, key: TransactionKey, effects: &[BranchEffect],
+pub(crate) fn stage_source(snapshot: Snapshot, prior: &BranchIndex, source: SourcePosition, receipt: &Receipt, effects: &[BranchEffect],
     memory: &Arc<MemoryBudget>) -> Result<StagedWrite> {
+    let key = TransactionKey { tx_id: TxId(source.0), system_time: receipt.system_time };
     let mut buffer = TransactionBuffer::new(snapshot, key, Arc::clone(memory))?;
     let view = prior.view(MAIN_BRANCH, At::Latest, Layer::Merged, prior.head().system_time)?;
     for effect in effects {
         match effect {
             BranchEffect::Write { branch, table, event } if branch == MAIN_BRANCH => {
                 let iid = prior.physical_iid(table, &event.id);
+                if event.image.as_ref().is_some_and(|image| image.custody_group.is_some() || image.custody_payload.is_some()) {
+                    return Err(super::invalid());
+                }
                 let put_until = event.image.as_ref().map_or(event.valid.lower(), |image| {
                     image.expires_at.unwrap_or(event.valid.upper()).clamp(event.valid.lower(), event.valid.upper())
                 });
                 if let Some(image) = &event.image && put_until > event.valid.lower() {
-                    if image.custody_payload.is_some() { return Err(super::invalid()); }
                     append(&mut buffer, table, iid, Interval::new(event.valid.lower(), put_until)?, StoredOperation::Put(image.cells.clone()))?;
                 }
                 if put_until < event.valid.upper() {
@@ -142,6 +146,7 @@ pub(crate) fn stage_main(snapshot: Snapshot, prior: &BranchIndex, key: Transacti
                 let fields = definition.columns.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect::<Vec<_>>();
                 buffer.record_sql_declaration(table, &fields)?;
             }
+            BranchEffect::RevokeCustodyGroup { .. } => return Err(super::invalid()),
             _ => (),
         }
     }

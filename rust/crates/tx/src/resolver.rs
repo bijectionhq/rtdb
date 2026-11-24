@@ -326,8 +326,15 @@ impl TxResolver {
         self.resolve_source_for_writer(durable, position, log_time, request, context, None).await
     }
 
-    pub async fn resolve_source_for_writer(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, mut request: SourceTransaction, context: &ResolveContext,
+    pub async fn resolve_source_for_writer(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext,
         writer: Option<WriterPublication<'_>>,
+    ) -> Result<Arc<ResolvedTx>> {
+        self.resolve_source_with_authority(durable, position, log_time, request, context, writer, None).await
+    }
+
+    pub async fn resolve_source_with_authority(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp,
+        mut request: SourceTransaction, context: &ResolveContext, writer: Option<WriterPublication<'_>>,
+        classic_authority: Option<&rtdb_index::branches::BranchIndex>,
     ) -> Result<Arc<ResolvedTx>> {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
@@ -542,6 +549,10 @@ impl TxResolver {
             tx.trace_parent = span.as_ref().map(|span| span.context());
             outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
+        }
+        if outcome.is_ok() && let Some(authority) = classic_authority {
+            let mut tables = tx.buffer.pending_tables().chain(prepared_writes.iter().flat_map(|write| write.tables().keys()));
+            outcome = tables.try_for_each(|table| authority.require_classic_write(table));
         }
         let candidate = resolution_candidate::resolve_candidate(tx, prepared_writes, outcome);
         let (mut tx, prepared_writes, result) = match candidate {

@@ -107,6 +107,7 @@ impl TransactPipeline {
 
     /// The acknowledged state. Reads, `TxStatus` and checkpoints use only this.
     pub fn durable(&self) -> &TransactState { &self.durable }
+    pub fn durable_mut(&mut self) -> &mut TransactState { &mut self.durable }
 
     pub fn into_durable(self) -> TransactState { self.durable }
 
@@ -278,7 +279,7 @@ impl TransactPipeline {
                     // Adopt the decided index: identical to applying the record, without re-applying it.
                     self.durable.index = after;
                     let previous = self.durable.store_receipt(StoredReceipt {
-                        receipt: receipt.clone(), fingerprint, receipt_namespace: key.namespace,
+                        receipt: receipt.clone(), fingerprint, receipt_namespace: key.namespace, installed: None,
                     });
                     debug_assert!(previous.is_none());
                     self.deciding.remove(&key);

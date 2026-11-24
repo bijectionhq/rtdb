@@ -47,6 +47,7 @@ pub struct Database {
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
     serving: Option<Arc<dyn crate::serving::ServingDriver>>,
+    pub(crate) native_serving_authority: Option<crate::serving::NativeServingAuthority>,
     pub(crate) custody_provider: crate::serving::custody_release::CustodyProviderSlot,
     replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
     pub(crate) await_authority: crate::AwaitAuthority,
@@ -621,8 +622,8 @@ impl DatabaseFactory {
                 }
                 authority => authority,
             };
-            if let Some(authority) = native_authority {
-                let handle = replica_driver.attach_native_serving(replication.clone(), authority, self.options.automatic_gc).await?;
+            if let Some(authority) = &native_authority {
+                let handle = replica_driver.attach_native_serving(replication.clone(), authority.clone(), self.options.automatic_gc).await?;
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {
                     handle, memory: Arc::clone(&self.memory), storage: Arc::clone(&storage),
                     clock: Arc::clone(&self.clock), tokens: Arc::clone(&tokens),
@@ -630,7 +631,8 @@ impl DatabaseFactory {
                 }));
             }
             let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
-                audience_storage: resources.audience_storage, logs, replication, serving, custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
+                audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority,
+                custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
