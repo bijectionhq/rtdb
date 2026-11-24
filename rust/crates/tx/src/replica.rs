@@ -470,7 +470,7 @@ mod tests {
             committed: Some(true),
             ..Default::default()
         };
-        frame.table_data.insert(table.schema_and_table(), bytes.as_slice().to_vec());
+        frame.table_data.insert(table.schema_and_table(), bytes.into_parts().0.into());
         let replayed = decode_replica(&frame, None, staged.block_index(), &memory)?;
         state.apply(&replayed.writes)?;
         let snapshot = state.snapshot();
