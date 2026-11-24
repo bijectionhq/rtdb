@@ -78,7 +78,7 @@ impl WorldProjectionCustody {
     }
 
     async fn row<'a>(
-        &self, relation: &OwnedRelation, id: &EntityId, fact: Option<&'a WorldFact>, memory: &Arc<MemoryBudget>,
+        &self, relation: &OwnedRelation, id: &EntityId, fact: Option<&'a WorldFact>, memory: &Arc<MemoryBudget>, historical: bool,
     ) -> Result<SearchRow<'a>> {
         let Some(fact) = fact else { return Ok(SearchRow::Clear(None)); };
         let Some(cell) = ArrowCell::named(&fact.row, FIELD, 0) else { return Ok(SearchRow::Clear(Some(fact))); };
@@ -107,7 +107,9 @@ impl WorldProjectionCustody {
                 assertion_id: carrier.member, scope_commitment: world_row_scope(slot, &carrier.disclosure), codec: CODEC,
             };
             let envelope = AssertionEnvelope::try_from(Bytes::copy_from_slice(carrier.envelope))?;
-            vault.open_assertion_for_resolution(stage, authoring, &self.region, envelope).await
+            let body = vault.open_assertion_for_resolution(stage, authoring, &self.region, envelope).await?;
+            families.require_derived_capability(family, stage, carrier.member, slot).await?;
+            Ok::<_, rtdb_types::Anomaly>(body)
         };
         let charge = memory.reserve(bytes.len().saturating_mul(16))?;
         match opened.await {
@@ -115,16 +117,16 @@ impl WorldProjectionCustody {
                 let projection = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
                 Ok(SearchRow::Sealed(projection, charge))
             }
-            Err(error) if error.code == "rtdb/erased-under-view" => Ok(SearchRow::Erased),
+            Err(error) if !historical && error.code == "rtdb/erased-under-view" => Ok(SearchRow::Erased),
             Err(error) => Err(error),
         }
     }
 
     pub(super) async fn shadow_text(
         &self, relation: &OwnedRelation, column: &str, fact: Option<&WorldFact>, id: EntityId,
-        partition: usize, corpus: &mut rtdb_node::HeldTextCorpus, memory: &Arc<MemoryBudget>,
+        partition: usize, corpus: &mut rtdb_node::HeldTextCorpus, memory: &Arc<MemoryBudget>, historical: bool,
     ) -> Result<()> {
-        match self.row(relation, &id, fact, memory).await? {
+        match self.row(relation, &id, fact, memory, historical).await? {
             SearchRow::Clear(fact) => corpus.shadow(partition, id, fact.map(|fact| search_text(fact, column)).transpose()?.flatten()),
             SearchRow::Erased => corpus.shadow(partition, id, None),
             SearchRow::Sealed(Projection(paths, _), _charge) => {
@@ -141,9 +143,9 @@ impl WorldProjectionCustody {
 
     pub(super) async fn shadow_nearest(
         &self, selected: &NearestPartition, query: &NearestQuery, fact: Option<&WorldFact>,
-        id: EntityId, partition: usize, shadows: &mut HeldVectorOverlay, memory: &Arc<MemoryBudget>,
+        id: EntityId, partition: usize, shadows: &mut HeldVectorOverlay, memory: &Arc<MemoryBudget>, historical: bool,
     ) -> Result<()> {
-        match self.row(&selected.relation, &id, fact, memory).await? {
+        match self.row(&selected.relation, &id, fact, memory, historical).await? {
             SearchRow::Clear(fact) => shadows.shadow_row(partition, selected, id, fact.map(|fact| &fact.row), query),
             SearchRow::Erased => shadows.shadow_row(partition, selected, id, None, query),
             SearchRow::Sealed(Projection(_, paths), _charge) => {
