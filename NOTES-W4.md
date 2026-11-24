@@ -28,11 +28,16 @@
 - W5 should validate its MAC using the issuing authority and compare its cut to the committed state before evaluating `Unchanged`.
 - Wire SQL paging reexecutes at the original cut and walks the ordered result to the authenticated offset.
 - Clients must supply a deterministic total order for paged queries.
+- The continuation test verifies stable paging across a value update and rejects tampering.
+- A stateless page currently plans against the available catalog and does not certify unchanged schema across pages.
 - Query exact reopening uses the existing system-time history over a fresh catalog.
 - The storage error `rtdb/erased-under-view` maps to wire `not-found`.
 - Durable generation-aware token invalidation and historical catalog reconstruction depend on the Wave 2 read source.
 - The change feed reads state transitions from SQL temporal history and uses the adopted checkpoint as a conservative coverage floor.
 - An update can produce one closed and one opened history rectangle within one system-time group.
+- Each sorted table and boundary scan keeps the first requested number of distinct system times plus one lookahead.
+- A skipped group has at least one full page of older groups in that scan and therefore cannot be in the globally first page in the requested order.
+- Descending pagination and cross-table page overflow have no executable case yet.
 - Wave 2 needs to replace this implementation with a feed over the settled applied effects and actual retained floor, including erasure and other transitions without surviving history rectangles.
 - The SQL table functions use the existing text-score and vector-distance operators.
 - The geographic nearest-neighbour and shape predicates from held spatial actions still need generic SQL geometry support.
@@ -40,7 +45,8 @@
 - Snapshot-scoped catalog data can be queried through the wire.
 - Node-wide role and metrics providers are outside the scoped wire query context.
 - `wire_database` is the branch admission point for W5's branch and layer resolution.
-- The wave's branch and draft PR instructions govern the handoff.
+- Legacy hosted audience and fresh-replica sessions remain on their existing admission paths.
+- Draft handoff is [PR #223](https://github.com/bijectionhq/rtdb/pull/223).
 
 ## Verification
 
@@ -49,7 +55,10 @@
 - The initial Changes case exposed wildcard column ordering and the regression passed after resolving its fields by name.
 - The follow-up command was `guarded-cargo.py rtdb test --locked -p rtdb-flight-sql --test flight rtdb_v1_changes`.
 - The remote endpoint case and the latency benchmark were compiled as ignored tests.
-- The full guarded workspace run was still in progress when the draft was prepared.
+- `guarded-cargo.py rtdb test --locked --workspace` first stopped building `rdkafka-sys` because the CMake shim lacked a selected tool version.
+- With `mise exec cmake@3.31.12`, the workspace retry stopped before running tests on the existing `rtdb-logkeeper` test compile error at `crates/logkeeper/src/client/writer.rs:1413`.
+- The test compares the `(i64, i64)` result of `seal_recover_committed` with an `i64` expected value.
+- The assertion and signature are present in the upstream base and outside the W4 diff.
 - `verification/check_consumer_names.sh` exited 1 for the expected 70 matching lines.
 - Shell syntax and diff whitespace checks passed.
 - The Allium CLI was unavailable and the new surface was checked against the Allium 3 language reference.
