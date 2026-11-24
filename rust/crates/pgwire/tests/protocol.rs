@@ -571,6 +571,35 @@ async fn transit_copy_fragments_normalize_keyword_ids_and_copy_fail_discards_the
 }
 
 #[tokio::test]
+async fn transit_copy_msgpack_decodes_across_pages_and_rejects_a_truncated_tail_atomically() {
+    use rtdb_format::transit::{TransitValue as T, encode_msgpack};
+
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let sql = "COPY docs FROM STDIN WITH (FORMAT 'transit-msgpack')";
+    for start in [0, 130] {
+        client.send(b'Q', &cstring(sql)).await;
+        assert_eq!(client.receive().await, (b'G', vec![1, 0, 1, 0, 1]));
+        let mut bytes = (start..start + 130).flat_map(|id| {
+            encode_msgpack(&T::Map(vec![(T::String("_id".into()), T::Integer(id))])).unwrap()
+        }).collect::<Vec<_>>();
+        if start != 0 { bytes.extend_from_slice(&[0xdd, 0]); }
+        for chunk in bytes.chunks(19) { client.send(b'd', chunk).await; }
+        client.send(b'c', &[]).await;
+        let result = client.through(b'Z').await;
+        if start == 0 {
+            assert_eq!(tags(&result), b"CZ");
+            assert_eq!(result[0].1, b"COPY 130\0");
+        } else {
+            assert_eq!(tags(&result), b"EZ");
+        }
+        assert_eq!(rows(&client.query("SELECT COUNT(*) FROM docs").await), vec![vec![Some(b"130".to_vec())]]);
+    }
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn a_read_only_pgwire_listener_refuses_copy_before_accepting_input() {
     let running = Running::start(ServerConfig { read_only: true, ..Default::default() }, None).await;
     let mut client = Client::connect(&running.server, None).await;

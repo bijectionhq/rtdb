@@ -22,6 +22,17 @@ pub fn decode_transit_sequence<T>(bytes: &[u8], format: Format, mut convert: imp
     inputs.into_iter().map(|input| convert(input.into_value()?)).collect()
 }
 
+pub fn visit_transit_sequence(
+    reader: impl std::io::BufRead + std::io::Seek, length: usize, format: Format,
+    io_error: fn(std::io::Error) -> Anomaly, mut visit: impl FnMut(Result<Value>),
+) -> Result<()> {
+    let native = |input: Input| visit(input.into_value());
+    match format {
+        Format::Text => transit::visit_json_sequence_with(reader, io_error, &mut NativeInput, native),
+        Format::Binary => transit::visit_msgpack_sequence_with(reader, length, io_error, &mut NativeInput, native),
+    }
+}
+
 pub fn decode_transit_msgpack(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<DecodedValue> {
     decode_msgpack(bytes, memory, Shape::Value)
 }

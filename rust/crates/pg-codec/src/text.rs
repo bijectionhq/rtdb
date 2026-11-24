@@ -6,7 +6,7 @@ use crate::interval::parse as interval;
 mod column;
 pub use column::{read_source_text_column, read_text_column, read_vector_column};
 mod transit_input;
-pub use transit_input::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction};
+pub use transit_input::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction, visit_transit_sequence};
 mod json_input;
 use json_input::read_json;
 
@@ -268,6 +268,7 @@ fn zoned_timestamp(text: &str) -> Result<Value> {
 fn unique(values: Vec<Value>) -> Vec<Value> { let mut result = Vec::new(); for value in values { if !result.contains(&value) { result.push(value); } } result }
 /// The caller retains a reservation covering both the consumed Transit graph and its native conversion.
 pub fn from_transit(value: rtdb_format::transit::TransitValue) -> Result<Value> { transit(value) }
+
 fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     Ok(match value {
@@ -279,7 +280,14 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
         T::Float32(value) => Value::F64(f64::from(value)),
         T::Map(entries) => {
             let mut fields = StructFields::new();
-            for (key, value) in entries { let key = match key { T::String(key) => key, T::Keyword(key) => normalize_keyword(&key), _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-map-key", "Source maps require string or keyword keys")) }; fields.insert(key, transit(value)?); }
+            for (key, value) in entries {
+                let key = match key {
+                    T::String(key) => key,
+                    T::Keyword(key) => normalize_keyword(&key),
+                    _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-map-key", "Source maps require string or keyword keys")),
+                };
+                fields.insert(key, transit(value)?);
+            }
             Value::Struct(fields)
         }
         T::Tagged { tag, representation } => {

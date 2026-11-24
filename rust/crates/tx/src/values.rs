@@ -508,6 +508,11 @@ impl ArrowDocuments {
         Ok(Some(Self { input: DocumentInput::LegacyOwned(LegacyOwnedPresence::Submitted), ..documents }))
     }
 
+    /// Combines ordered document pages into the payload of one source operation.
+    pub fn coalesce_pages(pages: Vec<Self>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        crate::source::coalesce_arrow_documents(pages, memory)
+    }
+
     pub(crate) fn owned_id(&self, row: usize) -> Result<EntityId> {
         self.owned_id_ref(row).map(rtdb_columnar::EntityIdRef::into_owned)
     }

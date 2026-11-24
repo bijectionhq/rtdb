@@ -375,6 +375,8 @@
 --      Dictionary frames and their rows share each batch's original delivery grant.
 --      COPY FROM STDIN with an Arrow format submits Arrow document batches.
 --      Without an explicit transaction, each input batch commits separately.
+--      COPY FROM STDIN with a Transit format decodes consecutive values from the input file and submits the documents in one operation.
+--      Transit wire failures take precedence over document conversion failures.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
 --      An implicit linearizable basis names the exact, held, applied certified cut selected during the invocation by active-loglet quorum probes.
 --      The selected decision must have quorum installation before exposure, including when the receiver has to complete installation.

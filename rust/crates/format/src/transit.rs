@@ -1,4 +1,5 @@
 use std::{collections::BTreeMap, mem::size_of, sync::Arc};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -143,7 +144,7 @@ pub fn decode_msgpack_in(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<(Tr
 pub fn decode_msgpack_with_in<B: TransitReadBuilder>(
     bytes: &[u8], memory: &Arc<MemoryBudget>, builder: &mut B,
 ) -> Result<(B::Value, Arc<MemoryReservation>)> {
-    let mut cursor = Cursor { bytes, offset: 0, admission: ReadAdmission::new(memory)? };
+    let mut cursor = Cursor { input: Input::Slice(bytes), admission: ReadAdmission::new(memory)? };
     let packed = cursor.complete_value()?;
     let mut cache = ReadCache { admission: ReadAdmission::new(memory)?, ..ReadCache::new() };
     let value = unpack_value(packed, false, &mut cache, 0, builder)?;
@@ -151,7 +152,7 @@ pub fn decode_msgpack_with_in<B: TransitReadBuilder>(
 }
 
 fn packed_msgpack(bytes: &[u8]) -> Result<Packed> {
-    Cursor { bytes, offset: 0, admission: ReadAdmission::default() }.complete_value()
+    Cursor { input: Input::Slice(bytes), admission: ReadAdmission::default() }.complete_value()
 }
 
 /// Decodes Transit JSON, retaining object entry order for Transit cache references.
@@ -188,8 +189,12 @@ pub fn decode_json_sequence_with<B: TransitReadBuilder>(bytes: &[u8], builder: &
 
 /// Malformed JSON is the reference's `xtdb.error/json-parse`; a stray close marker carries Jackson's wording.
 fn json_parse(bytes: &[u8], error: serde_json::Error) -> Anomaly {
-    if !matches!(error.classify(), serde_json::error::Category::Syntax | serde_json::error::Category::Eof) { return invalid(error); }
     let offending = bytes.split(|byte| *byte == b'\n').nth(error.line().saturating_sub(1)).and_then(|line| line.get(error.column().saturating_sub(1))).copied();
+    json_sequence_error(error, offending)
+}
+
+fn json_sequence_error(error: serde_json::Error, offending: Option<u8>) -> Anomaly {
+    if !matches!(error.classify(), serde_json::error::Category::Syntax | serde_json::error::Category::Eof) { return invalid(error); }
     let message = match offending {
         Some(marker @ (b'}' | b']')) => format!("Unexpected close marker '{}'", marker as char),
         _ => error.to_string(),
@@ -203,10 +208,45 @@ pub fn decode_msgpack_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
 }
 
 pub fn decode_msgpack_sequence_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Result<Vec<B::Value>> {
-    let mut cursor = Cursor { bytes, offset: 0, admission: ReadAdmission::default() };
+    let mut cursor = Cursor { input: Input::Slice(bytes), admission: ReadAdmission::default() };
     let mut values = Vec::new();
-    while cursor.offset < bytes.len() { values.push(unpack_value(cursor.value(0)?, false, &mut ReadCache::new(), 0, builder)?); }
+    cursor.visit_sequence(builder, |value| values.push(value))?;
     Ok(values)
+}
+
+/// Visits each top-level value under a fresh Transit cache.
+/// The caller admits reader and decode scratch before reading the sequence.
+pub fn visit_json_sequence_with<B: TransitReadBuilder>(
+    mut reader: impl BufRead + Seek, io_error: fn(io::Error) -> Anomaly, builder: &mut B, mut visit: impl FnMut(B::Value),
+) -> Result<()> {
+    let start = reader.stream_position().map_err(io_error)?;
+    let decoded = (|| {
+        for packed in serde_json::Deserializer::from_reader(&mut reader).into_iter::<JsonPacked>() {
+            match packed {
+                Ok(packed) => visit(unpack_value(packed.0, false, &mut ReadCache::new(), 0, builder)?),
+                Err(error) => return Ok(Some(error)),
+            }
+        }
+        Ok(None)
+    })()?;
+    let Some(error) = decoded else { return Ok(()); };
+    if error.is_io() { return Err(io_error(error.into())); }
+    let marker = if error.is_syntax() || error.is_eof() {
+        reader.seek(SeekFrom::Start(start)).map_err(io_error)?;
+        for _ in 1..error.line() { reader.skip_until(b'\n').map_err(io_error)?; }
+        io::copy(&mut reader.by_ref().take(error.column().saturating_sub(1) as u64), &mut io::sink()).map_err(io_error)?;
+        reader.fill_buf().map_err(io_error)?.first().copied()
+    } else { None };
+    Err(json_sequence_error(error, marker))
+}
+
+/// Visits one MessagePack value at a time within a known input length.
+/// The caller admits reader and decode scratch before reading the sequence.
+pub fn visit_msgpack_sequence_with<B: TransitReadBuilder>(
+    mut reader: impl Read, length: usize, io_error: fn(io::Error) -> Anomaly, builder: &mut B, visit: impl FnMut(B::Value),
+) -> Result<()> {
+    Cursor { input: Input::Stream { reader: &mut reader, remaining: length, io_error }, admission: ReadAdmission::default() }
+        .visit_sequence(builder, visit)
 }
 
 /// Encodes Transit JSON with array maps and top-level quoting; cache substitution is optional on the wire.
@@ -596,34 +636,74 @@ pub fn resolve_tag(tag: String, representation: TransitValue) -> Result<TransitV
     Ok(TransitValue::Tagged { tag, representation: Box::new(representation) })
 }
 
-struct Cursor<'a> { bytes: &'a [u8], offset: usize, admission: ReadAdmission }
+enum Input<'a> {
+    Slice(&'a [u8]),
+    Stream { reader: &'a mut dyn Read, remaining: usize, io_error: fn(io::Error) -> Anomaly },
+}
+
+struct Cursor<'a> { input: Input<'a>, admission: ReadAdmission }
 
 impl<'a> Cursor<'a> {
     fn complete_value(&mut self) -> Result<Packed> {
         let value = self.value(0)?;
-        if self.offset != self.bytes.len() { return Err(invalid("Trailing bytes after Transit value")); }
+        if self.remaining() != 0 { return Err(invalid("Trailing bytes after Transit value")); }
         Ok(value)
     }
 
-    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
-        let end = self.offset.checked_add(count).ok_or_else(|| invalid("MessagePack length overflow"))?;
-        let bytes = self.bytes.get(self.offset..end).ok_or_else(|| invalid("Truncated MessagePack value"))?;
-        self.offset = end;
-        Ok(bytes)
+    fn visit_sequence<B: TransitReadBuilder>(&mut self, builder: &mut B, mut visit: impl FnMut(B::Value)) -> Result<()> {
+        while self.remaining() != 0 {
+            visit(unpack_value(self.value(0)?, false, &mut ReadCache::new(), 0, builder)?);
+        }
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        match &self.input {
+            Input::Slice(bytes) => bytes.len(),
+            Input::Stream { remaining, .. } => *remaining,
+        }
     }
 
     fn unsigned(&mut self, count: usize) -> Result<u64> {
-        Ok(self.take(count)?.iter().fold(0u64, |value, byte| (value << 8) | u64::from(*byte)))
+        if count > self.remaining() { return Err(invalid("Truncated MessagePack value")); }
+        let mut bytes = [0; 8];
+        let target = &mut bytes[8 - count..];
+        match &mut self.input {
+            Input::Slice(input) => {
+                let (head, tail) = input.split_at(count);
+                target.copy_from_slice(head);
+                *input = tail;
+            }
+            Input::Stream { reader, remaining, io_error } => {
+                reader.read_exact(target).map_err(*io_error)?;
+                *remaining -= count;
+            }
+        }
+        Ok(u64::from_be_bytes(bytes))
     }
 
     fn text(&mut self, len: usize) -> Result<Packed> {
-        let text = std::str::from_utf8(self.take(len)?).map_err(invalid)?;
-        self.admission.bytes(len)?;
-        Ok(Packed::String(text.into()))
+        if len > self.remaining() { return Err(invalid("Truncated MessagePack value")); }
+        let text = match &mut self.input {
+            Input::Slice(input) => {
+                let (head, tail) = input.split_at(len);
+                *input = tail;
+                let text = std::str::from_utf8(head).map_err(invalid)?;
+                self.admission.bytes(len)?;
+                text.to_owned()
+            }
+            Input::Stream { reader, remaining, io_error } => {
+                let mut bytes = vec![0; len];
+                reader.read_exact(&mut bytes).map_err(*io_error)?;
+                *remaining -= len;
+                String::from_utf8(bytes).map_err(|error| invalid(error.utf8_error()))?
+            }
+        };
+        Ok(Packed::String(text))
     }
 
     fn array(&mut self, count: usize, depth: usize) -> Result<Packed> {
-        if count > self.bytes.len().saturating_sub(self.offset) { return Err(invalid("MessagePack array exceeds its input")); }
+        if count > self.remaining() { return Err(invalid("MessagePack array exceeds its input")); }
         self.admission.items::<Packed>(count)?;
         let mut values = Vec::new();
         for _ in 0..count {
@@ -631,12 +711,12 @@ impl<'a> Cursor<'a> {
                 let next = (values.len() * 2).clamp(1, count);
                 values.reserve_exact(next - values.len());
             }
-            if depth < MAX_DEPTH && let Some(tag @ (0xca | 0xcb)) = self.bytes.get(self.offset).copied() {
-                self.offset += 1;
+            let tag = self.tag(depth + 1)?;
+            if matches!(tag, 0xca | 0xcb) {
                 let value = self.float(tag)?;
                 push_float(&mut values, value);
             } else {
-                match self.value(depth + 1)? {
+                match self.value_with_tag(tag, depth + 1)? {
                     Packed::Array(items) => push_item(&mut values, items),
                     value => values.push(value),
                 }
@@ -646,7 +726,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn map(&mut self, count: usize, depth: usize) -> Result<Packed> {
-        if count > self.bytes.len().saturating_sub(self.offset) / 2 { return Err(invalid("MessagePack map exceeds its input")); }
+        if count > self.remaining() / 2 { return Err(invalid("MessagePack map exceeds its input")); }
         self.admission.items::<(Packed, Packed)>(count)?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count { entries.push((self.value(depth + 1)?, self.value(depth + 1)?)); }
@@ -658,9 +738,17 @@ impl<'a> Cursor<'a> {
         else { Ok(f64::from_bits(self.unsigned(8)?)) }
     }
 
-    fn value(&mut self, depth: usize) -> Result<Packed> {
+    fn tag(&mut self, depth: usize) -> Result<u8> {
         if depth > MAX_DEPTH { return Err(invalid("MessagePack nesting limit exceeded")); }
-        let tag = self.take(1)?[0];
+        Ok(self.unsigned(1)? as u8)
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Packed> {
+        let tag = self.tag(depth)?;
+        self.value_with_tag(tag, depth)
+    }
+
+    fn value_with_tag(&mut self, tag: u8, depth: usize) -> Result<Packed> {
         Ok(match tag {
             0x00..=0x7f => Packed::Integer(i64::from(tag)),
             0x80..=0x8f => return self.map(usize::from(tag & 0x0f), depth),
