@@ -4191,6 +4191,12 @@ async fn large_deployment(cell: &Cell, name: &str) -> tokio_postgres::Client {
     client.simple_query("UPDATE orders SET note = 'tail' WHERE _id BETWEEN 100 AND 300").await.unwrap();
     client.simple_query("DELETE FROM orders WHERE _id BETWEEN 2000 AND 2100").await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total, note) VALUES (5000, 1, 'late'), (5001, 2, 'late')").await.unwrap();
+    // The receiver clock is sampled independently of replica progress.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while values(&client, "SELECT _id FROM orders WHERE _id >= 5000").await != ["5000", "5001"] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the receiver clock reached the last two fixture rows");
     client
 }
 
