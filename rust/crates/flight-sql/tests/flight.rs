@@ -974,12 +974,200 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
 }
 
 
+#[tokio::test]
+async fn owned_import_page_uses_the_held_cut_and_commits_atomically() {
+    use arrow_array::{ArrayRef, TimestampMicrosecondArray};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    fn ipc(columns: impl IntoIterator<Item = (&'static str, ArrayRef)>) -> Vec<u8> {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap()
+    }
+
+    fn point_request(hold: &[u8], keys: &[&str], times: Vec<Option<i64>>) -> Bytes {
+        let mut body = hold.to_vec();
+        body.extend_from_slice(b"\0\x05items");
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false), Field::new("valid_micros", DataType::Int64, true),
+        ])), vec![Arc::new(StringArray::from(keys.to_vec())), Arc::new(Int64Array::from(times))]).unwrap();
+        body.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
+        body.into()
+    }
+
+    fn page(keys: &[&str], valid: Option<i64>) -> Bytes {
+        let batch = ipc([
+            ("_id", Arc::new(StringArray::from(keys.to_vec())) as ArrayRef),
+            ("_op", Arc::new(StringArray::from(vec!["create"; keys.len()]))),
+            ("value", Arc::new(Int64Array::from_iter_values(0..keys.len() as i64))),
+            ("_valid_from", Arc::new(TimestampMicrosecondArray::from_value(0, keys.len()).with_timezone("UTC"))),
+            ("_read_valid_micros", Arc::new(Int64Array::from(vec![valid; keys.len()]))),
+        ]);
+        let mut body = vec![0, 0];
+        body.extend_from_slice(&i64::MAX.to_be_bytes());
+        body.extend_from_slice(b"\0\x01\0\x05items");
+        body.extend_from_slice(&(batch.len() as u32).to_be_bytes());
+        body.extend(batch);
+        body.into()
+    }
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let commit = "rtdb.owned.CommitOrdered.v1";
+    let probe = "rtdb.owned.ReadHeldAbsentKeys.v1";
+    let point = "rtdb.owned.ReadHeldPoint.v2";
+    client.action(commit, page(&["present"], None)).await.unwrap();
+    let opened = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
+    let hold = opened[0].body.slice(..16);
+    let system = i64::from_be_bytes(opened[0].body[16..24].try_into().unwrap());
+    let valid = system - 1;
+    client.action(commit, page(&["later"], None)).await.unwrap();
+
+    let keys = (0..64).map(|row| format!("row_{row}")).collect::<Vec<_>>();
+    let keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
+    for (ids, absent) in [(&keys[..], 64), (&["missing", "later", "present", "trailing"][..], 2), (&["present", "missing"][..], 0)] {
+        let reply = client.action(probe, point_request(&hold, ids, vec![Some(valid); ids.len()])).await.unwrap();
+        let mut expected = vec![1];
+        expected.extend_from_slice(&system.to_be_bytes());
+        expected.extend_from_slice(&valid.to_be_bytes());
+        expected.push(absent);
+        assert_eq!(reply[0].body.as_ref(), expected.as_slice());
+    }
+    let observed = client.action(point, point_request(&hold, &["later"], vec![Some(valid)])).await.unwrap();
+    let mut observed = StreamReader::try_new(observed[0].body.as_ref(), None).unwrap();
+    assert!(observed.next().is_none());
+    assert_eq!(observed.schema().metadata()["rtdb.owned.present_micros"], system.to_string());
+    assert_eq!(observed.schema().metadata()["rtdb.owned.valid_micros"], valid.to_string());
+
+    for times in [vec![], vec![Some(valid); 65], vec![Some(valid), None], vec![Some(valid), Some(valid - 1)]] {
+        let ids = vec!["missing"; times.len()];
+        let error = client.action(probe, point_request(&hold, &ids, times)).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    let error = client.action(commit, page(&[keys[0], "later"], Some(valid))).await.unwrap_err();
+    assert_eq!(error.message(), "The owned point observation changed before ordering");
+    let committed = client.action(commit, page(&keys, Some(valid))).await.unwrap();
+    assert_eq!(committed.len(), 1);
+
+    let opened = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
+    let next = opened[0].body.slice(..16);
+    for (row, id) in keys.iter().enumerate() {
+        let reply = client.action(point, point_request(&next, &[*id], vec![Some(valid)])).await.unwrap();
+        let mut rows = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+        let batch = rows.next().unwrap().unwrap();
+        assert_eq!(integer(&batch, batch.schema().index_of("value").unwrap(), 0), row as i64);
+        assert!(rows.next().is_none());
+    }
+    client.action("rtdb.owned.CloseRead.v1", hold).await.unwrap();
+    client.action("rtdb.owned.CloseRead.v1", next).await.unwrap();
+    running.stop().await;
+}
+
 #[test]
 fn owned_spatial_flight_pages_share_the_original_cut() {
     std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
             .block_on(check_spatial_pages_at_the_original_cut());
     }).unwrap().join().unwrap();
+}
+
+#[tokio::test]
+async fn owned_import_page_preserves_hosted_effect_positions() {
+    use arrow_array::{ArrayRef, BooleanArray, TimestampMicrosecondArray};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    fn ipc(columns: impl IntoIterator<Item = (&'static str, ArrayRef)>) -> Vec<u8> {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap()
+    }
+
+    fn group(body: &mut Vec<u8>, relation: &str, arrow: &[u8]) {
+        body.extend_from_slice(&(relation.len() as u16).to_be_bytes());
+        body.extend_from_slice(relation.as_bytes());
+        body.extend_from_slice(&(arrow.len() as u32).to_be_bytes());
+        body.extend_from_slice(arrow);
+    }
+
+    fn creates(ids: &[&str]) -> Vec<u8> {
+        ipc([
+            ("_id", Arc::new(StringArray::from(ids.to_vec())) as ArrayRef),
+            ("_op", Arc::new(StringArray::from(vec!["create"; ids.len()]))),
+        ])
+    }
+
+    async fn ordinal(client: &mut Client, relation: &str, id: &str) -> u64 {
+        let mut body = (relation.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(relation.as_bytes());
+        body.extend(ipc([("_id", Arc::new(StringArray::from(vec![id])) as ArrayRef)]));
+        let reply = client.action("rtdb.owned.ReadPoint.v1", body.into()).await.unwrap();
+        let reader = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+        let schema = reader.schema();
+        let position = &schema.metadata()["rtdb.owned.event_position"];
+        assert_eq!(position.len(), 32);
+        u64::from_str_radix(&position[16..], 16).unwrap()
+    }
+
+    let running = Running::start_with_placements(Some("secret"), FlightConfig {
+        owned_native_actions: true,
+        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
+            owner: "xtdb".into(),
+            relations: ["bj_installation", "bj_fact_root_owner"].map(str::to_owned).into(),
+        }),
+        ..FlightConfig::default()
+    }, &["application"]).await;
+    let mut client = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
+    client.update("INSERT INTO bj_installation RECORDS {_id: 'authority', kind: 'hosted', incarnation: X'07070707070707070707070707070707', writer: '11111111111111111111111111111111', _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
+    client.update("INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', revision: 1, _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
+    let clock = |batches: &[RecordBatch]| batches[0].column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
+    let claim = clock(&client.query("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").await);
+    let mut control_revision = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await);
+
+    let request = |facts: Vec<u8>, expected: i64, revision: i64| {
+        let mut body = claim.to_be_bytes().to_vec();
+        body.extend([7; 16]);
+        body.extend([0x11; 16]);
+        body.extend([0, 0, 0]);
+        body.extend(i64::MAX.to_be_bytes());
+        body.extend((facts.len() as u32).to_be_bytes());
+        body.extend(facts);
+        body.extend(2u16.to_be_bytes());
+        group(&mut body, "bj_installation", &ipc([
+            ("_id", Arc::new(StringArray::from(vec!["authority"])) as ArrayRef),
+            ("_expected_micros", Arc::new(Int64Array::from(vec![claim]))),
+            ("_check_only", Arc::new(BooleanArray::from(vec![true]))),
+        ]));
+        group(&mut body, "bj_fact_root_owner", &ipc([
+            ("_id", Arc::new(StringArray::from(vec!["root"])) as ArrayRef),
+            ("_expected_micros", Arc::new(Int64Array::from(vec![expected]))),
+            ("revision", Arc::new(Int64Array::from(vec![revision]))),
+        ]));
+        Bytes::from(body)
+    };
+    let mut legacy = 3u16.to_be_bytes().to_vec();
+    group(&mut legacy, "old_documents", &creates(&["a"]));
+    group(&mut legacy, "old_index", &creates(&["posting"]));
+    group(&mut legacy, "old_documents", &creates(&["b"]));
+    client.action("rtdb.owned.DecideHosted.v4", request(legacy, control_revision, 2)).await.unwrap();
+    control_revision = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await);
+
+    let packed = |last_count: u16| {
+        let mut facts = [2u16, 0, 1, 1, last_count].into_iter().flat_map(u16::to_be_bytes).collect::<Vec<_>>();
+        group(&mut facts, "new_documents", &creates(&["a", "b"]));
+        facts.extend(1u16.to_be_bytes());
+        group(&mut facts, "new_index", &creates(&["posting"]));
+        facts
+    };
+    let action = "rtdb.owned.DecideHostedImportPage.v1";
+    let error = client.action(action, request(packed(2), control_revision, 3)).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    client.action(action, request(packed(1), control_revision, 3)).await.unwrap();
+    for (suffix, id) in [("documents", "a"), ("index", "posting"), ("documents", "b")] {
+        let original = ordinal(&mut client, &format!("old_{suffix}"), id).await;
+        assert_eq!(ordinal(&mut client, &format!("new_{suffix}"), id).await, original);
+    }
+    assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner WHERE _id = 'root'").await[0], 0, 0), 3);
+    running.stop().await;
 }
 
 async fn check_spatial_pages_at_the_original_cut() {

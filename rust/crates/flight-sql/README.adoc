@@ -356,6 +356,13 @@ The Arrow response uses the held present and valid instant on every call, includ
 A null `valid_micros` uses the held default. Otherwise it selects one business-valid microsecond within the original held system cut.
 `rtdb.owned.valid_micros` echoes the selected instant even when the row is absent, and `rtdb.owned.present_micros` stays at the held present.
 
+`rtdb.owned.ReadHeldAbsentKeys.v1` takes the held handle, relation prefix and one Arrow batch with 1 to 64 keys and a 96 KiB total request bound.
+Every row supplies a plain non-null `_id: Utf8` and the same non-null `valid_micros: Int64`.
+The action uses an ordinary unscoped held Root read on a relation without a creation lifetime.
+The reply contains version byte `1`, the big-endian signed i64 system and valid instants, and a u8 count of absent leading keys.
+Callers refine the first remaining key or handle unsupported peers with individual held point reads.
+They can submit the original per-key observations and creates as rows of one `CommitOrdered.v1` batch.
+
 `rtdb.owned.ReadHeldHistoricalPoint.v1` inserts an eight-byte big-endian signed system time in microseconds immediately after the held handle, before the relation prefix.
 It uses the same point key, with null `valid_micros` selecting the requested system time on the valid axis.
 The relation's journal must cover the system time at or before the held cut.
@@ -1022,6 +1029,14 @@ The authenticated token binds the principal, history, original transaction, rela
 Another eligible receiver can validate it after the original Flight session closes.
 The deadline follows, with the physical cutoff and receiver clock certificate digest present when requested.
 The final streams contain the primary facts and hosted controls.
+
+`rtdb.owned.DecideHostedImportPage.v1` uses the same authority, deadline, range evidence, and control checks as an ordinary live `DecideHosted.v4` with zero flags.
+Its length-prefixed fact stream begins with a big-endian u16 placement count and that many pairs of big-endian u16 values.
+Each pair names the number of inline runs preceding it and the number of consecutive page rows it consumes.
+The first coordinates strictly increase and the counts together consume the complete page.
+The schedule is followed by one usual relation and length-prefixed Arrow batch, then the usual ordered group stream for the inline effects.
+The shared batch has up to 64 creates and up to 128 total create and check rows on one Root relation.
+The owner restores the original run and row order and field presence before passing the effects and hosted controls to the ordinary decision path.
 
 `rtdb.owned.ValidateFreshHosted.v1` starts with the history UUID and one to four exact transaction positions, followed by the durable Root range prefix, the exclusive deadline and the fact and control group streams.
 It accepts only point and control equality checks and issued durable range evidence.

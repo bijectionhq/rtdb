@@ -51,6 +51,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | READ_HELD_UNIQUE_WINDOW_V1
         | HELD_OWNED_POINT_V1
         | HELD_OWNED_POINT_V2
+        | HELD_OWNED_ABSENT_KEYS_V1
         | HELD_OWNED_FIXED_POINT_V1
         | HELD_PROTECTED_COVERAGE_V1
         | HELD_OWNED_IDENTITIES_V1
@@ -136,7 +137,10 @@ impl Service {
             match action_type {
                 crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
                 crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECIDE_HOSTED_V4 => Ok(vec![Ok(self.decide_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECIDE_HOSTED_V4 | crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1 => {
+                    let import_page = action_type == crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1;
+                    Ok(vec![Ok(self.decide_hosted_action(&call, &action.body, import_page).await?)])
+                }
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
@@ -216,6 +220,7 @@ impl Service {
                 crate::owned_actions::READ_HELD_UNIQUE_WINDOW_V1 => Ok(vec![Ok(self.held_owned_unique_window_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, crate::owned_actions::PointTime::Default).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V2 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, crate::owned_actions::PointTime::Optional).await?)]),
+                crate::owned_actions::HELD_OWNED_ABSENT_KEYS_V1 => Ok(vec![Ok(Box::pin(self.held_owned_absent_keys_action(&call, &action.body)).await?)]),
                 crate::owned_actions::HELD_OWNED_FIXED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, crate::owned_actions::PointTime::Required).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_VALID_AT_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::ParentAt).await?)]),

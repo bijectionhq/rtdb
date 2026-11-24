@@ -1,10 +1,12 @@
 mod hosted_control;
 mod prepared_landing;
 mod hosted_observation;
+mod import_page;
 mod unique;
 
 pub(crate) use hosted_control::{READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1, READ_HELD_HOSTED_CONTROL_V3, READ_HELD_ROOT_CATALOG_V1};
 pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V6, CONFIRM_HOSTED_SOURCE_V1, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
+pub(crate) use import_page::DECIDE_HOSTED_IMPORT_PAGE_V1;
 pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
@@ -233,6 +235,7 @@ pub(crate) const OPEN_FRESH_OWNED_READ_V2: &str = "rtdb.owned.OpenFreshRead.v2";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V5: &str = "rtdb.owned.OpenAppliedRead.v5";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_OWNED_ABSENT_KEYS_V1: &str = "rtdb.owned.ReadHeldAbsentKeys.v1";
 pub(crate) const HELD_OWNED_FIXED_POINT_V1: &str = "rtdb.owned.ReadHeldFixedPoint.v1";
 pub(crate) const HELD_WORLD_VERSION_V2: &str = "rtdb.owned.ReadHeldWorldVersion.v2";
 pub(crate) const HELD_WORLD_TOUCH_IMAGES_V1: &str = "rtdb.owned.ReadHeldWorldTouchImages.v1";
@@ -1229,7 +1232,7 @@ impl Service {
     }
 
     pub(crate) async fn decide_hosted_action(
-        &self, call: &Call, envelope: &Bytes,
+        &self, call: &Call, envelope: &Bytes, import_page: bool,
     ) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
         let (authority, body) = Self::installed_authority(envelope)?;
@@ -1237,6 +1240,9 @@ impl Service {
             .ok_or_else(|| invalid("Missing hosted decision flags"))?;
         if *flags & !0b11_1111 != 0 || *flags & 48 == 48 {
             return Err(invalid("Invalid hosted decision flags"));
+        }
+        if import_page && *flags != 0 {
+            return Err(invalid("A hosted import page requires an ordinary Root decision"));
         }
         let counted = *flags & 1 != 0;
         let recheck_at_staging = *flags & 8 != 0;
@@ -1275,13 +1281,13 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority).await
+        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, import_page).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
-        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority,
+        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, import_page: bool,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -1306,11 +1312,18 @@ impl Service {
         let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
         let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
             .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
+        let (page, facts) = if import_page {
+            let (page, inline) = import_page::ImportPage::split(call, facts)?;
+            (Some(page), inline)
+        } else {
+            (None, facts)
+        };
         let fact_groups = ordered_group_count(facts)?;
         let _framing = call.reserve((fact_groups + MAX_COMMIT_GROUPS) * 512)?;
         let facts = owned_groups(facts, false, true)?;
         let controls = owned_groups(controls, true, false)?;
-        let fact_relations = facts.iter().map(|(relation, _)| relation).collect::<BTreeSet<_>>();
+        let fact_relations = facts.iter().map(|(relation, _)| relation)
+            .chain(page.iter().map(import_page::ImportPage::relation)).collect::<BTreeSet<_>>();
         if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS {
             return Err(Status::permission_denied("Hosted control targets are outside the installed allowlist"));
         }
@@ -1353,7 +1366,12 @@ impl Service {
             return Err(invalid("Native replay admits an original effect batch"));
         }
         let effects = CommitEffects::hosted(replay, counted || !worlds.is_empty(), &controls);
-        let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut writes, &mut rows_left, effects)?;
+        let _facts = if let Some(page) = page {
+            if replay { return Err(invalid("A hosted import page requires a live Root decision")); }
+            page.decode(self, call, envelope, facts, &mut writes, &mut rows_left, effects)?
+        } else {
+            self.decode_owned_commit_groups(call, envelope, facts, &mut writes, &mut rows_left, effects)?
+        };
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
         writes.extend(witnesses.into_iter().map(rtdb_node::DurableRange::operation));
         let _refusal = if let Some(refusal) = refusal {
@@ -1484,33 +1502,38 @@ impl Service {
         let mut retained = Vec::with_capacity(groups.len());
         for (relation, arrow) in groups {
             let batch = require_identity(decode_retained_batch(call, envelope.slice_ref(arrow))?)?;
-            let rows = batch.batch().num_rows();
-            *rows_left = rows_left.checked_sub(rows)
-                .ok_or_else(|| invalid("Owned commit exceeds its total row limit"))?;
-            let operations = wire::mul(rows, 2)?;
-            let mut operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
-            writes.try_reserve_exact(operations)
-                .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
-            if relation.is_root_data() {
-                let charge = Arc::get_mut(&mut operations_charge).expect("commit group owns its operation reservation");
-                for row in 0..rows {
-                    let start = writes.len();
-                    let bytes = charge.bytes();
-                    if !self.append_owned_arrow_row(writes, &relation, &batch, row, effects, charge)? {
-                        writes.truncate(start);
-                        charge.shrink_to(bytes).map_err(status)?;
-                        let (row, _decoded) = upload::owned_documents(&batch.batch().slice(row, 1), call.memory())?;
-                        self.append_owned_commit_group(writes, &relation, row, effects)?;
-                    }
-                }
-                retained.push((operations_charge, Arc::clone(batch.reservation())));
-                continue;
-            }
-            let (rows, documents_charge) = upload::owned_documents(batch.batch(), call.memory())?;
-            self.append_owned_commit_group(writes, &relation, rows, effects)?;
-            retained.push((operations_charge, documents_charge));
+            retained.push(self.append_decoded_owned_group(call, &relation, &batch, writes, rows_left, effects)?);
         }
         Ok(retained)
+    }
+
+    fn append_decoded_owned_group(
+        &self, call: &Call, relation: &OwnedRelation, batch: &OwnedBatch, writes: &mut Vec<TxOp>,
+        rows_left: &mut usize, effects: CommitEffects,
+    ) -> Result<(Arc<MemoryReservation>, Arc<MemoryReservation>), Status> {
+        let rows = batch.batch().num_rows();
+        *rows_left = rows_left.checked_sub(rows).ok_or_else(|| invalid("Owned commit exceeds its total row limit"))?;
+        let operations = wire::mul(rows, 2)?;
+        let mut operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
+        writes.try_reserve_exact(operations)
+            .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
+        if relation.is_root_data() {
+            let charge = Arc::get_mut(&mut operations_charge).expect("commit group owns its operation reservation");
+            for row in 0..rows {
+                let start = writes.len();
+                let bytes = charge.bytes();
+                if !self.append_owned_arrow_row(writes, relation, batch, row, effects, charge)? {
+                    writes.truncate(start);
+                    charge.shrink_to(bytes).map_err(status)?;
+                    let (row, _decoded) = upload::owned_documents(&batch.batch().slice(row, 1), call.memory())?;
+                    self.append_owned_commit_group(writes, relation, row, effects)?;
+                }
+            }
+            return Ok((operations_charge, Arc::clone(batch.reservation())));
+        }
+        let (rows, documents_charge) = upload::owned_documents(batch.batch(), call.memory())?;
+        self.append_owned_commit_group(writes, relation, rows, effects)?;
+        Ok((operations_charge, documents_charge))
     }
 
     fn owned_payload(&self, batch: &OwnedBatch, row: usize, positions: &[usize]) -> Result<Option<ArrowDocuments>, Status> {
@@ -2053,6 +2076,57 @@ impl Service {
         }
         let fixed = matches!(time, PointTime::Required);
         self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held))).await
+    }
+
+    pub(crate) async fn held_owned_absent_keys_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if body.len() > 96 * 1024 {
+            return Err(invalid("Owned absence request exceeds its byte bound"));
+        }
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Owned absence probe has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, arrow) = split_relation(request)?;
+        if held.snapshot.is_scoped_root() || !relation.is_root_data()
+            || held.snapshot.lifetime_point_policy(&relation).await.map_err(status)?.is_some()
+        {
+            return Err(unsupported());
+        }
+
+        let request = require_identity(decode_retained_batch(call, body.slice_ref(arrow))?)?;
+        let batch = request.batch();
+        let valid = absent_keys_valid(batch)?;
+        let mut absent = 0;
+        for row in 0..batch.num_rows() {
+            let (id, _identity) = point_identity_at(call, batch, row)?;
+            if let Some(mut cursor) = held.snapshot.open_point_at(&relation, &id, Some(valid)).await.map_err(status)? {
+                let mut present = false;
+                while let Some(page) = cursor.next_batch().await.map_err(status)? {
+                    if page.batch().num_rows() != 0 {
+                        present = true;
+                        break;
+                    }
+                }
+                if present { break; }
+                // Empty ordinary point replies still validate the cursor schema.
+                let _schema = wire::plan_schema(cursor.runtime_schema(), call.memory())?;
+            }
+            held.snapshot.check_live_point_relation(&relation).map_err(status)?;
+            absent += 1;
+        }
+        held.snapshot.check_live_point_relation(&relation).map_err(status)?;
+        let retained = call.reserve(18)?;
+        let mut reply = Vec::with_capacity(18);
+        reply.push(1);
+        reply.extend_from_slice(&held.snapshot.system_time().0.to_be_bytes());
+        reply.extend_from_slice(&valid.0.to_be_bytes());
+        reply.push(u8::try_from(absent).expect("request has at most 64 keys"));
+        Ok(ActionResult { body: wire::retain(Bytes::from(reply), retained) })
     }
 
     pub(crate) async fn held_owned_historical_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -5072,11 +5146,38 @@ fn change_region_request(
     Ok((lower, upper, valid, charge))
 }
 
+fn absent_keys_valid(batch: &RecordBatch) -> Result<Timestamp, Status> {
+    if batch.num_columns() != 2 || !(1..=64).contains(&batch.num_rows()) {
+        return Err(invalid("Owned absence requires 1 to 64 keys and one valid instant"));
+    }
+    let ids = batch.column_by_name("_id")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| invalid("Owned absence requires UTF-8 keys"))?;
+    let times = batch.column_by_name("valid_micros")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| invalid("Owned absence requires Int64 valid instants"))?;
+    let schema = batch.schema_ref();
+    if ids.null_count() != 0 || times.null_count() != 0 || !schema.metadata().is_empty()
+        || schema.fields().iter().any(|field| !field.metadata().is_empty())
+    {
+        return Err(invalid("Owned absence requires plain non-null keys and valid instants"));
+    }
+    let valid = times.value(0);
+    if times.values().iter().any(|time| *time != valid) {
+        return Err(invalid("Owned absence keys have different valid instants"));
+    }
+    Ok(Timestamp(valid))
+}
+
 fn point_identity(call: &Call, batch: &RecordBatch) -> Result<(EntityId, Arc<MemoryReservation>), Status> {
+    point_identity_at(call, batch, 0)
+}
+
+fn point_identity_at(call: &Call, batch: &RecordBatch, row: usize) -> Result<(EntityId, Arc<MemoryReservation>), Status> {
     let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(|| invalid("Owned point has no _id field"))?;
     let values = batch.column(column).as_ref();
-    let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, 0).map_err(status)?)?)?;
-    let id = rtdb_columnar::read_execution_value(field, values, 0).map_err(status)?.entity_id().map_err(status)?;
+    let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, row).map_err(status)?)?)?;
+    let id = rtdb_columnar::read_execution_value(field, values, row).map_err(status)?.entity_id().map_err(status)?;
     Ok((id, identity))
 }
 

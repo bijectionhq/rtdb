@@ -124,6 +124,12 @@
 -- Point reads and ordered checks open the registry at the same cut as the fact and verify its complete stored identity.
 -- An existing relation without a complete registry refuses owned access.
 -- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
+-- An ordinary unscoped held Root read can prove the absent prefix of up to 64 ordered keys on one relation at a common valid instant.
+-- The prefix proof retains the held system and requested valid coordinates and admits only relations without a creation lifetime.
+-- A caller may submit the original per-key observations and create operations together in one ordered commit batch.
+-- The commit checks every observation at the ordering cut and publishes the page atomically.
+-- A placed hosted import decision may carry one Arrow batch for several ordered runs on the same Root relation.
+-- Its schedule restores each run at its original position among inline effects and reconstructs field presence before ordering.
 -- A historical point uses the held catalog and the same identity registry within the admitted cut and its requested system-time cap.
 -- The relation journal certifies historical point coverage, and incomplete coverage refuses the read.
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
