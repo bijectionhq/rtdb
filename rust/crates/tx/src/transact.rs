@@ -20,12 +20,14 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::{RawValue, to_raw_value};
 use sha2::{Digest, Sha256};
 
+mod custody_prepare;
 mod custody_release;
 mod operations;
 mod pipeline;
 pub mod workload;
 use workload::Family as WorkloadFamily;
 
+pub use custody_prepare::prepare_custody;
 pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyCommand, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
 
@@ -635,12 +637,26 @@ impl TransactState {
 
     pub fn require_native_checkpoint_receipts(&self) -> Result<()> {
         for (key, basis) in self.index.native_checkpoint_receipts() {
-            let receipt = self.tx_status(key)?;
-            if receipt.basis != basis || matches!(receipt.outcome, Outcome::Refused { .. }) {
+            if self.original_custody_receipt(key, basis).is_err() {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/native-checkpoint-receipt", "A carrier has no matching original applied receipt"));
             }
         }
         Ok(())
+    }
+
+    pub fn original_custody_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
+        validate_key(key)?;
+        let mut matches = self.receipts.iter().filter_map(|(namespace, receipts)| {
+            let stored = receipts.get(key)?;
+            (stored.receipt.basis == basis
+                && (namespace.is_none() || stored.workload == Some(WorkloadFamily::CustodyWrite))
+                && stored.receipt.erasure != Some(Erasure::Pending)
+                && !matches!(stored.receipt.outcome, Outcome::Refused { .. }))
+                .then_some(&stored.receipt)
+        });
+        let receipt = matches.next().ok_or_else(unknown_receipt)?;
+        if matches.next().is_some() { return Err(invalid_record()); }
+        Ok(replay(receipt))
     }
 
     pub fn restore_native_checkpoint(&mut self, custody: &NativeCheckpointCustody) -> Result<()> {
@@ -1123,7 +1139,7 @@ impl TransactState {
             }
             if let BranchEffect::ActivateCustodyOccurrence { occurrence, .. }
                 | BranchEffect::ActivateDerivedCustodyOccurrence { occurrence, .. } = &effect
-                && (receipt_namespace.is_some()
+                && (receipt_namespace.is_some() && workload != Some(WorkloadFamily::CustodyWrite)
                     || !occurrence.receipt_key.is_empty() && occurrence.receipt_key != receipt.key)
             {
                 return Err(invalid_record());

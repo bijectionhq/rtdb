@@ -5703,6 +5703,7 @@ dependencies = [
  "bytes",
  "prost",
  "rtdb-columnar",
+ "rtdb-crypt",
  "rtdb-expr",
  "rtdb-format",
  "rtdb-index",

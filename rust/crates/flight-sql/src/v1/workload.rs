@@ -208,6 +208,14 @@ fn request_operation(
             },
             Some(required(value.transaction)?),
         ),
+        Wire::CustodyWrite(value) => (
+            Authority::CustodyWrite {
+                fence: fence(required(value.fence)?)?,
+                writer: applied(required(value.writer)?)?,
+                request_digest: digest,
+            },
+            Some(required(value.transaction)?),
+        ),
         Wire::CloseWriter(value) => (
             Authority::CloseWriter {
                 fence: fence(required(value.fence)?)?,
@@ -356,6 +364,7 @@ fn family(value: i32) -> Result<Family, Status> {
         Ok(proto::WorkloadFamily::ClaimWriter) => Ok(Family::ClaimWriter),
         Ok(proto::WorkloadFamily::Write) => Ok(Family::Write),
         Ok(proto::WorkloadFamily::CloseWriter) => Ok(Family::CloseWriter),
+        Ok(proto::WorkloadFamily::CustodyWrite) => Ok(Family::CustodyWrite),
         Ok(proto::WorkloadFamily::CloseEmptyAssignment) => Ok(Family::CloseEmptyAssignment),
         _ => Err(error::incorrect(
             "Invalid managed workload operation family",

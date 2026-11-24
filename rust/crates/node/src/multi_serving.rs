@@ -576,11 +576,8 @@ impl ServingDriver for MultiServing {
             };
             let view = index.view(&source.branch, At::Exactly(basis), source.layer, now)?;
             let snapshot = if index.has_custody_groups() {
-                let tables = view.tables().filter_map(|(table, _)| {
-                    (!view.ids(table).into_iter().any(|id| view.history(table, id).iter().any(|event| {
-                        event.image.as_ref().is_some_and(|image| image.custody_group.is_some() || image.custody_payload.is_some())
-                    }))).then(|| table.clone())
-                }).collect();
+                let tables = view.tables().filter(|(table, _)| !index.has_custody_relation(table))
+                    .map(|(table, _)| table.clone()).collect();
                 rtdb_query::branch_primary_snapshot(&view, &self.memory, &tables)?
             } else {
                 rtdb_query::branch_snapshot(&view, &self.memory)?
@@ -606,7 +603,9 @@ impl ServingDriver for MultiServing {
             let history = database.fresh_history().await?;
             history.index.require_local_custody()?;
             if request.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || history.index.has_visibility_history()
-                || history.index.has_custody_groups() || cut.incarnation() != self.incarnation
+                || cut.incarnation() != self.incarnation
+                || history.index.has_custody_groups() && (request.tables.is_empty()
+                    || request.tables.iter().any(|table| history.index.has_custody_relation(table)))
             {
                 return Err(workload::denied());
             }
@@ -705,9 +704,9 @@ impl ServingDriver for MultiServing {
     }
 
     async fn original_custody_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
-        let receipt = self.tx_status(key, cancellation).await?;
-        if receipt.basis != basis { return Err(crate::serving::custody_release::release_unavailable()); }
-        Ok(receipt)
+        cancellation.run_until_cancelled(async {
+            self.database.lock().await.original_custody_receipt(key, basis).await
+        }).await.ok_or_else(interrupted)?
     }
 
     async fn changes(

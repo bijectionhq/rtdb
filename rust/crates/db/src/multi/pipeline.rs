@@ -10,7 +10,7 @@ use rtdb_crypt::tokens::{TokenAuthority, VerifiedClaims};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, Decision, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
-    TransactPipeline, TransactState, TransactionRecord, TxKey, workload,
+    TransactPipeline, TransactState, TransactionRecord, TxKey, ROW_CUSTODY, prepare_custody, workload,
 };
 use rtdb_index::branches::BranchCut;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
@@ -659,15 +659,33 @@ impl MultiDatabase {
         let state = self.durable_transactions();
         let decision_time = now.max(state.index().head().system_time.next()?);
         request.check_expiry(upper.max(decision_time))?;
-        let (transaction, admission) = match request.prepare(state, decision_time)? {
+        let (mut transaction, admission) = match request.prepare(state, decision_time)? {
             workload::Prepared::Answer(reply) => return Ok(reply),
             workload::Prepared::Append { transaction, admission } => (transaction, admission),
         };
         self.require_armed_rotation()?;
+        let mut features = FEATURES.to_vec();
+        let now = if admission.family() == workload::Family::CustodyWrite && admission.cutoff().is_some() {
+            let cutoff = admission.cutoff().filter(|cutoff| decision_time < *cutoff)
+                .ok_or_else(workload::denied)?;
+            if upper >= cutoff { return Err(workload::denied()); }
+            for claim in transaction.claims() {
+                claims.verify(claim)?;
+            }
+            let vault = self.tokens.custody_vault();
+            prepare_custody(&mut transaction, &vault).await?;
+            let clock = self.append_authority(lease.epoch)?.upper();
+            if clock >= cutoff { return Err(workload::denied()); }
+            request.check_effect(self.durable_transactions(), clock)?;
+            features.push(ROW_CUSTODY);
+            (self.clock)()
+        } else {
+            now
+        };
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;
         let decision = self.writer.as_mut().ok_or_else(no_writer)?.pipeline
-            .decide_workload(&transaction, now, FEATURES, &claims, &admission)?;
+            .decide_workload(&transaction, now, &features, &claims, &admission)?;
         let mut write = match plan(decision, lease, generation, coordinates)? {
             Planned::Answer(receipt) => return Ok(workload::Reply::Receipt(receipt)),
             Planned::Append(write) => write,

@@ -115,11 +115,15 @@ impl BranchIndex {
 
     pub fn require_classic_write(&self, table: &TableRef) -> Result<()> {
         if self.definition(table, self.head().basis).is_some_and(|definition| definition.visibility.is_some())
-            || self.custody.values().any(|group| group.members.iter().any(|member| &member.table == table))
+            || self.has_custody_relation(table)
         {
             return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb/protected-relation", "A protected relation requires canonical writer admission"));
         }
         Ok(())
+    }
+
+    pub fn has_custody_relation(&self, table: &TableRef) -> bool {
+        self.custody.values().any(|group| group.members.iter().any(|member| &member.table == table))
     }
 
     pub fn has_custody_address(&self, table: &TableRef, id: &EntityId) -> bool {

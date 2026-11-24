@@ -82,6 +82,7 @@ pub enum Family {
     Write,
     CloseWriter,
     CloseEmptyAssignment,
+    CustodyWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +103,11 @@ pub enum Authority {
     Write {
         fence: Fence,
         writer: Applied,
+    },
+    CustodyWrite {
+        fence: Fence,
+        writer: Applied,
+        request_digest: [u8; 32],
     },
     CloseWriter {
         fence: Fence,
@@ -172,6 +178,11 @@ impl Authority {
             Self::ReadRoot { fence, writer } | Self::Write { fence, writer } => {
                 held(fence) && applied(writer)
             }
+            Self::CustodyWrite {
+                fence,
+                writer,
+                request_digest,
+            } => held(fence) && applied(writer) && *request_digest != [0; 32],
             Self::CloseWriter {
                 fence,
                 writer,
@@ -198,7 +209,9 @@ impl Authority {
 
     pub fn assignment_binding(&self) -> Result<Option<[u8; 32]>> {
         let (fence, writer) = match self {
-            Self::ReadRoot { fence, writer } | Self::Write { fence, writer } => (fence, writer),
+            Self::ReadRoot { fence, writer }
+            | Self::Write { fence, writer }
+            | Self::CustodyWrite { fence, writer, .. } => (fence, writer),
             _ => return Ok(None),
         };
         let bytes = serde_json::to_vec(&(fence, writer)).map_err(|_| denied())?;
@@ -213,6 +226,7 @@ impl Authority {
             Self::AdvancePlacement { .. } => Family::AdvancePlacement,
             Self::ClaimWriter { .. } => Family::ClaimWriter,
             Self::Write { .. } => Family::Write,
+            Self::CustodyWrite { .. } => Family::CustodyWrite,
             Self::CloseWriter { .. } => Family::CloseWriter,
             Self::CloseEmptyAssignment { .. } => Family::CloseEmptyAssignment,
             _ => return None,
@@ -388,6 +402,10 @@ impl Request {
                 {
                     return Err(denied());
                 }
+                if matches!(authority, Authority::CustodyWrite { request_digest, .. } if request_digest != digest)
+                {
+                    return Err(denied());
+                }
                 let commitment = Commitment {
                     family: authority.family().ok_or_else(denied)?,
                     digest: *digest,
@@ -488,9 +506,12 @@ impl Point {
                     retirement,
                 )
             }
-            Authority::Write { .. } => {
+            Authority::Write { .. } | Authority::CustodyWrite { .. } => {
                 let transaction = transaction.filter(|tx| tx.key == key).ok_or_else(denied)?;
-                self.check_write(transaction)?;
+                self.check_write(
+                    transaction,
+                    matches!(authority, Authority::CustodyWrite { .. }),
+                )?;
                 return Ok(transaction.clone());
             }
             _ => return Err(denied()),
@@ -554,9 +575,9 @@ impl Point {
         Ok(control)
     }
 
-    fn check_write(&self, request: &Transact) -> Result<()> {
+    fn check_write(&self, request: &Transact, custody: bool) -> Result<()> {
         if request.ops.is_empty() && request.otherwise.is_empty()
-            || request.uses_custody()
+            || request.uses_custody() != custody
             || request.custody_request_digest.is_some()
         {
             return Err(denied());
@@ -576,8 +597,38 @@ impl Point {
         }
         for op in request.ops.iter().chain(&request.otherwise) {
             match op {
-                Op::Put { branch, table, .. } | Op::Delete { branch, table, .. }
+                Op::Put {
+                    branch,
+                    table,
+                    rows,
+                    ..
+                } if branch == MAIN_BRANCH
+                    && *table != self.table
+                    && rows.iter().all(|row| {
+                        row.custody_group.is_none()
+                            && row.custody_payload.is_none()
+                            && row.protected_columns.is_empty()
+                    }) => {}
+                Op::Delete { branch, table, .. }
                     if branch == MAIN_BRANCH && *table != self.table => {}
+                Op::CreateCustodyGroup { group } if custody && *group != [0; 16] => {}
+                Op::ReserveCustodyPlacement { group, reservation }
+                    if custody
+                        && *group != [0; 16]
+                        && reservation.target.branch == MAIN_BRANCH
+                        && reservation.target.table != self.table => {}
+                Op::PlaceCustodyRow {
+                    branch,
+                    table,
+                    row,
+                    placement,
+                } if custody
+                    && branch == MAIN_BRANCH
+                    && *table != self.table
+                    && row.custody_group.is_some_and(|group| group != [0; 16])
+                    && !row.protected_columns.is_empty()
+                    && row.custody_payload.is_none()
+                    && placement.commitments.is_none() => {}
                 Op::Declare { table, change }
                     if *table != self.table && !matches!(change, Declaration::Drop) => {}
                 _ => return Err(denied()),
@@ -624,6 +675,7 @@ impl Point {
             }
             Authority::ReadRoot { fence, writer }
             | Authority::Write { fence, writer }
+            | Authority::CustodyWrite { fence, writer, .. }
             | Authority::CloseWriter { fence, writer, .. } => {
                 self.fence(state, fence, now)?;
                 self.writer(state, fence, writer, now)?.applied
@@ -823,7 +875,7 @@ impl Admission {
         self.cutoff
     }
 
-    pub(super) fn family(&self) -> Family {
+    pub fn family(&self) -> Family {
         self.commitment.family
     }
 

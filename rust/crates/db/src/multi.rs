@@ -360,6 +360,12 @@ impl MultiDatabase {
         self.complete_erase_receipt(receipt, scope).await
     }
 
+    pub async fn original_custody_receipt(&mut self, key: &[u8], basis: Basis) -> Result<Receipt> {
+        self.refresh().await?;
+        self.require_active()?;
+        self.durable_transactions().original_custody_receipt(key, basis)
+    }
+
     pub async fn tx_status(&mut self, key: &[u8]) -> Result<Receipt> {
         self.tx_status_in(key, None).await
     }

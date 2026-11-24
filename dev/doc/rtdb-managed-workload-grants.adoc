@@ -138,6 +138,8 @@ Converting a fixed-profile authority row requires an explicit installation trans
 | `fence`, `writer`
 | `write`
 | `fence`, `writer`
+| `custody-write`
+| `fence`, `writer`, `request_digest`
 | `close-writer`
 | `fence`, `writer`, `closure`
 | `close-empty-assignment`
@@ -162,7 +164,7 @@ fence = { placement, applied }
 predecessor = { fence, writer: applied, close: applied, closure }
 previous = { kind: "empty" } | { kind: "vacant", fence }
          | { kind: "closed", predecessor }
-family = "advance-placement" | "claim-writer" | "write" | "close-writer" | "close-empty-assignment"
+family = "advance-placement" | "claim-writer" | "write" | "close-writer" | "close-empty-assignment" | "custody-write"
 ----
 
 The epoch is a positive unsigned 64-bit integer.
@@ -198,11 +200,21 @@ Write uses the same key in the outer action and embedded `TransactRequest`.
 It admits main-branch puts, deletes and table declarations on data relations.
 Each arm must preserve the configured authority relation.
 The exact workload credential uses the named evidence actions for its control reads.
-The separate `read-root` grant admits Capabilities and Query on a plain original main database through the active local Multi writer.
-It supports merged Exactly, AtLeast and Linearizable cuts and binds page continuations to the stable read grant namespace.
-Each emitted frame checks the current fence, original writer receipt, attachment and expiry.
-The query catalog contains only the selected original database.
-Changes, branch control, custody, protected row visibility, ranked queries and erasure need separate admission.
+The separate `read-root` grant admits Capabilities, main merged Query and Changes for the exact applied fence and writer.
+The active writer confirms the capture cut and checks the authorization again before each delivered frame.
+The ingress replica reads at or before that cut and verifies its local key generation through delivery.
+Query supports Exactly, AtLeast and Linearizable with its catalog restricted to the selected Original.
+A continuation binds the stable read grant namespace, and a tracked claim binds the exact placement and writer for its corresponding write role.
+Ordinary Query withholds relations that have held protected rows.
+Ordinary Changes on an Original with custody requires a nonempty selection of clear relations.
+Branch control, protected reads, ranked queries and erasure use separate admission.
+
+The `custody-write` operation uses the `WorkloadWrite` payload and a distinct grant whose digest names the entire frozen positive action.
+This role admits group creation, planned reservations and enrolled protected placement on main alongside admissible data operations.
+The writer validates both arms and the original fence before preparing custody payloads.
+It rechecks the grant cutoff and fence at ordered effect admission.
+Exact custody evidence uses the original applied Basis and receipt key, including when the application receipt lives in a workload namespace.
+Use explicit `custody-write` receipt recovery and settlement authority for that namespace.
 
 Freeze the exact protobuf request body before the first positive submission and retain it with the namespace, key and family.
 The attempt digest is SHA-256 of the ASCII bytes `rtdb.v1/managed-workload-attempt`, a single zero byte, and that frozen body.

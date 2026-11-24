@@ -1565,3 +1565,70 @@ async fn multi_driver_releases_a_fork_pin_after_independent_destination_publicat
         .unwrap();
     assert_eq!(restored.bytes.as_slice(), b"fork data");
 }
+
+#[tokio::test]
+async fn checked_workload_custody_retains_its_namespaced_receipt_across_checkpoint() {
+    use rtdb_tx::transact::{CustodyPlacement, workload::{Applied, Authority, Family, Fence, Holder, Operation, Placement, Point, Previous, Reply, Request}};
+
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let database = Arc::new(Mutex::new(writer));
+    let writes = WritePipeline::start(database.clone());
+
+    let point = Point::new("public.installation_authority", "authority".into(), Timestamp(0)).unwrap();
+    let command = |namespace, operation| Request { point: point.clone(), namespace, expires_at: Timestamp(200), operation };
+    let submit = |key, authority, transaction| Operation::Submit {
+        key: vec![key; 16], authority, transaction, digest: [key; 32],
+    };
+    let receipt = |answer| {
+        let Reply::Receipt(receipt) = answer else { panic!("expected receipt") };
+        assert_eq!(receipt.outcome, Outcome::Then);
+        receipt
+    };
+    let applied = |receipt: Receipt, namespace| Applied {
+        namespace, key: receipt.key, basis: receipt.basis.to_bytes(), system_time_micros: receipt.system_time.0,
+    };
+    let placement = Placement { epoch: 1, assignment: Some(Holder { assignment_id: [7; 16], holder: "conductor".into() }) };
+    let advance = Authority::AdvancePlacement { installation_intent: [6; 16], previous: Previous::Empty, next: placement.clone() };
+    let placed = receipt(writes.workload(command([1; 32], submit(1, advance, None))).await.unwrap());
+    let fence = Fence { placement, applied: applied(placed, [1; 32]) };
+    let claim = Authority::ClaimWriter { fence: fence.clone() };
+    let original = receipt(writes.workload(command([2; 32], submit(2, claim, None))).await.unwrap());
+    let writer = applied(original, [2; 32]);
+    let group = [4; 16];
+    let mut transaction = request(3, Op::CreateCustodyGroup { group });
+    transaction.ops.push(Op::PlaceCustodyRow {
+        branch: MAIN_BRANCH.into(), table: table(),
+        row: Row {
+            id: EntityId::Integer(1), valid: Some(rtdb_types::Interval::ALL.into()),
+            cells: StructFields::from([("carrier".into(), Cell::Value(Value::Binary(vec![5])))]),
+            custody_group: Some(group), protected_columns: vec!["carrier".into()], custody_payload: None,
+        },
+        placement: CustodyPlacement {
+            placement_id: [6; 16], reservation: None, derived: None, carrier_column: "carrier".into(),
+            link_column: None, commitments: None,
+        },
+    });
+    let ordinary = Authority::Write { fence: fence.clone(), writer: writer.clone() };
+    assert_eq!(writes.workload(command([3; 32], submit(3, ordinary, Some(transaction.clone()))))
+        .await.err().unwrap().code, "rtdb/managed-workload-authority");
+    let custody = Authority::CustodyWrite { fence, writer, request_digest: [3; 32] };
+    let retained = receipt(writes.workload(command([3; 32], submit(3, custody, Some(transaction)))).await.unwrap());
+
+    database.lock().await.checkpoint(Vec::new()).await.unwrap();
+    drop(writes);
+    cluster.at(116);
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert!(matches!(successor.tick(&live(2)).await.unwrap(), Role::Writer(_)));
+    let recovered = successor.original_custody_receipt(&retained.key, retained.basis).await.unwrap();
+    assert_eq!(recovered, Receipt { replayed: true, ..retained.clone() });
+    let writes = WritePipeline::start(Arc::new(Mutex::new(successor)));
+    let status = |family| Operation::Status { key: retained.key.clone(), family };
+    assert_eq!(writes.workload(command([3; 32], status(Family::Write))).await.err().unwrap().code, "rtdb/unknown-transaction");
+    let Reply::Receipt(scoped) = writes.workload(command([3; 32], status(Family::CustodyWrite))).await.unwrap()
+        else { panic!("expected recovered custody receipt") };
+    assert_eq!(scoped, recovered);
+}
