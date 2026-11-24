@@ -158,7 +158,7 @@ The model includes no-lead, position-tie, erased-winner and cap-plus-await contr
 The native resolver imports the ordinary SQL history-time functions proved by [Verus](verus/system_time/proof.rs).
 The directory clock and the runtime publisher call the transition functions in [receiver clock](verus/receiver_clock/proof.rs).
 The hosted receiver stores the observation in its ordered result row. Replica application installs the stored rows without taking a new decision reading.
-The SQL token owner retains the catalog and its interpretation in the issuing native node. Durable cross-residence re-admission, fully position-addressed owned writes and derived indexes, and funded appointments remain open production refinements.
+The SQL token owner retains the admitted view in the issuing node. Placement-issued tokens can also re-admit the identical installed cut after restart or load its exact retained checkpoint by authenticated boundary and root digest. Cut reconstruction for arbitrary suffixes, full owned revision addressing and funded appointments remain open production refinements.
 
 **Done when:** the production path from stored events to returned rows refines the Lean reference, and the half-open, future-ERASE and tie mutations fail in the composed check.
 
