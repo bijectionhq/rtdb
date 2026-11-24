@@ -147,19 +147,21 @@ fn dense_child(
                 f64s.append_value(value);
                 (f64_id, f64s.len() - 1)
             }
-            FloatComponent::Null if let Some(null_id) = null_id => {
-                nulls += 1;
-                (null_id, nulls - 1)
-            }
-            // A null fixed-size row still occupies child slots in the first union leg.
-            FloatComponent::Null if padding_id == f32_id => {
-                f32s.append_null();
-                (f32_id, f32s.len() - 1)
-            }
-            FloatComponent::Null => {
-                f64s.append_null();
-                (f64_id, f64s.len() - 1)
-            }
+            FloatComponent::Null => match null_id {
+                Some(null_id) => {
+                    nulls += 1;
+                    (null_id, nulls - 1)
+                }
+                // A null fixed-size row still occupies child slots in the first union leg.
+                None if padding_id == f32_id => {
+                    f32s.append_null();
+                    (f32_id, f32s.len() - 1)
+                }
+                None => {
+                    f64s.append_null();
+                    (f64_id, f64s.len() - 1)
+                }
+            },
         };
         tags.push(tag);
         offsets.push(i32::try_from(offset).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);

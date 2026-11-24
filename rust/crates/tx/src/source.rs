@@ -1763,13 +1763,16 @@ fn canonical_cells(
     }
     let (array, _writer) = match copy_document_floats(&target, &ty, cells, memory) {
         Ok(Some(output)) => output,
-        Ok(None) | Err(_) if let Some(output) = gather_document_column(&target, &ty, cells, memory) => output,
         Ok(None) | Err(_) => {
-            let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
-            rtdb_columnar::copy_evaluated_cells(&ty, cells.len(), memory,
-                |row| cells[row].map_or(Ok(0), DocumentCell::bound),
-                |row| cells[row].map_or_else(|| Ok(missing.clone()), |cell| cell.value().map(Cow::into_owned)),
-            )?
+            if let Some(output) = gather_document_column(&target, &ty, cells, memory) {
+                output
+            } else {
+                let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
+                rtdb_columnar::copy_evaluated_cells(&ty, cells.len(), memory,
+                    |row| cells[row].map_or(Ok(0), DocumentCell::bound),
+                    |row| cells[row].map_or_else(|| Ok(missing.clone()), |cell| cell.value().map(Cow::into_owned)),
+                )?
+            }
         }
     };
     let column = arrays.column(array.get_array_memory_size(), || Ok(array))?;

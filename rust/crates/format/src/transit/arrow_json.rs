@@ -400,7 +400,8 @@ fn write_typed_leaf(output: &mut impl Write, cell: ArrowCell<'_>, key: bool, dep
             let value = value!(IntervalMonthDayNanoType);
             ("xtdb/interval", interval_text(value.months, value.days, value.nanoseconds))
         }
-        (_, None) if let Some((parameters, coefficient)) = cell.decimal_coefficient()? => {
+        (_, None) => {
+            let Some((parameters, coefficient)) = cell.decimal_coefficient()? else { return Ok(false); };
             let coefficient = num_bigint::BigInt::from_signed_bytes_be(&coefficient);
             let value = rtdb_types::jvm_number::decimal_parts_text(&coefficient, parameters.scale);
             quoted(output, top, |output| json(output, &format!("~f{value}")))?;
