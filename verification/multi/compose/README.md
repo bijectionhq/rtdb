@@ -1,11 +1,11 @@
-# X1 · Acknowledged transaction recovery
+# Installed journal composition
 
 Run `~/.elan/bin/lake build` from `verification/multi`.
 Lake imports `Protocol`, `RecoveryCertificate`, `SelectionFence`, `ObjectWithdrawal`, and `JournalRefinement` from pinned Logkeeper main.
 It also compiles the upstream Study 111 `MaintenanceBound` and Study 113 `DisposalLease` directly from that checkout and imports RTDB's `ReaderRetention`.
 The pin is for the Lean reference.
 
-## Theorems
+## X1 · Acknowledged transaction recovery
 
 [`acknowledged_transaction_survives_recovery`](AcknowledgedRecovery.lean) proves that, for any finite `Continuation` of the original chosen prefix and any valid `OrderedJournal.Trace`, the exact acknowledged append is still at its original decision position.
 A fresh read at the certified same-installation basis contains the transaction's logical event if no later committed erasure in that prefix covers it.
@@ -34,6 +34,47 @@ The maintenance lemma bounds retained records and room for the next maintenance 
 Transition from that bound to completion needs funded bytes, a runnable custodian, reachable services, and eventual settlement of holds.
 The two lease lemmas concern new admission after disposal eligibility and completion before physical collection, respectively.
 
+## PX2 · Progress under stated premises
+
+[`InstalledJournalProgress.lean`](InstalledJournalProgress.lean) proves `funded_maintenance_admits_next_record` for any reachable Study 111 lane about to append a boundary or upload.
+It translates the three-record bound into a byte budget using a maximum framed charge that includes references.
+It also proves `advancing_bounded_clock_reaches_disposal_time` for any time trace that reaches the required real-time threshold with bounded journal lag, using Study 113's `DisposalLease.MayDispose`.
+`withdrawn_holds_are_eventually_disposed` proves disposal on an arbitrary trace once time stays past that threshold, provided custody can reach the journal, the continuously enabled disposal decision is weakly fair, and a chosen disposal releases the holds.
+The Lean controls exhibit a reachable boundary with an underfunded reserve or an oversized charge, and an infinite time trace for each missing clock premise.
+
+[`InstalledJournalProgress.tla`](InstalledJournalProgress.tla) checks the following temporal laws on one shared state machine.
+Each law is checked with its own fairness scope and again with all the fairness clauses together.
+Weak fairness (`WF`) acts on a continuously enabled transition.
+Read admission needs strong fairness (`SF`) because expiry can disable admission between successful renewals.
+Stuttering is allowed, and each conditional law starts once its triggering state occurs.
+
+| Named law | Trigger and result | Required fair actions |
+| --- | --- | --- |
+| `CheckpointEventuallyPublishes` | A pending checkpoint goes through boundary, upload, exact preparation, immutable copy and publication. | The recovery actions below, then `AppendBoundary`, `AppendUpload`, `PrepareCheckpoint`, `CopyCheckpoint` and `PublishCheckpoint`, all `WF`. |
+| `PublishedCheckpointEventuallyTrims` | Once the ordinary root is published, the floor reaches its boundary cut and the later upload stays charged. | `TickJournal`, `DisposeExpired`, `ReleaseHolds` and `Trim`, all `WF`. |
+| `WithdrawnHoldsEventuallyDisposed` | The withdrawn enrollment's hold is removed once the chosen clock reaches its last lease end plus drift. If the enrollment never held a lease, disposal is eligible immediately. | `TickJournal` and `DisposeExpired`, both `WF`. |
+| `FreshReadEventuallyAdmitted` | From a ready writer and a pending fresh invocation, a renewable lease eventually permits the exact chosen barrier cut to be admitted. | `RenewLease` with `WF` and `AdmitFreshRead` with `SF`. |
+| `RequestedErasureEventuallyCommits` | A staged erasure obtains both authenticated clean images from each voter in the surviving majority and durably binds the cut and deadline. | `MirrorSome` and `CommitErasure`, both `WF`. |
+| `CleanSlotsEventuallyCommitErasure`, `OpenReservationEventuallyCommitsErasure` | Once both slots are clean, even when checking from an explicitly usable reservation, the qualified authority eventually commits. | `CommitErasure` with `WF` and enough deadline headroom to keep that action enabled. |
+| `WriterEventuallyGranted`, `WriterEventuallyReady` | After one AZ loss, the surviving journal grants the nominated writer, which materializes the exact grant cut and confirms the grant before reporting ready. | `GrantWriter` with `WF` for the grant, plus `ReplayGrant` and `ConfirmWriter` with `WF` for readiness. |
+
+The TLC bounds are three voters in three AZs with each possible single AZ loss, one replacement grant, a retained upload plus one boundary and upload, one ordinary checkpoint, one withdrawn hold, one independent overlapping hold, one fresh read with repeatable two-tick leases, and one clean erasure attempt with two slots per surviving voter.
+The baseline keeps both surviving voters reachable throughout the run and pauses ordinary intake.
+The disposal clock explores zero through four real ticks, monotone journal samples with one tick of clock error, a last lease end of two ticks or no lease, and one tick of disposal drift.
+The real-time cap leaves room for the longest modeled disposal wait.
+Lease aging can recur independently of the capped disposal clock.
+The erasure starts after the ordinary checkpoint and read, at a quiesced, prepared cut with an authenticated fixed reservation and a provisioned successor key.
+`StartErasure` abstracts the exact ordered rotation for that attempt.
+Each clean-slot action represents authenticated readback at that same rotation, following Study 112's two-image gate.
+The atomic decision follows W4's `JournalErasureDeadline`, with the installed fixed reservation as the deadline and a conservative clock sample as its commit guard.
+In the baseline the reserved deadline is tick six, beyond the last conservative sample at tick five.
+The shortened reservation shows that a usable deadline at the instant both slots become clean is insufficient under untimed fairness alone.
+These ticks express a finite model bound and supply no elapsed-time guarantee.
+
+Run `check-progress.sh` with `TLA2TOOLS_JAR` set to the TLC 2.19 jar and `JAVA_BIN` set if Java is outside `PATH`.
+The runner checks the composed baseline, the separately scoped laws, and each single-premise control at its configured law.
+Its reachability witness admits a fresh read at the chosen boundary before publication, settles the timed withdrawn hold, trims the published root, and commits erasure with the recovered writer ready.
+
 ## Hypotheses and evidence
 
 A named Lean witness establishes the result in the reference model.
@@ -58,7 +99,12 @@ The inventory identifiers have their definitions in Logkeeper's `verification/fo
 | `MaintenanceBound.Reaches lane` and paid capacity | L6, R3. Study 111 proves three retained maintenance records and gives the per-term-claim control. The fenced-term replacement test exercises classification and claim-free regrant. The byte translation requires three funded maximum framed record charges, including exact reference charges and funded checkpoint/control operations. Peak disk funding and progress under repeated interruptions are deployment obligations. |
 | `bounded`, `dispose`; `admittedBeforeRetirement`, `clockBound`, `admission`, `completionBound` | L8, R4, R7. Study 113 and `ReaderRetention` prove the two time inequalities. RTDB `read_lease` verifies the ordinary storage admission and grace decision leaves under clock and duration bounds. Installed `expired_withdrawn_worker_disposal_releases_the_read_that_blocks_trim` exercises disposal and trim. The installed serving/protection path must enforce the lease and settle or drain operations admitted earlier. Qualify clock rate/error and duration across restart, retirement, and loss of connectivity. |
 | Installed scope and trust environment | D03, D05, L3, L12, R9. Qualify authenticated identities, transitively retained verification keys, signatures and hash binding, deterministic canonical decoding under Prost, and installed-only routing. The framing Verus area, installed admission tests, and bypass mutations cover local decisions. Environment qualification includes corrupted-media/codec tests, verifier vectors, and fail-closed provider version and conditional mutation probes. |
-| Recovery progress | D06 and environment. The composition quantifies over finite valid continuations with a selected fresh read. Eventual selection, acquisition and delivery require reachable voters and stores, a live funded custodian, finite operation delays or eventual hold settlement, and fair scheduling. Qualification requires fault and restart runs with backlog, hold pressure and repeated replacement. |
+| PX2 `HasMajority`, eligible nomination and activation capacity | D03, D06, L11 and R2. Qualify authenticated reachability of both surviving current voters after loss of each AZ and keep one paid recovery slot for an eligible replacement. `no-majority`, `no-candidate`, `no-activation-slot`, `unfair-grant`, `unfair-replay` and `unfair-confirm` stall the corresponding grant or readiness law. Probe the exact checkpoint and held suffix on the surviving provider under fault. `no-provider` stalls after grant. |
+| PX2 `reached`, `retainedBound`, `nextBound`, `funded` | L6 and R3. Study 111 supplies reachability and the phase bound across arbitrary grant-only replacements. Qualify maximum framed and reference charges, the funded maintenance reserve and checkpoint allocation. `unfunded-lane` reaches a boundary whose upload cannot fit. `unfunded-checkpoint-copy` blocks the prepared copy with a funded lane. `unfair-boundary`, `unfair-upload`, `unfair-prepare`, `unfair-copy` and `unfair-publish` stall publication. The three-record projection needs reuse of selected progress records across replacement. Abandoned chosen attempts that consume extra records remain outside the projection. |
+| PX2 live custodian, hold settlement and trim | L5, L8 and R10. A runnable custodian can copy and publish the selected root and trim once the withdrawn and overlapping holds clear. `no-custodian` halts after publication, `holds-never-release` leaves a pin in place and `unfair-trim` leaves trim unchosen. Qualify maintenance over an idle journal and at full ordinary capacity with overlapping holds and lost responses. |
+| PX2 `advances`, `boundedLag` and expiry disposal | Study 113 and L8. Real time must reach the final lease end plus drift plus worst-case journal lag. `unfair-tick`, `unbounded-clock` and `unfair-dispose` stall removal of a withdrawn enrollment's hold. Qualify clock behavior across outages and restart, and repeated custodian scans and expiry decisions for an idle journal. |
+| PX2 usable renewal, reader slot and fair fresh admission | D01 and R4. The serving grant must stay current for the invocation and the journal must leave a reader slot and return a usable renewed lease. `writer-displaced`, `no-reader-slot`, `no-usable-renewal` and `unfair-renew` stall read admission. `weak-read-fairness` allows renewal and expiry to alternate forever without choosing the fresh barrier. Production qualification must measure renewal round trips and exact protected read admission under contention and loss. |
+| PX2 clean images, qualified deadline authority and headroom | D02, Study 112, W4 and R5. The model starts from a prepared, quiesced clean successor and authenticated reservation. `stale-slot` and `unfair-mirror` leave the requested erasure short of clean evidence. `unqualified-authority` and `unfair-commit` stall after both slots are clean. `short-deadline` stalls after a clean, usable reservation expires. Qualify exact slot readback and enough time to complete the authenticated commit, drain, destruction and evidence tail; PX2 checks eventual commit only. |
 
 ## Controls
 
