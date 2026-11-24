@@ -1,5 +1,7 @@
 //! Private current custody for a Proposal occurrence and its landed copies.
 
+mod root_landing;
+
 use std::{collections::BTreeSet, fmt, fs, io::ErrorKind, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -17,6 +19,7 @@ use crate::keys::{assertion_deadline::AssertionDeadline, malformed};
 pub(super) const LOCAL_PREFIX: &str = "assertion-family-";
 pub(super) const LOCAL_ISSUER_PREFIX: &str = "assertion-issuer-";
 pub(in crate::keys) const MAX_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_DERIVED_ROWS: usize = 2048;
 const ATTEMPTS: usize = 8;
 const DENIED: &[u8] = b"RTFD\x01";
 
@@ -88,12 +91,46 @@ impl LandingLink {
     }
 }
 
+/// A member's row in a derived search relation. A world row has its own
+/// enrolled capability; a Root row is sealed under its relation's slots.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedRow {
+    #[serde(with = "assertion_id")]
+    pub member: AssertionId,
+    pub world: Option<Uuid>,
+    pub relation: String,
+    pub key: Vec<u8>,
+    pub capability: Option<AssertionStage>,
+}
+
+impl DerivedRow {
+    fn same_row(&self, other: &Self) -> bool {
+        self.world == other.world && self.relation == other.relation && self.key == other.key
+    }
+
+    fn well_formed(&self) -> bool {
+        !self.relation.is_empty() && self.relation.len() <= 255 && !self.key.is_empty() && self.key.len() <= 512
+            && self.world.is_some() == self.capability.is_some() && self.world.is_none_or(|world| !world.is_nil())
+    }
+}
+
+/// The exact world overlay row an enrolled capability seals or opens.
+#[derive(Clone, Copy, Debug)]
+pub struct WorldRowSlot<'a> {
+    pub world: Uuid,
+    pub relation: &'a str,
+    pub key: &'a [u8],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FamilyFence {
     pub order: Uuid,
     pub positions: BTreeSet<Position>,
+    /// Includes the capabilities of pending landings and derived world rows.
     pub assertion_capabilities: BTreeSet<AssertionStage>,
     pub link_capabilities: BTreeSet<AssertionStage>,
+    pub derived: BTreeSet<DerivedRow>,
 }
 
 impl FamilyFence {
@@ -112,6 +149,27 @@ impl FamilyFence {
         for position in &self.positions {
             inventory.update(&[2]);
             inventory.update(&position.to_bytes());
+        }
+        for row in &self.derived {
+            inventory.update(&[3]);
+            inventory.update(&row.member.to_bytes());
+            match row.world {
+                Some(world) => { inventory.update(&[1]); inventory.update(world.as_bytes()); }
+                None => inventory.update(&[0]),
+            }
+            inventory.update(&(row.relation.len() as u16).to_be_bytes());
+            inventory.update(row.relation.as_bytes());
+            inventory.update(&(row.key.len() as u16).to_be_bytes());
+            inventory.update(&row.key);
+            match row.capability {
+                Some(stage) => {
+                    inventory.update(&[1]);
+                    inventory.update(stage.deployment.as_bytes());
+                    inventory.update(&stage.incarnation.get().to_be_bytes());
+                    inventory.update(stage.stage.as_bytes());
+                }
+                None => inventory.update(&[0]),
+            }
         }
         let mut result = [0; 32];
         result.copy_from_slice(inventory.finish().as_ref());
@@ -134,36 +192,81 @@ struct AcceptedLanding {
     placement_digest: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrolledWorldRow {
+    pub world: Uuid,
+    #[serde(with = "assertion_id")]
+    pub assertion: AssertionId,
+    pub capability: AssertionStage,
+    pub scope_commitment: [u8; 32],
+    pub codec: u32,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct OriginalPosition(#[serde(with = "position")] Position);
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorldRewrite {
+    #[serde(with = "assertion_id")]
+    member: AssertionId,
+    row: EnrolledWorldRow,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Family {
-    original: FamilyOccurrence,
+    original: EnrolledWorldRow,
+    original_position: Option<OriginalPosition>,
+    rewrites: Vec<WorldRewrite>,
     landings: Vec<Landing>,
+    derived: Vec<DerivedRow>,
     fenced: Option<Uuid>,
 }
 
 impl Family {
+    fn original_at(&self, position: Position) -> bool {
+        self.original_position.is_some_and(|original| original.0 == position)
+    }
+
     fn contains(&self, position: Position) -> bool {
-        self.original.position == position
+        self.original_at(position)
             || self.landings.iter().any(|landing| landing.accepted.as_ref().is_some_and(|accepted| accepted.position == position))
+    }
+
+    fn has_member(&self, assertion: AssertionId) -> bool {
+        self.original.assertion == assertion
+            || self.landings.iter().any(|landing| landing.reservation.destination == assertion)
     }
 
     fn stage_used(&self, stage: AssertionStage) -> bool {
         self.original.capability == stage || self.landings.iter().any(|landing| {
             landing.reservation.capability == stage || landing.reservation.link_capability == stage
+        }) || self.rewrites.iter().any(|rewrite| rewrite.row.capability == stage)
+            || self.derived.iter().any(|row| row.capability == Some(stage))
+    }
+
+    fn derived_capability(&self, stage: AssertionStage, assertion: AssertionId, slot: WorldRowSlot<'_>) -> bool {
+        self.derived.iter().any(|row| {
+            row.capability == Some(stage) && row.member == assertion && row.world == Some(slot.world)
+                && row.relation == slot.relation && row.key == slot.key
         })
     }
 
     fn fence_inventory(&self, order: Uuid) -> FamilyFence {
-        let mut positions = BTreeSet::from([self.original.position]);
+        let mut positions = self.original_position.map(|position| position.0).into_iter().collect::<BTreeSet<_>>();
         let mut assertion_capabilities = BTreeSet::from([self.original.capability]);
         let mut link_capabilities = BTreeSet::new();
+        assertion_capabilities.extend(self.rewrites.iter().map(|rewrite| rewrite.row.capability));
         for landing in &self.landings {
             positions.extend(landing.accepted.as_ref().map(|accepted| accepted.position));
             assertion_capabilities.insert(landing.reservation.capability);
             link_capabilities.insert(landing.reservation.link_capability);
         }
-        FamilyFence { order, positions, assertion_capabilities, link_capabilities }
+        assertion_capabilities.extend(self.derived.iter().filter_map(|row| row.capability));
+        let derived = self.derived.iter().cloned().collect();
+        FamilyFence { order, positions, assertion_capabilities, link_capabilities, derived }
     }
 
     fn require_live(&self) -> Result<()> {
@@ -222,21 +325,55 @@ impl<'a> AssertionFamilies<'a> {
         Self { journal, region }
     }
 
-    pub async fn register(&self, family: Uuid, original: FamilyOccurrence) -> Result<()> {
-        self.require_position_open(original.position).await?;
+    pub async fn enroll_original(&self, family: Uuid, original: EnrolledWorldRow) -> Result<()> {
         for _ in 0..ATTEMPTS {
             if let Some((prior, _)) = self.read(family).await? {
-                if prior.original != original {
-                    return Err(conflict());
-                }
-                return prior.require_live();
+                prior.require_live()?;
+                return if prior.original == original { Ok(()) } else { Err(conflict()) };
             }
-            let record = Family { original, landings: Vec::new(), fenced: None };
+            let record = Family {
+                original, original_position: None, rewrites: Vec::new(),
+                landings: Vec::new(), derived: Vec::new(), fenced: None,
+            };
             if self.write(family, None, &record).await? {
                 return Ok(());
             }
         }
         Err(contention())
+    }
+
+    pub async fn register(&self, family: Uuid, original: FamilyOccurrence) -> Result<()> {
+        self.require_position_open(original.position).await?;
+        self.update(family, |record| {
+            record.require_live()?;
+            if record.original.assertion != original.assertion || record.original.capability != original.capability
+                || record.original.world.as_bytes() != &original.position.line_generation
+            {
+                return Err(conflict());
+            }
+            if record.original_position.is_some() {
+                return if record.original_at(original.position) { Ok(((), false)) } else { Err(conflict()) };
+            }
+            if record.contains(original.position) {
+                return Err(conflict());
+            }
+            record.original_position = Some(OriginalPosition(original.position));
+            Ok(((), true))
+        }).await
+    }
+
+    pub async fn enroll_rewrite(&self, family: Uuid, member: AssertionId, row: EnrolledWorldRow) -> Result<()> {
+        self.update(family, |record| {
+            record.require_live()?;
+            if let Some(prior) = record.rewrites.iter().find(|prior| prior.row.capability == row.capability) {
+                return if prior.row == row && prior.member == member { Ok(((), false)) } else { Err(conflict()) };
+            }
+            if !record.has_member(member) || record.stage_used(row.capability) {
+                return Err(conflict());
+            }
+            record.rewrites.push(WorldRewrite { member, row });
+            Ok(((), true))
+        }).await
     }
 
     /// Enroll both destination and link stages before either can be provisioned.
@@ -307,7 +444,8 @@ impl<'a> AssertionFamilies<'a> {
         self.require_position_open(occurrence.position).await?;
         let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
         record.require_live()?;
-        if record.original == occurrence || record.landings.iter().any(|landing| {
+        if (record.original_at(occurrence.position) && record.original.assertion == occurrence.assertion
+            && record.original.capability == occurrence.capability) || record.landings.iter().any(|landing| {
             landing.reservation.destination == occurrence.assertion
                 && landing.reservation.capability == occurrence.capability
                 && landing.accepted.as_ref().is_some_and(|accepted| accepted.position == occurrence.position)
@@ -316,6 +454,72 @@ impl<'a> AssertionFamilies<'a> {
         } else {
             Err(conflict())
         }
+    }
+
+    /// Enrolls derived search rows of a member. Each world row's capability is
+    /// fresh within the family and later seals exactly that row.
+    pub async fn register_derived(&self, family: Uuid, rows: &[DerivedRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Err(conflict());
+        }
+        self.update(family, |record| {
+            record.require_live()?;
+            let mut changed = false;
+            for row in rows {
+                if !row.well_formed() || !record.has_member(row.member) {
+                    return Err(conflict());
+                }
+                if record.derived.contains(row) {
+                    continue;
+                }
+                if record.derived.iter().any(|prior| prior.same_row(row)
+                    && (row.world.is_none() || prior.member != row.member))
+                {
+                    return Err(conflict());
+                }
+                if row.capability.is_some_and(|stage| record.stage_used(stage)) {
+                    return Err(conflict());
+                }
+                if record.derived.len() >= MAX_DERIVED_ROWS {
+                    return Err(too_large());
+                }
+                record.derived.push(row.clone());
+                changed = true;
+            }
+            Ok(((), changed))
+        }).await
+    }
+
+    pub async fn require_row_capability(
+        &self, family: Uuid, row: EnrolledWorldRow, slot: WorldRowSlot<'_>,
+    ) -> Result<()> {
+        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        if record.original == row || record.rewrites.iter().any(|rewrite| rewrite.row == row)
+            || record.landings.iter().any(|landing| {
+                landing.reservation.capability == row.capability && landing.reservation.destination == row.assertion
+            })
+            || record.derived_capability(row.capability, row.assertion, slot)
+        {
+            Ok(())
+        } else {
+            Err(conflict())
+        }
+    }
+
+    pub async fn require_derived_capability(
+        &self, family: Uuid, stage: AssertionStage, member: AssertionId, slot: WorldRowSlot<'_>,
+    ) -> Result<()> {
+        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        if record.derived_capability(stage, member, slot) { Ok(()) } else { Err(conflict()) }
+    }
+
+    /// Admits sealing the private link of an enrolled reservation.
+    pub async fn require_reserved(&self, family: Uuid, reservation: LandingReservation) -> Result<()> {
+        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        if record.landings.iter().any(|landing| landing.reservation == reservation) { Ok(()) } else { Err(conflict()) }
     }
 
     /// The selected original, or any active landed copy, closes the same
@@ -398,9 +602,7 @@ impl<'a> AssertionFamilies<'a> {
         let bytes = serde_json::to_vec(record)
             .map_err(|_| Anomaly::fault("rtdb.multi/assertion-family-record", "Cannot encode family custody record"))?;
         if bytes.len() > MAX_RECORD_BYTES {
-            return Err(Anomaly::incorrect(
-                "rtdb.multi/assertion-family-size", "The assertion family exceeds its custody inventory limit",
-            ));
+            return Err(too_large());
         }
         self.journal.write_record(AssertionVaultRecord::Family(family), &self.region, previous, bytes.into()).await
     }
@@ -429,6 +631,10 @@ fn conflict() -> Anomaly {
         AnomalyCategory::Conflict, "rtdb.multi/assertion-family-mismatch",
         "The assertion does not match the original family custody",
     )
+}
+
+fn too_large() -> Anomaly {
+    Anomaly::incorrect("rtdb.multi/assertion-family-size", "The assertion family exceeds its custody inventory limit")
 }
 
 fn contention() -> Anomaly {
@@ -524,6 +730,14 @@ mod tests {
         AssertionStage::new(realm, NonZeroU64::MIN, Uuid::new_v4()).unwrap()
     }
 
+    fn enrolment(original: FamilyOccurrence) -> EnrolledWorldRow {
+        EnrolledWorldRow {
+            world: Uuid::from_bytes(original.position.line_generation),
+            assertion: original.assertion, capability: original.capability,
+            scope_commitment: [9; 32], codec: 1,
+        }
+    }
+
     fn placement(reservation: LandingReservation) -> PlacementBinding {
         PlacementBinding {
             assertion: reservation.destination,
@@ -569,6 +783,7 @@ mod tests {
             let copy = FamilyOccurrence {
                 position: binding.position, assertion: first.destination, capability: first.capability,
             };
+            families.enroll_original(family, enrolment(original)).await?;
             families.register(family, original).await?;
             families.reserve_landing(family, first).await?;
             assert!(families.require_live_occurrence(family, copy).await.is_err());
@@ -599,6 +814,69 @@ mod tests {
             assert!(reopened.activate_ordered_landing(family, placement(pending), pending).await.is_err());
             assert!(reopened.reserve_landing(family, pending).await.is_err());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn derived_world_rows_join_the_fence_and_close_with_their_family() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = LocalKeyService::with_archive_broker(directory.path())?;
+        let region = IoRegion::new();
+        let families = vault.assertion_families(Arc::clone(&region)).unwrap();
+        let realm = Uuid::new_v4();
+        let family = Uuid::new_v4();
+        let original = FamilyOccurrence {
+            position: position(1), assertion: AssertionId::from_bytes([1; 32]), capability: stage(realm),
+        };
+        let enrolled = enrolment(original);
+        families.enroll_original(family, enrolled).await?;
+        assert!(families.require_live_occurrence(family, original).await.is_err());
+        let world = enrolled.world;
+        let derived = DerivedRow {
+            member: original.assertion, world: Some(world), relation: "fact_l1_search".into(),
+            key: b"row".to_vec(), capability: Some(stage(realm)),
+        };
+        let root = DerivedRow {
+            member: original.assertion, world: None, relation: "fact_l1_search".into(),
+            key: b"row".to_vec(), capability: None,
+        };
+        families.register_derived(family, &[derived.clone(), root.clone()]).await?;
+        families.register_derived(family, &[derived.clone()]).await?;
+        let moved = DerivedRow { key: b"other".to_vec(), ..derived.clone() };
+        assert!(families.register_derived(family, &[moved]).await.is_err());
+        let stranger = DerivedRow { member: AssertionId::from_bytes([9; 32]), key: b"x".to_vec(), capability: Some(stage(realm)), ..derived.clone() };
+        assert!(families.register_derived(family, &[stranger]).await.is_err());
+
+        let slot = WorldRowSlot { world, relation: &derived.relation, key: &derived.key };
+        let capability = derived.capability.unwrap();
+        families.require_derived_capability(family, capability, original.assertion, slot).await?;
+        families.require_row_capability(family, enrolled, slot).await?;
+        let elsewhere = WorldRowSlot { world: Uuid::new_v4(), ..slot };
+        assert!(families.require_derived_capability(family, capability, original.assertion, elsewhere).await.is_err());
+
+        let rewrite = EnrolledWorldRow {
+            assertion: AssertionId::from_bytes([2; 32]), capability: stage(realm), ..enrolled
+        };
+        families.enroll_rewrite(family, original.assertion, rewrite).await?;
+        families.enroll_rewrite(family, original.assertion, rewrite).await?;
+        families.require_row_capability(family, rewrite, slot).await?;
+        let other_slot = EnrolledWorldRow { scope_commitment: [10; 32], ..rewrite };
+        assert!(families.require_row_capability(family, other_slot, slot).await.is_err());
+
+        let rewritten = DerivedRow { capability: Some(stage(realm)), ..derived.clone() };
+        families.register_derived(family, std::slice::from_ref(&rewritten)).await?;
+        let forged = FamilyOccurrence { position: Position { line_generation: [7; 16], ..original.position }, ..original };
+        assert!(families.register(family, forged).await.is_err());
+        families.register(family, original).await?;
+        families.register(family, original).await?;
+        families.require_live_occurrence(family, original).await?;
+        let fence = families.fence(family, original.position, Uuid::new_v4()).await?;
+        assert!(fence.assertion_capabilities.contains(&capability));
+        assert!(fence.assertion_capabilities.contains(&rewrite.capability));
+        assert_eq!(fence.derived, BTreeSet::from([derived.clone(), rewritten, root]));
+        assert!(families.require_derived_capability(family, capability, original.assertion, slot).await.is_err());
+        assert!(families.require_row_capability(family, rewrite, slot).await.is_err());
+        assert!(families.register_derived(family, &[derived]).await.is_err());
         Ok(())
     }
 

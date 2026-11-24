@@ -48,31 +48,57 @@ impl Partition {
     }
 }
 
-/// One indexable put: its identity, temporal extent, partition and unit vector.
+/// One indexable put and the position of its unit vector in the staged components.
 pub(crate) struct IndexedRow {
     pub(crate) iid: Iid,
     pub(crate) valid_from: i64,
     pub(crate) valid_to: i64,
     pub(crate) system_from: i64,
     pub(crate) partition: Partition,
-    pub(crate) unit: Vec<f32>,
+    unit_offset: usize,
 }
 
-/// The row a put contributes to a generation, or none.
-/// Deletes and erases contribute nothing: resolution at the read cut excludes the versions they end.
-/// A vector without a defined cosine distance (wrong dimension, a non-finite component, a zero norm) is left out.
-pub(crate) fn indexed_row(event: &EventRef<'_>, definition: &VectorDefinition) -> Result<Option<IndexedRow>> {
-    let header = event.header();
-    if header.op != EventOp::Put { return Ok(None); }
-    let Some(unit) = event_unit(event, &definition.column, definition.dimensions)? else { return Ok(None) };
-    let partition = Partition::of(definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()?)?;
-    Ok(Some(row(header, partition, unit)))
+pub(crate) struct IndexedRows {
+    dimensions: usize,
+    rows: Vec<IndexedRow>,
+    units: Vec<f32>,
 }
 
-fn row(header: EventHeader, partition: Partition, unit: Vec<f32>) -> IndexedRow {
-    IndexedRow {
-        iid: header.iid, valid_from: header.valid_time.lower().0, valid_to: header.valid_time.upper().0,
-        system_from: header.system_from.0, partition, unit,
+impl IndexedRows {
+    pub(crate) fn new(dimensions: usize) -> Self { Self { dimensions, rows: Vec::new(), units: Vec::new() } }
+
+    pub(crate) fn dimensions(&self) -> usize { self.dimensions }
+    pub(crate) fn rows(&self) -> &[IndexedRow] { &self.rows }
+    pub(crate) fn unit(&self, row: &IndexedRow) -> &[f32] { &self.units[row.unit_offset..row.unit_offset + self.dimensions] }
+
+    pub(crate) fn sort(&mut self) {
+        self.rows.sort_by_key(|row| (row.partition, row.iid, row.system_from, row.valid_from, row.valid_to));
+    }
+
+    pub(crate) fn push_event(&mut self, event: &EventRef<'_>, definition: &VectorDefinition) -> Result<()> {
+        let header = event.header();
+        if header.op != EventOp::Put { return Ok(()); }
+        let unit_offset = self.units.len();
+        if !append_event_unit(event, &definition.column, self.dimensions, &mut self.units)? { return Ok(()); }
+        let partition = definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()
+            .and_then(Partition::of).inspect_err(|_| self.units.truncate(unit_offset))?;
+        self.push_row(header, partition, unit_offset);
+        Ok(())
+    }
+
+    fn push_row(&mut self, header: EventHeader, partition: Partition, unit_offset: usize) {
+        self.rows.push(IndexedRow {
+            iid: header.iid, valid_from: header.valid_time.lower().0, valid_to: header.valid_time.upper().0,
+            system_from: header.system_from.0, partition, unit_offset,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_unit(&mut self, header: EventHeader, partition: Partition, unit: &[f32]) {
+        assert_eq!(unit.len(), self.dimensions);
+        let unit_offset = self.units.len();
+        self.units.extend_from_slice(unit);
+        self.push_row(header, partition, unit_offset);
     }
 }
 
@@ -83,23 +109,26 @@ fn event_value<'a>(event: &'a EventRef<'_>, column: &str) -> Result<Option<Cow<'
     }
 }
 
-fn event_unit(event: &EventRef<'_>, column: &str, dimensions: usize) -> Result<Option<Vec<f32>>> {
-    let Some(PutColumn::Stored(field, array, row)) = event.put_column(column) else { return Ok(None) };
+fn append_event_unit(event: &EventRef<'_>, column: &str, dimensions: usize, output: &mut Vec<f32>) -> Result<bool> {
+    let Some(PutColumn::Stored(field, array, row)) = event.put_column(column) else { return Ok(false) };
     let cell = ArrowCell { field, array, row };
-    if cell.is_null()? { return Ok(None); }
+    if cell.is_null()? { return Ok(false); }
     if let Some((values, range)) = cell.float_list_span() {
-        if range.len() != dimensions { return Ok(None); }
-        return Ok(unit((0..range.len()).map(|index| values.float_component(range.start + index))));
+        return Ok(range.len() == dimensions && append_unit(output, range.map(|index| values.float_component(index))));
     }
     let value = read_execution_value(field, array, row)?;
-    Ok(value_unit(&value, dimensions))
+    Ok(append_value_unit(output, &value, dimensions))
 }
 
 /// The unit vector of a SQL list value, or none where its cosine distance is undefined.
 pub(crate) fn value_unit(value: &Value, dimensions: usize) -> Option<Vec<f32>> {
-    let view = value.list_view()?;
-    if view.len() != dimensions { return None; }
-    unit((0..view.len()).map(|index| list_component(view, index)))
+    let mut output = Vec::new();
+    append_value_unit(&mut output, value, dimensions).then_some(output)
+}
+
+fn append_value_unit(output: &mut Vec<f32>, value: &Value, dimensions: usize) -> bool {
+    let Some(view) = value.list_view() else { return false };
+    view.len() == dimensions && append_unit(output, (0..view.len()).map(|index| list_component(view, index)))
 }
 
 fn list_component(view: ListView<'_>, index: usize) -> Option<f64> {
@@ -114,19 +143,48 @@ fn list_component(view: ListView<'_>, index: usize) -> Option<f64> {
 }
 
 pub(crate) fn unit_of(components: &[f32]) -> Option<Vec<f32>> {
-    unit(components.iter().map(|component| Some(f64::from(*component))))
+    let mut output = Vec::new();
+    append_unit(&mut output, components.iter().map(|component| Some(f64::from(*component)))).then_some(output)
 }
 
 /// Normalizes in f64 in component order, so the stored unit vector is a deterministic function of the input.
-fn unit(components: impl Iterator<Item = Option<f64>>) -> Option<Vec<f32>> {
-    let components = components.collect::<Option<Vec<f64>>>()?;
-    if components.is_empty() || components.iter().any(|component| !component.is_finite()) { return None; }
-    let norm = components.iter().map(|component| component * component).sum::<f64>().sqrt();
-    if !(norm.is_finite() && norm > 0.0) { return None; }
-    Some(components.into_iter().map(|component| (component / norm) as f32).collect())
+fn append_unit(output: &mut Vec<f32>, components: impl Iterator<Item = Option<f64>> + Clone) -> bool {
+    let norm = components.clone().try_fold(0.0, |sum, component| {
+        let component = component.filter(|value| value.is_finite())?;
+        Some(sum + component * component)
+    }).map(f64::sqrt);
+    let Some(norm) = norm.filter(|norm| norm.is_finite() && *norm > 0.0) else { return false };
+    output.extend(components.map(|component| (component.expect("component checked during normalization") / norm) as f32));
+    true
 }
 
 /// Cosine distance between unit vectors, accumulated in f64 in component order.
 pub(crate) fn unit_distance(left: &[f32], right: &[f32]) -> f64 {
     1.0 - left.iter().zip(right).map(|(left, right)| f64::from(*left) * f64::from(*right)).sum::<f64>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalization_keeps_f64_precision_until_the_final_components() {
+        let components = [1e100, -2e100, -0.0, 9_007_199_254_740_993i64 as f64];
+        let value = Value::list(vec![Value::F64(components[0]), Value::F64(components[1]), Value::F32(-0.0), Value::I64(9_007_199_254_740_993)]);
+        let norm = components.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let expected = components.map(|component| ((component / norm) as f32).to_bits());
+        let unit = value_unit(&value, 4).unwrap();
+        assert_eq!(unit.into_iter().map(f32::to_bits).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn undefined_vectors_leave_staged_components_untouched() {
+        let mut output = vec![1.0];
+        for components in [[Some(1.0), None], [Some(f64::NAN), Some(1.0)], [Some(0.0), Some(-0.0)], [Some(f64::MAX), Some(1.0)]] {
+            assert!(!append_unit(&mut output, components.into_iter()));
+            assert_eq!(output, [1.0]);
+        }
+        assert!(append_unit(&mut output, [Some(0.0), Some(1.0)].into_iter()));
+        assert_eq!(output, [1.0, 0.0, 1.0]);
+    }
 }

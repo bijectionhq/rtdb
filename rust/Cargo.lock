@@ -5822,9 +5822,11 @@ name = "rtdb-vector"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "futures",
  "rtdb-columnar",
  "rtdb-format",

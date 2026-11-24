@@ -152,7 +152,9 @@ impl Call {
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.session.memory() }
     pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.memory().reserve(bytes).map_err(status) }
-    pub(crate) fn retain_request(&self, bytes: Bytes) -> Bytes { wire::retain(bytes, Arc::clone(&self._reservation)) }
+    pub(crate) fn retain_request(&self, bytes: impl Into<Bytes>) -> Bytes {
+        wire::retain(bytes, Arc::clone(&self._reservation))
+    }
     pub fn close_session(&self) {
         self.service.retire_session(&self.session);
     }
@@ -622,7 +624,7 @@ impl FlightService for Service {
         if let Some(command) = crate::v1::ticket(ticket) {
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), CallKind::V1Get)
                 .await.map_err(crate::v1::error::map_status)?;
-            return self.v1_get(call, command).await;
+            return self.v1_get(call, command, request.metadata()).await;
         }
         let call = self.call(&request, request.get_ref().encoded_len()).await?;
         let command = command(&request.into_inner().ticket).map_err(|error| call.error(error))?;

@@ -18,13 +18,15 @@ pub(crate) fn cluster_count(rows: usize) -> usize {
 /// Seeds are evenly spaced rows, training runs on an evenly spaced sample, ties go to the lower cluster,
 /// and every sum accumulates in f64 in row order, so the same rows in the same order give the same bytes.
 /// Returns the unit centroids, flattened, and each row's cluster.
-pub(crate) fn train(rows: &[&[f32]], dimensions: usize, cancellation: &CancellationToken) -> Result<(Vec<f32>, Vec<u32>)> {
-    let clusters = cluster_count(rows.len()).min(rows.len()).max(1);
-    if rows.is_empty() { return Ok((Vec::new(), Vec::new())); }
-    let mut centroids: Vec<f32> = (0..clusters).flat_map(|cluster| rows[cluster * rows.len() / clusters].iter().copied()).collect();
+pub(crate) fn train<'a>(rows: usize, dimensions: usize, unit: impl Fn(usize) -> &'a [f32],
+    cancellation: &CancellationToken) -> Result<(Vec<f32>, Vec<u32>)> {
+    if rows == 0 { return Ok((Vec::new(), Vec::new())); }
+    let clusters = cluster_count(rows).min(rows);
+    let mut centroids = Vec::with_capacity(clusters * dimensions);
+    for cluster in 0..clusters { centroids.extend_from_slice(unit(cluster * rows / clusters)); }
     if clusters > 1 {
-        let sample_size = clusters.saturating_mul(TRAINING_ROWS_PER_CLUSTER).min(MAX_TRAINING_ROWS).min(rows.len());
-        let sample: Vec<&[f32]> = (0..sample_size).map(|index| rows[index * rows.len() / sample_size]).collect();
+        let sample_size = clusters.saturating_mul(TRAINING_ROWS_PER_CLUSTER).min(MAX_TRAINING_ROWS).min(rows);
+        let sample: Vec<&[f32]> = (0..sample_size).map(|index| unit(index * rows / sample_size)).collect();
         let mut assignment = vec![u32::MAX; sample.len()];
         for _ in 0..ITERATIONS {
             if cancellation.is_cancelled() { return Err(cancelled()); }
@@ -50,10 +52,10 @@ pub(crate) fn train(rows: &[&[f32]], dimensions: usize, cancellation: &Cancellat
             }
         }
     }
-    let mut assignment = Vec::with_capacity(rows.len());
-    for (index, row) in rows.iter().enumerate() {
+    let mut assignment = Vec::with_capacity(rows);
+    for index in 0..rows {
         if index % 4096 == 0 && cancellation.is_cancelled() { return Err(cancelled()); }
-        assignment.push(nearest(row, &centroids, dimensions));
+        assignment.push(nearest(unit(index), &centroids, dimensions));
     }
     Ok((centroids, assignment))
 }
@@ -90,10 +92,9 @@ mod tests {
     #[test]
     fn training_is_a_function_of_the_rows_in_order() {
         let rows: Vec<Vec<f32>> = (0..2_000).map(|seed| unit(seed, 8)).collect();
-        let borrowed: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
         let token = CancellationToken::new();
-        let first = train(&borrowed, 8, &token).unwrap();
-        let second = train(&borrowed, 8, &token).unwrap();
+        let first = train(rows.len(), 8, |index| rows[index].as_slice(), &token).unwrap();
+        let second = train(rows.len(), 8, |index| rows[index].as_slice(), &token).unwrap();
         assert_eq!(first.0.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), second.0.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
         assert_eq!(first.1, second.1);
         assert_eq!(first.0.len(), cluster_count(2_000) * 8);
@@ -102,8 +103,7 @@ mod tests {
     #[test]
     fn a_small_partition_is_one_cluster() {
         let rows: Vec<Vec<f32>> = (0..FLAT_ROWS as u64).map(|seed| unit(seed, 4)).collect();
-        let borrowed: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
-        let (centroids, assignment) = train(&borrowed, 4, &CancellationToken::new()).unwrap();
+        let (centroids, assignment) = train(rows.len(), 4, |index| rows[index].as_slice(), &CancellationToken::new()).unwrap();
         assert_eq!(centroids.len(), 4);
         assert!(assignment.iter().all(|cluster| *cluster == 0));
     }

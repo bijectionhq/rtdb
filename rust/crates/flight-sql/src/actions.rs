@@ -173,6 +173,9 @@ impl Service {
             if let Some(wire) = spatial_wire {
                 return Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, wire).await?)]);
             }
+            if crate::owned_family::is_family_action(action_type) {
+                return Ok(vec![Ok(self.assertion_family_action(&call, action_type, &action.body).await?)]);
+            }
             match action_type {
                 crate::catalog_actions::PUBLISH_CATALOG => Ok(vec![Ok(Box::pin(self.publish_catalog_action(&call, action.body)).await?)]),
                 crate::catalog_actions::WATCH_RELATION => Ok(vec![Ok(Box::pin(self.watch_relation_action(&call, action.body)).await?)]),

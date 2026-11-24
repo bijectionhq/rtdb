@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use arrow_buffer::Buffer;
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
@@ -11,9 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     definition::{self, VectorDefinition},
-    file::{Block, Directory, Locator},
+    file::{Block, Cluster, Directory, Locator},
     lane, probe,
-    rows::{self, IndexedRow, Partition},
+    rows::{self, IndexedRow, IndexedRows, Partition},
 };
 
 /// Where and at which cut a shortlist reads (vector.allium: ApproximateRead).
@@ -39,7 +41,7 @@ impl Default for Budget {
 pub struct Round { pub candidates: BTreeSet<Iid>, pub complete: bool }
 
 /// An opened generation and its clusters eligible under the partition filter, nearest centroid first.
-struct Opened { key: ObjectKey, directory: Directory, order: Vec<usize>, probed: usize }
+struct Opened { key: ObjectKey, clusters: Vec<Cluster>, order: Vec<usize>, probed: usize }
 
 /// The nearest candidates of a probe across a definition's published generations and the frontier above them.
 /// Each round probes further clusters; the caller resolves the candidates at its cut and widens the shortlist
@@ -63,20 +65,22 @@ impl Shortlist {
         if probe.len() != definition.dimensions { return Ok(None); }
         let Some(sources) = sources(cut, definition, budget) else { return Ok(None) };
         let mut gathered = Vec::new();
-        for row in frontier_rows(cut, definition, &sources).await? {
-            if admits(&row, partition, scope, bounds) { gathered.push((rows::unit_distance(&probe, &row.unit), row.iid)); }
+        let frontier = frontier_rows(cut, definition, &sources).await?;
+        for row in frontier.rows() {
+            if admits(row, partition, scope, bounds) { gathered.push((rows::unit_distance(&probe, frontier.unit(row)), row.iid)); }
         }
+        drop(frontier);
         let mut opened = Vec::new();
         for source in &sources {
             let Source::Generation { key, locator } = source else { continue };
             let bytes = cut.storage.get_range_or(key, locator.directory_range(), cut.memory).await?;
-            let directory = Directory::read(bytes.as_slice(), locator)?;
+            let directory = Directory::read(Buffer::from(Bytes::from_owner(bytes)), locator)?;
             if directory.dimensions != definition.dimensions { return Ok(None); }
             let mut order: Vec<(f64, usize)> = directory.clusters.iter().enumerate()
                 .filter(|(_, cluster)| partition.is_none_or(|partition| cluster.partition == partition))
                 .map(|(index, cluster)| (rows::unit_distance(&probe, directory.centroid(cluster)), index)).collect();
             order.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
-            opened.push(Opened { key: key.clone(), directory, order: order.into_iter().map(|(_, index)| index).collect(), probed: 0 });
+            opened.push(Opened { key: key.clone(), clusters: directory.clusters, order: order.into_iter().map(|(_, index)| index).collect(), probed: 0 });
         }
         Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, gathered, opened }))
     }
@@ -84,19 +88,22 @@ impl Shortlist {
     /// Probes the clusters the current plan reaches and returns the nearest distinct IIDs, or `None` past the candidate budget.
     pub async fn round(&mut self, cut: Cut<'_>, scope: Option<IidScope<'_>>) -> Result<Option<Round>> {
         let bounds = cut.bounds;
+        let dimensions = self.probe.len();
         for generation in &mut self.opened {
             let probes = self.plan.probes(generation.order.len());
-            let clusters: Vec<usize> = generation.order[generation.probed.min(probes)..probes].to_vec();
+            let start = generation.probed.min(probes);
             generation.probed = generation.probed.max(probes);
-            let generation = &*generation;
-            let blocks: Vec<Block> = futures::stream::iter(clusters.into_iter().map(|index| {
-                let cluster = &generation.directory.clusters[index];
+            let key = &generation.key;
+            let clusters = &generation.clusters;
+            let blocks = futures::stream::iter(generation.order[start..probes].iter().map(|&index| {
+                let cluster = &clusters[index];
                 async move {
-                    let bytes = cut.storage.get_range_or(&generation.key, cluster.range.clone(), cut.memory).await?;
-                    Block::read(bytes.as_slice(), cluster, generation.directory.dimensions)
+                    let bytes = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
+                    Block::read(Buffer::from(Bytes::from_owner(bytes)), cluster, dimensions)
                 }
-            })).buffer_unordered(8).try_collect().await?;
-            for block in blocks {
+            })).buffer_unordered(8);
+            futures::pin_mut!(blocks);
+            while let Some(block) = blocks.try_next().await? {
                 for row in 0..block.len() {
                     if row % 4096 == 0 && cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
                     let iid = block.iid(row)?;
@@ -146,18 +153,18 @@ fn sources(cut: Cut<'_>, definition: &VectorDefinition, budget: Budget) -> Optio
 }
 
 /// The indexable puts above the published frontier: tries without a generation, then the live segments.
-async fn frontier_rows(cut: Cut<'_>, definition: &VectorDefinition, sources: &[Source]) -> Result<Vec<IndexedRow>> {
-    let mut output = Vec::new();
+async fn frontier_rows(cut: Cut<'_>, definition: &VectorDefinition, sources: &[Source]) -> Result<IndexedRows> {
+    let mut output = IndexedRows::new(definition.dimensions);
     for source in sources {
         let Source::Frontier { data } = source else { continue };
         let lease = cut.storage.get_or(data, cut.memory).await?;
-        output.extend(lane::indexed_rows(std::io::Cursor::new(lease), definition, cut.memory, cut.cancellation)?);
+        lane::read_indexed_rows(std::io::Cursor::new(lease), definition, cut.memory, cut.cancellation, &mut output)?;
     }
     for segment in cut.snapshot.iter_segments(&definition.table) {
         for batch in segment.batches() {
             let events = batch.view();
             for row in 0..events.len() {
-                if let Some(indexed) = rows::indexed_row(&events.borrow_event(row)?, definition)? { output.push(indexed); }
+                output.push_event(&events.borrow_event(row)?, definition)?;
             }
         }
     }

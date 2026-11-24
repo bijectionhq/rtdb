@@ -3,6 +3,8 @@ use arrow_flight::{FlightData, Ticket};
 use prost::Name;
 use rtdb_flight_sql::rtdb::v1::{self as v1, at::Selection};
 
+const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
+
 fn input(sql: &str) -> v1::QueryRequest {
     v1::QueryRequest {
         source: Some(v1::Source {
@@ -19,6 +21,14 @@ async fn get<M: Message + Name, R: Message + Default>(
     client: &mut Client,
     message: M,
 ) -> std::result::Result<(Vec<RecordBatch>, R), Status> {
+    let (batches, trailer, _) = get_response(client, message).await?;
+    Ok((batches, trailer))
+}
+
+async fn get_response<M: Message + Name, R: Message + Default>(
+    client: &mut Client,
+    message: M,
+) -> std::result::Result<(Vec<RecordBatch>, R, MetadataMap), Status> {
     let command = Any {
         type_url: M::type_url(),
         value: message.encode_to_vec().into(),
@@ -26,13 +36,9 @@ async fn get<M: Message + Name, R: Message + Default>(
     let request = client.request(Ticket {
         ticket: command.encode_to_vec().into(),
     });
-    let mut frames: Vec<FlightData> = client
-        .client
-        .do_get(request)
-        .await?
-        .into_inner()
-        .try_collect()
-        .await?;
+    let response = client.client.do_get(request).await?;
+    let metadata = response.metadata().clone();
+    let mut frames: Vec<FlightData> = response.into_inner().try_collect().await?;
     let last = frames.pop().expect("typed trailer");
     assert!(last.data_header.is_empty() && last.data_body.is_empty());
     let trailer = R::decode(last.app_metadata).expect("protobuf stream trailer");
@@ -44,7 +50,7 @@ async fn get<M: Message + Name, R: Message + Default>(
         .try_collect()
         .await
         .unwrap();
-    Ok((batches, trailer))
+    Ok((batches, trailer, metadata))
 }
 
 fn error(status: Status, expected: v1::AnomalyCategory, code: &str) -> v1::Error {
@@ -73,6 +79,48 @@ fn ints(batches: &[RecordBatch]) -> Vec<i64> {
 }
 
 #[tokio::test]
+async fn query_parameters_require_one_row_and_continuations_bind_the_exact_ipc() {
+    fn batch(name: &str, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_from_iter([(name, Arc::new(Int64Array::from(values)) as ArrayRef)]).unwrap()
+    }
+    fn stream(batch: &RecordBatch, count: usize) -> Vec<u8> {
+        rtdb_format::ipc::write_stream(batch.schema_ref(), &vec![batch.clone(); count]).unwrap()
+    }
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO wire_params (_id) VALUES (1), (2), (3)", None).await;
+
+    let mut request = input("SELECT _id FROM wire_params WHERE _id >= $1 ORDER BY _id");
+    request.page = Some(v1::Page { limit: 1, after: vec![] });
+    let one = batch("p", vec![2]);
+    request.params_ipc = Some(stream(&one, 1));
+    let (rows, first) = query(&mut client, request.clone()).await;
+    assert_eq!(ints(&rows), [2]);
+    let mut continuation = request.clone();
+    continuation.page.as_mut().unwrap().after = first.next.unwrap();
+    assert_eq!(ints(&query(&mut client, continuation.clone()).await.0), [3]);
+
+    continuation.params_ipc = Some(stream(&batch("renamed", vec![2]), 1));
+    let status = get::<_, v1::QueryTrailer>(&mut client, continuation).await.unwrap_err();
+    let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+    assert_eq!(detail.message, "Continuation belongs to a different query");
+
+    for (bytes, message) in [
+        (stream(&one, 0), "Parameters require exactly one Arrow batch"),
+        (stream(&one, 2), "Parameters require exactly one Arrow batch"),
+        (stream(&batch("p", vec![]), 1), "Parameters require exactly one row"),
+        (stream(&batch("p", vec![2, 3]), 1), "Parameters require exactly one row"),
+    ] {
+        request.params_ipc = Some(bytes);
+        let status = get::<_, v1::QueryTrailer>(&mut client, request.clone()).await.unwrap_err();
+        let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+        assert_eq!(detail.message, message);
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
@@ -83,11 +131,8 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let caps = v1::CapabilitiesResponse::decode(reply[0].body.clone()).unwrap();
     assert_eq!(caps.api, "rtdb.v1");
     assert!(caps.features.iter().any(|feature| feature == "query.track"));
-    assert!(
-        caps.features
-            .iter()
-            .any(|feature| feature == "changes.progress-only")
-    );
+    assert!(caps.features.iter().any(|feature| feature == "changes.progress-only"));
+    assert!(caps.features.iter().any(|feature| feature == "changes.images.stream-v1"));
     assert_eq!(caps.limits.unwrap().min_key_bytes, 16);
     client
         .update(
@@ -352,6 +397,17 @@ async fn rtdb_v1_changes_whole_groups_images_wait_and_expiry() {
             );
         }
     }
+    let mut shared_request = request.clone();
+    shared_request.until = page.through.clone();
+    shared_request.wait_millis = None;
+    reader.headers.insert(CHANGE_IMAGE_HEADER, "stream-v1".parse().unwrap());
+    let (shared, shared_page, headers) =
+        get_response::<_, v1::ChangesTrailer>(&mut reader, shared_request).await.unwrap();
+    assert_eq!(headers.get(CHANGE_IMAGE_HEADER).unwrap(), "stream-v1");
+    assert_eq!(shared, rows);
+    assert_eq!(shared_page, page);
+    reader.headers.remove(CHANGE_IMAGE_HEADER);
+
     let mut request = request;
     request.after = page.through;
     request.after.as_mut().unwrap().value[0] ^= 1;
@@ -439,9 +495,9 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
             limit: 1,
             ..Default::default()
         };
-        let (rows, images) = get::<_, v1::ChangesTrailer>(&mut client, request.clone())
-            .await
-            .unwrap();
+        let (rows, images, headers) =
+            get_response::<_, v1::ChangesTrailer>(&mut client, request.clone()).await.unwrap();
+        assert!(headers.get(CHANGE_IMAGE_HEADER).is_none());
         assert_eq!(
             rows.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
             row_counts,
@@ -488,17 +544,55 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
         };
         assert_eq!(images.through, Some(expected_through));
 
+        client.headers.insert(CHANGE_IMAGE_HEADER, "stream-v1".parse().unwrap());
+        let (shared, shared_trailer, headers) =
+            get_response::<_, v1::ChangesTrailer>(&mut client, request.clone()).await.unwrap();
+        assert_eq!(headers.get(CHANGE_IMAGE_HEADER).unwrap(), "stream-v1");
+        assert_eq!(shared_trailer, images);
+        assert_eq!(shared.len(), rows.len());
+        for (ordinary, shared) in rows.iter().zip(&shared) {
+            assert_eq!(shared.schema(), ordinary.schema());
+            assert_eq!(&shared.columns()[..3], &ordinary.columns()[..3]);
+            for column in [3, 4, 5] {
+                let ordinary = ordinary.column(column).as_binary::<i32>();
+                let shared = shared.column(column).as_binary::<i32>();
+                assert!(shared.iter().skip(1).all(|cell| cell.is_none()));
+                let decoded = match shared.iter().next().flatten() {
+                    Some(stream) => StreamReader::try_new(stream, None)
+                        .unwrap()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap(),
+                    None => Vec::new(),
+                };
+                let expected = ordinary
+                    .iter()
+                    .flatten()
+                    .map(|cell| StreamReader::try_new(cell, None).unwrap().next().unwrap().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(decoded, expected);
+            }
+        }
+
+        client.headers.insert(CHANGE_IMAGE_HEADER, "future".parse().unwrap());
+        let (unknown, unknown_trailer, headers) =
+            get_response::<_, v1::ChangesTrailer>(&mut client, request.clone()).await.unwrap();
+        assert!(headers.get(CHANGE_IMAGE_HEADER).is_none());
+        assert_eq!(unknown, rows);
+        assert_eq!(unknown_trailer, images);
+
         request.images = v1::Images::None as i32;
-        let (_, ordinary) = get::<_, v1::ChangesTrailer>(&mut client, request.clone())
-            .await
-            .unwrap();
+        client.headers.insert(CHANGE_IMAGE_HEADER, "stream-v1".parse().unwrap());
+        let (_, ordinary, headers) =
+            get_response::<_, v1::ChangesTrailer>(&mut client, request.clone()).await.unwrap();
+        assert!(headers.get(CHANGE_IMAGE_HEADER).is_none());
         assert_eq!(ordinary, images);
         request.progress_only = true;
-        let (rows, progress) = get::<_, v1::ChangesTrailer>(&mut client, request.clone())
-            .await
-            .unwrap();
+        let (rows, progress, headers) =
+            get_response::<_, v1::ChangesTrailer>(&mut client, request.clone()).await.unwrap();
+        assert!(headers.get(CHANGE_IMAGE_HEADER).is_none());
         assert!(rows.is_empty());
         assert_eq!(progress, ordinary);
+        client.headers.remove(CHANGE_IMAGE_HEADER);
 
         request.images = v1::Images::Keys as i32;
         let status = get::<_, v1::ChangesTrailer>(&mut client, request)

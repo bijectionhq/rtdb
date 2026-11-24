@@ -1185,6 +1185,13 @@ The placed Root fork form with clock selector 11 takes a public marker's origina
 
 `rtdb.owned.ReadHeldHostedControlAtPublication.v1` reads the program or application admission in the original prefix of an authenticated public Root publication. It adds position and history before the relation in the held control request.
 
+=== Assertion-family custody
+
+The placed writer keeps per-copy custody of protected rows through the `rtdb.owned` family actions: `AssertionFamilyScope.v1`, `EnrollAssertionFamily.v1`, `EnrollFamilyWorldRow.v1`, `RegisterAssertionFamily.v1`, `ReserveFamilyLanding.v1`, `ActivateFamilyLanding.v2`, `SealFamilyLandingLink.v2`, `SealFamilyLandingPayload.v1`, `OpenFamilyLandingPayload.v1`, `RequireLiveFamilyOccurrence.v1`, `RequireFamilyPositionOpen.v1`, `RegisterFamilyDerived.v1`, `SealWorldOverlayRow.v1`, `OpenWorldOverlayRow.v1`, `FenceAssertionFamily.v1` and `SettleAssertionFamily.v1`.
+They require owned native actions and the placed world host.
+Families are addressed within the attached deployment, and every capability must name that deployment's current incarnation.
+link:../../../dev/doc/rtdb-assertion-families.md[The assertion-family wire contract] defines the frames, the derived search inventory and the fence across dependent forks.
+
 == Catalog publication and watches
 
 The normal owned listener advertises `rtdb.owned.PublishCatalog.v1` and `rtdb.owned.WatchRelation.v1` through ListActions.
@@ -1251,6 +1258,16 @@ Ascending requests advance `after` to `through`, and descending requests move `u
 A cursor below the retained checkpoint floor returns `rtdb/cursor-expired`.
 With the `changes.progress-only` capability, a request can set `progress_only` with `IMAGES_NONE` to receive only the schema and normal coverage trailer.
 Progress-only requests use the same table readers, group limits, interval bounds, and wait conditions.
+
+By default, a present `key_ipc`, `before_ipc`, or `after_ipc` cell is a standalone one-row Arrow IPC stream.
+When the route advertises `changes.images.stream-v1`, a client that supports shared image streams can send the `x-rtdb-changes-images: stream-v1` metadata header with an image-bearing `Changes` DoGet.
+The response echoes that header when it selects the shared carrier.
+For an offered carrier without an exact acknowledgement, retry without the request header to obtain the default representation.
+In a shared response, read each image column separately for each outer record batch.
+If row zero is null, that image is absent throughout the batch.
+Otherwise row zero holds an Arrow IPC stream with one single-row record batch per outer row, in the same order, and remaining cells in that column are null.
+A shared response can include single-row outer batches, for example when the image schemas or presence differ between adjacent changes.
+Both carriers use the same image projections, whole-group limit, and coverage trailer.
 
 Default mode serves the same wire operations on local or shared logs.
 The route advertises `query.linearizable` when it can establish a fresh barrier.

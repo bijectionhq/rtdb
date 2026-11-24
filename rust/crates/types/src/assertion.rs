@@ -250,6 +250,86 @@ impl PlacementBinding {
     }
 }
 
+/// The destination slot fixed by the reviewed landing before RTDB assigns
+/// the publication position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootLandingTarget {
+    pub receipt: [u8; 32],
+    pub review_slot: u64,
+    pub address_extent: [u8; 32],
+    pub disclosure: [u8; 32],
+}
+
+impl RootLandingTarget {
+    pub const WIDTH: usize = 104;
+
+    pub fn from_bytes(bytes: [u8; Self::WIDTH]) -> Result<Self, AssertionWireError> {
+        let target = Self {
+            receipt: field(&bytes, 0),
+            review_slot: u64::from_be_bytes(field(&bytes, 32)),
+            address_extent: field(&bytes, 40),
+            disclosure: field(&bytes, 72),
+        };
+        if [target.receipt, target.address_extent, target.disclosure].contains(&[0; 32]) {
+            return Err(AssertionWireError);
+        }
+        Ok(target)
+    }
+
+    pub fn to_bytes(self) -> [u8; Self::WIDTH] {
+        let mut bytes = [0; Self::WIDTH];
+        bytes[..32].copy_from_slice(&self.receipt);
+        bytes[32..40].copy_from_slice(&self.review_slot.to_be_bytes());
+        bytes[40..72].copy_from_slice(&self.address_extent);
+        bytes[72..].copy_from_slice(&self.disclosure);
+        bytes
+    }
+}
+
+/// The original ordered Root occurrence and the exact frames its landing
+/// receipt accepted. The installed release owner authenticates the order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootLandingBinding {
+    pub position: Position,
+    pub assertion: AssertionId,
+    pub stage: [u8; 16],
+    pub target: RootLandingTarget,
+    pub payload_digest: [u8; 32],
+    pub link_digest: [u8; 32],
+}
+
+impl RootLandingBinding {
+    pub const WIDTH: usize = 248;
+
+    pub fn from_bytes(bytes: [u8; Self::WIDTH]) -> Result<Self, AssertionWireError> {
+        let binding = Self {
+            position: Position::from_bytes(field(&bytes, 0))?,
+            assertion: AssertionId::from_bytes(field(&bytes, 32)),
+            stage: field(&bytes, 64),
+            target: RootLandingTarget::from_bytes(field(&bytes, 80))?,
+            payload_digest: field(&bytes, 184),
+            link_digest: field(&bytes, 216),
+        };
+        if binding.position.line_generation == [0; 16] || binding.stage == [0; 16]
+            || [binding.payload_digest, binding.link_digest].contains(&[0; 32])
+        {
+            return Err(AssertionWireError);
+        }
+        Ok(binding)
+    }
+
+    pub fn to_bytes(self) -> [u8; Self::WIDTH] {
+        let mut bytes = [0; Self::WIDTH];
+        bytes[..32].copy_from_slice(&self.position.to_bytes());
+        bytes[32..64].copy_from_slice(&self.assertion.to_bytes());
+        bytes[64..80].copy_from_slice(&self.stage);
+        bytes[80..184].copy_from_slice(&self.target.to_bytes());
+        bytes[184..216].copy_from_slice(&self.payload_digest);
+        bytes[216..].copy_from_slice(&self.link_digest);
+        bytes
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudienceFrontier {
     pub line_generation: [u8; 16],

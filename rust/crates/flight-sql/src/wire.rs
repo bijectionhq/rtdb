@@ -48,7 +48,7 @@ pub(crate) fn schema_data(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result
 pub(crate) fn reserve_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>, Status> {
     memory.reserve(batch_bound(batch)?).map_err(status)
 }
-fn batch_bound(batch: &RecordBatch) -> Result<usize, Status> {
+pub(crate) fn batch_bound(batch: &RecordBatch) -> Result<usize, Status> {
     add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)
 }
 pub(crate) struct Encoder { schema: SchemaRef, _reservation: Arc<MemoryReservation>, dictionaries: DictionaryTracker, compression: CompressionContext }

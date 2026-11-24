@@ -85,4 +85,10 @@ surface StatelessDatabase {
         -- A scoped credential requires a route that enforces that scope for every admitted operation.
         -- The initial scoped serving path selects merged main and uses a logical system-time coordinate.
         -- Put rows can supply literal signed-microsecond valid-time bounds in _valid_from and _valid_to.
+
+    @guarantee ChangesImages
+        -- Changes image columns carry individual Arrow IPC streams by default.
+        -- A route advertising changes.images.stream-v1 accepts an explicit request for shared image streams and acknowledges the selected representation in the response.
+        -- In the shared representation each present image column carries one Arrow IPC stream in its first cell, with one image per result row in that batch's order.
+        -- Image selection, change ordering and covered intervals apply equally to both representations.
 }

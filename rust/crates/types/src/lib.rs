@@ -43,7 +43,7 @@ mod owned_changes;
 mod assertion;
 pub use assertion::{
     AssertionId, AssertionWireError, AudienceCut, AudienceFrontier, ExactEraseSelector, PlacedId,
-    PlacementBinding, Position, ShadowBound, ShadowV1,
+    PlacementBinding, Position, RootLandingBinding, RootLandingTarget, ShadowBound, ShadowV1,
 };
 pub use owned_changes::{OwnedChange, OwnedChangeGroup, OwnedChangeKind, OwnedEntityRegion, OwnedRangeEvidence, OWNED_CHANGE_GROUP_BYTES, OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS, change_feed_uncovered, expired_lifetime_interval};
 pub use owned_world::{OwnedWorld, OwnedWorldAncestor, OwnedWorldAssertion, OwnedWorldForkLink, WorldClockLimit, WorldClockMode, WorldSchemas, WorldShadow};

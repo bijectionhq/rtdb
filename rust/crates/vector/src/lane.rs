@@ -10,7 +10,7 @@ use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::{definition::{self, VectorDefinition}, file, kmeans, rows};
+use crate::{definition::{self, VectorDefinition}, file, kmeans, rows::IndexedRows};
 
 /// Builds one immutable generation per current trie for each approximate vector index (vector.allium: BuildGeneration).
 /// The artefact lane publishes it with the trie, and the collector deletes it with the trie or its retired definition.
@@ -59,10 +59,11 @@ impl ArtefactBuilder for Builder {
         let memory = Arc::clone(&self.0.memory);
         let cancel = cancellation.clone();
         let written = tokio::task::spawn_blocking(move || {
-            let rows = indexed_rows(source, &definition, &memory, &cancel)?;
-            let _vectors = memory.reserve(rows.len().saturating_mul(definition.dimensions.saturating_mul(12)))?;
+            let mut rows = IndexedRows::new(definition.dimensions);
+            read_indexed_rows(source, &definition, &memory, &cancel, &mut rows)?;
+            let _vectors = memory.reserve(rows.rows().len().saturating_mul(definition.dimensions.saturating_mul(12)))?;
             let mut writer = std::io::BufWriter::new(std::fs::File::options().write(true).create_new(true).open(target).map_err(fault)?);
-            let written = file::write_generation(rows, definition.dimensions, &mut writer, &cancel)?;
+            let written = file::write_generation(rows, &mut writer, &cancel)?;
             std::io::Write::flush(&mut writer).map_err(fault)?;
             Ok::<_, Anomaly>(written)
         }).await.map_err(fault)??;
@@ -81,21 +82,20 @@ impl ArtefactBuilder for Builder {
     }
 }
 
-/// The indexable puts of a stored trie file, in page order.
-pub(crate) fn indexed_rows(source: impl Read + Seek + Send + 'static, definition: &VectorDefinition, memory: &Arc<MemoryBudget>,
-    cancellation: &CancellationToken) -> Result<Vec<rows::IndexedRow>> {
+/// Appends the indexable puts of a stored trie file in page order.
+pub(crate) fn read_indexed_rows(source: impl Read + Seek + Send + 'static, definition: &VectorDefinition, memory: &Arc<MemoryBudget>,
+    cancellation: &CancellationToken, output: &mut IndexedRows) -> Result<()> {
     let (mut reader, _metadata) = input::open_input(source, memory)?;
     let columns = definition.put_columns();
-    let mut output = Vec::new();
     for page in 0..reader.page_count() {
         if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
         let _page = memory.reserve(reader.page_allocation_bound(page)?)?;
         let events = EventBatch::new(reader.read_event_page(page, &columns)?)?;
         for row in 0..events.len() {
-            if let Some(indexed) = rows::indexed_row(&events.borrow_event(row)?, definition)? { output.push(indexed); }
+            output.push_event(&events.borrow_event(row)?, definition)?;
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.vector/build", error.to_string()) }
