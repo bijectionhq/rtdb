@@ -258,6 +258,8 @@ surface StatelessDatabase {
         -- Recovery retains the original terminal decision and evidence through checkpoint and trim.
         -- A revoked group's release holds drain before key destruction.
         -- A route advertises row custody once its protected readers, release adapters and key enforcement support these guarantees.
+        -- An installed Multi writer uses durable group-key retirement and shares its row-custody feature set with the single and batched resolvers.
+        -- The reviewed placement capability in either mode requires the configured Original owner's live provider mount and current writer receipt.
 
     @guarantee ChangesCoverage
         -- Changes reports its covered interval even when there are no changes for the selected tables.

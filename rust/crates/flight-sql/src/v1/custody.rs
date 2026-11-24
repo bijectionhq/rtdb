@@ -379,13 +379,20 @@ impl Service {
         Ok((sealed, inventory))
     }
 
+    pub(super) async fn reviewed_custody_writer(
+        &self, call: &Call, database: &Arc<Database>,
+    ) -> Result<(&CustodyProviderRoute, CustodyResponseOwner, rtdb_tx::transact::CustodyWriterFence), Status> {
+        let route = self.custody_route(call)?;
+        let owner = route.acquire(self, call, database).await?;
+        let writer = owner.response_release(&SystemClock, &call.cancellation).map_err(error::anomaly)?
+            .original_writer_fence().await.map_err(error::anomaly)?;
+        Ok((route, owner, writer))
+    }
+
     pub(super) async fn authenticate_reviewed_custody(
         &self, call: &Call, database: &Arc<Database>, request: &Transact,
     ) -> Result<(), Status> {
-        let route = self.custody_route(call)?;
-        let owner = route.acquire(self, call, database).await?;
-        let mounted = owner.response_release(&SystemClock, &call.cancellation).map_err(error::anomaly)?;
-        let writer = mounted.original_writer_fence().await.map_err(error::anomaly)?;
+        let (route, owner, writer) = self.reviewed_custody_writer(call, database).await?;
         if !request.requires.first().is_some_and(|guard| writer.authenticates(guard)) {
             return Err(unavailable());
         }

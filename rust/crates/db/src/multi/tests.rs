@@ -83,6 +83,14 @@ fn live(n: u8) -> BTreeSet<IpAddr> {
     BTreeSet::from([ip(n)])
 }
 
+#[test]
+fn an_ephemeral_key_vault_cannot_enable_multi_row_custody() {
+    let journal = MemoryJournal::default();
+    let database = Cluster::new().node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    assert!(!database.write_features().contains(&rtdb_tx::transact::ROW_CUSTODY));
+    assert_eq!(database.with_row_custody().err().unwrap().code, "rtdb/row-custody");
+}
+
 #[tokio::test]
 async fn ranked_catalog_replays_at_the_built_cut_after_later_writes() {
     let journal = MemoryJournal::default();

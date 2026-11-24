@@ -110,7 +110,8 @@ impl Service {
                     server_time_micros: self.0.node.now().0,
                 }.encode_to_vec())
             }.await,
-            CAPABILITIES => decode::<proto::CapabilitiesRequest>(action.body).map(|_| {
+            CAPABILITIES => async {
+                decode::<proto::CapabilitiesRequest>(action.body)?;
                 let mut features = Vec::new();
                 if !self.follower_only() {
                     if self.supports_hosted_upload(&call) && self.0.config.owned_world_host.is_some() {
@@ -155,8 +156,12 @@ impl Service {
                             if driver.supports_row_visibility() && !features.iter().any(|feature| feature == ROW_VISIBILITY) {
                                 features.push(ROW_VISIBILITY.into());
                             }
-                            if driver.features().contains(&ROW_CUSTODY) && self.custody_route(&call).is_ok() {
-                                features.push(REVIEWED_CUSTODY_PLACEMENT.into());
+                            if driver.features().contains(&ROW_CUSTODY) {
+                                if database.read_only() || driver.current_custody(&call.cancellation).await.is_err() {
+                                    features.retain(|feature| feature != ROW_CUSTODY);
+                                } else if self.reviewed_custody_writer(&call, &database).await.is_ok() {
+                                    features.push(REVIEWED_CUSTODY_PLACEMENT.into());
+                                }
                             }
                         } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
@@ -205,7 +210,7 @@ impl Service {
                         features.push(custody::SCOPED_CUSTODY.into());
                     }
                 }
-                proto::CapabilitiesResponse {
+                Ok(proto::CapabilitiesResponse {
                     api: API.into(),
                     features,
                     limits: Some(proto::Limits {
@@ -217,8 +222,8 @@ impl Service {
                     }),
                     server_time_micros: if scoped { 0 } else { self.0.node.now().0 },
                 }
-                .encode_to_vec()
-            }),
+                .encode_to_vec())
+            }.await,
             scoped_hold::ACTION => self.scoped_hold_action(&call, &action.body).await,
             custody::RELEASE => self.custody_release_action(&call, &action.body).await,
             "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,

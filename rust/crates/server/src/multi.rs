@@ -1129,6 +1129,9 @@ async fn open_database(
         Arc::clone(kms),
         Arc::new(|| SystemClock.now()),
     )?;
+    if !matches!(mode, DatabaseOpen::Prepared) {
+        database = database.with_row_custody()?;
+    }
     if let Some(batch) = &backends.batch {
         database = database.with_batch_appender(Arc::clone(batch));
     }
@@ -1694,6 +1697,25 @@ mod tests {
             result = runtime.drive(handle.node(), &stop) => panic!("Multi stopped before readiness: {result:?}"),
         };
         assert!(epoch > 0);
+        let attachment = handle.node().catalog().database(DEVELOPMENT_DATABASE).unwrap();
+        let driver = attachment.serving_driver().unwrap();
+        let feature = rtdb_tx::transact::ROW_CUSTODY;
+        assert!(driver.features().contains(&feature));
+        let group = [17; 16];
+        let receipt = driver.transact(Transact {
+            custody_request_digest: None,
+            request_memory: None,
+            key: vec![19; 16],
+            require: vec![feature.into()],
+            window: Default::default(),
+            guards: vec![],
+            requires: vec![],
+            otherwise: vec![],
+            ops: vec![Op::CreateCustodyGroup { group }],
+        }, &stop).await.unwrap();
+        assert_eq!(receipt.outcome, Outcome::Then);
+        assert!(driver.current_custody(&stop).await.unwrap().custody_group_live(group).unwrap());
+        drop(attachment);
         let identity = data.path().join("database-id");
         assert_eq!(fs::read(&identity).unwrap().as_slice(), incarnation.as_bytes());
         handle.shutdown();

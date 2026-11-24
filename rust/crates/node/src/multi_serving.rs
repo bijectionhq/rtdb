@@ -5,8 +5,7 @@ use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, PinnedExport, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
-    COUNT_RANGE_CONSTRAINT, CustodyGroupId, CustodyWriterFence, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME,
-    ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyCommand, workload,
+    CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, MemoryBudget, Result, TableRef, Timestamp,
@@ -53,6 +52,7 @@ pub struct MultiServing {
     writes: WritePipeline,
     incarnation: [u8; 16],
     tokens: TokenAuthority,
+    features: Vec<&'static str>,
     memory: Arc<MemoryBudget>,
     route: Option<Arc<dyn MultiWriteRoute>>,
     ranked_schedule: Mutex<Option<Instant>>,
@@ -289,11 +289,19 @@ impl MultiServing {
     pub fn new(database: MultiDatabase, memory: Arc<MemoryBudget>) -> Self {
         let incarnation = database.incarnation();
         let tokens = database.token_authority();
+        let mut features = database.write_features().to_vec();
+        features.extend([
+            "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
+            "query.linearizable", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status",
+            "sql.history", "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance",
+            rtdb_types::rtdb_v1::CLEAR_RANK_INPUT, rtdb_types::rtdb_v1::RANKED_ARTEFACT_READINESS,
+        ]);
         let database = Arc::new(Mutex::new(database));
         let writes = WritePipeline::start(Arc::clone(&database));
         Self {
             incarnation,
             tokens,
+            features,
             database,
             writes,
             memory,
@@ -413,11 +421,7 @@ impl ServingDriver for MultiServing {
     }
 
     fn features(&self) -> &[&str] {
-        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
-          "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history",
-          "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance",
-          rtdb_types::rtdb_v1::CLEAR_RANK_INPUT, rtdb_types::rtdb_v1::RANKED_INDEX_DECLARATIONS,
-          rtdb_types::rtdb_v1::RANKED_ARTEFACT_READINESS]
+        &self.features
     }
 
     fn supports_row_visibility(&self) -> bool { true }

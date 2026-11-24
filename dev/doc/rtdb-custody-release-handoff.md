@@ -4,7 +4,10 @@
 
 `transact.custody-reviewed-placement` is available to the configured Original owner on routes that already admit native row custody.
 The native transaction and release folds are shared by Default and Multi.
-The published Multi route still gates native row-custody writes and therefore does not advertise reviewed placement.
+Installed writable Multi residences enable native row custody with the durable key vault and use the same feature set for single and batched decisions.
+Default uses the native checkpoint and durable token custody attachment.
+Both modes advertise reviewed placement to the authenticated Original owner after its provider mount confirms the current writer point and retained receipt.
+An assigned follower and a restored attachment dependent on another custody authority have no ordinary row-custody capability.
 
 1. Run a tracked, unpaged, exact merged Query on the writable source branch, with `custody_release_evidence` and `custody_review` selecting the group, winning occurrence and valid instant.
    `CustodyReadInventory.reviewed_source` reports the authenticated complete inventory digest and the Original and winning occurrence, including their physical authoring branches, ordinals and independently confirmed receipt keys, bases and clocks.
@@ -29,8 +32,7 @@ An application that uses those stages still needs a durable mapping of the nativ
 The provider must authenticate that mapping without an owned branch registration, deny plaintext while activation is pending, and recover the same activation after branch drop.
 Its family fence, positive release terminals, checkpoint-copy drain and stage destruction must settle alongside the separately verified native group fence and drain.
 
-The producer branch includes the Query and Changes frame generation fence from `1a5d1b7e5b`, the Default authenticated source intake, ranked contributor custody from `c11220484e`, and exact Multi export pinning from `fc89eea064`.
-`ROW_CUSTODY` and protected exports remain gated.
+Protected exports remain subject to the managed checkpoint custody agreement.
 The existing hosted assertion-family route continues to own its current consumers.
 
 ## Mount and delivery calls

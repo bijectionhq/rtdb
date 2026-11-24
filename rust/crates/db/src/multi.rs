@@ -69,6 +69,7 @@ pub struct MultiDatabase {
     clock: Arc<dyn Fn() -> Timestamp + Send + Sync>,
     token_keys: Arc<StoredTokenKeys>,
     tokens: TokenAuthority,
+    row_custody: bool,
     committed: Option<Committed>,
     writer: Option<Writer>,
     candidate: Option<Lease>,
@@ -104,6 +105,7 @@ impl MultiDatabase {
             clock,
             token_keys,
             tokens,
+            row_custody: false,
             committed: None,
             writer: None,
             candidate: None,
@@ -120,6 +122,16 @@ impl MultiDatabase {
     }
 
     pub fn token_authority(&self) -> TokenAuthority { self.tokens.clone() }
+
+    pub fn with_row_custody(mut self) -> Result<Self> {
+        if !self.stream.kms.supports_durable_generation_retirement() {
+            return Err(Anomaly::unsupported("rtdb/row-custody", "Multi row custody requires durable key retirement"));
+        }
+        self.row_custody = true;
+        Ok(self)
+    }
+
+    pub fn supports_row_custody(&self) -> bool { self.row_custody }
 
     pub async fn finish_token_rotation(&mut self, generation: u64, unreadable_by: i64) -> Result<()> {
         self.refresh().await?;

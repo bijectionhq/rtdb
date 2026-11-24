@@ -28,6 +28,11 @@ use super::{
 const CAPACITY: usize = 64;
 const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, PHYSICAL_ERASURE, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, "row-visibility", "branches",
     rtdb_types::rtdb_v1::RANKED_INDEX_DECLARATIONS];
+const CUSTODY_FEATURES: &[&str] = &[
+    LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, PHYSICAL_ERASURE,
+    COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, "row-visibility", "branches",
+    rtdb_types::rtdb_v1::RANKED_INDEX_DECLARATIONS, ROW_CUSTODY,
+];
 const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, "row-visibility"];
 type Reply<T> = oneshot::Sender<Result<T>>;
 
@@ -573,6 +578,10 @@ pub(super) enum Planned {
 }
 
 impl MultiDatabase {
+    pub fn write_features(&self) -> &'static [&'static str] {
+        if self.supports_row_custody() { CUSTODY_FEATURES } else { FEATURES }
+    }
+
     pub(super) fn new_pipeline(&self) -> Result<TransactPipeline> {
         let state = self.state();
         let durable = &state.transactions;
@@ -590,11 +599,12 @@ impl MultiDatabase {
         claims: &dyn ClaimVerifier,
     ) -> Result<Planned> {
         let now = (self.clock)();
+        let features = self.write_features();
         let decide = |pipeline: &mut TransactPipeline| match scope {
             Some(scope) => {
                 pipeline.decide_scoped(request, now, SCOPED_FEATURES, claims, scope)
             }
-            None => pipeline.decide(request, now, FEATURES, claims),
+            None => pipeline.decide(request, now, features, claims),
         };
         if request.ops.is_empty() && request.otherwise.is_empty() {
             let validation = match self.writer.as_mut().filter(|writer| !writer.recovering) {
@@ -626,10 +636,11 @@ impl MultiDatabase {
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;
         let now = (self.clock)();
+        let features = self.write_features();
         let writer = self.writer.as_mut().ok_or_else(no_writer)?;
         Ok(writer
             .pipeline
-            .decide_batch(requests, now, FEATURES, claims)
+            .decide_batch(requests, now, features, claims)
             .into_iter()
             .map(|decision| decision.and_then(|decision| plan(decision, lease, generation, coordinates)))
             .collect())
