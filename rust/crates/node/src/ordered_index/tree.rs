@@ -1473,8 +1473,16 @@ impl Hit {
         self.leaf().key(self.row)
     }
 
+    pub fn same_leaf(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.node, &other.node)
+    }
+
+    pub fn row_in_leaf(&self) -> usize {
+        self.row
+    }
+
     pub fn follows(&self, first: &Self, distance: usize) -> bool {
-        Arc::ptr_eq(&self.node, &first.node) && first.row.checked_add(distance) == Some(self.row)
+        self.same_leaf(first) && first.row.checked_add(distance) == Some(self.row)
     }
 
     pub fn plain_column(

@@ -1348,6 +1348,14 @@ impl<'a> Tuple<'a> {
         self.get(slot).expect("slot is in the posting tuple")
     }
 
+    pub fn plain_column(self, slot: usize, kind: Kind) -> Option<&'a dyn Array> {
+        let Self::Arrow(postings, _) = self else { return None; };
+        if postings.layouts.get(slot)?.plain()? != kind {
+            return None;
+        }
+        Some(postings.batch.column(postings.prefix + slot).as_ref())
+    }
+
     pub fn compare(self, other: Tuple<'_>) -> Ordering {
         self.iter()
             .zip(other.iter())

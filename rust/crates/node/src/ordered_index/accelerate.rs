@@ -5,10 +5,14 @@ use std::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, GenericByteArray, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, ArrayAccessor, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+    FixedSizeBinaryArray, GenericByteArray, Int8Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
+    builder::{
+        ArrayBuilder, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, GenericByteBuilder,
+        PrimitiveBuilder, StringBuilder,
+    },
     types::ByteArrayType,
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, OffsetBuffer};
@@ -27,7 +31,7 @@ use super::{
     Definition, OwnedProjection, checkpoint, definitions,
     key::{Atom, AtomRef, Bucket, Family, family, owned_family},
     maintenance::{cancelled, read_root, source_frontier, source_rows},
-    postings::Tuple,
+    postings::{Kind, Tuple},
     tree::{Cursor, Hit, KeyRef, Measure, MeasureDomain, Root, Tree, cardinality_overflow},
 };
 
@@ -1381,6 +1385,10 @@ impl Covered {
                     continue;
                 }
             }
+            if let Some(array) = covered_gather(&mut builder, scalar, rows, *slot)? {
+                arrays.push(array);
+                continue;
+            }
             let cells = || rows.iter().map(|head| head.tuple().cell(*slot));
             let retained = cells()
                 .map(|cell| cell.retained_bytes())
@@ -1512,6 +1520,161 @@ fn slice_bytes<T: ByteArrayType<Offset = i32>>(
             GenericByteArray::<T>::try_new(offsets, values, nulls).map_err(super::format_error)?;
         Ok(Arc::new(array))
     })
+}
+
+fn covered_gather(
+    batch: &mut BatchBuilder,
+    scalar: &ScalarType,
+    rows: &[Head],
+    slot: usize,
+) -> Result<Option<ArrayRef>> {
+    use arrow_array::types::*;
+    use ScalarType as S;
+
+    let len = rows.len();
+    let bound = len * 64 + 1024;
+    macro_rules! gather {
+        ($source:ty, $kind:ident, $column:expr, $append:expr) => {
+            gather_covered_column(
+                batch,
+                bound,
+                covered_sources::<$source>(rows, slot, Kind::$kind),
+                $column,
+                $append,
+            )
+        };
+    }
+    macro_rules! convert {
+        ($source:ty, $kind:ident, $target:ty, $convert:expr) => {
+            gather!(
+                $source, $kind,
+                || PrimitiveBuilder::<$target>::with_capacity(len),
+                |column, value| {
+                    let value = value.map($convert).transpose().map_err(super::format_error)?;
+                    column.append_option(value);
+                    Ok(())
+                }
+            )
+        };
+    }
+    macro_rules! unsigned_bits {
+        ($target:ty, $signed:ty, $unsigned:ty) => {
+            convert!(Decimal128Array, Integer, $target, |value| {
+                <$signed>::try_from(value).map(|signed| signed as $unsigned)
+            })
+        };
+    }
+
+    match scalar {
+        S::Utf8 => gather_covered_bytes::<Utf8Type>(batch, rows, slot, Kind::Text),
+        S::Binary => gather_covered_bytes::<BinaryType>(batch, rows, slot, Kind::Binary),
+        S::Bool => gather!(
+            BooleanArray, Bool,
+            || BooleanBuilder::with_capacity(len),
+            |column, value| {
+                column.append_option(value);
+                Ok(())
+            }
+        ),
+        S::Uuid => gather!(
+            FixedSizeBinaryArray, Uuid,
+            || FixedSizeBinaryBuilder::with_capacity(len, 16),
+            |column, value| match value {
+                Some(value) => column.append_value(value).map_err(super::format_error),
+                None => {
+                    column.append_null();
+                    Ok(())
+                }
+            }
+        ),
+        S::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(timezone) } => gather!(
+            Int64Array, InstantMicros,
+            || PrimitiveBuilder::<TimestampMicrosecondType>::with_capacity(len).with_timezone(timezone.clone()),
+            |column, value| {
+                column.append_option(value);
+                Ok(())
+            }
+        ),
+        S::DateDay => convert!(Int64Array, Day, Date32Type, i32::try_from),
+        S::I8 => convert!(Decimal128Array, Integer, Int8Type, i8::try_from),
+        S::I16 => convert!(Decimal128Array, Integer, Int16Type, i16::try_from),
+        S::I32 => convert!(Decimal128Array, Integer, Int32Type, i32::try_from),
+        S::I64 => convert!(Decimal128Array, Integer, Int64Type, i64::try_from),
+        S::U8 => unsigned_bits!(UInt8Type, i8, u8),
+        S::U16 => unsigned_bits!(UInt16Type, i16, u16),
+        S::U32 => unsigned_bits!(UInt32Type, i32, u32),
+        S::U64 => unsigned_bits!(UInt64Type, i64, u64),
+        _ => Ok(None),
+    }
+}
+
+fn covered_sources<'a, A: 'static>(
+    rows: &'a [Head],
+    slot: usize,
+    kind: Kind,
+) -> impl Iterator<Item = Option<(&'a A, &'a [Head])>> + 'a {
+    rows.chunk_by(|left, right| left.hit.same_leaf(&right.hit))
+        .map(move |run| {
+            let column = run[0].tuple().plain_column(slot, kind)?;
+            Some((column.as_any().downcast_ref::<A>()?, run))
+        })
+}
+
+fn gather_covered_column<'a, A: 'static, B: ArrayBuilder>(
+    batch: &mut BatchBuilder,
+    bound: usize,
+    sources: impl Iterator<Item = Option<(&'a A, &'a [Head])>>,
+    make_column: impl FnOnce() -> B,
+    mut append: impl FnMut(&mut B, Option<<&'a A as ArrayAccessor>::Item>) -> Result<()>,
+) -> Result<Option<ArrayRef>>
+where
+    &'a A: ArrayAccessor,
+{
+    batch.try_column(bound, || {
+        let mut column = make_column();
+        for source in sources {
+            let Some((source, run)) = source else {
+                return Ok(None);
+            };
+            for head in run {
+                let row = head.hit.row_in_leaf();
+                append(&mut column, source.is_valid(row).then(|| source.value(row)))?;
+            }
+        }
+        Ok(Some(column.finish()))
+    })
+}
+
+fn gather_covered_bytes<T: ByteArrayType<Offset = i32>>(
+    batch: &mut BatchBuilder,
+    rows: &[Head],
+    slot: usize,
+    kind: Kind,
+) -> Result<Option<ArrayRef>> {
+    let sources = || covered_sources::<GenericByteArray<T>>(rows, slot, kind);
+    let Some(payload) = sources().try_fold(0usize, |bytes, source| {
+        let (source, run) = source?;
+        let offsets = source.value_offsets();
+        Some(run.iter()
+            .map(|head| head.hit.row_in_leaf())
+            .filter(|&row| source.is_valid(row))
+            .fold(bytes, |bytes, row| bytes.saturating_add((offsets[row + 1] - offsets[row]) as usize)))
+    }) else {
+        return Ok(None);
+    };
+    if payload > i32::MAX as usize {
+        return Err(super::format_error("Covered column exceeds Arrow offsets"));
+    }
+    gather_covered_column(
+        batch,
+        payload.saturating_add(rows.len() * 64 + 1024),
+        sources(),
+        || GenericByteBuilder::<T>::with_capacity(rows.len(), payload),
+        |column, value| {
+            column.append_option(value);
+            Ok(())
+        },
+    )
 }
 
 fn covered_array<'a>(
