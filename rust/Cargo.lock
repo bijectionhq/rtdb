@@ -4872,6 +4872,7 @@ dependencies = [
 name = "rtdb-multi"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "arrow-flight",
  "async-trait",
  "aws-config",

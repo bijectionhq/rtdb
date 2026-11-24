@@ -642,7 +642,7 @@ impl RecoveryService {
                     transfer_only: true,
                 };
                 let terminal = Box::pin(archive::issue_checkpoint_transfer(
-                    directory, &self.storage, &self.archive, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                    directory, &self.storage, &self.archive, self.keys.as_ref(), selector, self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 Ok(Reply::TransferSourceSealed { terminal })
             },
@@ -662,7 +662,7 @@ impl RecoveryService {
                     transfer_only: true,
                 };
                 let activation = Box::pin(archive::activate_checkpoint_transfer_target(
-                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                    directory, &self.storage, self.keys.as_ref(), selector, self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 Ok(Reply::TransferTargetActivated { activation })
             },

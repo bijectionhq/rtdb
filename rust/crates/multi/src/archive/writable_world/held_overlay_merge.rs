@@ -1,4 +1,6 @@
 //! Covered seek pages across a live writer and its frozen predecessor.
+use std::collections::BTreeMap;
+
 use arrow_array::{Array, BinaryArray, RecordBatch, StringArray};
 use rtdb_node::{OwnedRangePage, OwnedRangeRequest};
 
@@ -99,8 +101,8 @@ impl HeldCheckpointWorld {
                 let batch = if output.is_empty() {
                     None
                 } else {
-                    let paths = Arc::new(output.iter().map(|key| key.0.as_slice()).collect::<BinaryArray>());
-                    let ids = Arc::new(output.iter().map(|key| key.1.as_str()).collect::<StringArray>());
+                    let paths = Arc::new(BinaryArray::from_iter_values(output.iter().map(|key| key.0.as_slice())));
+                    let ids = Arc::new(StringArray::from_iter_values(output.iter().map(|key| key.1.as_str())));
                     let columns = schema.fields().iter().map(|field| -> arrow_array::ArrayRef {
                         if field.name() == "_id" { ids.clone() } else { paths.clone() }
                     }).collect::<Vec<_>>();
