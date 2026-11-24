@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch};
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
 use rtdb_maintenance::input;
@@ -53,7 +53,7 @@ pub struct Shortlist {
     plan: probe::Plan,
     budget: Budget,
     partition: Option<Partition>,
-    gathered: Vec<(f64, Iid)>,
+    scores: Scores,
     opened: Vec<Opened>,
 }
 
@@ -66,9 +66,11 @@ impl Shortlist {
         if !(bounds.valid_time.is_point() && bounds.system_time.is_point()) || cut.snapshot.has_overlays() { return Ok(None); }
         if probe.len() != definition.dimensions { return Ok(None); }
         let Some(sources) = sources(cut, definition, budget) else { return Ok(None) };
-        let gathered = FrontierRanker {
-            definition, probe: &probe, partition, scope, bounds, unit: Vec::new(), gathered: Vec::new(),
+        let mut scores = Scores::new(cut.memory, budget.max_candidates)?;
+        FrontierRanker {
+            definition, probe: &probe, partition, scope, bounds, unit: Vec::new(), scores: &mut scores,
         }.rank(cut, &sources).await?;
+        if scores.overflowed { return Ok(None); }
         let mut opened = Vec::new();
         for source in &sources {
             let Source::Generation { key, locator } = source else { continue };
@@ -81,7 +83,7 @@ impl Shortlist {
             order.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
             opened.push(Opened { key: key.clone(), clusters: directory.clusters, order: order.into_iter().map(|(_, index)| index).collect(), probed: 0 });
         }
-        Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, gathered, opened }))
+        Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, scores, opened }))
     }
 
     /// Probes the clusters the current plan reaches and returns the nearest distinct IIDs, or `None` past the candidate budget.
@@ -108,12 +110,11 @@ impl Shortlist {
                     let iid = block.iid(row)?;
                     let (valid_from, valid_to, system_from) = block.extent(row);
                     if scope.is_some_and(|scope| !scope.contains(&iid)) || !may_be_visible(valid_from, valid_to, system_from, bounds) { continue; }
-                    self.gathered.push((rows::unit_distance(&self.probe, block.unit(row)), iid));
+                    self.scores.add(iid, rows::unit_distance(&self.probe, block.unit(row)))?;
                 }
             }
         }
-        let (candidates, truncated) = nearest(&mut self.gathered, self.plan.target());
-        if candidates.len() > self.budget.max_candidates { return Ok(None); }
+        let Some((candidates, truncated)) = self.scores.nearest(self.plan.target()) else { return Ok(None) };
         let complete = !truncated && self.opened.iter().all(|generation| generation.probed >= generation.order.len());
         Ok(Some(Round { candidates, complete }))
     }
@@ -158,11 +159,11 @@ struct FrontierRanker<'a> {
     scope: Option<IidScope<'a>>,
     bounds: TemporalBounds,
     unit: Vec<f32>,
-    gathered: Vec<(f64, Iid)>,
+    scores: &'a mut Scores,
 }
 
 impl FrontierRanker<'_> {
-    async fn rank(mut self, cut: Cut<'_>, sources: &[Source]) -> Result<Vec<(f64, Iid)>> {
+    async fn rank(mut self, cut: Cut<'_>, sources: &[Source]) -> Result<()> {
         let definition = self.definition;
         for source in sources {
             let Source::Frontier { data } = source else { continue };
@@ -181,7 +182,7 @@ impl FrontierRanker<'_> {
                 self.rank_batch(batch.view())?;
             }
         }
-        Ok(self.gathered)
+        Ok(())
     }
 
     fn rank_batch(&mut self, events: &EventBatch) -> Result<()> {
@@ -196,25 +197,56 @@ impl FrontierRanker<'_> {
                 && self.scope.is_none_or(|scope| scope.contains(&header.iid))
                 && may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, self.bounds)
             {
-                self.gathered.push((rows::unit_distance(self.probe, &self.unit), header.iid));
+                self.scores.add(header.iid, rows::unit_distance(self.probe, &self.unit))?;
             }
         }
         Ok(())
     }
 }
 
-/// The `target` nearest distinct IIDs of the gathered rows, which this leaves sorted and truncated to them,
-/// and whether it left any distinct IID out.
-fn nearest(gathered: &mut Vec<(f64, Iid)>, target: usize) -> (BTreeSet<Iid>, bool) {
-    gathered.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
-    let mut seen = BTreeSet::new();
-    let mut truncated = false;
-    gathered.retain(|(_, iid)| {
-        if seen.contains(iid) { return false; }
-        if seen.len() == target { truncated = true; return false; }
-        seen.insert(*iid)
-    });
-    (seen, truncated)
+struct Scores {
+    by_iid: BTreeMap<Iid, f64>,
+    admitted: usize,
+    limit: usize,
+    overflowed: bool,
+    allocation: Arc<MemoryReservation>,
+}
+
+impl Scores {
+    fn new(memory: &Arc<MemoryBudget>, limit: usize) -> Result<Self> {
+        Ok(Self { by_iid: BTreeMap::new(), admitted: 0, limit, overflowed: false, allocation: memory.reserve(0)? })
+    }
+
+    fn add(&mut self, iid: Iid, distance: f64) -> Result<()> {
+        if let Some(best) = self.by_iid.get_mut(&iid) {
+            if distance.total_cmp(best).is_lt() { *best = distance; }
+            return Ok(());
+        }
+        if self.by_iid.len() == self.limit {
+            self.overflowed = true;
+            return Ok(());
+        }
+        if self.by_iid.len() == self.admitted {
+            let admitted = self.admitted.saturating_add(256).min(self.limit);
+            // The grant covers the score tree, ordering scratch and one returned IID set.
+            Arc::get_mut(&mut self.allocation).expect("Scores own their allocation")
+                .grow_to(admitted.saturating_mul(192))?;
+            self.admitted = admitted;
+        }
+        self.by_iid.insert(iid, distance);
+        Ok(())
+    }
+
+    fn nearest(&self, target: usize) -> Option<(BTreeSet<Iid>, bool)> {
+        if self.overflowed { return None; }
+        if self.by_iid.len() <= target {
+            return Some((self.by_iid.keys().copied().collect(), false));
+        }
+        let mut ranked = self.by_iid.iter().collect::<Vec<_>>();
+        ranked.sort_unstable_by(|(left, d1), (right, d2)| d1.total_cmp(d2).then(left.cmp(right)));
+        let candidates = ranked.into_iter().take(target).map(|(iid, _)| *iid).collect();
+        Some((candidates, true))
+    }
 }
 
 /// A version can be visible only if its valid interval meets the read's and it was written by the read's system instant.
@@ -263,11 +295,11 @@ mod tests {
         EventBatch::new(build_event_batch(events, Some(fields), None)?)
     }
 
-    fn frontier<'a>(definition: &'a VectorDefinition, scope: &'a BTreeSet<Iid>, partition: Option<Partition>) -> FrontierRanker<'a> {
+    fn frontier<'a>(definition: &'a VectorDefinition, scope: &'a BTreeSet<Iid>, partition: Option<Partition>, scores: &'a mut Scores) -> FrontierRanker<'a> {
         let point = Interval::at(Timestamp(10)).unwrap();
         FrontierRanker {
             definition, probe: &[1.0, 0.0], partition, scope: Some(IidScope::Set(scope)),
-            bounds: TemporalBounds { valid_time: point, system_time: point }, unit: Vec::new(), gathered: Vec::new(),
+            bounds: TemporalBounds { valid_time: point, system_time: point }, unit: Vec::new(), scores,
         }
     }
 
@@ -277,7 +309,8 @@ mod tests {
         let scope = BTreeSet::from([Iid([1; 16]), Iid([2; 16]), Iid([3; 16]), Iid([4; 16]), Iid([5; 16])]);
         let tenant = |name: &str| Value::Utf8(name.into());
         let partition = Partition::of([Some(std::borrow::Cow::Owned(tenant("a")))])?;
-        let mut ranker = frontier(&definition, &scope, Some(partition));
+        let mut scores = Scores::new(&MemoryBudget::new(8192), 8)?;
+        let mut ranker = frontier(&definition, &scope, Some(partition), &mut scores);
         let mut expired = put(3, [1.0, 0.0], tenant("a"));
         expired.valid_time = Interval::from_micros(0, 10)?;
         let mut future = put(4, [1.0, 0.0], tenant("a"));
@@ -286,7 +319,7 @@ mod tests {
         ranker.rank_batch(&batch(&[
             put(2, [1.0, 0.0], tenant("a")), put(5, [1.0, 0.0], tenant("b")), put(6, [1.0, 0.0], tenant("a")),
         ], ScalarType::Utf8)?)?;
-        assert_eq!(ranker.gathered, [(1.0 - f64::from(0.6_f32), Iid([1; 16])), (0.0, Iid([2; 16]))]);
+        assert_eq!(ranker.scores.by_iid, BTreeMap::from([(Iid([1; 16]), 1.0 - f64::from(0.6_f32)), (Iid([2; 16]), 0.0)]));
         Ok(())
     }
 
@@ -294,7 +327,8 @@ mod tests {
     fn frontier_reports_partition_errors_only_for_indexable_vectors_even_outside_the_scope() -> Result<()> {
         let definition = definition();
         let scope = BTreeSet::new();
-        let mut ranker = frontier(&definition, &scope, None);
+        let mut scores = Scores::new(&MemoryBudget::new(8192), 8)?;
+        let mut ranker = frontier(&definition, &scope, None, &mut scores);
         ranker.rank_batch(&batch(&[put(1, [0.0, -0.0], Value::F64(1.0))], ScalarType::F64)?)?;
         let batch = batch(&[put(1, [1.0, 0.0], Value::F64(1.0))], ScalarType::F64)?;
         assert_eq!(ranker.rank_batch(&batch).unwrap_err().code, "rtdb.vector/partition-type");
@@ -302,15 +336,41 @@ mod tests {
     }
 
     #[test]
-    fn the_shortlist_keeps_the_nearest_distinct_iids_and_reports_truncation() {
+    fn the_shortlist_widens_over_previously_scored_candidates() -> Result<()> {
         let iid = |byte| Iid([byte; 16]);
-        let mut gathered = vec![(0.3, iid(1)), (0.1, iid(2)), (0.2, iid(1)), (0.4, iid(3))];
-        let (kept, truncated) = nearest(&mut gathered, 2);
-        assert_eq!(kept, [iid(1), iid(2)].into_iter().collect());
+        let mut plan = probe::Plan::new(0.9, 1);
+        let memory = MemoryBudget::new(1 << 20);
+        let mut scores = Scores::new(&memory, 128)?;
+        for byte in 1..=70 { scores.add(iid(byte), f64::from(byte))?; }
+        scores.add(iid(64), 100.0)?;
+        assert_eq!(scores.by_iid.len(), 70);
+        assert_eq!(scores.by_iid[&iid(64)], 64.0);
+        let (kept, truncated) = scores.nearest(plan.target()).unwrap();
+        assert_eq!(kept.len(), 64);
+        assert!(!kept.contains(&iid(65)));
         assert!(truncated);
-        assert_eq!(gathered, vec![(0.1, iid(2)), (0.2, iid(1))]);
-        let (kept, truncated) = nearest(&mut gathered, 4);
-        assert_eq!(kept.len(), 2);
+        assert!(plan.widen(128));
+        let (kept, truncated) = scores.nearest(plan.target()).unwrap();
+        assert_eq!(kept.len(), 70);
+        assert!(kept.contains(&iid(65)));
         assert!(!truncated);
+        assert!(memory.used_bytes() > 0);
+        drop(scores);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn score_budget_counts_distinct_iids_and_declines_an_incomplete_shortlist() -> Result<()> {
+        let mut scores = Scores::new(&MemoryBudget::new(8192), 1)?;
+        let first = Iid([1; 16]);
+        scores.add(first, 2.0)?;
+        scores.add(first, 1.0)?;
+        assert_eq!(scores.by_iid[&first], 1.0);
+        assert_eq!(scores.nearest(1), Some((BTreeSet::from([first]), false)));
+        scores.add(Iid([2; 16]), 0.0)?;
+        assert_eq!(scores.by_iid.len(), 1);
+        assert!(scores.nearest(1).is_none());
+        Ok(())
     }
 }
