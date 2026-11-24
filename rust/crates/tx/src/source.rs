@@ -368,17 +368,30 @@ impl SourceTransaction {
         Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    pub(crate) fn encode_landing_footprint(&self) -> Result<RetainedBytes> {
+    pub(crate) fn landing_footprint(&self) -> Result<Self> {
         let batch = self.operation_batch(None, SourcePurpose::Log)?;
-        crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)
-    }
+        let schema = batch.batch().schema_ref();
+        let schema_bytes = rtdb_format::ipc::schema_translation_bound(schema)?;
+        let decode = |pages: &[OwnedBatch]| {
+            let mut scratch = self.memory.reserve(4096)?;
+            let scratch = Arc::get_mut(&mut scratch).expect("source decoding owns its reservation");
+            let operations = decode_operation_pages(pages, false, &self.memory, scratch)?;
+            Self::from_operations(operations, self.options.clone(), &self.memory)
+        };
+        if schema.fields().iter().zip(batch.batch().columns())
+            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref()))
+        {
+            let _schema = self.memory.reserve(schema_bytes)?;
+            let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch())? {
+                Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation()))?,
+                None => batch,
+            };
+            return decode(std::slice::from_ref(&batch));
+        }
 
-    pub(crate) fn decode_landing_footprint(&self, footprint: &Bytes) -> Result<Self> {
-        let pages = crate::ipc::decode(footprint, &self.memory)?;
-        let mut scratch = self.memory.reserve(4096)?;
-        let scratch = Arc::get_mut(&mut scratch).expect("source decoding owns its reservation");
-        let operations = decode_operation_pages(&pages, false, &self.memory, scratch)?;
-        Self::from_operations(operations, self.options.clone(), &self.memory)
+        let footprint = crate::ipc::encode(schema, [batch.batch()], &self.memory)?;
+        drop(batch);
+        decode(&crate::ipc::decode(&footprint.into_bytes(), &self.memory)?)
     }
 
     pub fn encode(&self) -> Result<RetainedBytes> {
@@ -524,6 +537,33 @@ impl SourceTransaction {
         let schema = Arc::new(Schema::new(vec![Field::new("tx-ops", union.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![union]).map_err(|error| invalid(error.to_string()))?;
         arrays.finish(batch)
+    }
+}
+
+fn landing_field_matches_ipc(field: &Field, array: &dyn Array) -> bool {
+    // The Java stream layout drops validity buffers for non-nullable fields, including masked child nulls.
+    if (!field.is_nullable() && array.null_count() != 0) || rtdb_columnar::decimal_field_parameters(field).is_err() {
+        return false;
+    }
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
+            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref())),
+        DataType::Union(fields, UnionMode::Dense) => fields.iter()
+            .all(|(id, field)| landing_field_matches_ipc(field, array.as_union().child(id).as_ref())),
+        DataType::List(item) => landing_field_matches_ipc(item, array.as_list::<i32>().values().as_ref()),
+        DataType::LargeList(item) => landing_field_matches_ipc(item, array.as_list::<i64>().values().as_ref()),
+        DataType::FixedSizeList(item, _) => landing_field_matches_ipc(item, array.as_fixed_size_list().values().as_ref()),
+        DataType::Map(entries, _) => landing_field_matches_ipc(entries, array.as_map().entries()),
+        // Arrow IPC omits an empty timezone string from the schema.
+        DataType::Timestamp(_, zone) => zone.as_ref().is_none_or(|zone| !zone.is_empty()),
+        DataType::Null | DataType::Boolean
+        | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+        | DataType::Float16 | DataType::Float32 | DataType::Float64
+        | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+        | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_)
+        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => true,
+        _ => false,
     }
 }
 
@@ -4873,9 +4913,64 @@ mod tests {
             relation, documents, valid_from: Some(Timestamp::MIN), valid_to: None,
         }], SubmitOptions::default(), &memory).unwrap();
         let replay = roundtrip(&source);
-        assert!(matches!(&replay.operations[0], Operation::OwnedArrowIids { .. }));
-        assert!(crate::hosted_control::proposal_landing_frontier_rows(&replay.operations[0]).is_some());
+        let footprint = source.landing_footprint().unwrap();
+        for transaction in [&replay, &footprint] {
+            assert!(matches!(&transaction.operations[0], Operation::OwnedArrowIids { .. }));
+            assert!(crate::hosted_control::proposal_landing_frontier_rows(&transaction.operations[0]).is_some());
+        }
         assert_eq!(source.body_digest().unwrap(), replay.body_digest().unwrap());
+    }
+
+    #[test]
+    fn landing_footprint_reuses_compatible_payloads_and_normalizes_masked_children() {
+        use arrow_array::{Int64Array, StringArray};
+
+        let memory = budget();
+        let values = [Value::I64(7), Value::Utf8("text".into()), Value::Null];
+        let types = values.each_ref().map(Value::logical_type);
+        let value_type = LogicalType::join_all(&types);
+        let items = to_field("item", &value_type).unwrap();
+        for masked_child in [false, true] {
+            let field = Field::new("code", DataType::Int64, false);
+            let codes = Int64Array::from(vec![Some(10), (!masked_child).then_some(20), Some(30)]);
+            let detail = StructArray::new(
+                vec![field].into(), vec![Arc::new(codes)], Some(NullBuffer::from(vec![true, false, true])),
+            );
+            let ids = Arc::new(StringArray::from(vec!["first", "second", "third"]));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", DataType::Utf8, false),
+                items.clone(),
+                Field::new("detail", detail.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![
+                ids.clone(), build_array(&value_type, &values).unwrap(), Arc::new(detail),
+            ]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+            let source = SourceTransaction::new(vec![
+                TxOp::OwnedArrowDocs {
+                    relation: rtdb_types::OwnedRelation::new("facts").unwrap(), documents, create_only: true,
+                    valid_from: Some(Timestamp(10)), valid_to: None,
+                },
+                TxOp::HostedConstraintRefusal,
+            ], SubmitOptions::default(), &memory).unwrap();
+
+            let footprint = source.landing_footprint().unwrap();
+            let replay = roundtrip(&source);
+            assert_eq!(footprint.encode().unwrap().as_slice(), replay.encode().unwrap().as_slice());
+            let [
+                Operation::OwnedArrowIids { documents, iids, presence: Some(presence), valid_from: Some(Timestamp(10)), .. },
+                Operation::Public(TxOp::HostedConstraintRefusal),
+            ] = footprint.operations.as_slice() else { panic!("expected the ordered landing footprint"); };
+            assert_eq!(iids[1], EntityId::String("second".into()).iid());
+            assert!(presence[2].contains("item"));
+            assert!(documents.array().fields()[1].is_nullable());
+            let retained_ids = documents.array().column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(retained_ids.value(0).as_ptr() == ids.value(0).as_ptr(), !masked_child);
+            let detail = documents.array().column(2).as_struct();
+            assert!(detail.is_null(1));
+            assert!(detail.column(0).is_valid(1));
+        }
     }
 
     #[test]
