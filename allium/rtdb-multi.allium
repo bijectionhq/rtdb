@@ -24,6 +24,7 @@
 -- A cluster of the opt-in stream driver runs one node role per process and takes one journal URL with a client identity and trust bundle.
 -- The same node image runs the default driver with Kafka source and replica logs when the cluster selects default mode.
 -- dev/doc/rtdb-v1.allium defines the stateless consumer surface shared with default mode.
+-- ScopedRowVisibility defines the target contract for labelled rows served by either mode.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- The target serving protocol uses scoped attempt receipts and a loglet read index.
 -- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
@@ -3772,6 +3773,46 @@ surface ClientAccess {
         -- The resolver decides from engine-owned receipts in xt.idempotency_receipts, which SQL cannot write, valid for idempotency_window of system time.
         -- A string application key takes precedence over the gateway key and must be stable across attempts for deduplication.
         -- A transaction without a usable application key uses the gateway key and its transaction ordinal.
+}
+
+external entity ScopedDatabaseClient {
+    -- A client whose verified credential carries label sets for the selected database.
+}
+
+actor ScopedRowReader {
+    identified_by: ScopedDatabaseClient
+}
+
+surface ScopedRowVisibility {
+    facing client: ScopedRowReader
+
+    @guarantee ScopedAdmission
+        -- The serving route verifies the host-issued credential before admitting a scoped call.
+        -- A route advertises scoped visibility only when each operation it admits for scoped credentials preserves the scope.
+        -- Plain SQL and legacy endpoints require separate admission and cannot widen a scoped credential's authority.
+
+    @guarantee VisibleVersions
+        -- A table declares the column containing each row version's opaque label.
+        -- A read resolves branch lineage and the winning bitemporal version before applying the read label set.
+        -- An excluded winning version masks the older or inherited row throughout the interval where it wins.
+        -- Query operators, ranking, change images and aggregates consume the resulting visible view.
+        -- Scoped catalog access and query metadata describe only the admitted view.
+
+    @guarantee ScopedCoordinates
+        -- A scoped basis orders the authorized effects of the selected view within the database incarnation and read scope.
+        -- A scoped change position and through value use the same coordinate as the read basis.
+        -- Scoped system time is logical and derived from the authorized effect sequence.
+        -- A scoped position, pagination token or claim can be redeemed only in its issuing incarnation and scope.
+        -- Recovery and routing preserve the meaning of admitted coordinates.
+        -- A waiting feed advances when its scope observes an effect or its requested coverage is complete.
+        -- A hidden winner can affect the authorized sequence by masking an already visible row.
+        -- Histories with the same authorized effect sequence produce the same row results, projected time and change coverage for the same scoped reads.
+        -- This property holds for successful calls at corresponding admitted prefixes and a common valid-time observation.
+        -- Explicit guard outcomes, resource use and service latency have their own contracts.
+
+    @guarantee ScopedWrites
+        -- The transaction resolver enforces the write scope and any SingleLabelPerTx declaration in both modes.
+        -- dev/doc/tx.allium defines label checks, claim validation and guard outcomes.
 }
 
 surface HolderToLog {

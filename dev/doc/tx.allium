@@ -1743,6 +1743,27 @@ surface ConnectionLifecycle {
 -- A transaction applies the selected effects and receipt atomically.
 -- The ordered receipt records Then, Otherwise with its failed guard positions, or Refused with its error.
 
+---- RTDB v1 row visibility (target design)
+
+-- A verified credential for the admitted database can carry independent sets of opaque read and write labels.
+-- The resolver checks the credential's write set against every label supplied or affected by the selected row effects.
+-- A replacement must authorize the incoming label and each effective label it supersedes in the replacement period.
+-- A delete or erasure must authorize the effective or historical labels it removes, respectively.
+-- Scope violations return the same refusal for every affected label.
+-- A scoped credential writes through Transact and requires a visibility declaration on each addressed table.
+-- An unrestricted credential declares visibility before the table has retained row history.
+-- Every put to a declared table contains a literal label in the declared column.
+-- SingleLabelPerTx checks the distinct labels affected by the selected effects across declared tables whenever those effects address a table with that policy.
+-- The otherwise arm has the same write checks as the then arm and starts from the original state.
+-- Before and After guards evaluate the full original state or the full candidate, respectively.
+-- A failed guard returns only its position in the request.
+-- A tracked read records an authenticated footprint of its visible query dependencies under its admitted read scope.
+-- Unchanged tests every write intersecting that footprint, including writes the credential cannot read.
+-- A conservative footprint can cover an entire branch when dependencies cannot be represented precisely.
+-- A scoped attempt and its status lookup are bound to the authenticated credential identity and scope.
+-- Scoped receipts, version guards and transaction placeholders use the scoped coordinates defined by the serving surface.
+-- Erasure removes the authorized historical payloads and follows the storage erasure contract.
+
 rule ValidateRtdbV1 {
     when: TransactValidationRequested(request, reader)
     requires: LinearizablePrefix(reader, basis)
