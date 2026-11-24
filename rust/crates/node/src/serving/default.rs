@@ -54,7 +54,7 @@ impl ServingDriver for DefaultServing {
             }
             let (snapshot, cut) = self.handle.classic_read(source.at, cancellation).await?;
             let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage).await?;
-            return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new() });
+            return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(), key_generation: None });
         }
         let snapshot = self.handle.view(source.at, cancellation).await?;
         let at = if source.at == At::Linearizable { At::Latest } else { source.at };

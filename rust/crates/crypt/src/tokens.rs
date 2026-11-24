@@ -111,13 +111,22 @@ pub struct PageToken {
     pub request: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExportTicket {
+    pub pin: Uuid,
+    pub basis: Basis,
+    pub manifest_sha256: [u8; 32],
+}
+
 const PAGE_BYTES: usize = Basis::WIDTH + 8 + 8 + 32;
+const EXPORT_BYTES: usize = Basis::WIDTH + 16 + 32;
 const SCOPED_CLAIM_DOMAIN: &[u8; 8] = b"scoped\0\x01";
 
 #[derive(Clone, Copy)]
 enum Purpose {
     Claim = 1,
     Page = 2,
+    Export = 3,
 }
 
 impl Purpose {
@@ -129,6 +138,7 @@ impl Purpose {
                 "rtdb/cursor-expired",
                 "Resume from a fresh query",
             ),
+            Self::Export => Anomaly::incorrect("rtdb/invalid-export", "Invalid checkpoint export ticket"),
         }
     }
 
@@ -136,6 +146,7 @@ impl Purpose {
         match self {
             Self::Claim => MAX_CLAIM_PAYLOAD_BYTES,
             Self::Page => PAGE_BYTES,
+            Self::Export => EXPORT_BYTES,
         }
     }
 }
@@ -214,6 +225,31 @@ impl TokenAuthority {
 
     pub async fn open_page(&self, token: &[u8]) -> Result<PageToken> {
         self.resume_page(token).await.map(|(page, _)| page)
+    }
+
+    pub async fn seal_export(&self, ticket: ExportTicket) -> Result<Vec<u8>> {
+        if ticket.pin.is_nil() || ticket.basis.incarnation() != *self.incarnation.as_bytes() {
+            return Err(Purpose::Export.invalid());
+        }
+        let issuer = self.issuer().await?;
+        let mut bytes = Vec::with_capacity(EXPORT_BYTES);
+        bytes.extend_from_slice(ticket.pin.as_bytes());
+        bytes.extend_from_slice(&ticket.basis.to_bytes());
+        bytes.extend_from_slice(&ticket.manifest_sha256);
+        self.seal(&issuer.key, Purpose::Export, &bytes).await
+    }
+
+    pub async fn open_export(&self, token: &[u8]) -> Result<ExportTicket> {
+        let (bytes, _) = self.open(Purpose::Export, token).await?;
+        let invalid = || Purpose::Export.invalid();
+        let (pin, bytes) = bytes.split_first_chunk::<16>().ok_or_else(invalid)?;
+        let (basis, digest) = bytes.split_first_chunk::<{ Basis::WIDTH }>().ok_or_else(invalid)?;
+        let pin = Uuid::from_bytes(*pin);
+        let basis = Basis::from_bytes(basis).map_err(|_| invalid())?;
+        if pin.is_nil() || basis.incarnation() != *self.incarnation.as_bytes() {
+            return Err(invalid());
+        }
+        Ok(ExportTicket { pin, basis, manifest_sha256: digest.try_into().map_err(|_| invalid())? })
     }
 
     pub async fn issuer(&self) -> Result<TokenIssuer> {

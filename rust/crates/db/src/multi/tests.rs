@@ -274,7 +274,12 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     assert_eq!(writer.pin_checkpoint_at(id, future.basis, None).await.unwrap_err().code, "rtdb/pin-id");
     writer.checkpoint(Vec::new()).await.unwrap();
 
-    let export = writer.open_export(id).await.unwrap();
+    let ticket = writer.export_ticket(id, selected.basis, None).await.unwrap();
+    assert_eq!(writer.export_ticket(id, selected.basis, None).await.unwrap(), ticket);
+    let mut changed = ticket.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    assert_eq!(writer.open_export_ticket(&changed).await.err().unwrap().code, "rtdb/invalid-export");
+    let export = writer.open_export_ticket(&ticket).await.unwrap();
     let (cut, checkpoint) = export.exact_checkpoint().await.unwrap();
     assert_eq!(cut.basis, selected.basis);
     let view = checkpoint.index().view("report", At::Exactly(cut.basis), Layer::Merged, cut.system_time).unwrap();
@@ -310,6 +315,11 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     let written = child.transact(&timed).await.unwrap();
     assert!(written.basis > restored.basis);
     assert_eq!(written.outcome, Outcome::Then);
+    writer.release_pin(id).await.unwrap();
+    assert_eq!(writer.open_export_ticket(&ticket).await.err().unwrap().code, "rtdb/unknown-pin");
+    let replacement = writer.export_ticket(id, selected.basis, None).await.unwrap();
+    assert_ne!(replacement, ticket);
+    assert_eq!(writer.open_export_ticket(&ticket).await.err().unwrap().code, "rtdb/invalid-export");
     writer.release_pin(id).await.unwrap();
     child.checkpoint(Vec::new()).await.unwrap();
     let mut follower = cluster.node_for(destination, 3, Arc::new(journal.handle(Identity(3))));

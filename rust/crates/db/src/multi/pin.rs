@@ -1,6 +1,6 @@
 use std::{ops::AsyncFnOnce, sync::Arc};
 
-use rtdb_crypt::{Kms, Plaintext};
+use rtdb_crypt::{Kms, Plaintext, tokens::ExportTicket};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
 use rtdb_index::branches::BranchCut;
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
@@ -106,6 +106,22 @@ impl MultiDatabase {
         })
     }
 
+    pub async fn export_ticket(&mut self, pin: Uuid, basis: Basis, until: Option<Timestamp>) -> Result<Vec<u8>> {
+        let pin = self.pin_checkpoint_at(pin, basis, until).await?;
+        self.tokens.seal_export(ExportTicket { pin: pin.id, basis, manifest_sha256: manifest_identity(pin.manifest) }).await
+    }
+
+    pub async fn open_export_ticket(&mut self, ticket: &[u8]) -> Result<PinnedExport> {
+        let ticket = self.tokens.open_export(ticket).await?;
+        let export = self.open_export(ticket.pin).await?;
+        if manifest_identity(export.image.id()) != ticket.manifest_sha256
+            || exact_payload(&export.image)?.0.basis != ticket.basis
+        {
+            return Err(Anomaly::incorrect("rtdb/invalid-export", "The pinned checkpoint does not match the export ticket"));
+        }
+        Ok(export)
+    }
+
     /// Install an independent backing for an exact export. The destination's
     /// journal and KMS own all bytes needed to recover after the append.
     pub async fn restore_export(&mut self, export: &PinnedExport) -> Result<BranchCut> {
@@ -118,7 +134,7 @@ impl MultiDatabase {
         }
         self.refresh().await?;
         let lease = self.authority()?;
-        let source_identity: [u8; 32] = Sha256::digest(source.to_string().as_bytes()).into();
+        let source_identity = manifest_identity(source);
         let state = self.state();
         let through = state.head;
         let generation = state.generation;
@@ -176,6 +192,10 @@ impl MultiDatabase {
         self.release_pin(id).await?;
         Ok(destination)
     }
+}
+
+fn manifest_identity(manifest: ObjectId) -> [u8; 32] {
+    Sha256::digest(manifest.to_string().as_bytes()).into()
 }
 
 fn exact_payload(image: &VerifiedManifest) -> Result<(BranchCut, &[u8])> {
