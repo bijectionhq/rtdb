@@ -73,6 +73,12 @@ pub(crate) struct NativeRequest<C = VerifiedClaims> {
     scope: Option<NativeServingScope>,
 }
 
+pub(crate) enum ReceiptLookup {
+    Status(Option<NativeServingScope>),
+    ExactRequest { scope: Option<NativeServingScope>, fingerprint: [u8; 32] },
+    InstalledCustody(Basis),
+}
+
 #[derive(Clone)]
 pub struct NativeServingAuthority {
     pub incarnation: [u8; 16],
@@ -240,7 +246,7 @@ impl NativeServingHandle {
             {
                 self.replication.serving_barrier(cancellation).await?;
                 return self.replication.serving_status(
-                    request.transaction.key, request.scope, Some(fingerprint), cancellation,
+                    request.transaction.key, ReceiptLookup::ExactRequest { scope: request.scope, fingerprint }, cancellation,
                 ).await.map_err(|status| if status.code == "rtdb/unknown-transaction" { error } else { status });
             }
             return Err(error);
@@ -275,7 +281,12 @@ impl NativeServingHandle {
 
     pub async fn tx_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
         self.replication.serving_barrier(cancellation).await?;
-        self.replication.serving_status(key, scope, None, cancellation).await
+        self.replication.serving_status(key, ReceiptLookup::Status(scope), cancellation).await
+    }
+
+    pub async fn original_custody_receipt(&self, key: Vec<u8>, basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+        self.replication.serving_barrier(cancellation).await?;
+        self.replication.serving_status(key, ReceiptLookup::InstalledCustody(basis), cancellation).await
     }
 }
 
@@ -669,6 +680,15 @@ impl NativeServing {
         project_receipt(self.durable().index(), receipt, scope)
     }
 
+    pub(crate) fn installed_custody_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
+        let receipt = self.status(key, None)?;
+        if receipt.basis != basis || self.durable().installed_receipt(None, key, basis).is_none() {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/custody-release-receipt",
+                "The original custody receipt is not an exact installed v1 decision"));
+        }
+        Ok(receipt)
+    }
+
     pub(crate) fn recover_exact(&self, key: &[u8], scope: Option<&NativeServingScope>, fingerprint: [u8; 32]) -> Result<Receipt> {
         if !self.view.borrow().compatible { return Err(incompatible()); }
         let namespace = scope.map(|scope| scope.receipt_namespace);
@@ -966,6 +986,8 @@ mod tests {
             let (reopened, _) = open(Some(&image));
             assert_eq!(reopened.durable().installed_receipt(None, &receipt.key, receipt.basis), Some(witness));
             assert_eq!(reopened.durable().installed_receipt(Some([0; 32]), &receipt.key, receipt.basis), None);
+            assert_eq!(reopened.installed_custody_receipt(&receipt.key, receipt.basis).unwrap().basis, receipt.basis);
+            assert!(reopened.installed_custody_receipt(&receipt.key, Basis::new(INCARNATION, 1)).is_err());
             assert!(reopened.durable().validate_installed_receipts(Some(source), Some(ReplicaPosition(11)), Term(2)).is_ok());
             assert!(reopened.durable().validate_installed_receipts(Some(source), Some(ReplicaPosition(8)), Term(2)).is_err());
         }
@@ -991,6 +1013,7 @@ mod tests {
         assert_eq!(row.written_basis(), Some(receipt.basis));
         assert_eq!(reopened.status(&receipt.key, None).unwrap().basis, receipt.basis);
         assert_eq!(reopened.durable().installed_receipt(None, &receipt.key, receipt.basis), None);
+        assert!(reopened.installed_custody_receipt(&receipt.key, receipt.basis).is_err());
         assert!(!reopened.shares_main());
     }
 

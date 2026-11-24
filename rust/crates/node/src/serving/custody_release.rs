@@ -472,6 +472,10 @@ mod tests {
         async fn tx_status(&self, key: &[u8], _: &CancellationToken) -> Result<Receipt> {
             self.state.lock().await.tx_status(key)
         }
+
+        async fn original_custody_receipt(&self, key: &[u8], _: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+            self.tx_status(key, cancellation).await
+        }
     }
 
     struct Carrier {

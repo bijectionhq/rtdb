@@ -928,7 +928,7 @@ fn custody_admission_orders_the_whole_part_and_preserves_its_drain_after_restart
             carrier_receipt_sha256: [at as u8; 32], expires_at: Timestamp(1_000) });
     }
     let admission = CustodyResponseAdmission { registrations: registrations.clone(), frame_sha256: [15; 32],
-        read_proofs_sha256: Some([16; 32]), selected_basis: basis(3), key_generation: Some(7) };
+        read_proofs_sha256: Some([16; 32]), selected_basis: basis(3), key_generation: 7 };
     let admit = |admission| TrustedCustodyCommand::Admit(TrustedCustodyAdmission { admission, writer: writer.clone() }).into_request().unwrap();
     let exact = admit(admission.clone());
     assert!(Transact::decode_canonical_request(exact.canonical_request().unwrap().get().as_bytes()).is_err());

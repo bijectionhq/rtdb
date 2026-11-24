@@ -96,7 +96,7 @@ pub struct CustodyResponseAdmission {
     pub frame_sha256: [u8; 32],
     pub read_proofs_sha256: Option<[u8; 32]>,
     pub selected_basis: Basis,
-    pub key_generation: Option<u64>,
+    pub key_generation: u64,
 }
 
 impl CustodyResponseAdmission {

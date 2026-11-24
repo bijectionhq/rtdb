@@ -95,37 +95,44 @@ impl ServingDriver for DefaultServing {
         self.handle.transact(request, claims, None, cancellation).await
     }
 
-    async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
-        if groups.is_empty() { return Ok(()); }
-        let view = self.handle.view(At::Linearizable, cancellation).await?;
-        let vault = self.tokens.authority().await?.custody_vault();
-        super::custody::check_delivery(&view.index, &vault, groups).await
-    }
-
     async fn check_read_delivery(&self, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
-        self.check_custody_delivery(groups, cancellation).await?;
-        if let Some(generation) = generation {
-            self.handle.authority().check_checkpoint_generation(generation).await?;
+        let Some(generation) = generation else {
+            return if groups.is_empty() { Ok(()) } else { Err(super::custody_release::release_unavailable()) };
+        };
+        if !groups.is_empty() {
+            let index = self.current_custody(cancellation).await?;
+            let vault = self.tokens.authority().await?.custody_vault();
+            super::custody::check_delivery(&index, &vault, groups).await?;
         }
-        Ok(())
+        self.handle.authority().check_checkpoint_generation(generation).await
     }
 
     async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
+        if self.handle.has_classic_read() { return Err(super::custody_release::release_unavailable()); }
         Ok(self.handle.view(At::Linearizable, cancellation).await?.index)
     }
 
+    async fn original_custody_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+        self.handle.original_custody_receipt(key.to_vec(), basis, cancellation).await
+    }
+
     async fn submit_custody_release(&self, command: TrustedCustodyCommand, cancellation: &CancellationToken) -> Result<Receipt> {
-        if !self.writable { return Err(super::custody_release::release_unavailable()); }
+        if !self.writable || self.handle.has_classic_read() { return Err(super::custody_release::release_unavailable()); }
         self.handle.submit_custody_release(command, cancellation).await
     }
 
     async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,
                                             generation: Option<u64>, cancellation: &CancellationToken) -> Result<()> {
-        if generation.is_some() { return Err(super::custody_release::release_unavailable()); }
-        let vault = self.tokens.authority().await?.custody_vault();
-        for &group in groups { vault.check_readable(group).await?; }
+        if !groups.is_empty() {
+            let vault = self.tokens.authority().await?.custody_vault();
+            for &group in groups { vault.check_readable(group).await?; }
+        }
         let index = self.current_custody(cancellation).await?;
-        super::custody_release::check_release_cut(&index, writer, groups, self.clock.now())
+        super::custody_release::check_release_cut(&index, writer, groups, self.clock.now())?;
+        if let Some(generation) = generation {
+            self.handle.authority().check_checkpoint_generation(generation).await?;
+        }
+        Ok(())
     }
 
     async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {

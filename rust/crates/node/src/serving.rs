@@ -202,6 +202,10 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no ordered custody catalog"))
     }
 
+    async fn original_custody_receipt(&self, _key: &[u8], _basis: Basis, _cancellation: &CancellationToken) -> Result<Receipt> {
+        Err(custody_release::release_unavailable())
+    }
+
     async fn submit_custody_release(&self, _command: TrustedCustodyCommand, _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no trusted release submission"))
     }

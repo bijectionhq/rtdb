@@ -169,3 +169,18 @@ The provider client declines redirects, uses a five-second request timeout and v
 The first Query proof fields are `custody_release_evidence` at request tag 7 and `custody_release_proof` at trailer tag 6.
 A proof is issued only for an unscoped native view with complete placement evidence and uses that view's selected key generation.
 The cross-process bridge and action remain private while the active W10b consumers and protected reader coverage are incomplete.
+
+### Default canonical delivery
+
+The original provider identifies the unscoped v1 writer and carrier receipts by their exact request keys, opaque Basis and system time.
+Default verifies each receipt's canonical source, replica and term installation in that namespace before matching the original carrier occurrence in the v1 fold.
+Release phase and admission receipts stay in the private custody release namespace.
+The Default Classic mirror serves its public projection and contributes no protected inventory, installed receipt proof or delivery generation.
+
+A protected read or response admission carries the held native view's exact sealed checkpoint generation.
+Default checks that generation against the checkpoint key authority at delivery and around ordered response admission.
+If a survivor adopts a new generation, only the generation already held by an old view can authorize that view.
+An inline view with protected contributors has no release proof and refuses delivery.
+Qualify a sealed checkpoint selection or verified survivor adoption before serving protected data from a newly attached Default database.
+Run `physical_receipt_follows_the_original_source_and_the_settled_replica`, `previously_persisted_native_rows_keep_their_exact_basis_without_a_physical_witness`, and the mounted owner test's held-generation retirement case.
+The Default feature and source admission gates stay closed for the joint qualification of the source projection, protected readers, provider drain and erasure.

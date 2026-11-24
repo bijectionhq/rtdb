@@ -253,7 +253,7 @@ mod release_tests {
 
         let admit = TrustedCustodyCommand::Admit(TrustedCustodyAdmission {
             admission: CustodyResponseAdmission { registrations: vec![command.release.registration],
-                frame_sha256: [16; 32], read_proofs_sha256: Some([17; 32]), selected_basis: Basis::new(incarnation, 3), key_generation: None },
+                frame_sha256: [16; 32], read_proofs_sha256: Some([17; 32]), selected_basis: Basis::new(incarnation, 3), key_generation: 7 },
             writer: command.writer,
         });
         let transaction = admit.clone().into_request().unwrap();

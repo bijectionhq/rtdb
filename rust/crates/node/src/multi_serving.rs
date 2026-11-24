@@ -302,6 +302,12 @@ impl ServingDriver for MultiServing {
             .ok_or_else(interrupted)?
     }
 
+    async fn original_custody_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+        let receipt = self.tx_status(key, cancellation).await?;
+        if receipt.basis != basis { return Err(crate::serving::custody_release::release_unavailable()); }
+        Ok(receipt)
+    }
+
     async fn changes(
         &self,
         request: Changes,

@@ -289,7 +289,12 @@ impl MountedResponseRelease<'_> {
             })
             .await?;
         if view.cut.basis.incarnation() != authority.incarnation
-            || view.custody_contributors.is_none()
+            || view
+                .custody_contributors
+                .as_ref()
+                .is_none_or(|contributors| {
+                    !contributors.is_empty() && view.key_generation.is_none()
+                })
         {
             return Err(release_unavailable());
         }
@@ -333,7 +338,7 @@ impl MountedResponseRelease<'_> {
             frame_sha256: custody_frame_commitment(frame),
             read_proofs_sha256: None,
             selected_basis: first.view.cut.basis,
-            key_generation: first.view.key_generation,
+            key_generation: first.view.key_generation.ok_or_else(release_unavailable)?,
         };
         let first = admission
             .registrations
@@ -405,10 +410,10 @@ impl MountedResponseRelease<'_> {
                         writer,
                     }))
                     .await?;
-                if !receipt.replayed && generation.is_some() {
+                if !receipt.replayed {
                     release
                         .driver
-                        .check_read_delivery(generation, &BTreeSet::new(), self.cancellation)
+                        .check_read_delivery(Some(generation), &BTreeSet::new(), self.cancellation)
                         .await?;
                 }
                 Ok(receipt)
@@ -452,7 +457,7 @@ impl MountedResponseRelease<'_> {
             .check_contributors(
                 contributors,
                 &admission.registrations,
-                admission.key_generation,
+                Some(admission.key_generation),
             )
             .await
     }

@@ -113,7 +113,7 @@ impl<'a> AttachedCustodyCarrierJournal<'a> {
         }
         let receipt = self
             .attachment
-            .tx_status(&expected.key, cancellation)
+            .original_custody_receipt(&expected.key, expected.basis, cancellation)
             .await?;
         if receipt.key != expected.key
             || receipt.basis != expected.basis

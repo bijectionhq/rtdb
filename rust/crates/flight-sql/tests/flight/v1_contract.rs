@@ -2,6 +2,7 @@ use super::*;
 use arrow_flight::{FlightData, Ticket};
 use prost::Name;
 use rtdb_flight_sql::rtdb::v1::{self as v1, at::Selection};
+use rtdb_types::EntityId;
 
 const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
 
@@ -2004,6 +2005,7 @@ impl rtdb_node::serving::custody_release::OriginalCarrierObservations for Custod
 
 #[tokio::test]
 async fn native_original_custody_mount_rechecks_the_writer_and_withdraws_old_owners() {
+    use rtdb_crypt::{Generation, Kms, LocalKms};
     use rtdb_node::serving::{NativeServingAuthority, QuerySource, custody_release::{
         CustodyCarrierAuthority, CustodyProviderInstallation, OriginalReceipt, OriginalWriterPoint, original_writer_commitment,
     }};
@@ -2011,8 +2013,19 @@ async fn native_original_custody_mount_rechecks_the_writer_and_withdraws_old_own
     use tokio_util::sync::CancellationToken;
 
     let incarnation = [74; 16];
+    let kms_time = Arc::new(AtomicI64::new(0));
+    let kms: Arc<dyn Kms> = Arc::new(LocalKms::new({
+        let time = Arc::clone(&kms_time);
+        move || time.load(Ordering::SeqCst)
+    }));
+    let selected = Generation { database: uuid::Uuid::from_bytes(incarnation), number: 1 };
+    let successor = Generation { number: 2, ..selected };
+    kms.create(selected).await.unwrap();
+    kms.create(successor).await.unwrap();
     let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
-        "xtdb", NativeServingAuthority { incarnation, checkpoints: None },
+        "xtdb", NativeServingAuthority { incarnation, checkpoints: Some(rtdb_replication::NativeCheckpointAuthority {
+            kms: Arc::clone(&kms), generation: successor.number,
+        }) },
     );
     let running = Running::start_with_resources(
         None, FlightConfig::default(), &[], None, Default::default(), None, Some(Arc::new(resources)),
@@ -2051,7 +2064,18 @@ async fn native_original_custody_mount_rechecks_the_writer_and_withdraws_old_own
     assert!(catalog.original_custody_response_owner("xtdb").is_err());
     let mount = catalog.mount_original_custody_provider("xtdb", installation(observed.clone()), &cancellation).await.unwrap();
     assert!(catalog.mount_original_custody_provider("xtdb", installation(observed.clone()), &cancellation).await.is_err());
-    assert!(!database.serving_driver().unwrap().features().contains(&rtdb_tx::transact::ROW_CUSTODY));
+    let driver = database.serving_driver().unwrap();
+    assert!(!driver.features().contains(&rtdb_tx::transact::ROW_CUSTODY));
+    assert!(driver.check_read_delivery(None, &[[1; 16]].into(), &cancellation).await.is_err());
+    let writer = rtdb_tx::transact::CustodyWriterFence {
+        table: TableRef::new("public", "installation"), id: EntityId::Integer(1), valid_at: observed.system_time, written: observed.basis,
+    };
+    driver.check_custody_release_delivery(&Default::default(), &writer, Some(selected.number), &cancellation).await.unwrap();
+    kms.retire(selected, 10).await.unwrap();
+    kms_time.store(10, Ordering::SeqCst);
+    assert_eq!(driver.check_custody_release_delivery(&Default::default(), &writer, Some(selected.number), &cancellation)
+        .await.unwrap_err().code, "rtdb/erased-under-view");
+    driver.check_custody_release_delivery(&Default::default(), &writer, Some(successor.number), &cancellation).await.unwrap();
     let owner = catalog.original_custody_response_owner("xtdb").unwrap();
     let release = owner.response_release(&rtdb_node::SystemClock, &cancellation).unwrap();
     let source = || QuerySource { branch: "main".into(), at: At::Linearizable, layer: Layer::Merged };

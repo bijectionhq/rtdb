@@ -225,6 +225,9 @@ impl Service {
         generation: Option<u64>,
         contributors: CustodyContributors,
     ) -> Result<Vec<u8>, Status> {
+        if !contributors.is_empty() && generation.is_none() {
+            return Err(unavailable());
+        }
         let route = self.custody_route(call)?;
         let owner = route.acquire(self, call, database).await?;
         let release = owner
@@ -323,7 +326,7 @@ impl Service {
                     registrations,
                     frame_sha256,
                     selected_basis,
-                    key_generation,
+                    key_generation: key_generation.ok_or_else(unavailable)?,
                     read_proofs_sha256: Some(read_proofs_commitment(&read_proofs)),
                 };
                 if admit {

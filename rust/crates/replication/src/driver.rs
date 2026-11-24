@@ -24,7 +24,7 @@ use crate::logs::{APPEND_CAPACITY, DecodedReplica, PartitionReplay, STRICT_DISPA
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
 use crate::state::fail_pending;
-use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, NativeServingScope, SourceRequest};
+use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, SourceRequest};
 use rtdb_tx::transact::{Erasure, Outcome as ServingOutcome, Receipt as ServingReceipt};
 use crate::default_erasure::{self, AppliedErasure, DefaultErasure, ErasureCut};
 
@@ -176,9 +176,9 @@ impl ReplicationHandle {
             .ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
         cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::interrupted())?
     }
-    pub(crate) async fn serving_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, fingerprint: Option<[u8; 32]>, cancellation: &CancellationToken) -> Result<ServingReceipt> {
+    pub(crate) async fn serving_status(&self, key: Vec<u8>, lookup: serving::ReceiptLookup, cancellation: &CancellationToken) -> Result<ServingReceipt> {
         let (completion, receipt) = oneshot::channel();
-        cancellation.run_until_cancelled(self.commands.send(Command::ServingStatus { key, scope, fingerprint, completion })).await
+        cancellation.run_until_cancelled(self.commands.send(Command::ServingStatus { key, lookup, completion })).await
             .ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
         cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?
     }
@@ -316,7 +316,7 @@ impl ExternalReceipt {
 
 enum Command {
     ServingValidate { term: Term, request: NativeRequest, completion: serving::Completion },
-    ServingStatus { key: Vec<u8>, scope: Option<NativeServingScope>, fingerprint: Option<[u8; 32]>, completion: serving::Completion },
+    ServingStatus { key: Vec<u8>, lookup: serving::ReceiptLookup, completion: serving::Completion },
     ResetCompactor { term: Term, primary: PublishedPrimaryReset, reservations: Arc<[Arc<MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
     Retire { term: Term, tables: Vec<TableRef>, as_of: Timestamp, completion: oneshot::Sender<Result<Applied>> },
@@ -2143,10 +2143,11 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
-        if let Command::ServingStatus { key, scope, fingerprint, completion } = command {
-            let status = self.serving.as_ref().ok_or_else(serving::unavailable).and_then(|serving| match fingerprint {
-                Some(fingerprint) => serving.recover_exact(&key, scope.as_ref(), fingerprint),
-                None => serving.status(&key, scope.as_ref()),
+        if let Command::ServingStatus { key, lookup, completion } = command {
+            let status = self.serving.as_ref().ok_or_else(serving::unavailable).and_then(|serving| match lookup {
+                serving::ReceiptLookup::Status(scope) => serving.status(&key, scope.as_ref()),
+                serving::ReceiptLookup::ExactRequest { scope, fingerprint } => serving.recover_exact(&key, scope.as_ref(), fingerprint),
+                serving::ReceiptLookup::InstalledCustody(basis) => serving.installed_custody_receipt(&key, basis),
             });
             let _ = completion.send(status);
             return Ok(());

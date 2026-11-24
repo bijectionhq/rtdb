@@ -144,6 +144,7 @@ surface StatelessDatabase {
     @guarantee ProtectedResponseRelease
         -- The installed original carrier journal authenticates the exact attachment, original writer, response part, admitted occurrence and immutable cutoff.
         -- The original writer and carrier receipt are observed independently and verified by exact request key, basis and system time on the original attachment.
+        -- Default verifies receipt installation in the canonical v1 fold and validates the exact generation held by the protected view.
         -- The carrier receipt selects the admitted occurrence and its commitment is retained in the release registration.
         -- The response release command checks the observed writer version in the same order as the hold or terminal.
         -- The writer version must own both its configured valid-time point and the current valid-time point at the ordered decision.
