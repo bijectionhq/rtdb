@@ -235,6 +235,7 @@ rule SearchJobRuns {
     -- A forward witness identifies an event and a digest of the ordered analyzer token sequence for one field.
     -- Readers authenticate the selected forward-witness range and decode Arrow from its retained bytes.
     -- A resolved event must identify itself before a forward witness can certify its score.
+    -- A posting run receipt carries the SHA-256 of the complete Arrow file, including its footer and trailer.
     -- The writer stores a search-pending intent with its staging owner before uploading the immutable body.
     -- A successful upload supplies the immutable publication for ordered adoption when the provider exposes it.
     -- An unsuccessful upload leaves the intent for collection under the same writer-drain rules.

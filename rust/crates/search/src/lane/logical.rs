@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fs::File, io::{BufWriter, Read}, path::Path, sync::Arc};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fs::File, io::BufWriter, path::Path, sync::Arc};
 
 use arrow_array::Array;
 use rtdb_format::term_directory;
@@ -12,7 +12,7 @@ use rtdb_types::{AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, Interva
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchDefinition, file::{BuildMode, EncodedTreeLocator, IndexedRow, LOGICAL_FORMAT_VERSION, LogicalDocument, SearchPage, SearchPosition, search_position, TextRevision, write_group_as}};
+use crate::{SearchDefinition, file::{BuildMode, EncodedTreeLocator, FileDigestWriter, IndexedRow, LOGICAL_FORMAT_VERSION, LogicalDocument, SearchPage, SearchPosition, search_position, TextRevision, write_group_as}};
 use super::{ArrowSearchPage, PageRows, SearchBuilder, fault, indexing_allowance, open_search_input};
 use super::forward::{ForwardFile, ForwardOutput};
 use crate::term_directory::{TermEdits, TermSummaries};
@@ -380,14 +380,14 @@ impl SearchBuilder {
         let identity = run_identity(&entry.slug, &index.id, index.version, &blocks, 0, &allocation);
         let (budget, token, columns, version, analyzer) = (Arc::clone(&self.memory), cancellation.clone(), columns.to_vec(), index.version, index.analyzer);
         let indexing = self.memory.reserve(indexing_allowance(size))?;
-        let ((locator, digest), source_rows, has_erases, summaries, forward) = tokio::task::spawn_blocking(move || {
+        let (locator, digest, source_rows, has_erases, summaries, forward) = tokio::task::spawn_blocking(move || {
             let build = |forward_owner: Option<[u8; 32]>, indexing| {
                 let forward = RefCell::new(forward_owner.and_then(|owner| ForwardOutput::new(owner, &budget).ok()));
                 let (reader, opening) = open_search_input(input.try_clone().map_err(fault)?, &columns, &budget)?;
                 let mut pages = PageRows::new(reader, opening, Arc::clone(&budget), token.clone(), analyzer, false);
                 pages.mode = BuildMode::Postings;
                 pages.seal = seal.clone();
-                let output = BufWriter::new(File::create(&file).map_err(fault)?);
+                let mut output = FileDigestWriter::new(BufWriter::new(File::create(&file).map_err(fault)?));
                 let mut source_rows = 0i64;
                 let mut has_erases = false;
                 let counted = pages.enumerate().map(|(number, page)| {
@@ -406,9 +406,11 @@ impl SearchBuilder {
                     Ok(PostingPage { page, number, columns: columns.len(), forward: &forward,
                         revisions: Vec::with_capacity(capacity), _scratch: scratch })
                 });
-                let (_, summaries) = write_group_as(&columns, [counted], &identity, Some(version), None, output, Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
+                let (_, summaries) = write_group_as(&columns, [counted], &identity, Some(version), None, &mut output,
+                    Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
+                let digest = output.into_digest();
                 let forward = forward.into_inner().and_then(|output| output.finish().ok());
-                Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, source_rows, has_erases, summaries, forward))
+                Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, digest, source_rows, has_erases, summaries, forward))
             };
             match build(forward_owner, indexing) {
                 Err(error) if forward_owner.is_some() && error.code == "rtdb/memory-budget-exceeded" && !token.is_cancelled() => {
@@ -880,11 +882,12 @@ impl SearchBuilder {
         let file = output.clone();
         let allocation = *uuid::Uuid::new_v4().as_bytes();
         let (identity, columns, version) = (run_identity(slug, &index.id, index.version, &blocks, rebuild, &allocation), columns.to_vec(), index.version);
-        let ((locator, digest), summaries) = tokio::task::spawn_blocking(move || {
-            let output = BufWriter::new(File::create(&file).map_err(fault)?);
-            let (_, summaries) = write_group_as(&columns, [[Ok(MergedRows(rows))]], &identity, Some(version), None, output,
+        let (locator, digest, summaries) = tokio::task::spawn_blocking(move || {
+            let mut output = FileDigestWriter::new(BufWriter::new(File::create(&file).map_err(fault)?));
+            let (_, summaries) = write_group_as(&columns, [[Ok(MergedRows(rows))]], &identity, Some(version), None, &mut output,
                 Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
-            Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, summaries))
+            let digest = output.into_digest();
+            Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, digest, summaries))
         }).await.map_err(fault)??;
         let run = self.publish_run(index, slug, &output, blocks, rebuild, source_rows, has_erases, locator, digest, allocation, source_receipt, cancellation).await?;
         Ok(PreparedLogicalRun { run, summaries })
@@ -928,16 +931,9 @@ impl SearchPage for MergedRows {
     }
 }
 
-fn read_locator(path: &Path) -> Result<(EncodedTreeLocator, [u8; 32])> {
+fn read_locator(path: &Path) -> Result<EncodedTreeLocator> {
     let mut file = File::open(path).map_err(fault)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let size = file.read(&mut buffer).map_err(fault)?;
-        if size == 0 { break; }
-        digest.update(&buffer[..size]);
-    }
-    Ok((EncodedTreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION, false)?, digest.finalize().into()))
+    EncodedTreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION, false)
 }
 
 async fn publish_change(publisher: &dyn ArtefactPublisher, storage: (StorageVersion, StorageEpoch), index: &LogicalIndex,
@@ -1422,6 +1418,9 @@ mod tests {
             }
             let body = ObjectKey::new(run.object_key(&slug).unwrap()).unwrap();
             assert_eq!(builder.store.head(&body).await.unwrap().size, run.file_size() as u64);
+            let bytes = builder.store.get(&body).await.unwrap();
+            let digest: [u8; 32] = Sha256::digest(bytes.as_ref()).into();
+            assert_eq!(run.identity().unwrap(), digest);
         }
     }
 

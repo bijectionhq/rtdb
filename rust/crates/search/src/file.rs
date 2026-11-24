@@ -49,6 +49,7 @@ pub(crate) fn term_stats(nodes: &StructArray, row: usize, doc_freq: u32) -> Resu
     Ok(crate::term_directory::TermStats { doc_freq, max_tf: node.frequency, min_len: node.length,
         unit_bound: node.unit_score, first_window: node.first, last_window: node.last })
 }
+pub(crate) use layout::FileDigestWriter;
 pub(crate) use page_tree::PageCache;
 pub(crate) use tree_file::{EncodedTreeLocator, MAX_ROOT_BYTES, TreeFile, TreeLocator};
 pub(crate) use tree_file::LogicalDocument;

@@ -238,6 +238,33 @@ pub(super) fn record(format: i32, populated: impl IntoIterator<Item = (Table, St
     RecordBatch::try_new(Arc::clone(schema), columns).map_err(fault)
 }
 
+pub(crate) struct FileDigestWriter<W> {
+    output: W,
+    digest: Sha256,
+}
+
+impl<W> FileDigestWriter<W> {
+    pub(crate) fn new(output: W) -> Self {
+        Self { output, digest: Sha256::new() }
+    }
+
+    pub(crate) fn into_digest(self) -> [u8; 32] {
+        self.digest.finalize().into()
+    }
+}
+
+impl<W: Write> Write for FileDigestWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.output.write(buf)?;
+        self.digest.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
 struct DigestWriter<W> {
     writer: W,
     digest: Sha256,
