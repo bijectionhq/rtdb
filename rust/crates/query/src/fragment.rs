@@ -1,6 +1,6 @@
 //! Scan fragments: a scan of one table split by trie prefix, so that another node can read a slice of the table at the
 //! query's basis and send back the rows it resolves, in place of this node reading those tries itself.
-use std::{io::{self, Cursor, Write}, ops::Range};
+use std::{io::{self, Write}, ops::Range};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -121,7 +121,7 @@ impl ScanFragment {
     ) -> Result<crate::BoundParameters> {
         use rtdb_plan::Expr;
         let malformed = || invalid("fragment-argument", "Invalid delegated predicate argument");
-        let stream = rtdb_format::ipc::OwnedStream::read_buffer(Buffer::from(Bytes::from_owner(bytes)), memory)?;
+        let stream = rtdb_format::ipc::OwnedStream::read_buffer(bytes.into_ipc_buffer(), memory)?;
         let [page] = stream.pages() else { return Err(malformed()); };
         let batch = page.batch();
         if batch.num_rows() != 1 || self.scan.predicates.iter().any(|predicate| !portable(predicate)) { return Err(malformed()); }
@@ -294,6 +294,7 @@ impl FragmentBytes {
 
     pub fn as_slice(&self) -> &[u8] { &self.bytes }
     pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+    pub(crate) fn into_ipc_buffer(self) -> Buffer { Buffer::from(Bytes::from_owner(self)) }
 }
 
 impl AsRef<[u8]> for FragmentBytes {
@@ -433,19 +434,22 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
 }
 
 /// The batches `encode_batch` wrote into `bytes`, each charged to `memory` for what it retains.
-pub(crate) fn decode_batches(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Vec<ColumnBatch>> {
+pub(crate) fn decode_batches(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Vec<ColumnBatch>> {
     let malformed = |message: &str| invalid("fragment-decode", message);
     let mut batches = Vec::new();
     let mut rest = bytes;
     while !rest.is_empty() {
-        let (length, tail) = rest.split_first_chunk::<8>().ok_or_else(|| malformed("A fragment frame is truncated"))?;
+        let (length, tail) = rest.as_slice().split_first_chunk::<8>()
+            .ok_or_else(|| malformed("A fragment frame is truncated"))?;
         let length = usize::try_from(u64::from_be_bytes(*length)).map_err(|error| invalid("fragment-decode", error))?;
         if tail.len() < length { return Err(malformed("A fragment frame is truncated")); }
-        let (frame, tail) = tail.split_at(length);
-        rest = tail;
-        let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(frame), None).map_err(|error| invalid("fragment-decode", error))?;
-        for record in reader {
-            let record = record.map_err(|error| invalid("fragment-decode", error))?;
+        let frame = rest.slice_with_length(8, length);
+        rest.advance(8 + length);
+        let stream = rtdb_format::ipc::OwnedStream::read_buffer(frame, memory).map_err(|error| {
+            if error.code == "rtdb.format/invalid-arrow" { invalid("fragment-decode", error) } else { error }
+        })?;
+        for page in stream.pages() {
+            let record = page.batch();
             let mut reservation = memory.reserve(256)?;
             let metadata_charge = Arc::get_mut(&mut reservation).expect("A fragment batch owns its reservation");
             let mut columns = Vec::with_capacity(record.num_columns());
@@ -661,7 +665,7 @@ mod tests {
         let batch = ColumnBatch::settled(vec![Column::Values(values.clone())], 4, memory.reserve(4096).unwrap()).unwrap();
         let mut bytes = FragmentBytes::new(&memory).unwrap();
         encode_batch(&batch, &memory, &mut bytes).unwrap();
-        let batches = decode_batches(bytes.as_slice(), &memory).unwrap();
+        let batches = decode_batches(bytes.into_ipc_buffer(), &memory).unwrap();
         let [frame] = batches.as_slice() else { panic!("one fixed-width IPC frame") };
         let Column::Selected(selection) = &frame.columns[0] else { panic!("decoded Arrow-backed selection") };
         let mut sources = selection.source_layouts();
@@ -691,6 +695,77 @@ mod tests {
     }
 
     #[test]
+    fn decoded_fragment_values_keep_the_charged_reply_allocation() {
+        use arrow_array::StringArray;
+
+        let reply_memory = MemoryBudget::new(1 << 20);
+        let memory = MemoryBudget::new(1 << 20);
+        let column = Column::Arrow {
+            array: Arc::new(StringArray::from(vec!["retained"])),
+            field: Arc::new(ArrowField::new("text", arrow_schema::DataType::Utf8, false)),
+            logical: None,
+        };
+        let batch = ColumnBatch::settled(vec![column], 1, memory.reserve(256).unwrap()).unwrap();
+        let mut reply = FragmentBytes::new(&reply_memory).unwrap();
+        encode_batch(&batch, &memory, &mut reply).unwrap();
+        drop(batch);
+        let reply_addresses = reply.as_slice().as_ptr_range();
+        let reply_charge = reply_memory.used_bytes();
+
+        let decoded = decode_batches(reply.into_ipc_buffer(), &memory).unwrap();
+        let Column::Arrow { array, .. } = &decoded[0].columns[0] else { panic!("Expected an Arrow column") };
+        let array = Arc::clone(array);
+        drop(decoded);
+
+        let text = array.as_any().downcast_ref::<StringArray>().unwrap().value(0);
+        assert_eq!(text, "retained");
+        assert!(reply_addresses.contains(&text.as_ptr()));
+        assert_eq!(reply_memory.used_bytes(), reply_charge);
+        drop(array);
+        assert_eq!(reply_memory.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn fragment_decoder_refuses_truncated_frames_and_invalid_wire_layouts() {
+        use arrow_array::Int64Array;
+        use arrow_ipc::writer::StreamWriter;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let stream = |metadata| {
+            let field = ArrowField::new("c0", arrow_schema::DataType::Int64, false).with_metadata(metadata);
+            let schema = Arc::new(ArrowSchema::new(vec![field]));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vec![42]))]).unwrap();
+            let mut writer = StreamWriter::try_new(Vec::new(), &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.into_inner().unwrap()
+        };
+        let decode = |frame: &[u8], length: usize| {
+            let mut bytes = (length as u64).to_be_bytes().to_vec();
+            bytes.extend_from_slice(frame);
+            decode_batches(FragmentBytes::from_vec(bytes, &memory).unwrap().into_ipc_buffer(), &memory)
+        };
+        let legacy = stream([(COLUMN_KEY.into(), "values".into())].into());
+        let decoded = decode(&legacy, legacy.len()).unwrap();
+        assert_eq!(decoded[0].columns[0].value(0).unwrap(), Value::I64(42));
+        drop(decoded);
+        let missing_encoding = stream(Default::default());
+        let missing_name = stream([(COLUMN_KEY.into(), "arrow".into())].into());
+        let mut trailing = legacy.clone();
+        trailing.push(0);
+        for (frame, length) in [
+            (legacy.as_slice(), legacy.len() + 1),
+            (&legacy[..legacy.len() - 8], legacy.len() - 8),
+            (trailing.as_slice(), trailing.len()),
+            (missing_encoding.as_slice(), missing_encoding.len()),
+            (missing_name.as_slice(), missing_name.len()),
+        ] {
+            assert_eq!(decode(frame, length).err().unwrap().code, "rtdb.query/fragment-decode");
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn fragment_splits_after_a_partial_write_fails_admission() {
         let source_memory = MemoryBudget::new(32 << 20);
         let memory = MemoryBudget::new(9 << 20);
@@ -706,7 +781,7 @@ mod tests {
 
         encode_batch(&batch, &memory, &mut out).unwrap();
 
-        let frames = decode_batches(out.as_slice(), &source_memory).unwrap();
+        let frames = decode_batches(out.into_ipc_buffer(), &source_memory).unwrap();
         assert_eq!(frames.iter().map(|frame| frame.len).collect::<Vec<_>>(), [1, 1]);
         for frame in frames {
             assert_eq!(frame.columns[0].value(0).unwrap(), Value::Binary(data.clone()));
@@ -731,7 +806,7 @@ mod tests {
         let mut bytes = FragmentBytes::new(&memory).unwrap();
         encode_batch(&batch, &memory, &mut bytes).unwrap();
         encode_batch(&ColumnBatch::settled(Vec::new(), 2, memory.reserve(256).unwrap()).unwrap(), &memory, &mut bytes).unwrap();
-        let decoded = decode_batches(&bytes.into_bytes(), &memory).unwrap();
+        let decoded = decode_batches(bytes.into_ipc_buffer(), &memory).unwrap();
         let (empty_width, payload) = decoded.split_last().unwrap();
         assert_eq!((empty_width.len, empty_width.columns.len()), (2, 0), "a batch of no columns keeps its row count");
         let cells = |batch: &ColumnBatch| -> Vec<Vec<String>> { (0..batch.len).map(|row| batch.columns.iter().map(|column| format!("{:?}", column.value(row).unwrap())).collect()).collect() };

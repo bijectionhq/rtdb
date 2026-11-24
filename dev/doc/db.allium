@@ -2133,6 +2133,7 @@ surface QueryAccess {
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget.
+        -- Compatible mixed-layout spill vectors retain their charged IPC body storage through replay.
         -- A shared mark can replay its candidate Arrow pages to evaluate arbitrary Boolean comparisons.
         -- Direct floating-point list comparisons in a shared mark preserve SQL unknown results across candidate pages.
         -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
@@ -2193,6 +2194,7 @@ surface QueryAccess {
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
+        -- A fragment vector that borrows its reply's IPC body keeps the reply allocation charged through its last use.
         -- A delegated reader restores literal expressions from the fragment's Arrow argument page.
         -- The literal page preserves full-width time values, decimal coefficients and their declared types until expression evaluation.
         -- The literal page preserves URI text until expression evaluation admits it.

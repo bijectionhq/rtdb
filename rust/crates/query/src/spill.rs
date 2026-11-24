@@ -199,9 +199,11 @@ impl SpillReader {
                 ColumnBatch::from_owned(batch).map(Some)
             }
             [2] => {
-                let (bytes, _charge) = self.read_frame(1)?
+                let (bytes, charge) = self.read_frame(1)?
                     .ok_or_else(|| invalid("invalid-spill", "Spilled Arrow fragments are absent"))?;
-                let mut batches = decode_batches(&bytes, &self.memory)?;
+                let bytes = rtdb_columnar::retain_buffer(&Buffer::from_vec(bytes), &charge);
+                drop(charge);
+                let mut batches = decode_batches(bytes, &self.memory)?;
                 if batches.len() == 1 { return Ok(batches.pop()); }
                 if batches.is_empty() { return Err(invalid("invalid-spill", "Spilled page has no Arrow fragments")); }
                 let rows = batches.iter().try_fold(0usize, |count, batch| {
@@ -305,11 +307,22 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
 
     let mut writer = spill.create().unwrap();
     writer.write_columns(&batch, &schema, &memory).unwrap();
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let replay_memory = MemoryBudget::new(1 << 23);
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&replay_memory)).unwrap();
     let replayed = reader.read_columns(1).unwrap().unwrap();
-    assert!(matches!(replayed.columns[0], Column::Selected(_)));
+    let Column::Selected(selected) = &replayed.columns[0] else { panic!("Expected mixed Arrow fields") };
+    let retained = {
+        let (source, _, _) = selected.source_layouts().next().unwrap();
+        let source = source.as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+        Arc::clone(source.column(0))
+    };
     for (row, expected) in values.into_iter().enumerate() {
         assert_eq!(replayed.columns[0].value(row).unwrap(), expected);
     }
     assert!(reader.read_columns(1).unwrap().is_none());
+    drop((reader, replayed));
+    assert_eq!(spill.retained_bytes(), 0);
+    assert!(replay_memory.used_bytes() > 0);
+    drop(retained);
+    assert_eq!(replay_memory.used_bytes(), 0);
 }

@@ -1459,9 +1459,8 @@ fn fragment_frames_keep_source_layouts_and_selection_order() {
     let mut wire = crate::fragment::FragmentBytes::new(&memory).unwrap();
 
     crate::fragment::encode_batch(&batch, &memory, &mut wire).unwrap();
-    let wire = wire.into_bytes();
-    assert!(wire.len() < width * 2);
-    let frames = crate::fragment::decode_batches(&wire, &memory).unwrap();
+    assert!(wire.as_slice().len() < width * 2);
+    let frames = crate::fragment::decode_batches(wire.into_ipc_buffer(), &memory).unwrap();
 
     assert_eq!(frames.iter().map(|frame| frame.len).collect::<Vec<_>>(), [2, 1, 1, 1]);
     for frame in &frames {
@@ -1505,7 +1504,7 @@ fn a_fragment_splits_repeated_positions_at_the_run_end_width() {
     let mut wire = crate::fragment::FragmentBytes::new(&memory).unwrap();
 
     crate::fragment::encode_batch(&batch, &memory, &mut wire).unwrap();
-    let frames = crate::fragment::decode_batches(&wire.into_bytes(), &memory).unwrap();
+    let frames = crate::fragment::decode_batches(wire.into_ipc_buffer(), &memory).unwrap();
 
     assert_eq!(frames.len(), 2);
     assert_eq!(frames.iter().map(|frame| frame.len).sum::<usize>(), len);
@@ -1534,7 +1533,7 @@ fn fragment_refiltering_retains_the_decoded_arrow_array() {
     let page = ColumnBatch::settled(vec![column], 2, memory.reserve(256).unwrap()).unwrap();
     let mut wire = crate::fragment::FragmentBytes::new(&memory).unwrap();
     crate::fragment::encode_batch(&page, &memory, &mut wire).unwrap();
-    let mut decoded = crate::fragment::decode_batches(wire.as_slice(), &memory).unwrap();
+    let mut decoded = crate::fragment::decode_batches(wire.into_ipc_buffer(), &memory).unwrap();
     let page = decoded.pop().unwrap();
     let Column::Selected(column) = &page.columns[0] else { panic!("Expected a selection over the decoded array") };
     let source = Arc::as_ptr(&column.source(0).unwrap().unwrap().0.0);
