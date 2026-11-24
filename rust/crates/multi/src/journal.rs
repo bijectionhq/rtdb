@@ -20,6 +20,7 @@ pub mod hosted;
 mod prefix_retirement;
 pub(crate) mod retention_decision;
 mod log;
+mod owned_read;
 mod read_selection;
 pub(crate) mod replay_cursor;
 pub(crate) use log::{Held, JournalLog};
@@ -373,7 +374,7 @@ impl InstalledJournal {
     }
 
     pub async fn release(&self, hold: Hold) -> Result<()> {
-        match self.call(Operation::Release { hold }).await? {
+        match self.call(owned_read::release_on_close(hold)).await? {
             Reply::Released(closed) if closed == hold => Ok(()),
             _ => Err(mismatch("The peer released a different replay hold")),
         }

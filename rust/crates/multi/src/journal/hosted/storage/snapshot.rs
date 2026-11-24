@@ -27,9 +27,7 @@ impl Source {
         let through = (cut.through.0 - genesis.0) as u64;
         let route = journal.route().await?;
         if from < route.erasure_floor { return Err(Error::ErasedUnderView.into()); }
-        let request = journal.request(&route, ordered_logkeeper::ordered::Command::ProtectCheckpoint {
-            root: base.root, from, through,
-        })?;
+        let request = journal.request(&route, crate::journal::owned_read::protect_snapshot(base.root, from, through))?;
         let held = crate::journal::Held::acquire(journal, request, &self.tasks).await?;
         let scope = held.scope();
         if scope.checkpoint.root != base.root || scope.checkpoint.cut != scope.start

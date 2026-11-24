@@ -1,0 +1,59 @@
+{
+  "summary": "Requests protect the exact checkpoint and suffix of an owned snapshot and release the hold when it closes.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "snapshot_without_a_hold": {
+      "defect": "Snapshot admission uses an unrelated barrier instead of retaining the selected checkpoint and suffix.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/owned_read.rs",
+          "find": "    Command::ProtectCheckpoint { root, from, through }\n",
+          "replace": "    Command::Barrier\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/owned_read.rs",
+          "find": "ensures command == (Command::ProtectCheckpoint { root, from, through }),",
+          "replace": "ensures command == Command::Barrier,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_owned_read/laws.rs",
+          "function": "protected_snapshot_names_its_exact_scope",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "close_without_release": {
+      "defect": "Close only samples the route and leaves the known hold outstanding.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/owned_read.rs",
+          "find": "    Operation::Release { hold }\n",
+          "replace": "    Operation::Route\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/owned_read.rs",
+          "find": "ensures operation == (Operation::Release { hold }),",
+          "replace": "ensures operation == Operation::Route,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_owned_read/laws.rs",
+          "function": "close_releases_the_original_hold",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

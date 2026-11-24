@@ -132,10 +132,56 @@ def querySnapshot (captured : Option (PublishedCatalog Meaning))
 theorem queryUsesRead (snapshot current : PublishedCatalog Meaning) (query : Meaning → Answer) :
     query (querySnapshot (some snapshot) current).meaning = query snapshot.meaning := rfl
 
+structure SnapshotScope where
+  root : Nat
+  fromLSN : Nat
+  through : Nat
+  deriving DecidableEq
+
+inductive OwnedReadCommand
+  | barrier
+  | protectCheckpoint (scope : SnapshotScope)
+  | releaseRead (id : Invocation)
+  | release (hold : OrderedJournal.Hold)
+  | inspectRoute
+
+def protectSnapshot (scope : SnapshotScope) : OwnedReadCommand :=
+  .protectCheckpoint scope
+
+def releaseOnClose (hold : OrderedJournal.Hold) : OwnedReadCommand :=
+  .release hold
+
+def releaseAfterLostBarrier (read : Invocation) : OwnedReadCommand :=
+  .releaseRead read
+
+theorem protected_snapshot_names_its_exact_scope (scope : SnapshotScope) :
+    protectSnapshot scope = .protectCheckpoint scope := rfl
+
+theorem close_releases_the_original_hold (hold : OrderedJournal.Hold) :
+    releaseOnClose hold = .release hold := rfl
+
+theorem a_lost_barrier_names_its_original_invocation (read : Invocation) :
+    releaseAfterLostBarrier read = .releaseRead read := rfl
+
+theorem barrier_alone_does_not_protect_the_snapshot (scope : SnapshotScope) :
+    OwnedReadCommand.barrier ≠ .protectCheckpoint scope := by
+  intro h
+  contradiction
+
+theorem route_inspection_does_not_release_the_hold (hold : OrderedJournal.Hold) :
+    OwnedReadCommand.inspectRoute ≠ .release hold := by
+  intro h
+  contradiction
+
 #print axioms dataCut_advances
 #print axioms exactReadCut
 #print axioms readCoversAcknowledgement
 #print axioms capture_at_selects_exact_catalog
 #print axioms queryUsesRead
+#print axioms protected_snapshot_names_its_exact_scope
+#print axioms close_releases_the_original_hold
+#print axioms a_lost_barrier_names_its_original_invocation
+#print axioms barrier_alone_does_not_protect_the_snapshot
+#print axioms route_inspection_does_not_release_the_hold
 
 end RTDB.Recovery.InstalledRead
