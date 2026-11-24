@@ -640,8 +640,46 @@ impl LogReplayTail for LocalTail {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sealing_byte_path_writes_original_record_bytes_after_short_writes() {
+        struct ShortWriter<'a> {
+            payload: &'a [u8],
+            output: Vec<u8>,
+            interrupted: bool,
+        }
+
+        impl Write for ShortWriter<'_> {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("expected a vectored write")
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
+                if !self.interrupted {
+                    assert_eq!(slices[1].as_ptr(), self.payload.as_ptr());
+                    self.interrupted = true;
+                    return Err(ErrorKind::Interrupted.into());
+                }
+                let prior = self.output.len();
+                self.output.extend(slices.iter().flat_map(|slice| slice.iter().copied()).take(6));
+                Ok(self.output.len() - prior)
+            }
+        }
+
+        let sealed = [0x32; LOG_SEAL_OVERHEAD + 17];
+        for (separator, payload) in [(0x1c, sealed.as_slice()), (0x1e, b"")] {
+            let mut writer = ShortWriter { payload, output: Vec::new(), interrupted: false };
+            write_record(&mut writer, separator, payload, Timestamp(-3), 21).unwrap();
+            let mut expected = vec![separator];
+            expected.extend((payload.len() as i32).to_be_bytes());
+            expected.extend((-3_i64).to_be_bytes());
+            expected.extend(payload);
+            expected.extend(21_i64.to_be_bytes());
+            assert_eq!(writer.output, expected);
+        }
+    }
+
     #[tokio::test]
-    async fn sealed_frames_replay_with_the_original_lineage_and_keep_plaintext_out_of_the_log() -> rtdb_types::Result<()> {
+    async fn sealing_byte_path_replays_local_frames_with_the_original_lineage() -> rtdb_types::Result<()> {
         let keys = tempfile::tempdir().unwrap();
         let files = tempfile::tempdir().unwrap();
         #[cfg(unix)]
@@ -663,6 +701,11 @@ mod tests {
         let chosen = log.enqueue(body.clone(), Timestamp(7)).await?.durable().await?;
         let raw = fs::read(&path).unwrap();
         assert!(!raw.windows(body.len()).any(|window| window == body.as_ref()));
+        let length = body.len() + LOG_SEAL_OVERHEAD;
+        assert_eq!(raw[0], 0x1c);
+        assert_eq!(&raw[1..5], &(length as i32).to_be_bytes());
+        assert_eq!(&raw[5..13], &7_i64.to_be_bytes());
+        assert_eq!(&raw[13 + length..], &0_i64.to_be_bytes());
         let slots = vault.log_keys(&path, false, Arc::clone(&io))?;
         let reader = super::super::ReadOnlyLocalLog::open_with_key_slots(&path, Default::default(), io, slots)?;
         let records = reader.read_range(chosen.offset, LogOffset(chosen.offset.0 + 1)).await?;

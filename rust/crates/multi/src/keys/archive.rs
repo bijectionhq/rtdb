@@ -20,7 +20,12 @@ use super::{
 
 #[async_trait::async_trait]
 pub trait ArchiveKey: ObjectCipher {
-    async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes>;
+    async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
+        self.seal_prefixed(associated, Bytes::new(), plaintext).await
+    }
+    async fn seal_prefixed(
+        &self, associated: &str, prefix: Bytes, plaintext: Bytes,
+    ) -> rtdb_storage::Result<Bytes>;
     async fn open(&self, associated: &str, ciphertext: Bytes) -> rtdb_storage::Result<Bytes>;
     async fn seal_object(&self, name: &ObjectKey, plaintext: Bytes) -> rtdb_storage::Result<Bytes>;
     async fn open_object(&self, name: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes>;
@@ -60,14 +65,16 @@ impl ObjectCipher for LegacyArchiveKey {
         if matches!(operation, UnitOperation::Grant) {
             return Err(Error::Closed("Raw archive material cannot confirm delivery".into()));
         }
-        operation.apply(&self.cipher, name)
+        operation.apply_async(&self.cipher, name).await
     }
 }
 
 #[async_trait::async_trait]
 impl ArchiveKey for LegacyArchiveKey {
-    async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.cipher.seal_deterministic(associated, &plaintext)
+    async fn seal_prefixed(
+        &self, associated: &str, prefix: Bytes, plaintext: Bytes,
+    ) -> rtdb_storage::Result<Bytes> {
+        self.cipher.seal_deterministic_prefixed(associated, &prefix, &plaintext)
     }
 
     async fn open(&self, associated: &str, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
@@ -291,8 +298,10 @@ impl ObjectCipher for TrackedArchiveKey {
 
 #[async_trait::async_trait]
 impl ArchiveKey for TrackedArchiveKey {
-    async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.inner.seal(associated, plaintext).await
+    async fn seal_prefixed(
+        &self, associated: &str, prefix: Bytes, plaintext: Bytes,
+    ) -> rtdb_storage::Result<Bytes> {
+        self.inner.seal_prefixed(associated, prefix, plaintext).await
     }
 
     async fn open(&self, associated: &str, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
@@ -339,29 +348,50 @@ pub(super) fn associated_unit(associated: &str) -> rtdb_storage::Result<ObjectKe
     ObjectKey::new(name)
 }
 
-pub(super) fn with_archive_unit(
+fn with_archive_unit(
     authority: &[u8; KEY_BYTES],
     mut material: [u8; KEY_BYTES],
     deadline: Instant,
     name: &ObjectKey,
     operation: UnitOperation,
 ) -> rtdb_storage::Result<UnitOutput> {
+    unit::with_material(archive_material(authority, &mut material), deadline, |cipher| {
+        operation.apply(cipher, name)
+    })
+}
+
+#[cfg(any(feature = "dynamodb", feature = "s3-key-vault"))]
+pub(super) fn apply_archive_unit<'a>(
+    authority: &mut [u8; KEY_BYTES],
+    material: &mut [u8; KEY_BYTES],
+    deadline: Instant,
+    name: &'a ObjectKey,
+    operation: UnitOperation,
+) -> impl std::future::Future<Output = rtdb_storage::Result<UnitOutput>> + use<'a> {
+    let mut combined = archive_material(authority, material);
+    authority.fill(0);
+    unit::apply_with_material(&mut combined, deadline, name, operation)
+}
+
+fn archive_material(authority: &[u8; KEY_BYTES], material: &mut [u8; KEY_BYTES]) -> [u8; KEY_BYTES] {
     let key = hmac::Key::new(hmac::HMAC_SHA256, authority);
-    let combined = hmac::sign(&key, &material);
+    let combined = hmac::sign(&key, material);
     material.fill(0);
-    unit::with_material(
-        combined.as_ref().try_into().expect("HMAC-SHA256 width"),
-        deadline,
-        |cipher| operation.apply(cipher, name),
-    )
+    combined.as_ref().try_into().expect("HMAC-SHA256 width")
 }
 
 #[async_trait::async_trait]
 impl<T: CaptureCryptography> ArchiveKey for CaptureKey<T> {
-    async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
+    async fn seal_prefixed(
+        &self, associated: &str, prefix: Bytes, plaintext: Bytes,
+    ) -> rtdb_storage::Result<Bytes> {
         self.0.crypt(
             associated_unit(associated)?,
-            UnitOperation::SealValue(associated.to_owned(), plaintext),
+            UnitOperation::SealPrefixedValue {
+                associated: associated.to_owned(),
+                prefix,
+                body: plaintext,
+            },
         )
         .await?
         .bytes()

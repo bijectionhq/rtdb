@@ -1827,6 +1827,7 @@ rule ExternalSourceLearnsDurableExtent {
 
 rule ExternalSourceLearnsReplayExtent {
     -- Synced local journals retain the durable prefix through restart.
+    -- A sealed Classic local record retains its publication identity and authenticates its payload at the original offset and timestamp.
     -- Synced local storage retains the checkpoint files used to open that prefix.
     -- The leader can supply the token from applied read-back before a block adopts it.
     when: ExternalReplicaPrefixApplied(database, external_source_token)

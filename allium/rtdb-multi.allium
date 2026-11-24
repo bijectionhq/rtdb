@@ -753,6 +753,7 @@ contract LogService {
 
     @invariant BrokeredDetachedBodyUsesTheCommittedPosition
         -- A sealed directory journal frame commits the digest of its detached reference.
+        -- Its publication identity selects the original key slot and the seal authenticates the reference digest.
         -- The broker admits one position under a current replay ticket and retains its own directory region through delivery and provider drain.
         -- It matches the supplied reference to the quorum-certified frame and verifies the exact provider publication and body digest.
         -- The detached storage namespace and unit-key vault belong to the broker.
@@ -1062,7 +1063,7 @@ entity LogRecord {
     -- Hash of the previous record's hash and this record's payload, across epochs.
     -- The chain from a checkpoint's chain_hash is verifiable offline.
     prev_hash: String
-    -- Encrypted under the deployment's data key.
+    -- Encrypted under the key selected by the journal's custody authority.
     payload: ResolvedTx | EpochStart | BlockUploaded | TriesAdded | TriesReleased | Handoff | Parked
 }
 
@@ -3826,6 +3827,11 @@ surface StorageAccess {
 
     @guarantee ZombiesCannotDamageStorage
         -- A deposed holder can create only orphans under its own epoch's prefix until its credential expires, and can delete nothing.
+
+    @guarantee FramedObjectsAuthenticateTheirContents
+        -- A framed publication authenticates the plaintext length and digest and binds each frame to the logical object key and its position.
+        -- A portable publication selects its original key slot from the origin carried by its bytes.
+        -- An immutable retry that compares plaintext authenticates the existing payload before accepting a match.
 }
 
 surface CheckpointArchiveDisposal {

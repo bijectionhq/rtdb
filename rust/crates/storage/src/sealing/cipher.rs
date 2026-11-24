@@ -7,7 +7,7 @@ pub mod object;
 
 use crate::Error;
 use bytes::Bytes;
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, Tag, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use rtdb_types::{Anomaly, Result};
 
@@ -37,70 +37,193 @@ impl Cipher {
     }
 
     pub fn seal(&self, associated: &str, plaintext: &[u8]) -> crate::Result<Bytes> {
+        self.seal_prefixed(associated, &[], plaintext)
+    }
+
+    /// Prepends bytes to the returned envelope. Bind any authenticated prefix fields through `associated`.
+    pub fn seal_prefixed(
+        &self,
+        associated: &str,
+        prefix: &[u8],
+        plaintext: &[u8],
+    ) -> crate::Result<Bytes> {
         let mut nonce = [0u8; NONCE_LEN];
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| Error::Task("no randomness for a nonce".into()))?;
-        self.seal_with(nonce, associated, plaintext)
+        self.seal_with(nonce, associated, prefix, plaintext)
     }
 
     /// Seals with a nonce derived from `associated` and `plaintext`: the same pair always seals to the same bytes, and two different ones never share a nonce.
     pub fn seal_deterministic(&self, associated: &str, plaintext: &[u8]) -> crate::Result<Bytes> {
-        let mut sealed = Vec::with_capacity(plaintext.len() + SEALED_OVERHEAD);
-        self.append_deterministic(associated, plaintext, &mut sealed)?;
-        Ok(Bytes::from(sealed))
+        self.seal_deterministic_prefixed(associated, &[], plaintext)
     }
 
-    pub(super) fn append_deterministic(&self, associated: &str, plaintext: &[u8], sealed: &mut Vec<u8>) -> crate::Result<()> {
+    /// Uses the deterministic nonce of the envelope and prepends bytes as in [Self::seal_prefixed].
+    pub fn seal_deterministic_prefixed(
+        &self,
+        associated: &str,
+        prefix: &[u8],
+        plaintext: &[u8],
+    ) -> crate::Result<Bytes> {
+        self.seal_with(
+            self.deterministic_nonce(associated, plaintext),
+            associated,
+            prefix,
+            plaintext,
+        )
+    }
+
+    fn deterministic_nonce(&self, associated: &str, plaintext: &[u8]) -> [u8; NONCE_LEN] {
         let mut context = ring::hmac::Context::with_key(&self.nonces);
         context.update(&(associated.len() as u64).to_be_bytes());
         context.update(associated.as_bytes());
         context.update(plaintext);
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(&context.sign().as_ref()[..NONCE_LEN]);
-        self.append_sealed(nonce, associated, plaintext, sealed)
+        nonce
     }
 
-    fn seal_with(&self, nonce: [u8; NONCE_LEN], associated: &str, plaintext: &[u8]) -> crate::Result<Bytes> {
-        let mut sealed = Vec::with_capacity(plaintext.len() + SEALED_OVERHEAD);
+    fn seal_with(
+        &self,
+        nonce: [u8; NONCE_LEN],
+        associated: &str,
+        prefix: &[u8],
+        plaintext: &[u8],
+    ) -> crate::Result<Bytes> {
+        let mut sealed = Vec::with_capacity(prefix.len() + plaintext.len() + SEALED_OVERHEAD);
+        sealed.extend_from_slice(prefix);
         self.append_sealed(nonce, associated, plaintext, &mut sealed)?;
-        Ok(Bytes::from(sealed))
+        Ok(sealed.into())
     }
 
-    fn append_sealed(&self, nonce: [u8; NONCE_LEN], associated: &str, plaintext: &[u8], sealed: &mut Vec<u8>) -> crate::Result<()> {
-        sealed.extend_from_slice(&nonce);
+    pub(super) fn append_deterministic(
+        &self,
+        associated: &str,
+        plaintext: &[u8],
+        sealed: &mut Vec<u8>,
+    ) -> crate::Result<()> {
+        self.append_sealed(
+            self.deterministic_nonce(associated, plaintext),
+            associated,
+            plaintext,
+            sealed,
+        )
+    }
+
+    fn append_sealed(
+        &self,
+        nonce: [u8; NONCE_LEN],
+        associated: &str,
+        plaintext: &[u8],
+        sealed: &mut Vec<u8>,
+    ) -> crate::Result<()> {
         let start = sealed.len();
+        sealed.extend_from_slice(&nonce);
         sealed.extend_from_slice(plaintext);
-        let tag = self.key.seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from(associated.as_bytes()), &mut sealed[start..])
-            .map_err(|_| Error::Task("encryption failed".into()))?;
+        let Ok(tag) = self.key.seal_in_place_separate_tag(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(associated.as_bytes()),
+            &mut sealed[start + NONCE_LEN..],
+        ) else {
+            sealed.truncate(start);
+            return Err(Error::Task("encryption failed".into()));
+        };
         sealed.extend_from_slice(tag.as_ref());
         Ok(())
     }
 
     pub fn open(&self, associated: &str, sealed: &[u8]) -> crate::Result<Bytes> {
+        let mut out = Vec::with_capacity(sealed.len().saturating_sub(SEALED_OVERHEAD));
+        self.append_opened(associated, sealed, &mut out)?;
+        Ok(out.into())
+    }
+
+    fn append_opened(
+        &self,
+        associated: &str,
+        sealed: &[u8],
+        out: &mut Vec<u8>,
+    ) -> crate::Result<()> {
         if sealed.len() < SEALED_OVERHEAD {
             return Err(Error::Task(format!("{associated}: too short to be sealed")));
         }
         let nonce = Nonce::try_assume_unique_for_key(&sealed[..NONCE_LEN])
             .map_err(|_| Error::Task("malformed nonce".into()))?;
-        let mut body = sealed[NONCE_LEN..].to_vec();
-        let length = self
+        let (ciphertext, tag) = sealed[NONCE_LEN..].split_at(sealed.len() - SEALED_OVERHEAD);
+        let tag = Tag::try_from(tag).expect("fixed AES-GCM tag size");
+        let start = out.len();
+        out.extend_from_slice(ciphertext);
+        if self
             .key
-            .open_in_place(nonce, Aad::from(associated.as_bytes()), &mut body)
-            .map_err(|_| {
-                Error::Task(format!(
-                    "{associated} cannot be decrypted under this deployment's key"
-                ))
-            })?
-            .len();
-        body.truncate(length);
-        Ok(Bytes::from(body))
+            .open_in_place_separate_tag(
+                nonce,
+                Aad::from(associated.as_bytes()),
+                tag,
+                &mut out[start..],
+                0..,
+            )
+            .is_err()
+        {
+            out.truncate(start);
+            return Err(Error::Task(format!(
+                "{associated} cannot be decrypted under this deployment's key"
+            )));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealing_byte_path_preserves_the_original_nonce_ciphertext_and_tag() {
+        let cipher = Cipher::new(&[5; 32]).unwrap();
+        let prefix = [6; 64];
+        let associated = "journal slot";
+        for (body, nonce) in [
+            (
+                b"".as_slice(),
+                [246, 163, 190, 5, 124, 65, 235, 94, 86, 251, 100, 118],
+            ),
+            (
+                b"one journal record".as_slice(),
+                [195, 69, 99, 161, 237, 44, 205, 29, 137, 69, 242, 12],
+            ),
+        ] {
+            let mut expected = prefix.to_vec();
+            expected.extend_from_slice(&nonce);
+            let start = expected.len();
+            expected.extend_from_slice(body);
+            let tag = cipher
+                .key
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(associated.as_bytes()),
+                    &mut expected[start..],
+                )
+                .unwrap();
+            expected.extend_from_slice(tag.as_ref());
+
+            let framed = cipher.seal_with(nonce, associated, &prefix, body).unwrap();
+            assert_eq!(framed.as_ref(), expected);
+            assert_eq!(
+                cipher
+                    .seal_deterministic_prefixed(associated, &prefix, body)
+                    .unwrap(),
+                framed,
+            );
+            assert_eq!(
+                cipher
+                    .open(associated, &framed[prefix.len()..])
+                    .unwrap()
+                    .as_ref(),
+                body
+            );
+        }
+    }
 
     #[test]
     fn an_object_seals_to_the_same_bytes_every_time_and_a_log_payload_never_does() {

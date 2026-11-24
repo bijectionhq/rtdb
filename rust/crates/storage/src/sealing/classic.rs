@@ -430,13 +430,9 @@ impl ClassicObjectKeys {
         let publication = Uuid::new_v4();
         let name = ObjectKey::new(format!("frames/{publication}"))?;
         let associated = format!("rtdb.classic.log-frame/v1/{publication}/{offset}/{timestamp}");
-        let ciphertext = with_key(&self.name(&name), true, |cipher| {
-            cipher.seal(&associated, payload)
-        })?;
-        let mut sealed = Vec::with_capacity(16 + ciphertext.len());
-        sealed.extend_from_slice(publication.as_bytes());
-        sealed.extend_from_slice(&ciphertext);
-        Ok(sealed.into())
+        with_key(&self.name(&name), true, |cipher| {
+            cipher.seal_prefixed(&associated, publication.as_bytes(), payload)
+        })
     }
 
     pub(crate) fn open_record(

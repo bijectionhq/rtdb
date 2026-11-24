@@ -5,7 +5,9 @@ use bytes::{Bytes, BytesMut};
 use rtdb_types::ServingPublication;
 use uuid::Uuid;
 
-use super::{FramedObject, ObjectCipher, PlaintextView, UnitOperation, UnitOutput};
+use super::{
+    FramedObject, ObjectCipher, PlaintextView, UnitOperation, UnitOutput, object::FramedFile,
+};
 use crate::{Error, ObjectKey, Result, RetainedBytes};
 
 pub const PUBLICATION_ID_BYTES: usize = ServingPublication::BYTES;
@@ -79,14 +81,13 @@ impl PublicationSealing {
             .ok_or_else(|| Error::ConflictingObject(name.to_string()))
     }
 
-    pub(super) async fn operate(
+    fn bind(
         &self,
         name: &ObjectKey,
         publication: ServingPublication,
         operation: UnitOperation,
-    ) -> Result<UnitOutput> {
-        let read = !operation.provisions();
-        let (authority, slot, operation) = if publication == ServingPublication::ARCHIVE {
+    ) -> Result<(&Arc<dyn ObjectCipher>, ObjectKey, UnitOperation)> {
+        Ok(if publication == ServingPublication::ARCHIVE {
             let authority = self
                 .archive
                 .as_ref()
@@ -103,7 +104,17 @@ impl PublicationSealing {
                 slot,
                 UnitOperation::AtLogicalName(name.clone(), Box::new(operation)),
             )
-        };
+        })
+    }
+
+    pub(super) async fn operate(
+        &self,
+        name: &ObjectKey,
+        publication: ServingPublication,
+        operation: UnitOperation,
+    ) -> Result<UnitOutput> {
+        let read = !operation.provisions();
+        let (authority, slot, operation) = self.bind(name, publication, operation)?;
         let output = authority.operate(&slot, operation).await?;
         if read {
             PlaintextView::track(authority, &slot)?;
@@ -111,11 +122,13 @@ impl PublicationSealing {
         Ok(output)
     }
 
-    pub async fn seal(&self, name: &ObjectKey, plaintext: Bytes) -> Result<Bytes> {
+    async fn allocate(&self, name: &ObjectKey) -> Result<ServingPublication> {
         let publication = ServingPublication {
             origin: self.origin,
             attempt: Uuid::new_v4(),
         };
+        #[cfg(not(feature = "remote"))]
+        let _ = name;
         #[cfg(feature = "remote")]
         if let Some((journal, prefix)) = &self.attempts {
             journal
@@ -126,11 +139,41 @@ impl PublicationSealing {
                 )
                 .await?;
         }
-        let sealed = self
-            .operate(name, publication, UnitOperation::Seal(plaintext))
-            .await?
-            .bytes()?;
-        Ok(Self::envelope(publication, sealed))
+        Ok(publication)
+    }
+
+    pub async fn seal(&self, name: &ObjectKey, plaintext: Bytes) -> Result<Bytes> {
+        let publication = self.allocate(name).await?;
+        self.operate(name, publication, UnitOperation::SealPrefixedObject {
+            prefix: Bytes::copy_from_slice(&publication.prefix()),
+            body: plaintext,
+        }).await?.bytes()
+    }
+
+    pub(super) async fn seal_file(&self, name: &ObjectKey, file: FramedFile) -> Result<Bytes> {
+        let publication = self.allocate(name).await?;
+        self.operate(name, publication, UnitOperation::SealFile {
+            prefix: Bytes::copy_from_slice(&publication.prefix()),
+            file,
+        }).await?.bytes()
+    }
+
+    pub(super) async fn matches_sealed(
+        &self, name: &ObjectKey, existing: Bytes, expected: Bytes,
+    ) -> Result<bool> {
+        let existing_publication = Self::identity(name, &existing)?;
+        let expected_publication = Self::identity(name, &expected)?;
+        let expected = expected.slice(PUBLICATION_ID_BYTES..);
+        if existing_publication == expected_publication {
+            return self.operate(name, existing_publication, UnitOperation::CompareSealed {
+                existing: existing.slice(PUBLICATION_ID_BYTES..),
+                expected,
+            }).await?.matches();
+        }
+        let existing = self.open(name, existing).await?;
+        let (authority, slot, operation) = self.bind(name, expected_publication, UnitOperation::Open(expected))?;
+        let expected = authority.operate(&slot, operation).await?.bytes()?;
+        Ok(existing == expected)
     }
 
     pub async fn open(&self, name: &ObjectKey, sealed: Bytes) -> Result<Bytes> {

@@ -66,15 +66,14 @@ impl JournalUnits {
 
     async fn seal_unit(&self, publication: Publication, plaintext: Bytes) -> Result<Bytes> {
         let reference = reference_digest(&plaintext);
-        let ciphertext = self
-            .keys
-            .seal(&self.associated(&publication, &reference), plaintext)
-            .await?;
-        let mut frame = Vec::with_capacity(HEADER_BYTES + ciphertext.len());
-        frame.extend_from_slice(&publication);
-        frame.extend_from_slice(&reference);
-        frame.extend_from_slice(&ciphertext);
-        Ok(frame.into())
+        let mut header = [0; HEADER_BYTES];
+        header[..PUBLICATION_BYTES].copy_from_slice(&publication);
+        header[PUBLICATION_BYTES..].copy_from_slice(&reference);
+        self.keys.seal_prefixed(
+            &self.associated(&publication, &reference),
+            Bytes::copy_from_slice(&header),
+            plaintext,
+        ).await
     }
 
     pub(crate) fn retirement_label(&self, sealed: &[u8]) -> Result<String> {
@@ -149,7 +148,7 @@ mod tests {
     use rtdb_types::{BlockIndex, StorageEpoch, Term, TermSequence};
 
     #[tokio::test]
-    async fn a_certified_frame_commits_only_its_exact_external_reference() -> DomainResult<()> {
+    async fn sealing_byte_path_commits_only_its_exact_external_reference() -> DomainResult<()> {
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path())?;
         keys.key("replica").await?;
@@ -164,6 +163,16 @@ mod tests {
         let chosen = reference("chosen".into());
         let other = reference("other".into());
         let sealed = units.seal(chosen.clone().into()).await?;
+        let publication: Publication = sealed[..PUBLICATION_BYTES].try_into().unwrap();
+        let digest = reference_digest(&chosen);
+        let old_ciphertext = units.keys.seal(
+            &units.associated(&publication, &digest),
+            chosen.clone().into(),
+        ).await?;
+        let mut old_frame = publication.to_vec();
+        old_frame.extend_from_slice(&digest);
+        old_frame.extend_from_slice(&old_ciphertext);
+        assert_eq!(sealed.as_ref(), old_frame);
 
         assert!(commits_payload_reference(&sealed, &chosen));
         assert!(!commits_payload_reference(&sealed, &other));
@@ -177,7 +186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reseeded_frame_uses_only_its_destination_slot() -> DomainResult<()> {
+    async fn sealing_byte_path_reseed_uses_only_its_destination_slot() -> DomainResult<()> {
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path())?;
         keys.key("predecessor").await?;

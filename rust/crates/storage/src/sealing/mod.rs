@@ -50,11 +50,15 @@ pub trait ObjectCipher: Send + Sync {
 
 pub enum UnitOperation {
     Seal(Bytes),
+    SealPrefixedObject { prefix: Bytes, body: Bytes },
+    SealFile { prefix: Bytes, file: object::FramedFile },
     Open(Bytes),
+    CompareSealed { existing: Bytes, expected: Bytes },
     OpenRetained(RetainedBytes),
     Header(Bytes),
     Frames(FramedObject, Range<usize>, Bytes),
     SealValue(String, Bytes),
+    SealPrefixedValue { associated: String, prefix: Bytes, body: Bytes },
     OpenValue(String, Bytes),
     AtLogicalName(ObjectKey, Box<UnitOperation>),
     Grant,
@@ -63,7 +67,8 @@ pub enum UnitOperation {
 impl UnitOperation {
     pub fn provisions(&self) -> bool {
         match self {
-            Self::Seal(_) | Self::SealValue(..) => true,
+            Self::Seal(_) | Self::SealPrefixedObject { .. } | Self::SealFile { .. }
+            | Self::SealValue(..) | Self::SealPrefixedValue { .. } => true,
             Self::AtLogicalName(_, operation) => operation.provisions(),
             _ => false,
         }
@@ -73,7 +78,17 @@ impl UnitOperation {
         match self {
             Self::Grant => Ok(UnitOutput::Granted),
             Self::Seal(body) => key.seal_object(name, &body).map(UnitOutput::Bytes),
+            Self::SealPrefixedObject { prefix, body } => key
+                .seal_object_prefixed(name, &prefix, &body)
+                .map(UnitOutput::Bytes),
+            Self::SealFile { prefix, file } => file.seal(key, name, &prefix).map(UnitOutput::Bytes),
             Self::Open(sealed) => key.open_object(name, &sealed).map(UnitOutput::Bytes),
+            Self::CompareSealed { existing, expected } => {
+                let existing_plaintext = key.open_object(name, &existing)?;
+                drop(existing);
+                let expected = key.open_object(name, &expected)?;
+                Ok(UnitOutput::Matches(existing_plaintext == expected))
+            }
             Self::OpenRetained(sealed) => key
                 .open_object(name, sealed.as_slice())
                 .map(UnitOutput::Bytes),
@@ -86,22 +101,47 @@ impl UnitOperation {
             Self::SealValue(associated, body) => key
                 .seal_deterministic(&associated, &body)
                 .map(UnitOutput::Bytes),
+            Self::SealPrefixedValue { associated, prefix, body } => key
+                .seal_deterministic_prefixed(&associated, &prefix, &body)
+                .map(UnitOutput::Bytes),
             Self::OpenValue(associated, sealed) => {
                 key.open(&associated, &sealed).map(UnitOutput::Bytes)
             }
             Self::AtLogicalName(logical, operation) => operation.apply(key, &logical),
         }
     }
+
+    pub async fn apply_async(self, key: &Cipher, name: &ObjectKey) -> crate::Result<UnitOutput> {
+        let mut operation = self;
+        let mut logical_name = None;
+        while let Self::AtLogicalName(logical, inner) = operation {
+            logical_name = Some(logical);
+            operation = *inner;
+        }
+        let name = logical_name.as_ref().unwrap_or(name);
+        match operation {
+            Self::SealFile { prefix, file } => file.seal_async(key, name, &prefix).await.map(UnitOutput::Bytes),
+            operation => operation.apply(key, name),
+        }
+    }
 }
 
 pub enum UnitOutput {
     Bytes(Bytes),
+    Matches(bool),
     Header(FramedObject),
     Granted,
     HeldGrant { until: Option<std::time::Instant>, custody: Arc<dyn Send + Sync> },
 }
 
 impl UnitOutput {
+    fn matches(self) -> crate::Result<bool> {
+        match self {
+            Self::Matches(matches) => Ok(matches),
+            _ => Err(Error::Task("Expected a sealed object comparison".into())),
+        }
+    }
+
     pub fn bytes(self) -> crate::Result<Bytes> {
         match self {
             Self::Bytes(bytes) => Ok(bytes),
@@ -205,7 +245,7 @@ impl EncryptingStore {
         match &self.keys {
             ObjectKeys::Deployment { cipher, delivery } => {
                 let reads_plaintext = !operation.provisions();
-                let output = operation.apply(cipher, name)?;
+                let output = operation.apply_async(cipher, name).await?;
                 if reads_plaintext && let Some(authority) = delivery {
                     PlaintextView::track(authority, name)?;
                 }
@@ -243,16 +283,73 @@ impl EncryptingStore {
         self.crypt(key, UnitOperation::OpenRetained(sealed)).await?.bytes()
     }
 
-    async fn seal_missing(&self, key: &ObjectKey, bytes: Bytes) -> crate::Result<Option<Bytes>> {
+    async fn existing_for_put(&self, key: &ObjectKey) -> crate::Result<Option<Bytes>> {
         if matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))) {
-            return Ok(Some(self.seal(key, bytes).await?));
+            return Ok(None);
         }
         match self.get_fresh(key).await {
-            Ok(existing) if existing == bytes => Ok(None),
-            Ok(_) => Err(Error::ConflictingObject(key.to_string())),
-            Err(Error::MissingObject(_)) => Ok(Some(self.seal(key, bytes).await?)),
+            Ok(existing) => Ok(Some(existing)),
+            Err(Error::MissingObject(_)) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    async fn seal_missing(&self, key: &ObjectKey, bytes: Bytes) -> crate::Result<Option<Bytes>> {
+        match self.existing_for_put(key).await? {
+            Some(existing) if existing == bytes => Ok(None),
+            Some(_) => Err(Error::ConflictingObject(key.to_string())),
+            None => Ok(Some(self.seal(key, bytes).await?)),
+        }
+    }
+
+    async fn put_framed_file(
+        &self, key: &ObjectKey, source: &Path, with_publication: bool,
+    ) -> crate::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        use object::PreparedFile;
+
+        let source = source.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || object::prepare_file(source))
+            .await.map_err(|error| Error::Task(error.to_string()))??;
+        let file = match file {
+            PreparedFile::Framed(file) => file,
+            PreparedFile::Buffered(body) => {
+                return if with_publication {
+                    self.put_with_publication(key, body).await
+                } else {
+                    self.put(key, body).await.map(|()| None)
+                };
+            }
+        };
+        if (!with_publication || matches!(self.keys, ObjectKeys::Units(_)))
+            && let Some(existing) = self.existing_for_put(key).await?
+        {
+            if !file.matches(&existing).await? {
+                return Err(Error::ConflictingObject(key.to_string()));
+            }
+            return if with_publication { self.inner.retirement_publication(key).await } else { Ok(None) };
+        }
+        let publication = self.publication(key);
+        let sealed = match publication {
+            Some(publication) => publication.seal_file(key, file).await?,
+            None => self.crypt(key, UnitOperation::SealFile { prefix: Bytes::new(), file }).await?.bytes()?,
+        };
+        let written = if with_publication {
+            self.inner.put_with_publication(key, sealed.clone()).await
+        } else {
+            self.inner.put(key, sealed.clone()).await.map(|()| None)
+        };
+        if !matches!(written, Err(Error::ConflictingObject(_))) {
+            return written;
+        }
+        let existing = self.inner.get_fresh(key).await?;
+        let matches = match publication {
+            Some(publication) => publication.matches_sealed(key, existing, sealed).await?,
+            None => self.crypt(key, UnitOperation::CompareSealed { existing, expected: sealed }).await?.matches()?,
+        };
+        if !matches {
+            return written;
+        }
+        if with_publication { self.inner.retirement_publication(key).await } else { Ok(None) }
     }
 
     async fn read_frames(
@@ -662,15 +759,8 @@ impl ObjectStore for EncryptingStore {
         }
     }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> crate::Result<()> {
-        if let ObjectKeys::Deployment { cipher, .. } = &self.keys
-            && object::framed(key)
-            && matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_)))
-        {
-            let sealed = cipher.seal_framed_file(key, source).await?;
-            return match self.inner.put(key, sealed.clone()).await {
-                Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == cipher.open_object(key, &sealed)? => Ok(()),
-                written => written,
-            };
+        if object::framed(key) {
+            return self.put_framed_file(key, source, false).await.map(|_| ());
         }
         let bytes = tokio::fs::read(source)
             .await
@@ -702,14 +792,8 @@ impl ObjectStore for EncryptingStore {
         key: &ObjectKey,
         source: &Path,
     ) -> crate::Result<Option<rtdb_types::PhysicalObjectPublication>> {
-        if let ObjectKeys::Deployment { cipher, .. } = &self.keys && object::framed(key) {
-            let sealed = cipher.seal_framed_file(key, source).await?;
-            return match self.inner.put_with_publication(key, sealed.clone()).await {
-                Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == cipher.open_object(key, &sealed)? => {
-                    self.inner.retirement_publication(key).await
-                }
-                written => written,
-            };
+        if object::framed(key) {
+            return self.put_framed_file(key, source, true).await;
         }
         let bytes = tokio::fs::read(source)
             .await
@@ -733,5 +817,154 @@ impl ObjectStore for EncryptingStore {
     }
     async fn forget(&self, key: &ObjectKey) -> crate::Result<()> {
         self.inner.forget(key).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IoRegion, MemoryStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct MeasuredStore {
+        inner: MemoryStore,
+        gets: AtomicUsize,
+        racing_body: std::sync::Mutex<Option<Bytes>>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for MeasuredStore {
+        async fn head(&self, key: &ObjectKey) -> crate::Result<StoredObject> {
+            self.inner.head(key).await
+        }
+        async fn get(&self, key: &ObjectKey) -> crate::Result<Bytes> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(key).await
+        }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> crate::Result<Bytes> {
+            self.inner.get_range(key, range).await
+        }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> crate::Result<()> {
+            let racing_body = self.racing_body.lock().unwrap().take();
+            if let Some(racing_body) = racing_body {
+                self.inner.put(key, racing_body).await?;
+                return Err(Error::ConflictingObject(key.to_string()));
+            }
+            self.inner.put(key, bytes).await
+        }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> crate::Result<()> {
+            self.inner.put_file(key, source).await
+        }
+        async fn list(&self, directory: Option<&ObjectKey>) -> crate::Result<Vec<StoredObject>> {
+            self.inner.list(directory).await
+        }
+        async fn delete(&self, key: &ObjectKey) -> crate::Result<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sealing_byte_path_file_put_uses_original_frame_bytes_and_reads_only_for_retries() -> Result<()> {
+        let raw = Arc::new(MeasuredStore::default());
+        let store = EncryptingStore::new(raw.clone(), &[7; 32])?;
+        let cipher = Cipher::new(&[7; 32])?;
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let body = vec![23; object::FRAME_BYTES * 2 + 3];
+        std::fs::write(source.path(), &body).unwrap();
+        let key = ObjectKey::new("tables/orders/data/l00-rc-b00.arrow")?;
+        let published = ObjectKey::new("tables/orders/data/l00-rc-b01.arrow")?;
+        let metadata = ObjectKey::new("blocks/b00.binpb")?;
+        store.put(&metadata, Bytes::from_static(b"catalog")).await?;
+        store.put_file(&key, source.path()).await?;
+        store.put_file_with_publication(&published, source.path()).await?;
+        assert_eq!(raw.gets.load(Ordering::Relaxed), 0);
+        for key in [&key, &published] {
+            assert_eq!(raw.inner.get(key).await?, cipher.seal_object(key, &body)?);
+            assert_eq!(store.get(key).await?.as_ref(), body);
+        }
+
+        let retry = ObjectKey::new("tables/orders/data/l00-rc-b02.arrow")?;
+        let sealed = cipher.seal_object(&retry, &body)?;
+        let header_name = format!("\0rtdb-frame-header/v1/{}", retry.as_str());
+        let header = cipher.open(&header_name, &sealed[..object::SEALED_HEADER_BYTES])?;
+        let mut alternative = cipher.seal(&header_name, &header)?.to_vec();
+        alternative.extend_from_slice(&sealed[object::SEALED_HEADER_BYTES..]);
+        assert_ne!(alternative.as_slice(), sealed.as_ref());
+        *raw.racing_body.lock().unwrap() = Some(alternative.into());
+        store.put_file(&retry, source.path()).await?;
+        store.put_file(&retry, source.path()).await?;
+        assert_eq!(raw.gets.load(Ordering::Relaxed), 4);
+
+        std::fs::write(source.path(), b"different").unwrap();
+        assert!(matches!(
+            store.put_file(&retry, source.path()).await,
+            Err(Error::ConflictingObject(_)),
+        ));
+        assert!(matches!(
+            store.put_file_with_publication(&retry, source.path()).await,
+            Err(Error::ConflictingObject(_)),
+        ));
+
+        let damaged = ObjectKey::new("tables/orders/data/l00-rc-b03.arrow")?;
+        let mut sealed = cipher.seal_object(&damaged, b"different")?.to_vec();
+        *sealed.last_mut().unwrap() ^= 1;
+        raw.inner.put(&damaged, sealed.into()).await?;
+        assert!(matches!(store.put_file(&damaged, source.path()).await, Err(Error::Task(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sealing_byte_path_file_publication_obeys_unit_key_custody() -> Result<()> {
+        let vault_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(vault_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let raw = Arc::new(MeasuredStore::default());
+        let vault = ClassicKeyVault::open(vault_dir.path())?;
+        let keys = vault.units(raw.as_ref(), IoRegion::new(), true).await?;
+        let store = EncryptingStore::with_units(raw.clone(), keys.clone());
+        raw.gets.store(0, Ordering::Relaxed);
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let body = vec![3; object::FRAME_BYTES + 1];
+        std::fs::write(source.path(), &body).unwrap();
+        let key = ObjectKey::new("tables/orders/data/l00-rc-b00.arrow")?;
+        store.put_file_with_publication(&key, source.path()).await?;
+        assert_eq!(raw.gets.load(Ordering::Relaxed), 0);
+        assert_eq!(store.get(&key).await?.as_ref(), body);
+        let from_buffer = keys.operate(&key, UnitOperation::Seal(body.into())).await?.bytes()?;
+        assert_eq!(raw.inner.get(&key).await?, from_buffer);
+        store.put_file_with_publication(&key, source.path()).await?;
+
+        keys.withdraw(&key).await?;
+        assert!(matches!(
+            store.put_file_with_publication(&key, source.path()).await,
+            Err(Error::ErasedUnderView),
+        ));
+
+        let previous = PublicationSealing::new(keys.clone(), [5; 32], object::framed);
+        let active_origin = [6; 32];
+        let active = PublicationSealing::new(keys, active_origin, object::framed);
+        let installed = EncryptingStore::published(raw.clone(), active.clone());
+        let body: Bytes = std::fs::read(source.path()).unwrap().into();
+        let fresh = ObjectKey::new("tables/orders/data/l00-rc-b01.arrow")?;
+        installed.put_file(&fresh, source.path()).await?;
+        let wire = raw.inner.get(&fresh).await?;
+        let publication = rtdb_types::ServingPublication::from_prefix(&wire).unwrap();
+        assert_eq!(publication.origin, active_origin);
+        let original_envelope = active.operate(&fresh, publication, UnitOperation::Seal(body.clone()))
+            .await?.bytes()?;
+        assert_eq!(&wire[PUBLICATION_ID_BYTES..], original_envelope.as_ref());
+        assert_eq!(installed.get(&fresh).await?, body);
+
+        let raced = ObjectKey::new("tables/orders/data/l00-rc-b02.arrow")?;
+        let winner = previous.seal(&raced, body.clone()).await?;
+        *raw.racing_body.lock().unwrap() = Some(winner.clone());
+        installed.put_file_with_publication(&raced, source.path()).await?;
+        assert_eq!(raw.inner.get(&raced).await?, winner);
+        assert_eq!(installed.get(&raced).await?, body);
+        Ok(())
     }
 }

@@ -12,8 +12,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use super::{
     KEY_BYTES, KeyService, UnitOperation, UnitOutput, UnitScope, UnitSlot,
     archive::{
-        ArchiveKey, CaptureCryptography, matches_authority_key, tracked_archive_key,
-        with_archive_unit,
+        ArchiveKey, CaptureCryptography, apply_archive_unit, matches_authority_key,
+        tracked_archive_key,
     },
     journal::key_error,
     malformed, new_key,
@@ -252,11 +252,11 @@ impl KeyService for DynamoKeyService {
     ) -> rtdb_storage::Result<UnitOutput> {
         let deadline = Instant::now() + OPERATION_LIMIT;
         tokio::time::timeout_at(deadline.into(), async {
-            let material = self
+            let mut material = self
                 .unit_material(&slot, operation.provisions())
                 .await
                 .map_err(key_error)?;
-            unit::with_material(material, deadline, |key| operation.apply(key, &name))
+            unit::apply_with_material(&mut material, deadline, &name, operation).await
         })
         .await
         .map_err(|_| unit::expired())?
@@ -325,15 +325,15 @@ impl CaptureCryptography for DynamoArchive {
         let slot = UnitScope::archive(&self.id).slot(&name);
         let deadline = Instant::now() + OPERATION_LIMIT;
         tokio::time::timeout_at(deadline.into(), async {
-            let authority = KeyService::existing(&self.vault, &self.id)
+            let mut authority = KeyService::existing(&self.vault, &self.id)
                 .await
                 .map_err(key_error)?;
-            let material = self
+            let mut material = self
                 .vault
                 .unit_material(&slot, operation.provisions())
                 .await
                 .map_err(key_error)?;
-            with_archive_unit(&authority, material, deadline, &name, operation)
+            apply_archive_unit(&mut authority, &mut material, deadline, &name, operation).await
         })
         .await
         .map_err(|_| unit::expired())?

@@ -246,17 +246,41 @@ pub(super) fn with_material<T>(
     deadline: Instant,
     operation: impl FnOnce(&Cipher) -> rtdb_storage::Result<T>,
 ) -> rtdb_storage::Result<T> {
-    let cipher = if Instant::now() < deadline {
-        Cipher::new(&material).map_err(key_error)
-    } else {
-        Err(expired())
-    };
-    material.fill(0);
-    let result = operation(&cipher?);
+    let result = operation(&cipher_from_material(&mut material, deadline)?);
     if Instant::now() >= deadline {
         return Err(expired());
     }
     result
+}
+
+#[cfg(any(feature = "dynamodb", feature = "s3-key-vault"))]
+pub(super) fn apply_with_material<'a>(
+    material: &mut [u8; KEY_BYTES],
+    deadline: Instant,
+    name: &'a ObjectKey,
+    operation: UnitOperation,
+) -> impl std::future::Future<Output = rtdb_storage::Result<UnitOutput>> + use<'a> {
+    let cipher = cipher_from_material(material, deadline);
+    async move {
+        let result = operation.apply_async(&cipher?, name).await;
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        result
+    }
+}
+
+fn cipher_from_material(
+    material: &mut [u8; KEY_BYTES],
+    deadline: Instant,
+) -> rtdb_storage::Result<Cipher> {
+    let cipher = if Instant::now() < deadline {
+        Cipher::new(material).map_err(key_error)
+    } else {
+        Err(expired())
+    };
+    material.fill(0);
+    cipher
 }
 
 fn local_scope_closed(path: &Path) -> Result<bool> {

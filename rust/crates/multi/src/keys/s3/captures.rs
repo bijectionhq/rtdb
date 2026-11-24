@@ -8,7 +8,7 @@ use super::{
     key_error, unit,
 };
 use crate::keys::archive::{
-    ArchiveKey, CaptureCryptography, matches_authority_key, tracked_archive_key, with_archive_unit,
+    ArchiveKey, CaptureCryptography, apply_archive_unit, matches_authority_key, tracked_archive_key,
 };
 
 pub(super) struct CaptureAuthority {
@@ -30,12 +30,12 @@ impl CaptureCryptography for CaptureAuthority {
                 .require_never_versioned()
                 .await
                 .map_err(key_error)?;
-            let authority = self.vault.existing(&self.id).await.map_err(key_error)?;
-            let material = self
+            let mut authority = self.vault.existing(&self.id).await.map_err(key_error)?;
+            let mut material = self
                 .vault
                 .load_unit_slot(&slot, operation.provisions())
                 .await?;
-            with_archive_unit(&authority, material, deadline, &name, operation)
+            apply_archive_unit(&mut authority, &mut material, deadline, &name, operation).await
         })
         .await
         .map_err(|_| unit::expired())?

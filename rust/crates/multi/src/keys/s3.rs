@@ -238,8 +238,8 @@ impl KeyService for S3KeyService {
         let deadline = Instant::now() + OPERATION_LIMIT;
         tokio::time::timeout_at(deadline.into(), async {
             self.require_never_versioned().await.map_err(key_error)?;
-            let material = self.load_unit_slot(&slot, operation.provisions()).await?;
-            unit::with_material(material, deadline, |cipher| operation.apply(cipher, &name))
+            let mut material = self.load_unit_slot(&slot, operation.provisions()).await?;
+            unit::apply_with_material(&mut material, deadline, &name, operation).await
         }).await.map_err(|_| unit::expired())?
     }
 
