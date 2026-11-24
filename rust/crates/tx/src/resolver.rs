@@ -316,10 +316,10 @@ impl TxResolver {
         };
         context.check_cancelled()?;
         let slot = request.operations.iter().find_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
+            Operation::Public(TxOp::OwnedClockSlot { slot }) => Some(*slot),
             _ => None,
         });
-        let slot_time = slot.map(|predecessor| {
+        let slot_time = slot.map(|slot| {
             let mut count = 0;
             request.operations.retain(|operation| {
                 let is_slot = matches!(operation, Operation::Public(TxOp::OwnedClockSlot { .. }));
@@ -334,7 +334,10 @@ impl TxResolver {
             {
                 return Err(Anomaly::incorrect("rtdb.owned/invalid-clock-slot", "A clock slot requires a fresh placed transaction with a deadline"));
             }
-            crate::system_time::clock_slot_time(predecessor, self.resolved_head, log_time)
+            let observed = decision.ok_or_else(|| Anomaly::incorrect(
+                "rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable",
+            ))?;
+            crate::system_time::clock_slot_time(slot, self.resolved_head, log_time, observed.instant)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"))
         }).transpose();
         let clock_request = match request.options.system_time {

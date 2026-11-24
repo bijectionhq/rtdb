@@ -40,13 +40,12 @@ impl SourceTransaction {
     pub fn proposal_generation_reading(&self) -> Result<Option<Timestamp>> {
         if !is_landing(&self.operations) { return Ok(None); }
         let mut ticks = self.operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
+            Operation::Public(TxOp::OwnedClockSlot { slot }) => Some(*slot),
             _ => None,
         });
-        let tick = ticks.next().ok_or_else(invalid)?;
-        let time = crate::system_time::clock_slot_reading(tick.system_time).ok_or_else(invalid)?;
+        let slot = ticks.next().ok_or_else(invalid)?;
         if ticks.next().is_some() { return Err(invalid()); }
-        Ok(Some(time))
+        Ok(Some(slot.reading))
     }
 
     /// Lowers both the approved effects and the chosen constraint outcome on one
@@ -73,11 +72,11 @@ impl SourceTransaction {
             .filter(|scope| Some(*scope) == context.owned_witness_scope).ok_or_else(invalid)?;
 
         let time = self.proposal_generation_reading()?.ok_or_else(invalid)?;
-        let tick = operations.operations.iter().find_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
+        let slot = operations.operations.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedClockSlot { slot }) => Some(*slot),
             _ => None,
         }).ok_or_else(invalid)?;
-        crate::system_time::clock_slot_time(tick, Some(predecessor), time).ok_or_else(|| {
+        crate::system_time::clock_slot_time(slot, Some(predecessor), time, time).ok_or_else(|| {
             Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable")
         })?;
         operations.operations.retain(|operation| !matches!(operation, Operation::Public(TxOp::OwnedClockSlot { .. })));
@@ -131,7 +130,7 @@ fn require_landing(primary: &[Operation], refusal: &[Operation]) -> Result<()> {
 
 impl PreparedLanding {
     pub(super) fn choose(
-        self, base: &Snapshot, assigned: TransactionKey, slot: Option<TransactionKey>,
+        self, base: &Snapshot, assigned: TransactionKey, slot: Option<crate::OwnedClockSlot>,
         primary: &[Operation], refusal: &[Operation],
         scope: Option<rtdb_types::PlacedAttemptScope>, context: &ResolveContext,
     ) -> Result<(StagedWrite, bool)> {

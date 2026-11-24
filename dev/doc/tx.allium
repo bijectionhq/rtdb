@@ -155,6 +155,9 @@
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
 -- A checked Proposal settlement binds a count condition to its own world and evaluates the complete counted prefix across the retained parent and final overlay.
 -- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
+-- The private Proposal slot carries the held Root's through-position and a separate receiver-clock target.
+-- A positioned receiver evaluates the half-open slot using its independent clock observation.
+-- The staged history coordinate also has to fit between the previous owned coordinate and source append.
 -- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.
 -- In a Proposal, local period rows and absence shadows mask the same identity in the held parent at that cut.
 -- An installed sample projection folds the complete assertion population per series in accepted order and counts each surviving sample coordinate once.

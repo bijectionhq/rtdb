@@ -827,10 +827,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("version".into(), Value::I64(1));
             "rtdb-hosted-constraint-refusal-v1"
         }
-        Operation::Public(TxOp::OwnedClockSlot { predecessor }) => {
-            body.insert("predecessor_id".into(), Value::I64(predecessor.tx_id.0));
-            body.insert("predecessor_micros".into(), Value::I64(predecessor.system_time.0));
-            "rtdb-owned-clock-slot-v1"
+        Operation::Public(TxOp::OwnedClockSlot { slot }) => {
+            body.insert("through".into(), Value::I64(slot.through.0));
+            body.insert("reading".into(), Value::I64(slot.reading.0));
+            "rtdb-owned-clock-slot-v2"
         }
         Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging, journal_before }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -2037,12 +2037,13 @@ impl SourceOperationReader<'_> {
                 }
                 TxOp::HostedConstraintRefusal
             }
-            "rtdb-owned-clock-slot-v1" => {
-                let (Value::I64(id), Value::I64(micros)) = (value("predecessor_id")?, value("predecessor_micros")?) else {
-                    return Err(invalid("Invalid owned clock slot predecessor"));
+            "rtdb-owned-clock-slot-v2" => {
+                let (Value::I64(id), Value::I64(micros)) = (value("through")?, value("reading")?) else {
+                    return Err(invalid("Invalid owned clock slot"));
                 };
+                if id < 0 || micros <= 0 { return Err(invalid("Invalid owned clock slot")); }
                 TxOp::OwnedClockSlot {
-                    predecessor: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(id), system_time: Timestamp(micros) },
+                    slot: crate::OwnedClockSlot { through: rtdb_types::TxId(id), reading: Timestamp(micros) },
                 }
             }
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" | "rtdb-owned-physical-deadline-v2" => {

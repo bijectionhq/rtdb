@@ -65,24 +65,27 @@ pub(crate) fn admits_historical_time(previous: Option<i64>, requested: i64, logg
 }
 
 #[cfg(not(verus_keep_ghost))]
-pub fn clock_slot_reading(tick: rtdb_types::Timestamp) -> Option<rtdb_types::Timestamp> {
-    tick.0.checked_add(500_000).map(rtdb_types::Timestamp)
+pub fn clock_slot_reading(observed: rtdb_types::Timestamp) -> Option<rtdb_types::Timestamp> {
+    observed.0.checked_add(500_000).map(rtdb_types::Timestamp)
 }
 
 #[cfg(not(verus_keep_ghost))]
 pub(crate) fn clock_slot_time(
-    tick: rtdb_types::TransactionKey,
+    slot: crate::OwnedClockSlot,
     head: Option<rtdb_types::TransactionKey>,
     appended: rtdb_types::Timestamp,
+    observed: rtdb_types::Timestamp,
 ) -> Option<rtdb_types::Timestamp> {
     const GRACE_MICROS: i64 = 1_000_000;
     let head = head?;
-    let reading = clock_slot_reading(tick.system_time)?;
-    (head.tx_id.0 >= tick.tx_id.0
-        && head.system_time >= tick.system_time
+    let reading = slot.reading;
+    let until = reading.0.checked_add(GRACE_MICROS)?;
+    (head.tx_id.0 >= slot.through.0
+        // The owned storage format still stages effects at a distinct history coordinate.
         && head.system_time < reading
         && appended >= reading
-        && appended.0 < reading.0.saturating_add(GRACE_MICROS))
+        && observed >= reading
+        && observed.0 < until)
         .then_some(reading)
 }
 
@@ -146,17 +149,22 @@ fn require_append_bound(
 mod tests {
     use rtdb_types::{Timestamp, TransactionKey, TxId};
 
-    use super::clock_slot_time;
+    use crate::OwnedClockSlot;
+    use super::{clock_slot_reading, clock_slot_time};
 
     #[test]
-    fn clock_slot_survives_earlier_orders_and_admits_only_its_append_window() {
-        let tick = TransactionKey { tx_id: TxId(8), system_time: Timestamp(100) };
-        let earlier = TransactionKey { tx_id: TxId(9), system_time: Timestamp(101) };
-        let used = TransactionKey { tx_id: TxId(9), system_time: Timestamp(500_100) };
+    fn clock_slot_tests_position_and_independent_half_open_window() {
+        let reading = clock_slot_reading(Timestamp(100)).unwrap();
+        let slot = OwnedClockSlot { through: TxId(8), reading };
+        let behind = TransactionKey { tx_id: TxId(7), system_time: Timestamp(100) };
+        let carried = TransactionKey { tx_id: TxId(9), system_time: Timestamp(301) };
+        let used = TransactionKey { tx_id: TxId(9), system_time: reading };
 
-        assert_eq!(clock_slot_time(tick, Some(earlier), Timestamp(500_100)), Some(Timestamp(500_100)));
-        assert_eq!(clock_slot_time(tick, Some(tick), Timestamp(500_099)), None);
-        assert_eq!(clock_slot_time(tick, Some(tick), Timestamp(1_500_100)), None);
-        assert_eq!(clock_slot_time(tick, Some(used), Timestamp(500_100)), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, reading), Some(reading));
+        assert_eq!(clock_slot_time(slot, Some(behind), reading, reading), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), Timestamp(500_099), reading), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(500_099)), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(1_500_100)), None);
+        assert_eq!(clock_slot_time(slot, Some(used), reading, reading), None);
     }
 }

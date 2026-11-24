@@ -2944,7 +2944,7 @@ impl OwnedWorldFork {
 
 #[derive(Default)]
 pub struct OwnedRootSection {
-    pub clock_slot: Option<TransactionKey>,
+    pub clock_slot: Option<rtdb_tx::OwnedClockSlot>,
     pub proposal_overlay: bool,
     pub proposal_land: bool,
     pub refusal: Vec<rtdb_tx::HostedControlWrite>,
@@ -3349,7 +3349,7 @@ impl NativeSession {
         let mut ops = Vec::with_capacity(effects);
         ops.push(TxOp::owned_deadline(until));
         ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
-        ops.extend(root.clock_slot.map(|predecessor| TxOp::OwnedClockSlot { predecessor }));
+        ops.extend(root.clock_slot.map(|slot| TxOp::OwnedClockSlot { slot }));
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
         ops.extend(root.checks);
         if !observed_worlds.is_empty() {

@@ -64,7 +64,7 @@ ENV TZ=UTC
 STOPSIGNAL SIGTERM
 
 FROM runtime-environment AS multi
-LABEL io.rtdb.hosted-protocol=134 io.rtdb.pgwire-arrow-copy-out=true
+LABEL io.rtdb.hosted-protocol=135 io.rtdb.pgwire-arrow-copy-out=true
 RUN apt-get update \
     && apt-get install --no-install-recommends -y curl jq netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*

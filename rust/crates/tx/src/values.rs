@@ -1308,6 +1308,13 @@ pub enum OwnedPeriodEffect {
     Delete(EntityId),
 }
 
+/// A temporal target from a held live clock, anchored to an ordered data cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedClockSlot {
+    pub through: TxId,
+    pub reading: Timestamp,
+}
+
 #[derive(Clone, Debug)]
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
@@ -1330,7 +1337,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     HostedConstraintRefusal,
     OwnedDeadline { until: Timestamp, recheck_at_staging: bool, journal_before: Option<rtdb_types::TimedJournalCutoff> },
-    OwnedClockSlot { predecessor: TransactionKey },
+    OwnedClockSlot { slot: OwnedClockSlot },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope, clock: Option<rtdb_types::WorldClockLimit> },
     OwnedForkWorld {
         record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,

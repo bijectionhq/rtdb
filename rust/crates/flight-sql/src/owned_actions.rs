@@ -18,7 +18,7 @@ use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, Own
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{HeldSpatialNearest, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
-use rtdb_tx::{ArrowDocuments, Documents, OwnedRelativePeriod, TxOp};
+use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
 use rtdb_types::{EntityId, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
@@ -1026,17 +1026,15 @@ impl Service {
     }
 
     pub(crate) async fn offer_clock_slot_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        let (tick, trailing) = self.owned_clock_slot(call, body).await?;
+        let (slot, trailing) = self.owned_clock_slot(call, body).await?;
         if !trailing.is_empty() {
             return Err(invalid("A clock slot takes one original hold handle"));
         }
-        let reading = rtdb_tx::clock_slot_reading(tick.system_time).ok_or_else(Self::clock_slot_missed)?;
-        Ok(ActionResult { body: wire::retain(reading.0.to_be_bytes().to_vec(), call.reserve(8)?) })
+        Ok(ActionResult { body: wire::retain(slot.reading.0.to_be_bytes().to_vec(), call.reserve(8)?) })
     }
 
-    async fn wait_for_clock_slot(&self, call: &Call, tick: rtdb_types::TransactionKey) -> Result<(), Status> {
-        let reading = rtdb_tx::clock_slot_reading(tick.system_time).ok_or_else(Self::clock_slot_missed)?;
-        let delay = reading.0.saturating_sub(self.0.node.now().0);
+    async fn wait_for_clock_slot(&self, call: &Call, slot: OwnedClockSlot) -> Result<(), Status> {
+        let delay = slot.reading.0.saturating_sub(self.0.node.now().0);
         if delay > 1_000_000 {
             return Err(Self::clock_slot_missed());
         }
@@ -1050,7 +1048,7 @@ impl Service {
 
     async fn owned_clock_slot<'a>(
         &self, call: &Call, body: &'a [u8],
-    ) -> Result<(rtdb_types::TransactionKey, &'a [u8]), Status> {
+    ) -> Result<(OwnedClockSlot, &'a [u8]), Status> {
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing clock slot hold"))?;
@@ -1061,10 +1059,12 @@ impl Service {
         let cut = original.snapshot.fork_cut(scope).await.map_err(|error| {
             if error.code == "rtdb.world/unavailable" { Self::clock_slot_missed() } else { status(error) }
         })?;
-        if cut.live().is_none() {
-            return Err(Status::failed_precondition("An ordered clock slot requires a live placed Root hold"));
-        }
-        Ok((original.snapshot.present(), body))
+        let through = cut.live().ok_or_else(|| Status::failed_precondition(
+            "An ordered clock slot requires a live placed Root hold",
+        ))?.tx_id;
+        let observed = original.snapshot.query_time().map_err(status)?;
+        let reading = rtdb_tx::clock_slot_reading(observed).ok_or_else(Self::clock_slot_missed)?;
+        Ok((OwnedClockSlot { through, reading }, body))
     }
 
     pub(crate) async fn decide_hosted_action(
@@ -1142,7 +1142,7 @@ impl Service {
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len() + usize::from(slot.is_some()))
             .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging, journal_before }];
-        writes.extend(slot.map(|predecessor| TxOp::OwnedClockSlot { predecessor }));
+        writes.extend(slot.map(|slot| TxOp::OwnedClockSlot { slot }));
         writes.extend(conditions);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
