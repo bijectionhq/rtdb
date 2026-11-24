@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ring::{aead, digest, rand::{SecureRandom, SystemRandom}};
 use serde::{Deserialize, Serialize};
 
-use crate::{Anomaly, Result, Timestamp};
+use crate::{Anomaly, Iid, Result, TableRef, Timestamp};
 
 pub type Branch = String;
 pub const MAIN_BRANCH: &str = "main";
@@ -88,11 +88,100 @@ impl Claim {
     pub fn into_bytes(self) -> Vec<u8> { self.0 }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimScope {
     pub branch: Branch,
     pub basis: Basis,
     pub layer: Layer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ClaimRegion {
+    Table(TableRef),
+    Row { table: TableRef, iid: Iid },
+    IidRange { table: TableRef, lower: Iid, upper: Iid },
+    IndexRange { table: TableRef, index: String, lower: Option<Vec<u8>>, upper: Option<Vec<u8>> },
+}
+
+impl ClaimRegion {
+    pub fn table(&self) -> &TableRef {
+        match self {
+            Self::Table(table) | Self::Row { table, .. } | Self::IidRange { table, .. } | Self::IndexRange { table, .. } => table,
+        }
+    }
+}
+
+const MAX_CLAIM_TABLES: usize = 32;
+pub const MAX_REGIONS_PER_TABLE: usize = 16;
+const MAX_REGION_BYTES: usize = 1024;
+const MAX_FOOTPRINT_BYTES: usize = 16 * 1024;
+pub const MAX_CLAIM_PAYLOAD_BYTES: usize = MAX_FOOTPRINT_BYTES + 2048;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimFootprint(Option<BTreeSet<ClaimRegion>>);
+
+impl ClaimFootprint {
+    pub fn from_regions(regions: impl IntoIterator<Item = ClaimRegion>) -> Self {
+        let mut tables = BTreeMap::<TableRef, Option<BTreeSet<ClaimRegion>>>::new();
+        for region in regions {
+            let table = region.table();
+            if table.schema.len().saturating_add(table.table.len()) > MAX_REGION_BYTES
+                || (tables.len() == MAX_CLAIM_TABLES && !tables.contains_key(table))
+            {
+                return Self::default();
+            }
+            let entry = tables.entry(table.clone()).or_insert_with(|| Some(BTreeSet::new()));
+            let Some(parts) = entry.as_mut() else { continue; };
+            if matches!(region, ClaimRegion::Table(_)) || oversized_or_invalid(&region) {
+                *entry = None;
+                continue;
+            }
+            parts.insert(region);
+            if parts.len() > MAX_REGIONS_PER_TABLE {
+                *entry = None;
+            }
+        }
+        let coarse = tables.keys().cloned().map(ClaimRegion::Table).collect();
+        let mut precise = BTreeSet::new();
+        for (table, parts) in tables {
+            match parts {
+                Some(parts) => precise.extend(parts),
+                None => { precise.insert(ClaimRegion::Table(table)); }
+            }
+        }
+        if fits_footprint(&precise) {
+            return Self(Some(precise));
+        }
+        if fits_footprint(&coarse) { Self(Some(coarse)) } else { Self::default() }
+    }
+
+    pub fn regions(&self) -> Option<&BTreeSet<ClaimRegion>> { self.0.as_ref() }
+}
+
+fn oversized_or_invalid(region: &ClaimRegion) -> bool {
+    if matches!(region, ClaimRegion::IidRange { lower, upper, .. } if lower > upper) { return true; }
+    if let ClaimRegion::IndexRange { index, lower, upper, .. } = region
+        && (index.len().saturating_add(lower.as_ref().map_or(0, Vec::len))
+            .saturating_add(upper.as_ref().map_or(0, Vec::len)) > MAX_REGION_BYTES
+            || lower.as_ref().zip(upper.as_ref()).is_some_and(|(lower, upper)| lower > upper))
+    {
+        return true;
+    }
+    serde_json::to_vec(region).is_ok_and(|bytes| bytes.len() > MAX_REGION_BYTES)
+}
+
+fn fits_footprint(regions: &BTreeSet<ClaimRegion>) -> bool {
+    serde_json::to_vec(regions).is_ok_and(|bytes| bytes.len() <= MAX_FOOTPRINT_BYTES)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimEvidence {
+    pub scope: ClaimScope,
+    pub footprint: ClaimFootprint,
+}
+
+pub trait ClaimVerifier: Send + Sync {
+    fn verify(&self, claim: &Claim) -> Result<ClaimEvidence>;
 }
 
 const CLAIM_DOMAIN: &[u8] = b"rtdb.v1/branch-claim/1";
@@ -106,7 +195,22 @@ pub struct ClaimSealer {
     incarnation: [u8; 16],
 }
 
+impl ClaimVerifier for ClaimSealer {
+    fn verify(&self, claim: &Claim) -> Result<ClaimEvidence> {
+        Ok(ClaimEvidence { scope: self.open(claim)?, footprint: ClaimFootprint::default() })
+    }
+}
+
 impl ClaimSealer {
+    pub fn scoped_verifier<'a>(&'a self, scope: &'a LabelScope) -> impl ClaimVerifier + 'a {
+        struct Scoped<'a>(&'a ClaimSealer, &'a LabelScope);
+        impl ClaimVerifier for Scoped<'_> {
+            fn verify(&self, claim: &Claim) -> Result<ClaimEvidence> {
+                Ok(ClaimEvidence { scope: self.0.open_scoped(claim, self.1)?, footprint: Default::default() })
+            }
+        }
+        Scoped(self, scope)
+    }
     pub fn new(incarnation: [u8; 16], key: [u8; 32]) -> Self {
         let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key)
             .expect("AES-256-GCM keys are 32 bytes");

@@ -115,7 +115,7 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let (rows, second) = query(&mut other_session, request.clone()).await;
     assert_eq!(ints(&rows), [30]);
     assert_eq!(first.basis, second.basis);
-    assert!(second.claim.is_some());
+    assert_eq!(first.claim, second.claim);
     assert!(second.next.is_none());
 
     let mut exact = input("SELECT n FROM wire_rows WHERE _id = 3");
@@ -178,6 +178,74 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
         "rtdb/invalid-request",
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn rtdb_v1_tokens_survive_database_and_flight_restart() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+    use rtdb_types::{EntityId, TableRef, rtdb_v1::{Claim, ClaimRegion}};
+
+    let root = tempfile::tempdir().unwrap();
+    let options = || NodeOptions {
+        membership: Membership::Durable {
+            primary: DatabaseConfig {
+                log: Some(database_config::Log::LocalLog(LocalLog {
+                    path: Some(root.path().join("log").to_string_lossy().into()), ..Default::default()
+                })),
+                storage: Some(database_config::Storage::LocalStorage(LocalStorage {
+                    path: Some(root.path().join("objects").to_string_lossy().into()), ..Default::default()
+                })),
+                ..Default::default()
+            },
+            skipped: Default::default(),
+        },
+        ..Default::default()
+    };
+    let mut request = input("SELECT n FROM wire_rows WHERE _id = 1 OR _id = 2 ORDER BY _id");
+    request.track = true;
+    request.page = Some(v1::Page { limit: 1, after: Vec::new() });
+
+    let first = {
+        let running = Running::start_with_options(None, FlightConfig::default(), &[], None, options()).await;
+        let mut client = Client::connect(&running.server, None).await;
+        client.update("INSERT INTO wire_rows (_id, n) VALUES (1, 10), (2, 20), (3, 30)", None).await;
+        let (rows, first) = query(&mut client, request.clone()).await;
+        assert_eq!(ints(&rows), [10]);
+        let database = running.node.catalog().database("xtdb").unwrap();
+        let authority = database.token_authority().await.unwrap();
+        let claim = Claim::from_bytes(first.claim.clone().unwrap().value);
+        let opened = authority.open_claim(&claim).await.unwrap();
+        let table = TableRef::new("public", "wire_rows");
+        assert_eq!(opened.footprint.regions().unwrap(), &[
+            ClaimRegion::Row { table: table.clone(), iid: EntityId::Integer(1).iid() },
+            ClaimRegion::Row { table, iid: EntityId::Integer(2).iid() },
+        ].into_iter().collect());
+        client.update("UPDATE wire_rows SET n = 200 WHERE _id = 2", None).await;
+        database.apply_token_key_rotation(1, i64::MAX).await.unwrap();
+        running.stop().await;
+        first
+    };
+
+    request.page.as_mut().unwrap().after = first.next.clone().unwrap();
+    let rerouted = Running::start_with_options(None, FlightConfig::default(), &[], None, options()).await;
+    let mut client = Client::connect(&rerouted.server, None).await;
+    let (rows, second) = query(&mut client, request.clone()).await;
+    assert_eq!(ints(&rows), [20]);
+    assert_eq!(first.basis, second.basis);
+    assert!(second.next.is_none());
+    let database = rerouted.node.catalog().database("xtdb").unwrap();
+    let authority = database.token_authority().await.unwrap();
+    let before = Claim::from_bytes(first.claim.unwrap().value);
+    let after = Claim::from_bytes(second.claim.unwrap().value);
+    assert_eq!(before, after);
+    assert_eq!(authority.open_claim(&before).await.unwrap().scope.branch, "main");
+    rerouted.stop().await;
+
+    let foreign = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&foreign.server, None).await;
+    let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
+    error(status, v1::AnomalyCategory::NotFound, "rtdb/cursor-expired");
+    foreign.stop().await;
 }
 
 #[tokio::test]
@@ -781,11 +849,22 @@ const FIXTURE_INCARNATION: [u8; 16] = [41; 16];
 
 struct AppliedFixture {
     state: std::sync::Mutex<rtdb_tx::transact::TransactState>,
-    claims: rtdb_types::rtdb_v1::ClaimSealer,
+    tokens: rtdb_crypt::tokens::TokenAuthority,
     memory: Arc<MemoryBudget>,
     admission: std::sync::Mutex<Option<(uuid::Uuid, Timestamp, Bytes)>>,
     waiting: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+struct FixtureTokenKeys(rtdb_crypt::tokens::TokenKey);
+
+#[async_trait]
+impl rtdb_crypt::tokens::TokenKeys for FixtureTokenKeys {
+    async fn current(&self) -> Result<rtdb_crypt::tokens::TokenKey> { Ok(self.0.clone()) }
+
+    async fn get(&self, number: u64) -> Result<Option<rtdb_crypt::tokens::TokenKey>> {
+        Ok((number == self.0.generation().number).then(|| self.0.clone()))
+    }
 }
 
 #[async_trait]
@@ -793,6 +872,8 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
     fn incarnation(&self) -> [u8; 16] {
         FIXTURE_INCARNATION
     }
+
+    fn token_authority(&self) -> Option<rtdb_crypt::tokens::TokenAuthority> { Some(self.tokens.clone()) }
 
     fn features(&self) -> &[&str] {
         &[
@@ -809,7 +890,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
     async fn query(
         &self,
         source: rtdb_node::serving::QuerySource,
-        track: bool,
+        _track: bool,
         now: Timestamp,
         _: &tokio_util::sync::CancellationToken,
     ) -> Result<rtdb_node::serving::QueryView> {
@@ -824,9 +905,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
         Ok(rtdb_node::serving::QueryView {
             snapshot: rtdb_query::branch_snapshot(&view, &self.memory)?,
             cut: view.cut(),
-            claim: track
-                .then(|| rtdb_query::seal_branch_claim(&view, &self.claims))
-                .transpose()?,
+            claim: None,
         })
     }
 
@@ -842,6 +921,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             self.waiting.notify_one();
             self.release.notified().await;
         }
+        let claims = self.tokens.verify_claims(request.transaction.claims()).await;
         let mut state = self.state.lock().unwrap();
         let cut = state.index().head();
         let now = if cut.basis.position() == 0 {
@@ -854,7 +934,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             cut.basis.position() + 1,
             now,
             self.features(),
-            &self.claims,
+            &claims,
         )? {
             Resolution::Answer(receipt) => Ok(receipt),
             Resolution::Append(append) => {
@@ -980,9 +1060,13 @@ async fn transact_wire(
 
 #[tokio::test]
 async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and_changes() {
+    let database = uuid::Uuid::from_bytes(FIXTURE_INCARNATION);
+    let kms: Arc<dyn rtdb_crypt::Kms> = Arc::new(rtdb_crypt::LocalKms::new(|| 0));
+    let key = rtdb_crypt::tokens::TokenKey::create(kms.as_ref(), rtdb_crypt::Generation { database, number: 0 }).await.unwrap();
+    let tokens = rtdb_crypt::tokens::TokenAuthority::new(database, kms, Arc::new(FixtureTokenKeys(key)));
     let driver = Arc::new(AppliedFixture {
         state: std::sync::Mutex::new(rtdb_tx::transact::TransactState::new(FIXTURE_INCARNATION)),
-        claims: rtdb_types::rtdb_v1::ClaimSealer::new(FIXTURE_INCARNATION, [9; 32]),
+        tokens,
         memory: MemoryBudget::new(1 << 27),
         admission: Default::default(),
         waiting: Default::default(),

@@ -5,11 +5,10 @@ use std::{
 
 use arrow_flight::FlightData;
 use prost::Message;
-use rtdb_node::serving::QuerySource;
-use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
+use rtdb_crypt::tokens::{PageToken, TokenIssuer};
+use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::QuerySource};
 use rtdb_query::{QueryContext, QueryCursor};
-use rtdb_types::rtdb_v1::{At, Basis, Layer};
-use rtdb_types::{LogicalType, Timestamp};
+use rtdb_types::{LogicalType, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -21,7 +20,7 @@ use crate::{
 use super::{
     MAX_PAGE_ROWS, MAX_WAIT, error, head,
     proto::{self, at::Selection},
-    tokens::{self, Continuation, cursor_expired},
+    tokens::{self, cursor_expired},
     trailer,
 };
 
@@ -80,13 +79,23 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     hash.finalize().into()
 }
 
+struct OpenedQuery {
+    cursor: QueryCursor,
+    database: Arc<Database>,
+    issuer: Option<TokenIssuer>,
+    labels: Option<LabelScope>,
+    page: PageToken,
+    limit: u64,
+    trailer: proto::QueryTrailer,
+}
+
 impl Service {
     pub(super) async fn v1_query(
         &self,
         call: Call,
         request: proto::QueryRequest,
     ) -> Result<Response<Output<FlightData>>, Status> {
-        let (mut cursor, database, page, limit, mut trailer_msg) = self
+        let OpenedQuery { mut cursor, database, issuer, labels, page, limit, trailer: mut trailer_msg } = self
             .open_v1_query(&call, request)
             .await
             .map_err(|status| call.error(status))?;
@@ -125,17 +134,19 @@ impl Service {
                 let Some((data, more)) = encoded else { break; };
                 for item in data {
                     service.check_attachment(&call, &database)?;
+                    if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
                     call.handoff(cursor.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
                     yield item;
                 }
                 if more {
-                    let next = Continuation { offset: page.offset.checked_add(sent).ok_or_else(|| error::incorrect("Page offset overflow"))?, ..page };
-                    let scope = uuid::Uuid::from_bytes(next.cut.incarnation());
-                    trailer_msg.next = Some(service.0.v1.tokens.continuation(scope, &next));
+                    let next = PageToken { offset: page.offset.checked_add(sent).ok_or_else(|| error::incorrect("Page offset overflow"))?, ..page };
+                    let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("query.page"))?;
+                    trailer_msg.next = Some(issuer.seal_page_in(&next, labels.as_ref()).await.map_err(error::anomaly)?);
                     break;
                 }
             }
             if skip != 0 { Err(cursor_expired())?; }
+            if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
             service.check_attachment(&call, &database)?;
             call.handoff(cursor.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
             yield trailer(trailer_msg);
@@ -149,36 +160,34 @@ impl Service {
         &self,
         call: &Call,
         request: proto::QueryRequest,
-    ) -> Result<
-        (
-            QueryCursor,
-            Arc<Database>,
-            Continuation,
-            u64,
-            proto::QueryTrailer,
-        ),
-        Status,
-    > {
+    ) -> Result<OpenedQuery, Status> {
         let source = request
             .source
             .as_ref()
             .ok_or_else(|| error::incorrect("Query requires a Source"))?;
         let layer = proto::Layer::try_from(source.layer)
             .map_err(|_| error::incorrect("Unknown source layer"))?;
+        let claim_layer = match layer { proto::Layer::Merged => Layer::Merged, proto::Layer::Local => Layer::Local };
         let selection = source.at.as_ref().and_then(|at| at.selection.as_ref());
         if source.at.is_some() && selection.is_none() {
             return Err(error::incorrect("Empty At selector"));
         }
         let database = self.wire_database(call, &source.branch, layer).await?;
-        let tokens = &self.0.v1.tokens;
         let driver = database.serving_driver();
         let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
-        let scope = driver.map_or_else(
-            || database.wire_incarnation(),
-            |driver| uuid::Uuid::from_bytes(visibility.as_ref().map_or_else(
-                || driver.incarnation(), |scope| scope.labels.main_read_incarnation(driver.incarnation()),
-            )),
-        );
+        let authority = if request.track || request.page.is_some() {
+            if !database.wire_tokens_supported() {
+                return Err(error::unsupported(if request.track { "query.track" } else { "query.page" }));
+            }
+            Some(database.token_authority().await.map_err(error::anomaly)?)
+        } else { None };
+        let raw_scope = match driver {
+            Some(driver) => uuid::Uuid::from_bytes(driver.incarnation()),
+            None => database.wire_incarnation().await.map_err(error::anomaly)?,
+        };
+        let scope = visibility.as_ref().map_or(raw_scope, |scope| {
+            uuid::Uuid::from_bytes(scope.labels.main_read_incarnation(*raw_scope.as_bytes()))
+        });
         let request_hash = fingerprint(&request);
         let (limit, after) = match &request.page {
             Some(page) if (1..=MAX_PAGE_ROWS).contains(&page.limit) => {
@@ -191,71 +200,50 @@ impl Service {
             }
             None => (u64::MAX, &[][..]),
         };
-        let continuation = if after.is_empty() {
-            None
-        } else {
-            let page = tokens.read_continuation(scope, after)?;
-            if page.request != request_hash {
-                return Err(error::incorrect(
-                    "Continuation belongs to a different query",
-                ));
+        let (continuation, issuer) = match authority {
+            Some(authority) if !after.is_empty() => {
+                let (page, issuer) = authority.resume_page_in(after, visibility.as_ref().map(|scope| &scope.labels)).await.map_err(error::anomaly)?;
+                if page.request != request_hash {
+                    return Err(error::incorrect("Continuation belongs to a different query"));
+                }
+                (Some(page), Some(issuer))
             }
-            Some(page)
+            Some(authority) => (None, Some(authority.issuer().await.map_err(error::anomaly)?)),
+            None => (None, None),
         };
-        let (context, page, time, claim) = if let Some(driver) = driver {
+        let (context, page, cut, scoped_claim) = if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
-            let (source, clock, offset) =
-                applied_source(source, layer, selection, continuation, now)?;
-            let scoped = visibility.as_ref();
-            let view = match scoped {
-                Some(scope) => driver.query_scoped(source, request.track, now, scope, &call.cancellation).await,
-                None => driver.query(source, request.track, now, &call.cancellation).await,
+            let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
+            let view = match &visibility {
+                Some(scope) => driver.query_scoped(query_source, request.track, now, scope, &call.cancellation).await,
+                None => driver.query(query_source, false, now, &call.cancellation).await,
             }.map_err(error::anomaly)?;
-            let time = view.cut.system_time;
-            let (context, clock) = if scoped.is_some() {
+            let cut = view.cut.system_time;
+            let (context, clock) = if visibility.is_some() {
                 let clock = continuation.map_or(now, |page| page.clock);
                 let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
                 let context = self.scoped_wire_context(call, snapshot, clock)?
-                    .with_wire_cut(time, clock.into()).map_err(error::anomaly)?;
+                    .with_wire_cut(cut, clock.into()).map_err(error::anomaly)?;
                 (context, clock)
             } else {
-                let clock = if exact { time } else { clock };
+                let clock = if exact { cut } else { clock };
                 let context = self.wire_context(call, &database, false).await?
-                    .with_wire_snapshot(view.snapshot, time, clock.into()).map_err(error::anomaly)?;
+                    .with_wire_snapshot(view.snapshot, cut, clock.into()).map_err(error::anomaly)?;
                 (context, clock)
             };
-            (
-                context,
-                Continuation {
-                    cut: view.cut.basis,
-                    clock,
-                    offset,
-                    request: request_hash,
-                },
-                time,
-                view.claim.map(|claim| proto::Claim {
-                    value: claim.into_bytes(),
-                }),
-            )
+            let page = PageToken { basis: view.cut.basis, clock, offset, request: request_hash };
+            (context, page, cut, view.claim)
         } else {
-            if continuation.is_none()
-                && let Some(Selection::AtLeast(basis)) = selection
-            {
-                let minimum = tokens::read_basis(scope, basis)?;
-                if minimum != Timestamp::MIN {
-                    self.0
-                        .node
-                        .wire_await_time(
-                            &call.database,
-                            call.session.caller.principal.as_ref(),
-                            minimum,
-                            MAX_WAIT,
-                            &call.cancellation,
-                        )
-                        .await
-                        .map_err(error::anomaly)?;
-                }
+            let minimum = match (continuation, selection) {
+                (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
+                (None, Some(Selection::AtLeast(basis))) => Some(tokens::read_basis(scope, basis)?),
+                _ => None,
+            };
+            if let Some(minimum) = minimum.filter(|minimum| *minimum != Timestamp::MIN) {
+                self.0.node.wire_await_time(
+                    &call.database, call.session.caller.principal.as_ref(), minimum, MAX_WAIT, &call.cancellation,
+                ).await.map_err(error::anomaly)?;
             }
             let context = self
                 .wire_context(
@@ -279,25 +267,24 @@ impl Service {
                         }
                         _ => (present, now),
                     };
-                    Continuation {
-                        cut: tokens::basis(scope, cut),
+                    PageToken {
+                        basis: tokens::basis(scope, cut),
                         clock,
                         offset: 0,
                         request: request_hash,
                     }
                 }
             };
-            let time = tokens::read_basis(scope, &page.cut.into())?;
-            if time > present {
+            let cut = tokens::read_basis(scope, &page.basis.into())?;
+            if cut > present {
                 return Err(error::unavailable(
                     "Database has not applied the requested basis",
                 ));
             }
             let context = context
-                .with_wire_cut(time, page.clock.into())
+                .with_wire_cut(cut, page.clock.into())
                 .map_err(error::anomaly)?;
-            let claim = request.track.then(|| tokens.claim(page.cut)).transpose()?;
-            (context, page, time, claim)
+            (context, page, cut, None)
         };
         let parameters = request
             .params_ipc
@@ -312,27 +299,39 @@ impl Service {
             .v1
             .plans
             .prepare(scope, &request.sql, &context, types)?;
-        let cursor = open_query(prepared, context, parameters.as_ref()).await?;
-        let reply = proto::QueryTrailer {
-            basis: Some(page.cut.into()),
-            system_time_micros: time.0,
+        let (cursor, footprint) = open_query(prepared, context, parameters.as_ref(), request.track).await?;
+        let claim = if visibility.is_some() && request.track {
+            let claim = scoped_claim.ok_or_else(|| error::unsupported("query.track"))?;
+            Some(proto::Claim { value: claim.into_bytes() })
+        } else if request.track {
+            let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("query.track"))?;
+            let evidence = ClaimEvidence {
+                scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: claim_layer },
+                footprint,
+            };
+            let value = issuer.seal_claim(&evidence).await.map_err(error::anomaly)?.into_bytes();
+            Some(proto::Claim { value })
+        } else { None };
+        let trailer = proto::QueryTrailer {
+            basis: Some(page.basis.into()),
+            system_time_micros: cut.0,
             claim,
             next: None,
         };
-        Ok((cursor, database, page, limit, reply))
+        Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer })
     }
 }
 
 fn applied_source(
     source: &proto::Source,
-    layer: proto::Layer,
+    layer: Layer,
     selection: Option<&Selection>,
-    continuation: Option<Continuation>,
+    continuation: Option<PageToken>,
     now: Timestamp,
 ) -> Result<(QuerySource, Timestamp, u64), Status> {
     let read_basis = |basis: &proto::Basis| Basis::from_bytes(&basis.value).map_err(error::anomaly);
     let (at, clock, offset) = match continuation {
-        Some(page) => (At::Exactly(page.cut), page.clock, page.offset),
+        Some(page) => (At::Exactly(page.basis), page.clock, page.offset),
         None => match selection {
             None | Some(Selection::Latest(_)) => (At::Latest, now, 0),
             Some(Selection::AtLeast(basis)) => (At::AtLeast(read_basis(basis)?), now, 0),
@@ -340,10 +339,6 @@ fn applied_source(
             Some(Selection::Linearizable(_)) => (At::Linearizable, now, 0),
             Some(Selection::AsOfMicros(time)) => (At::AsOf(Timestamp(*time)), Timestamp(*time), 0),
         },
-    };
-    let layer = match layer {
-        proto::Layer::Merged => Layer::Merged,
-        proto::Layer::Local => Layer::Local,
     };
     Ok((
         QuerySource {
@@ -386,33 +381,22 @@ async fn open_query(
     prepared: PreparedSql,
     context: Arc<QueryContext>,
     parameters: Option<&Parameters>,
-) -> Result<QueryCursor, Status> {
-    let Some(parameters) = parameters else {
-        return prepared
-            .open_query_columns_typed(context, Vec::new(), &[])
-            .await
-            .map_err(error::anomaly);
-    };
-    let types = parameters.types.as_slice();
-    let arguments =
-        wire::arguments(&parameters.batch, &context.memory).map_err(error::map_status)?;
-    let row = arguments
-        .rows()
-        .next()
-        .ok_or_else(|| error::incorrect("Parameters require one row"))?
-        .map_err(error::anomaly)?;
-    let size = row
-        .iter()
-        .try_fold(1024usize, |bytes, value| {
-            wire::add(
-                wire::add(bytes, std::mem::size_of::<rtdb_types::Value>())?,
-                value.retained_bytes().map_err(error::anomaly)?,
-            )
-        })
-        .map_err(error::map_status)?;
-    let _values = context.memory.reserve(size).map_err(error::anomaly)?;
-    prepared
-        .open_query_columns_typed(context, row.to_vec(), types)
-        .await
-        .map_err(error::anomaly)
+    track: bool,
+) -> Result<(QueryCursor, ClaimFootprint), Status> {
+    let (row, types, _values) = if let Some(parameters) = parameters {
+        let arguments = wire::arguments(&parameters.batch, &context.memory).map_err(error::map_status)?;
+        let row = arguments.rows().next().ok_or_else(|| error::incorrect("Parameters require one row"))?
+            .map_err(error::anomaly)?;
+        let size = row.iter().try_fold(1024usize, |bytes, value| {
+            wire::add(wire::add(bytes, std::mem::size_of::<rtdb_types::Value>())?, value.retained_bytes().map_err(error::anomaly)?)
+        }).map_err(error::map_status)?;
+        let values = context.memory.reserve(size).map_err(error::anomaly)?;
+        (row.to_vec(), parameters.types.as_slice(), Some(values))
+    } else { (Vec::new(), &[][..], None) };
+    if track {
+        prepared.open_tracked_query_columns(context, row, types).await.map_err(error::anomaly)
+    } else {
+        let cursor = prepared.open_query_columns_typed(context, row, types).await.map_err(error::anomaly)?;
+        Ok((cursor, ClaimFootprint::default()))
+    }
 }

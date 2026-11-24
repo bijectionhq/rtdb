@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{Snapshot, branches::BranchCut};
 use rtdb_tx::transact::{Receipt, Transact};
 use rtdb_types::{
@@ -14,6 +15,7 @@ use uuid::Uuid;
 mod visibility;
 pub use visibility::{ScopedSubmission, ServingScope, ROW_VISIBILITY};
 
+#[derive(Clone)]
 pub struct QuerySource {
     pub branch: Branch,
     pub at: At,
@@ -91,6 +93,15 @@ pub struct ChangeRow {
 pub trait ServingDriver: Send + Sync {
     fn incarnation(&self) -> [u8; 16];
     fn features(&self) -> &[&str];
+    fn token_authority(&self) -> Option<TokenAuthority> { None }
+
+    async fn apply_token_key_rotation(&self, _generation: u64, _unreadable_by: i64) -> Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/token-rotation", "This driver does not own token key rotation"))
+    }
+
+    async fn destroy_retired_token_key(&self, _generation: u64) -> Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/token-rotation", "This driver does not own token key rotation"))
+    }
 
     fn supports_row_visibility(&self) -> bool { false }
 

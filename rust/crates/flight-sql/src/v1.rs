@@ -32,7 +32,6 @@ pub(crate) const ACTIONS: [&str; 3] = [
 
 #[derive(Default)]
 pub(crate) struct State {
-    tokens: tokens::Tokens,
     plans: query::PlanCache,
 }
 
@@ -71,8 +70,6 @@ impl Service {
                     features.extend(
                         [
                             "query",
-                            "query.track",
-                            "query.page",
                             "changes",
                             changes::PROGRESS_ONLY,
                             "sql.history",
@@ -95,6 +92,15 @@ impl Service {
                             }
                         } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
+                        }
+                        if database.wire_tokens_supported() {
+                            for feature in ["query.track", "query.page"] {
+                                if !features.iter().any(|existing| existing == feature) {
+                                    features.push(feature.into());
+                                }
+                            }
+                        } else {
+                            features.retain(|feature| feature != "query.track" && feature != "query.page");
                         }
                     }
                 }

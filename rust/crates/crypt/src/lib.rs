@@ -1,13 +1,16 @@
 //! Database key generations and authenticated storage and journal envelopes.
 
 mod aead;
+mod file;
 mod local;
+pub mod tokens;
 
 use async_trait::async_trait;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+pub use file::FileKms;
 pub use local::LocalKms;
 
 pub type DataKey = Zeroizing<[u8; 32]>;

@@ -5,11 +5,12 @@ use std::{
 };
 
 use journal_contract::{JournalError, Lsn};
+use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::{
     LINEARIZABLE, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, Transact, TransactState,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{ClaimSealer, LabelScope}};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::LabelScope};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
@@ -102,7 +103,7 @@ struct Overlay {
     transactions: TransactState,
     head: Lsn,
     generation: u64,
-    claims: Arc<ClaimSealer>,
+    tokens: TokenAuthority,
 }
 
 struct Authority {
@@ -211,12 +212,12 @@ async fn burst(
             return;
         }
     };
-    let mut staged = VecDeque::from([overlay.stage(&authority, first, reply)]);
+    let mut staged = VecDeque::from([overlay.stage(&authority, first, reply).await]);
     let mut input_open = true;
     loop {
         while barrier.is_none() && staged.len() < CAPACITY {
             let Ok(command) = input.try_recv() else { break };
-            overlay.admit(&authority, command, &mut staged, barrier);
+            overlay.admit(&authority, command, &mut staged, barrier).await;
         }
         let Some(next) = staged.pop_front() else {
             *cached_overlay = Some((overlay, authority));
@@ -237,7 +238,7 @@ async fn burst(
                     result = &mut append => break result,
                     command = input.recv(), if input_open && barrier.is_none() && staged.len() < CAPACITY => {
                         if let Some(command) = command {
-                            overlay.admit(&authority, command, &mut staged, barrier);
+                            overlay.admit(&authority, command, &mut staged, barrier).await;
                         } else {
                             input_open = false;
                         }
@@ -270,7 +271,7 @@ async fn burst(
 }
 
 impl Overlay {
-    fn admit(
+    async fn admit(
         &mut self,
         authority: &Authority,
         command: Command,
@@ -279,14 +280,14 @@ impl Overlay {
     ) {
         match command {
             Command::Transact(request, reply) if ordinary(&request) => {
-                staged.push_back(self.stage(authority, request, reply));
+                staged.push_back(self.stage(authority, request, reply).await);
             }
             command => *barrier = Some(command),
         }
     }
 
-    fn stage(&mut self, authority: &Authority, request: Transact, reply: Reply<Receipt>) -> Staged {
-        match self.prepare(authority, &request) {
+    async fn stage(&mut self, authority: &Authority, request: Transact, reply: Reply<Receipt>) -> Staged {
+        match self.prepare(authority, &request).await {
             Ok(Ok(write)) => Staged::Append { write, reply },
             Ok(Err(answer)) => Staged::Answer {
                 result: Ok(answer),
@@ -299,19 +300,20 @@ impl Overlay {
         }
     }
 
-    fn prepare(
+    async fn prepare(
         &mut self,
         authority: &Authority,
         request: &Transact,
     ) -> Result<std::result::Result<Append, Receipt>> {
         reject_erasure(request)?;
         let at = next(self.head)?;
+        let claims = self.tokens.verify_claims(request.claims()).await;
         let resolution = self.transactions.resolve(
             request,
             at.0,
             (authority.clock)(),
             &[LINEARIZABLE, TIMED_TRANSACT, "row-visibility"],
-            &self.claims,
+            &claims,
         )?;
         let prepared = match resolution {
             Resolution::Answer(answer) => return Ok(Err(answer)),
@@ -360,7 +362,7 @@ impl MultiDatabase {
                 transactions: state.transactions.clone(),
                 head: state.head,
                 generation: state.generation,
-                claims: Arc::clone(&self.claims),
+                tokens: self.tokens.clone(),
             },
             Authority {
                 stream: self.stream.clone(),

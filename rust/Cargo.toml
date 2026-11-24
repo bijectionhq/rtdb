@@ -35,6 +35,7 @@ rtdb-temporal = { path = "crates/temporal" }
 rtdb-trie = { path = "crates/trie" }
 rtdb-format = { path = "crates/format" }
 rtdb-storage = { path = "crates/storage" }
+rtdb-crypt = { path = "crates/crypt" }
 rtdb-index = { path = "crates/index" }
 rtdb-plan = { path = "crates/plan" }
 rtdb-expr = { path = "crates/expr" }

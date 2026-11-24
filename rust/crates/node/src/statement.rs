@@ -189,12 +189,17 @@ impl PreparedSql {
     /// Opens one argument row using its vector field types, preserving typed nulls and empty containers.
     /// Unsigned storage types and values enter execution at the corresponding signed width.
     pub async fn open_query_typed(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
-        self.open_query_batches(context, arguments, types, false).await
+        self.open_query_batches(context, arguments, types, false, false).await.map(|(cursor, _)| cursor)
     }
 
     /// Opens Arrow batches directly for a client that consumes Arrow.
     pub async fn open_query_columns_typed(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
-        self.open_query_batches(context, arguments, types, true).await
+        self.open_query_batches(context, arguments, types, true, false).await.map(|(cursor, _)| cursor)
+    }
+
+    pub async fn open_tracked_query_columns(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType])
+        -> Result<(QueryCursor, rtdb_types::rtdb_v1::ClaimFootprint)> {
+        self.open_query_batches(context, arguments, types, true, true).await
     }
 
     pub async fn try_open_query_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<Option<QueryCursor>> {
@@ -311,12 +316,14 @@ impl PreparedSql {
         }
     }
 
-    async fn open_query_batches(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType], columnar: bool) -> Result<QueryCursor> {
+    async fn open_query_batches(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType], columnar: bool, track: bool)
+        -> Result<(QueryCursor, rtdb_types::rtdb_v1::ClaimFootprint)> {
         if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
         arguments.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
         let context = context.reopen_sql_snapshot(&self.0.snapshot_selector, rtdb_expr::Parameters::Values(&arguments)).await?;
         let query = deep(self.source(), || self.bind(&context, types, true))?;
+        let footprint = if track { query.claim_footprint(&context, &arguments) } else { Default::default() };
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
         let cursor = if columnar {
             query.execute_columns_with_text(context, arguments, Some(self.source())).await?
@@ -324,7 +331,7 @@ impl PreparedSql {
             query.execute_column_rows(context, arguments, Some(self.source())).await?
         };
         if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
-        Ok(cursor)
+        Ok((cursor, footprint))
     }
 
     /// Preserves absent arguments and an explicitly empty argument batch as distinct source operations.

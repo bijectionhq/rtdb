@@ -1125,6 +1125,9 @@ pub async fn open_owned_path_catalog(
         &["_id", "schema_name", "table_name", "columns", "version", "geometry_encoding"]
     } else if catalog.is_owned_vector_catalog() {
         &["_id", "schema_name", "table_name", "columns", "version", "dimensions", "recall"]
+    } else if catalog.is_owned_search_catalog() {
+        // A search path that uses the simple analyzer stores none.
+        &["_id", "schema_name", "table_name", "columns", "version", "analyzer"]
     } else {
         &["_id", "schema_name", "table_name", "columns", "version"]
     };

@@ -23,6 +23,7 @@ surface StatelessDatabase {
 
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
+        -- The database incarnation survives node restart and is shared by routes to the same database.
         -- A basis orders cuts within the selected database incarnation.
         -- The shared v1 encoding places the 16 incarnation bytes first, then the unsigned position as eight big-endian bytes.
         -- Applied-position drivers supply their applied position in this field.
@@ -37,7 +38,9 @@ surface StatelessDatabase {
     @guarantee QueryContinuation
         -- A continuation reopens the same read basis and interpretation for the same ordered query and parameters.
         -- A successful final page has no continuation.
-        -- The caller may redeem a continuation in a new Flight session.
+        -- Any authorized route to the same database incarnation can redeem a continuation while its cut and key generation are readable.
+        -- A continuation binds its query, execution clock and next offset to the captured basis.
+        -- Successive pages preserve the original token generation and share its retirement deadline.
 
     @guarantee RankedReads
         -- Text search returns matching rows ordered by descending relevance score.
@@ -46,9 +49,15 @@ surface StatelessDatabase {
 
     @guarantee QueryClaim
         -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.
-        -- An applied-position driver issues the query claim using its transaction verification authority.
-        -- The region may cover the entire database.
-        -- The serving process issues claims with its attachment's current authority.
+        -- The same authority seals the claim and authenticates it when the writer evaluates Unchanged.
+        -- The region can name rows, an index interval, a table, or the selected branch.
+        -- The authority issues identical claim bytes for the same evidence under one key generation.
+
+    @guarantee TokenAuthority
+        -- All routes to an incarnation use the same wrapped token key for each published generation.
+        -- New queries use the latest published generation.
+        -- An earlier generation remains usable until its retirement deadline while the selected view is readable.
+        -- Redeeming a token whose generation is erased returns erased-under-view.
 
     @guarantee TransactionReceipt
         -- A route that advertises writes returns its selected outcome with the applied basis and system time.

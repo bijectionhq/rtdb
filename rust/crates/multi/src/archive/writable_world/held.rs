@@ -251,7 +251,7 @@ enum ArchiveRead {
         partitions: Vec<(OwnedRelation, OwnedRelation)>,
         frontiers: Vec<i64>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
-        reply: oneshot::Sender<Result<Vec<String>>>,
+        reply: oneshot::Sender<Result<(Vec<String>, rtdb_plan::Analyzer)>>,
     },
     Ordered {
         relation: OwnedRelation,
@@ -966,7 +966,7 @@ impl HeldCheckpointWorld {
     }
     pub async fn ranked_search(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
-        valid: Timestamp, staged: Option<rtdb_node::HeldTextCorpus>,
+        valid: Timestamp, staged: Option<rtdb_node::TextShadows>,
     ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         if staged.is_some() && (self.clock_mode() != WorldClockMode::Proposal || valid != self.present().system_time) {
             return Err(OwnedWorld::unavailable());
@@ -991,7 +991,7 @@ impl HeldCheckpointWorld {
     async fn ranked_search_on_cut(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, earlier: Option<(Timestamp, bool)>, parent_at: Option<Timestamp>,
-        staged: Option<rtdb_node::HeldTextCorpus>,
+        staged: Option<rtdb_node::TextShadows>,
     ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         self.check()?;
         if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
@@ -1051,16 +1051,14 @@ impl HeldCheckpointWorld {
         let writable = self.clock_mode().is_writable();
         let use_overlay = writable && !historical
             && !earlier.is_some_and(|(system, parent_only)| parent_only || self.uses_frozen_overlay(Some(system)));
-        let columns = if use_overlay || earlier.is_some() {
+        let (columns, analyzer) = if use_overlay || earlier.is_some() {
             self.search_columns(&partitions, &frontiers, &guard).await?
         } else {
-            Vec::new()
+            (Vec::new(), rtdb_plan::Analyzer::Simple)
         };
         let overlay = if use_overlay {
-            let corpus = match staged {
-                Some(staged) => staged,
-                None => rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), &query)?,
-            };
+            let staged = staged.unwrap_or_default();
+            let corpus = staged.into_corpus(Arc::clone(&self.memory), analyzer, &query)?;
             Some(self.search_overlay(&partitions, &columns, valid, corpus, &guard,
                 earlier.map(|(system, _)| system)).await?)
         } else {
@@ -1292,12 +1290,12 @@ impl HeldCheckpointWorld {
     async fn search_columns(
         &self, partitions: &[(OwnedRelation, OwnedRelation)], frontiers: &[i64],
         guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, rtdb_plan::Analyzer)> {
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::SearchColumns {
             partitions: partitions.to_vec(), frontiers: frontiers.to_vec(), guard: Arc::clone(guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-        let columns = self.cancellation.run_until_cancelled(result).await
+        let (columns, analyzer) = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         if columns.len() != partitions.len() || partitions.iter().zip(&columns).any(|((relation, _), column)| {
             !self.open.record.schemas.relation(relation)
@@ -1305,7 +1303,7 @@ impl HeldCheckpointWorld {
         }) {
             return Err(OwnedWorld::unavailable());
         }
-        Ok(columns)
+        Ok((columns, analyzer))
     }
 
     pub async fn range(
@@ -2994,7 +2992,10 @@ pub(crate) async fn open_held_checkpoint_world(
                                                     async move {
                                                         let mut corpus = match overlay {
                                                             Some(corpus) => corpus,
-                                                            None => rtdb_node::HeldTextCorpus::new(Arc::clone(memory), query)?,
+                                                            None => {
+                                                                let analyzer = rtdb_node::owned_search_analyzer(Arc::clone(root), owner, partitions).await?;
+                                                                rtdb_node::HeldTextCorpus::new(Arc::clone(memory), analyzer, query)?
+                                                            }
                                                         };
                                                         let mut remaining = 4096;
                                                         for (index, ((relation, path), schema)) in partitions.iter().zip(schemas).enumerate() {
@@ -3086,8 +3087,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                                 Arc::clone(&scoped), &owner, relation, path,
                                             ).await?);
                                         }
+                                        let analyzer = rtdb_node::owned_search_analyzer(Arc::clone(&scoped), &owner, &partitions).await?;
                                         guard()?;
-                                        Ok(columns)
+                                        Ok((columns, analyzer))
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

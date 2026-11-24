@@ -107,6 +107,27 @@ impl PreparedQuery {
     }
     pub fn schema(&self) -> &Schema { match &self.output { QueryOutput::Rows => self.relation.schema(), QueryOutput::Plan(plan) => &plan.schema, QueryOutput::Analyze(schema) => schema } }
     pub fn relation(&self) -> &Arc<Relation> { &self.relation }
+
+    pub fn claim_footprint(&self, context: &QueryContext, arguments: &[Value]) -> rtdb_types::rtdb_v1::ClaimFootprint {
+        use rtdb_types::rtdb_v1::ClaimFootprint;
+        let mut regions = Vec::new();
+        let mut pending = vec![&self.relation];
+        while let Some(relation) = pending.pop() {
+            if let rtdb_plan::RelationNode::Scan(scan) = relation.node() {
+                if scan.table.name.database != context.catalog.default_database
+                    || matches!(scan.table.name.table.schema.as_str(), "xt" | "information_schema" | "pg_catalog")
+                {
+                    return ClaimFootprint::default();
+                }
+                regions.extend(crate::scan::claim_regions(scan, context, arguments));
+            }
+            if matches!(relation.node(), rtdb_plan::RelationNode::Apply { .. } | rtdb_plan::RelationNode::Mark { .. }) {
+                return ClaimFootprint::default();
+            }
+            pending.extend(relation.children());
+        }
+        ClaimFootprint::from_regions(regions)
+    }
     /// Emits result fields against the pinned catalog using the parameter types in the plan.
     pub fn result_schema(&self, context: &QueryContext) -> Result<Arc<RuntimeSchema>> {
         self.emit_result_schema(context, &[])

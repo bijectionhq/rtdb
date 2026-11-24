@@ -58,7 +58,6 @@ impl Cluster {
             self.store.clone(),
             self.kms.clone(),
             Arc::new(move || Timestamp(time.load(Ordering::SeqCst))),
-            Arc::new(ClaimSealer::new(*DATABASE.as_bytes(), [42; 32])),
         )
         .unwrap()
     }
@@ -70,6 +69,42 @@ fn ip(n: u8) -> IpAddr {
 
 fn live(n: u8) -> BTreeSet<IpAddr> {
     BTreeSet::from([ip(n)])
+}
+
+#[tokio::test]
+async fn multi_driver_tokens_reroute_and_verify_the_row_footprint() {
+    use rtdb_crypt::tokens::PageToken;
+    use rtdb_types::rtdb_v1::{ClaimEvidence, ClaimFootprint, ClaimRegion, ClaimScope};
+
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(Identity(1))));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let receipt = writer.transact(&put(1, 1, "original")).await.unwrap();
+    let evidence = ClaimEvidence {
+        scope: ClaimScope { branch: MAIN_BRANCH.into(), basis: receipt.basis, layer: Layer::Merged },
+        footprint: ClaimFootprint::from_regions([ClaimRegion::Row {
+            table: table(), iid: EntityId::Integer(1).iid(),
+        }]),
+    };
+    let page = PageToken { basis: receipt.basis, clock: receipt.system_time, offset: 1, request: [5; 32] };
+    let issuer = writer.token_authority();
+    let claim = issuer.seal_claim(&evidence).await.unwrap();
+    let after = issuer.seal_page(&page).await.unwrap();
+
+    let follower = cluster.node(2, Arc::new(journal.handle(Identity(2))));
+    let rerouted = follower.token_authority();
+    assert_eq!(rerouted.seal_claim(&evidence).await.unwrap(), claim);
+    assert_eq!(rerouted.open_page(&after).await.unwrap(), page);
+
+    writer.transact(&put(2, 2, "unrelated")).await.unwrap();
+    let mut guarded = put(3, 3, "accepted");
+    guarded.guards.push(Guard::Unchanged(claim));
+    assert_eq!(writer.transact(&guarded).await.unwrap().outcome, Outcome::Then);
+    writer.transact(&put(4, 1, "changed")).await.unwrap();
+    guarded.key = vec![5; 16];
+    assert_eq!(writer.transact(&guarded).await.unwrap().outcome, Outcome::Otherwise { failed: vec![0] });
 }
 
 fn table() -> TableRef {
@@ -328,11 +363,12 @@ async fn multi_driver_fences_an_append_delayed_until_after_the_next_seal() {
     first.tick(&live(1)).await.unwrap();
 
     let request = put(1, 1, "deposed");
+    let claims = first.tokens.verify_claims(request.claims()).await;
     let at = next(first.state().head).unwrap();
     let Resolution::Append(prepared) = first
         .state()
         .transactions
-        .resolve(&request, at.0, (first.clock)(), &[], &first.claims)
+        .resolve(&request, at.0, (first.clock)(), &[], &claims)
         .unwrap()
     else {
         panic!("expected a new write");

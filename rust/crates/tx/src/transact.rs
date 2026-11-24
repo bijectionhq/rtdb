@@ -8,7 +8,7 @@ pub use rtdb_index::branches::{CountRange, IndexDefinition, Visibility};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Claim, ClaimScope, ClaimSealer, LabelScope, Layer, MAIN_BRANCH, valid_branch_name},
+    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, valid_branch_name},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,15 @@ pub struct Transact {
     pub guards: Vec<Guard>,
     pub ops: Vec<Op>,
     pub otherwise: Vec<Op>,
+}
+
+impl Transact {
+    pub fn claims(&self) -> impl Iterator<Item = &Claim> {
+        self.guards.iter().filter_map(|guard| match guard {
+            Guard::Unchanged(claim) => Some(claim),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -268,14 +277,14 @@ impl TransactState {
     }
 
     pub fn resolve(
-        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
+        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
     ) -> Result<Resolution> {
         self.resolve_with_scope(request, position, now, features, claims, None)
     }
 
     /// The driver binds claims, written-version selectors, and receipt coordinates to the admitted scope.
     pub fn resolve_scoped(
-        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
+        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: ScopedTransact<'_>,
     ) -> Result<Resolution> {
         let mut request = request.clone();
@@ -301,7 +310,7 @@ impl TransactState {
     }
 
     fn resolve_with_scope(
-        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
+        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<Resolution> {
         validate_key(&request.key)?;
@@ -368,7 +377,7 @@ impl TransactState {
 
     fn decide(
         &self, request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
-        features: &[&str], claims: &ClaimSealer, scope: Option<&LabelScope>,
+        features: &[&str], claims: &dyn ClaimVerifier, scope: Option<&LabelScope>,
     ) -> Result<(Outcome, Vec<BranchEffect>)> {
         if let Some(feature) = request.require.iter().find(|feature| !features.contains(&feature.as_str())) {
             return Err(feature_required(feature));
@@ -387,13 +396,13 @@ impl TransactState {
 
         let mut failed = Vec::new();
         for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| !guard.after()) {
-            if !guard.evaluate(&base, time, claims, scope)? { failed.push(i); }
+            if !guard.evaluate(&base, time, claims)? { failed.push(i); }
         }
         if failed.is_empty() {
             let mut then = Candidate::new(base.clone(), scope);
             then.execute(&request.ops)?;
             for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| guard.after()) {
-                if !guard.evaluate(&then.index, time, claims, scope)? { failed.push(i); }
+                if !guard.evaluate(&then.index, time, claims)? { failed.push(i); }
             }
             if failed.is_empty() {
                 if !request.ops.is_empty() { then.check_constraints()?; }
@@ -506,16 +515,10 @@ impl Guard {
         matches!(self, Self::CountAtMost { when: When::After, .. })
     }
 
-    fn evaluate(&self, index: &BranchIndex, time: Timestamp, claims: &ClaimSealer, scope: Option<&LabelScope>) -> Result<bool> {
+    fn evaluate(&self, index: &BranchIndex, time: Timestamp, claims: &dyn ClaimVerifier) -> Result<bool> {
         let view = |branch| index.view(branch, At::Latest, Layer::Merged, time);
         match self {
-            Self::Unchanged(claim) => {
-                let ClaimScope { branch, basis, layer } = match scope {
-                    Some(scope) => claims.open_scoped(claim, scope)?,
-                    None => claims.open(claim)?,
-                };
-                index.is_unchanged(&branch, basis, layer, time)
-            }
+            Self::Unchanged(claim) => index.claim_unchanged(&claims.verify(claim)?, time),
             Self::Version { branch, table, id, valid_at, expect } => {
                 if let Version::Written(basis) = expect { index.exact(*basis)?; }
                 let at = valid_at.unwrap_or(time);

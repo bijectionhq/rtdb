@@ -5,7 +5,7 @@ use rtdb_index::branches::BranchIndex;
 use rtdb_tx::transact::{ScopedTransact, Transact};
 use rtdb_types::{
     Anomaly, MemoryBudget,
-    rtdb_v1::{ClaimScope, ClaimSealer, LabelScope, MAIN_BRANCH},
+    rtdb_v1::{LabelScope, MAIN_BRANCH},
 };
 
 use super::*;
@@ -31,26 +31,19 @@ impl ServingScope {
     }
 
     pub fn query(
-        &self, index: &BranchIndex, source: QuerySource, track: bool, now: Timestamp,
-        memory: &Arc<MemoryBudget>, claims: &ClaimSealer,
-    ) -> Result<QueryView> {
+        &self, index: &BranchIndex, source: QuerySource, now: Timestamp, memory: &Arc<MemoryBudget>,
+    ) -> Result<(QueryView, Basis)> {
         check_source(&source.branch, source.layer)?;
         let projected = index.project_main_visibility(&self.labels)?;
         let at = if source.at == At::Linearizable { At::Latest } else { source.at };
         let view = projected.index().view(MAIN_BRANCH, at, Layer::Merged, now)?;
         let cut = view.cut();
-        let claim = if track {
-            let basis = if matches!(at, At::Latest | At::AtLeast(_)) {
-                index.head().basis
-            } else {
-                projected.source_basis(cut.basis)?
-            };
-            let evidence = ClaimScope { branch: source.branch, basis, layer: source.layer };
-            Some(claims.seal_scoped(&evidence, &self.labels)?)
+        let raw_cut = if matches!(at, At::Latest | At::AtLeast(_)) {
+            index.head().basis
         } else {
-            None
+            projected.source_basis(cut.basis)?
         };
-        Ok(QueryView { snapshot: rtdb_query::branch_snapshot(&view, memory)?, cut, claim })
+        Ok((QueryView { snapshot: rtdb_query::branch_snapshot(&view, memory)?, cut, claim: None }, raw_cut))
     }
 
     pub fn changes(&self, index: &BranchIndex, request: &Changes) -> Result<ChangePage> {

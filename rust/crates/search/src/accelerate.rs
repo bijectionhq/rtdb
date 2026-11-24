@@ -545,7 +545,9 @@ fn uncovered_owned_search() -> Anomaly {
 pub async fn owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
 ) -> Result<rtdb_text::Corpus> {
-    let query = Query::parse(text);
+    let partition = [(relation.clone(), path.clone())];
+    let analyzer = crate::owned_search_analyzer(Arc::clone(&context), owner, &partition).await?;
+    let query = Query::analyzed(analyzer, text);
     let covered = covered_owned_corpus(context, owner, relation, path, &query, None, false, None).await?;
     Ok(rtdb_text::Corpus {
         documents: covered.documents, tokens: covered.tokens,
@@ -736,7 +738,8 @@ pub async fn owned_ranked_overlay_batch(
     if distinct.len() != partitions.len() {
         return Err(Anomaly::incorrect("rtdb.owned/search-relations", "An owned search relation must be selected once"));
     }
-    let query = Query::parse(text);
+    let analyzer = crate::owned_search_analyzer(Arc::clone(&context), owner, partitions).await?;
+    let query = Query::analyzed(analyzer, text);
     if let Some(overlay) = &overlay { overlay.require_query(&query)?; }
     match rank_owned_artefacts(&context, owner, partitions, &query, offset, limit, valid_at, overlay.as_ref()).await {
         Ok((scorer, mut rank)) => {
@@ -747,7 +750,7 @@ pub async fn owned_ranked_overlay_batch(
         Err(error) if error.code == "rtdb.owned/search-uncovered" => {
             let mut corpus = match overlay {
                 Some(overlay) => overlay,
-                None => crate::HeldTextCorpus::new(Arc::clone(&context.memory), text)?,
+                None => crate::HeldTextCorpus::new(Arc::clone(&context.memory), analyzer, text)?,
             };
             let valid = valid_at.unwrap_or(context.current_time.as_micros()?);
             for (partition, (relation, path)) in partitions.iter().enumerate() {

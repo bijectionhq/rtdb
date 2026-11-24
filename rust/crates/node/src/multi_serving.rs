@@ -1,12 +1,13 @@
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
 use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
-    rtdb_v1::{At, Basis, Layer},
+    rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
 };
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -20,16 +21,19 @@ pub struct MultiServing {
     database: Arc<Mutex<MultiDatabase>>,
     writes: WritePipeline,
     incarnation: [u8; 16],
+    tokens: TokenAuthority,
     memory: Arc<MemoryBudget>,
 }
 
 impl MultiServing {
     pub fn new(database: MultiDatabase, memory: Arc<MemoryBudget>) -> Self {
         let incarnation = database.incarnation();
+        let tokens = database.token_authority();
         let database = Arc::new(Mutex::new(database));
         let writes = WritePipeline::start(Arc::clone(&database));
         Self {
             incarnation,
+            tokens,
             database,
             writes,
             memory,
@@ -47,6 +51,16 @@ impl ServingDriver for MultiServing {
         self.incarnation
     }
 
+    fn token_authority(&self) -> Option<TokenAuthority> { Some(self.tokens.clone()) }
+
+    async fn apply_token_key_rotation(&self, generation: u64, unreadable_by: i64) -> Result<()> {
+        self.database.lock().await.finish_token_rotation(generation, unreadable_by).await
+    }
+
+    async fn destroy_retired_token_key(&self, generation: u64) -> Result<()> {
+        self.database.lock().await.destroy_retired_token_key(generation).await
+    }
+
     fn features(&self) -> &[&str] {
         &[LINEARIZABLE, TIMED_TRANSACT, ROW_VISIBILITY, "query", "query.track", "query.page",
           "query.linearizable", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
@@ -57,14 +71,23 @@ impl ServingDriver for MultiServing {
     async fn query_scoped(&self, source: QuerySource, track: bool, now: Timestamp,
                           scope: &ServingScope, cancellation: &CancellationToken) -> Result<QueryView> {
         cancellation.run_until_cancelled(async {
-            let (index, generation, claims) = {
-                let mut database = self.database.lock().await;
-                let (index, generation) = database.fresh_view().await?;
-                (index, generation, database.claim_sealer())
-            };
-            let view = scope.query(&index, source, track, now, &self.memory, &claims)?;
-            self.database.lock().await.check_generation(generation).await?;
-            Ok(view)
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let (index, generation) = self.database.lock().await.fresh_view().await?;
+                match scope.query(&index, source.clone(), now, &self.memory) {
+                    Ok((mut view, raw)) => {
+                        if track {
+                            view.claim = Some(self.tokens.issuer().await?.seal_scoped_claim(raw, &scope.labels).await?);
+                        }
+                        self.database.lock().await.check_generation(generation).await?;
+                        return Ok(view);
+                    }
+                    Err(error) if error.code == "rtdb/basis-ahead" && Instant::now() < deadline => {
+                        tokio::time::sleep_until((Instant::now() + Duration::from_millis(50)).min(deadline)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }).await.ok_or_else(interrupted)?
     }
 
@@ -118,11 +141,10 @@ impl ServingDriver for MultiServing {
                 let cut = view.cut();
                 let snapshot = rtdb_query::branch_snapshot(&view, &self.memory)?;
                 let claim = if track {
-                    Some(self.database.lock().await.seal_claim(
-                        source.branch,
-                        cut.basis,
-                        source.layer,
-                    )?)
+                    Some(self.tokens.seal_claim(&ClaimEvidence {
+                        scope: ClaimScope { branch: source.branch, basis: cut.basis, layer: source.layer },
+                        footprint: Default::default(),
+                    }).await?)
                 } else {
                     None
                 };
@@ -385,7 +407,7 @@ mod tests {
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact, Window};
     use rtdb_types::{
         EntityId, StructFields, Value,
-        rtdb_v1::{ClaimSealer, MAIN_BRANCH},
+        rtdb_v1::MAIN_BRANCH,
     };
     use uuid::Uuid;
 
@@ -415,7 +437,7 @@ mod tests {
             }],
             otherwise: vec![],
         };
-        TransactSubmission { transaction, attempt: Uuid::new_v4(), submitted_at: Timestamp(10), source: Default::default() }
+        TransactSubmission { transaction, attempt: Uuid::from_u128(u128::from(key)), submitted_at: Timestamp(10), source: Default::default() }
     }
 
     #[tokio::test]
@@ -434,7 +456,6 @@ mod tests {
             Arc::new(MemoryStore::default()),
             Arc::new(LocalKms::new(|| 10)),
             Arc::new(|| Timestamp(10)),
-            Arc::new(ClaimSealer::new(*id.as_bytes(), [8; 32])),
         )
         .unwrap();
         database.create().await.unwrap();
@@ -558,7 +579,6 @@ mod tests {
             MultiOptions { database: id, node, lease_micros: 100, drift_micros: 1 },
             Arc::new(journal.handle(Identity(1))), Arc::new(MemoryStore::default()),
             Arc::new(LocalKms::new(|| 10)), Arc::new(|| Timestamp(10)),
-            Arc::new(ClaimSealer::new(*id.as_bytes(), [8; 32])),
         ).unwrap();
         database.create().await.unwrap();
         let driver = MultiServing::new(database, MemoryBudget::new(64 * 1024 * 1024));

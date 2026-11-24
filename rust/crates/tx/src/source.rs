@@ -163,7 +163,7 @@ impl SourceTransaction {
         let mut bytes = operations.capacity().checked_mul(std::mem::size_of::<Operation>()).and_then(|size| size.checked_add(options.default_tz.capacity())).and_then(|size| size.checked_add(options.user.as_ref().map_or(0, String::capacity))).ok_or_else(overflow)?;
         for operation in &operations {
             let (text, table, ids) = match operation {
-                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column }
+                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column, .. } | TxOp::OwnedDeclareUniquePath { relation, name, column }
                     | TxOp::OwnedDeclareVectorPath { relation, name, column, .. }) =>
                     (owned_path_bytes(relation, name, std::slice::from_ref(column))?, None, 0),
                 Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, .. }) =>
@@ -468,7 +468,7 @@ impl SourceTransaction {
                 }
                 Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => sql.capacity().checked_add(arg_bytes.as_slice().len()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) => ids.ids().len().checked_mul(128).ok_or_else(overflow)?,
-                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column }
+                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column, .. } | TxOp::OwnedDeclareUniquePath { relation, name, column }
                     | TxOp::OwnedDeclareVectorPath { relation, name, column, .. }) =>
                     owned_path_bytes(relation, name, std::slice::from_ref(column))?,
                 Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, .. }) =>
@@ -714,11 +714,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("column".into(), Value::Utf8(column.clone()));
             "rtdb-owned-unique-path-v1"
         }
-        Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) => {
+        Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column, analyzer }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("name".into(), Value::Utf8(name.name().into()));
             body.insert("column".into(), Value::Utf8(column.clone()));
-            "rtdb-owned-search-path-v1"
+            body.insert("analyzer".into(), Value::Utf8(analyzer.name().into()));
+            "rtdb-owned-search-path-v2"
         }
         Operation::Public(TxOp::OwnedDeclareVectorPath { relation, name, column, dimensions, recall }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -2536,11 +2537,12 @@ impl SourceOperationReader<'_> {
                 else { return Err(invalid("Owned unique path declaration has invalid fields")); };
                 TxOp::OwnedDeclareUniquePath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, column }
             }
-            "rtdb-owned-search-path-v1" => {
-                let (Value::Utf8(relation), Value::Utf8(name), Value::Utf8(column)) =
-                    (value("relation")?, value("name")?, value("column")?)
+            "rtdb-owned-search-path-v2" => {
+                let (Value::Utf8(relation), Value::Utf8(name), Value::Utf8(column), Value::Utf8(analyzer)) =
+                    (value("relation")?, value("name")?, value("column")?, value("analyzer")?)
                 else { return Err(invalid("Owned search path declaration has invalid fields")); };
-                TxOp::OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, column }
+                let analyzer = rtdb_plan::parse_analyzer(&analyzer)?;
+                TxOp::OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, column, analyzer }
             }
             "rtdb-owned-vector-path-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(name), Value::Utf8(column), Value::I64(dimensions), Value::F64(recall)) =

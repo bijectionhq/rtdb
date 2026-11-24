@@ -482,8 +482,9 @@ The result contains one non-null `count: UInt64` at the held system present and 
 The result schema carries `rtdb.owned.present_micros` and `rtdb.owned.valid_micros`.
 The count requires the same complete generation as a covered range and uses subtree cardinalities without a scan fallback.
 
-`rtdb.owned.DeclareSearchPath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
-Its fields are `_id: Utf8` for the path name and `column: Utf8` for the stored clear-text column.
+`rtdb.owned.DeclareSearchPath.v2` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
+Its fields are `_id: Utf8` for the path name, `column: Utf8` for the stored clear-text column and `analyzer: Utf8` for the path's full-text analyzer (`simple`, `standard`, or a language analyzer as in `CREATE SEARCH INDEX`).
+The analyzer is part of the path: its search files, SearchHeld.v5, its world variants, HybridHeld.v1 and staged overlays all tokenise with it, every partition of one held search must use the same analyzer, and redeclaring the path with another analyzer conflicts.
 The relation must already exist in the authenticated owner's namespace, and the column must contain only text or null.
 The FTS maintenance lane uses the private declaration to build the relation's search files.
 A successful declaration returns the same transaction-key Arrow row as Create.
@@ -1213,12 +1214,15 @@ A failed call carries a protobuf `Error` in the `rtdb-error-bin` status detail.
 
 `Query` accepts a read-only SQL statement and an optional Arrow IPC stream containing one positional parameter row.
 Use a deterministic total `ORDER BY` for queries whose results span pages and repeat the request with the returned continuation and the desired page limit.
-The request's basis and query clock are fixed across its pages.
-Tracking returns an authenticated claim covering the database at the reported basis.
+The request's basis and query clock are fixed across its pages, including after restart or routing to another node serving the same database incarnation.
+Tracking returns an authenticated claim at the reported basis, using row or index bounds when the query plan proves them and coarsening to a table or branch when needed.
 The current implementation accepts `main` with the merged layer.
-Query and Changes tokens are scoped to the serving attachment and process.
+Query and Changes bases are scoped to the database incarnation.
 The temporal read driver encodes system-time boundaries as positions in the shared basis format.
-Claims use the shared claim format with the process's sealing authority.
+Claims and continuations use KMS-wrapped database keys.
+New tokens use the current generation, and earlier tokens remain redeemable while their generation and view are readable.
+For shared object storage, set `RTDB_V1_TOKEN_KEY_VAULT` to the same private durable key vault on every serving node.
+Local storage keeps its token keys in `.rtdb-token-keys` in the configured storage directory unless an explicit vault is configured.
 
 `RTDB_SEARCH(table, column, query[, analyzer])` returns matching rows with `_score` in descending score order.
 `RTDB_NEAREST(table, column, vector, limit)` returns the nearest vectors with `_distance` in ascending cosine-distance order.

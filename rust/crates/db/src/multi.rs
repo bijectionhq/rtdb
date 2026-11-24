@@ -1,18 +1,18 @@
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc};
 
 use journal_contract::{Epoch, Journal, JournalError, Lsn};
-use rtdb_crypt::{Generation, Kms};
+use rtdb_crypt::{Generation, Kms, tokens::TokenAuthority};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, ObjectKind, Pin, Record};
 use rtdb_index::branches::BranchIndex;
 use rtdb_store::{
-    ObjectKey, ObjectStore, Reachability, VerifiedManifest, WriterObjects, read_manifest,
+    ObjectKey, ObjectStore, Reachability, StoredTokenKeys, VerifiedManifest, WriterObjects, read_manifest,
 };
 use rtdb_tx::transact::{
     LINEARIZABLE, Op, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, Transact, TransactionRecord,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
-    rtdb_v1::{Basis, Claim, ClaimScope, ClaimSealer, Layer},
+    rtdb_v1::Basis,
 };
 use uuid::Uuid;
 
@@ -56,7 +56,8 @@ pub struct MultiDatabase {
     stream: Stream,
     store: Arc<dyn ObjectStore>,
     clock: Arc<dyn Fn() -> Timestamp + Send + Sync>,
-    claims: Arc<ClaimSealer>,
+    token_keys: Arc<StoredTokenKeys>,
+    tokens: TokenAuthority,
     committed: Option<Committed>,
     writer: Option<Writer>,
     candidate: Option<Lease>,
@@ -71,7 +72,6 @@ impl MultiDatabase {
         store: Arc<dyn ObjectStore>,
         kms: Arc<dyn Kms>,
         clock: Arc<dyn Fn() -> Timestamp + Send + Sync>,
-        claims: Arc<ClaimSealer>,
     ) -> Result<Self> {
         if options.drift_micros < 0
             || options.lease_micros <= options.drift_micros.saturating_mul(2)
@@ -81,12 +81,17 @@ impl MultiDatabase {
                 "Writer lease must exceed twice the clock drift",
             ));
         }
+        let token_keys = Arc::new(StoredTokenKeys::new(
+            Arc::clone(&store), format!("~rtdb-v1/{}", options.database.simple()), options.database, 1,
+        ));
+        let tokens = TokenAuthority::new(options.database, Arc::clone(&kms), token_keys.clone());
         Ok(Self {
             stream: Stream::new(options.database, journal, kms),
             options,
             store,
             clock,
-            claims,
+            token_keys,
+            tokens,
             committed: None,
             writer: None,
             candidate: None,
@@ -96,7 +101,21 @@ impl MultiDatabase {
     }
 
     pub async fn create(&self) -> Result<()> {
-        self.stream.create().await
+        self.stream.create().await?;
+        self.token_keys.install(self.stream.kms.as_ref(), 1).await?;
+        Ok(())
+    }
+
+    pub fn token_authority(&self) -> TokenAuthority { self.tokens.clone() }
+
+    pub async fn finish_token_rotation(&mut self, generation: u64, unreadable_by: i64) -> Result<()> {
+        self.refresh().await?;
+        if self.state().generation < generation { return Err(no_writer()); }
+        self.token_keys.rotate(self.stream.kms.as_ref(), generation, unreadable_by).await
+    }
+
+    pub async fn destroy_retired_token_key(&self, generation: u64) -> Result<()> {
+        self.token_keys.destroy_retired(self.stream.kms.as_ref(), generation).await
     }
 
     pub fn incarnation(&self) -> [u8; 16] {
@@ -246,13 +265,14 @@ impl MultiDatabase {
             self.refuse_pending(lease).await?;
         }
         reject_erasure(request)?;
+        let claims = self.tokens.verify_claims_in(request.claims(), scope.map(|scope| scope.labels)).await;
         let position = next(self.state().head)?;
         let now = (self.clock)();
         let features = [LINEARIZABLE, TIMED_TRANSACT, "row-visibility"];
         let state = &self.state().transactions;
         let resolution = match scope {
-            Some(scope) => state.resolve_scoped(request, position.0, now, &features, &self.claims, scope),
-            None => state.resolve(request, position.0, now, &features, &self.claims),
+            Some(scope) => state.resolve_scoped(request, position.0, now, &features, &claims, scope),
+            None => state.resolve(request, position.0, now, &features, &claims),
         }?;
         let prepared = match resolution {
             Resolution::Answer(receipt) => return Ok(receipt),
@@ -294,16 +314,6 @@ impl MultiDatabase {
         let state = self.state();
         Ok((state.transactions.index().clone(), state.generation))
     }
-
-    pub fn seal_claim(&self, branch: String, basis: Basis, layer: Layer) -> Result<Claim> {
-        self.claims.seal(&ClaimScope {
-            branch,
-            basis,
-            layer,
-        })
-    }
-
-    pub fn claim_sealer(&self) -> Arc<ClaimSealer> { Arc::clone(&self.claims) }
 
     pub async fn fresh_history(&mut self) -> Result<ChangeHistory<'_>> {
         self.refresh().await?;
