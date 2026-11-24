@@ -148,9 +148,13 @@ pub(crate) fn timestamp_to_time(value: i64, source: TimeUnit, unit: TimeUnit, ti
 
 pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Value> {
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
+    cast_from(value, &value.logical_type(), data_type, timezone)
+}
+
+fn cast_from(value: &Value, source: &LogicalType, data_type: &LogicalType, timezone: &str) -> Result<Value> {
     let data_type = data_type.unencoded();
     let data_type = match &data_type { LogicalType::Maybe(ty) => ty.as_ref(), ty => ty };
-    if value.logical_type() == *data_type { return Ok(value.clone()); }
+    if source == data_type { return Ok(value.clone()); }
     if let Some(days) = crate::temporal::date_days(value) {
         match data_type {
             LogicalType::Scalar(ScalarType::DateDay) => return Ok(Value::calendar_date(CivilDate::from_epoch_day(days)?, DateUnit::Day)),
@@ -159,10 +163,12 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
         }
     }
     if let LogicalType::List { kind: rtdb_types::ListKind::List, element } = data_type {
-        return cast_target(value, &rtdb_plan::CastTarget::List(Box::new(rtdb_plan::CastTarget::fixed(element.as_ref().clone()))), timezone);
+        let target = rtdb_plan::CastTarget::List(Box::new(rtdb_plan::CastTarget::fixed(element.as_ref().clone())));
+        target.validate_source(source)?;
+        return cast_target_from(value, source, &target, timezone);
     }
     let LogicalType::Scalar(target) = data_type else {
-        return Err(Anomaly::unsupported("xtdb/unsupported-cast", format!("Cast from {:?} to {data_type:?}", value.logical_type())));
+        return Err(Anomaly::unsupported("xtdb/unsupported-cast", format!("Cast from {source:?} to {data_type:?}")));
     };
     use ScalarType as S;
     match target {
@@ -317,28 +323,42 @@ fn binary_from_hex(text: &str) -> Result<Vec<u8>> {
 /// Applies expression cast semantics, including source-preserving decimal defaults and recursive lists.
 /// Time-to-timestamp casts require `evaluate` with an `EvalContext` supplying the query date.
 pub fn cast_target(value: &Value, target: &rtdb_plan::CastTarget, timezone: &str) -> Result<Value> {
-    use rtdb_plan::CastTarget;
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
-    target.validate_source(&value.logical_type())?;
+    let source = value.logical_type();
+    target.validate_source(&source)?;
+    cast_target_from(value, &source, target, timezone)
+}
+
+pub(crate) fn cast_target_from(value: &Value, source: &LogicalType, target: &rtdb_plan::CastTarget, timezone: &str) -> Result<Value> {
+    use rtdb_plan::CastTarget;
     match target {
-        CastTarget::Checked { target: inner, .. } => cast_target(value, inner, timezone),
-        CastTarget::Fixed(data_type) => cast(value, data_type, timezone),
+        CastTarget::Checked { target: inner, .. } => cast_target_from(value, source, inner, timezone),
+        CastTarget::Fixed(data_type) => cast_from(value, source, data_type, timezone),
         CastTarget::DecimalDefault => match value {
             Value::Decimal(_) => Ok(value.clone()),
-            value => cast(value, &rtdb_plan::default_decimal_type(), timezone),
+            value => cast_from(value, source, &rtdb_plan::default_decimal_type(), timezone),
         },
-        CastTarget::IntervalDefault | CastTarget::IntervalEmptyOptions => cast(value, &LogicalType::Scalar(ScalarType::IntervalMonthDayMicro), timezone),
-        CastTarget::Temporal(target) => crate::temporal_cast::cast(value, target, timezone),
-        CastTarget::Deferred(target) => match target.resolve_value(&value.logical_type())? {
+        CastTarget::IntervalDefault | CastTarget::IntervalEmptyOptions => cast_from(value, source, &LogicalType::Scalar(ScalarType::IntervalMonthDayMicro), timezone),
+        CastTarget::Temporal(target) => crate::temporal_cast::cast_resolved(value, target, timezone),
+        CastTarget::Deferred(target) => match target.resolve_value(source)? {
             CastTarget::Temporal(target) => crate::temporal_cast::cast_resolved(value,&target,timezone),
-            target => cast_target(value,&target,timezone),
+            target => {
+                target.validate_source(source)?;
+                cast_target_from(value, source, &target, timezone)
+            },
         },
         CastTarget::Interval(target) => crate::interval_cast::cast(value, target),
         CastTarget::List(element) => {
             if let Some(target) = element.union_target() {
                 let Value::List(values) = value else { return Err(inapplicable("list union", &[value])); };
                 let legs = target.legs();
-                if values.iter().any(|value| !legs.contains(&value.logical_type())) { return Err(inapplicable("list union", &[value])); }
+                let fits = if values.array().is_some() {
+                    let LogicalType::List { element, .. } = source else { unreachable!("list source type"); };
+                    element.legs().iter().all(|ty| legs.contains(ty))
+                } else {
+                    values.iter().all(|value| legs.contains(&value.logical_type()))
+                };
+                if !fits { return Err(inapplicable("list union", &[value])); }
                 return Ok(Value::List(values.clone()));
             }
             if let Value::List(list) | Value::FixedSizeList(list) = value
@@ -387,4 +407,38 @@ pub(crate) fn pg_array_text(text: &str) -> Result<Vec<Value>> {
     }
     values.push(finish(&mut element, quoted));
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wave4_union_list_cast_checks_selected_numeric_legs() {
+        let Value::List(full) = Value::list(vec![Value::F32(4.0), Value::I64(5), Value::Null]) else { unreachable!() };
+        let accepted = rtdb_plan::CastTarget::List(Box::new(rtdb_plan::CastTarget::Fixed(LogicalType::Scalar(ScalarType::I64).maybe())));
+        let slice = Value::List(full.slice_packed(1, 2).unwrap());
+        assert_eq!(cast_target(&slice, &accepted, "UTC").unwrap(), slice);
+        assert_eq!(cast_target(&Value::List(full), &accepted, "UTC").unwrap_err().code, "xtdb.expression/function-type-mismatch");
+        assert_eq!(cast_target(&Value::list(vec![]), &accepted, "UTC").unwrap(), Value::list(vec![]));
+    }
+
+    #[test]
+    fn wave4_union_list_cast_rejects_an_incompatible_element_only_when_reached() {
+        use rtdb_plan::{CastTarget, Expr, Schema};
+
+        let target = LogicalType::Scalar(ScalarType::I64).maybe();
+        let array = Value::list(vec![Value::I64(7), Value::F32(3.0)]);
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Literal(array)),
+            target: CastTarget::List(Box::new(CastTarget::Fixed(target.clone()))),
+        };
+        let subscript = |index| Expr::Subscript {
+            expr: Box::new(expr.clone()), index: Box::new(Expr::Literal(Value::I32(index))), data_type: target.clone(),
+        };
+        let schema = Schema::default();
+        let context = crate::EvalContext::default();
+        assert_eq!(crate::evaluate(&subscript(0), &schema, &[], &context).unwrap(), Value::I64(7));
+        assert_eq!(crate::evaluate(&subscript(1), &schema, &[], &context).unwrap_err().code, "xtdb/invalid-argument-types");
+    }
 }

@@ -31,22 +31,35 @@ pub fn validate_projected_decimals(field: &Field, array: &dyn Array) -> Result<(
         if let Some(mut children) = cell.structure() { return children.try_for_each(validate); }
         if let Some(mut children) = cell.sequence() { return children.try_for_each(validate); }
         let Some((parameters, mut coefficient)) = cell.decimal_coefficient()? else { return Ok(()); };
-        let precision = parameters.precision;
-        if precision >= 77 { return Ok(()); }
-        if precision > 0 {
-            let width = usize::from(parameters.bit_width / 8);
-            let start = coefficient.len() - width;
-            let sign = if coefficient[start] & 0x80 == 0 { 0 } else { 0xff };
-            coefficient[..start].fill(sign);
-            let coefficient = i256::from_be_bytes(coefficient);
-            let limit = i256::from_i128(10).wrapping_pow(precision as u32);
-            if coefficient > -limit && coefficient < limit { return Ok(()); }
+        let width = usize::from(parameters.bit_width / 8);
+        let start = coefficient.len() - width;
+        let sign = if coefficient[start] & 0x80 == 0 { 0 } else { 0xff };
+        coefficient[..start].fill(sign);
+        if fits_precision(i256::from_be_bytes(coefficient), precision_bound(parameters.precision)) {
+            Ok(())
+        } else {
+            Err(precision_error())
         }
-        Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"))
     }
 
     if !has_decimal(field.data_type()) { return Ok(()); }
     (0..array.len()).try_for_each(|row| validate(ArrowCell { field, array, row }))
+}
+
+pub(crate) fn precision_bound(precision: i32) -> Option<i256> {
+    match precision {
+        ..=0 => Some(i256::ZERO),
+        1..=76 => Some(i256::from_i128(10).wrapping_pow(precision as u32)),
+        _ => None,
+    }
+}
+
+pub(crate) fn fits_precision(coefficient: i256, bound: Option<i256>) -> bool {
+    bound.is_none_or(|limit| coefficient > -limit && coefficient < limit)
+}
+
+pub(crate) fn precision_error() -> Anomaly {
+    Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision")
 }
 
 /// Rebuilds a schema's fields bottom-up, preserving container layouts and schema metadata.

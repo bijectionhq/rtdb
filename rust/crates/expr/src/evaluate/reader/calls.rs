@@ -120,22 +120,7 @@ pub(super) fn call<'a>(expr: &'a Expr,name: &'a str,args: &'a [Expr],frame: &'a 
         let name = name.to_lowercase().replace('-',"_");
         frame.context.reserve(args.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr, frame.replacements)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
         validate(expr, &name, args, frame)?;
-        if name == "_id_eq_any" {
-            let id = evaluate(&args[0], frame)?.await?;
-            let array = evaluate(&args[1], frame)?.await?;
-            if is_null(&array) { return Ok(scalar(Value::Null)); }
-            if !matches!(&array, EvalValue::List(Kind::List | Kind::Fixed, _)) { return Err(invalid(&name)); }
-            let mut answer = Some(false);
-            for index in 0..len(&array)? {
-                let value = nth(clone_value(&array, frame)?, index, frame)?.await?;
-                match compare::equal(clone_value(&id, frame)?, value, false, frame)?.await? {
-                    Some(true) => return Ok(scalar(Value::Bool(true))),
-                    None => answer = None,
-                    Some(false) => (),
-                }
-            }
-            return Ok(scalar(boolean(answer)));
-        }
+        if name == "_id_eq_any" { return id_eq_any(&args[0], &args[1], frame).await; }
         if name == "set" { return make_list(Kind::Set,ListReader::Expressions(args),frame); }
         if name == "coalesce" {
             for expr in args { let value = evaluate(expr,frame)?.await?;if !is_null(&value) { return Ok(value); } }
@@ -172,6 +157,158 @@ pub(super) fn call<'a>(expr: &'a Expr,name: &'a str,args: &'a [Expr],frame: &'a 
         }
         apply(name,values,frame)?.await
     },frame)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdCell<'a> {
+    Null,
+    Integer(i128),
+    Bytes(&'a [u8]),
+}
+
+fn borrowed_id_type(field: &arrow_schema::Field) -> bool {
+    use arrow_schema::DataType as D;
+
+    if field.metadata().is_empty() {
+        return match field.data_type() {
+            D::Null => field.is_nullable(),
+            D::Int8 | D::Int16 | D::Int32 | D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64
+            | D::Utf8 | D::Binary | D::FixedSizeBinary(_) => true,
+            _ => false,
+        };
+    }
+    field.metadata().len() == 1 && matches!((field.data_type(), field.extension_type_name()),
+        (D::Utf8, Some("xt/clj-keyword")) | (D::FixedSizeBinary(16), Some("uuid")))
+}
+
+fn borrowed_id_array_child(field: &arrow_schema::Field) -> bool {
+    if let arrow_schema::DataType::Union(fields, arrow_schema::UnionMode::Dense) = field.data_type()
+        && field.metadata().is_empty()
+    {
+        return fields.iter().all(|(_, field)| {
+            if !borrowed_id_type(field) { return false; }
+            let Ok(ty) = rtdb_columnar::from_field(field) else { return false; };
+            let leg = match &ty { LogicalType::Maybe(leg) => leg.as_ref(), leg => leg };
+            rtdb_columnar::leg_name(leg).is_ok_and(|name| &name == field.name())
+        });
+    }
+    borrowed_id_type(field)
+}
+
+impl<'a> IdCell<'a> {
+    fn value(value: &'a Value) -> Option<Self> {
+        if nullish(value) { return Some(Self::Null); }
+        crate::numeric::integer(value).map(Self::Integer)
+            .or_else(|| crate::compare::emitted_byte_buffer(value).map(Self::Bytes))
+    }
+
+    fn arrow(cell: ArrowCell<'a>) -> Result<Option<Self>> {
+        use arrow_array::cast::AsArray;
+        use arrow_schema::DataType;
+
+        let cell = cell.physical()?;
+        if cell.is_null()? { return Ok(Some(Self::Null)); }
+        if !borrowed_id_type(cell.field) { return Ok(None); }
+        if let Some(value) = cell.signed_integer() {
+            return Ok(Some(Self::Integer(i128::from(value))));
+        }
+        let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
+        let bytes = match (cell.field.data_type(), extension) {
+            (DataType::Utf8, None | Some("xt/clj-keyword")) => cell.array.as_string::<i32>().value(cell.row).as_bytes(),
+            (DataType::Binary, None) => cell.array.as_binary::<i32>().value(cell.row),
+            (DataType::FixedSizeBinary(_), None) | (DataType::FixedSizeBinary(16), Some("uuid")) =>
+                cell.array.as_fixed_size_binary().value(cell.row),
+            _ => return Ok(None),
+        };
+        Ok(Some(Self::Bytes(bytes)))
+    }
+}
+
+async fn id_eq_any<'a>(id_expr: &'a Expr, array_expr: &'a Expr, frame: &'a EvaluationFrame<'a>) -> Result<EvalValue<'a>> {
+    let borrowed_id = if let Some(cell) = frame.arrow_input(id_expr) {
+        IdCell::arrow(cell)?
+    } else {
+        match (id_expr, frame.row) {
+            (Expr::Literal(value), _) => IdCell::value(value),
+            (Expr::Column { id, .. }, ExpressionRow::Values(row)) =>
+                frame.schema.position(*id).and_then(|index| row.get(index)).and_then(IdCell::value),
+            _ => None,
+        }
+    };
+    let mut id = if borrowed_id.is_none() { Some(evaluate(id_expr, frame)?.await?) } else { None };
+    let mut evaluated_array = None;
+    let mut arrow_array = None;
+    let mut stored_array = None;
+    if let Expr::Parameter { index, .. } = array_expr {
+        if let Some(cell) = frame.context.parameters.arrow_cell(*index) {
+            let cell = cell.physical()?;
+            if cell.field.metadata().is_empty()
+                && let arrow_schema::DataType::List(child) | arrow_schema::DataType::FixedSizeList(child, _) = cell.field.data_type()
+                && borrowed_id_array_child(child)
+            {
+                if cell.is_null()? { return Ok(scalar(Value::Null)); }
+                arrow_array = cell.sequence_range();
+            }
+        } else if let Some(value) = frame.context.parameters.get(*index)? {
+            match value {
+                Value::List(values) | Value::FixedSizeList(values) => stored_array = Some(values.view()),
+                value if nullish(value) => return Ok(scalar(Value::Null)),
+                _ => return Err(invalid("_id_eq_any")),
+            }
+        } else {
+            return Err(Anomaly::incorrect("xtdb/missing-parameter", format!("Missing parameter ${}", index + 1)));
+        }
+    }
+    if arrow_array.is_none() && stored_array.is_none() {
+        let array = evaluate(array_expr, frame)?.await?;
+        if is_null(&array) { return Ok(scalar(Value::Null)); }
+        if !matches!(array, EvalValue::List(Kind::List | Kind::Fixed, _)) { return Err(invalid("_id_eq_any")); }
+        evaluated_array = Some(array);
+        if let Some(EvalValue::List(_, reader)) = &evaluated_array {
+            match reader.as_ref() {
+                ListReader::Arrow(cell) => arrow_array = cell.sequence_range(),
+                ListReader::Stored(values) => stored_array = Some(values.view()),
+                _ => (),
+            }
+        }
+    }
+
+    let length = if let Some((_, _, range)) = &arrow_array { range.len() }
+        else if let Some(values) = stored_array { values.len() }
+        else { len(evaluated_array.as_ref().expect("evaluated array"))? };
+    let mut answer = Some(false);
+    for index in 0..length {
+        let child = arrow_array.as_ref().map(|(field, array, range)| ArrowCell { field, array: *array, row: range.start + index });
+        let stored = stored_array.and_then(|values| values.get(index));
+        let left = borrowed_id.or_else(|| id.as_ref().and_then(|id| scalar_ref(id).ok()).and_then(IdCell::value));
+        let right = if let Some(child) = child { IdCell::arrow(child)? }
+            else { stored.as_deref().and_then(IdCell::value) };
+        let matched = if let (Some(left), Some(right)) = (left, right) {
+            if left == IdCell::Null || right == IdCell::Null { None } else { Some(left == right) }
+        } else {
+            let value = if let Some(child) = child {
+                box_cell(from_arrow(child, frame)?)?
+            } else if let Some(value) = &stored {
+                box_cell(from_value(super::super::retained_clone(value.as_ref(), frame.context)?, frame)?)?
+            } else {
+                nth(clone_value(evaluated_array.as_ref().expect("evaluated array"), frame)?, index, frame)?.await?
+            };
+            if id.is_none() { id = Some(evaluate(id_expr, frame)?.await?); }
+            let id = id.as_ref().expect("evaluated ID");
+            match (id, &value) {
+                (EvalValue::Scalar(left), EvalValue::Scalar(right)) => {
+                    crate::compare::sql_eq_scoped(left, right, frame.context.timezone, frame.context.allocation)?
+                }
+                _ => compare::equal(clone_value(id, frame)?, value, false, frame)?.await?,
+            }
+        };
+        match matched {
+            Some(true) => return Ok(scalar(Value::Bool(true))),
+            None => answer = None,
+            Some(false) => (),
+        }
+    }
+    Ok(scalar(boolean(answer)))
 }
 
 fn trim<'a>(args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
@@ -291,3 +428,45 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, ListArray, types::Int64Type};
+    use arrow_schema::Field;
+
+    struct BoundList {
+        field: Field,
+        array: ListArray,
+    }
+
+    impl crate::ParameterLookup for BoundList {
+        fn width(&self) -> usize { 1 }
+        fn value(&self, _: usize) -> Result<Option<&Value>> { Err(Anomaly::fault("test/row-read", "Expected Arrow parameter access")) }
+        fn known_value(&self, _: usize) -> Option<&Value> { None }
+        fn arrow_cell(&self, index: usize) -> Option<ArrowCell<'_>> {
+            (index == 0).then_some(ArrowCell { field: &self.field, array: &self.array, row: 1 })
+        }
+    }
+
+    #[test]
+    fn wave4_id_membership_reads_only_the_bound_list_slice() {
+        let array = ListArray::from_iter_primitive::<Int64Type, _, _>([
+            Some(vec![Some(91)]), Some(vec![None, Some(7)]), Some(vec![Some(93)]),
+        ]);
+        let params = BoundList { field: Field::new("arg", array.data_type().clone(), false), array };
+        let context = EvalContext { parameters: crate::Parameters::Lookup(&params), ..Default::default() };
+        let schema = Schema::default();
+        let array_type = LogicalType::list(LogicalType::Scalar(rtdb_types::ScalarType::I64).maybe());
+        let any = |id, array| Expr::Call { name: "_id_eq_any".into(), args: vec![Expr::Literal(id), array],
+            return_type: LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe(),
+        };
+        for (id, expected) in [(Value::I64(7), Value::Bool(true)), (Value::I64(91), Value::Null), (Value::Null, Value::Null)] {
+            let array = Expr::Parameter { index: 0, data_type: array_type.clone() };
+            assert_eq!(crate::evaluate(&any(id, array), &schema, &[], &context).unwrap(), expected);
+        }
+
+        let empty = Expr::Literal(Value::list(vec![]));
+        assert_eq!(crate::evaluate(&any(Value::Null, empty), &schema, &[], &context).unwrap(), Value::Bool(false));
+    }
+}

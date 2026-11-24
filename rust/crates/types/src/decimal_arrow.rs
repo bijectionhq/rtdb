@@ -38,7 +38,9 @@ pub fn decimal_field_parameters(field: &Field) -> Result<Option<DecimalParameter
     fn annotated(value: Option<&String>, stored: i32, narrow: impl Fn(i32) -> bool) -> Result<i32> {
         let Some(value) = value else { return Ok(stored); };
         let parsed = value.parse::<i32>().map_err(|_| invalid("Invalid full-width decimal parameter"))?;
-        if narrow(parsed) || stored != 1 || value != &parsed.to_string() { return Err(invalid("Decimal annotation disagrees with its carrier")); }
+        let digits = value.strip_prefix('-').unwrap_or(value);
+        let canonical = if parsed == 0 { value == "0" } else { matches!(digits.as_bytes().first(), Some(b'1'..=b'9')) };
+        if narrow(parsed) || stored != 1 || !canonical { return Err(invalid("Decimal annotation disagrees with its carrier")); }
         Ok(parsed)
     }
     Ok(Some(DecimalParameters {
@@ -73,3 +75,22 @@ pub fn with_decimal_scale(field: Field, scale: i32) -> Result<Field> {
 }
 
 fn invalid(message: &str) -> Anomaly { Anomaly::incorrect("rtdb/decimal-metadata", message) }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wave4_decimal_annotations_keep_their_canonical_spellings() {
+        for (text, expected) in [("-200", Some(-200)), ("200", Some(200)), ("+200", None), ("0200", None),
+            ("-0200", None), ("-2147483648", Some(i32::MIN)), ("2147483647", Some(i32::MAX))] {
+            let field = Field::new("value", DataType::Decimal128(10, 1), false)
+                .with_metadata([(INTERNAL_DECIMAL_SCALE_KEY.into(), text.into())].into());
+            match expected {
+                Some(scale) => assert_eq!(decimal_scale(&field).unwrap(), Some(scale)),
+                None => assert_eq!(decimal_scale(&field).unwrap_err().code, "rtdb/decimal-metadata"),
+            }
+        }
+    }
+}

@@ -2116,9 +2116,14 @@ surface QueryAccess {
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
         -- Columnar text search reads compatible Arrow text and bound corpus statistics from their selected cells.
+        -- Equality against a compatible ID array compares borrowed candidate cells in order and stops at the first match.
+        -- With no match, a reached null comparison gives an unknown result.
+        -- A compatible cast to nullable or union list elements checks the types observed in the selected input.
+        -- Text conversion of packed numeric lists renders the selected typed components into one text buffer.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
         -- Computed Arrow projections validate decimal precision on the selected result cells, including nested decimals.
+        -- Run-end encoding of list values groups adjacent equal representations and preserves raw floating-point bits.
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
         -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
         -- Adjacent compatible projections can pass computed scalar results as Arrow columns, including into a mutation's document projection.

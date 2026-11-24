@@ -232,6 +232,12 @@ impl ListValue {
 
     pub fn supports_numeric_arrow(field: &Field) -> bool { numeric_list::supported(field) }
 
+    pub fn observed_numeric_type(field: &Field, array: &dyn Array, range: std::ops::Range<usize>) -> Option<LogicalType> {
+        (range.start <= range.end && range.end <= array.len()
+            && field.data_type() == array.data_type() && Self::supports_numeric_arrow(field))
+            .then(|| numeric_list::observed_type_in(field, array, range))
+    }
+
     pub fn from_numeric_arrow(field: Arc<Field>, values: ArrayRef) -> Option<Self> {
         if field.data_type() != values.data_type() { return None; }
         if field.metadata().is_empty() {
@@ -426,7 +432,7 @@ pub struct ListBuilder(BuildingList);
 
 enum BuildingList {
     Numeric(NumericListBuilder),
-    Values(Vec<Value>),
+    Mixed { prefix: ListValue, tail: Vec<Value> },
 }
 
 impl ListBuilder {
@@ -436,13 +442,11 @@ impl ListBuilder {
 
     pub fn push(&mut self, value: Value) {
         match &mut self.0 {
-            BuildingList::Values(values) => values.push(value),
+            BuildingList::Mixed { tail, .. } => tail.push(value),
             BuildingList::Numeric(builder) => {
                 if NumericCell::from_value(&value).is_some_and(|number| builder.push(number).is_some()) { return; }
-                let BuildingList::Numeric(builder) = std::mem::replace(&mut self.0, BuildingList::Values(Vec::new())) else { unreachable!() };
-                let mut values = finish_numeric(builder).into_values();
-                values.push(value);
-                self.0 = BuildingList::Values(values);
+                let BuildingList::Numeric(builder) = std::mem::replace(&mut self.0, BuildingList::Numeric(NumericListBuilder::new(0))) else { unreachable!() };
+                self.0 = BuildingList::Mixed { prefix: finish_numeric(builder), tail: vec![value] };
             }
         }
     }
@@ -450,7 +454,7 @@ impl ListBuilder {
     pub fn try_push_numeric(&mut self, value: NumericCell) -> bool {
         match &mut self.0 {
             BuildingList::Numeric(builder) => builder.push(value).is_some(),
-            BuildingList::Values(_) => false,
+            BuildingList::Mixed { .. } => false,
         }
     }
 
@@ -469,7 +473,13 @@ impl ListBuilder {
     pub fn finish(self) -> ListValue {
         match self.0 {
             BuildingList::Numeric(builder) => finish_numeric(builder),
-            BuildingList::Values(values) => ListValue(Storage::Values(values)),
+            BuildingList::Mixed { prefix, mut tail } => {
+                let prefix_len = prefix.len();
+                tail.reserve_exact(prefix_len);
+                tail.extend(prefix.iter().map(Cow::into_owned));
+                tail.rotate_right(prefix_len);
+                ListValue(Storage::Values(tail))
+            }
         }
     }
 }
@@ -531,4 +541,24 @@ fn packed_list_serialization_retains_the_value_tags_and_float_bits() {
     let expected = serde_json::to_vec(&raw).unwrap();
     assert_eq!(serde_json::to_vec(&packed).unwrap(), expected);
     assert_eq!(serde_json::to_vec(&view.float_slice(1..3).unwrap()).unwrap(), serde_json::to_vec(&raw[1..]).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wave4_mixed_builder_retains_packed_prefix_until_row_export() {
+        let mut builder = ListBuilder::with_capacity(4);
+        builder.push(Value::F32(-0.0));
+        builder.push(Value::Null);
+        builder.push(Value::Utf8("text".into()));
+        builder.push(Value::F32(1.0));
+        let BuildingList::Mixed { prefix, tail } = &builder.0 else { panic!("expected a split builder"); };
+        assert!(matches!(prefix.view(), ListView::F32(_)));
+        assert_eq!(prefix.get(1).as_deref(), Some(&Value::Null));
+        assert_eq!(tail, &[Value::Utf8("text".into()), Value::F32(1.0)]);
+        assert_eq!(serde_json::to_vec(&builder.finish()).unwrap(),
+            serde_json::to_vec(&[Value::F32(-0.0), Value::Null, Value::Utf8("text".into()), Value::F32(1.0)]).unwrap());
+    }
 }

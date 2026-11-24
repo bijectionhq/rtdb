@@ -9,7 +9,7 @@ use num_traits::{Signed,ToPrimitive,Zero};
 use crate::Anomaly;
 use self::text::decimal_parts_text as decimal_text;
 mod text;
-pub use text::decimal_parts_text;
+pub use text::{decimal_parts_text, write_decimal_coefficient};
 mod parse;
 mod hash;
 mod arithmetic;

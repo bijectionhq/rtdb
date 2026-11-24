@@ -127,6 +127,11 @@ fn inert_metadata(field: &Field) -> bool {
         && decimal_field_parameters(field).is_ok()
 }
 
+pub(crate) fn observed_type_in(field: &Field, array: &dyn Array, range: std::ops::Range<usize>) -> LogicalType {
+    let selected = array.slice(range.start, range.len());
+    observed_numeric_type(field, selected.as_ref())
+}
+
 pub(crate) fn observed_numeric_type(field: &Field, array: &dyn Array) -> LogicalType {
     let mut types = Vec::new();
     if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
@@ -434,6 +439,7 @@ fn append(builder: &mut dyn ArrayBuilder, value: NumericCell) -> Option<()> {
 
 pub(crate) struct NumericListBuilder {
     fields: Vec<Field>,
+    decimal_legs: Vec<(DecimalParameters, usize)>,
     builders: Vec<Box<dyn ArrayBuilder>>,
     ids: Vec<i8>,
     offsets: Vec<i32>,
@@ -443,6 +449,7 @@ impl NumericListBuilder {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             fields: Vec::new(),
+            decimal_legs: Vec::new(),
             builders: Vec::new(),
             ids: Vec::with_capacity(capacity),
             offsets: Vec::with_capacity(capacity),
@@ -457,17 +464,15 @@ impl NumericListBuilder {
             Field::new(name, ty, value == NumericCell::Null)
         } else {
             let NumericCell::Decimal(_, params) = value else { unreachable!() };
-            let field = decimal_field(params)?;
-            if let Some(i) = self.fields.iter().position(|candidate| candidate == &field) {
-                return self.append_leg(i, value);
+            if let Some(&(_, leg)) = self.decimal_legs.iter().find(|(key, _)| *key == params) {
+                return self.append_leg(leg, value);
             }
-            field
+            let leg = self.add_leg(decimal_field(params)?)?;
+            self.decimal_legs.push((params, leg));
+            return self.append_leg(leg, value);
         };
-        let i = self.fields.len();
-        if i >= i8::MAX as usize { return None; }
-        self.builders.push(make_builder(field.data_type(), 0));
-        self.fields.push(field);
-        self.append_leg(i, value)
+        let leg = self.add_leg(field)?;
+        self.append_leg(leg, value)
     }
 
     fn append_leg(&mut self, leg: usize, value: NumericCell) -> Option<()> {
@@ -478,6 +483,14 @@ impl NumericListBuilder {
         self.ids.push(id);
         self.offsets.push(offset);
         Some(())
+    }
+
+    fn add_leg(&mut self, field: Field) -> Option<usize> {
+        let leg = self.fields.len();
+        if leg >= i8::MAX as usize { return None; }
+        self.builders.push(make_builder(field.data_type(), 0));
+        self.fields.push(field);
+        Some(leg)
     }
 
     pub(crate) fn finish(mut self) -> Option<NumericList> {
@@ -515,6 +528,22 @@ pub(crate) fn pack(values: &[Value]) -> Option<NumericList> {
 mod tests {
     use super::*;
     use crate::{ListBuilder, ListValue, ListView};
+
+    #[test]
+    fn wave4_decimal_legs_keep_tags_and_full_width_parameters() {
+        let value = |coefficient: i64, scale| Value::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), 4, scale, 64).unwrap());
+        let input = [value(1, -300), Value::I32(7), value(-1, -300), value(2, 1), value(3, -300)];
+        let packed = pack(&input).unwrap();
+        let union = packed.array().as_any().downcast_ref::<UnionArray>().unwrap();
+        assert_eq!(union.type_ids().as_ref(), &[0, 1, 0, 2, 0]);
+        assert_eq!(union.offsets().unwrap().as_ref(), &[0, 0, 1, 0, 2]);
+        assert_eq!(packed.observed_type(), LogicalType::from_legs([
+            LogicalType::Scalar(ScalarType::Decimal { precision: 4, scale: -300, bit_width: 64 }),
+            LogicalType::Scalar(ScalarType::I32),
+            LogicalType::Scalar(ScalarType::Decimal { precision: 4, scale: 1, bit_width: 64 }),
+        ]));
+        for (index, expected) in input.iter().enumerate() { assert_eq!(&packed.value(index), expected); }
+    }
 
     #[test]
     fn optional_numeric_lists_store_validity_on_the_primitive_child() {

@@ -77,13 +77,21 @@ pub fn requires_pg_catalog(expression: &Expr) -> bool {
 
 pub(crate) fn cast(value: &Value, target: &CastTarget, context: &EvalContext<'_>) -> Result<Value> {
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
-    target.validate_source(&value.logical_type())?;
+    let source = value.logical_type();
+    target.validate_source(&source)?;
+    cast_from(value, &source, target, context)
+}
+
+fn cast_from(value: &Value, source: &LogicalType, target: &CastTarget, context: &EvalContext<'_>) -> Result<Value> {
     match target {
-        CastTarget::Checked { target: inner, .. } => return cast(value, inner, context),
-        CastTarget::Temporal(target) => return crate::temporal_cast::with_context(value,target,context),
-        CastTarget::Deferred(target) => return match target.resolve_value(&value.logical_type())? {
+        CastTarget::Checked { target: inner, .. } => return cast_from(value, source, inner, context),
+        CastTarget::Temporal(target) => return crate::temporal_cast::with_context_resolved(value,target,context),
+        CastTarget::Deferred(target) => return match target.resolve_value(source)? {
             CastTarget::Temporal(target) => crate::temporal_cast::with_context_resolved(value,&target,context),
-            target => cast(value,&target,context),
+            target => {
+                target.validate_source(source)?;
+                cast_from(value, source, &target, context)
+            },
         },
         CastTarget::Fixed(LogicalType::Scalar(ScalarType::Utf8)) => match value {
             Value::RegClass(oid) => return Ok(Value::Utf8(relation_text(*oid, context)?)),
@@ -109,7 +117,7 @@ pub(crate) fn cast(value: &Value, target: &CastTarget, context: &EvalContext<'_>
             let values = match value {
                 Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(),
                 Value::Utf8(text) => { parsed = crate::cast::pg_array_text(text)?; rtdb_types::ListView::Values(&parsed) },
-                _ => return crate::cast::cast_target(value, target, context.timezone),
+                _ => return crate::cast::cast_target_from(value, source, target, context.timezone),
             };
             if let Some(list) = crate::scalar_list_cast::cast_list(
                 crate::scalar_list_cast::Source::Stored(values), element, context.timezone, Some(context.current_time), false, |bytes| context.reserve(bytes),
@@ -120,5 +128,5 @@ pub(crate) fn cast(value: &Value, target: &CastTarget, context: &EvalContext<'_>
         }
         _ => (),
     }
-    crate::cast::cast_target(value, target, context.timezone)
+    crate::cast::cast_target_from(value, source, target, context.timezone)
 }

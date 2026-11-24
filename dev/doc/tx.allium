@@ -102,6 +102,8 @@
 -- Fixed-width list read bounds account for the selected length and any null-sensitive payload charge.
 -- An expression invocation shares the prepared storage of eligible literal arrays across its rows.
 -- Cosine scoring borrows compatible Arrow list columns and bound Arrow list parameters at their selected child positions.
+-- Mixed list construction retains a packed numeric prefix through element evaluation until the row-backed list is emitted.
+-- Compatible cosine operands read their selected floating-point slices in row order.
 -- A cosine projection guarded by a simple Boolean CASE reads only the rows selected by its guard.
 -- A list cast to REAL or DOUBLE PRECISION elements converts the packed components of a numeric list in one pass, through binary64 as each scalar cast does.
 -- A packed numeric list derives its observed element type from the first selected occurrence of each present leg and of null.

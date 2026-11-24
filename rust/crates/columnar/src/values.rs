@@ -382,7 +382,7 @@ fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[impl Borr
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal32Array::from(values), precision, scale, check_precision)
+            finish_decimal(Decimal32Array::from(values), precision, scale, check_precision, i256::from)
         }
         64 => {
             let values = values.iter().map(Borrow::borrow).map(|value| match value {
@@ -392,7 +392,7 @@ fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[impl Borr
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal64Array::from(values), precision, scale, check_precision)
+            finish_decimal(Decimal64Array::from(values), precision, scale, check_precision, i256::from)
         }
         128 => {
             let values = values.iter().map(Borrow::borrow).map(|value| match value {
@@ -402,7 +402,7 @@ fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[impl Borr
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal128Array::from(values), precision, scale, check_precision)
+            finish_decimal(Decimal128Array::from(values), precision, scale, check_precision, i256::from_i128)
         }
         256 => {
             let values = values.iter().map(Borrow::borrow).map(|value| match value {
@@ -412,15 +412,20 @@ fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[impl Borr
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal256Array::from(values), precision, scale, check_precision)
+            finish_decimal(Decimal256Array::from(values), precision, scale, check_precision, std::convert::identity)
         }
         _ => Err(decimal_width()),
     }
 }
 
-fn finish_decimal<T: arrow_array::types::DecimalType>(array: arrow_array::PrimitiveArray<T>, precision: i32, scale: i32, check_precision: bool) -> Result<ArrayRef> where T::Native: std::fmt::Display {
-    if check_precision && array.iter().flatten().any(|coefficient| precision <= 0 || coefficient.to_string().trim_start_matches('-').len() > precision as usize) {
-        return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"));
+fn finish_decimal<T: arrow_array::types::DecimalType>(
+    array: arrow_array::PrimitiveArray<T>, precision: i32, scale: i32, check_precision: bool,
+    coefficient: impl Fn(T::Native) -> i256,
+) -> Result<ArrayRef> {
+    if check_precision && let Some(bound) = crate::decimal::precision_bound(precision) {
+        if array.iter().flatten().any(|value| !crate::decimal::fits_precision(coefficient(value), Some(bound))) {
+            return Err(crate::decimal::precision_error());
+        }
     }
     Ok(Arc::new(array.with_data_type(T::TYPE_CONSTRUCTOR(crate::decimal_storage_precision(precision), crate::decimal_storage_scale(scale)))))
 }
@@ -646,10 +651,30 @@ fn same_representation(left: &Value, right: &Value) -> bool {
         (Value::F32(a), Value::F32(b)) => a.to_bits() == b.to_bits(),
         (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
         (Value::Set(a), Value::Set(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_representation(a, b)),
-        (Value::List(a), Value::List(b)) | (Value::FixedSizeList(a), Value::FixedSizeList(b)) => a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| same_representation(a.as_ref(), b.as_ref())),
+        (Value::List(a), Value::List(b)) | (Value::FixedSizeList(a), Value::FixedSizeList(b)) => same_list_representation(a.view(), b.view()),
         (Value::Struct(a), Value::Struct(b)) => a.len() == b.len() && a.iter().zip(b).all(|((ak, av), (bk, bv))| ak == bk && same_representation(av, bv)),
         (Value::Map { entries: a, sorted: sa }, Value::Map { entries: b, sorted: sb }) => sa == sb && a.len() == b.len() && a.iter().zip(b).all(|((ak, av), (bk, bv))| same_representation(ak, bk) && same_representation(av, bv)),
         _ => left == right,
+    }
+}
+
+fn same_list_representation(left: ListView<'_>, right: ListView<'_>) -> bool {
+    if left.len() != right.len() { return false; }
+    match (left, right) {
+        (ListView::F32(left), ListView::F32(right)) => left.to_data() == right.to_data(),
+        (ListView::F64(left), ListView::F64(right)) => left.to_data() == right.to_data(),
+        (ListView::Numeric(left), ListView::Numeric(right))
+            if !matches!(left.array().data_type(), DataType::Union(..))
+                && left.array().data_type() == right.array().data_type()
+                && left.field().metadata() == right.field().metadata() =>
+            left.array().to_data() == right.array().to_data(),
+        _ if left.is_packed_numeric() && right.is_packed_numeric() =>
+            (0..left.len()).all(|index| match (left.numeric_component(index), right.numeric_component(index)) {
+                (rtdb_types::NumericCell::F32(left), rtdb_types::NumericCell::F32(right)) => left.to_bits() == right.to_bits(),
+                (rtdb_types::NumericCell::F64(left), rtdb_types::NumericCell::F64(right)) => left.to_bits() == right.to_bits(),
+                (left, right) => left == right,
+            }),
+        _ => left.iter().zip(right.iter()).all(|(left, right)| same_representation(left.as_ref(), right.as_ref())),
     }
 }
 
@@ -1234,6 +1259,41 @@ mod tests {
         *plain == actual
             || matches!(plain, LogicalType::Maybe(inner) if **inner == actual || actual == LogicalType::Null)
             || plain.join(&actual) == *plain
+    }
+
+    #[test]
+    fn wave4_run_list_buffers_keep_zero_and_nan_bits() {
+        let list_type = LogicalType::list(LogicalType::Scalar(ScalarType::F64));
+        let ty = list_type.run_end_encoded(RunEndWidth::I32).unwrap();
+        let bits = [0, 0, 1 << 63, 0x7ff8_0000_0000_0001, 0x7ff8_0000_0000_0001, 0x7ff8_0000_0000_0002];
+        let values = bits.map(|bits| Value::list(vec![Value::F64(f64::from_bits(bits))]));
+        let array = build_array(&ty, &values).unwrap();
+        let data = array.to_data();
+        assert_eq!(data.child_data()[0].buffers()[0].as_slice(), [2i32, 3, 5, 6].map(i32::to_le_bytes).concat());
+        assert_eq!(data.child_data()[1].child_data()[0].buffers()[0].as_slice(),
+            [bits[0], bits[2], bits[3], bits[5]].map(u64::to_le_bytes).concat());
+    }
+
+    #[test]
+    fn wave4_decimal_precision_is_strict_at_signed_coefficient_bounds() {
+        for (width, coefficient) in [(32, i32::MIN as i128), (64, i64::MIN as i128), (128, i128::MIN)] {
+            let decimal = |coefficient: i128, precision| Value::Decimal(DecimalValue::new(
+                coefficient.to_be_bytes()[16 - width / 8..].to_vec(), precision, 0, width as u16,
+            ).unwrap());
+            for value in [decimal(-99, 2), decimal(99, 2), decimal(coefficient, 77)] {
+                let field = to_field("value", &value.logical_type()).unwrap();
+                let array = build_array(&value.logical_type(), &[value.clone()]).unwrap();
+                assert_eq!(read_value(&field, array.as_ref(), 0).unwrap(), value);
+            }
+            for value in [decimal(-100, 2), decimal(100, 2), decimal(0, 0)] {
+                assert_eq!(build_array(&value.logical_type(), &[value]).unwrap_err().code, "rtdb/decimal-precision");
+            }
+        }
+        let min = Value::Decimal(DecimalValue::new(i256::MIN.to_be_bytes().to_vec(), 77, 0, 256).unwrap());
+        let actual = build_array(&min.logical_type(), &[min.clone()]).unwrap().to_data();
+        assert_eq!(actual.buffers()[0].as_slice(), i256::MIN.to_le_bytes());
+        let too_wide = Value::Decimal(DecimalValue::new(i256::MIN.to_be_bytes().to_vec(), 76, 0, 256).unwrap());
+        assert_eq!(build_array(&too_wide.logical_type(), &[too_wide]).unwrap_err().code, "rtdb/decimal-precision");
     }
 
     #[test]

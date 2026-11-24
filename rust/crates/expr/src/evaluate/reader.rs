@@ -30,7 +30,7 @@ enum ListReader<'a> {
     Stored(rtdb_types::ListValue),
     Prepared(&'a PreparedList),
     Arrow(ArrowCell<'a>),
-    Cast { input: EvalValue<'a>, element: Target<'a> },
+    Cast { input: EvalValue<'a>, element: Target<'a>, union_admitted: bool },
     Trim { input: EvalValue<'a>, size: i64 },
     IntegerSeries(crate::series::IntegerSeries),
     RangeBins(crate::temporal_functions::RangeBins),
@@ -182,10 +182,14 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
                 }
                 ListReader::Arrow(cell) => {
                     frame.context.reserve(cell.observed_type_bytes()?)?;
-                    let LogicalType::List { element, .. } = cell.observed_type()? else { return Err(invalid("list type")); };
-                    rtdb_columnar::execution_type(&element)
+                    if let Some(element) = cell.sequence_range().and_then(|(field, array, range)| rtdb_types::ListValue::observed_numeric_type(field, array, range)) {
+                        rtdb_columnar::execution_type(&element)
+                    } else {
+                        let LogicalType::List { element, .. } = cell.observed_type()? else { return Err(invalid("list type")); };
+                        rtdb_columnar::execution_type(&element)
+                    }
                 }
-                ListReader::Cast { input,element } => {
+                ListReader::Cast { input,element,.. } => {
                     if let Some(target) = union_target(*element) {
                         frame.context.reserve(target.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;
                         return Ok(LogicalType::list(target.unencoded()));
@@ -453,11 +457,11 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
                 let item = ArrowCell { field, array, row: range.start + index };
                 from_arrow(item, frame)?
             }
-            ListReader::Cast { input,element } => {
+            ListReader::Cast { input,element,union_admitted } => {
                 let value = nth(clone_value(input,frame)?,index,frame)?.await?;
                 if let Some(target) = union_target(*element) {
                     frame.context.reserve(target.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;
-                    if !target.legs().contains(&value_type(&value,frame)?) { return Err(invalid("list union")); }
+                    if !union_admitted && !target.legs().contains(&value_type(&value,frame)?) { return Err(invalid("list union")); }
                     value
                 } else { cast_value(value,*element,frame)?.await? }
             }
@@ -535,7 +539,7 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
             let values = rtdb_types::ListValue::from_numeric_arrow(Arc::new(field.clone()), array);
             Ok(values)
         }
-        ListReader::Cast { input, element } => packed::cast(input, *element, offset..end, projection, context),
+        ListReader::Cast { input, element, .. } => packed::cast(input, *element, offset..end, projection, context),
         ListReader::Trim { input, size } if end <= crate::collection::view_size(*size)? => {
             packed_slice(input, offset, count, projection, context)
         }
@@ -618,7 +622,7 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                     }
                 }
                 if let EvalValue::List(Kind::List, reader) = &value
-                    && let ListReader::Cast { input, element } = reader.as_ref()
+                    && let ListReader::Cast { input, element, .. } = reader.as_ref()
                     && let Some(values) = packed::cast(input, *element, 0..len(input)?, false, frame.context)?
                 {
                     return Ok(Value::List(values));
@@ -692,7 +696,20 @@ fn cast_value<'a>(value: EvalValue<'a>,target: Target<'a>,frame: &'a EvaluationF
                 }
                 _ => return Err(invalid("list cast")),
             };
-            return make_list(Kind::List,ListReader::Cast { input: value,element },frame);
+            let packed = match &value {
+                EvalValue::List(_, reader) => match reader.as_ref() {
+                    ListReader::Stored(list) => list.array().is_some(),
+                    ListReader::Arrow(cell) => cell.sequence_range().is_some_and(|(field, _, _)| rtdb_types::ListValue::supports_numeric_arrow(field)),
+                    _ => false,
+                },
+                _ => false,
+            };
+            let union_admitted = packed && if let (Some(target), LogicalType::List { element, .. }) = (union_target(element), &source) {
+                frame.context.reserve(target.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;
+                let accepted = target.legs();
+                element.legs().iter().all(|ty| accepted.contains(ty))
+            } else { false };
+            return make_list(Kind::List,ListReader::Cast { input: value,element,union_admitted },frame);
         }
         let value = materialize(value,frame)?.await?;
         frame.context.reserve(crate::string::render::allocation_bound(&value)?)?;

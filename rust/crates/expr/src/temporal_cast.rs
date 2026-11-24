@@ -2,11 +2,6 @@ use rtdb_plan::{TemporalCast, TemporalKind, fractional_precision};
 use rtdb_types::{Anomaly, Instant, LogicalType, Result, TimeUnit, Value};
 use crate::{numeric::overflow, temporal::IntervalParts};
 
-pub(crate) fn with_context(value: &Value, target: &TemporalCast, context: &crate::EvalContext<'_>) -> Result<Value> {
-    target.validate_source(&value.logical_type())?;
-    with_context_resolved(value,target,context)
-}
-
 pub(crate) fn with_context_resolved(value: &Value, target: &TemporalCast, context: &crate::EvalContext<'_>) -> Result<Value> {
     if let Value::Time { value, unit, .. } = value {
         if matches!(target.kind, TemporalKind::TimestampLocal | TemporalKind::TimestampZone(_)) {
@@ -36,11 +31,6 @@ pub(crate) fn precision(nanos: i128, precision: Option<i64>) -> Result<i128> {
     let Some(precision) = precision else { return Ok(nanos); };
     let factor = 10i128.pow(9 - fractional_precision(precision, false)?);
     Ok(nanos.div_euclid(factor) * factor)
-}
-
-pub(crate) fn cast(value: &Value, target: &TemporalCast, timezone: &str) -> Result<Value> {
-    target.validate_source(&value.logical_type())?;
-    cast_resolved(value,target,timezone)
 }
 
 pub(crate) fn cast_resolved(value: &Value, target: &TemporalCast, timezone: &str) -> Result<Value> {

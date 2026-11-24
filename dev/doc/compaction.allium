@@ -241,12 +241,14 @@ contract OutputSegmentLayout {
         -- Each decimal field in an output Arrow schema carries the merged field's signed 32-bit precision and scale, including decimal fields nested in containers.
         -- Its coefficient buffers represent values at that scale.
         -- Copied cells retain their coefficient bytes and their decimal type leg in the merged schema.
+        -- An ordinary decimal vector write checks the signed coefficient against the declared precision.
 
     @invariant PageMetadataReadsArrowCells
         -- Page metadata derives numeric statistics and logical presence from Arrow cells.
         -- List and set presence counts valid parent rows independently of the presence of their child values.
         -- Dense union presence follows the selected tag and its child validity.
         -- Numeric list bounds read supported Arrow children at their physical width, including half-precision floats.
+        -- Compatible list hashes fold selected child buffers in physical order with a zero contribution for null cells.
 
     @invariant MillisecondDateStatisticsUseEpochDays
         -- A millisecond date's page statistics and value hash use the UTC epoch day containing the stored instant.

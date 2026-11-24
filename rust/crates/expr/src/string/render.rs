@@ -1,5 +1,6 @@
+use std::fmt::Write as _;
 use arrow_array::Array;
-use rtdb_types::{Anomaly, Result, TimeUnit, Value};
+use rtdb_types::{Anomaly, ListView, NumericCell, Result, TimeUnit, Value};
 use crate::{admission::Admission, numeric::overflow, temporal::IntervalParts, EvaluationScope};
 
 /// Bounds scratch and output retained while casting a value to text, including Transit cache expansion.
@@ -12,6 +13,15 @@ pub fn allocation_bound(value: &Value) -> Result<usize> {
         Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => match value.list_view().unwrap() {
             rtdb_types::ListView::F32(values) => float_bound(values.len(), values.null_count(), &Value::F32(0.0))?,
             rtdb_types::ListView::F64(values) => float_bound(values.len(), values.null_count(), &Value::F64(0.0))?,
+            values @ (ListView::Union(_) | ListView::Numeric(_)) => {
+                (0..values.len()).try_fold(0usize, |bytes, index| {
+                    let extra = match values.numeric_component(index) {
+                        NumericCell::Decimal(_, params) => usize::from(params.bit_width / 8),
+                        _ => 0,
+                    };
+                    bytes.checked_add(4096 + 64 * (std::mem::size_of::<Value>() + extra)).ok_or_else(overflow)
+                })?
+            }
             values => values.iter().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value.as_ref())?).ok_or_else(overflow))?,
         },
         Value::Struct(fields) => fields.values().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value)?).ok_or_else(overflow))?,
@@ -51,8 +61,8 @@ pub fn arrow_text(cell: rtdb_columnar::ArrowCell<'_>, allocation: &EvaluationSco
     let bytes = range.len().checked_mul(4096 + 64 * (std::mem::size_of::<Value>() + width))
         .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?;
     allocation.reserve(bytes)?;
-    let single = |value| printed_float(f64::from(value), Some(value));
-    let double = |value| printed_float(value, None);
+    let single = |value| (f64::from(value), Some(value));
+    let double = |value| (value, None);
     let output = match view {
         ListView::F32(array) => floats(range.map(|row| array.is_valid(row).then(|| single(array.value(row))))),
         ListView::F64(array) => floats(range.map(|row| array.is_valid(row).then(|| double(array.value(row))))),
@@ -120,11 +130,7 @@ fn reader(value: &Value, depth: usize) -> Result<String> {
         Value::Duration { value, unit } => tagged("time/duration", &crate::temporal_text::duration_text(nanos(*value, *unit))),
         value if IntervalParts::of(value).is_some() => tagged("xt/interval", &crate::temporal_text::interval_text(IntervalParts::of(value).ok_or_else(overflow)?)),
         Value::TimestampTzRange { lower, upper } => format!("[{} {}]", tagged("time/zoned-date-time", &timestamp(nanos(*lower, TimeUnit::Microsecond), Some("UTC"))?), tagged("time/zoned-date-time", &timestamp(nanos(*upper, TimeUnit::Microsecond), Some("UTC"))?)),
-        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => match value.list_view().unwrap() {
-            rtdb_types::ListView::F32(values) => floats(values.iter().map(|value| value.map(|value| printed_float(f64::from(value), Some(value))))),
-            rtdb_types::ListView::F64(values) => floats(values.iter().map(|value| value.map(|value| printed_float(value, None)))),
-            values => format!("[{}]", values.iter().map(|value| object(value.as_ref(), depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-        },
+        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => list(value.list_view().unwrap(), depth)?,
         Value::Struct(fields) => record(fields.iter(), depth)?,
         Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", object(key, depth + 1)?, object(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Transit(bytes) => crate::transit_object::printed_text(bytes, Admission::Standalone)?,
@@ -133,14 +139,59 @@ fn reader(value: &Value, depth: usize) -> Result<String> {
 }
 
 /// Prints packed float components as `object` prints each one, writing into one buffer.
-fn floats(components: impl Iterator<Item = Option<String>>) -> String {
+fn floats(components: impl Iterator<Item = Option<(f64, Option<f32>)>>) -> String {
     let mut output = String::from("[");
     for (index, component) in components.enumerate() {
         if index > 0 { output.push(' '); }
-        output.push_str(component.as_deref().unwrap_or("nil"));
+        if let Some((value, single)) = component { write_printed_float(&mut output, value, single); }
+        else { output.push_str("nil"); }
     }
     output.push(']');
     output
+}
+
+fn list(values: ListView<'_>, depth: usize) -> Result<String> {
+    if depth == 128 && !values.is_empty() { return Err(Anomaly::incorrect("xtdb.expression/value-depth", "Printable value exceeds the nesting limit")); }
+    let mut out = String::from("[");
+    for index in 0..values.len() {
+        if index != 0 { out.push(' '); }
+        if values.is_packed_numeric() {
+            write_numeric(&mut out, values.numeric_component(index));
+        } else {
+            out.push_str(&object(values.get(index).expect("list index").as_ref(), depth + 1)?);
+        }
+    }
+    out.push(']');
+    Ok(out)
+}
+
+fn write_numeric(out: &mut String, value: NumericCell) {
+    use NumericCell::*;
+    match value {
+        Null => out.push_str("nil"),
+        I8(value) => write!(out, "{value}").expect("writing to String"),
+        I16(value) => write!(out, "{value}").expect("writing to String"),
+        I32(value) => write!(out, "{value}").expect("writing to String"),
+        I64(value) => write!(out, "{value}").expect("writing to String"),
+        U8(value) => write!(out, "{value}").expect("writing to String"),
+        U16(value) => write!(out, "{value}").expect("writing to String"),
+        U32(value) => write!(out, "{value}").expect("writing to String"),
+        U64(value) => write!(out, "{value}").expect("writing to String"),
+        F16(bits) => { let value = half::f16::from_bits(bits).to_f32(); write_printed_float(out, f64::from(value), Some(value)); }
+        F32(value) => write_printed_float(out, f64::from(value), Some(value)),
+        F64(value) => write_printed_float(out, value, None),
+        Decimal(coefficient, params) => {
+            rtdb_types::jvm_number::write_decimal_coefficient(out, coefficient, params.scale);
+            out.push('M');
+        }
+    }
+}
+
+fn write_printed_float(out: &mut String, value: f64, single: Option<f32>) {
+    if value.is_nan() { out.push_str("##NaN"); }
+    else if value == f64::INFINITY { out.push_str("##Inf"); }
+    else if value == f64::NEG_INFINITY { out.push_str("##-Inf"); }
+    else { rtdb_types::write_java_float(out, value, single); }
 }
 
 fn object(value: &Value, depth: usize) -> Result<String> {
@@ -228,5 +279,33 @@ mod tests {
         let vector = Value::List(ListValue::from_f32(arrow_array::Float32Array::from(vec![1.0])));
         assert_eq!(reader(&vector, 128).unwrap_err().code, "xtdb.expression/value-depth");
         assert_eq!(reader(&Value::List(ListValue::from_f32(arrow_array::Float32Array::from(Vec::<f32>::new()))), 128).unwrap(), "[]");
+    }
+
+    #[test]
+    fn wave4_packed_list_text_uses_scalar_spelling_at_every_width() {
+        let decimal = |coefficient: [u8; 32], scale| Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_vec(), 77, scale, 256).unwrap());
+        let coeff = |value: i128| {
+            let mut bytes = [if value < 0 { 0xff } else { 0 }; 32];
+            bytes[16..].copy_from_slice(&value.to_be_bytes());
+            bytes
+        };
+        let mut min = [0; 32];
+        min[0] = 128;
+        let mut max = [0xff; 32];
+        max[0] = 127;
+        for values in [
+            vec![Value::F32(-0.0), Value::Null, Value::F32(0.0001)],
+            vec![Value::F64(f64::from_bits(1)), Value::F64(f64::NAN), Value::F64(f64::MAX)],
+            vec![Value::F32(f32::INFINITY), Value::Null, Value::F64(f64::NEG_INFINITY)],
+            vec![Value::F16(1), Value::U64(u64::MAX), decimal(min, i32::MIN), decimal(max, i32::MAX),
+                decimal(coeff(-123), 5), decimal(coeff(0), 7), decimal(coeff(5_000_000_000_000_000_001), 2)],
+        ] {
+            let scalar_text: Vec<_> = values.iter().map(|value| object(value, 1).unwrap()).collect();
+            let packed = Value::list(values.clone());
+            assert_eq!(text(&packed).unwrap(), format!("[{}]", scalar_text.join(" ")));
+            assert_eq!(allocation_bound(&packed).unwrap(),
+                4096 + 64 * packed.retained_bytes().unwrap() + values.iter().map(|value| allocation_bound(value).unwrap()).sum::<usize>());
+        }
+        assert_eq!(text(&Value::list(vec![Value::F64(-0.0), Value::F64(1e7)])).unwrap(), "[-0.0 1.0E7]");
     }
 }

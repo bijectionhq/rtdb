@@ -113,8 +113,14 @@ fn hash_value_with(value: &Value, seed: u32, hash_bytes: fn(&[u8], u32) -> u32) 
         }
         Value::List(_) | Value::FixedSizeList(_) => {
             let values = value.list_view().unwrap();
-            if values.is_float() {
-                hash_float_components((0..values.len()).map(|index| values.float_component(index)), seed, hash_bytes)
+            if let rtdb_types::ListView::F32(array) = values {
+                array.iter().fold(0, |hash, value| combine(hash, value.map_or(0, |value| float_hash(f64::from(value), seed))))
+            } else if let rtdb_types::ListView::F64(array) = values {
+                array.iter().fold(0, |hash, value| combine(hash, value.map_or(0, |value| float_hash(value, seed))))
+            } else if values.is_float() {
+                (0..values.len()).fold(0, |hash, index| {
+                    combine(hash, values.float_component(index).map_or(0, |value| float_hash(value, seed)))
+                })
             } else if let rtdb_types::ListView::Numeric(values) = values {
                 let array = values.array().as_ref();
                 (0..array.len()).try_fold(0, |hash, row| {
@@ -261,16 +267,16 @@ pub fn hash_cell(field: &Field, array: &dyn Array, row: usize, seed: u32) -> Res
             fields.iter().enumerate().try_fold(0, |hash, (index, child)| Ok::<i32, Anomaly>(combine(hash, hash_cell(child, values.column(index).as_ref(), row, seed)?)))
         }
         DataType::List(child) => {
-            let values = downcast::<ListArray>(array)?.value(row);
+            let list = downcast::<ListArray>(array)?;
+            let offsets = list.value_offsets();
+            let range = offsets[row] as usize..offsets[row + 1] as usize;
             let set = field.metadata().get(EXTENSION_NAME_KEY).is_some_and(|name| name == "set");
-            (0..values.len()).try_fold(0i32, |hash, index| {
-                let next = hash_cell(child, values.as_ref(), index, seed)?;
-                Ok(if set { hash.wrapping_add(next) } else { combine(hash, next) })
-            })
+            hash_sequence(child, list.values().as_ref(), range, seed, set, xxhash32)
         }
         DataType::FixedSizeList(child, _) => {
-            let values = downcast::<FixedSizeListArray>(array)?.value(row);
-            (0..values.len()).try_fold(0, |hash, index| Ok::<i32, Anomaly>(combine(hash, hash_cell(child, values.as_ref(), index, seed)?)))
+            let list = downcast::<FixedSizeListArray>(array)?;
+            let start = list.value_offset(row) as usize;
+            hash_sequence(child, list.values().as_ref(), start..start + list.value_length() as usize, seed, false, xxhash32)
         }
         DataType::Map(child, _) => {
             let values = downcast::<MapArray>(array)?.value(row);
@@ -283,6 +289,69 @@ pub fn hash_cell(field: &Field, array: &dyn Array, row: usize, seed: u32) -> Res
     }
 }
 
+fn hash_sequence(
+    field: &Field, array: &dyn Array, mut range: std::ops::Range<usize>, seed: u32, set: bool,
+    hash_bytes: fn(&[u8], u32) -> u32,
+) -> Result<i32> {
+    if range.is_empty() { return Ok(0); }
+    if range.end > array.len() || array.data_type() != field.data_type() { return Err(layout_error()); }
+    let add = if set { i32::wrapping_add } else { combine };
+    let double = |value: f64| hash_bytes(&value.to_bits().to_be_bytes(), seed) as i32;
+    macro_rules! primitive {
+        ($ty:ty, $hash:expr) => {{
+            let values = downcast::<PrimitiveArray<$ty>>(array)?;
+            let start = range.start;
+            Ok(values.values()[range].iter().enumerate().fold(0, |hash, (index, &value)| {
+                add(hash, if values.is_valid(start + index) { $hash(value) } else { 0 })
+            }))
+        }};
+    }
+    if field.metadata().is_empty() {
+        match field.data_type() {
+            DataType::Null => return Ok(0),
+            DataType::Int8 => return primitive!(Int8Type, |v| double(f64::from(v))),
+            DataType::Int16 => return primitive!(Int16Type, |v| double(f64::from(v))),
+            DataType::Int32 => return primitive!(Int32Type, |v| double(f64::from(v))),
+            DataType::Int64 => return primitive!(Int64Type, |v| double(v as f64)),
+            DataType::UInt8 => return primitive!(UInt8Type, |v| double(f64::from(v as i8))),
+            DataType::UInt16 => return primitive!(UInt16Type, |v| double(f64::from(v as i16))),
+            DataType::UInt32 => return primitive!(UInt32Type, |v| double(f64::from(v as i32))),
+            DataType::UInt64 => return primitive!(UInt64Type, |v| double((v as i64) as f64)),
+            DataType::Float32 => return primitive!(Float32Type, |v| double(f64::from(v))),
+            DataType::Float64 => return primitive!(Float64Type, double),
+            DataType::Utf8 => {
+                let values = downcast::<StringArray>(array)?;
+                return Ok(range.fold(0, |hash, row| add(hash, if values.is_valid(row) {
+                    hash_bytes(values.value(row).as_bytes(), seed) as i32
+                } else { 0 })));
+            }
+            _ => (),
+        }
+    }
+    range.try_fold(0, |hash, row| Ok(add(hash, hash_cell(field, array, row, seed)?)))
+}
+
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
 fn layout_error() -> Anomaly { Anomaly::incorrect("rtdb/hash-array-layout", "Hash cell index, field, and array must agree") }
 fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width") }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Float64Array, UInt64Array};
+
+    #[test]
+    fn wave4_list_hash_retains_selected_order_nulls_and_float_bits() {
+        let float = Float64Array::from(vec![Some(7.0), Some(-0.0), None, Some(f64::from_bits(0x7ff8_0000_0000_0042)), Some(13.0)]);
+        let field = Field::new("item", DataType::Float64, true);
+        let seed = 174;
+        let hash = |row| hash_cell(&field, &float, row, seed).unwrap();
+        let expected = (1..4).fold(0, |acc, row| combine(acc, hash(row)));
+        assert_eq!(hash_sequence(&field, &float, 1..4, seed, false, xxhash32).unwrap(), expected);
+        let unsigned = UInt64Array::from(vec![Some(1), Some(u64::MAX), None]);
+        let field = Field::new("item", DataType::UInt64, true);
+        let expected = (0..3).fold(0i32, |acc, row| acc.wrapping_add(hash_cell(&field, &unsigned, row, seed).unwrap()));
+        assert_eq!(hash_sequence(&field, &unsigned, 0..3, seed, true, xxhash32).unwrap(), expected);
+    }
+}

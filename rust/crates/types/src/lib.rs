@@ -60,7 +60,7 @@ pub use error::{Anomaly, AnomalyCategory, Result};
 pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
 pub use zone::{FixedOffset, ZoneId, timezone_names, TZDB_VERSION, TZDB_SHA256};
 pub use legacy_zone::LegacyTimeZone;
-pub use float_text::{java_f32_text, java_f64_text};
+pub use float_text::{java_f32_text, java_f64_text, write_java_float};
 pub use text_fingerprint::text_pair_fingerprint;
 pub use id::{HOSTED_RECEIPT_TX_ID, HOSTED_ROOT_RECEIPTS_TABLE, OWNED_ATTEMPT_RELATION, OWNED_PUBLIC_ROOT_VERSIONS_RELATION, OWNED_ROOT_PUBLICATION_RELATION, EntityId, Iid, Keyword, OwnedRelation, TableRef};
 pub use java_map::{compute_if_absent_indices as java_hash_map_compute_if_absent_order, indices as java_hash_map_order, put_all_indices as java_hash_map_put_all_order};
