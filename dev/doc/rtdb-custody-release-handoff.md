@@ -56,3 +56,56 @@ Run `native_original_custody_mount_rechecks_the_writer_and_withdraws_old_owners`
 Exercise both drivers with a mounted live provider, distinct contributing groups on a zero-hit rank, provider or attachment withdrawal at enqueue, selected-generation destruction after capture, and writer displacement during an ordered response transition.
 Recover a promoted terminal after reply loss and registry removal, and confirm protected export remains refused pending destination custody binding.
 No builds, tests, code generation or benchmarks ran during this source pass.
+
+## Cross-process v1 contract for W10b
+
+W10b owns the Bijection endpoint and caller on its W10 branch from `71384decd44`.
+RTDB owns the configured HTTPS client, provider signature verification, attachment mount and private owner Flight action.
+This contract uses JSON with unsigned byte arrays for fixed-width binary identifiers and opaque Basis bytes.
+All objects reject extra keys and malformed widths.
+
+### Original provider HTTPS endpoint
+
+RTDB sends a POST to the exact configured HTTPS endpoint with `Authorization: Bearer <dedicated provider credential>` and `Content-Type: application/json`.
+The endpoint must authenticate the credential for the exact original authority and read the independent frontier and original registry at a current durable barrier.
+Each request has a fresh lower-case 32-hex-digit `challenge` and an `operation`.
+`writer` adds `authority`, `carrier` adds `registration`, and `response` adds `authority` and `part`.
+
+For a successful observation, return HTTP 200 with `{"payload_hex":"...","signature_hex":"..."}`.
+The payload is the exact UTF-8 JSON bytes encoded in lower-case hex.
+The 64-byte Ed25519 signature covers the bytes `rtdb/custody/provider/v1\0`, then SHA-256 of the exact raw request body, then SHA-256 of the exact decoded payload bytes, in that order.
+RTDB verifies the detached signature with the configured 32-byte provider public key before interpreting the payload.
+The challenge and exact request hash prevent replay across visits, operations and authorities.
+The response body limit is 512 KiB.
+
+- `writer` payload is `{"authority": authority, "receipt": receipt}`.
+  The receipt carries `key`, `basis`, and `system_time_micros` and comes from the original independently confirmed writer frontier.
+- `carrier` payload is `{"registration": registration, "receipt": receipt, "state":"live"}` or the same structure with `"state":"disposed"` and required `evidence_sha256`.
+  The registry entry must match its full exact registration and original creator.
+  Disposal must be positive immutable evidence that the original transport part has closed.
+- `response` payload is `{"authority": authority, "part": part, "expires_at": micros, "frame_sha256": digest, "contributors": [[group,occurrence],...]}`.
+  Return the live exact carrier part with the full distinct protected contributor set, including dependencies that never appear in the frame.
+  The maximum is 512 contributors.
+
+`authority` has `incarnation` (16), `source_history` (32), `installation` (16), `registry` (32), and `original_writer` (32).
+`original_writer` is SHA-256 over `rtdb/v1/custody-original-writer\0`, the installation bytes and the confirmed writer request key.
+`part` has `transport_history`, `producer`, `consumer`, `response` (16 each) and positive `ordinal`.
+`registration` has `authority`, `group` (16), `original` (32), `occurrence` (32), `carrier_receipt_sha256` (32), `part` and `expires_at` in microseconds.
+The carrier receipt commitment is SHA-256 over `rtdb/v1/custody-carrier-receipt\0`, key byte length as big-endian u64, key bytes, the opaque Basis bytes, and system time as big-endian signed i64 microseconds.
+
+### Private Flight action
+
+Use `rtdb.custody.v1.Release` on the authenticated Flight session for the configured original database and dedicated hosted owner.
+It is a private JSON action alongside the ordinary protobuf APIs.
+`prepare`, `stage`, `promote`, `cancel`, and `dispose` requests are `{"operation":"…","registration": registration}`.
+`prepare` returns `{"registration": registration}`.
+`stage`, `promote` and `check` return `{"ok":true}`.
+`cancel` and `dispose` return `{"state":"cancelled"}` or `{"state":"disposed","evidence_sha256":[...]}` from the retained ordered terminal.
+`drained` accepts `authority`, `group`, opaque `revoked_at` Basis and `inventory_sha256` and returns `{"drained":bool}`.
+
+`check` accepts `registrations`, `frame_sha256` and `read_proofs` in addition to `operation`.
+For native protected reads the query flag `custody_release_evidence` requests a sealed `custody_release_proof` in the Query trailer.
+Preserve those opaque bytes on the same owner Flight session through final check.
+The new custody proof attests the producer's complete protected occurrences and captured key generation.
+The `930e66bec7` receiver clock proof remains separate and supplies no disposal or custody authorization.
+The responding transport owns exact single admission and deadline enforcement for its queued bytes after the check.
