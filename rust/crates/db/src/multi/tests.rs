@@ -995,32 +995,18 @@ async fn multi_driver_routes_the_same_idempotency_key_in_two_receipt_namespaces(
     );
 }
 
-struct FixedRotationTime(Lsn, Timestamp);
-
-impl RotationTiming for FixedRotationTime {
-    fn committed_at(&self, database: Uuid, rotation: Lsn) -> BoxFuture<'_, Result<Timestamp>> {
-        Box::pin(async move {
-            assert_eq!(database, DATABASE);
-            assert_eq!(rotation, self.0);
-            Ok(self.1)
-        })
-    }
-}
-
 #[tokio::test]
 async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();
     let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(Identity(1)))));
-    let timing = Arc::new(FixedRotationTime(Lsn(5), Timestamp(10)));
-    let mut writer = cluster
-        .node(1, gate.clone())
-        .with_rotation_timing(timing.clone());
+    let mut writer = cluster.node(1, gate.clone());
     writer.create().await.unwrap();
     writer.tick(&live(1)).await.unwrap();
     let receipt = writer.transact(&put(1, 1, "retained")).await.unwrap();
     let old = writer.write_file(b"old ciphertext").await.unwrap();
     writer.checkpoint(vec![old]).await.unwrap();
+    cluster.at(5);
     gate.block_trim.store(true, Ordering::SeqCst);
     assert!(
         writer
@@ -1044,9 +1030,7 @@ async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
         "rtdb/erased-under-view"
     );
     cluster.at(116);
-    let mut successor = cluster
-        .node(2, Arc::new(journal.handle(Identity(2))))
-        .with_rotation_timing(timing);
+    let mut successor = cluster.node(2, Arc::new(journal.handle(Identity(2))));
     assert_eq!(
         successor.tick(&live(2)).await.unwrap(),
         Role::Writer(Epoch(2))

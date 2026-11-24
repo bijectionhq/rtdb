@@ -26,7 +26,7 @@ pub use pin::PinnedExport;
 pub use pipeline::WritePipeline;
 use pipeline::{Append, AttemptError, Planned, receipt_for};
 use rotation::ArmedRotation;
-pub use rotation::{RotationReceipt, RotationTiming};
+pub use rotation::RotationReceipt;
 
 pub struct MultiOptions {
     pub database: Uuid,
@@ -65,7 +65,6 @@ pub struct MultiDatabase {
     clock: Arc<dyn Fn() -> Timestamp + Send + Sync>,
     token_keys: Arc<StoredTokenKeys>,
     tokens: TokenAuthority,
-    rotation_timing: Option<Arc<dyn RotationTiming>>,
     committed: Option<Committed>,
     writer: Option<Writer>,
     candidate: Option<Lease>,
@@ -100,7 +99,6 @@ impl MultiDatabase {
             clock,
             token_keys,
             tokens,
-            rotation_timing: None,
             committed: None,
             writer: None,
             candidate: None,

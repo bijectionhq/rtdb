@@ -135,6 +135,12 @@ pub enum Record {
     Refuse {
         tx_lsn: u64,
     },
+    /// Durable post-commit clock observation for the preceding key rotation.
+    KeyRetirement {
+        generation: u64,
+        rotation_lsn: u64,
+        observed_at: i64,
+    },
 }
 
 impl Record {

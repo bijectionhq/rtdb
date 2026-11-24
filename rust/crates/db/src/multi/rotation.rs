@@ -1,16 +1,10 @@
 use bytes::Bytes;
-use journal_contract::BoxFuture;
 use rtdb_store::{ErasurePlan, Retirement};
 
 use super::{
     Anomaly, AnomalyCategory, Checkpoint, Committed, Generation, Lsn, Manifest, MultiDatabase,
-    Record, Result, Timestamp, Uuid, next, no_writer,
+    Record, Result, Timestamp, next, no_writer,
 };
-
-/// An adapter's durable timestamp for the original successful rotation append.
-pub trait RotationTiming: Send + Sync {
-    fn committed_at(&self, database: Uuid, rotation: Lsn) -> BoxFuture<'_, Result<Timestamp>>;
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RotationReceipt {
@@ -27,11 +21,6 @@ pub(super) struct ArmedRotation {
 }
 
 impl MultiDatabase {
-    pub fn with_rotation_timing(mut self, timing: std::sync::Arc<dyn RotationTiming>) -> Self {
-        self.rotation_timing = Some(timing);
-        self
-    }
-
     /// Publishes the current clean fold with its complete rewritten file set.
     pub async fn rotate_clean_checkpoint(
         &mut self,
@@ -39,14 +28,11 @@ impl MultiDatabase {
     ) -> Result<RotationReceipt> {
         self.refresh().await?;
         let lease = self.authority()?;
-        self.rotation_timing
-            .as_ref()
-            .ok_or_else(timing_unavailable)?;
         if self.state().rotation.is_some() {
             return self
                 .finish_key_rotation()
                 .await?
-                .ok_or_else(timing_unavailable);
+                .ok_or_else(missing_rotation);
         }
         if self.reachability(lease).await?.pins().next().is_some() {
             return Err(rotation_busy("Release drained pins before rotating keys"));
@@ -90,7 +76,7 @@ impl MultiDatabase {
         .await?;
         self.finish_key_rotation()
             .await?
-            .ok_or_else(timing_unavailable)
+            .ok_or_else(missing_rotation)
     }
 
     pub(super) async fn finish_key_rotation(&mut self) -> Result<Option<RotationReceipt>> {
@@ -98,15 +84,11 @@ impl MultiDatabase {
             return Ok(None);
         };
         let lease = self.authority()?;
-        let timing = self
-            .rotation_timing
-            .clone()
-            .ok_or_else(timing_unavailable)?;
         let plan = self.rotation_plan(
             rotation
                 .generation
                 .checked_sub(1)
-                .ok_or_else(timing_unavailable)?,
+                .ok_or_else(missing_rotation)?,
             rotation.cut,
         )?;
         if !rotation.committed {
@@ -128,13 +110,24 @@ impl MultiDatabase {
         {
             Some(armed) => armed,
             None => {
-                let committed = timing
-                    .committed_at(self.options.database, Lsn(plan.rotation_lsn()))
-                    .await?;
+                let observed_at = match rotation.retirement_observed_at {
+                    Some(observed_at) => observed_at,
+                    None => {
+                        // Sample only after seeing KeyRotate commit. Persist the observation
+                        // before arming the KMS so successors use the original deadline.
+                        let observed_at = self.upper();
+                        self.append_control(lease, Record::KeyRetirement {
+                            generation: rotation.generation,
+                            rotation_lsn: plan.rotation_lsn(),
+                            observed_at,
+                        }).await?;
+                        observed_at
+                    }
+                };
                 self.require_authority(lease)?;
                 let this = &mut *self;
                 let retirement = plan
-                    .finish_rotation(kms.as_ref(), committed.0, move |through| async move {
+                    .finish_rotation(kms.as_ref(), observed_at, move |through| async move {
                         this.trim(lease, Lsn(through)).await
                     })
                     .await?;
@@ -206,9 +199,9 @@ fn rotation_busy(message: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Busy, "rtdb/key-rotation-pending", message)
 }
 
-fn timing_unavailable() -> Anomaly {
-    Anomaly::unsupported(
-        "rtdb/key-rotation-clock",
-        "Key rotation needs a durable journal commit timestamp",
+fn missing_rotation() -> Anomaly {
+    Anomaly::fault(
+        "rtdb/key-rotation",
+        "The expected key rotation is absent from the applied prefix",
     )
 }
