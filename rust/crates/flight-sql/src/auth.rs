@@ -40,26 +40,23 @@ impl Authentication {
     pub fn new(authenticator: Arc<Authenticator>) -> Self { let mut key = [0; 32]; key[..16].copy_from_slice(Uuid::new_v4().as_bytes()); key[16..].copy_from_slice(Uuid::new_v4().as_bytes()); Self { authenticator, key: Zeroizing::new(key) } }
     pub fn mac(&self, raw: &str) -> [u8; 32] { let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_ref()).expect("HMAC key"); mac.update(raw.as_bytes()); mac.finalize().into_bytes().into() }
     pub async fn authenticate(&self, credentials: &Credentials<'_>, peer: Option<&str>) -> Result<Arc<Caller>, Status> {
-        let (principal, _method) = match credentials {
-            Credentials::None => { if self.authenticator.method_for(None, peer) != Some(Method::Trust) { return Err(unauthenticated("credentials required")); } (self.authenticator.unauthenticated().map_err(auth_error)?, Method::Trust) }
+        let (principal, verified_credential) = match credentials {
+            Credentials::None => { if self.authenticator.method_for(None, peer) != Some(Method::Trust) { return Err(unauthenticated("credentials required")); } (self.authenticator.unauthenticated().map_err(auth_error)?, false) }
             Credentials::Bearer(_) => return Err(unauthenticated("unknown session")),
             Credentials::Basic { user, secret, .. } => match self.authenticator.method_for(Some(user), peer) {
-                Some(Method::Trust) => (self.authenticator.authenticate_trusted(user).map_err(auth_error)?, Method::Trust),
-                Some(Method::Password) => (self.authenticator.verify_password(user, secret).await.map_err(auth_error)?, Method::Password),
+                Some(Method::Trust) => (self.authenticator.authenticate_trusted(user).map_err(auth_error)?, false),
+                Some(Method::Password) => (self.authenticator.verify_password(user, secret).await.map_err(auth_error)?, true),
                 Some(Method::ClientCredentials) => return Err(unauthenticated("client credentials require Client authorization")),
                 Some(Method::DeviceAuth) => return Err(Status::unimplemented("device authorization is not supported over Flight SQL")),
                 None => return Err(unauthenticated("no matching authentication rule")),
             },
             Credentials::Client { id, secret, .. } => {
                 let principal = self.authenticator.verify_client_credentials(id, secret).await.map_err(auth_error)?;
-                if self.authenticator.method_for(principal.user(), peer) != Some(Method::ClientCredentials) { return Err(unauthenticated("client credentials authentication failed")); } (principal, Method::ClientCredentials)
+                if self.authenticator.method_for(principal.user(), peer) != Some(Method::ClientCredentials) { return Err(unauthenticated("client credentials authentication failed")); } (principal, true)
             }
         };
         let owner = if matches!(credentials, Credentials::None) { Owner::Anonymous } else { Owner::Authenticated(Uuid::new_v4()) };
-        Ok(Arc::new(Caller { owner, principal, mac: credentials.raw().map(|raw| self.mac(raw)),
-            #[cfg(feature = "multi")]
-            credential_verified: _method != Method::Trust,
-        }))
+        Ok(Arc::new(Caller { owner, principal, mac: credentials.raw().map(|raw| self.mac(raw)), verified_credential }))
     }
 }
 pub(crate) fn auth_error(error: Anomaly) -> Status { match error.category { AnomalyCategory::Fault => Status::internal("authentication failed"), AnomalyCategory::Unsupported => Status::unimplemented(error.message.unwrap_or_default()), _ => unauthenticated(error.message.unwrap_or_else(|| "authentication failed".into())) } }
@@ -110,6 +107,26 @@ mod tests {
         let caller = Authentication::new(authenticator).authenticate(&credentials, None).await.unwrap();
         assert!(caller.principal.label_scope().is_some());
         assert!(caller.principal.authorize_database("main", rtdb_node::DatabaseAccess::Read).is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_login_has_no_verified_custody_credential() {
+        use rtdb_auth::{AuthConfig, NativeHttp, Secret};
+        use rtdb_columnar::MemoryBudget;
+        use std::time::Duration;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut request = Request::new(());
+        request.metadata_mut().insert("authorization", "Basic eHRkYjpzZWNyZXQ=".parse().unwrap());
+        let credentials = Credentials::parse(&request).unwrap();
+        for password in [None, Some(Secret::new("secret"))] {
+            let verified = password.is_some();
+            let http = Arc::new(NativeHttp::new(memory.clone(), Duration::from_secs(1), 1024).unwrap());
+            let auth = Authenticator::open(AuthConfig::SingleRootUser { password }, memory.clone(), Arc::new(rtdb_node::SystemClock), http).await.unwrap();
+            let caller = Authentication::new(auth).authenticate(&credentials, None).await.unwrap();
+            assert_eq!(caller.principal.user_id(), Some("xtdb"));
+            assert_eq!(caller.verified_credential, verified);
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ const MAX_LIVE_RELEASES: usize = 256;
 const MAX_RELEASE_MICROS: i64 = 120_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustodyCarrierAuthority {
     pub incarnation: [u8; 16],
     pub source_history: [u8; 32],
@@ -17,6 +18,7 @@ pub struct CustodyCarrierAuthority {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustodyResponsePart {
     pub transport_history: [u8; 16],
     pub producer: [u8; 16],
@@ -26,6 +28,7 @@ pub struct CustodyResponsePart {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustodyReleaseRegistration {
     pub authority: CustodyCarrierAuthority,
     pub group: CustodyGroupId,

@@ -22,7 +22,7 @@ const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
-       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST]] [--parent-stdin]\n\
+       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST [--custody-provider-config FILE]]] [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi stage-sql-erasure --name NAME --at HOLDER --operation FILE --cell-secret FILE\n\
        rtdb-multi custody-domain --domain UUID --action FILE --replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE [--replay-broker-custody-token-file FILE]
@@ -396,6 +396,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     .then(|| arguments.required("flight-control-relations")
                         .map(|list| list.split(',').map(str::to_owned).collect()))
                     .transpose()?,
+                custody_provider_config: arguments.present("custody-provider-config")
+                    .then(|| arguments.required("custody-provider-config").map(PathBuf::from)).transpose()?,
             }, cancellation).await
         }
         "initialize-directory" => MemoryDirectory::initialize(std::path::Path::new(arguments.required("state")?)),

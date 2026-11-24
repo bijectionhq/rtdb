@@ -11,6 +11,7 @@ use rtdb_format::{config::{Yaml, YamlFields, default_database_config, decode_dat
 use rtdb_types::{Anomaly, Result, SourcePosition};
 
 pub use remotes::RemoteConfig;
+pub use crate::custody_provider::Settings as CustodyProviderSettings;
 pub use bounded::{ConfigurationEnvironment, EnvironmentValue, ParsedConfiguration, ParsedYamlDocument, ProcessEnvironment};
 pub use properties::object_sort_properties;
 
@@ -26,10 +27,11 @@ pub struct FlightSettings {
     pub session_idle_timeout: Duration, pub session_unclaimed_timeout: Duration,
     pub owned_native_actions: bool,
     pub hosted_controls: Option<rtdb_flight_sql::HostedControlConfig>,
+    pub custody_providers: Vec<CustodyProviderSettings>,
     pub audience: Option<(std::net::SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>,
 }
 impl Default for FlightSettings {
-    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, hosted_controls: None, audience: None } }
+    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, hosted_controls: None, custody_providers: Vec::new(), audience: None } }
 }
 #[derive(Clone, Debug)]
 pub struct HealthSettings { pub host: String, pub port: i32 }
@@ -196,11 +198,33 @@ fn flight(value: Yaml) -> Result<FlightSettings> {
         controls.finish()?;
         Ok::<_, Anomaly>(rtdb_flight_sql::HostedControlConfig { owner, relations })
     }).transpose()?;
+    let custody_providers = custody_providers(&mut fields)?;
+    if !custody_providers.is_empty() && hosted_controls.is_none() {
+        return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "Custody provider routes require the hosted owner"));
+    }
     let config = FlightSettings { host: fields.string("host")?.unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
         transaction_idle_timeout: duration(&mut fields, "transactionIdleTimeout", 1800)?, prepared_statement_idle_timeout: duration(&mut fields, "preparedStatementIdleTimeout", 1800)?,
-        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), hosted_controls, audience: None };
+        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), hosted_controls, custody_providers, audience: None };
     fields.finish()?;
     Ok(config)
+}
+
+fn custody_providers(fields: &mut YamlFields) -> Result<Vec<CustodyProviderSettings>> {
+    let providers = fields.sequence("custodyProviders")?.unwrap_or_default().into_iter()
+        .map(crate::custody_provider::read_settings).collect::<Result<Vec<_>>>()?;
+    if providers.iter().map(|provider| &provider.database).collect::<BTreeSet<_>>().len() != providers.len() {
+        return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "A database accepts one configured original custody provider"));
+    }
+    Ok(providers)
+}
+
+pub fn parse_custody_provider_config(text: &str) -> Result<Vec<CustodyProviderSettings>> {
+    let mut value = parse_yaml(text)?;
+    resolve_env_vars(&mut value, &|name| std::env::var(name).ok())?;
+    let mut fields = YamlFields::new(value, "custody provider configuration")?;
+    let providers = custody_providers(&mut fields)?;
+    fields.finish()?;
+    Ok(providers)
 }
 fn health(value: Yaml) -> Result<HealthSettings> {
     let mut fields = YamlFields::new(value, "healthz")?;

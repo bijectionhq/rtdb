@@ -35,6 +35,7 @@ mod v1;
 mod admin;
 #[cfg(feature = "multi")]
 pub use admin::{DeploymentAdminAction, DeploymentAdminAuthority};
+pub use v1::custody::CustodyProviderRoute;
 
 pub mod rtdb {
     pub mod v1 {

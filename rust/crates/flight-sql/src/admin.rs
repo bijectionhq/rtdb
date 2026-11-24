@@ -52,7 +52,7 @@ impl Service {
     pub(crate) fn has_admin_route(&self, call: &Call) -> bool {
         let principal = &call.session.caller.principal;
         self.0.config.deployment_admin.is_some()
-            && call.session.caller.credential_verified
+            && call.session.caller.verified_credential
             && principal.user_id().is_some()
             && principal.label_scope().is_none()
             && call.session.audience_source().is_none()

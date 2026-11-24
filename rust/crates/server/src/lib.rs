@@ -7,6 +7,7 @@ pub mod inspect;
 pub mod tracing;
 pub mod metric_export;
 mod runtime;
+mod custody_provider;
 mod resources;
 #[cfg(feature = "multi")]
 pub mod multi;

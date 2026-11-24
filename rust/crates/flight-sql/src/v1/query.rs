@@ -90,6 +90,7 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     }
     hash.update([query.track.into()]);
     if query.observe_receiver_clock { hash.update(b"receiver-clock"); }
+    if query.custody_release_evidence { hash.update(b"custody-release-evidence"); }
     hash.finalize().into()
 }
 
@@ -194,6 +195,9 @@ impl Service {
         if source.at.is_some() && selection.is_none() {
             return Err(error::incorrect("Empty At selector"));
         }
+        if request.custody_release_evidence {
+            self.custody_route(call)?;
+        }
         let database = self.wire_database(call, &source.branch, layer).await?;
         let driver = database.serving_driver();
         let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
@@ -204,7 +208,12 @@ impl Service {
         ) {
             return Err(error::unsupported(super::RECEIVER_CLOCK));
         }
-        let authority = if request.track || request.page.is_some() || request.observe_receiver_clock {
+        if request.custody_release_evidence && (
+            driver.is_none_or(|driver| !driver.supports_query_tokens()) || visibility.is_some() || !database.wire_tokens_supported()
+        ) {
+            return Err(error::unsupported("custody release proof"));
+        }
+        let authority = if request.track || request.page.is_some() || request.observe_receiver_clock || request.custody_release_evidence {
             if !database.wire_tokens_supported() || driver.is_some_and(|driver| !driver.supports_query_tokens()) {
                 return Err(error::unsupported(if request.track { "query.track" } else { "query.page" }));
             }
@@ -240,7 +249,7 @@ impl Service {
             Some(authority) => (None, Some(authority.issuer().await.map_err(error::anomaly)?)),
             None => (None, None),
         };
-        let (context, page, cut, scoped_claim, custody_groups, key_generation) = if let Some(driver) = driver {
+        let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors) = if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
@@ -262,7 +271,7 @@ impl Service {
                 (context, clock)
             };
             let page = PageToken { basis: view.cut.basis, clock, offset, request: request_hash };
-            (context, page, cut, view.claim, view.custody_groups, view.key_generation)
+            (context, page, cut, view.claim, view.custody_groups, view.key_generation, view.custody_contributors)
         } else {
             let minimum = match (continuation, selection) {
                 (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
@@ -313,7 +322,7 @@ impl Service {
             let context = context
                 .with_wire_cut(cut, page.clock.into())
                 .map_err(error::anomaly)?;
-            (context, page, cut, None, BTreeSet::new(), None)
+            (context, page, cut, None, BTreeSet::new(), None, None)
         };
         let parameters = request
             .params_ipc
@@ -354,12 +363,18 @@ impl Service {
             }).await.map_err(error::anomaly)?;
             Some(proto::ReceiverClockObservation { observed_at_micros: observed_at.0, proof })
         } else { None };
+        let custody_release_proof = if request.custody_release_evidence {
+            let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("custody release proof"))?;
+            let contributors = custody_contributors.ok_or_else(|| error::unsupported("complete custody release inventory"))?;
+            Some(self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors).await?)
+        } else { None };
         let trailer = proto::QueryTrailer {
             basis: Some(page.basis.into()),
             system_time_micros: cut.0,
             claim,
             next: None,
             receiver_clock,
+            custody_release_proof,
         };
         Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
     }

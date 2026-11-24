@@ -1978,14 +1978,14 @@ async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
     running.stop().await;
 }
 
-struct CustodyMountObservations(rtdb_node::serving::custody_release::OriginalReceipt);
+struct CustodyMountObservations(std::sync::OnceLock<rtdb_node::serving::custody_release::OriginalReceipt>);
 
 #[async_trait]
 impl rtdb_node::serving::custody_release::OriginalCarrierObservations for CustodyMountObservations {
     async fn confirmed_writer(
         &self, _: rtdb_node::serving::custody_release::CustodyCarrierAuthority, _: &tokio_util::sync::CancellationToken,
     ) -> Result<rtdb_node::serving::custody_release::OriginalReceipt> {
-        Ok(self.0.clone())
+        self.0.get().cloned().ok_or_else(|| rtdb_types::Anomaly::unsupported("test/no-writer", "The fixture writer is not confirmed"))
     }
 
     async fn registered_response(
@@ -2043,7 +2043,7 @@ async fn native_original_custody_mount_rechecks_the_writer_and_withdraws_old_own
             original_writer: original_writer_commitment([78; 16], &observed.key),
         },
         writer: OriginalWriterPoint { table: TableRef::new("public", "installation"), id: EntityId::Integer(1), valid_at: observed.system_time },
-        observations: Arc::new(CustodyMountObservations(proof)),
+        observations: Arc::new(CustodyMountObservations(proof.into())),
     };
     let cancellation = CancellationToken::new();
     let wrong = OriginalReceipt { system_time: observed.system_time.next().unwrap(), ..observed.clone() };
@@ -2064,5 +2064,77 @@ async fn native_original_custody_mount_rechecks_the_writer_and_withdraws_old_own
     assert!(owner.response_release(&rtdb_node::SystemClock, &cancellation).is_err());
     assert!(catalog.original_custody_response_owner("xtdb").is_ok());
     drop(replacement);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn configured_custody_query_mounts_only_for_the_credentialed_owner() {
+    use rtdb_node::serving::{NativeServingAuthority, custody_release::{
+        CustodyCarrierAuthority, CustodyProviderInstallation, OriginalReceipt, OriginalWriterPoint, original_writer_commitment,
+    }};
+    use rtdb_types::rtdb_v1::Basis;
+
+    let incarnation = [84; 16];
+    let key = vec![85; 16];
+    let observations = Arc::new(CustodyMountObservations(Default::default()));
+    let provider = Arc::new(rtdb_flight_sql::CustodyProviderRoute::new(CustodyProviderInstallation {
+        authority: CustodyCarrierAuthority {
+            incarnation, source_history: [86; 32], installation: [87; 16], registry: [88; 32],
+            original_writer: original_writer_commitment([87; 16], &key),
+        },
+        writer: OriginalWriterPoint { table: TableRef::new("public", "installation"), id: EntityId::Integer(1), valid_at: Timestamp(0) },
+        observations: observations.clone(),
+    }));
+    let config = || FlightConfig {
+        owned_native_actions: true,
+        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig { owner: "xtdb".into(), relations: ["bj_installation".into()].into() }),
+        custody_providers: [("xtdb".into(), provider.clone())].into(),
+        ..Default::default()
+    };
+    let resources = || Arc::new(rtdb_node::NativeResources::default().with_native_serving_authority(
+        "xtdb", NativeServingAuthority { incarnation, checkpoints: None },
+    ));
+    let mut evidence_query = input("SELECT 42 AS n");
+    evidence_query.custody_release_evidence = true;
+
+    let trusted = Running::start_with_resources(None, config(), &[], None, Default::default(), None, Some(resources())).await;
+    let mut client = Client::connect(&trusted.server, Some("xtdb:secret")).await;
+    let denied = get::<_, v1::QueryTrailer>(&mut client, evidence_query.clone()).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert!(trusted.node.catalog().original_custody_response_owner("xtdb").is_err());
+    trusted.stop().await;
+
+    let running = Running::start_with_resources(Some("secret"), config(), &[], None, Default::default(), None, Some(resources())).await;
+    let catalog = running.node.catalog();
+    let mut status = catalog.database("xtdb").unwrap().watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let receipt = transact_wire(&mut client, v1::TransactRequest {
+        key,
+        ops: vec![v1::Op { op: Some(v1::op::Op::Put(v1::Put {
+            branch: "main".into(), table: "public.installation".into(), if_absent: true,
+            rows: vec![v1::Row { cells: [
+                ("_id".into(), integer_cell(1)), ("_valid_from".into(), integer_cell(0)),
+                ("writer".into(), integer_cell(1)),
+            ].into(), ..Default::default() }],
+        })) }],
+        ..Default::default()
+    }).await.unwrap();
+    assert!(observations.0.set(OriginalReceipt {
+        key: receipt.key,
+        basis: Basis::from_bytes(&receipt.basis.unwrap().value).unwrap(),
+        system_time: Timestamp(receipt.system_time_micros),
+    }).is_ok());
+    let (_, ordinary) = query(&mut client, input("SELECT 42 AS n")).await;
+    assert!(ordinary.custody_release_proof.is_none());
+    assert!(catalog.original_custody_response_owner("xtdb").is_err());
+    let (_, protected) = query(&mut client, evidence_query).await;
+    assert!(protected.custody_release_proof.is_some_and(|proof| !proof.is_empty()));
+    assert!(catalog.original_custody_response_owner("xtdb").is_ok());
+    let capabilities = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
+    let capabilities = v1::CapabilitiesResponse::decode(capabilities[0].body.clone()).unwrap();
+    assert!(!capabilities.features.iter().any(|feature| feature == rtdb_tx::transact::ROW_CUSTODY));
     running.stop().await;
 }

@@ -121,6 +121,7 @@ pub struct FlightConfig {
     pub maximum_message_bytes: usize,
     pub owned_native_actions: bool,
     pub hosted_controls: Option<HostedControlConfig>,
+    pub custody_providers: std::collections::BTreeMap<String, Arc<crate::CustodyProviderRoute>>,
     /// An exclusive listener for this installed audience.
     pub audience: Option<AudienceFlightConfig>,
     /// The ordinary listener cannot mint applied holds for this installed audience.
@@ -135,7 +136,7 @@ pub struct FlightConfig {
 }
 impl Default for FlightConfig {
     fn default() -> Self {
-        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, owned_world_host: None,
+        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, custody_providers: Default::default(), audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, owned_world_host: None,
             #[cfg(feature = "multi")]
             deployment_admin: None,
         }
@@ -143,6 +144,9 @@ impl Default for FlightConfig {
 }
 impl FlightConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if !self.custody_providers.is_empty() && (self.hosted_controls.is_none() || self.audience.is_some()) {
+            return Err(Anomaly::incorrect("rtdb.flight-sql/custody-provider", "Custody providers require the installed hosted owner on the original Flight listener"));
+        }
         if self.audience.is_some() && (!self.owned_native_actions || self.hosted_controls.is_none() || self.forwarded_peer.is_none()
             || self.reserved_applied_source.is_some()) {
             return Err(Anomaly::incorrect("rtdb.flight-sql/audience", "An audience reservation requires placed hosted controls and authenticated forwarding"));

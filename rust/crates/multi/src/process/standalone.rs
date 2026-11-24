@@ -12,7 +12,7 @@ use base64::Engine as _;
 use rtdb_directory::{Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemoryDirectory};
 use rtdb_flight_sql::HostedControlConfig;
 use rtdb_logkeeper::{LocalListener, PreparedJournal, ServerOptions};
-use rtdb_server::config::{FlightSettings, NodeConfiguration};
+use rtdb_server::config::{FlightSettings, NodeConfiguration, parse_custody_provider_config};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -103,6 +103,7 @@ pub struct StandaloneSettings {
     pub ready_file: PathBuf,
     pub owned_flight: bool,
     pub flight_control_relations: Option<BTreeSet<String>>,
+    pub custody_provider_config: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -160,7 +161,10 @@ pub async fn serve_standalone(
     let mut configuration = NodeConfiguration::from_yaml(&format!(
         "server:\n  host: 127.0.0.1\n  port: 0\nauthn: !SingleRootUser\n  password: \"{password}\"\n"
     ))?;
-    if let Some(flight) = owned_flight_settings(settings.owned_flight, settings.flight_control_relations)? {
+    if let Some(flight) = owned_flight_settings(
+        settings.owned_flight, settings.flight_control_relations,
+        settings.custody_provider_config.as_deref(), &settings.name,
+    )? {
         configuration.flight_sql = Some(flight);
     }
     let tls = gateway_tls(&settings.certificate, &settings.private_key)?;
@@ -300,19 +304,34 @@ pub async fn serve_standalone(
 fn owned_flight_settings(
     enabled: bool,
     relations: Option<BTreeSet<String>>,
+    provider_config: Option<&Path>,
+    database: &str,
 ) -> Result<Option<FlightSettings>> {
+    if provider_config.is_some() && (!enabled || relations.is_none()) {
+        return Err(invalid("A custody provider requires the installed Flight control owner"));
+    }
     if !enabled {
         if relations.is_some() {
             return Err(invalid("Flight control relations require --owned-flight"));
         }
         return Ok(None);
     }
+    let custody_providers = if let Some(path) = provider_config {
+        let providers = parse_custody_provider_config(&read_bounded(path, 64 * 1024)?)?;
+        if providers.len() != 1 || providers[0].database != database {
+            return Err(invalid("A standalone custody provider must identify the original database"));
+        }
+        providers
+    } else {
+        Vec::new()
+    };
     Ok(Some(FlightSettings {
         owned_native_actions: true,
         hosted_controls: relations.map(|relations| HostedControlConfig {
             owner: "xtdb".to_owned(),
             relations,
         }),
+        custody_providers,
         ..FlightSettings::default()
     }))
 }
@@ -435,12 +454,13 @@ mod tests {
     #[test]
     fn standalone_owned_flight_requires_opt_in_and_scopes_control_relations() {
         let relations = BTreeSet::from(["bj_installation".to_owned()]);
-        assert!(owned_flight_settings(false, None).unwrap().is_none());
-        assert!(owned_flight_settings(false, Some(relations.clone())).is_err());
-        let ordinary = owned_flight_settings(true, None).unwrap().unwrap();
+        assert!(owned_flight_settings(false, None, None, "xtdb").unwrap().is_none());
+        assert!(owned_flight_settings(false, Some(relations.clone()), None, "xtdb").is_err());
+        assert!(owned_flight_settings(true, None, Some(Path::new("unused")), "xtdb").is_err());
+        let ordinary = owned_flight_settings(true, None, None, "xtdb").unwrap().unwrap();
         assert!(ordinary.owned_native_actions);
         assert!(ordinary.hosted_controls.is_none());
-        let owned = owned_flight_settings(true, Some(relations.clone())).unwrap().unwrap();
+        let owned = owned_flight_settings(true, Some(relations.clone()), None, "xtdb").unwrap().unwrap();
         let controls = owned.hosted_controls.unwrap();
         assert_eq!(controls.owner, "xtdb");
         assert_eq!(controls.relations, relations);

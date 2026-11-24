@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod changes;
+pub(crate) mod custody;
 pub(crate) mod error;
 mod query;
 mod tokens;
@@ -52,7 +53,7 @@ pub(crate) fn ticket(bytes: &Bytes) -> Option<Ticket> {
 }
 
 pub(crate) fn is_action(name: &str) -> bool {
-    ACTIONS.contains(&name) || name.starts_with("rtdb.admin.v1.")
+    ACTIONS.contains(&name) || name == custody::RELEASE || name.starts_with("rtdb.admin.v1.")
 }
 
 fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
@@ -135,6 +136,7 @@ impl Service {
                 }
                 .encode_to_vec()
             }),
+            custody::RELEASE => self.custody_release_action(&call, &action.body).await,
             "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
             "rtdb.v1.TxStatus" => match decode(action.body) {
                 Ok(request) => self.v1_tx_status(&call, request).await,

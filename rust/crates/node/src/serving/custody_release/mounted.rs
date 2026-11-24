@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::Timestamp;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::*;
 use crate::{
@@ -16,6 +17,7 @@ use crate::{
 
 pub type CustodyContributors = BTreeSet<(CustodyGroupId, [u8; 32])>;
 
+#[derive(Clone)]
 pub struct CustodyProviderInstallation {
     pub authority: CustodyCarrierAuthority,
     pub writer: OriginalWriterPoint,
@@ -28,6 +30,7 @@ pub struct RegisteredCustodyResponse {
     pub part: CustodyResponsePart,
     pub expires_at: Timestamp,
     pub frame_sha256: [u8; 32],
+    pub read_proofs_sha256: Option<[u8; 32]>,
     pub contributors: CustodyContributors,
 }
 
@@ -58,6 +61,7 @@ pub fn custody_frame_commitment(frame: &[u8]) -> [u8; 32] {
 }
 
 struct InstalledProvider {
+    id: Uuid,
     installation: CustodyProviderInstallation,
     lifetime: CancellationToken,
 }
@@ -79,6 +83,12 @@ impl CustodyProviderSlot {
 pub struct CustodyProviderMount {
     database: Weak<Database>,
     provider: Arc<InstalledProvider>,
+}
+
+impl CustodyProviderMount {
+    pub fn is_for(&self, attachment: &Arc<Database>) -> bool {
+        !self.provider.lifetime.is_cancelled() && self.database.ptr_eq(&Arc::downgrade(attachment))
+    }
 }
 
 impl Drop for CustodyProviderMount {
@@ -125,7 +135,7 @@ impl DatabaseCatalog {
             .run_until_cancelled(async {
                 let writer = journal.writer_fence(cancellation).await?;
                 let index = driver.current_custody(cancellation).await?;
-                if !writer.matches(&index)? {
+                if !writer.matches(&index, crate::SystemClock.now())? {
                     return Err(release_unavailable());
                 }
                 Ok(())
@@ -138,6 +148,7 @@ impl DatabaseCatalog {
                 return Err(release_unavailable());
             }
             let provider = Arc::new(InstalledProvider {
+                id: Uuid::new_v4(),
                 installation,
                 lifetime,
             });
@@ -188,6 +199,16 @@ pub struct MountedResponseRelease<'a> {
 }
 
 impl CustodyResponseOwner {
+    pub fn mount_id(&self) -> Uuid {
+        self.provider.id
+    }
+
+    pub fn is_for(&self, attachment: &Arc<Database>, authority: CustodyCarrierAuthority) -> bool {
+        Arc::ptr_eq(attachment, &self.database)
+            && self.provider.installation.authority == authority
+            && !self.provider.lifetime.is_cancelled()
+    }
+
     pub fn response_release<'a>(
         &'a self,
         clock: &'a dyn Clock,
@@ -243,6 +264,15 @@ impl MountedResponseRelease<'_> {
             .await
             .flatten()
             .ok_or_else(release_unavailable)?
+    }
+
+    pub async fn require_original_writer(&self) -> Result<()> {
+        let release = self.release();
+        let authority = self.owner.provider.installation.authority;
+        self.while_mounted(async { release.current_with_writer(authority).await.map(drop) })
+            .await?;
+        self.owner
+            .with_live_mount(|| release.require_authority(authority))
     }
 
     pub async fn capture_ranked(&self, source: QuerySource) -> Result<CapturedCustodyRank> {
@@ -326,19 +356,13 @@ impl MountedResponseRelease<'_> {
         let release = self.release();
         release.require_authority(first.authority)?;
         let expected_frame = custody_frame_commitment(frame);
-        self.while_mounted(async {
-            let manifest = self
-                .owner
-                .provider
-                .installation
-                .observations
-                .registered_response(first.authority, first.part, self.cancellation)
-                .await?;
-            manifest.require_frame(*first, contributors, expected_frame)?;
-            release
-                .check_contributors(contributors, registrations, generation)
-                .await
-        })
+        self.check_registered_response(
+            contributors,
+            generation,
+            registrations,
+            expected_frame,
+            None,
+        )
         .await?;
         self.owner.with_live_mount(|| {
             release.require_authority(first.authority)?;
@@ -347,6 +371,52 @@ impl MountedResponseRelease<'_> {
                 return Err(release_unavailable());
             }
             enqueue(frame, deadline)
+        })
+    }
+    pub async fn check_registered_response(
+        &self,
+        contributors: &CustodyContributors,
+        generation: Option<u64>,
+        registrations: &[CustodyReleaseRegistration],
+        frame_sha256: [u8; 32],
+        read_proofs_sha256: Option<[u8; 32]>,
+    ) -> Result<()> {
+        let first = registrations.first().ok_or_else(release_unavailable)?;
+        first.require_live_time(self.clock.now())?;
+        let cutoff = u64::try_from(first.expires_at.0)
+            .ok()
+            .and_then(|micros| micros.checked_mul(1_000))
+            .and_then(DeliveryDeadline::from_wire_nanos)
+            .ok_or_else(release_unavailable)?;
+        let release = self.release();
+        release.require_authority(first.authority)?;
+        tokio::time::timeout_at(
+            cutoff.instant().into(),
+            self.while_mounted(async {
+                let manifest = self
+                    .owner
+                    .provider
+                    .installation
+                    .observations
+                    .registered_response(first.authority, first.part, self.cancellation)
+                    .await?;
+                manifest.require_frame(*first, contributors, frame_sha256)?;
+                if manifest.read_proofs_sha256 != read_proofs_sha256 {
+                    return Err(release_unavailable());
+                }
+                release
+                    .check_contributors(contributors, registrations, generation)
+                    .await
+            }),
+        )
+        .await
+        .map_err(|_| release_unavailable())??;
+        self.owner.with_live_mount(|| {
+            release.require_authority(first.authority)?;
+            if !cutoff.is_live() {
+                return Err(release_unavailable());
+            }
+            first.require_live_time(self.clock.now())
         })
     }
 }
@@ -388,6 +458,7 @@ mod tests {
             part: registration.part,
             expires_at: registration.expires_at,
             frame_sha256,
+            read_proofs_sha256: None,
             contributors,
         };
         assert!(

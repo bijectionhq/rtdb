@@ -46,15 +46,19 @@ The common interface has three operations.
   The native captured set can include rows outside the final page and remains bound to its original view.
   The legacy rank inventory still uses hosted assertion-family coordinates and needs an explicit bridge to generic placement commitments before its consumers can move over.
 
-Provider mount and lookup are trusted in-process server calls.
-W10b and RTDB still need to agree and implement the authenticated cross-process provider transport, release action and recovery address encoding, plus mapping for legacy, archived, and scoped contributors and protected index bytes.
-Once that bridge is installed, a producer can recover old terminals on the same original writer attachment without the transport registry row, while new admissions still require the live registry.
+The RTDB host owns provider mount and lookup, with the authenticated cross-process bridge below.
+W10b owns the Bijection endpoint, the caller and its mapping for legacy, archived and scoped contributors and protected index bytes.
+The same original writer attachment can recover an ordered terminal after loss of the transport registry row.
+New admissions require a live original registry observation.
 
 ## Final qualification source cases
 
 Run `native_original_custody_mount_rechecks_the_writer_and_withdraws_old_owners`, `registered_frame_rejects_omitted_contributors_and_transport_substitution`, and `ranked_capture_retains_inherited_and_shadowing_custody_groups_before_slicing` with the earlier custody and source-intake regressions.
+Run `configured_custody_query_mounts_only_for_the_credentialed_owner`, `trusted_login_has_no_verified_custody_credential`, `provider_attestation_is_bound_to_request_challenge_and_payload`, and `custody_read_proof_preserves_the_full_inventory_and_selected_generation`.
 Exercise both drivers with a mounted live provider, distinct contributing groups on a zero-hit rank, provider or attachment withdrawal at enqueue, selected-generation destruction after capture, and writer displacement during an ordered response transition.
+Use a writer replacement whose valid interval leaves the former writer visible at its configured point.
 Recover a promoted terminal after reply loss and registry removal, and confirm protected export remains refused pending destination custody binding.
+Delay or lose a successful Flight Check reply across revocation or generation withdrawal and assert that protected enqueue stays closed.
 No builds, tests, code generation or benchmarks ran during this source pass.
 
 ## Cross-process v1 contract for W10b
@@ -83,7 +87,10 @@ The response body limit is 512 KiB.
 - `carrier` payload is `{"registration": registration, "receipt": receipt, "state":"live"}` or the same structure with `"state":"disposed"` and required `evidence_sha256`.
   The registry entry must match its full exact registration and original creator.
   Disposal must be positive immutable evidence that the original transport part has closed.
-- `response` payload is `{"authority": authority, "part": part, "expires_at": micros, "frame_sha256": digest, "contributors": [[group,occurrence],...]}`.
+- `response` payload is `{"authority": authority, "part": part, "expires_at": micros, "frame_sha256": digest, "contributors": [[group,occurrence],...], "read_proofs_sha256": digest}`.
+  For Flight the proof digest is required and observes the exact list registered for that frame.
+  It is SHA-256 over `rtdb/v1/custody-read-proofs\0`, the big-endian u16 list count, then each opaque proof prefixed by its big-endian u64 byte length, in list order.
+  In-process handoff uses its captured view directly and omits the proof digest.
   Return the live exact carrier part with the full distinct protected contributor set, including dependencies that never appear in the frame.
   The maximum is 512 contributors.
 
@@ -99,13 +106,42 @@ Use `rtdb.custody.v1.Release` on the authenticated Flight session for the config
 It is a private JSON action alongside the ordinary protobuf APIs.
 `prepare`, `stage`, `promote`, `cancel`, and `dispose` requests are `{"operation":"…","registration": registration}`.
 `prepare` returns `{"registration": registration}`.
-`stage`, `promote` and `check` return `{"ok":true}`.
+`stage`, `promote` and the producer-side `check` preflight return `{"ok":true}`.
 `cancel` and `dispose` return `{"state":"cancelled"}` or `{"state":"disposed","evidence_sha256":[...]}` from the retained ordered terminal.
 `drained` accepts `authority`, `group`, opaque `revoked_at` Basis and `inventory_sha256` and returns `{"drained":bool}`.
 
 `check` accepts `registrations`, `frame_sha256` and `read_proofs` in addition to `operation`.
 For native protected reads the query flag `custody_release_evidence` requests a sealed `custody_release_proof` in the Query trailer.
-Preserve those opaque bytes on the same owner Flight session through final check.
+Preserve those opaque bytes on the same owner Flight session and original provider mount through the preflight.
+Submit one to eight proofs from the same selected Basis and data generation, and register their exact ordered digest in the original response manifest.
+The request body limit is 2 MiB.
 The new custody proof attests the producer's complete protected occurrences and captured key generation.
 The `930e66bec7` receiver clock proof remains separate and supplies no disposal or custody authorization.
-The responding transport owns exact single admission and deadline enforcement for its queued bytes after the check.
+A successful Check reports the state at the producer's barrier.
+Cross-process protected enqueue remains gated until Bijection's single admission and deadline enforcement can share a fence-ordered transport admission or an equivalent final barrier with RTDB.
+Delayed and lost Check replies must close delivery across an intervening revocation or generation withdrawal.
+
+### RTDB host activation
+
+Configure one `flightSql.custodyProviders` entry per original database on the ordinary listener and use the existing `flightSql.hostedControls.owner` principal.
+That principal must use validated password or client credentials, with write access to the selected original database.
+An anonymous, trust-only, scoped, fresh-replica or audience session cannot mount or use the provider.
+Ordinary `Transact` and Query requests never mount a provider.
+The owner-only action or explicitly requested custody read proof lazily mounts the configured HTTPS provider after checking its independently confirmed writer receipt and current writer point.
+The route retains the mount for the live attachment and verifies a replacement attachment as a new mount.
+A writer identity change requires updating the host configuration to the newly confirmed writer.
+Supply the pinned writer request key commitment at process launch and reuse the exact prepared writer claim through initial confirmation.
+For a successor, the configured writer point must select the successor's written version once it is current.
+The ordered phase checks both the configured valid instant and the current decision time while preserving the original canonical release request bytes.
+Standalone Multi uses `--owned-flight --flight-control-relations LIST --custody-provider-config FILE` with its existing isolated owner listener.
+That file contains the same `custodyProviders` list at its root, with one entry for the original standalone database.
+
+The configuration entry has `database`, `endpoint`, `bearerToken`, `providerPublicKey`, `incarnation`, `sourceHistory`, `installation`, `registry`, `originalWriter`, `writerTable`, `writerId` and `writerValidAtMicros`.
+Use `!Env` for the dedicated bearer credential and lowercase hexadecimal for the public key and authority identifiers.
+`writerTable` is `schema.table`, `writerId` is the exact string row identity, and `writerValidAtMicros` selects its stable valid instant.
+Keep the ordinary Flight connection on the existing authenticated host transport and configure the provider endpoint as HTTPS.
+The provider client declines redirects, uses a five-second request timeout and validates TLS plus the configured response signing key.
+
+The first Query proof fields are `custody_release_evidence` at request tag 7 and `custody_release_proof` at trailer tag 6.
+A proof is issued only for an unscoped native view with complete placement evidence and uses that view's selected key generation.
+The cross-process bridge and action remain private while the active W10b consumers and protected reader coverage are incomplete.

@@ -2,6 +2,7 @@
 
 mod aead;
 mod custody;
+pub mod custody_provider;
 mod file;
 mod local;
 mod source;

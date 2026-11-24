@@ -215,16 +215,23 @@ impl ServerDriver {
         if let Some(settings) = &config.flight_sql
             && settings.port >= 0
         {
+            let mut custody_providers = std::collections::BTreeMap::new();
+            for provider in &settings.custody_providers {
+                let route = Arc::new(rtdb_flight_sql::CustodyProviderRoute::new(provider.installation(Arc::clone(node.memory()))?));
+                if custody_providers.insert(provider.database.clone(), route).is_some() {
+                    return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "A database accepts one configured original custody provider"));
+                }
+            }
             let ordinary = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                 transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
                 session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
                 forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions,
-                hosted_controls: settings.hosted_controls.clone(),
+                hosted_controls: settings.hosted_controls.clone(), custody_providers,
                 reserved_applied_source: settings.audience.map(|(_, audience)| audience.source()),
                 ..Default::default() };
             if let Some((address, audience)) = settings.audience {
                 let reserved = rtdb_flight_sql::FlightConfig {
-                    address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None,
+                    address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None, custody_providers: Default::default(),
                     ..ordinary.clone()
                 };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(reserved, node.clone(), auth.clone()).await?;

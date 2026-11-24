@@ -783,8 +783,8 @@ impl TransactState {
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
             return Err(feature_required(TRANSACT_REQUIRES));
         }
+        let response_release = request.is_response_release();
         if request.uses_custody() {
-            let response_release = request.is_response_release();
             if request.contains_response_release() && (!response_release || scope.is_some()) {
                 return Err(Anomaly::incorrect("rtdb/custody-release", "Response release requires its original writer and private receipt namespace"));
             }
@@ -821,7 +821,12 @@ impl TransactState {
                     "rtdb/invalid-requirement", "A count requirement must use the Before phase",
                 ));
             }
-            if !evaluate(requirement, &base)? {
+            let valid = if response_release {
+                CustodyWriterFence::check_requirement(requirement, &base, time)?
+            } else {
+                evaluate(requirement, &base)?
+            };
+            if !valid {
                 return Err(Anomaly::new(
                     AnomalyCategory::Conflict, REQUIREMENT_FAILED, format!("Requirement {i} failed"),
                 ));

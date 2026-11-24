@@ -125,7 +125,7 @@ impl ServingDriver for DefaultServing {
         let vault = self.tokens.authority().await?.custody_vault();
         for &group in groups { vault.check_readable(group).await?; }
         let index = self.current_custody(cancellation).await?;
-        super::custody_release::check_release_cut(&index, writer, groups)
+        super::custody_release::check_release_cut(&index, writer, groups, self.clock.now())
     }
 
     async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {

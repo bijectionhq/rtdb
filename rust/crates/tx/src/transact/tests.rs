@@ -856,8 +856,10 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
     let mut displaced = state.clone();
     let mut replacement = put(MAIN_BRANCH, 99, "replacement");
     let Op::Put { rows, .. } = &mut replacement else { unreachable!() };
-    rows[0].valid = Some(Interval::ALL.into());
+    rows[0].valid = Some(Interval::new(Timestamp(80), Timestamp::MAX).unwrap().into());
     assert_eq!(commit(&mut displaced, 8, &request(16, vec![replacement])).outcome, Outcome::Then);
+    let view = displaced.index().view(MAIN_BRANCH, At::Latest, Layer::Local, Timestamp(90)).unwrap();
+    assert_eq!(view.row(&table(), &EntityId::Integer(99), Timestamp(20)).unwrap().cut.basis, basis(1));
     assert!(matches!(commit(&mut displaced, 9, &stage).outcome,
         Outcome::Refused { error } if error.code == REQUIREMENT_FAILED));
     assert!(displaced.index().custody_release_phase(registration).unwrap().is_none());

@@ -256,7 +256,7 @@ impl ServingDriver for MultiServing {
             for &group in groups { vault.check_readable(group).await?; }
             let mut database = self.database.lock().await;
             let (index, current_generation) = database.fresh_view().await?;
-            crate::serving::custody_release::check_release_cut(&index, writer, groups)?;
+            crate::serving::custody_release::check_release_cut(&index, writer, groups, crate::Clock::now(&crate::SystemClock))?;
             database.check_generation(current_generation).await?;
             if let Some(selected) = generation.filter(|selected| *selected != current_generation) {
                 database.check_generation(selected).await?;

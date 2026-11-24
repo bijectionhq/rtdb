@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rtdb_index::branches::{BranchIndex, CustodyGroupId, CustodyRelease};
 use rtdb_tx::transact::{CustodyWriterFence, Outcome, Receipt, TrustedCustodyRelease};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 use std::collections::BTreeSet;
 use tokio_util::sync::CancellationToken;
 
@@ -240,7 +240,7 @@ impl ResponseRelease<'_> {
         let writer = self.original.writer_fence(self.cancellation).await?;
         let index = self.driver.current_custody(self.cancellation).await?;
         self.require_authority(authority)?;
-        if !writer.matches(&index)? {
+        if !writer.matches(&index, self.clock.now())? {
             return Err(release_unavailable());
         }
         Ok((index, writer))
@@ -314,8 +314,9 @@ pub(crate) fn check_release_cut(
     index: &BranchIndex,
     writer: &CustodyWriterFence,
     groups: &BTreeSet<CustodyGroupId>,
+    now: Timestamp,
 ) -> Result<()> {
-    if !writer.matches(index)? {
+    if !writer.matches(index, now)? {
         return Err(release_unavailable());
     }
     for &group in groups {
@@ -410,7 +411,7 @@ mod tests {
                 return Err(rtdb_crypt::erased_under_view());
             }
             let index = self.current_custody(cancellation).await?;
-            if !writer.matches(&index)? {
+            if !writer.matches(&index, index.head().system_time)? {
                 return Err(release_unavailable());
             }
             for &group in groups {

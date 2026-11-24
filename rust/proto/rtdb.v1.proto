@@ -63,6 +63,8 @@ message QueryRequest {
   Page page = 5;
   // Ask for an authenticated receiver sample on the first page of this read.
   bool observe_receiver_clock = 6;
+  // Request a custody proof on the configured original owner route.
+  bool custody_release_evidence = 7;
 }
 message QueryTrailer {
   Basis basis = 1;
@@ -70,6 +72,7 @@ message QueryTrailer {
   Claim claim = 3;
   optional bytes next = 4;
   ReceiverClockObservation receiver_clock = 5;
+  optional bytes custody_release_proof = 6;
 }
 message ReceiverClockObservation {
   // A sample from the installed receiver clock. QueryTrailer.system_time_micros names the selected cut.

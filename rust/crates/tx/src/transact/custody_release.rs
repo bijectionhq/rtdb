@@ -12,16 +12,24 @@ pub struct CustodyWriterFence {
 }
 
 impl CustodyWriterFence {
-    pub fn matches(&self, index: &BranchIndex) -> Result<bool> {
+    pub fn matches(&self, index: &BranchIndex, now: Timestamp) -> Result<bool> {
+        let current = now.max(index.head().system_time);
         let view = index.view(
             MAIN_BRANCH,
             At::Latest,
             Layer::Local,
-            index.head().system_time,
+            current,
         )?;
-        Ok(view
-            .row(&self.table, &self.id, self.valid_at)
-            .is_some_and(|row| row.cut.basis == self.written))
+        Ok([self.valid_at, current].into_iter().all(|valid_at| {
+            view.row(&self.table, &self.id, valid_at).is_some_and(|row| row.cut.basis == self.written)
+        }))
+    }
+
+    pub(super) fn check_requirement(requirement: &Guard, index: &BranchIndex, now: Timestamp) -> Result<bool> {
+        let Guard::Version { table, id, valid_at: Some(valid_at), expect: Version::Written(written), .. } = requirement else {
+            return Ok(false);
+        };
+        Self { table: table.clone(), id: id.clone(), valid_at: *valid_at, written: *written }.matches(index, now)
     }
 
     fn requirement(&self) -> Guard {

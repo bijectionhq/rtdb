@@ -127,6 +127,17 @@ pub struct ReceiverClockObservation {
     pub session: [u8; 32],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustodyReadProof {
+    pub basis: Basis,
+    pub key_generation: Option<u64>,
+    pub expires_at: Timestamp,
+    pub contributors: Vec<([u8; 16], [u8; 32])>,
+}
+
+const CUSTODY_READ_HEADER: usize = Basis::WIDTH + 1 + 8 + 8 + 32 + 32;
+const MAX_CUSTODY_CONTRIBUTORS: usize = 512;
+
 const PAGE_BYTES: usize = Basis::WIDTH + 8 + 8 + 32;
 const EXPORT_BYTES: usize = Basis::WIDTH + 16 + 32;
 const OBSERVATION_BYTES: usize = Basis::WIDTH + 16 + 64;
@@ -138,6 +149,7 @@ enum Purpose {
     Page = 2,
     Export = 3,
     ReceiverClock = 4,
+    CustodyRead = 5,
 }
 
 impl Purpose {
@@ -151,6 +163,7 @@ impl Purpose {
             ),
             Self::Export => Anomaly::incorrect("rtdb/invalid-export", "Invalid checkpoint export ticket"),
             Self::ReceiverClock => Anomaly::incorrect("rtdb/invalid-receiver-observation", "Invalid receiver clock observation"),
+            Self::CustodyRead => Anomaly::incorrect("rtdb/invalid-custody-read", "Invalid custody read proof"),
         }
     }
 
@@ -160,6 +173,7 @@ impl Purpose {
             Self::Page => PAGE_BYTES,
             Self::Export => EXPORT_BYTES,
             Self::ReceiverClock => OBSERVATION_BYTES,
+            Self::CustodyRead => CUSTODY_READ_HEADER + 48 * MAX_CUSTODY_CONTRIBUTORS,
         }
     }
 }
@@ -283,6 +297,33 @@ impl TokenAuthority {
         })
     }
 
+    pub async fn open_custody_read(&self, token: &[u8], owner: [u8; 32], session: [u8; 32]) -> Result<CustodyReadProof> {
+        let (bytes, _) = self.open(Purpose::CustodyRead, token).await?;
+        let invalid = || Purpose::CustodyRead.invalid();
+        let (basis, bytes) = bytes.split_first_chunk::<{ Basis::WIDTH }>().ok_or_else(invalid)?;
+        let (tag, bytes) = bytes.split_first().ok_or_else(invalid)?;
+        let (generation, bytes) = bytes.split_first_chunk::<8>().ok_or_else(invalid)?;
+        let (expiry, bytes) = bytes.split_first_chunk::<8>().ok_or_else(invalid)?;
+        let (bound_owner, bytes) = bytes.split_first_chunk::<32>().ok_or_else(invalid)?;
+        let (bound_session, bytes) = bytes.split_first_chunk::<32>().ok_or_else(invalid)?;
+        let basis = Basis::from_bytes(basis).map_err(|_| invalid())?;
+        if basis.incarnation() != *self.incarnation.as_bytes() || *bound_owner != owner || *bound_session != session
+            || bytes.len() % 48 != 0 || bytes.len() / 48 > MAX_CUSTODY_CONTRIBUTORS
+        { return Err(invalid()); }
+        let key_generation = match (*tag, u64::from_be_bytes(*generation)) {
+            (0, 0) => None,
+            (1, generation) => Some(generation),
+            _ => return Err(invalid()),
+        };
+        let contributors = bytes.chunks_exact(48).map(|entry| {
+            (entry[..16].try_into().expect("group width"), entry[16..].try_into().expect("occurrence width"))
+        }).collect::<Vec<([u8; 16], [u8; 32])>>();
+        if contributors.windows(2).any(|pair| pair[0] >= pair[1])
+            || contributors.iter().any(|(group, occurrence)| *group == [0; 16] || *occurrence == [0; 32])
+        { return Err(invalid()); }
+        Ok(CustodyReadProof { basis, key_generation, expires_at: Timestamp(i64::from_be_bytes(*expiry)), contributors })
+    }
+
     pub async fn issuer(&self) -> Result<TokenIssuer> {
         let key = self.keys.current().await?;
         if key.generation.database != self.incarnation {
@@ -404,6 +445,26 @@ impl TokenAuthority {
 }
 
 impl TokenIssuer {
+    pub async fn seal_custody_read(&self, proof: &CustodyReadProof, owner: [u8; 32], session: [u8; 32]) -> Result<Vec<u8>> {
+        if proof.basis.incarnation() != *self.authority.incarnation.as_bytes() || proof.expires_at.0 <= 0
+            || proof.contributors.len() > MAX_CUSTODY_CONTRIBUTORS
+            || proof.contributors.windows(2).any(|pair| pair[0] >= pair[1])
+            || proof.contributors.iter().any(|(group, occurrence)| *group == [0; 16] || *occurrence == [0; 32])
+        { return Err(Purpose::CustodyRead.invalid()); }
+        let mut bytes = Vec::with_capacity(CUSTODY_READ_HEADER + 48 * proof.contributors.len());
+        bytes.extend_from_slice(&proof.basis.to_bytes());
+        bytes.push(u8::from(proof.key_generation.is_some()));
+        bytes.extend_from_slice(&proof.key_generation.unwrap_or(0).to_be_bytes());
+        bytes.extend_from_slice(&proof.expires_at.0.to_be_bytes());
+        bytes.extend_from_slice(&owner);
+        bytes.extend_from_slice(&session);
+        for (group, occurrence) in &proof.contributors {
+            bytes.extend_from_slice(group);
+            bytes.extend_from_slice(occurrence);
+        }
+        self.authority.seal(&self.key, Purpose::CustodyRead, &bytes).await
+    }
+
     pub async fn seal_receiver_clock(&self, observation: ReceiverClockObservation) -> Result<Vec<u8>> {
         if observation.basis.incarnation() != *self.authority.incarnation.as_bytes() {
             return Err(Purpose::ReceiverClock.invalid());
@@ -556,6 +617,27 @@ mod tests {
         assert_eq!(authority.open_receiver_clock(&proof, observation.session).await.unwrap(), observation);
         assert_eq!(authority.open_receiver_clock(&proof, [6; 32]).await.unwrap_err().code, "rtdb/invalid-receiver-observation");
         assert!(authority.open_page(&proof).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn custody_read_proof_preserves_the_full_inventory_and_selected_generation() {
+        let database = Uuid::from_u128(42);
+        let kms: Arc<dyn Kms> = Arc::new(crate::LocalKms::new(|| 0));
+        let metadata = TokenKey::create(kms.as_ref(), Generation { database, number: 0 }).await.unwrap().encode();
+        let authority = TokenAuthority::new(database, kms, Arc::new(Keys(vec![metadata])));
+        let evidence = CustodyReadProof {
+            basis: Basis::new(*database.as_bytes(), 77), key_generation: Some(9), expires_at: Timestamp(10_000),
+            contributors: vec![([1; 16], [2; 32]), ([3; 16], [4; 32])],
+        };
+        let issuer = authority.issuer().await.unwrap();
+        let token = issuer.seal_custody_read(&evidence, [5; 32], [6; 32]).await.unwrap();
+        assert_eq!(authority.open_custody_read(&token, [5; 32], [6; 32]).await.unwrap(), evidence);
+        assert!(authority.open_custody_read(&token, [7; 32], [6; 32]).await.is_err());
+        assert!(authority.open_custody_read(&token, [5; 32], [8; 32]).await.is_err());
+        assert!(authority.open_receiver_clock(&token, [6; 32]).await.is_err());
+        let mut duplicate = evidence;
+        duplicate.contributors.push(duplicate.contributors[1]);
+        assert!(issuer.seal_custody_read(&duplicate, [5; 32], [6; 32]).await.is_err());
     }
 
     #[tokio::test]
