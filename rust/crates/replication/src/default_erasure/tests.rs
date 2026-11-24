@@ -14,8 +14,8 @@ use rtdb_index::{
 use rtdb_storage::MemoryStore;
 use rtdb_trie::TrieConfig;
 use rtdb_types::{
-    BlockIndex, EntityId, EventOp, Interval, StorageEpoch, StructFields, TableRef, Term,
-    TermSequence, TransactionKey, TxId, Value, rtdb_v1::MAIN_BRANCH,
+    BlockIndex, EntityId, EventOp, Interval, StorageEpoch, StructFields, TableRef, TermSequence,
+    TransactionKey, TxId, Value, rtdb_v1::MAIN_BRANCH,
 };
 
 use super::*;
@@ -26,6 +26,7 @@ fn an_ordered_retirement_keeps_the_deadline_when_reopened() -> Result<()> {
         basis: Basis::new([3; 16], 9),
         source: SourcePosition(31),
         replica: ReplicaPosition(41),
+        term: Term(6),
     };
     let selected = SelectedRewrite {
         evidence: RewriteEvidence {

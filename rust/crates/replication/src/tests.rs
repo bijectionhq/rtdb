@@ -1245,6 +1245,36 @@ async fn classic_and_v1_writes_share_the_root_and_compare_exact_written_bases() 
 }
 
 #[tokio::test]
+async fn classic_source_cannot_write_a_canonically_labelled_relation() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_tx::transact::{Declaration, Op, Outcome, Visibility};
+    use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};
+
+    let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), NativeServingAuthority {
+        incarnation: [7; 16], checkpoints: None,
+    }, false).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let driver = tokio::spawn(fixture.driver.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let table = TableRef::new("public", "docs");
+        let mut declare = serving_source_put(1);
+        declare.ops = vec![Op::Declare { table: table.clone(), change: Declaration::Visibility(Visibility { column: "label".into() }) }];
+        let declared = serving.transact(declare, VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        assert_eq!(declared.outcome, Outcome::Then);
+        let source = submit_recovery_row(&fixture.handle, &fixture.memory, 41, 100).await;
+        let result = fixture.handle.await_tx(TxId(source.0), &cancellation).await.unwrap().unwrap();
+        assert_eq!(result.error().map(|error| error.code.as_str()), Some("rtdb/protected-relation"));
+        let index = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+        let branch = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+        assert!(branch.row(&table, &EntityId::Integer(41), Timestamp(0)).is_none());
+        assert!(fixture.handle.serving_partition().unwrap().iter_segments(&table).all(|segment| segment.row_count() == 0));
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn queued_classic_sql_resolves_against_the_preceding_v1_write() {
     use rtdb_crypt::tokens::VerifiedClaims;
     use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};

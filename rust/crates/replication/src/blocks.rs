@@ -45,19 +45,26 @@ impl RecoveredPartition {
     pub fn apply_archived_transaction(
         &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
-        self.apply_archive(message, memory, rtdb_tx::decode_replica)
+        self.apply_archived_transaction_with(message, memory, |_| Ok(()))
+    }
+
+    pub(crate) fn apply_archived_transaction_with(
+        &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>, observe: impl FnOnce(&rtdb_index::StagedWrite) -> Result<()>,
+    ) -> Result<()> {
+        self.apply_archive(message, memory, rtdb_tx::decode_replica, observe)
     }
 
     /// Apply a business projection authenticated by a held-world manifest.
     pub fn apply_held_transaction(
         &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
-        self.apply_archive(message, memory, rtdb_tx::decode_held_replica)
+        self.apply_archive(message, memory, rtdb_tx::decode_held_replica, |_| Ok(()))
     }
 
     fn apply_archive(
         &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>,
         decode: impl FnOnce(&proto::ResolvedTx, Option<rtdb_types::TransactionKey>, BlockIndex, &Arc<MemoryBudget>) -> Result<rtdb_tx::ReplayedTransaction>,
+        observe: impl FnOnce(&rtdb_index::StagedWrite) -> Result<()>,
     ) -> Result<()> {
         let source = message.src_msg_id.map(SourcePosition).ok_or_else(|| invalid("Archived transaction has no source position"))?;
         if message.db_op.is_some() || message.external_source_token.is_some() || source <= self.progress.source_position {
@@ -73,6 +80,7 @@ impl RecoveredPartition {
             return Err(invalid("Archived transaction regressed its basis"));
         }
         self.partition.apply(&writes)?;
+        observe(&writes)?;
         self.progress.source_position = source;
         self.progress.tx_key = Some(result.tx_key());
         self.progress.latest_result = None;
@@ -556,6 +564,7 @@ impl BlockStore {
     pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
 
     pub(crate) fn object_store(&self) -> &dyn ObjectStore { self.store.as_ref() }
+    pub(crate) fn storage(&self) -> &Arc<BufferPool> { &self.cache }
 
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
         IoRegion::reading_recovery(self.store.as_ref(), async {

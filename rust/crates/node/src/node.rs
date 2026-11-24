@@ -743,13 +743,14 @@ impl Node {
             let store = database.object_store().open_log_snapshot(owner).await?;
             let storage = Arc::new(BufferPool::with_budget(Arc::clone(&store), Arc::clone(database.storage.budget())));
             let blocks = rtdb_replication::BlockStore::new(Arc::clone(&store),
-                storage, Arc::clone(self.memory()), self.factory.options.file_size_target)?;
+                Arc::clone(&storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
             let mut recovered = match checkpoint {
                 Some(checkpoint) => cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
                     database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
                     .await.ok_or_else(cancelled)??,
                 None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
             };
+            let replay = replay.with_serving(database.native_serving_authority.clone(), storage);
             recovered.replay_sql_erasure(&database.logs, replay, store, cancellation).await
         }).await
     }
@@ -780,6 +781,7 @@ impl Node {
                     .await.ok_or_else(cancelled)??,
                 None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
             };
+            let replay = replay.with_serving(database.native_serving_authority.clone(), Arc::clone(&storage));
             let suffix = recovered.replay_snapshot_suffix(&database.logs, replay, cancellation).await?;
             recovered.partition.publish_catalog_cut(cut)?;
             let snapshot = recovered.partition.snapshot();

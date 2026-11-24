@@ -603,6 +603,12 @@ async fn replay(
     let first = logs.decode_replica(first)?.ok_or_else(|| invalid("The trusted base has an unknown replica record"))?;
     require_boundary(&first, base)?;
     drop(first);
+    if base.as_proto().serving_checkpoint_object.is_some() || target.as_proto().serving_checkpoint_object.is_some() {
+        return Err(unavailable("Offline mixed replay needs the original sealed serving checkpoint authority"));
+    }
+    let authority = crate::serving::retained::checkpoint_incarnation(target)?
+        .map(|incarnation| crate::NativeServingAuthority { incarnation, checkpoints: None });
+    let mut serving = crate::serving::retained::open(authority, Some(base), repair.partition.snapshot(), blocks.storage(), memory, cancellation).await?;
     let mut previous = base.clone();
     while let Some(raw) = cancellation.run_until_cancelled(range.next(ReadReservation::new(bound, memory.reserve(bound)?)))
         .await.ok_or_else(interrupted)??
@@ -622,12 +628,17 @@ async fn replay(
                 if message.table_data.keys().any(|name| rtdb_types::TableRef::is_owned_lifetime_replica_table(name)) {
                     return Err(unavailable("Offline replay cannot apply a placed lifetime floor"));
                 }
-                repair.apply_archived_transaction(message, memory)?;
+                repair.apply_archived_transaction_with(message, memory, |write| {
+                    if let Some(serving) = &mut serving { serving.observe_classic(write, position, memory)?; }
+                    Ok(())
+                })?;
             }
             ReplicaBody::BlockBoundary(message) => {
                 let index = BlockIndex(message.block_index.ok_or_else(|| invalid("A replay boundary has no block index"))?);
                 if installed.table_catalog().block_index().is_some_and(|prior| index <= prior) { continue; }
-                if index != installed.live().block_index() || message.external_source_token.is_some() {
+                if index != installed.live().block_index() || message.external_source_token.is_some()
+                    || serving.as_ref().is_some_and(crate::serving::NativeServing::holds_checkpoint)
+                {
                     return Err(invalid("The replica journal has a discontinuous or external-source block boundary"));
                 }
                 let source = message.latest_processed_msg_id.map(SourcePosition)
@@ -637,7 +648,8 @@ async fn replay(
                 if position == through && installed.live().latest_completed_tx() != target.latest_completed_tx() {
                     return Err(invalid("The replayed transaction head differs from the target checkpoint"));
                 }
-                let output = blocks.produce_cancellable(&prepared, &record, Default::default(), cancellation).await?;
+                let serving_checkpoint = serving.as_mut().map(|serving| serving.checkpoint(record.envelope.term, false)).transpose()?;
+                let output = blocks.produce_with_search(&prepared, &record, Default::default(), cancellation, None, serving_checkpoint).await?;
                 if position == through && output.catalog.table_entries()? != target.table_entries()? {
                     return Err(invalid("The rebuilt table registry differs from the target checkpoint"));
                 }
@@ -654,7 +666,24 @@ async fn replay(
                 let tables = message.table_names.iter().map(|name| legacy_table_ref(name)).collect::<Result<Vec<_>>>()?;
                 repair.partition.retire_tables(tables, Timestamp(message.as_of_micros.unwrap_or_default()));
             }
-            ReplicaBody::NoOp(message) => crate::serving::require_physical_replay_support(message)?,
+            ReplicaBody::NoOp(message) if message.serving_record.is_some() => {
+                if message.placed_slot_reservation.is_some() { return Err(invalid("Serving repair crossed a placed receiver slot")); }
+                if let Some(applied) = crate::serving::retained::apply(serving.as_mut(), message, repair.partition.snapshot(),
+                    repair.progress.source_position, position, record.envelope.term, memory)?
+                {
+                    if let Some((write, _)) = applied.write {
+                        repair.partition.apply(&write)?;
+                        repair.progress.tx_key = Some(write.tx_key());
+                        repair.progress.latest_result = None;
+                    }
+                    repair.progress.source_position = applied.source;
+                }
+            }
+            ReplicaBody::NoOp(message) => {
+                if let Some(source) = message.src_msg_id.map(SourcePosition) {
+                    repair.progress.source_position = repair.progress.source_position.max(source);
+                }
+            }
             ReplicaBody::BlockUploaded(_) | ReplicaBody::TriesAdded(_)
             | ReplicaBody::TriesDeleted(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
             ReplicaBody::OversizedMessage(_) => return Err(invalid("The source journal has an unresolved oversized record")),

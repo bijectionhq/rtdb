@@ -596,10 +596,11 @@ impl ReplicationDriver {
         };
         let store = Arc::clone(self.resolve.storage.object_store());
         let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_ref(), collect_checkpoints)?;
+        if let Some(block) = &block { serving.verify_checkpoint_prefix(block)?; }
         serving.recover_classic(self.partition.snapshot(), block.as_ref().and_then(|block| block.boundary_replica_position()),
             &self.resolve.storage, &self.resolve.memory, &self.cancellation,
             self.resolve.owned_witness_scope.is_none() && !self.config.external_source,
-            checkpoint.as_ref().is_some_and(|image| NativeServing::is_shared_checkpoint(image.bytes())),
+            checkpoint.as_ref().is_some_and(NativeServing::is_shared_checkpoint),
         ).await?;
         if let Some(block) = &block {
             let selected = default_erasure::recover_rewrite(&authority, &self.blocks, &self.logs, block,
@@ -614,6 +615,7 @@ impl ReplicationDriver {
     }
 
     async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>, replica: ReplicaPosition) -> Result<()> {
+        if let Some(serving) = &self.serving { serving.require_classic_effects(write)?; }
         self.install_classic_transaction(write, search_delta).await?;
         if let Some(serving) = &mut self.serving { serving.observe_classic(write, replica, &self.resolve.memory)?; }
         Ok(())
@@ -1535,9 +1537,9 @@ impl ReplicationDriver {
                         let mut first_erasure = None;
                         let mut captured_erasure = None;
                         let logs = &self.logs;
-                        let ready = serving.apply(message, own, |source, receipt, prior, effects| {
-                            let key = TransactionKey { tx_id: TxId(source.0), system_time: receipt.system_time };
-                            let write = serving::classic::stage_main(partition.snapshot(), prior, key, effects, memory)?;
+                        let ready = serving.apply_ordered(message, own, Some((record.metadata.position, record.envelope.term)), |source, receipt, prior, effects| {
+                            let write = serving::classic::stage_source(partition.snapshot(), prior, source, receipt, effects, memory)?;
+                            let key = write.tx_key();
                             let result = match &receipt.outcome {
                                 ServingOutcome::Refused { error } => TransactionResult::Aborted { tx_key: key,
                                     error: Some(rtdb_tx::RetainedAnomaly::new(error.clone(), memory)?) },
@@ -1546,7 +1548,7 @@ impl ReplicationDriver {
                             first_erasure = first_write_erasure(record.metadata.position, &write)?;
                             if receipt.erasure == Some(Erasure::Pending) {
                                 captured_erasure = Some(AppliedErasure::capture(ErasureCut {
-                                    basis: receipt.basis, source, replica: record.metadata.position,
+                                    basis: receipt.basis, source, replica: record.metadata.position, term: record.envelope.term,
                                 }, &write, logs)?);
                             }
                             partition.apply(&write)?;
@@ -1555,7 +1557,11 @@ impl ReplicationDriver {
                         })?;
                         if self.track_catalog_cut && self.first_erasure.is_none() { self.first_erasure = first_erasure; }
                         if let Some(captured) = captured_erasure {
-                            if self.default_erasure.is_some() { return Err(default_erasure::invalid()); }
+                            if self.default_erasure.is_some()
+                                || serving.pending_erasure_installation() != Some(captured.cut.installation())
+                            {
+                                return Err(default_erasure::invalid());
+                            }
                             self.default_erasure = Some(DefaultErasure::Applied(captured));
                         }
                         if let Some((source, reply)) = ready {
@@ -2007,6 +2013,7 @@ impl ReplicationDriver {
 
     fn begin_source_resolution(&mut self, source: SourceInput) -> Result<()> {
         let durable = self.partition.snapshot();
+        let classic_authority = self.serving.as_ref().map(|serving| serving.classic_write_authority().clone());
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
         let context = Arc::clone(&self.resolve);
@@ -2025,8 +2032,8 @@ impl ReplicationDriver {
                         Ok::<_, Anomaly>(())
                     }.await;
                     match prepared {
-                        Ok(_) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
-                            Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes })).await,
+                        Ok(_) => resolver.resolve_source_with_authority(durable, position, log_time, request, &context,
+                            Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes }), classic_authority.as_ref()).await,
                         Err(error) if error.is_caller_error() => resolver.resolve_source_abort(
                             durable, position, log_time, reservation.map(|slot| slot.attempt), &context, error, false,
                         ).await,

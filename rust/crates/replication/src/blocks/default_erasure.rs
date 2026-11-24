@@ -126,6 +126,8 @@ impl BlockStore {
                 if evidence.cut.basis != cut.basis
                     || evidence.cut.source != cut.installed.source
                     || evidence.cut.replica != cut.installed.replica
+                    || evidence.cut.term > catalog.boundary_term()
+                    || fold.pending_erasure_installation() != Some(evidence.cut.installation())
                     || evidence.boundary != checkpoint.boundary
                     || crate::default_erasure::members_sha256(
                         self,
@@ -401,6 +403,32 @@ mod tests {
                 ..Default::default()
             }),
         )?;
+        use crate::default_erasure::{ErasureCut, RewriteEvidence};
+        let evidence = RewriteEvidence {
+            cut: ErasureCut {
+                basis: cut.basis,
+                source,
+                replica: cut.installed.replica,
+                term: Term(1),
+            },
+            boundary: boundary.metadata.position,
+            members_sha256: [1; 32],
+        };
+        let prefix = &image[..41];
+        let without_witness = evidence.frame(prefix, &fold.encode_checkpoint()?)?;
+        assert!(decode_checkpoint_image(&without_witness, incarnation).is_err());
+        fold.install_receipt_position(None, &receipt, evidence.cut.installation().1)?;
+        let state = fold.encode_checkpoint()?;
+        let authenticated = evidence.frame(prefix, &state)?;
+        assert!(decode_checkpoint_image(&authenticated, incarnation).is_ok());
+        let wrong_term = RewriteEvidence {
+            cut: ErasureCut {
+                term: Term(2),
+                ..evidence.cut
+            },
+            ..evidence
+        };
+        assert!(decode_checkpoint_image(&wrong_term.frame(prefix, &state)?, incarnation).is_err());
         let prepared = WriterObjects::new(database, 1)
             .file(kms.as_ref(), generation.number, &image)
             .await?;

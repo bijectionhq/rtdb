@@ -9,8 +9,8 @@ pub use rtdb_index::branches::{
     CustodyPlacementId, CustodyTarget, GroupedCount, IndexDefinition, Visibility,
 };
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
-    TimeUnit, Timestamp, Value,
+    Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
+    Term, TimeUnit, Timestamp, Value,
     rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, valid_branch_name},
 };
 use serde::{Deserialize, Serialize, Serializer};
@@ -82,7 +82,7 @@ impl Transact {
         self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::Erase { .. }))
     }
 
-    fn is_response_release(&self) -> bool {
+    pub fn is_response_release(&self) -> bool {
         matches!(self.ops.as_slice(), [Op::CustodyRelease(_)])
             && self.otherwise.is_empty() && self.guards.is_empty()
             && matches!(self.requires.as_slice(),
@@ -414,6 +414,8 @@ impl ResolvedTransact {
 
     pub fn effects(&self) -> &[BranchEffect] { &self.effects }
 
+    pub fn receipt_namespace(&self) -> Option<[u8; 32]> { self.receipt_namespace }
+
     fn validate_admission(&self) -> Result<()> {
         #[derive(Deserialize)]
         struct AdmissionFields {
@@ -450,6 +452,15 @@ pub(crate) struct StoredReceipt {
     fingerprint: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt_namespace: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed: Option<InstalledReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledReceipt {
+    pub source: SourcePosition,
+    pub replica: ReplicaPosition,
+    pub term: Term,
 }
 
 /// Durable receipts by receipt namespace, then idempotency key.
@@ -494,6 +505,35 @@ impl TransactState {
         self.pending.as_ref().map(|pending| pending.tx.effects())
     }
 
+    pub fn pending_receipt_namespace(&self) -> Option<[u8; 32]> {
+        self.pending.as_ref().and_then(|pending| pending.tx.receipt_namespace())
+    }
+
+    pub fn has_receipts(&self) -> bool { !self.receipts.is_empty() }
+
+    pub fn install_receipt_position(&mut self, namespace: Option<[u8; 32]>, receipt: &Receipt, position: InstalledReceipt) -> Result<()> {
+        let stored = self.receipts.get_mut(&namespace).and_then(|receipts| receipts.get_mut(&receipt.key)).ok_or_else(invalid_record)?;
+        if stored.receipt != *receipt || stored.installed.is_some() { return Err(invalid_record()); }
+        stored.installed = Some(position);
+        Ok(())
+    }
+
+    pub fn installed_receipt(&self, namespace: Option<[u8; 32]>, key: &[u8], basis: Basis) -> Option<InstalledReceipt> {
+        let receipt = self.receipts.get(&namespace)?.get(key)?;
+        (receipt.receipt.basis == basis).then_some(receipt.installed).flatten()
+    }
+
+    pub fn validate_installed_receipts(&self, source: Option<SourcePosition>, replica: Option<ReplicaPosition>, term: Term) -> Result<()> {
+        for position in self.receipts.values().flat_map(|receipts| receipts.values()).filter_map(|receipt| receipt.installed) {
+            if source.is_none_or(|source| position.source > source) || replica.is_none_or(|replica| position.replica > replica)
+                || position.term > term || position.source.0 < 0 || position.replica.0 < 0
+            {
+                return Err(invalid_record());
+            }
+        }
+        Ok(())
+    }
+
     /// A checkpoint can replace the settled prefix once the mode installs its manifest.
     pub fn encode_checkpoint(&self) -> Result<Bytes> {
         if self.pending.is_some() { return Err(pending_error()); }
@@ -515,6 +555,7 @@ impl TransactState {
         self.index.restore_in(incarnation)?;
         for stored in self.receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
             stored.receipt.basis = Basis::new(incarnation, stored.receipt.basis.position());
+            stored.installed = None;
         }
         Ok(())
     }
@@ -559,6 +600,12 @@ impl TransactState {
     pub fn pending_erasure(&self) -> Option<Basis> {
         let key = self.pending_erasure.as_ref()?;
         self.receipts.get(&key.namespace)?.get(&key.key).map(|stored| stored.receipt.basis)
+    }
+
+    pub fn pending_erasure_installation(&self) -> Option<(Basis, InstalledReceipt)> {
+        let key = self.pending_erasure.as_ref()?;
+        let stored = self.receipts.get(&key.namespace)?.get(&key.key)?;
+        Some((stored.receipt.basis, stored.installed?))
     }
 
     pub fn arm_erasure(&mut self, basis: Basis, unreadable_by: Timestamp) -> Result<()> {
@@ -877,7 +924,7 @@ impl TransactState {
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects { candidate.apply(effect)?; }
         self.index = candidate;
-        let previous = self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace });
+        let previous = self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None });
         debug_assert!(previous.is_none());
         Ok(receipt)
     }

@@ -1410,6 +1410,8 @@ impl TransactionBuffer {
     /// The snapshot the transaction started from, without its own writes, for a statement that reads no table.
     pub fn base_snapshot(&self) -> Snapshot { self.base.clone() }
     pub fn has_pending_table(&self, table: &TableRef) -> bool { self.tables.contains_key(table) }
+
+    pub fn pending_tables(&self) -> impl Iterator<Item = &TableRef> { self.tables.keys() }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
         for (table, pending) in &self.tables {

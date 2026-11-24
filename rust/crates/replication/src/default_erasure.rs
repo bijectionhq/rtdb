@@ -4,8 +4,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rtdb_format::{catalog::BlockCatalog, envelope::ReplicaBody, keys::block_key, log::proto};
 use rtdb_index::{BlockPreparation, StagedWrite};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
+use rtdb_tx::transact::InstalledReceipt;
 use rtdb_types::{
-    Anomaly, CatalogCut, ReplicaPosition, Result, SourcePosition, Timestamp, rtdb_v1::Basis,
+    Anomaly, CatalogCut, ReplicaPosition, Result, SourcePosition, Term, Timestamp, rtdb_v1::Basis,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,6 +36,20 @@ pub(crate) struct ErasureCut {
     pub basis: Basis,
     pub source: SourcePosition,
     pub replica: ReplicaPosition,
+    pub term: Term,
+}
+
+impl ErasureCut {
+    pub fn installation(self) -> (Basis, InstalledReceipt) {
+        (
+            self.basis,
+            InstalledReceipt {
+                source: self.source,
+                replica: self.replica,
+                term: self.term,
+            },
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -260,7 +275,7 @@ pub(crate) async fn recover_rewrite(
     let (fold, position, shared) =
         serving::decode_checkpoint_image(image.bytes(), authority.incarnation)?;
     if !shared
-        || fold.pending_erasure() != Some(evidence.cut.basis)
+        || fold.pending_erasure_installation() != Some(evidence.cut.installation())
         || position != evidence.cut.basis.position()
     {
         return Err(invalid());
@@ -288,7 +303,8 @@ impl SelectedRewrite {
         logs: &PartitionLogs,
     ) -> Result<Self> {
         if catalog.boundary_replica_position() != Some(evidence.boundary)
-            || catalog.as_proto().latest_processed_msg_id != Some(evidence.cut.source.0)
+            || catalog.latest_source_position() != Some(evidence.cut.source)
+            || evidence.cut.term > catalog.boundary_term()
             || evidence.cut.source.after_offset(logs.source_epoch) < 0
             || evidence.cut.replica.after_offset(logs.replica_epoch) < 0
             || evidence.boundary.after_offset(logs.replica_epoch)

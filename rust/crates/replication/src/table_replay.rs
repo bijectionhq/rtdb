@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use rtdb_format::{catalog::BlockCatalog, data::EventBatch, envelope::ReplicaBody};
-use rtdb_index::LiveTable;
+use rtdb_index::{LiveIndex, LiveTable, Snapshot, TableCatalog, TrieCatalog};
 use rtdb_storage::{log::LogRange, object_store::ReadReservation};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TransactionKey};
 use tokio_util::sync::CancellationToken;
 
-use crate::{PartitionLogs, TermFence, blocks::matches_catalog_boundary, repair_decision::exclusive_replay_end};
+use crate::{PartitionLogs, TermFence, blocks::matches_catalog_boundary, repair_decision::exclusive_replay_end,
+    serving::{NativeServing, retained}};
 
 pub struct RetainedTableReplay<'a> {
     logs: &'a PartitionLogs,
@@ -17,7 +20,9 @@ pub struct RetainedTableReplay<'a> {
     block: BlockIndex,
     source: SourcePosition,
     latest_tx: Option<TransactionKey>,
+    serving: Option<NativeServing>,
     awaiting_upload: Option<BlockIndex>,
+    last_boundary: Option<ReplicaPosition>,
     finished: bool,
 }
 
@@ -34,6 +39,7 @@ impl<'a> RetainedTableReplay<'a> {
         };
         let end = exclusive_replay_end(through.0).map(ReplicaPosition).ok_or_else(|| invalid("The replay boundary overflows"))?;
         let start = ReplicaPosition::from_epoch_offset(logs.replica_epoch, 0)?;
+        let serving = retained::checkpoint_incarnation(target)?.map(|incarnation| retained::genesis(incarnation, logs.store())).transpose()?;
         Ok(Some(Self {
             logs, target, table, through,
             range: logs.replica_range(start, end).await?,
@@ -41,7 +47,9 @@ impl<'a> RetainedTableReplay<'a> {
             block: BlockIndex(0),
             source: logs.source_floor()?,
             latest_tx: None,
+            serving,
             awaiting_upload: None,
+            last_boundary: None,
             finished: false,
         }))
     }
@@ -87,6 +95,7 @@ impl<'a> RetainedTableReplay<'a> {
                     if let Some(write) = transaction.writes.tables().get(self.table) {
                         live = live.append(write, key.system_time)?;
                     }
+                    if let Some(serving) = &mut self.serving { serving.observe_classic(&transaction.writes, record.metadata.position, memory)?; }
                     self.source = source;
                     self.latest_tx = Some(key);
                 }
@@ -96,6 +105,7 @@ impl<'a> RetainedTableReplay<'a> {
                     let source = boundary.latest_processed_msg_id.map(SourcePosition).filter(|source| *source >= self.source)
                         .ok_or_else(|| invalid("The boundary does not cover the retained source prefix"))?;
                     if self.awaiting_upload.is_some() || boundary.external_source_token.is_some()
+                        || self.serving.as_ref().is_some_and(NativeServing::holds_checkpoint)
                         || block != self.block || block > self.target.block_index()
                         || terminal != (block == self.target.block_index())
                         || (terminal && self.latest_tx != self.target.latest_completed_tx())
@@ -105,6 +115,7 @@ impl<'a> RetainedTableReplay<'a> {
                     self.source = source;
                     self.finished = terminal;
                     self.awaiting_upload = (!terminal).then_some(block);
+                    self.last_boundary = Some(record.metadata.position);
                     self.block = BlockIndex(block.0.checked_add(1).ok_or_else(|| invalid("The replay block index overflows"))?);
                     if live.row_count() > 0 {
                         let pages = live.block_pages(memory)?;
@@ -125,7 +136,27 @@ impl<'a> RetainedTableReplay<'a> {
                         self.awaiting_upload = None;
                     }
                 }
-                ReplicaBody::NoOp(message) => crate::serving::require_physical_replay_support(message)?,
+                ReplicaBody::NoOp(message) if message.serving_record.is_some() => {
+                    if let (Some(serving), Some(boundary), Some(latest)) = (&mut self.serving, self.last_boundary, self.latest_tx) {
+                        if self.awaiting_upload.is_some() { return Err(invalid("A serving record preceded the checkpoint upload")); }
+                        serving.replay_classic_anchor(message, boundary, latest.system_time)?;
+                    }
+                    let snapshot = Snapshot::new(Arc::new(TrieCatalog::new(100_000_000)?), Arc::new(TableCatalog::load(None, &Default::default())?),
+                        Arc::new(LiveIndex::new(self.block, self.latest_tx, TrieConfig::default())));
+                    if let Some(applied) = retained::apply(self.serving.as_mut(), message, snapshot, self.source,
+                        record.metadata.position, record.envelope.term, memory)?
+                    {
+                        if let Some((write, _)) = applied.write {
+                            let key = write.tx_key();
+                            if let Some(write) = write.tables().get(self.table) { live = live.append(write, key.system_time)?; }
+                            self.latest_tx = Some(key);
+                        }
+                        self.source = applied.source;
+                    }
+                }
+                ReplicaBody::NoOp(message) => {
+                    if let Some(source) = message.src_msg_id.map(SourcePosition) { self.source = self.source.max(source); }
+                }
                 ReplicaBody::TriesAdded(_)
                 | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("An oversized replica record was not resolved")),
