@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
 use crate::lease::MemberLease;
-use crate::hosted_recovery::{ReplicaTrimPlan, advance_body_fence, replay_start};
+use crate::hosted_recovery::{ReplicaTrimPlan, advance_body_fence, capture_replay_start};
 use crate::journal::hosted::checkpoint_for_block;
 
 enum SuffixCut<'a> {
@@ -928,7 +928,7 @@ impl NodeAgent {
             let checkpoint = archived.checkpoint;
             if checkpoint.boundary < 0 || cutoff.time().0 <= checkpoint.system_time
                 || record.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != record.incarnation)
-                || replay_start(record, checkpoint.boundary).is_err()
+                || capture_replay_start(record, archived).is_err()
             {
                 return Err(unavailable());
             }

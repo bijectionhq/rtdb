@@ -160,7 +160,7 @@ async fn copy_fork_suffix(
             && base.log_epoch == source.log_epoch && base.checkpoint.system_time < cut.basis().0
             && restore_binding.is_none_or(|binding| base.world_replay == Some(binding))
             && require_capture_open(source, **capture).is_ok()
-            && crate::hosted_recovery::replay_start(source, base.checkpoint.boundary).is_ok()
+            && crate::hosted_recovery::capture_replay_start(source, base).is_ok()
     }).max_by_key(|(_, base)| base.checkpoint.boundary)
         .map(|(capture, _)| *capture).ok_or_else(OwnedWorld::unavailable)?;
 
@@ -175,7 +175,7 @@ async fn copy_fork_suffix(
                     current.incarnation == source.incarnation && current.log_epoch == source.log_epoch
                         && source.checkpoint_captures.get(&capture) == Some(*selected)
                 }).ok_or_else(OwnedWorld::unavailable)?;
-            Ok(Some(crate::hosted_recovery::replay_start(current, selected.checkpoint.boundary)?))
+            Ok(Some(crate::hosted_recovery::capture_replay_start(current, selected)?))
         },
         |current, region, io| async move {
             let (point, manifest) = capture_receipt(&current, archive, deployment, capture)?

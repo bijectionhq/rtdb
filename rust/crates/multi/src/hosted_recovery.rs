@@ -17,6 +17,16 @@ pub(crate) fn journal_replay_start(record: &DeploymentRecord, after: i64) -> rtd
     first_after(after, anchor_end(record.replica_anchor.as_deref())?)
 }
 
+pub(crate) fn capture_replay_start(record: &DeploymentRecord, capture: &rtdb_directory::CheckpointCapture) -> rtdb_storage::Result<i64> {
+    if capture.world_replay.is_some() && capture.incarnation == record.incarnation && capture.log_epoch == record.log_epoch {
+        // This capture already holds the source range for a writable
+        // recovery. An ordinary archive may open only new eligible replay.
+        journal_replay_start(record, capture.checkpoint.boundary)
+    } else {
+        replay_start(record, capture.checkpoint.boundary)
+    }
+}
+
 pub(crate) fn replay_admission_floor(record: &DeploymentRecord) -> rtdb_storage::Result<i64> {
     Ok(anchor_end(record.replica_anchor.as_deref())?.max(anchor_end(body_anchor(record))?))
 }
