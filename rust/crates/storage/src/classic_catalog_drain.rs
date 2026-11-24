@@ -111,8 +111,13 @@ mod tests {
         let admitted_io = Arc::clone(&registered);
         drop(registered);
         assert!(!CatalogReadWitness::drained(vault.path(), ticket, identity).unwrap());
+        let foreign = tempfile::tempdir().unwrap();
+        let unrelated = CatalogReadWitness::reserve(foreign.path(), ticket).unwrap().unwrap();
+        drop(unrelated);
+        assert!(!CatalogReadWitness::drained(foreign.path(), ticket, identity).unwrap());
         drop(admitted_io);
         assert!(CatalogReadWitness::drained(vault.path(), ticket, identity).unwrap());
+        assert!(!CatalogReadWitness::drained(foreign.path(), ticket, identity).unwrap());
         assert!(!CatalogReadWitness::drained(vault.path(), Uuid::new_v4(), identity).unwrap());
     }
 }
