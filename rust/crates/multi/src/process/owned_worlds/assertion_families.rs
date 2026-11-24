@@ -40,7 +40,8 @@ impl Scope {
             if let Some(first) = replay_worlds.next() {
                 let current = session.current_assertion_family_read(self.deployment).await?;
                 for row in std::iter::once(first).chain(replay_worlds) {
-                    let world = row.world.ok_or_else(|| scope_mismatch("Proposal replay has no authoring world"))?;
+                    let world = row.world.ok_or_else(|| scope_mismatch("A private family artifact has no authoring line"))?;
+                    if world.as_bytes() == &self.root_line { continue; }
                     if current.world_registration(Iid(*world.as_bytes())).await?.is_none_or(|record|
                         record.dropped || !matches!(record.mode, WorldClockMode::Proposal))
                     {
@@ -267,8 +268,18 @@ pub(super) async fn serve(
             FamilyReply::Done
         }
         FamilyRequest::RegisterDerived { family, rows } => {
+            let family_vault = scope.family(family);
             let rows = rows.into_iter().map(|row| scope.derived(family, row)).collect::<Result<Vec<_>>>()?;
-            families.register_derived(scope.family(family), &rows).await?;
+            for row in rows.iter().filter(|row| row.world.is_some_and(|world| world.as_bytes() == &scope.root_line)) {
+                if row.relation != DerivedRow::PROPOSAL_REPLAY_RELATION {
+                    return Err(scope_mismatch("The Root line admits only private family receipt artifacts"));
+                }
+                let member = families.resolve_member(family_vault, row.member).await?;
+                if member.position.line_generation != scope.root_line {
+                    return Err(scope_mismatch("A Root receipt requires an active Root landing"));
+                }
+            }
+            families.register_derived(family_vault, &rows).await?;
             FamilyReply::Done
         }
         FamilyRequest::SealWorldRow { row, plaintext } => {

@@ -160,6 +160,16 @@ All hex is lowercase, including the canonical AddressRef. The full selector fits
 RTDB checks the selector's family and member against the request. Root entries are deduplicated by relation and physical selector.
 A refused or interrupted reservation may retain its inventory entry. Its selector is disjoint from every ordinary Root projection at that address.
 A world slot can enrol multiple fresh stages for the same member across rewrites.
+A retained Root execution outcome may use a separately enrolled stage on the installed Root line.
+For that artifact the `world` field names the original installed Root line, the member is an active landing on that line, the relation is `bj_fact_root_admission`, and the key is a 64-character lowercase hex commitment to the receipt and its disclosure.
+The Root line is a sealing scope for this private artifact. A Root search projection uses its distinct physical selector and carries no stage.
+The existing family envelope actions and the derived-stage response hold bind the same receipt artifact slot.
+The retained outcome keeps its existing Root unit seal, and recall requires the original Root unit fence and the exact live family member.
+The installed Root line, family vault and receipt must remain reachable.
+The admitted output route covers a registered result with one exact landed Root point as its protected input.
+A successor archive copy needs a durable route authenticated to the Original deployment, incarnation, ordered journal position and current family authority.
+A frozen capture proves the historical assertion and bytes. Recall through a new deployment also needs access to the Original ordered marker and release owner through any source retirement.
+Successor replay of a family carrier refuses until that route is available.
 An exact retry succeeds and conflicting reuse of a stage or slot is refused.
 A family holds at most 2048 derived entries; the next registration is refused with `rtdb.multi/assertion-family-size`.
 
