@@ -921,6 +921,11 @@ pub fn stream_allocation_bound(bytes: &[u8]) -> Result<usize> {
     stream_bound(bytes, false, row_descriptors)
 }
 
+/// Checks a complete, bounded IPC stream before decoding it one batch at a time.
+pub fn validate_complete_stream(bytes: &[u8]) -> Result<()> {
+    stream_bound(bytes, true, arrow_descriptors).map(drop)
+}
+
 fn stream_bound(bytes: &[u8], terminated: bool, field_bound: fn(usize) -> Result<usize>) -> Result<usize> {
     let mut position = 0;
     let mut bound = 8192;

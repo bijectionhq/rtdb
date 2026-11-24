@@ -1,6 +1,6 @@
 //! Scan fragments: a scan of one table split by trie prefix, so that another node can read a slice of the table at the
 //! query's basis and send back the rows it resolves, in place of this node reading those tries itself.
-use std::{io::{self, Write}, ops::Range};
+use std::{io::{self, Cursor, Write}, ops::Range};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -435,9 +435,17 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
 
 /// The batches `encode_batch` wrote into `bytes`, each charged to `memory` for what it retains.
 pub(crate) fn decode_batches(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Vec<ColumnBatch>> {
+    match decode_fragment_frames(bytes.clone(), memory, true) {
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+            decode_fragment_frames(bytes, memory, false)
+        }
+        result => result,
+    }
+}
+
+fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: bool) -> Result<Vec<ColumnBatch>> {
     let malformed = |message: &str| invalid("fragment-decode", message);
     let mut batches = Vec::new();
-    let mut rest = bytes;
     while !rest.is_empty() {
         let (length, tail) = rest.as_slice().split_first_chunk::<8>()
             .ok_or_else(|| malformed("A fragment frame is truncated"))?;
@@ -445,32 +453,47 @@ pub(crate) fn decode_batches(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Resul
         if tail.len() < length { return Err(malformed("A fragment frame is truncated")); }
         let frame = rest.slice_with_length(8, length);
         rest.advance(8 + length);
-        let stream = rtdb_format::ipc::OwnedStream::read_buffer(frame, memory).map_err(|error| {
-            if error.code == "rtdb.format/invalid-arrow" { invalid("fragment-decode", error) } else { error }
-        })?;
-        for page in stream.pages() {
-            let record = page.batch();
-            let mut reservation = memory.reserve(256)?;
-            let metadata_charge = Arc::get_mut(&mut reservation).expect("A fragment batch owns its reservation");
-            let mut columns = Vec::with_capacity(record.num_columns());
-            for (field, array) in record.schema().fields().iter().zip(record.columns()) {
-                let mut metadata = field.metadata().clone();
-                let kind = metadata.remove(COLUMN_KEY);
-                columns.push(match kind.as_deref() {
-                    Some("arrow") => {
-                        let name = metadata.remove(NAME_KEY).ok_or_else(|| malformed("A fragment column has no name"))?;
-                        let logical = metadata.remove(LOGICAL_KEY).map(|logical| serde_json::from_str::<LogicalType>(&logical)).transpose().map_err(|error| invalid("fragment-decode", error))?;
-                        let field: Arc<ArrowField> = Arc::new(field.as_ref().clone().with_name(name).with_metadata(metadata));
-                        fragment_column(Arc::clone(array), field, logical, memory, metadata_charge)?
-                    }
-                    Some("values") => fragment_column(Arc::clone(array), Arc::clone(field), None, memory, metadata_charge)?,
-                    _ => return Err(malformed("A fragment column has no encoding")),
-                });
+        if retain {
+            let stream = rtdb_format::ipc::OwnedStream::read_buffer(frame, memory).map_err(|error| {
+                if error.code == "rtdb.format/invalid-arrow" { invalid("fragment-decode", error) } else { error }
+            })?;
+            for page in stream.pages() {
+                batches.push(decode_fragment_batch(page.batch(), memory)?);
             }
-            batches.push(ColumnBatch::settled(columns, record.num_rows(), reservation)?);
+        } else {
+            let frame = frame.as_slice();
+            rtdb_format::ipc::validate_complete_stream(frame).map_err(|error| invalid("fragment-decode", error))?;
+            let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(frame), None)
+                .map_err(|error| invalid("fragment-decode", error))?;
+            for record in reader {
+                let record = record.map_err(|error| invalid("fragment-decode", error))?;
+                batches.push(decode_fragment_batch(&record, memory)?);
+            }
         }
     }
     Ok(batches)
+}
+
+fn decode_fragment_batch(record: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
+    let malformed = |message: &str| invalid("fragment-decode", message);
+    let mut reservation = memory.reserve(256)?;
+    let metadata_charge = Arc::get_mut(&mut reservation).expect("A fragment batch owns its reservation");
+    let mut columns = Vec::with_capacity(record.num_columns());
+    for (field, array) in record.schema_ref().fields().iter().zip(record.columns()) {
+        let mut metadata = field.metadata().clone();
+        let kind = metadata.remove(COLUMN_KEY);
+        columns.push(match kind.as_deref() {
+            Some("arrow") => {
+                let name = metadata.remove(NAME_KEY).ok_or_else(|| malformed("A fragment column has no name"))?;
+                let logical = metadata.remove(LOGICAL_KEY).map(|logical| serde_json::from_str::<LogicalType>(&logical)).transpose().map_err(|error| invalid("fragment-decode", error))?;
+                let field = Arc::new(field.as_ref().clone().with_name(name).with_metadata(metadata));
+                fragment_column(Arc::clone(array), field, logical, memory, metadata_charge)?
+            }
+            Some("values") => fragment_column(Arc::clone(array), Arc::clone(field), None, memory, metadata_charge)?,
+            _ => return Err(malformed("A fragment column has no encoding")),
+        });
+    }
+    ColumnBatch::settled(columns, record.num_rows(), reservation)
 }
 
 #[cfg(test)]

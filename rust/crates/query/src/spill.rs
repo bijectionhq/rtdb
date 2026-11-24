@@ -378,8 +378,21 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
 
     let mut writer = spill.create().unwrap();
     writer.write_columns(&batch, &schema, &memory).unwrap();
+    let file = writer.finish().unwrap();
+    let wire_bytes = usize::try_from(spill.retained_bytes()).unwrap();
+    let tight_memory = MemoryBudget::new(wire_bytes + (14 << 10));
+    let mut tight_reader = file.reader(Arc::clone(&tight_memory)).unwrap();
+    let detached = tight_reader.read_columns(1).unwrap().unwrap();
+    for (row, expected) in values.iter().enumerate() {
+        assert_eq!(&detached.columns[0].value(row).unwrap(), expected);
+    }
+    assert!(tight_reader.read_columns(1).unwrap().is_none());
+    drop((tight_reader, detached));
+    assert_eq!(tight_memory.used_bytes(), 0);
+
     let replay_memory = MemoryBudget::new(1 << 23);
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&replay_memory)).unwrap();
+    let mut reader = file.reader(Arc::clone(&replay_memory)).unwrap();
+    drop(file);
     let replayed = reader.read_columns(1).unwrap().unwrap();
     let Column::Selected(selected) = &replayed.columns[0] else { panic!("Expected mixed Arrow fields") };
     let retained = {
