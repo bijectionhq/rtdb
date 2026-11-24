@@ -1322,6 +1322,29 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     let facts = OwnedRelation::new("facts").unwrap();
     let control = OwnedRelation::new("bj_control").unwrap();
     let table = rtdb_types::TableRef::new("public", control.name());
+    let authority = OwnedRelation::new("bj_installation").unwrap();
+    let claim = |writer: &str| TxOp::PutDocs {
+        table: TableRef::new("public", authority.name()),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::Utf8("authority".into())),
+            ("kind".into(), Value::Utf8("hosted".into())),
+            ("incarnation".into(), Value::Binary(vec![7; 16])),
+            ("writer".into(), Value::Utf8(writer.into())),
+        ])], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(0)), valid_to: None,
+    };
+    let authority_check = |stamp: i64, grant: u8| {
+        let mut bytes = [grant; rtdb_tx::HostedAuthority::WIDTH];
+        bytes[..8].copy_from_slice(&stamp.to_be_bytes());
+        bytes[8..24].fill(7);
+        let mut controls = [rtdb_tx::HostedControlWrite::check(
+            authority.clone(), scope, Some(Timestamp(stamp)),
+            StructFields::from([("_id".into(), Value::Utf8("authority".into()))]),
+        ).unwrap()];
+        rtdb_tx::bind_installed_authority(&mut controls, Some(rtdb_tx::HostedAuthority::decode(&bytes).unwrap())).unwrap();
+        let [control] = controls;
+        TxOp::HostedControl(control)
+    };
     let control_row = |n| StructFields::from([
         ("_id".into(), Value::Utf8("head".into())), ("n".into(), Value::I64(n)),
     ]);
@@ -1342,14 +1365,14 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     };
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
-        source(vec![TxOp::PutDocs {
+        source(vec![claim("11111111111111111111111111111111"), TxOp::PutDocs {
             table: table.clone(), documents: Documents::new(vec![control_row(1)], &context.memory).unwrap(),
             valid_from: Some(Timestamp(0)), valid_to: None,
         }]), &context).await.unwrap();
     assert!(initial.result().committed());
     let deadline = || TxOp::owned_deadline(Timestamp(200));
     let stale = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
-        source(vec![deadline(), replacement(99, 2), native_fact()]), &context).await.unwrap();
+        source(vec![deadline(), authority_check(100, 0x11), replacement(99, 2), native_fact()]), &context).await.unwrap();
     assert_eq!(stale.result().error().unwrap().code, "rtdb.hosted/stale-control");
     assert!(!stale.writes().tables().contains_key(&facts.table("owner")));
 
@@ -1358,11 +1381,11 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
         StructFields::from([("_id".into(), Value::Utf8("head".into()))]),
     ).unwrap());
     let verified = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
-        source(vec![deadline(), check(100)]), &context).await.unwrap();
+        source(vec![deadline(), authority_check(100, 0x11), check(100)]), &context).await.unwrap();
     assert!(verified.result().committed(), "{:?}", verified.result().error());
     assert!(!verified.writes().tables().contains_key(&table));
     let changed = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
-        source(vec![deadline(), check(101), native_fact()]), &context).await.unwrap();
+        source(vec![deadline(), authority_check(100, 0x11), check(101), native_fact()]), &context).await.unwrap();
     assert_eq!(changed.result().error().unwrap().code, "rtdb.hosted/stale-control");
     assert!(!changed.writes().tables().contains_key(&facts.table("owner")));
 
@@ -1372,7 +1395,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     };
     apply_staged(&mut resolver);
     let expired = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(4), Timestamp(50),
-        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        source(vec![staging_deadline(), authority_check(100, 0x11), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication {
             clock: &|| Timestamp(199),
             maximum_inline_bytes: Some(1 << 20),
@@ -1393,7 +1416,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
 
     apply_staged(&mut resolver);
     let oversized = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(5), Timestamp(105),
-        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        source(vec![staging_deadline(), authority_check(100, 0x11), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication {
             clock: &|| Timestamp(198),
             maximum_inline_bytes: Some(100),
@@ -1416,7 +1439,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     };
     let refused = staging_only.resolve_source_for_writer(
         state.snapshot(), SourcePosition(6), Timestamp(106),
-        source(vec![physical, replacement(100, 2), native_fact()]), &context,
+        source(vec![physical, authority_check(100, 0x11), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication {
             clock: &|| Timestamp(198),
             maximum_inline_bytes: Some(1 << 20),
@@ -1429,7 +1452,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(refused.staging_clock_upper().is_none());
 
     let accepted = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(6), Timestamp(106),
-        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        source(vec![staging_deadline(), authority_check(100, 0x11), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication {
             clock: &|| Timestamp(198),
             maximum_inline_bytes: Some(1 << 20),
@@ -1451,7 +1474,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(replayed.writes.tables().contains_key(&table));
     assert!(replayed.writes.tables().contains_key(&facts.table("owner")));
     let refused = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
-        source(vec![deadline(), replacement(106, 3), native_fact()]), &context).await.unwrap();
+        source(vec![deadline(), authority_check(100, 0x11), replacement(106, 3), native_fact()]), &context).await.unwrap();
     assert!(!refused.result().committed());
     assert!(!refused.writes().tables().contains_key(&table));
 
@@ -1462,9 +1485,26 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
         }]), &context).await.unwrap();
     assert!(malformed.result().committed());
     let refused_slice = resolver.resolve_source(state.snapshot(), SourcePosition(9), Timestamp(109),
-        source(vec![deadline(), check(108)]), &context).await.unwrap();
+        source(vec![deadline(), authority_check(100, 0x11), check(108)]), &context).await.unwrap();
     assert_eq!(refused_slice.result().error().unwrap().code, "rtdb.hosted/control-scope");
     assert!(!refused_slice.writes().tables().contains_key(&table));
+
+    let replaced = resolver.resolve_source(state.snapshot(), SourcePosition(10), Timestamp(110),
+        source(vec![claim("22222222222222222222222222222222")]), &context).await.unwrap();
+    assert!(replaced.result().committed());
+    for (offset, fence, error) in [
+        (11, None, "rtdb.hosted/authority-required"),
+        (12, Some(authority_check(100, 0x11)), "rtdb.hosted/stale-authority"),
+        (13, Some(authority_check(110, 0x11)), "rtdb.hosted/stale-authority"),
+    ] {
+        let operations = [deadline()].into_iter().chain(fence)
+            .chain([replacement(108, 5), native_fact()]).collect();
+        let refused = resolver.resolve_source(state.snapshot(), SourcePosition(offset), Timestamp(100 + offset),
+            source(operations), &context).await.unwrap();
+        assert_eq!(refused.result().error().unwrap().code, error);
+        assert!(!refused.writes().tables().contains_key(&table));
+        assert!(!refused.writes().tables().contains_key(&facts.table("owner")));
+    }
 }
 
 struct ClocklessRecord;

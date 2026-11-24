@@ -666,7 +666,7 @@ Conditions validate the original archive pin and whole-corpus purge frontiers, p
 `rtdb.owned.RetainReplayedWorld.v5` retains a provisional world on the held restore writer.
 Each Held ancestor carries the original selected publication transaction and the separately protected archive end transaction.
 `rtdb.owned.PreflightHeldWorldAt.v2` and `rtdb.owned.SelectHeldWorldAsOf.v2` return the selected transaction ID, its SQL history time, the logical clock reading, and the world mode.
-`rtdb.owned.PrepareHeldWorldOverlay.v5` and `rtdb.owned.PublishHeldWorldRetention.v4` take that exact publication key on the original hold.
+`rtdb.owned.PrepareHeldWorldOverlay.v5` and `rtdb.owned.PublishHeldWorldRetention.v5` take that exact publication key on the original hold.
 A retained Held fork has two independently certified destination positions, an inherited Root cut and the exact replay of its source Held overlay.
 The reply carries the destination parent media and the optional Held ancestor media with its unchanged source world, pin and logical publication.
 World readmission binds both positions to the same Original replay before the restored world opens.
@@ -696,7 +696,7 @@ The region suffix has the same half-open valid and typed identity bounds as `Rea
 The reply uses the single-relation change shape and can advance its coverage metadata while returning no group.
 The scope and inherited basis are checked by the held world owner.
 
-`rtdb.owned.PublishWorldCut.v1` registers an initial archived cut or moves a retained world to a newer verified Root cut.
+`rtdb.owned.PublishWorldCut.v2` registers an initial archived cut or moves a retained world to a newer verified Root cut.
 The request supplies 16-byte IDs for the original Root hold, world, minted pin, predecessor world hold, capture and suffix. A nil suffix selects the capture itself.
 An initial request uses the world ID as its pin and a nil predecessor. An advance supplies the original retained-world hold and a freshly minted pin.
 Expiry and deadline follow as big-endian i64. An advance supplies Int64 minimum for expiry to inherit the original world's expiry.
@@ -710,7 +710,7 @@ Its source accepts immutable creation only, preserving complete identities after
 One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
 Mode 3 of `rtdb.owned.ReadHeldWorldPoint.v2` reads an ordinary point from the held parent.
 It returns a witness for the original pin and the relation's purge frontier, independent of the world's overlay.
-`rtdb.owned.DecideHosted.v2` can order this evidence with Root writes and hosted controls.
+`rtdb.owned.DecideHosted.v4` can order this evidence with Root writes and hosted controls.
 The request prefixes the hosted commit body with a counted-commit byte (0 or 1), a big-endian u16 hold count, and one section per distinct hold.
 Each section has a 16-byte handle, a big-endian u16 witness count, and 16 bytes per witness nonce.
 The commit admits one to eight holds with up to 128 witnesses each.
@@ -753,7 +753,7 @@ Hosted sweep dispatch still requires the logical replay-retention owner. Archive
 Leading-key, historical, and world ranges and historical or world counts remain unavailable for these relations.
 Other read coordinates and paths refuse this declaration.
 
-`rtdb.owned.DecideWorldCut.v1` orders one initial retained fork alongside a Root publication at the same source position.
+`rtdb.owned.DecideWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
 Its Root section starts with a flags byte for final count conditions and a refusal alternative.
 Optional count conditions precede the Root witnesses.
 The length-prefixed Root facts precede the optional length-prefixed refusal controls and the primary controls.
@@ -798,7 +798,7 @@ The predecessor archive pin is eligible for retirement only after the order acce
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 
-`rtdb.owned.DecideHeldWorlds.v1` orders one to eight world publications with optional Root facts and checks.
+`rtdb.owned.DecideHeldWorlds.v2` orders one to eight world publications with optional Root facts and checks.
 The first byte signals an offered clock slot, final count conditions and a refusal alternative in its three low bits.
 The optional slot handle precedes a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.
 Each world supplies the 16-byte world ID and original held handle, a u16 witness count and its 16-byte nonces, and a 22-byte attempt ID.
@@ -825,7 +825,7 @@ RTDB fills these from the selected source reading before checking archived and l
 The fact payload retains the authored expression for landing.
 Each changed entity must supply the complete-key point at its finite valid start and a local timeline frontier over the same inherited relation and pin.
 The ordered writer enforces the inherited bounded-period schema and admits one assertion or tombstone per complete entity key.
-`rtdb.owned.SwitchPreparedProposal.v1` uses the same frame with Root kind 6 and an offered clock.
+`rtdb.owned.SwitchPreparedProposal.v2` uses the same frame with Root kind 6 and an offered clock.
 It accepts one reviewed Proposal under the original live Root and Proposal holds.
 The submitting node evaluates its complete footprint and materializes immutable table batches against the exact installed predecessor.
 The replica order selects the generation only at that predecessor and clock.
@@ -875,7 +875,7 @@ An empty covered page has no rows and carries the already-known held present in 
 
 === Retiring an owned relation
 
-An admitted Root `rtdb.owned.DecideHosted.v2` can retire Root relations together with its catalog changes.
+An admitted Root `rtdb.owned.DecideHosted.v4` can retire Root relations together with its catalog changes.
 Send one row in the retired relation's fact group with `_op: Utf8` equal to `retire-relation`, `_id: Utf8` equal to the relation name, and `retain_micros: Int64`, the 0 to 100-year history the relation keeps after retirement.
 The transaction records the retirement in the principal's retired catalog and deletes the relation's ordered, search and spatial paths from their catalogs.
 The declaration stays, so historical reads keep resolving the relation's schema until collection reclaims it.
@@ -894,7 +894,7 @@ The resolver initializes the new rule's covered counters from the final visible 
 If a prefix already exceeds the proposed cap, the transaction aborts with `rtdb.owned/capacity-already-exceeded`.
 Redeclaring a projection with the same predicate and prefix width changes its maximum while retaining its counters.
 Lowering the maximum checks the relation's final membership at the declaring revision, including any removals in that transaction.
-An admitted Root `rtdb.owned.DecideHosted.v2` can co-order capacity declarations with its catalog changes.
+An admitted Root `rtdb.owned.DecideHosted.v4` can co-order capacity declarations with its catalog changes.
 Send each declaration in the target relation's fact group with `_op: Utf8` equal to `declare-capacity`, `_id: Utf8` equal to the projection column, and the four fields from DeclareCapacity.v2.
 The hosted batch must check the observed `bj_installation` authority row.
 The facts, counters and catalog changes commit together after the authority, catalog and capacity conditions all succeed.
@@ -972,9 +972,14 @@ The relation-frontier check still applies to moving-valid reads, continuation re
 
 === Committing checked hosted control rows with owned facts
 
-`rtdb.owned.DecideHosted.v2` is enabled only for a live placed connection authenticated as `flightSql.hostedControls.owner` with `flightSql.ownedNativeActions` enabled.
+`rtdb.owned.DecideHosted.v4` is enabled only for a live placed connection authenticated as `flightSql.hostedControls.owner` with `flightSql.ownedNativeActions` enabled.
 The operator's `flightSql.hostedControls.relations` sequence names the admitted ordinary `public.bj_*` tables.
-The Root witness block uses the Commit.v3 unsigned Int16 big-endian witness count (zero to 32) and its 16-byte held handle plus 16-byte nonce pairs.
+All six hosted publication actions start with the 40-byte installed authority proof.
+It contains a signed big-endian Int64 claim revision in microseconds, the 16-byte installation incarnation and the 16-byte writer grant in that order.
+The primary controls must include one check-only `public.bj_installation/authority` row with that exact revision.
+The resolver compares the proof with the live authority at the ordered predecessor on the authenticated placement.
+A refusal alternative shares that check.
+With hosted controls installed, generic placed Flight fact writes can address only `fact_layout_readiness`.
 The optional sections and the ordering deadline precede the ordered fact and control groups as described below.
 Both sections use the Commit.v2 relation-group sequence framing. The control section has at least one group. A check-only transaction may omit fact groups.
 Fact groups may repeat a relation to preserve run order. The combined sections admit at most 32 distinct fact and control groups and 4096 total rows.
@@ -1005,9 +1010,9 @@ a revision or rows. Send that revision or null as `_expected_micros` in a
 subsequent checked hosted commit. A missing table or a non-epoch valid slice
 refuses the read.
 
-`rtdb.owned.DecideHosted.v2` starts with one flags byte.
-The low five bits signal final counts, held-world reads, a refusal alternative, a physical journal cutoff and an offered clock slot, in that order.
-The optional 16-byte slot handle comes first.
+After the authority proof, `rtdb.owned.DecideHosted.v4` carries one flags byte.
+The low six bits signal final counts, held-world reads, a refusal alternative, a physical journal cutoff, an offered clock slot and a funded mutation clock, in that order.
+The optional 16-byte slot handle or length-prefixed funded offer comes first.
 The optional refusal comes next as a length-prefixed section containing a length-prefixed fact group stream and the hosted control group stream.
 An optional held-world prefix follows, using the original handles and witness nonces.
 The optional ordered-present count conditions precede the durable Root range evidence.
@@ -1028,7 +1033,7 @@ The reply contains the signed big-endian microsecond reading and the original 40
 An accepted receipt retains that observation alongside the actual receiver observation and the offered through-position.
 A successor authenticates continuation of the same clock domain with nondecreasing epoch, sequence, and time.
 The reading is a signed big-endian microsecond count.
-`rtdb.owned.DecideHosted.v2` and `rtdb.owned.DecideHeldWorlds.v1` can use that reading with the original handle.
+`rtdb.owned.DecideHosted.v4` and `rtdb.owned.DecideHeldWorlds.v2` can use that reading with the original handle.
 The placement and session must still own the hold.
 The source append must reach the offered reading. The receiver's sampled clock must be in the half-open second starting there.
 A committed receipt keeps the exact reading and original held position alongside the unrounded receiver observation.

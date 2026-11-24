@@ -736,6 +736,90 @@ pub(crate) fn retained_release_world(operations: &[crate::source::Operation]) ->
     })
 }
 
+pub const INSTALLATION_AUTHORITY_RELATION: &str = "bj_installation";
+pub(crate) const INSTALLATION_AUTHORITY_ID: &str = "authority";
+
+/// A writer grant observed at one ordered revision of the installed authority.
+#[derive(Clone, Copy)]
+pub struct HostedAuthority {
+    revision: Timestamp,
+    incarnation: [u8; 16],
+    writer: [u8; 16],
+}
+
+impl HostedAuthority {
+    pub const WIDTH: usize = 40;
+
+    pub fn decode(bytes: &[u8; Self::WIDTH]) -> Result<Self> {
+        let (revision, rest) = bytes.split_first_chunk::<8>().expect("authority width");
+        let (incarnation, writer) = rest.split_first_chunk::<16>().expect("authority width");
+        Self::new(Timestamp(i64::from_be_bytes(*revision)), *incarnation,
+            writer.try_into().expect("authority width"))
+    }
+
+    fn new(revision: Timestamp, incarnation: [u8; 16], writer: [u8; 16]) -> Result<Self> {
+        if revision.0 <= 0 || incarnation == [0; 16] {
+            return Err(authority_required());
+        }
+        Ok(Self { revision, incarnation, writer })
+    }
+
+    pub(crate) fn matches(self, incarnation: &[u8], writer: &str) -> bool {
+        self.incarnation.as_slice() == incarnation && writer.len() == 32
+            && self.writer.into_iter().zip(writer.as_bytes().chunks_exact(2)).all(|(byte, pair)| {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                pair == [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]]
+            })
+    }
+
+    fn from_control(revision: Option<Timestamp>, row: &StructFields<Value>) -> Result<Self> {
+        let (Some(revision), Some(Value::Binary(incarnation)), Some(Value::Binary(writer))) =
+            (revision, row.get("incarnation"), row.get("writer"))
+        else { return Err(authority_required()); };
+        if row.len() != 3 || row.get("_id") != Some(&Value::Utf8(INSTALLATION_AUTHORITY_ID.into())) {
+            return Err(authority_required());
+        }
+        Self::new(revision, incarnation.as_slice().try_into().map_err(|_| authority_required())?,
+            writer.as_slice().try_into().map_err(|_| authority_required())?)
+    }
+}
+
+pub(crate) fn authority_required() -> Anomaly {
+    Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "rtdb.hosted/authority-required",
+        "Hosted publication requires the installed authority check")
+}
+
+pub(crate) fn installed_authority_control<'a>(
+    controls: impl IntoIterator<Item = &'a HostedControlWrite>,
+) -> Result<(usize, &'a HostedControlWrite)> {
+    let mut authority = controls.into_iter().enumerate()
+        .filter(|(_, control)| control.name() == INSTALLATION_AUTHORITY_RELATION);
+    let (index, control) = authority.next().ok_or_else(authority_required)?;
+    if authority.next().is_some() || !control.is_check()
+        || !matches!(control.id(), EntityId::String(id) if id == INSTALLATION_AUTHORITY_ID)
+        || !control.expected().is_some_and(|stamp| stamp.0 > 0)
+    {
+        return Err(authority_required());
+    }
+    Ok((index, control))
+}
+
+/// Bind the required wire proof to its exact primary control before submission.
+pub fn bind_installed_authority(
+    controls: &mut [HostedControlWrite], proof: Option<HostedAuthority>,
+) -> Result<()> {
+    let (index, control) = installed_authority_control(controls.iter())?;
+    if let Some(proof) = proof {
+        if control.expected() != Some(proof.revision) { return Err(authority_required()); }
+        controls[index].document = HostedControlDocument::Row(StructFields::from([
+            ("_id".into(), Value::Utf8(INSTALLATION_AUTHORITY_ID.into())),
+            ("incarnation".into(), Value::Binary(proof.incarnation.to_vec())),
+            ("writer".into(), Value::Binary(proof.writer.to_vec())),
+        ]));
+    }
+    Ok(())
+}
+
 /// An assertion or checked replacement of one installed hosted control row.
 #[derive(Clone, Debug)]
 pub struct HostedControlWrite {
@@ -796,7 +880,8 @@ impl HostedControlWrite {
         document: StructFields<Value>,
     ) -> Result<Self> {
         if document.len() != 1 {
-            return Err(invalid());
+            if relation.name() != INSTALLATION_AUTHORITY_RELATION { return Err(invalid()); }
+            HostedAuthority::from_control(expected, &document)?;
         }
         let mut result = Self::new(relation, scope, expected, document)?;
         result.check_only = true;
@@ -882,6 +967,13 @@ impl HostedControlWrite {
         match &self.document {
             HostedControlDocument::Row(document) if !self.check_only => Some(document),
             _ => None,
+        }
+    }
+
+    pub(crate) fn installed_authority(&self) -> Result<Option<HostedAuthority>> {
+        match self.source_row() {
+            Some(row) if row.len() > 1 => HostedAuthority::from_control(self.expected, row).map(Some),
+            _ => Ok(None),
         }
     }
 

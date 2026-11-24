@@ -38,6 +38,7 @@ use crate::{
 pub(crate) const SEAL_HOSTED_RANGES_V1: &str = "rtdb.owned.SealHostedRanges.v1";
 pub(crate) const VALIDATE_FRESH_HOSTED_V1: &str = "rtdb.owned.ValidateFreshHosted.v1";
 pub(crate) const DECIDE_HOSTED_V3: &str = "rtdb.owned.DecideHosted.v3";
+pub(crate) const DECIDE_HOSTED_V4: &str = "rtdb.owned.DecideHosted.v4";
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
@@ -286,10 +287,15 @@ pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V4: &str = "rtdb.owned.PublishHeldWorldRetention.v4";
+pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V5: &str = "rtdb.owned.PublishHeldWorldRetention.v5";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
+pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const DECIDE_WORLD_CUT_V1: &str = "rtdb.owned.DecideWorldCut.v1";
+pub(crate) const DECIDE_WORLD_CUT_V2: &str = "rtdb.owned.DecideWorldCut.v2";
 pub(crate) const DECIDE_HELD_WORLDS_V1: &str = "rtdb.owned.DecideHeldWorlds.v1";
+pub(crate) const DECIDE_HELD_WORLDS_V2: &str = "rtdb.owned.DecideHeldWorlds.v2";
 pub(crate) const SWITCH_PREPARED_PROPOSAL_V1: &str = "rtdb.owned.SwitchPreparedProposal.v1";
+pub(crate) const SWITCH_PREPARED_PROPOSAL_V2: &str = "rtdb.owned.SwitchPreparedProposal.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -930,9 +936,20 @@ impl Service {
         self.owned_write_reply(call, vec![operation]).await
     }
 
+    fn require_generic_owned_target(&self, call: &Call, relation: &OwnedRelation) -> Result<(), Status> {
+        if self.0.config.hosted_controls.is_some()
+            && call.session.placed_database() == Some(call.database.as_str())
+            && relation.name() != "fact_layout_readiness"
+        {
+            return Err(Status::permission_denied("Hosted fact writes require an installed authority decision"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn create_owned_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
+        self.require_generic_owned_target(call, &relation)?;
         let batch = require_identity(decode_retained_batch(call, body.slice_ref(arrow))?)?;
         if relation.is_root_data() {
             if batch.batch().column_by_name("_absent").is_none() {
@@ -1211,11 +1228,19 @@ impl Service {
         hosted_observation::confirmation_reply(call, confirmation)
     }
 
+    fn installed_authority(body: &[u8], typed: bool) -> Result<(Option<rtdb_tx::HostedAuthority>, &[u8]), Status> {
+        if !typed { return Ok((None, body)); }
+        let (authority, rest) = body.split_first_chunk::<{ rtdb_tx::HostedAuthority::WIDTH }>()
+            .ok_or_else(|| invalid("Missing installed authority proof"))?;
+        Ok((Some(rtdb_tx::HostedAuthority::decode(authority).map_err(status)?), rest))
+    }
+
     pub(crate) async fn decide_hosted_action(
-        &self, call: &Call, envelope: &Bytes,
+        &self, call: &Call, envelope: &Bytes, typed: bool,
     ) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
-        let ([flags], body) = envelope.split_first_chunk::<1>()
+        let (authority, body) = Self::installed_authority(envelope, typed)?;
+        let ([flags], body) = body.split_first_chunk::<1>()
             .ok_or_else(|| invalid("Missing hosted decision flags"))?;
         if *flags & !0b11_1111 != 0 || *flags & 48 == 48 {
             return Err(invalid("Invalid hosted decision flags"));
@@ -1257,13 +1282,13 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref()).await
+        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
-        funded: Option<&rtdb_node::FundedMutationClock>,
+        funded: Option<&rtdb_node::FundedMutationClock>, authority: Option<rtdb_tx::HostedAuthority>,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -1307,7 +1332,8 @@ impl Service {
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging, journal_before }];
         writes.extend(slot.map(|slot| TxOp::OwnedClockSlot { slot }));
         writes.extend(conditions);
-        let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
+        let (mut controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
+        rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         if let Some(offer) = funded {
             let reading = offer.slot.reading;
             let end = reading.0.checked_add(1_000_000).ok_or_else(Self::clock_slot_missed)?;
@@ -1443,6 +1469,9 @@ impl Service {
         };
         let _framing = call.reserve(group_limit * 512)?;
         let CommitRequest { deadline, groups } = CommitRequest::parse(body, format)?;
+        for (relation, _) in &groups {
+            self.require_generic_owned_target(call, relation)?;
+        }
         let mut rows_left = match format {
             CommitFormat::Single => usize::MAX,
             CommitFormat::Grouped | CommitFormat::Ordered => MAX_GROUPED_COMMIT_ROWS.checked_sub(conditions.len())
@@ -4086,9 +4115,10 @@ impl Service {
         }
     }
 
-    pub(crate) async fn publish_held_world_retention_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn publish_held_world_retention_action(&self, call: &Call, body: &[u8], typed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (authority, body) = Self::installed_authority(body, typed)?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires its original hold"))?;
         let (publication, body) = split_world_publication(body)?;
         let (child, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires a minted child"))?;
@@ -4113,8 +4143,9 @@ impl Service {
         let groups = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 3;
-        let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
-        if controls.is_empty() || controls.iter().any(|control| !control.is_check()) {
+        let (mut controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+        rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
+        if controls.iter().any(|control| !control.is_check()) {
             return Err(invalid("Retaining a Held publication requires checked hosted ownership"));
         }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
@@ -4142,8 +4173,8 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, charge) })
     }
 
-    pub(crate) async fn publish_world_cut_action(&self, call: &Call, envelope: &Bytes, publish_root: bool) -> Result<ActionResult, Status> {
-        let body = envelope.as_ref();
+    pub(crate) async fn publish_world_cut_action(&self, call: &Call, envelope: &Bytes, publish_root: bool, typed: bool) -> Result<ActionResult, Status> {
+        let (authority, body) = Self::installed_authority(envelope, typed)?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no held root handle"))?;
@@ -4350,10 +4381,8 @@ impl Service {
             return Err(invalid("Fork exceeds its grouped effect limit"));
         }
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
-        let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, !publish_root)?;
-        if !controls.iter().any(rtdb_tx::HostedControlWrite::is_check) {
-            return Err(invalid("A retained fork requires a hosted ownership check"));
-        }
+        let (mut controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, !publish_root)?;
+        rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         if publish_root && (root.publication.is_none() || proposed_publication || held_publication)
             && controls.iter().all(rtdb_tx::HostedControlWrite::is_check) {
             return Err(invalid("A co-ordered fork requires Root facts or a hosted control replacement"));
@@ -4401,11 +4430,12 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool, typed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
-        let ([flags], body) = envelope.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world decision flags"))?;
+        let (authority, body) = Self::installed_authority(envelope, typed)?;
+        let ([flags], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world decision flags"))?;
         if *flags & !7 != 0 { return Err(invalid("Invalid world decision flags")); }
         let (slot, body) = if *flags & 1 != 0 {
             let (slot, body) = self.owned_clock_slot(call, body).await?;
@@ -4649,7 +4679,8 @@ impl Service {
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
-        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
+        let (mut controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
+        rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         let _refusal_charge = if !refusal.is_empty() {
             hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;
             let (refusal, charge) = self.decode_hosted_control_groups(call, refusal, scope, &mut rows_left, false)?;
@@ -5132,7 +5163,9 @@ fn hosted_control_row(
         _ => return Err(invalid("Hosted control check flag must be Boolean")),
     };
     match owned_landing_wire::hosted_control_command(expected, check_only, require_checks) {
-        ControlCommand::Check(expected) => HostedControlWrite::check(relation.clone(), scope, expected.map(Timestamp), row),
+        ControlCommand::Check(expected) if row.len() == 1 =>
+            HostedControlWrite::check(relation.clone(), scope, expected.map(Timestamp), row),
+        ControlCommand::Check(_) => return Err(invalid("Hosted control checks carry only the row identity")),
         ControlCommand::Replace(expected) => HostedControlWrite::new(relation.clone(), scope, expected.map(Timestamp), row),
         ControlCommand::Refuse => return Err(invalid("Read validation permits only hosted control checks")),
     }.map_err(status)

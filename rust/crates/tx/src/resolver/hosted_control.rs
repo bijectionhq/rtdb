@@ -28,6 +28,11 @@ impl OpenTransaction<'_> {
             _ => None,
         });
         if controls.clone().next().is_none() {
+            if operations.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::OwnedForkWorld { .. } | TxOp::OwnedPublishRoot { .. } | TxOp::OwnedPublishWorld { .. })
+            )) {
+                return Err(crate::hosted_control::authority_required());
+            }
             return if self.clock_slot.is_some_and(|slot| slot.funded) {
                 Err(funded_booking_missing())
             } else {
@@ -176,6 +181,31 @@ impl OpenTransaction<'_> {
             &self.options.default_tz,
             self.trace_parent,
         )?;
+        let (_, authority) = crate::hosted_control::installed_authority_control(controls.clone())?;
+        if authority.scope() != scope { return Err(unavailable()); }
+        let proof = authority.installed_authority()?;
+        let stale = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.hosted/stale-authority",
+            "The installation authority changed before ordering");
+        let point = rtdb_query::read_hosted_control_point(
+            Arc::clone(&context), authority.table(), authority.id(), true,
+        ).await?;
+        let (row, revision) = point.row.ok_or_else(stale)?;
+        if Some(revision) != authority.expected() { return Err(stale()); }
+        let row = row.batch();
+        let field = |name| {
+            let (index, field) = row.schema_ref().column_with_name(name).ok_or_else(stale)?;
+            rtdb_columnar::read_value(field, row.column(index).as_ref(), 0)
+        };
+        let (Value::Utf8(kind), Value::Binary(incarnation), Value::Utf8(writer)) =
+            (field("kind")?, field("incarnation")?, field("writer")?)
+        else { return Err(stale()); };
+        if kind != "hosted" || incarnation.len() != 16 || incarnation.iter().all(|&byte| byte == 0)
+            || writer.len() != 32 || !writer.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || proof.is_some_and(|proof| !proof.matches(&incarnation, &writer))
+        {
+            return Err(stale());
+        }
+
         let mut locators = BTreeSet::new();
         let mut selected_tables = BTreeSet::new();
         let mut charges = Vec::new();
@@ -222,6 +252,7 @@ impl OpenTransaction<'_> {
                     "A hosted control row must appear once per commit",
                 ));
             }
+            if std::ptr::eq(control, authority) { continue; }
             let booked_seat = funded.filter(|_| control.name() == "bj_fact_root_admission"
                 && matches!(control.id(), EntityId::String(id) if id == "funded_mutation_seat:v1"));
             let point = rtdb_query::read_hosted_control_point(

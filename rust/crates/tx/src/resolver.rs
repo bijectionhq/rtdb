@@ -4005,6 +4005,16 @@ mod tests {
             catalog_row(1),
             Interval::new(Timestamp(0), Timestamp::MAX)?,
         )?;
+        installation.buffer.put(
+            TableRef::new("public", "bj_installation"),
+            StructFields::from([
+                ("_id".into(), Value::Utf8("authority".into())),
+                ("kind".into(), Value::Utf8("hosted".into())),
+                ("incarnation".into(), Value::Binary(vec![7; 16])),
+                ("writer".into(), Value::Utf8("11111111111111111111111111111111".into())),
+            ]),
+            Interval::new(Timestamp(0), Timestamp::MAX)?,
+        )?;
         let schema = OwnedSchema::from_json(
             br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#,
         )?;
@@ -4032,7 +4042,17 @@ mod tests {
             let documents = crate::Documents::new(vec![StructFields::from([
                 ("_id".into(), Value::Utf8("head".into())),
             ])], &memory)?;
+            let mut authority = [crate::HostedControlWrite::check(
+                OwnedRelation::new("bj_installation")?, scope, Some(installed_at.system_time),
+                StructFields::from([("_id".into(), Value::Utf8("authority".into()))]),
+            )?];
+            let mut proof = [0x11; crate::HostedAuthority::WIDTH];
+            proof[..8].copy_from_slice(&installed_at.system_time.0.to_be_bytes());
+            proof[8..24].fill(7);
+            crate::bind_installed_authority(&mut authority, Some(crate::HostedAuthority::decode(&proof)?))?;
+            let [authority] = authority;
             let operations = vec![
+                TxOp::HostedControl(authority),
                 TxOp::OwnedDeadline { until: Timestamp(1000), recheck_at_staging: false, journal_before: None },
                 TxOp::OwnedReplaceDocs { relation: marker.clone(), documents, valid_from: Some(Timestamp::MIN), valid_to: None },
                 TxOp::OwnedArrowDocs { relation: relation.clone(), documents: hook.clone(), create_only: true, valid_from: None, valid_to: None },

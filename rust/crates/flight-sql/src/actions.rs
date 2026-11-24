@@ -136,7 +136,9 @@ impl Service {
             match action_type {
                 crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
                 crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECIDE_HOSTED_V3 => Ok(vec![Ok(self.decide_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECIDE_HOSTED_V3 | crate::owned_actions::DECIDE_HOSTED_V4 =>
+                    Ok(vec![Ok(self.decide_hosted_action(&call, &action.body,
+                        action_type == crate::owned_actions::DECIDE_HOSTED_V4).await?)]),
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
@@ -266,14 +268,22 @@ impl Service {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V4 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
-                crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::DECIDE_WORLD_CUT_V1 => {
+                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V4 | crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V5 =>
+                    Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body,
+                        action_type == crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V5).await?)]),
+                crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::DECIDE_WORLD_CUT_V1
+                | crate::owned_actions::PUBLISH_WORLD_CUT_V2 | crate::owned_actions::DECIDE_WORLD_CUT_V2 => {
+                    use crate::owned_actions::*;
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
-                        action.r#type == crate::owned_actions::DECIDE_WORLD_CUT_V1).await?)])
+                        matches!(action_type, DECIDE_WORLD_CUT_V1 | DECIDE_WORLD_CUT_V2),
+                        matches!(action_type, PUBLISH_WORLD_CUT_V2 | DECIDE_WORLD_CUT_V2)).await?)])
                 }
-                crate::owned_actions::DECIDE_HELD_WORLDS_V1 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V1 => {
+                crate::owned_actions::DECIDE_HELD_WORLDS_V1 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V1
+                | crate::owned_actions::DECIDE_HELD_WORLDS_V2 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2 => {
+                    use crate::owned_actions::*;
                     Ok(vec![Ok(self.decide_held_worlds_action(&call, &action.body,
-                        action.r#type == crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V1).await?)])
+                        matches!(action_type, SWITCH_PREPARED_PROPOSAL_V1 | SWITCH_PREPARED_PROPOSAL_V2),
+                        matches!(action_type, DECIDE_HELD_WORLDS_V2 | SWITCH_PREPARED_PROPOSAL_V2)).await?)])
                 }
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {

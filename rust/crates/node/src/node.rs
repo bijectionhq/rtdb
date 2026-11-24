@@ -1831,6 +1831,20 @@ impl OwnedReadSession {
         Ok(record)
     }
 
+    /// Tests whether the ordered decision installed this exact world and pin.
+    pub async fn registered_world_at(
+        &self, world: &rtdb_types::OwnedWorld, at: TransactionKey,
+    ) -> Result<bool> {
+        self.require_unscoped_root()?;
+        if !at.at_or_before(self.present) { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        self.admit_read().await?;
+        let record = rtdb_query::read_owned_world_at(
+            Arc::clone(&self.context), &self.owner, world.id, at.system_time,
+        ).await?;
+        self.check()?;
+        Ok(record.is_some_and(|(record, revision, _)| &record == world && revision == at.system_time))
+    }
+
     /// Reads the exact local shadow, retaining its revision even when that shadow is a tombstone.
     /// Certifies the exact physical revision of a protected writable-world clock publication.
     pub async fn certify_world_accepted_cut<'a>(
@@ -3121,6 +3135,12 @@ pub enum WorldClockRequest {
     Proposal,
 }
 
+/// Local admission never submitted. Ordered results have a known disposition.
+pub enum OwnedWorldRegistrationOutcome {
+    Refused(Anomaly),
+    Ordered(TransactionResult),
+}
+
 pub struct OwnedWorldFork {
     pub world: rtdb_types::Iid,
     pub pin: rtdb_types::Iid,
@@ -3254,7 +3274,17 @@ impl NativeSession {
 
     pub async fn register_owned_world_checked(
         &mut self, record: &rtdb_types::OwnedWorld, fork: OwnedWorldFork,
-    ) -> Result<TransactionResult> {
+    ) -> Result<OwnedWorldRegistrationOutcome> {
+        let (ops, _charge) = match self.checked_world_registration(record, fork) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(OwnedWorldRegistrationOutcome::Refused(error)),
+        };
+        self.state.execute_tx(ops, Default::default()).await.map(OwnedWorldRegistrationOutcome::Ordered)
+    }
+
+    fn checked_world_registration(
+        &self, record: &rtdb_types::OwnedWorld, fork: OwnedWorldFork,
+    ) -> Result<(Vec<TxOp>, Arc<rtdb_columnar::MemoryReservation>)> {
         let until = fork.deadline.min(fork.cut.until).min(record.until);
         let inherited = record.inherited_clock();
         let requested = match fork.requested {
@@ -3343,7 +3373,7 @@ impl NativeSession {
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
+        let charge = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
         ops.push(TxOp::owned_deadline(until));
         let refusal = if let Some(section) = fork.root {
@@ -3383,7 +3413,7 @@ impl NativeSession {
             ops.push(self.decision_receipt_head()?);
             ops.extend(refusal.into_iter().map(TxOp::HostedControl));
         }
-        self.state.execute_tx(ops, Default::default()).await
+        Ok((ops, charge))
     }
 
     fn decision_attempt_marker(&self, attempt: &str, fingerprint: [u8; 32]) -> Result<TxOp> {

@@ -3,7 +3,7 @@
 [HeldWorldsOrder.lean](lean/HeldWorldsOrder.lean) projects the hosted actions onto the chosen data cuts of [OrderedJournal.lean](lean/OrderedJournal.lean).
 It distinguishes the source position from the assigned system revision.
 The projection covers the six Flight actions, including the kind-6 prepared switch and constraint refusal and the hosted staging refusal.
-A publication requires equality with the installation authority at its ordered predecessor.
+A publication requires the current installation claim revision, incarnation and writer grant at its ordered predecessor.
 The publication contains one marker per submitted live context at its assigned revision with the submitted fingerprint.
 The recovery laws preserve the chosen cut through every modeled journal step and exclude a different cut digest at the same index in the same history.
 These model laws leave the correspondence from native recovery to the modeled chosen cut open.
@@ -17,18 +17,20 @@ The bindings below identify the async callers, codec, catalog, and journal work 
 
 | Flight action | Resolver input and effects |
 | --- | --- |
-| `DecideHosted.v1` | `commit_hosted_with_reads` appends the decoded hosted controls to the primary operation list. A cutoff selects a strict durable predecessor and a failed staging check discards the candidate. An optional constraint alternative is separated at `HostedConstraintRefusal`. |
-| `DecideHeldWorlds.v1` and `SwitchPreparedProposal.v1` | Both enter `decide_held_worlds_action`. Kind 6 requires the prepared action and its original offered clock slot. The action sends the primary controls, world sections and one fingerprint through `PlacedWorldHost::commit_world_batch` to `commit_owned_world_batch`. The prepared switch shares the Proposal section's attempt with the Root and emits one embedded marker on success. Its refusal uses that same context and fingerprint and retains the Proposal. |
-| `PublishHeldWorldRetention.v3` | `publish_held_world_retention_action` passes decoded check-only controls and the exact attempt and fingerprint to `PlacedWorldHost::fork_world_checked`. |
-| `PublishWorldCut.v1` and `DecideWorldCut.v1` | `publish_world_cut_action` carries the original controls, attempt and fingerprint through `fork_world_checked` to `register_owned_world_checked`. Only the decide form can carry a Root publication and a paired refusal. |
+| `DecideHosted.v4` | `commit_hosted_with_reads` appends the decoded hosted controls to the primary operation list. A cutoff selects a strict durable predecessor and a failed staging check discards the candidate. An optional constraint alternative is separated at `HostedConstraintRefusal`. |
+| `DecideHeldWorlds.v2` and `SwitchPreparedProposal.v2` | Both enter `decide_held_worlds_action`. Kind 6 requires the prepared action and its original offered clock slot. The action sends the primary controls, world sections and one fingerprint through `PlacedWorldHost::commit_world_batch` to `commit_owned_world_batch`. The prepared switch shares the Proposal section's attempt with the Root and emits one embedded marker on success. Its refusal uses that same context and fingerprint and retains the Proposal. |
+| `PublishHeldWorldRetention.v5` | `publish_held_world_retention_action` passes decoded check-only controls and the exact attempt and fingerprint to `PlacedWorldHost::fork_world_checked`. |
+| `PublishWorldCut.v2` and `DecideWorldCut.v2` | `publish_world_cut_action` carries the original controls, attempt and fingerprint through `fork_world_checked` to `register_owned_world_checked`. Only the decide form can carry a Root publication and a paired refusal. |
 
 `decode_hosted_control_groups` requires an Int64 expectation column and decodes a true check flag through `hosted_control_row`.
-The source operation preserves the check variant and expected stamp across `source_header` and `SourceTransaction::decode`.
+Flight binds the required typed authority prefix to the single primary check for the installed authority.
+The source operation preserves the check, expected stamp, incarnation and writer grant across `source_header` and `SourceTransaction::decode`.
 `TxResolver::resolving_snapshot` combines the durable snapshot with its ordered staged queue and checks the resulting basis against its head.
 `check_hosted_controls` looks up the exact table and ID in that base snapshot and compares the row's physical revision or covered absence with the decoded expectation.
 The primary loop starts after preconditions succeed.
 On constraint refusal, the resolver drops the primary buffer, reopens the same base, calls `apply_selected_refusal`, and retains the original primary writer check.
 That method can omit a scope-only world check when it has no corresponding observation.
+The installed authority check is shared with the alternative.
 It runs the selected preconditions before applying refusal operations.
 The prepared-generation candidate's own validation and installation still need a proof from the checked predecessor through the exact chosen replica body.
 The staging deadline can refuse that selected transaction after resolution but cannot replace its checked predecessor.
@@ -54,23 +56,18 @@ The claim replaces an ordinary hosted control at the claim's assigned system tim
 The remaining proof must tie those recovered bytes, their catalog and source watermark, the Bijection claim receipt, and the resolver snapshot to one certified installation prefix.
 Comparing numerically equal offsets from separate installations would leave that proof open.
 
-## Authority row omission
+## Installed authority and fork custody
 
-An authenticated raw Flight caller can supply an arbitrary eligible check-only control to several of these actions.
-The RTDB action shapes alone do not require `bj_installation/authority` on every request.
+The hosted commit actions require a typed authority prefix and an exact matching check-only control for `public.bj_installation/authority`.
+The receiver derives placement scope from the authenticated attachment and refuses a missing, repeated, replaced or inconsistent authority check.
+The ordered resolver selects that row independently of the caller's other controls.
+It compares the row's physical stamp, incarnation and active writer grant at the selected predecessor before applying any primary or alternate effects.
+The other checked controls cannot authorize a request for a replaced writer.
+Generic placed Flight fact writes are limited to private layout readiness in this hosted gateway.
 
-1. Establish an otherwise admissible `DecideHosted.v1` Root edit with an unchanging checked ordinary control and an installation-authority check at revision 10.
-2. Order an installation owner claim at revision 11 on the same placement while leaving the other control and affected fact unchanged.
-3. The original request with both checks conflicts at the ordered predecessor.
-4. Repeat from the history immediately after the claim with a fresh attempt and the same edit, but omit the authority group and retain the other checked control.
-   `commit_hosted_with_reads` admits the remaining group and `check_hosted_controls` compares only the supplied control.
-
-Bijection's configured native callers must discharge authority-row presence and exact wire transport before this argument can cover every writer they issue.
-Mandating this particular application row in RTDB would require a design choice between a typed installed authority policy and the existing caller-owned check contract.
-This change preserves the existing caller-owned contract.
-The affected owners are the configured hosted Flight gateway and Bijection's installation-writer guard construction.
-
-The scope of the transaction proof is the published native Root, world and landing-control batch.
-`fork_checkpoint_world_selected` can reserve directory custody before `register_owned_world_checked` orders the native registration.
-An authority conflict can therefore leave that prerequisite custody reservation while refusing native registration.
-A guarantee about those directory effects requires a separate ordering and cleanup contract.
+The directory precedes fork registration with a provisional pin claimed by one attempt.
+A definitive local or ordered refusal releases that claim by an exact directory comparison.
+A committed constraint alternative keeps its receipt and releases the provisional pin when the ordered cut has no corresponding registration.
+A registered pin survives a competing refusal, and refusal preserves the predecessor.
+An indeterminate submission keeps custody for recovery or expiry.
+The async and directory correspondence still needs proof that native disposition and the compared directory reservation refer to the same attempt, including cancellation, recovery and a racing update.

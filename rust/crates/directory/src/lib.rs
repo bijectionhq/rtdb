@@ -719,8 +719,16 @@ pub struct CheckpointWorldAncestor {
     pub logical: rtdb_types::Timestamp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorldForkReservation {
+    Prepared,
+    Registering(uuid::Uuid),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointWorldRetention {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_reservation: Option<WorldForkReservation>,
     pub world: uuid::Uuid,
     pub ancestors: Vec<CheckpointWorldAncestor>,
     pub owner: String,

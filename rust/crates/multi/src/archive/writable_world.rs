@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_directory::{CheckpointWorldMedia, CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, now_ms};
-use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWitness, TransactionStatus};
+use rtdb_directory::{CheckpointWorldMedia, CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, WorldForkReservation, now_ms};
+use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldRegistrationOutcome, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, OwnedWorldAssertion, PlacedAttemptScope, Result, StructFields,
     Timestamp, TransactionKey, Value, WorldClockMode, WorldSchemas, WorldShadow,
@@ -313,6 +313,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     if now() >= until { return Err(unavailable()); }
     ancestors.push(ancestor.clone());
     let binding = CheckpointWorldRetention {
+        fork_reservation: Some(WorldForkReservation::Prepared),
         world: child, ancestors, owner: owner.clone(),
         capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
         schema_digest: retained.schema_digest, suffix: retained.suffix, basis: retained.basis,
@@ -331,7 +332,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         admit_world_media(current, archive, deployment, &binding)?;
         current.checkpoint_worlds.retain(|_, world| world.until > active);
         if let Some(prior) = current.checkpoint_worlds.get(&child) {
-            return if prior == &binding { Ok(()) } else { Err(unavailable()) };
+            return if same_fork_binding(prior, &binding) { Ok(()) } else { Err(unavailable()) };
         }
         if current.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS { return Err(unavailable()); }
         current.checkpoint_worlds.insert(child, binding.clone());
@@ -542,6 +543,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     live.check()?;
     let pin = Uuid::from_bytes(world.pin.0);
     let retained = CheckpointWorldRetention {
+        fork_reservation: None,
         ancestors,
         world: id,
         owner,
@@ -681,6 +683,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
+    let reservation = WorldForkReservation::Registering(Uuid::new_v4());
     if let Some((world, pin)) = fork.cut.retained_parent() {
         let unavailable = OwnedWorld::unavailable;
         let child = Uuid::from_bytes(fork.world.0);
@@ -706,12 +709,12 @@ pub(crate) async fn fork_checkpoint_world_selected(
             }
             _ => return Err(unavailable()),
         };
-        let binding = CheckpointWorldRetention { world: child, until, mode, ..retained.clone() };
+        let binding = CheckpointWorldRetention { fork_reservation: None, world: child, until, mode, ..retained.clone() };
         let mut registration = world_record(child, &binding, opened.record.schemas.clone());
         if !opened.record.can_retain_parent(&registration) { return Err(unavailable()); }
         registration.fork_lineage = opened.record.retained_child_lineage(&registration, opened.registered)?;
         drop(opened);
-        update_installation(directory.as_ref(), &deployment, |current| {
+        let installed = update_installation(directory.as_ref(), &deployment, |current| {
             let active = now();
             if active >= fork.cut.until() || active >= until
                 || current.incarnation != source.incarnation || current.log_epoch != source.log_epoch
@@ -722,18 +725,11 @@ pub(crate) async fn fork_checkpoint_world_selected(
             }
             admit_world_media(current, archive, deployment_id, &binding)?;
             current.checkpoint_worlds.retain(|_, world| world.until > active);
-            if let Some(prior) = current.checkpoint_worlds.get(&child) {
-                return if prior == &binding { Ok(()) } else { Err(unavailable()) };
-            }
-            if current.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS { return Err(unavailable()); }
-            current.checkpoint_worlds.insert(child, binding.clone());
-            Ok(())
+            reserve_fork_pin(current, child, &binding, reservation, false)
         }).await?;
-        let outcome = session.register_owned_world_checked(&registration, fork).await?;
-        if !outcome.committed() {
-            return Err(outcome.error().cloned().unwrap_or_else(unavailable));
-        }
-        return Ok((child, outcome.tx_key()));
+        let (key, _) = register_fork_pin(directory.as_ref(), &deployment, &installed, reservation,
+            session, &registration, fork).await?;
+        return Ok((child, key));
     }
     if let Some((world, pin, logical)) = fork.cut.overlay() {
         let unavailable = OwnedWorld::unavailable;
@@ -767,11 +763,18 @@ pub(crate) async fn fork_checkpoint_world_selected(
         admit_world_media(&source, archive, deployment_id, retained)?;
         live.check()?;
         drop(live);
-        let outcome = session.register_owned_world_checked(&registration, fork).await?;
-        if !outcome.committed() {
-            return Err(outcome.error().cloned().unwrap_or_else(unavailable));
-        }
-        return Ok((child, outcome.tx_key()));
+        let installed = update_installation(directory.as_ref(), &deployment, |current| {
+            if current.incarnation != source.incarnation || current.log_epoch != source.log_epoch
+                || PlacedAttemptScope::new(&current.stream("replica"), current.epoch)? != fork.cut.scope()
+                || retained.until <= now() || fork.cut.until() <= now()
+            {
+                return Err(unavailable());
+            }
+            reserve_fork_pin(current, child, retained, reservation, true)
+        }).await?;
+        let (key, _) = register_fork_pin(directory.as_ref(), &deployment, &installed, reservation,
+            session, &registration, fork).await?;
+        return Ok((child, key));
     }
     let authored_advance = fork.previous.is_some() && fork.cut.is_publication()
         && fork.root.as_ref().is_some_and(|root| root.publication.is_some())
@@ -914,6 +917,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         return Err(OwnedWorld::unavailable());
     }
     let retained = CheckpointWorldRetention {
+        fork_reservation: None,
         ancestors: Vec::new(),
         world: id,
         owner,
@@ -964,34 +968,18 @@ pub(crate) async fn fork_checkpoint_world_selected(
                 return Err(OwnedWorld::unavailable());
             }
         }
-        if let Some(existing) = record.checkpoint_worlds.get(&pin) {
-            return if existing == &retained { Ok(()) } else { Err(OwnedWorld::unavailable()) };
-        }
-        if record.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS {
-            return Err(OwnedWorld::unavailable());
-        }
-        record.checkpoint_worlds.insert(pin, retained.clone());
-        Ok(())
-    })
-    .await?;
-    admit_session(session, &installed, &retained.owner)?;
+        reserve_fork_pin(record, pin, &retained, reservation, false)
+    }).await?;
     let mut registration = world_record(pin, &retained, schemas);
     registration.fork_lineage = fork_lineage;
     let previous = if fork.sibling.is_some() { None } else { fork.previous.map(|previous| Uuid::from_bytes(previous.0)) };
-    let outcome = session.register_owned_world_checked(&registration, fork).await?;
-    if !outcome.committed() {
-        // A competing retry may already have registered this world.
-        // Its exact pending pin remains eligible for recovery until expiry.
-        return Err(outcome
-            .error()
-            .cloned()
-            .unwrap_or_else(OwnedWorld::unavailable));
-    }
+    let (key, registered) = register_fork_pin(directory.as_ref(), &deployment, &installed, reservation,
+        session, &registration, fork).await?;
+    if !registered { return Ok((id, key)); }
     if let Some(previous) = previous
         && let Some(prior) = installed.checkpoint_worlds.get(&previous)
     {
-        // An ordered refusal keeps the predecessor live. If the new pin
-        // cannot be confirmed here, let directory custody expire naturally.
+        // Confirm the new pin is still live before retiring its predecessor.
         if let Ok(held) = session.open_owned_read().await
             && let Ok(Some((current, _))) = held.world_registration(registration.id).await
             && current.pin == registration.pin && !current.dropped
@@ -999,7 +987,87 @@ pub(crate) async fn fork_checkpoint_world_selected(
             let _ = retire_world_pins(directory.as_ref(), &deployment, &[(previous, prior)], installed.incarnation, installed.log_epoch).await;
         }
     }
-    Ok((id, outcome.tx_key()))
+    Ok((id, key))
+}
+
+fn same_fork_binding(existing: &CheckpointWorldRetention, requested: &CheckpointWorldRetention) -> bool {
+    let mut requested = requested.clone();
+    requested.fork_reservation = existing.fork_reservation;
+    existing == &requested
+}
+
+fn reserve_fork_pin(
+    installation: &mut DeploymentRecord, pin: Uuid, binding: &CheckpointWorldRetention,
+    reservation: WorldForkReservation, prepared: bool,
+) -> Result<()> {
+    let unavailable = OwnedWorld::unavailable;
+    if let Some(current) = installation.checkpoint_worlds.get_mut(&pin) {
+        if !same_fork_binding(current, binding) { return Err(unavailable()); }
+        return match current.fork_reservation {
+            None => Ok(()),
+            Some(WorldForkReservation::Prepared) if prepared => {
+                current.fork_reservation = Some(reservation);
+                Ok(())
+            }
+            Some(_) => Err(unavailable()),
+        };
+    }
+    if prepared || installation.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS {
+        return Err(unavailable());
+    }
+    let mut binding = binding.clone();
+    binding.fork_reservation = Some(reservation);
+    installation.checkpoint_worlds.insert(pin, binding);
+    Ok(())
+}
+
+async fn register_fork_pin(
+    directory: &dyn Directory, deployment: &str, installed: &DeploymentRecord,
+    reservation: WorldForkReservation, session: &mut NativeSession, world: &OwnedWorld,
+    fork: rtdb_node::OwnedWorldFork,
+) -> Result<(TransactionKey, bool)> {
+    let unavailable = OwnedWorld::unavailable;
+    let pin = Uuid::from_bytes(world.pin.0);
+    let binding = installed.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
+    let has_alternative = fork.root.as_ref().is_some_and(|root| !root.refusal.is_empty());
+    let outcome = match admit_session(session, installed, &binding.owner) {
+        Ok(()) => session.register_owned_world_checked(world, fork).await?,
+        Err(error) => OwnedWorldRegistrationOutcome::Refused(error),
+    };
+    let disposition = match outcome {
+        OwnedWorldRegistrationOutcome::Refused(error) => Err(error),
+        OwnedWorldRegistrationOutcome::Ordered(outcome) if !outcome.committed() =>
+            Err(outcome.error().cloned().unwrap_or_else(unavailable)),
+        OwnedWorldRegistrationOutcome::Ordered(outcome) => {
+            let key = outcome.tx_key();
+            let registered = !has_alternative || session.open_owned_read().await?.registered_world_at(world, key).await?;
+            Ok((key, registered))
+        }
+    };
+    if binding.fork_reservation == Some(reservation) {
+        let registered = disposition.as_ref().is_ok_and(|&(_, registered)| registered);
+        update_installation(directory, deployment, |current| {
+            if current.incarnation != installed.incarnation || current.log_epoch != installed.log_epoch {
+                return Ok(());
+            }
+            settle_fork_pin(current, pin, binding, registered);
+            Ok(())
+        }).await?;
+    }
+    disposition
+}
+
+fn settle_fork_pin(
+    current: &mut DeploymentRecord, pin: Uuid, expected: &CheckpointWorldRetention, registered: bool,
+) {
+    if current.checkpoint_worlds.get(&pin) != Some(expected) { return; }
+    if registered {
+        if let Some(binding) = current.checkpoint_worlds.get_mut(&pin) {
+            binding.fork_reservation = None;
+        }
+    } else {
+        current.checkpoint_worlds.remove(&pin);
+    }
 }
 
 fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
@@ -1312,6 +1380,35 @@ impl OpenWorld {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusing_a_fork_releases_only_its_own_directory_reservation() -> Result<()> {
+        let mut installation = DeploymentRecord::new("application", "org", Vec::new(), 0);
+        let pin = Uuid::new_v4();
+        let token = WorldForkReservation::Registering(Uuid::new_v4());
+        let binding = CheckpointWorldRetention {
+            fork_reservation: None, world: pin, ancestors: Vec::new(), owner: "owner".into(),
+            capture: Uuid::new_v4(), manifest_sha256: "manifest".into(), schema_digest: [0; 32],
+            suffix: None, basis: TransactionKey { tx_id: rtdb_types::TxId(1), system_time: Timestamp(1) },
+            parent_publication: None, mode: WorldClockMode::Retained, until: Timestamp(100),
+        };
+        let predecessor = Uuid::new_v4();
+        installation.checkpoint_worlds.insert(predecessor, binding.clone());
+        reserve_fork_pin(&mut installation, pin, &binding, token, false)?;
+        let held = installation.checkpoint_worlds[&pin].clone();
+        assert!(reserve_fork_pin(&mut installation, pin, &binding,
+            WorldForkReservation::Registering(Uuid::new_v4()), false).is_err());
+
+        settle_fork_pin(&mut installation, pin, &held, false);
+        assert!(!installation.checkpoint_worlds.contains_key(&pin));
+        assert_eq!(installation.checkpoint_worlds[&predecessor], binding);
+
+        reserve_fork_pin(&mut installation, pin, &binding, token, false)?;
+        settle_fork_pin(&mut installation, pin, &held, true);
+        settle_fork_pin(&mut installation, pin, &held, false);
+        assert_eq!(installation.checkpoint_worlds[&pin], binding);
+        Ok(())
+    }
 
     #[test]
     fn world_shadow_keeps_the_winning_ordinal_on_its_authoring_line() -> Result<()> {

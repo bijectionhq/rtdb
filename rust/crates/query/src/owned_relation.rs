@@ -1163,6 +1163,12 @@ pub async fn read_owned_world(
         .await?.map(|(record, _, retained)| (record, retained)))
 }
 
+pub async fn read_owned_world_at(
+    context: Arc<QueryContext>, owner: &str, world: rtdb_types::Iid, system: Timestamp,
+) -> Result<Option<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)>> {
+    read_owned_world_with_revision(owned_context_at_system(context, system)?, owner, world).await
+}
+
 pub async fn read_owned_world_with_revision(
     context: Arc<QueryContext>, owner: &str, world: rtdb_types::Iid,
 ) -> Result<Option<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)>> {

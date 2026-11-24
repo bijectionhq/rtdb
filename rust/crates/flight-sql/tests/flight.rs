@@ -1421,7 +1421,7 @@ async fn held_root_catalog_keeps_its_cut_and_excludes_retired_declarations() {
 
 #[tokio::test]
 async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_count() {
-    use arrow_array::{ArrayRef, BinaryArray, TimestampMicrosecondArray, builder::{ListBuilder, StringBuilder}};
+    use arrow_array::{ArrayRef, BinaryArray, BooleanArray, TimestampMicrosecondArray, builder::{ListBuilder, StringBuilder}};
     use arrow_ipc::writer::IpcWriteOptions;
     use rtdb_format::ipc::write_arrow_stream;
 
@@ -1449,7 +1449,7 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
         owned_native_actions: true,
         hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
             owner: "xtdb".into(),
-            relations: ["bj_fact_root_owner", "bj_fact_root_program", "bj_relation_declarations"].map(str::to_owned).into(),
+            relations: ["bj_installation", "bj_fact_root_owner", "bj_fact_root_program", "bj_relation_declarations"].map(str::to_owned).into(),
         }),
         ..FlightConfig::default()
     }, &["application"]).await;
@@ -1457,7 +1457,10 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
     client.update("INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', revision: 1, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
     client.update("INSERT INTO bj_fact_root_program RECORDS {_id: 'active', application_schema: 'old', _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
     client.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', declaration: X'01', history_days: 7, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
+    let authority_claim = |writer| format!("INSERT INTO bj_installation RECORDS {{_id: 'authority', kind: 'hosted', incarnation: X'07070707070707070707070707070707', writer: '{writer}', _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}}");
+    client.update(&authority_claim("11111111111111111111111111111111"), None).await;
     let clock = |batches: &[RecordBatch]| batches[0].column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
+    let first_claim = clock(&client.query("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").await);
     let expected = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await);
     let expected_program = clock(&client.query("SELECT _system_from FROM bj_fact_root_program WHERE _id = 'active'").await);
 
@@ -1534,17 +1537,45 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
     body.extend_from_slice(&i64::MAX.to_be_bytes());
     body.extend_from_slice(&u32::try_from(facts.len()).unwrap().to_be_bytes());
     body.extend(facts);
-    body.extend(groups(&[("bj_fact_root_owner", &owner), ("bj_fact_root_program", &program), ("bj_relation_declarations", &declarations)]));
-    let body = Bytes::from(body);
+    let request = |stamp: i64, grant: u8, include_authority: bool| {
+        let authority = ipc([
+            ("_id", Arc::new(StringArray::from(vec!["authority"])) as ArrayRef),
+            ("_expected_micros", Arc::new(Int64Array::from(vec![stamp]))),
+            ("_check_only", Arc::new(BooleanArray::from(vec![true]))),
+        ]);
+        let mut controls: Vec<(&str, &[u8])> = vec![
+            ("bj_fact_root_owner", &owner),
+            ("bj_fact_root_program", &program),
+            ("bj_relation_declarations", &declarations),
+        ];
+        if include_authority { controls.push(("bj_installation", &authority)); }
+        let mut request = stamp.to_be_bytes().to_vec();
+        request.extend([7; 16]);
+        request.extend([grant; 16]);
+        request.extend(&body);
+        request.extend(groups(&controls));
+        Bytes::from(request)
+    };
+    let action = "rtdb.owned.DecideHosted.v4";
+    let omitted = client.action(action, request(first_claim, 0x11, false)).await.unwrap_err();
+    assert!(omitted.message().contains("requires the installed authority check"), "{omitted}");
 
-    let refused = client.action("rtdb.owned.DecideHosted.v2", body.clone()).await.unwrap_err();
+    let refused = client.action(action, request(first_claim, 0x11, true)).await.unwrap_err();
     assert!(refused.message().contains("lacks coverage"), "{refused}");
+
+    client.update(&authority_claim("22222222222222222222222222222222"), None).await;
+    let second_claim = clock(&client.query("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").await);
+    assert!(second_claim > first_claim);
+    let stale = client.action(action, request(first_claim, 0x11, true)).await.unwrap_err();
+    assert!(stale.message().contains("authority changed before ordering"), "{stale}");
+    let wrong_grant = client.action(action, request(second_claim, 0x11, true)).await.unwrap_err();
+    assert!(wrong_grant.message().contains("authority changed before ordering"), "{wrong_grant}");
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 1);
     assert_eq!(integer(&client.query("SELECT count(*) FROM bj_relation_declarations").await[0], 0, 0), 1);
 
     relation.extend(declaration);
     client.action("rtdb.owned.DeclareSpatialPath.v1", relation.into()).await.unwrap();
-    client.action("rtdb.owned.DecideHosted.v2", body).await.unwrap();
+    client.action(action, request(second_claim, 0x22, true)).await.unwrap();
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 2);
     let ordered = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner").await);
     assert_eq!(clock(&client.query("SELECT _system_from FROM bj_fact_root_program WHERE application_schema = 'new'").await), ordered);
