@@ -9,7 +9,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{
-    catalog::{BlockCatalog, CheckpointContents, legacy_table_ref, publication_digest, same_publication_digest},
+    catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref, publication_digest, same_publication_digest},
     envelope::ReplicaBody,
     keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key},
 };
@@ -21,7 +21,8 @@ use rtdb_storage::{
     object_store::ReadReservation,
     sealing::ClassicKeyVault,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Timestamp, TransactionKey};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{BlockDiscovery, BlockStore, PartitionLogs, RecoveredPartition, ReplicaRecord, blocks::matches_catalog_boundary, repair_decision};
@@ -95,23 +96,22 @@ impl RetainRepairBase {
         let result = self.install_locked(source_root.clone(), base_root, &journal, &region, &memory, cancellation, vault.as_ref()).await;
         region.close_and_wait().await;
         drop(region);
-        let boundary = result?;
+        let anchor = result?;
         if reclaim {
             cancelled(cancellation)?;
-            let source = LocalStore::open(source_root)?.with_catalog_ledger(boundary.epoch());
-            let anchor = LocalRepairAnchor { block: self.base.block, boundary, sha256: self.base.sha256 };
+            let source = LocalStore::open(source_root)?.with_catalog_ledger(anchor.boundary.epoch());
             let result = source.retire_classic_log_prefixes(anchor, &journal, ReadOnlyLocalLogOptions::default().maximum_message_bytes, vault.as_ref()).await;
             source.close_and_wait().await;
             result?;
         }
-        Ok(boundary)
+        Ok(anchor.boundary)
     }
 
     async fn install_locked(
         &self, source_root: PathBuf, base_root: PathBuf, journal: &Path,
         region: &Arc<IoRegion>, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
         vault: Option<&ClassicKeyVault>,
-    ) -> Result<ReplicaPosition> {
+    ) -> Result<LocalRepairAnchor> {
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
         let cache = CacheBudget::new(CACHE_BYTES);
         let source = Arc::new(LocalStore::open_in(source_root, region.clone())?);
@@ -132,6 +132,10 @@ impl RetainRepairBase {
         require_root(&base, self.base)?;
         require_offline_lifetime_admission(&base)?;
         base_blocks.verify_primary_inventory(&base, &tables).await?;
+        let primary_inventory_sha256 = primary_inventory_digest(base_blocks.object_store(), &base, &tables, memory, cancellation).await?;
+        if primary_inventory_sha256 != primary_inventory_digest(source_body.as_ref(), &serving, &tables, memory, cancellation).await? {
+            return Err(invalid("The detached repair inventory differs from the serving checkpoint"));
+        }
         for entry in base.table_entries()? {
             cancelled(cancellation)?;
             let table = tables.get(&entry.table).ok_or_else(|| invalid("The base has no bound table block"))?;
@@ -161,9 +165,9 @@ impl RetainRepairBase {
         let record = logs.decode_replica(record)?.ok_or_else(|| invalid("The trusted base has an unknown replica record"))?;
         require_boundary(&record, &base)?;
         cancelled(cancellation)?;
-        let anchor = LocalRepairAnchor { block: self.base.block, boundary, sha256: self.base.sha256 };
+        let anchor = LocalRepairAnchor { block: self.base.block, boundary, sha256: self.base.sha256, primary_inventory_sha256 };
         source.install_repair_anchor(anchor).await?;
-        Ok(boundary)
+        Ok(anchor)
     }
 }
 
@@ -292,7 +296,10 @@ impl PrimaryReset {
             return Err(invalid("The retained repair boundary differs from its exported checkpoint"));
         }
         let staged = Arc::new(LocalStore::open_in(directory.path(), region)?);
-        stage_primary_base(&archive, &staged, &base, tables, memory, cancellation).await?;
+        stage_primary_base(&archive, &staged, &base, &tables, memory, cancellation).await?;
+        if primary_inventory_digest(staged.as_ref(), &base, &tables, memory, cancellation).await? != anchor.primary_inventory_sha256 {
+            return Err(invalid("The retained primary inventory differs from its enrolled checkpoint"));
+        }
         let staged_blocks = BlockStore::new(staged.clone(), pool(staged.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut rebuilt = staged_blocks.recover(Default::default(), source.source_floor()?, Timestamp(0), BlockDiscovery::At(base.block_index())).await?;
         IoRegion::reading(recovery,
@@ -396,12 +403,12 @@ impl RepairRange {
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
         let cache = CacheBudget::new(CACHE_BYTES);
         let source = Arc::new(LocalStore::open_in(source_root, Arc::clone(io_region))?);
-        let (base_receipt, retained_boundary) = match self.base {
+        let (base_receipt, retained_anchor) = match self.base {
             BaseSelection::Explicit(base) => (base, None),
             BaseSelection::Retained => {
                 let anchor = source.retained_repair_anchor().await?
                     .ok_or_else(|| invalid("The source storage has no retained repair base"))?;
-                (RepairCheckpoint { block: anchor.block, sha256: anchor.sha256 }, Some(anchor.boundary.0))
+                (RepairCheckpoint { block: anchor.block, sha256: anchor.sha256 }, Some(anchor))
             }
         };
         require_advancing_cut(base_receipt, self.through)?;
@@ -422,7 +429,7 @@ impl RepairRange {
         require_root(&target, self.through)?;
         require_offline_lifetime_admission(&target)?;
         let after = base.boundary_replica_position().ok_or_else(|| invalid("The base has no replica boundary"))?;
-        if !repair_decision::matches_retained_boundary(retained_boundary, after.0) {
+        if !repair_decision::matches_retained_boundary(retained_anchor.map(|anchor| anchor.boundary.0), after.0) {
             return Err(invalid("The retained repair boundary differs from its exported checkpoint"));
         }
         let through = target.boundary_replica_position().ok_or_else(|| invalid("The target has no replica boundary"))?;
@@ -437,7 +444,12 @@ impl RepairRange {
         let staged = directory.path().join(".staging");
         let stage_io = io_region.child_holding(Some(directory.clone()));
         let destination = Arc::new(LocalStore::open_in(staged.join(root), Arc::clone(&stage_io))?);
-        stage_primary_base(&base_storage, &destination, &base, tables, memory, cancellation).await?;
+        stage_primary_base(&base_storage, &destination, &base, &tables, memory, cancellation).await?;
+        if let Some(anchor) = retained_anchor
+            && primary_inventory_digest(destination.as_ref(), &base, &tables, memory, cancellation).await? != anchor.primary_inventory_sha256
+        {
+            return Err(invalid("The retained primary inventory differs from its enrolled checkpoint"));
+        }
 
         let stage_blocks = BlockStore::new(destination.clone(), pool(destination.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut repaired = stage_blocks.recover(Default::default(), logs.source_floor()?, Timestamp(0), BlockDiscovery::At(base_receipt.block)).await?;
@@ -462,7 +474,7 @@ async fn stage_primary_base(
     base_storage: &LocalStore,
     destination: &LocalStore,
     base: &BlockCatalog,
-    tables: BTreeMap<rtdb_types::TableRef, rtdb_format::catalog::TableBlock>,
+    tables: &BTreeMap<TableRef, TableBlock>,
     memory: &Arc<MemoryBudget>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -490,6 +502,52 @@ async fn stage_primary_base(
     destination.put(&ObjectKey::new(block_key(base.block_index())?)?, Bytes::from(staged_base.encode_for_publication())).await?;
 
     Ok(())
+}
+
+async fn primary_inventory_digest(
+    store: &dyn ObjectStore,
+    catalog: &BlockCatalog,
+    tables: &BTreeMap<TableRef, TableBlock>,
+    memory: &Arc<MemoryBudget>,
+    cancellation: &CancellationToken,
+) -> Result<[u8; 32]> {
+    const PAGE_BYTES: u64 = 256 << 10;
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb/local-repair-primary-inventory/v1\0");
+    for entry in catalog.table_entries()? {
+        let table = tables.get(&entry.table).ok_or_else(|| invalid("The base has no bound table block"))?;
+        let _scratch = memory.reserve(table_manifest_reservation(table.encoded_len())?)?;
+        for name in table.checkpoint_trie_files(&entry, CheckpointContents::Primary)? {
+            cancelled(cancellation)?;
+            let key = ObjectKey::new(name)?;
+            let extent = store.head_fresh(&key).await?.size;
+            digest.update((key.as_str().len() as u64).to_be_bytes());
+            digest.update(key.as_str().as_bytes());
+            digest.update(extent.to_be_bytes());
+            if store.supports_scan_ranges(&key) {
+                let mut offset = 0;
+                while offset < extent {
+                    cancelled(cancellation)?;
+                    let end = offset.saturating_add(PAGE_BYTES).min(extent);
+                    let length = (end - offset) as usize;
+                    let allocation = store.scan_range_allocation(&key, length)?;
+                    let retained = memory.reserve(allocation.retained_bytes)?;
+                    let scratch = (allocation.scratch_bytes != 0).then(|| memory.reserve(allocation.scratch_bytes)).transpose()?;
+                    let body = store.get_reserved_scan_range(&key, offset..end, ReadReservation::funded(length, retained, scratch)).await?;
+                    digest.update(body.as_slice());
+                    offset = end;
+                }
+            } else {
+                let length = usize::try_from(extent).map_err(|_| invalid("A primary object exceeds addressable memory"))?;
+                let allocation = store.whole_object_allocation(&key, length)?;
+                let retained = memory.reserve(allocation.retained_bytes)?;
+                let scratch = (allocation.scratch_bytes != 0).then(|| memory.reserve(allocation.scratch_bytes)).transpose()?;
+                let body = store.get_reserved_object(&key, ReadReservation::funded(length, retained, scratch)).await?;
+                digest.update(body.as_slice());
+            }
+        }
+    }
+    Ok(digest.finalize().into())
 }
 
 fn require_offline_lifetime_admission(catalog: &BlockCatalog) -> Result<()> {

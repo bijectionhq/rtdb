@@ -2412,6 +2412,19 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     hold.base.sha256[0] ^= 1;
     assert_eq!(hold.install(memory.clone(), &cancellation).await.unwrap_err().code, "rtdb.repair/invalid-checkpoint");
     hold.base = receipt(&base);
+    let slug = base.table_entries().unwrap().into_iter().find(|entry| entry.table.table == "docs").unwrap().slug;
+    let trie = rtdb_format::keys::TrieKey::l0(base.block_index()).unwrap();
+    let relative = slug.data_key(&trie);
+    let version = rtdb_format::keys::StorageRoot::new(
+        rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0),
+    ).unwrap().key();
+    let detached_data = trusted_base.join(version).join(relative);
+    let original_data = std::fs::read(&detached_data).unwrap();
+    let mut changed_data = original_data.clone();
+    changed_data[0] ^= 1;
+    std::fs::write(&detached_data, changed_data).unwrap();
+    assert_eq!(hold.install(memory.clone(), &cancellation).await.unwrap_err().code, "rtdb.repair/invalid-checkpoint");
+    std::fs::write(&detached_data, original_data).unwrap();
     assert_eq!(hold.install(memory.clone(), &cancellation).await.unwrap(), base.boundary_replica_position().unwrap());
 
     settings.automatic_gc = true;

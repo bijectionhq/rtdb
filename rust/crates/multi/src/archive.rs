@@ -1602,6 +1602,18 @@ pub(crate) async fn copy_fork_checkpoint(
         destination.put(&source.name, content).await?;
     }
     destination.put(&catalog_key, catalog_bytes).await?;
+    let copied = BlockCatalog::decode(&destination.get_fresh(&catalog_key).await?)?;
+    if copied.publication_sha256() != catalog.publication_sha256() {
+        return Err(inconsistent("The fork destination does not hold the selected checkpoint root"));
+    }
+    let mut closure = catalog_objects(&destination, &copied, CheckpointContents::Replay).await?.into_iter();
+    loop {
+        let batch = closure.by_ref().take(OBSERVATION_BATCH_MEMBERS).collect::<Vec<_>>();
+        if batch.is_empty() { break; }
+        for member in observe_checkpoint_batch(&destination, batch).await? {
+            member.witness.require_extent(member.observed_bytes as u64)?;
+        }
+    }
     Ok(())
 }
 

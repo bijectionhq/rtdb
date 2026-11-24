@@ -98,6 +98,7 @@ async fn malformed_repair_anchor_prevents_collection_after_reopen() -> rtdb_type
     store.put(&file, Bytes::from_static(b"replica bytes")).await?;
     store.install_repair_anchor(rtdb_storage::LocalRepairAnchor {
         block: rtdb_types::BlockIndex(1), boundary: ReplicaPosition(7), sha256: [1; 32],
+        primary_inventory_sha256: [2; 32],
     }).await?;
     drop(store);
     std::fs::write(location.path().join(".tmp/catalog-ledger/repair-anchor"), b"{").unwrap();

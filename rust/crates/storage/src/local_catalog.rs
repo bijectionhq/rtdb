@@ -42,6 +42,7 @@ pub struct LocalRepairAnchor {
     pub block: BlockIndex,
     pub boundary: ReplicaPosition,
     pub sha256: [u8; 32],
+    pub primary_inventory_sha256: [u8; 32],
 }
 
 impl LocalRepairAnchor {
@@ -221,7 +222,8 @@ impl LocalCatalogLedger {
         let prior = self.repair_anchor()?;
         let decision = repair_anchor_decision::install_anchor(
             prior.map(|anchor| (anchor.block.0, anchor.boundary.0)), next.block.0, next.boundary.0,
-            prior.is_some_and(|anchor| same_publication_digest(anchor.sha256, next.sha256)),
+            prior.is_some_and(|anchor| same_publication_digest(anchor.sha256, next.sha256)
+                && same_publication_digest(anchor.primary_inventory_sha256, next.primary_inventory_sha256)),
         );
         match decision {
             AnchorInstallation::Replace => (),
@@ -231,7 +233,7 @@ impl LocalCatalogLedger {
 
         let mut staged = tempfile::NamedTempFile::new_in(&self.directory)
             .map_err(|error| Error::io(&self.directory, error))?;
-        staged.write_all(&serde_json::to_vec(&(next.block, next.boundary, next.sha256)).map_err(invalid)?)
+        staged.write_all(&serde_json::to_vec(&(next.block, next.boundary, next.sha256, next.primary_inventory_sha256)).map_err(invalid)?)
             .map_err(|error| Error::io(staged.path(), error))?;
         crate::sync_file(staged.as_file()).map_err(|error| Error::io(staged.path(), error))?;
         let path = self.directory.join("repair-anchor");
@@ -285,8 +287,8 @@ impl LocalCatalogLedger {
         let mut bytes = Vec::new();
         Read::by_ref(&mut file).take(1025).read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
         if bytes.len() > 1024 { return Err(invalid("Local repair anchor exceeds its format bound")); }
-        let (block, boundary, sha256) = serde_json::from_slice(&bytes).map_err(invalid)?;
-        let anchor = LocalRepairAnchor { block, boundary, sha256 };
+        let (block, boundary, sha256, primary_inventory_sha256) = serde_json::from_slice(&bytes).map_err(invalid)?;
+        let anchor = LocalRepairAnchor { block, boundary, sha256, primary_inventory_sha256 };
         if !anchor.well_formed() { return Err(invalid("Malformed local repair anchor")); }
         Ok(Some(anchor))
     }
