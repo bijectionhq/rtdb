@@ -1,7 +1,7 @@
 {
-  "summary": "The staged archive reader checks manifest and sealed object identity, validates the recovered transaction, and walks the selected live trie vector.",
+  "summary": "The staged archive reader checks manifest and sealed object identity, validates the recovered transaction, selects exactly the live entries of the recovered catalog, and walks the selected live trie vector.",
   "flags": ["--no-external-by-default"],
-  "min_verified_functions": 8,
+  "min_verified_functions": 10,
   "controls": {
     "skip_last_advertised_trie": {
       "defect": "End the file stream before the last trie advertised by the relation header.",
@@ -19,7 +19,25 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 7
+      "min_verified_functions": 9
+    },
+    "skip_first_live_catalog_entry": {
+      "defect": "Omit a live trie in the first catalog position.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/trie_membership.rs",
+          "find": "        if matches!(state, TrieState::Live) {",
+          "replace": "        if index != 0 && matches!(state, TrieState::Live) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/trie_membership.rs",
+          "function": "select_live",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 9
     }
   }
 }

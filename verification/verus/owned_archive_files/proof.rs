@@ -4,6 +4,8 @@ use vstd::prelude::*;
 
 #[path = "../../../rust/crates/multi/src/archive/inventory_identity.rs"]
 mod production;
+#[path = "../../../rust/crates/index/src/trie_membership.rs"]
+mod membership;
 
 verus! {
 
@@ -51,9 +53,18 @@ fn owned_file_stream_step<T>(selected: &[T], index: usize) -> (entry: Option<(&T
     ensures
         entry is None <==> index == selected@.len(),
         entry matches Some((file, next)) ==> *file == selected@[index as int]
-            && index < next <= selected@.len(),
+            && next == index + 1 <= selected@.len(),
 {
     production::next_owned_file(selected, index)
+}
+
+fn archive_trie_membership<T: Copy, At: Copy>(inventory: &[(T, membership::TrieState<At>)])
+    -> (selected: Vec<T>)
+    ensures
+        selected@ == inventory@.filter(|entry: (T, membership::TrieState<At>)| entry.1 is Live)
+            .map_values(|entry: (T, membership::TrieState<At>)| entry.0),
+{
+    membership::select_live(inventory)
 }
 
 } // verus!
