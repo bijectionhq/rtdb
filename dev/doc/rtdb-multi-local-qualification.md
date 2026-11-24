@@ -211,6 +211,97 @@ For a different bridge target, use its name in the grants and add a dedicated pa
 That principal can seed the bridge with an explicit name and UUID through the existing Create action.
 The profile rejects wildcard database grants and requires a grant mapping for each UserList principal.
 
+## Combined OIDC Create and assignment profile
+
+Use a third, independent native Multi process with a fresh data directory and bootstrap UUID.
+Keep the separate OIDC Create and fixed UserList runs as independent evidence.
+Reuse the loopback Flight certificate and readiness procedure above with a fresh Flight TLS directory.
+Keep all YAML, keys, credential responses and attempt exports in owner-only files in the disposable directory.
+
+Use two separate loopback HTTPS OIDC origins with different issuing CAs and leaf IP SANs.
+The sample addresses allow the Bijection Create fixture to keep its existing `127.0.0.3:443` OIDC listener and put assignment OIDC on `127.0.0.4:443`.
+Bind only addresses available in the isolated qualification environment.
+Use the OIDC server CA for each issuer's discovery, token and UserInfo requests.
+The acquisition listeners' mTLS roots and the RTDB Flight CA have their own inputs.
+
+```yaml
+authn: !ManagedWorkloadOidc
+  create:
+    issuerUrl: https://127.0.0.3/
+    issuerCaCertificate: !Env RTDB_LOCAL_CREATE_OIDC_CA
+    audience: local-rtdb-create
+    clientIdPrefix: local-create-
+  assignment:
+    issuerUrl: https://127.0.0.4/
+    issuerCaCertificate: !Env RTDB_LOCAL_ASSIGNMENT_OIDC_CA
+    audience: local-rtdb-assignment
+    clientIdPrefix: local-assignment-
+    authorityPoint:
+      relation: public.app_installation
+      rowId: authority
+      validAtMicros: 0
+```
+
+Match each audience and prefix to its issuer and use the same serialized issuer URL as its receipt identity.
+`public.app_installation` is the generic RTDB fixture point on `main`.
+For an existing application Original, configure the application's exact registered authority point.
+
+```bash
+RTDB_LOCAL_CREATE_OIDC_CA=$(cat "$work/create-oidc-ca.pem") \
+RTDB_LOCAL_ASSIGNMENT_OIDC_CA=$(cat "$work/assignment-oidc-ca.pem") \
+  "$RTDB" dev --multi --data "$work/rtdb-combined" --multi-tls-dir "$combined_tls" \
+  --incarnation "$combined_bootstrap_id" --multi-authn "$work/combined.yaml" \
+  --flight-sql-port 0 >"$work/combined.ready" 2>"$work/combined.stderr" &
+combined_pid=$!
+```
+
+Start both issuers before RTDB discovers them.
+Verify readiness against `combined_bootstrap_id` and verify Flight TLS against `combined_tls/ca.pem` as above.
+Use the endpoint from this readiness record for both workload calls.
+In separate fresh startups, replace one configured OIDC CA at a time with the other CA and require startup to fail before Flight readiness.
+
+The Bijection harness `crates/cell_management/qualification/local-rtdb.sh` and `rtdb_admin::qualification::durable_create_oidc` provide the separate real Create and UserList fixtures.
+Reuse the real Create harness's enrolled cell identity and accepted durable INSTALL for the v1 acquisition.
+Hold that INSTALL while exercising its current grant.
+Prepare the v2 case on an exact ready Original in the combined Multi process with an empty authority point, a separately admitted installation and its live reserved first target.
+Separate deployment names and UUIDs let both grants stay valid if placement preparation requires completion of the other INSTALL.
+Provision the assignment target first with its own accepted INSTALL and exact Create grant, then retain its admitted installation and placement intent.
+The v2 issuer must revalidate the stamped first placement intent, matching installation digest, placement epoch 1, assignment, holder and target before issuing the exact `advance-placement` grant with empty predecessor.
+Acquire through the issuer's separate private mTLS listener using its enrolled placement-controller leaf for that catalog history.
+Use the retained original Advance protobuf body from `PreparedSubmission.body` in the stamped attempt record and pause its automatic submission until the probe runs.
+The Bijection runtime retains the exact body before the acquisition call and uses the same namespace and key for submission.
+The separate Bijection harness currently has no combined first-placement fixture that prepares this evidence and pauses the submission.
+
+After preparing both authorities, save the complete Create acquisition response as `create-credential.json` and the version 2 delivery as `assignment-credential.json`.
+Preserve the v2 delivery's `issuer`, `sub`, grant ID and scope.
+Write the retained protobuf body bytes as `first-advance.pb` without re-encoding it.
+Write a private `combined-fixture.json` beside those files with the actual Flight socket and the Flight CA path.
+
+```json
+{
+  "flight_address": "127.0.0.1:32123",
+  "flight_ca": "combined-tls/ca.pem",
+  "create_credential": "create-credential.json",
+  "assignment_credential": "assignment-credential.json",
+  "frozen_advance_body": "first-advance.pb"
+}
+```
+
+Use the matching prebuilt `rtdb-flight-sql` `flight` integration test executable with Multi support.
+This ignored probe uses the existing Flight fixture client and requires a private manifest.
+
+```bash
+RTDB_COMBINED_WORKLOAD_FIXTURE="$work/combined-fixture.json" "$RTDB_FLIGHT_TEST" \
+  v1_contract::managed_workload_qualification::combined_local_workload_oidc_exact_roles \
+  --exact --ignored
+```
+
+Require one passed probe from the executable.
+The Create credential confirms the exact reserved name and UUID and receives `PermissionDenied` for the typed Advance action.
+The assignment credential receives `PermissionDenied` for Create of its own exact deployment and a fresh `Then` for the frozen first Advance with the expected receipt namespace, key and database incarnation.
+Both rejections follow successful `Client` handshakes and present the database of the credential being checked.
+Retain the accepted INSTALL, the stamped v2 first intent and attempt, the exact source revisions and the probe result as separate evidence.
+
 ## One Multi writer and three durable keepers
 
 Use a prebuilt Logkeeper executable with the `stream` feature and the protocol revision pinned by the RTDB source.

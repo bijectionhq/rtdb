@@ -8,6 +8,10 @@ use rtdb_types::EntityId;
 const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
 
 #[cfg(feature = "multi")]
+#[path = "managed_workload_qualification.rs"]
+mod managed_workload_qualification;
+
+#[cfg(feature = "multi")]
 #[tokio::test]
 async fn checkpoint_administration_requires_a_verified_unscoped_credential() {
     use rtdb_flight_sql::{

@@ -153,7 +153,7 @@ fn multi_tls_development_mounts_custody_only_for_the_exact_original() {
 }
 
 #[test]
-fn multi_tls_development_authn_admits_oidc_or_user_list_only() {
+fn multi_tls_development_authn_preserves_separate_oidc_and_user_list_profiles() {
     use rtdb_auth::{AuthConfig, GrantedAccess};
     let mut input = tempfile::NamedTempFile::new().unwrap();
     let path = input.path().to_str().unwrap().to_owned();
@@ -217,6 +217,53 @@ fn multi_tls_development_authn_admits_oidc_or_user_list_only() {
         assert!(options.load_reserved().is_ok());
     }
     assert!(cli::parse(["dev", "--multi", "--multi-authn", path].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
+fn multi_tls_development_admits_a_separate_loopback_managed_workload_oidc_profile() {
+    use rtdb_auth::AuthConfig;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    let path = input.path().to_str().unwrap().to_owned();
+    let arguments = [
+        "dev", "--multi", "--data", "fresh", "--incarnation", "01234567-89ab-4def-8000-000000000001",
+        "--multi-tls-dir", "tls", "--multi-authn", &path,
+    ];
+    let Command::Dev(options) = parse(&arguments) else { panic!("expected development TLS"); };
+    let profile = r#"authn: !ManagedWorkloadOidc
+  create:
+    issuerUrl: https://127.0.0.3/
+    issuerCaCertificate: create fixture CA
+    audience: local-create
+    clientIdPrefix: local-create-
+  assignment:
+    issuerUrl: https://127.0.0.4/
+    issuerCaCertificate: assignment fixture CA
+    audience: local-assignment
+    clientIdPrefix: local-assignment-
+    authorityPoint:
+      relation: public.app_installation
+      rowId: authority
+      validAtMicros: 0
+"#;
+    input.write_all(profile.as_bytes()).unwrap();
+    let loaded = options.load_reserved().unwrap();
+    let AuthConfig::ManagedWorkloadOidc(auth) = &loaded.configuration().auth else { panic!("expected combined OIDC"); };
+    assert_eq!(auth.create().issuer_url().as_str(), "https://127.0.0.3/");
+    assert_eq!(auth.assignment().issuer_url().as_str(), "https://127.0.0.4/");
+    assert_eq!(auth.assignment().grants().client_id_prefix(), "local-assignment-");
+    assert!(auth.create().grants().assignment().is_none());
+
+    for invalid in [
+        profile.replace("127.0.0.3", "create.example.invalid"),
+        profile.replace("127.0.0.4", "assignment.example.invalid"),
+        profile.replace("127.0.0.4", "127.0.0.3"),
+        profile.replace("clientIdPrefix: local-assignment-", "clientIdPrefix: local-create-shadow-"),
+        format!("{profile}deploymentCreatePrincipals: [seed]\n"),
+    ] {
+        std::fs::write(&path, invalid).unwrap();
+        assert!(options.load_reserved().is_err());
+    }
 }
 
 #[test]
