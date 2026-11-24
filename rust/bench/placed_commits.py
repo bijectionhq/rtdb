@@ -206,11 +206,12 @@ def prepare(pg, port, workload):
     return "rtdb.owned.DecideHosted.v4", lambda key: hosted_commit(claim, key, workload == "hosted-staged")
 
 
-def verify(port, acknowledged):
+def verify(port, acknowledged, receipt_floor):
     client, options, _ = connect(port)
     try:
-        handle = action(client, options, "rtdb.owned.OpenRead.v3", b"")[:16].to_pybytes()
-        valid = pa.array([None], type=pa.int64())
+        floor = INSTALLATION.bytes + b"\1" + struct.pack(">qqQ", *receipt_floor, 0)
+        handle = action(client, options, "rtdb.owned.OpenAppliedRead.v5", floor)[:16].to_pybytes()
+        valid = pa.array([max(receipt_floor[1], time.time_ns() // 1000)], type=pa.int64())
         try:
             for first in range(0, len(acknowledged), 64):
                 keys = acknowledged[first:first + 64]
@@ -311,7 +312,7 @@ def measure(args, count, logs, pg, port, health, holder):
     latencies = sorted(latency for _, _, batch in results for latency in batch)
     if not latencies:
         raise RuntimeError("No measured commits")
-    verify(port, keys)
+    verify(port, keys, receipts[-1])
     if args.workload != "commit-v7":
         verify_hosted_receipts(pg, results)
     return dict(action=name, workload=args.workload, clients=count, seconds=args.seconds, offered_rate=args.rate,
