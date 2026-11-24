@@ -6,7 +6,10 @@ use rtdb_plan::CatalogRows;
 use rtdb_query::{OrderedIndexInventory, OrderedIndexStorage, QueryContext};
 use rtdb_types::{OwnedRelation, Result, TableRef};
 
-use super::{checkpoint, definitions, format_error, maintenance::source_frontier, tree::Tree};
+use super::{
+    DefinitionSet, checkpoint, definition_allocation_overflow, definitions, format_error,
+    maintenance::source_frontier, tree::Tree,
+};
 
 /// Totals only requested Root tables from the held owner's protected path catalog.
 pub(crate) async fn owned_file_bytes(
@@ -23,14 +26,16 @@ pub(crate) async fn owned_file_bytes(
     let Some(cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(context), &catalog, None).await? else {
         return Ok(());
     };
-    for definition in super::read_definitions(cursor).await? {
+    let mut definitions = DefinitionSet::new(&context.memory)?;
+    super::read_definitions(cursor, &mut definitions).await?;
+    for definition in definitions.iter() {
         if !catalog.owns_path_target(&definition.table) {
             return Err(format_error("Owned path definition refers to another owner or an internal catalog"));
         }
         let Some(bytes) = totals.get_mut(&definition.table) else { continue; };
         context.check_cancelled()?;
         let through = source_frontier(snapshot, &definition.table);
-        if let Some((_, size)) = checkpoint_file_bytes(context, &database.storage, &definition, through).await? {
+        if let Some((_, size)) = checkpoint_file_bytes(context, &database.storage, definition, through).await? {
             *bytes = bytes.checked_add(size).ok_or_else(|| format_error("Ordered index file bytes overflow"))?;
         }
     }
@@ -62,14 +67,14 @@ impl OrderedIndexInventory for Inventory {
         context: &QueryContext,
     ) -> Result<CatalogRows<OrderedIndexStorage>> {
         let database = context.catalog.database(name)?;
-        let mut indexes = BTreeMap::new();
         let mut allocations = Vec::new();
+        let mut indexes = BTreeMap::new();
         for snapshot in &database.partitions {
             context.check_cancelled()?;
             let now = snapshot
                 .tx_basis()
                 .map_or(context.current_time, |key| key.system_time.into());
-            for definition in definitions(
+            let Some(definitions) = definitions(
                 name,
                 snapshot,
                 &database.storage,
@@ -77,19 +82,12 @@ impl OrderedIndexInventory for Inventory {
                 now,
                 &context.cancellation,
             )
-            .await?
-            .iter()
-            {
-                let bytes = [
-                    &definition.name,
-                    &definition.table.schema,
-                    &definition.table.table,
-                ]
-                .into_iter()
-                .chain(&definition.columns)
-                .fold(1024usize, |bytes, name| {
-                    bytes.saturating_add(name.len().saturating_mul(2))
-                });
+            .await? else {
+                continue;
+            };
+            for definition in definitions.iter() {
+                let bytes = definition.payload_bytes_for(&definition.table)?
+                    .checked_add(1024).ok_or_else(definition_allocation_overflow)?;
                 allocations.push(context.memory.reserve(bytes)?);
                 let through = source_frontier(snapshot, &definition.table);
                 let current = indexes.entry(definition.clone()).or_insert(through);

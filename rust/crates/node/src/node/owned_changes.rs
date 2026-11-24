@@ -10,6 +10,8 @@ use rtdb_types::{
     OwnedRelation, Result, Timestamp, TransactionKey, TxId, Value, change_feed_uncovered,
 };
 
+use crate::ordered_index::OwnedPathColumns;
+
 use super::{
     OwnedChangePage, OwnedReadSession, OwnedVersion, OwnedVersionOrder, OwnedVersionPage,
     OwnedVersionRequest, historical_owned_read,
@@ -480,7 +482,7 @@ impl OwnedReadSession {
     pub async fn path_touch_columns(
         &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
         publication: TransactionKey, valid: Timestamp,
-    ) -> Result<Vec<String>> {
+    ) -> Result<OwnedPathColumns> {
         let page = self.merged_changes_window(
             std::slice::from_ref(relation), OwnedChangeEdge::before(publication),
             publication.into(), 1, false,
@@ -500,7 +502,7 @@ impl OwnedReadSession {
     pub async fn world_path_touch(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, path: &OwnedRelation,
         id: &EntityId, group: Timestamp, valid: Timestamp,
-    ) -> Result<(Vec<String>, [super::OwnedWorldShadowRead; 2])> {
+    ) -> Result<(OwnedPathColumns, [super::OwnedWorldShadowRead; 2])> {
         let (before, columns) = self.certify_world_path_touch(world, relation, path, id, group, valid).await?;
         let before = self.read_world_shadow_at(world, relation, id, valid, before, false).await?;
         let after = self.read_world_shadow_at(world, relation, id, valid, group, false).await?;
@@ -510,7 +512,7 @@ impl OwnedReadSession {
     async fn certify_world_path_touch(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, path: &OwnedRelation,
         id: &EntityId, group: Timestamp, valid: Timestamp,
-    ) -> Result<(Timestamp, Vec<String>)> {
+    ) -> Result<(Timestamp, OwnedPathColumns)> {
         let before = Timestamp(group.0.checked_sub(1).ok_or_else(change_feed_uncovered)?);
         let page = self.world_merged_changes(world, std::slice::from_ref(relation), before, group, 1).await?;
         require_path_touch(&page, relation, id, group, valid)?;
@@ -1111,7 +1113,7 @@ pub async fn archived_changes_at_cut(
 pub async fn archived_path_touch_at_cut(
     context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
     id: &EntityId, selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp,
-) -> Result<Vec<String>> {
+) -> Result<OwnedPathColumns> {
     if before.next()? != group || group > selected { return Err(change_feed_uncovered()); }
     let page = archived_changes_at_cut(Arc::clone(&context), owner, relation, before, group, 1, false).await?;
     let root = relation.root_relation().unwrap_or_else(|| relation.clone());
