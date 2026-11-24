@@ -49,9 +49,13 @@ impl rtdb_node::WorldConstraintArchive for WorldArchive {
         let family = crate::keys::family_vault_address(deployment, client_family);
         let region = rtdb_storage::IoRegion::new();
         let families = self.keys.assertion_families(region).ok_or_else(unavailable)?;
-        let winner = match claim.winner {
-            Some(winner) => Some((winner, self.keys.assertion_keys().ok_or_else(unavailable)?)),
-            None => None,
+        let winner = match (claim.winner, claim.root_carrier) {
+            (Some(winner), None) => Some((winner, self.keys.assertion_keys().ok_or_else(unavailable)?)),
+            (None, Some(carrier)) => {
+                families.require_root_retirement_carrier(family, client_family, claim.marker, carrier).await?;
+                None
+            }
+            _ => return Err(unavailable()),
         };
         families.claim_fence(family, client_family, claim.marker, claim.attempt, claim.durable_predecessor, claim.root_erases, winner).await
     }

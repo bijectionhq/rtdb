@@ -203,7 +203,10 @@ For a world retirement, the transaction supplies one present observed point chec
 The resolver rereads that exact witnessed valid instant against the current ordered base.
 It rejects ambiguous present witnesses and authenticates the winning carrier's physical world, publication and positive ordinal, the observed point version, and its sealed payload at the enrolled slot.
 The original vault checks that the carrier belongs to the stable bound member from `ResolveFamilyMember.v1`.
-A rewrite can have a different authoring line from its registered member. A Root retirement supplies the active Root member in both position fields.
+A rewrite can have a different authoring line from its registered member.
+A Root retirement supplies the active Root member in both position fields.
+The ordered resolver reads the current Root carrier at the retiring fence identity and verifies its publication.
+The original vault verifies that carrier's family, stage, destination assertion, target, payload digest and link digest against the exact accepted Root binding before it claims the fence.
 The source refuses world winners that exist only in an inherited layer.
 A nonterminal controlled Proposal retirement with Root erases uses world-batch Root kind 8.
 Its Root publication section has the same hold and independent attempt as kind 2.
@@ -238,7 +241,10 @@ The fixed assertion profile is not installed on hosted cells, so this action is 
 
 A Bijection Root carrier contains the existing unit-sealed payload inside an assertion envelope sealed by the RTDB broker under the reservation's fresh destination stage.
 The Root unit fence and the original family fence both govern release.
-The landing authority verifies equivalent effective disclosure, including access to the Proposal and world, before probing or opening the source.
+The landing authority verifies that Proposal and Root have the same installed payload audience before probing or opening the source.
+This comparison includes the effective world payload-read gate at the reviewed source and the installed payload-read authority at Root.
+Matching label strings alone does not establish equality.
+Proposal authoring, review and approval grants give no payload-read standing.
 The receipt, destination and branch retirement share the prepared-generation switch at the protected publication label.
 The receipt stores the sealed link under the distinct link stage; the Root carrier requires only the destination stage.
 

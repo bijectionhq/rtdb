@@ -131,26 +131,52 @@ impl OpenTransaction<'_> {
         }
         let (retirement_world, retirement_id) = retirement.ok_or_else(invalid)?;
         let rows = match retirement_world {
-            Some(world) => Some(self.assertion_fence_world_winner(
+            Some(world) => self.assertion_fence_world_winner(
                 owner, operations, world, &retirement_id, marker.winner,
-            ).await?),
-            None => None,
+            ).await?,
+            None => self.assertion_fence_root_winner(owner, &retirement_id, marker.winner).await?,
         };
-        let winner = match (&rows, retirement_world, &retirement_id) {
-            (Some(rows), Some(world), EntityId::String(key)) => {
-                let carrier = ArrowCell::named(rows.batch(), "sealed_payload", 0)
-                    .and_then(ArrowCell::binary).ok_or_else(invalid)?;
-                Some(super::AssertionFenceWorldWinner { world, key, carrier })
-            }
-            (None, None, _) => None,
+        let carrier = ArrowCell::named(rows.batch(), "sealed_payload", 0)
+            .and_then(ArrowCell::binary).ok_or_else(invalid)?;
+        let (winner, root_carrier) = match (retirement_world, &retirement_id) {
+            (Some(world), EntityId::String(key)) => (Some(super::AssertionFenceWorldWinner { world, key, carrier }), None),
+            (None, EntityId::String(_)) => (None, Some(carrier)),
             _ => return Err(invalid()),
         };
         archive.claim_assertion_family_fence(super::AssertionFenceClaim {
             database: &self.context.database, attempt, durable_predecessor: self.buffer.base_snapshot().tx_basis(),
-            family, marker, winner, root_erases: &root_erases,
+            family, marker, winner, root_carrier, root_erases: &root_erases,
         }).await?;
         self.family_fence_admitted = true;
         Ok(())
+    }
+
+    async fn assertion_fence_root_winner(
+        &self, owner: &str, id: &EntityId, winner: rtdb_types::Position,
+    ) -> Result<OwnedBatch> {
+        let invalid = invalid_family_fence;
+        let relation = OwnedRelation::new("fact_unit_column_payloads")?;
+        let at = self.tx_key().system_time;
+        let context = self.context.query_context(
+            self.buffer.base_snapshot().clone(), at, &self.options.default_tz, self.trace_parent,
+        )?;
+        let mut cursor = rtdb_query::open_owned_assertion_point(
+            context, owner, &relation, id, Some(Interval::at(at)?), false,
+        ).await?.ok_or_else(invalid)?;
+        let mut selected = None;
+        while let Some(rows) = cursor.next_batch().await? {
+            match rows.batch().num_rows() {
+                0 => continue,
+                1 if selected.is_none() => selected = Some(rows),
+                _ => return Err(invalid()),
+            }
+        }
+        let rows = selected.ok_or_else(invalid)?;
+        let revision = rtdb_query::owned_row_revision(rows.batch(), 0, id, &self.context.memory)?;
+        if u64::try_from(revision.0).ok() != Some(winner.publication) {
+            return Err(invalid());
+        }
+        Ok(rows)
     }
 
     async fn assertion_fence_world_winner(

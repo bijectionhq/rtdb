@@ -94,6 +94,42 @@ impl AssertionFamilies<'_> {
         Ok(body)
     }
 
+    /// Authenticate a physical Root carrier against the immutable activation.
+    /// The erasing transaction does not need to acquire payload release.
+    pub(crate) async fn require_root_retirement_carrier(
+        &self, family: Uuid, client_family: Uuid, marker: AssertionFamilyFenceMarker, carrier: &[u8],
+    ) -> Result<()> {
+        let carrier = carrier.strip_prefix(b"BJRL1").ok_or_else(conflict)?;
+        let (carrier_family, carrier) = carrier.split_first_chunk::<16>().ok_or_else(conflict)?;
+        let (stage, carrier) = carrier.split_first_chunk::<40>().ok_or_else(conflict)?;
+        let (assertion, carrier) = carrier.split_first_chunk::<32>().ok_or_else(conflict)?;
+        let (target, carrier) = carrier.split_first_chunk::<{ RootLandingTarget::WIDTH }>().ok_or_else(conflict)?;
+        let (link_digest, payload) = carrier.split_first_chunk::<32>().ok_or_else(conflict)?;
+        if carrier_family != client_family.as_bytes() || marker.selected != marker.winner || payload.is_empty() {
+            return Err(conflict());
+        }
+        let assertion = AssertionId::from_bytes(*assertion);
+        let target = RootLandingTarget::from_bytes(*target).map_err(|_| conflict())?;
+        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        let landing = record.landings.iter().find(|landing| landing.reservation.destination == assertion)
+            .ok_or_else(conflict)?;
+        let capability = landing.reservation.capability;
+        if &stage[..16] != capability.deployment().as_bytes()
+            || stage[16..24] != capability.incarnation().get().to_be_bytes()
+            || &stage[24..] != capability.identity().as_bytes()
+        {
+            return Err(conflict());
+        }
+        let mut payload_digest = [0; 32];
+        payload_digest.copy_from_slice(digest(&SHA256, payload).as_ref());
+        let binding = RootLandingBinding {
+            position: marker.winner, assertion, stage: *capability.identity().as_bytes(),
+            target, payload_digest, link_digest: *link_digest,
+        };
+        require_binding(landing.accepted.as_ref().ok_or_else(conflict)?, binding.position, root_binding_digest(binding))
+    }
+
     async fn require_live_root_landing(
         &self, family: Uuid, stage: AssertionStage, binding: RootLandingBinding,
     ) -> Result<()> {

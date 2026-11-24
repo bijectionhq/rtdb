@@ -29,6 +29,7 @@ pub struct AssertionFenceClaim<'a> {
     pub family: [u8; 16],
     pub marker: rtdb_types::AssertionFamilyFenceMarker,
     pub winner: Option<AssertionFenceWorldWinner<'a>>,
+    pub root_carrier: Option<&'a [u8]>,
     pub root_erases: &'a BTreeSet<(&'a OwnedRelation, &'a EntityId)>,
 }
 
