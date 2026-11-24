@@ -349,7 +349,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 191 } else { 49 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 192 } else { 50 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
             held_root_catalog: true,
@@ -838,11 +838,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let from = arguments.required("from")?;
             let org = if arguments.present("org") { Some(arguments.required("org")?) } else { None };
             let task = hosted_task(&arguments)?;
-            let destination = admin::ForkDestination { name: arguments.required("name")?, org, hosted_task: task.as_ref() };
+            let broker = replay_broker_client(&arguments, "")?;
+            let destination = admin::ForkDestination {
+                name: arguments.required("name")?, org, hosted_task: task.as_ref(), broker: broker.as_ref(),
+            };
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
                     let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;
-                    admin::fork_time_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, replay_broker_client(&arguments, "")?.as_ref(), rtdb_types::Timestamp(time.timestamp_micros()), 4 << 20).await?
+                    admin::fork_time_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, broker.as_ref(), rtdb_types::Timestamp(time.timestamp_micros()), 4 << 20).await?
                 }
                 (at_block, _) => match at_block {
                 Some(block) => {

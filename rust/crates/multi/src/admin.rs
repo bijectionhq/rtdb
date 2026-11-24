@@ -545,12 +545,13 @@ pub struct ForkDestination<'a> {
     pub name: &'a str,
     pub org: Option<&'a str>,
     pub hosted_task: Option<&'a rtdb_directory::HostedTask>,
+    pub broker: Option<&'a crate::replay_broker::Client>,
 }
 
 /// Forks `parent` into a new deployment in its lineage.
 /// The parent is flushed, and the child references its objects and starts on fresh logs.
 pub async fn fork(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
-    fork_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, control).await
+    fork_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None, broker: None }, control).await
 }
 
 pub async fn fork_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, control: &ControlKey) -> Result<DeploymentRecord> {
@@ -565,7 +566,7 @@ pub async fn fork_into(directory: &Arc<dyn Directory>, storage: &CellStorage, ke
 /// Forks `parent` as of one of its past blocks: the fork's state is that block's, and what the parent wrote after it is not the fork's.
 /// The fork is admitted only while the selected block's complete checkpoint inventory is still available.
 pub async fn fork_at_block(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64) -> Result<DeploymentRecord> {
-    fork_block_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, block).await
+    fork_block_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None, broker: None }, block).await
 }
 
 pub async fn fork_block_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, block: i64) -> Result<DeploymentRecord> {
@@ -578,7 +579,7 @@ pub async fn fork_block_into(directory: &Arc<dyn Directory>, storage: &CellStora
 /// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
 /// A time before the checkpoint is a past block's, which `fork_at_block` forks from.
 pub async fn fork_at_time(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, broker: Option<&crate::replay_broker::Client>, system_time: rtdb_types::Timestamp, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    fork_time_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, broker, system_time, maximum_message_bytes).await
+    fork_time_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None, broker }, broker, system_time, maximum_message_bytes).await
 }
 
 pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, broker: Option<&crate::replay_broker::Client>, system_time: rtdb_types::Timestamp, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
@@ -662,6 +663,11 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
         child.replica_journals.extend(servers.iter().cloned());
         Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
     };
+    let custody_broker = match preparation {
+        ForkPublication::Hosted(_) if same_organisation => Some(destination.broker.ok_or_else(||
+            Anomaly::incorrect("rtdb.multi/fork-custody", "A shared hosted fork needs the original custody broker"))?),
+        _ => None,
+    };
     let hosted = match preparation {
         ForkPublication::Hosted(preparation) => {
             let stage = directory.stage_hosted_fork(child.clone(), preparation).await?;
@@ -672,6 +678,10 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
         _ => None,
     };
     let prepared = async {
+        if let (Some(broker), ForkPublication::Hosted(preparation)) = (custody_broker, preparation) {
+            use crate::replay_broker::History;
+            broker.enroll_fork(History::of(source)?, History::of(&child)?, preparation).await?;
+        }
         let bucket = match &hosted {
             Some((_, _, target_io)) => storage.bucket(target_io.clone()).await?,
             None => bucket,
@@ -2768,7 +2778,7 @@ mod tests {
             bucket.put(&key, Bytes::from_static(name.as_bytes())).await.unwrap();
         }
 
-        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
+        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None, broker: None };
         let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
         let fork_store = format!("{}/v06", child.storage_prefix());
@@ -2952,7 +2962,7 @@ mod tests {
         let updated = directory.replace_deployment(updated, source.version).await.unwrap().applied().unwrap();
         let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &source,
-                super::ForkDestination { name: "child", org: None, hosted_task: None }, None, Vec::new(), 4 << 20)).await.unwrap();
+                super::ForkDestination { name: "child", org: None, hosted_task: None, broker: None }, None, Vec::new(), 4 << 20)).await.unwrap();
         assert_eq!(keys.existing(&child.key_id()).await.unwrap(), key);
         let before = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
 
@@ -2962,7 +2972,7 @@ mod tests {
         directory.replace_deployment(deleting, updated.version).await.unwrap().applied().unwrap();
         let error = super::with_fork_access(directory.as_ref(), &storage, &keys, &updated, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &updated,
-                super::ForkDestination { name: "refused", org: None, hosted_task: None }, None, Vec::new(), 4 << 20)).await.unwrap_err();
+                super::ForkDestination { name: "refused", org: None, hosted_task: None, broker: None }, None, Vec::new(), 4 << 20)).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/fork-unavailable");
         assert!(directory.deployment_by_name("refused").await.unwrap().is_none());
         let after = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
@@ -2992,10 +3002,10 @@ mod tests {
         let bytes = Bytes::from_static(b"rows");
         bucket.put(&object, bytes.clone()).await.unwrap();
 
-        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
+        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None, broker: None };
         let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
-        let destination = super::ForkDestination { name: "grandchild", org: None, hosted_task: None };
+        let destination = super::ForkDestination { name: "grandchild", org: None, hosted_task: None, broker: None };
         let old_generation = directory.lineage_state(&child.lineage).await.unwrap().open_generation().unwrap();
         let preparation = super::ForkPublication::Remote { generation: old_generation };
         let mut staged = DeploymentRecord::new(destination.name, &child.org, Vec::new(), 0);

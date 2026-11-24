@@ -155,6 +155,15 @@ struct Work {
     join: Option<WorkJoin>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkEnrollment {
+    pub(super) parent: History,
+    pub(super) child: History,
+    pub preparation: rtdb_directory::ForkPreparation,
+    pub enrollment: Root,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
@@ -165,6 +174,7 @@ struct State {
     duties: BTreeMap<Uuid, Work>,
     operation: Option<Operation>,
     sql_intents: BTreeMap<Uuid, SqlIntent>,
+    forks: BTreeMap<Uuid, ForkEnrollment>,
     root_drains: BTreeMap<Uuid, SignedRootDrain>,
     destruction: BTreeMap<Uuid, RootDestruction>,
     last_completed: Option<Completion>,
@@ -181,6 +191,7 @@ impl State {
             duties: BTreeMap::new(),
             operation: None,
             sql_intents: BTreeMap::new(),
+            forks: BTreeMap::new(),
             root_drains: BTreeMap::new(),
             destruction: BTreeMap::new(),
             last_completed: None,
@@ -280,6 +291,36 @@ impl State {
                 }
                 self.roots.insert(*root, *enrollment);
             }
+            Action::ReserveFork { fork } => {
+                let child = fork.child.deployment;
+                if let Some(prior) = self.forks.get(&child) {
+                    if prior == fork { return Ok(()); }
+                    return Err(conflict("A different custody enrollment owns this fork"));
+                }
+                self.require_open(self.generation)?;
+                let parent = self.roots.get(&fork.parent.deployment)
+                    .ok_or_else(|| conflict("The fork source is outside the custody membership"))?;
+                if parent.history != directory_history(fork.parent)?
+                    || fork.enrollment.history != directory_history(fork.child)?
+                    || self.roots.contains_key(&child)
+                {
+                    return Err(conflict("The fork has different custody history"));
+                }
+                self.forks.insert(child, *fork);
+            }
+            Action::FinishFork { fork, published } => {
+                let child = fork.child.deployment;
+                let Some(current) = self.forks.get(&child) else { return Ok(()); };
+                if current != fork || self.operation.is_some() {
+                    return Err(conflict("The custody enrollment changed before its directory decision"));
+                }
+                if *published {
+                    self.apply(&Action::Enroll {
+                        generation: self.generation, root: child, enrollment: fork.enrollment,
+                    })?;
+                }
+                self.forks.remove(&child);
+            }
             Action::RecordSql { generation, intent, signature } => {
                 if *generation != self.generation {
                     return Err(conflict("The SQL initiation belongs to a closed custody generation"));
@@ -331,6 +372,7 @@ impl State {
                 }
                 self.require_open(*generation)?;
                 if self.roots.is_empty()
+                    || !self.forks.is_empty()
                     || operation.is_nil()
                     || *target == [0; 32]
                     || self.completed_operations.contains(operation)
@@ -562,6 +604,10 @@ pub enum Action {
         root: Uuid,
         enrollment: Root,
     },
+    #[serde(skip)]
+    ReserveFork { fork: ForkEnrollment },
+    #[serde(skip)]
+    FinishFork { fork: ForkEnrollment, published: bool },
     RecordSql {
         generation: u64,
         intent: SqlIntent,
@@ -761,6 +807,10 @@ async fn load(store: &dyn ObjectStore, domain: Uuid) -> Result<State> {
     Ok(state)
 }
 
+pub(super) async fn pending_forks(store: &dyn ObjectStore, domain: Uuid) -> Result<Vec<ForkEnrollment>> {
+    Ok(load(store, domain).await?.forks.into_values().collect())
+}
+
 pub(super) async fn execute(store: &dyn ObjectStore, domain: Uuid, action: Action) -> Result<View> {
     if domain.is_nil() {
         return Err(conflict("The custody domain has no identity"));
@@ -802,6 +852,36 @@ pub(super) async fn execute(store: &dyn ObjectStore, domain: Uuid, action: Actio
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    #[test]
+    fn staged_fork_fences_domain_closure_until_publication_is_resolved() {
+        let mut state = State::new(Uuid::new_v4());
+        let parent = History {
+            deployment: Uuid::new_v4(), incarnation: 1, log_epoch: 0, storage_generation: None,
+        };
+        let child = History { deployment: Uuid::new_v4(), log_epoch: 1, ..parent };
+        let root = |history| Root {
+            history: directory_history(history).unwrap(), verification_key: [17; 32], admission_key: [18; 32],
+        };
+        state.apply(&Action::Enroll {
+            generation: 1, root: parent.deployment, enrollment: root(parent),
+        }).unwrap();
+        let fork = ForkEnrollment {
+            parent, child, enrollment: root(child),
+            preparation: rtdb_directory::ForkPreparation { token: Uuid::new_v4(), generation: 0 },
+        };
+        let reserve = Action::ReserveFork { fork };
+        let begin = Action::Begin { generation: 1, operation: Uuid::new_v4(), target: [19; 32] };
+        state.apply(&reserve).unwrap();
+        state.apply(&reserve).unwrap();
+        assert!(state.apply(&begin).is_err());
+        state.apply(&Action::FinishFork { fork, published: false }).unwrap();
+        assert!(!state.roots.contains_key(&child.deployment));
+        state.apply(&reserve).unwrap();
+        state.apply(&Action::FinishFork { fork, published: true }).unwrap();
+        state.apply(&begin).unwrap();
+        assert_eq!(state.roots.get(&child.deployment), Some(&root(child)));
+    }
 
     #[test]
     fn first_sql_intent_requires_the_enrolled_history_and_generation() {

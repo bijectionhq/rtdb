@@ -297,7 +297,9 @@ The SQL submission entry checks broker admission before accepting new work.
 An installation with a configured custody signer automatically stages and rotates a sole enrolled root from its committed SQL marker.
 Its custodian resumes the staged operation on restart and contributes signed root and provider dispositions after the joined drain.
 A source rewrite covers every authorized erase effect in its selected replica suffix.
-Dependent-root survivor staging and mandatory fork enrollment remain open.
+Shared hosted forks must reserve a broker member against their exact Directory stage before copying.
+The broker promotes the member after Directory publication and removes a rejected reservation after disposal.
+Dependent-root survivor staging and local fork enrollment remain open.
 
 |8
 |Transaction metadata retention.

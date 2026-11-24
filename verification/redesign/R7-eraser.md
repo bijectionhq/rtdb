@@ -169,3 +169,6 @@ The installed operational adapter binds an independent PKCS#8 signer to the enro
 A sole enrolled root can advance its committed marker to the certified switch automatically.
 The provider retains the chosen rotation and the authenticated root and physical disposition records.
 The installed provider uses a 120-second operational target and the existing custody profile offers no fixed physical-destruction deadline.
+A shared hosted fork reserves membership at the original broker before referencing or copying its checkpoint closure.
+A live Directory publication makes it a dependent root.
+A rejected stage retains the reservation until Directory disposal.

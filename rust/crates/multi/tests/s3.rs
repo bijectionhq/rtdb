@@ -304,7 +304,7 @@ async fn exercise_cell(storage: CellStorage) {
     }
     let external = admin::fork_into(
         &cell.directory, &cell.storage(), &cell.keys(), "shop",
-        admin::ForkDestination { name: "outside-preview", org: Some("recipient"), hosted_task: None }, &control(),
+        admin::ForkDestination { name: "outside-preview", org: Some("recipient"), hosted_task: None, broker: None }, &control(),
     ).await.unwrap();
     let versioned = rtdb_multi::reference::stores(bucket.as_ref(), &external.storage_prefix()).await.unwrap();
     assert_eq!(versioned.len(), 1);

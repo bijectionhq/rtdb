@@ -4335,7 +4335,7 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", None, then, 4 << 20).await.unwrap();
     admin::fork_time_into(
         &cell.directory, &cell.storage(), &cell.keys(), "shop",
-        admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org"), hosted_task: None },
+        admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org"), hosted_task: None, broker: None },
         None, then, 4 << 20,
     ).await.unwrap();
     let external = connect_eventually(&cell, "shop-external-then").await;
@@ -4377,11 +4377,11 @@ async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_i
 
     let current = admin::fork_into(
         &cell.directory, &storage, &keys, "shop",
-        admin::ForkDestination { name: "shop-current", org: Some("recipient-org"), hosted_task: None }, &control(),
+        admin::ForkDestination { name: "shop-current", org: Some("recipient-org"), hosted_task: None, broker: None }, &control(),
     ).await.unwrap();
     let historical = admin::fork_block_into(
         &cell.directory, &storage, &keys, "shop",
-        admin::ForkDestination { name: "shop-historical", org: Some("recipient-org"), hosted_task: None },
+        admin::ForkDestination { name: "shop-historical", org: Some("recipient-org"), hosted_task: None, broker: None },
         first.block,
     ).await.unwrap();
 
