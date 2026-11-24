@@ -27,7 +27,7 @@ use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::{BufferPool, CacheBudget};
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -618,6 +618,23 @@ impl Node {
         context
             .with_read_options(&basis.snapshot, basis.snapshot_time, basis.current_time)
             .map(|context| context.with_query_cpu(query_cpu))
+    }
+
+    pub(crate) async fn recover_sql_snapshot_checkpoint(
+        &self, database: &Database, cut: CatalogCut, checkpoint: rtdb_replication::PublishedCheckpoint,
+        cancellation: &CancellationToken,
+    ) -> Result<rtdb_index::Snapshot> {
+        let storage = &database.storage;
+        let hold = storage.hold_catalog(Some(cut)).await?;
+        if !hold.is_registered() { return Err(crate::sql_snapshots::unretained()); }
+        let blocks = rtdb_replication::BlockStore::new(Arc::clone(storage.object_store()),
+            Arc::clone(storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
+        let recovered = cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
+            database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
+            .await.ok_or_else(cancelled)??;
+        recovered.partition.publish_catalog_cut(cut)?;
+        let snapshot = recovered.partition.snapshot().with_catalog_read(hold);
+        rtdb_query::retain_catalog_snapshot(snapshot, storage).await
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
@@ -3776,28 +3793,19 @@ impl NativeSessionService {
 
     pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         let registry = &self.node.sql_snapshots;
-        let context = match &basis.resume_token {
-            Some(token) => {
-                let retained = registry.select(token, self.user(), database)?;
-                self.node.admit_retained_catalog(&retained.view.catalog, self.identity.as_ref(), cancellation).await?;
-                if basis.timezone != retained.view.timezone {
-                    return Err(crate::sql_snapshots::unretained());
-                }
-                let catalog = retained.view.catalog.clone().with_runtime(Arc::new(
-                    crate::runtime::NodeCatalogRuntime::new(self.node.clone(), cancellation.clone())
-                ));
-                QueryContext::with_owner(catalog, self.node.query_memory(), retained.view.current_time,
-                    retained.view.timezone.clone(), self.node.factory.options.query.clone(), cancellation,
-                    &self.node.cancellation)?.with_exact_snapshot_token(token.clone())?
-            }
-            None => self.node.query_context_in_placement(
-                database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation,
-            ).await?,
-        };
         let admission = Arc::new(crate::sql_snapshots::SqlSnapshotAdmission {
             node: self.node.clone(), registry: Arc::clone(registry), identity: Arc::clone(&self.identity),
         });
-        let context = registry.with_issuer(context, self.user(), self.node.memory());
+        let context = self.node.query_context_in_placement(
+            database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation,
+        ).await?;
+        let context = if let Some(token) = &basis.resume_token {
+            let view = admission.restore(token, &context, cancellation).await?;
+            context.with_snapshot_view(view, token.clone())?
+        } else {
+            context
+        };
+        let context = registry.with_issuer(context, self.user(), self.node.clone(), self.placement.clone());
         Ok(if basis.has_await_floor { context } else { context.with_snapshot_admission(admission) })
     }
 

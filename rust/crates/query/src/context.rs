@@ -86,6 +86,11 @@ impl CatalogSnapshot {
     /// Provider requests for this catalog's files begin only while the lease admits them.
     pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
     pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
+    pub(crate) fn reset_sql_snapshot_view(&mut self) {
+        self.read_view = Arc::default();
+        self.fragmenter = None;
+        self.fragment_residence = None;
+    }
     pub(crate) async fn held_view(&self) -> Result<Arc<rtdb_storage::HeldView>> {
         self.check_view_lease()?;
         self.read_view.get_or_try_init(|| async {

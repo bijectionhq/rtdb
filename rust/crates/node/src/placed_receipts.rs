@@ -48,6 +48,8 @@ pub trait PlacedReceiptCodec: Send + Sync {
     fn scope(&self) -> PlacedAttemptScope;
     fn seal(&self, value: &[u8]) -> Result<String>;
     fn open(&self, token: &str) -> Result<Vec<u8>>;
+    fn seal_snapshot(&self, value: &[u8]) -> Result<String>;
+    fn open_snapshot(&self, token: &str) -> Result<Vec<u8>>;
 }
 
 pub(crate) enum PlacedToken {

@@ -93,6 +93,7 @@ struct DeploymentReceipts {
 }
 
 const RECEIPT_ASSOCIATED: &str = "rtdb.multi/placed-await/v1";
+const SQL_SNAPSHOT_ASSOCIATED: &str = "rtdb.multi/sql-snapshot/v1";
 
 impl PlacedReceiptCodec for DeploymentReceipts {
     fn scope(&self) -> PlacedAttemptScope { self.scope }
@@ -104,6 +105,16 @@ impl PlacedReceiptCodec for DeploymentReceipts {
         if token.len() > 192 { return Err(invalid()); }
         let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
         self.cipher.open(RECEIPT_ASSOCIATED, &sealed).map(|bytes| bytes.to_vec()).map_err(|_| invalid())
+    }
+
+    fn seal_snapshot(&self, value: &[u8]) -> Result<String> {
+        Ok(URL_SAFE_NO_PAD.encode(self.cipher.seal(SQL_SNAPSHOT_ASSOCIATED, value)?))
+    }
+
+    fn open_snapshot(&self, token: &str) -> Result<Vec<u8>> {
+        let invalid = || Anomaly::incorrect("rtdb/invalid-snapshot-token", "Snapshot token is invalid for this database");
+        let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
+        self.cipher.open(SQL_SNAPSHOT_ASSOCIATED, &sealed).map(|bytes| bytes.to_vec()).map_err(|_| invalid())
     }
 }
 
