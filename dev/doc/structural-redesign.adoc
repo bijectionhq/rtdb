@@ -188,6 +188,7 @@ Hosted installed search runs with exact publication evidence use the same bounde
 A hosted checkpoint subscription renews the exact catalog scope through a fresh storage-ledger admission. Prior readers retain independent claims through provider and delivery drain.
 Owned relations past their declared retention can enter installed retirement once no selectable older world names them. Expired worlds close new admission. Already admitted scopes retain their dependencies through drain.
 Directory-managed search staging binds the upload to its writer epoch and storage region. A successor waits for both writer turnover and provider drain before ordering abandonment.
+Governed worlds share the selected root and frozen ancestor inventory between admission and retirement. Each retained capture binds its manifest and each suffix also binds its original transaction key.
 Abandoned Classic remote hold recovery, renewal across other entry points, full recovery-root integration, other search staging and seal retirement, and uncoordinated timers remain open.
 
 |5

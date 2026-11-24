@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, now_ms};
+use rtdb_directory::{CheckpointWorldMedia, CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, now_ms};
 use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, OwnedWorldAssertion, PlacedAttemptScope, Result, StructFields,
@@ -1015,26 +1015,26 @@ fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) ->
         && world.schemas.digest() == retained.schema_digest
 }
 
-fn parent_media(deployment: Uuid, retained: &CheckpointWorldRetention) -> CheckpointReadWorld {
+fn checkpoint_read_world(deployment: Uuid, media: CheckpointWorldMedia<'_>) -> CheckpointReadWorld {
     CheckpointReadWorld {
-        deployment, capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
-        suffix: retained.suffix, basis: retained.basis,
+        deployment, capture: media.capture, manifest_sha256: media.manifest_sha256.to_owned(),
+        suffix: media.suffix, basis: media.basis,
     }
 }
 
+fn parent_media(deployment: Uuid, retained: &CheckpointWorldRetention) -> CheckpointReadWorld {
+    checkpoint_read_world(deployment, retained.parent_media())
+}
+
 fn ancestor_media(deployment: Uuid, ancestor: &rtdb_directory::CheckpointWorldAncestor) -> CheckpointReadWorld {
-    CheckpointReadWorld {
-        deployment, capture: ancestor.capture, manifest_sha256: ancestor.manifest_sha256.clone(),
-        suffix: Some(ancestor.suffix), basis: ancestor.basis,
-    }
+    checkpoint_read_world(deployment, ancestor.media())
 }
 
 fn admit_world_media(
     installation: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, retained: &CheckpointWorldRetention,
 ) -> Result<()> {
-    admit_capture(installation, archive, &parent_media(deployment, retained))?;
-    for ancestor in &retained.ancestors {
-        admit_capture(installation, archive, &ancestor_media(deployment, ancestor))?;
+    for media in retained.media() {
+        admit_capture(installation, archive, &checkpoint_read_world(deployment, media))?;
     }
     Ok(())
 }

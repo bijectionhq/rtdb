@@ -730,18 +730,48 @@ pub struct CheckpointWorldRetention {
     pub until: rtdb_types::Timestamp,
 }
 
+/// The selected archive and optional suffix for one independently retained layer.
+#[derive(Clone, Copy)]
+pub struct CheckpointWorldMedia<'a> {
+    pub capture: uuid::Uuid,
+    pub suffix: Option<uuid::Uuid>,
+    pub manifest_sha256: &'a str,
+    pub basis: rtdb_types::TransactionKey,
+}
+
+impl CheckpointWorldMedia<'_> {
+    fn retains_suffix(&self, suffix: uuid::Uuid, pin: &CheckpointSuffixPin) -> bool {
+        self.suffix == Some(suffix) && self.capture == pin.capture
+            && self.manifest_sha256 == pin.manifest_sha256 && self.basis == pin.basis
+    }
+}
+
+impl CheckpointWorldAncestor {
+    pub fn media(&self) -> CheckpointWorldMedia<'_> {
+        CheckpointWorldMedia {
+            capture: self.capture, suffix: Some(self.suffix), manifest_sha256: &self.manifest_sha256, basis: self.basis,
+        }
+    }
+}
+
 impl CheckpointWorldRetention {
-    pub fn retains_capture(&self, capture: uuid::Uuid, now: rtdb_types::Timestamp) -> bool {
-        self.until > now && (self.capture == capture
-            || self.ancestors.iter().any(|ancestor| ancestor.capture == capture))
+    pub fn parent_media(&self) -> CheckpointWorldMedia<'_> {
+        CheckpointWorldMedia {
+            capture: self.capture, suffix: self.suffix, manifest_sha256: &self.manifest_sha256, basis: self.basis,
+        }
+    }
+
+    /// The complete root and frozen-layer inventory, including root-only worlds.
+    pub fn media(&self) -> impl Iterator<Item = CheckpointWorldMedia<'_>> {
+        std::iter::once(self.parent_media()).chain(self.ancestors.iter().map(CheckpointWorldAncestor::media))
+    }
+
+    pub fn retains_capture(&self, capture: uuid::Uuid, manifest: &str, now: rtdb_types::Timestamp) -> bool {
+        self.until > now && self.media().any(|media| media.capture == capture && media.manifest_sha256 == manifest)
     }
 
     fn retains_suffix(&self, suffix: uuid::Uuid, pin: &CheckpointSuffixPin, now_ms: i64) -> bool {
-        self.until.0 > now_ms.saturating_mul(1000)
-            && ((self.suffix == Some(suffix) && self.capture == pin.capture)
-                || self.ancestors.iter().any(|ancestor|
-                    ancestor.suffix == suffix && ancestor.capture == pin.capture && ancestor.basis == pin.basis
-                        && ancestor.manifest_sha256 == pin.manifest_sha256))
+        self.until.0 > now_ms.saturating_mul(1000) && self.media().any(|media| media.retains_suffix(suffix, pin))
     }
 }
 

@@ -533,3 +533,14 @@ Each guard has a mutation that TLC rejects; the pending-preparation guard is imp
 ## Open questions
 
 - How many roots to keep, and whether a root is written per block or on a schedule (it bounds recovery time against storage).
+
+
+## Governed fork archive dependencies
+
+Directory selection and retirement use the same root and frozen ancestor
+inventory. A layer retains the capture with its selected manifest, and a
+suffix only with its matching capture, manifest and original transaction
+key. The frozen writer publication and source basis remain part of the
+ordered world certificate. An admitted archive consumer also carries its
+storage region through provider drain, so expiry of the world admission
+cannot release work that has already started reading.

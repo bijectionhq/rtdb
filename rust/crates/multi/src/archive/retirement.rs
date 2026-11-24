@@ -47,6 +47,14 @@ pub(crate) async fn retire_capture(
     finish_capture_retirement(directory, storage, keys, &installation.id, capture).await
 }
 
+fn world_retains_capture(record: &DeploymentRecord, capture: Uuid, now_ms: i64) -> bool {
+    let Some(manifest) = record.checkpoint_captures.get(&capture)
+        .and_then(|capture| capture.manifest_sha256.as_deref())
+    else { return false; };
+    let now = rtdb_types::Timestamp(now_ms.saturating_mul(1000));
+    record.checkpoint_worlds.values().any(|world| world.retains_capture(capture, manifest, now))
+}
+
 pub(crate) fn obsolete_fork_input(record: &DeploymentRecord, capture: Uuid) -> bool {
     record
         .checkpoint_captures
@@ -59,10 +67,7 @@ pub(crate) fn obsolete_fork_input(record: &DeploymentRecord, capture: Uuid) -> b
             .storage_regions
             .values()
             .any(|region| region.holds_archive(capture))
-        && !record
-            .checkpoint_worlds
-            .values()
-            .any(|world| world.retains_capture(capture, rtdb_types::Timestamp(now_ms().saturating_mul(1000))))
+        && !world_retains_capture(record, capture, now_ms())
         && !record.checkpoint_suffix_pins.values().any(|pin| {
             pin.capture == capture
                 && (pin.expires_at_ms > now_ms()
@@ -229,9 +234,7 @@ async fn prepare_capture_retirement_with_intent(
         }) {
             return Err(inconsistent("A live suffix pin retains this checkpoint capture"));
         }
-        if record.checkpoint_worlds.values().any(|world| {
-            world.retains_capture(capture, rtdb_types::Timestamp(sampled_at.saturating_mul(1000)))
-        }) {
+        if world_retains_capture(record, capture, sampled_at) {
             return Err(inconsistent("A live world retains this checkpoint capture"));
         }
 
@@ -537,7 +540,20 @@ mod tests {
         let world = Uuid::new_v4();
         let basis = TransactionKey { tx_id: TxId(4), system_time: Timestamp(90) };
         let primary = Uuid::new_v4();
+        let selected_archive = archive_binding(&archive)?;
         update_installation(directory.as_ref(), &installation.id, |record| {
+            record.checkpoint_captures.insert(capture, CheckpointCapture {
+                archive: selected_archive.clone(),
+                key_namespace: None,
+                incarnation: record.incarnation,
+                log_epoch: record.log_epoch,
+                checkpoint: Checkpoint { block: 2, boundary: 5, source: 4, system_time: 90, root_sha256: Some([2; 32]) },
+                automatic_fork: true,
+                world_replay: None,
+                media_bound: true,
+                manifest_sha256: Some("ancestor".into()),
+                remote_disposal: None,
+            });
             record.checkpoint_worlds.insert(world, CheckpointWorldRetention {
                 ancestors: vec![rtdb_directory::CheckpointWorldAncestor {
                     world: Uuid::new_v4(),
@@ -570,6 +586,9 @@ mod tests {
         let current = directory.deployment(&installation.id).await?.unwrap();
         assert!(!current.checkpoint_capture_retirements.contains_key(&capture));
         assert_eq!(current.checkpoint_worlds[&world].capture, primary);
+        let world_claim = &current.checkpoint_worlds[&world];
+        assert!(world_claim.retains_capture(capture, "ancestor", Timestamp(100)));
+        assert!(!world_claim.retains_capture(capture, "another publication", Timestamp(100)));
 
         update_installation(directory.as_ref(), &installation.id, |record| {
             record.checkpoint_worlds.get_mut(&world).unwrap().until = Timestamp::MIN;
@@ -664,7 +683,7 @@ mod tests {
         };
         let object = |suffix| {
             key(&format!(
-                "{}/v2/manifest",
+                "{}/v3/manifest",
                 super::super::replica_suffix::archive_prefix(deployment, suffix, &pin)
             ))
         };
