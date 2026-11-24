@@ -97,6 +97,7 @@ mod tests {
         let memory = MemoryBudget::new(8 << 20);
         let authenticator = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig {
             issuer_url: "https://issuer.example".parse().unwrap(),
+            issuer_ca_pem: None,
             client_id: "rtdb".into(),
             client_secret: Secret::new("configured"),
             rules: vec![MethodRule::any(Method::ClientCredentials)],

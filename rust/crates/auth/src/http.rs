@@ -41,8 +41,26 @@ pub struct NativeHttp {
 impl NativeHttp {
     /// Limits the decoded response body; TLS and connection-pool buffers are owned by reqwest.
     pub fn new(memory: Arc<MemoryBudget>, timeout: Duration, maximum_response_bytes: usize) -> Result<Self> {
+        Self::with_issuer_ca(memory, timeout, maximum_response_bytes, None)
+    }
+
+    /// An explicit private issuer trust bundle replaces the platform TLS roots.
+    pub fn with_issuer_ca(
+        memory: Arc<MemoryBudget>,
+        timeout: Duration,
+        maximum_response_bytes: usize,
+        issuer_ca_pem: Option<&str>,
+    ) -> Result<Self> {
         if maximum_response_bytes == 0 { return Err(Anomaly::incorrect("rtdb.auth/http-limit", "OIDC response limit must be positive")); }
-        let client = reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none()).build().map_err(http_error)?;
+        let mut builder = reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
+        if let Some(pem) = issuer_ca_pem {
+            let invalid = || Anomaly::incorrect("rtdb.auth/issuer-ca", "OIDC issuer CA must be a nonempty PEM certificate bundle");
+            if pem.len() > 64 * 1024 { return Err(invalid()); }
+            let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|_| invalid())?;
+            if certs.is_empty() { return Err(invalid()); }
+            builder = builder.tls_certs_only(certs).https_only(true);
+        }
+        let client = builder.build().map_err(http_error)?;
         Ok(Self { client, memory, maximum_response_bytes })
     }
 }

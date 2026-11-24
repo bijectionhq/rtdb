@@ -15,6 +15,7 @@ use crate::{Credentials as PrincipalCredentials, HttpRequest, HttpResponse, Http
 #[derive(Clone, Debug)]
 pub struct OidcConfig {
     pub issuer_url: Url,
+    pub issuer_ca_pem: Option<String>,
     pub client_id: String,
     pub client_secret: Secret,
     pub rules: Vec<MethodRule>,

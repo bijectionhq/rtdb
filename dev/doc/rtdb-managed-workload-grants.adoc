@@ -27,6 +27,8 @@ authn: !OpenIdConnect
 
 Discovery must identify the configured issuer.
 The token and UserInfo endpoints must use HTTPS at the issuer's origin.
+For a service with a private issuer CA, set `authn.issuerCaCertificate` to its PEM certificate bundle, directly or through `!Env`.
+This setting uses those roots for the issuer's HTTPS requests and preserves hostname checks.
 The configured issuer authenticates the exact client and returns a UserInfo grant computed by trusted issuer policy.
 Keep the grant out of self-editable profile attributes, tenant settings, and request-controlled claims.
 Reserve the configured prefix at the issuer and provision only grant-bearing client identities under it.

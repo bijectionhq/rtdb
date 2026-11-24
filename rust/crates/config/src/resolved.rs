@@ -15,6 +15,9 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
         AuthConfig::UserList { users, rules, grants } => json!({"kind":"user-list", "users":users.keys().collect::<Vec<_>>(), "rules":rules, "grants":grants.iter().map(|(user, databases)| (user.clone(), databases.iter().map(|(database, access)| (database.clone(), access.as_str())).collect::<BTreeMap<_, _>>())).collect::<BTreeMap<_, _>>()}),
         AuthConfig::OpenIdConnect(oidc) => {
             let mut authentication = json!({"kind":"openid-connect", "issuer":endpoint(oidc.issuer_url.as_str(), "authn.issuerUrl", report), "client_id":oidc.client_id, "client_secret":"[redacted]", "rules":oidc.rules});
+            if oidc.issuer_ca_pem.is_some() {
+                authentication["issuer_ca_configured"] = json!(true);
+            }
             if let Some(grants) = &oidc.workload_grants {
                 authentication["workload_grants"] = json!({"audience":grants.audience(), "client_id_prefix":grants.client_id_prefix()});
                 if let Some(point) = grants.assignment() {

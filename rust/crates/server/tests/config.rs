@@ -127,6 +127,16 @@ fn startup_auth_rules_remain_ordered_and_default_oidc_to_reference_trust() {
 }
 
 #[test]
+fn startup_bounds_private_oidc_issuer_trust_to_https() {
+    let https = "authn: !OpenIdConnect\n  issuerUrl: https://issuer.example/realm\n  clientId: db\n  clientSecret: secret";
+    let config = decode(&format!("{https}\n  issuerCaCertificate: private-ca")).unwrap();
+    let AuthConfig::OpenIdConnect(config) = config.auth else { panic!() };
+    assert_eq!(config.issuer_ca_pem.as_deref(), Some("private-ca"));
+    assert!(decode(&format!("{https}\n  issuerCaCertificate: ''")).is_err());
+    assert!(decode(&format!("{}\n  issuerCaCertificate: private-ca", https.replace("https:", "http:"))).is_err());
+}
+
+#[test]
 fn startup_configures_an_explicit_workload_audience_and_client_prefix() {
     let oidc = "authn: !OpenIdConnect\n  issuerUrl: https://issuer.example/realm\n  clientId: db\n  clientSecret: secret";
     let config = decode(&format!("{oidc}\n  workloadGrants: {{audience: cell, clientIdPrefix: workload-}}")).unwrap();

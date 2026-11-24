@@ -39,11 +39,23 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
             }
             AuthConfig::UserList { users, rules: rules(fields.sequence("rules")?, Method::Password)?, grants }
         }
-        "!OpenIdConnect" => AuthConfig::OpenIdConnect(OidcConfig {
-            issuer_url: fields.required_string("issuerUrl")?.parse().map_err(|_| invalid("issuerUrl must be an absolute URL"))?,
-            client_id: fields.required_string("clientId")?, client_secret: Secret::new(fields.required_string("clientSecret")?), rules: rules(fields.sequence("rules")?, Method::Trust)?,
-            workload_grants: fields.take("workloadGrants").map(workload_grants).transpose()?,
-        }),
+        "!OpenIdConnect" => {
+            let config = OidcConfig {
+                issuer_url: fields.required_string("issuerUrl")?.parse()
+                    .map_err(|_| invalid("issuerUrl must be an absolute URL"))?,
+                issuer_ca_pem: fields.nullable_string("issuerCaCertificate")?,
+                client_id: fields.required_string("clientId")?,
+                client_secret: Secret::new(fields.required_string("clientSecret")?),
+                rules: rules(fields.sequence("rules")?, Method::Trust)?,
+                workload_grants: fields.take("workloadGrants").map(workload_grants).transpose()?,
+            };
+            if let Some(ca) = &config.issuer_ca_pem
+                && (config.issuer_url.scheme() != "https" || ca.trim().is_empty() || ca.len() > 64 * 1024)
+            {
+                return Err(invalid("issuerCaCertificate requires an HTTPS issuer and a PEM bundle up to 64 KiB"));
+            }
+            AuthConfig::OpenIdConnect(config)
+        },
         _ => return Err(invalid(format!("Unknown authentication configuration tag '{tag}'"))),
     };
     fields.finish()?;

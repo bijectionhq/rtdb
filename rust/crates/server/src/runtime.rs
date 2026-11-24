@@ -193,7 +193,13 @@ impl ServerDriver {
             match crate::tracing::TraceExporter::open(&config.tracing, Arc::clone(&memory)) { Ok(tracing) => Some(tracing), Err(error) => { let _ = writeln!(std::io::stderr().lock(), "Failed to create tracer; tracing is disabled: {error}"); None } }
         } else { None };
         let tracer = tracing.as_ref().map(|(handle, _)| handle.recorder().clone() as Arc<dyn rtdb_plan::Tracer>);
-        let http = Arc::new(NativeHttp::new(Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024)?);
+        let issuer_ca_pem = match &config.auth {
+            rtdb_auth::AuthConfig::OpenIdConnect(config) => config.issuer_ca_pem.as_deref(),
+            _ => None,
+        };
+        let http = Arc::new(NativeHttp::with_issuer_ca(
+            Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024, issuer_ca_pem,
+        )?);
         let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
         let authority: Arc<dyn TransactionAuthorization> = match config.flight_sql.as_ref()
             .filter(|flight| flight.port >= 0 && flight.owned_native_actions)

@@ -87,6 +87,7 @@ async fn managed_workload_can_only_create_and_reopen_its_exact_deployment() {
     let clock = Arc::new(ManualClock(AtomicI64::new(1_000_000)));
     let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig {
         issuer_url: "https://issuer.example".parse().unwrap(),
+        issuer_ca_pem: None,
         client_id: "rtdb".into(),
         client_secret: Secret::new("configured"),
         rules: vec![MethodRule::any(Method::ClientCredentials)],

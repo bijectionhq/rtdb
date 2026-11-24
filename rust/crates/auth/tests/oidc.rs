@@ -47,7 +47,7 @@ async fn setup_with_workload(extra: Vec<(u16, Value)>, gate: bool, workload_gran
     responses.extend(extra);
     let script = Arc::new(Script { memory: Arc::clone(&memory), responses: Mutex::new(responses), forms: Mutex::new(Vec::new()), refreshes: AtomicUsize::new(0), refresh_gate: gate.then(|| Semaphore::new(0)) });
     let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig { issuer_url: "https://issuer.example".parse().unwrap(), client_id: "configured-client".into(), client_secret: Secret::new("configured-secret"), rules: vec![MethodRule::any(Method::Password)], workload_grants }), memory, clock.clone(), script.clone()).await.unwrap();
+    let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig { issuer_url: "https://issuer.example".parse().unwrap(), issuer_ca_pem: None, client_id: "configured-client".into(), client_secret: Secret::new("configured-secret"), rules: vec![MethodRule::any(Method::Password)], workload_grants }), memory, clock.clone(), script.clone()).await.unwrap();
     (auth, script, clock)
 }
 
