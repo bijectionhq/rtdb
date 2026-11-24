@@ -114,6 +114,7 @@ See link:../../rust/crates/query/src/cursor.rs[results], link:../../rust/crates/
 
 * SQL and XTQL parsing, planning, catalog lookup, transaction dispatch, hashes and selected addresses use Rust control representations.
 * The source and replica log envelopes transport Arrow payloads with transaction and durability metadata.
+* SQL survivor replay reads compatible event files from their funded input buffers.
 * Owned fact commits borrow UTF-8 operation values directly from Int8 Arrow dictionaries, including import page validation.
 * PostgreSQL protocols and explicit row APIs retain their public representations.
 * Block, table and trie catalogs retain the metadata needed to open persisted Arrow files.
