@@ -39,6 +39,7 @@ use crate::reference::custody::ReferenceReads;
 mod key_enrollment;
 pub(crate) mod exact_retirement;
 mod replay_retirement;
+mod publication_retirement;
 
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
@@ -1421,14 +1422,14 @@ async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Durati
 
 #[cfg(test)]
 pub(crate) async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
-    reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(references)).await
+    reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(references, None)).await
 }
 
 /// Runs the missing-reference control against an in-memory cell.
 #[doc(hidden)]
 pub async fn simulate_reap_without_references(bucket: &rtdb_storage::MemoryStore, record: &DeploymentRecord, now_ms: i64,
     grace: Duration) -> Result<Reaped> {
-    reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(&crate::reference::References::default())).await
+    reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(&crate::reference::References::default(), None)).await
 }
 
 /// Exercises physical collection and reference transfer on the simulator's in-memory cells.
@@ -1438,13 +1439,13 @@ pub async fn simulate_reap_cell(bucket: &rtdb_storage::MemoryStore, deployments:
     let references = crate::reference::References::scan(bucket, deployments).await?;
     let mut outcomes = Vec::new();
     for record in deployments.iter().filter(|record| can_reap(record)) {
-        outcomes.push(reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(&references)).await);
+        outcomes.push(reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(&references, None)).await);
     }
     Ok(outcomes)
 }
 
 enum ReleaseSweep<'a> {
-    Local(&'a crate::reference::References),
+    Local(&'a crate::reference::References, Option<publication_retirement::LocalSlots<'a>>),
     Hosted,
 }
 
@@ -1470,7 +1471,10 @@ fn recovery_covers_release(owner: &DeploymentRecord, release: &GarbageRecord) ->
 async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration,
     sweep: ReleaseSweep<'_>) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
-    let local = match sweep { ReleaseSweep::Local(references) => Some(references), ReleaseSweep::Hosted => None };
+    let (local, slots) = match sweep {
+        ReleaseSweep::Local(references, slots) => (Some(references), slots),
+        ReleaseSweep::Hosted => (None, None),
+    };
     let mut reaped = Reaped::default();
     if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) { return Ok(reaped); }
     let published = record.checkpoint.map(|checkpoint| checkpoint.block);
@@ -1489,6 +1493,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
         // A released object is either its own object or one entry of a pack; a pack goes once every entry in it has been released for the grace period.
         let mut due: BTreeMap<String, String> = BTreeMap::new();
         let mut exact = BTreeSet::new();
+        let mut slot_candidates = BTreeSet::new();
         for name in records {
             let Some(location) = physical(&own, &name) else { continue };
             let Ok(bytes) = bucket.get(&crate::reference::key(&location)?).await else { continue };
@@ -1510,6 +1515,9 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 reaped.waiting += 1;
                 continue;
             }
+            if released.trie_floor.is_some() && is_collected_trie_file(&released.key) {
+                slot_candidates.insert(released.key.clone());
+            }
             due.insert(released.key, name);
         }
         due.retain(|key, _| !exact.contains(key));
@@ -1520,7 +1528,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
         let walked = |pack: &str| crate::packing::pack_block(pack)
             .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest));
         let mut packed = BTreeSet::new();
-        let mut obsolete_packs = Vec::new();
+        let mut obsolete_packs = BTreeMap::new();
         for pack in packs {
             let Some(location) = physical(&own, &pack) else { continue };
             let index = match crate::packing::read_index(bucket, &crate::reference::key(&location)?).await {
@@ -1537,21 +1545,28 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
             if (local.is_some() || !own.contains(&pack)) && Some(&pack) != latest.as_ref()
                 && !walked(&pack) && index.entries.keys().all(|name| due.contains_key(name))
             {
-                obsolete_packs.push(pack);
+                obsolete_packs.insert(pack, index);
             } else {
                 packed.extend(index.entries.into_keys());
             }
         }
         if let Some(references) = local {
             // Withdraw fallback edges before physical removal can expose them.
-            let shadowed = obsolete_packs.iter().chain(due.keys())
+            let shadowed = obsolete_packs.keys().chain(due.keys())
                 .filter(|name| own.contains(*name) && before.objects.contains_key(*name)).cloned().collect();
             before.forget_and_prune_locally(bucket, &store, &shadowed).await?;
-            for name in obsolete_packs.iter().chain(due.keys()).filter(|name| own.contains(*name)) {
+            for name in obsolete_packs.keys().chain(due.keys()).filter(|name| own.contains(*name)) {
+                let pack = obsolete_packs.get(name);
+                if let Some(slots) = &slots && (pack.is_some() || slot_candidates.contains(name)) {
+                    let target = ObjectKey::new(format!("{store}/{name}"))?;
+                    if !references.has_declared_reference(&target) {
+                        slots.withdraw_last(bucket, record, &target, name, pack).await?;
+                    }
+                }
                 references.erase(bucket, &store, name).await?;
             }
         }
-        forgotten.extend(obsolete_packs.into_iter().chain(due.keys().cloned())
+        forgotten.extend(obsolete_packs.into_keys().chain(due.keys().cloned())
             .filter(|name| !own.contains(name) && before.objects.contains_key(name)));
         let mut local_records = Vec::new();
         for (name, garbage_record) in &due {
@@ -1859,7 +1874,8 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
         let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source && can_reap(record))
             else { return Ok(Reaped::default()); };
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
-        let mut reaped = reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references)).await?;
+        let slots = keys.map(|keys| publication_retirement::LocalSlots::new(keys, &deployments, &io));
+        let mut reaped = reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references, slots)).await?;
         if let Some(keys) = keys.filter(|_| replay_retirement::eligible(record)) {
             reaped.erased += replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references).await?;
         }
