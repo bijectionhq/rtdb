@@ -648,7 +648,7 @@ impl<'a> BranchView<'a> {
     }
 
     pub fn count_constraints(&self) -> impl Iterator<Item = (&TableRef, &str, &CountRange)> {
-        self.tables().filter(|_| !self.index.visibility_projection).flat_map(|(table, definition)| {
+        self.tables().filter(move |_| !self.index.visibility_projection).flat_map(|(table, definition)| {
             definition.constraints.iter().map(move |(name, range)| (table, name.as_str(), range))
         })
     }

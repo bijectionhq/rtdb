@@ -416,7 +416,9 @@ fn otherwise_discards_the_candidate_and_validation_never_appends() {
 fn requires_count_validates_the_original_state_without_appending() {
     let mut state = TransactState::new(INCARNATION);
     commit(&mut state, 1, &request(1, vec![
-        Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by_key".into(), column: "key".into() }) },
+        Op::Declare { table: table(), change: Declaration::Index(IndexDefinition {
+            name: "by_key".into(), column: "key".into(), additional_columns: Vec::new(),
+        }) },
         put(MAIN_BRANCH, 1, "a"),
     ]));
     let range = CountRange { table: table(), index: "by_key".into(), lower: None, upper: None, valid_at: None, n: 0 };
