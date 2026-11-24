@@ -2961,7 +2961,7 @@ mod tests {
 
             let mut cursor = BatchExpressions::new(input(len), schema.clone(), projections, execution.clone());
             let error = cursor.next_batch().await.err().expect("The first projection fails");
-            assert!(error.message.contains("first projection, second row"));
+            assert!(error.message.as_deref().expect("The cast error has a message").contains("first projection, second row"));
         }
     }
 

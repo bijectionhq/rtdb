@@ -298,7 +298,7 @@ pub(crate) const HELD_WORLD_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldValidDu
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_PARENT_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentIdentityPageAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentValidDuringAt.v1";
-pub(crate) const SEARCH_HELD_WORLD_PARENT_AT_V2: &str = "rtdb.owned.SearchHeldWorldParentAt.v2";
+pub(crate) const SEARCH_HELD_WORLD_PARENT_AT_V3: &str = "rtdb.owned.SearchHeldWorldParentAt.v3";
 
 pub(crate) enum WorldHistoricalRead { Current, EarlierEffective, EarlierParent }
 
@@ -310,6 +310,7 @@ pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWo
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
 pub(crate) const HELD_ROW_CARRIER_EXISTS_V1: &str = "rtdb.owned.ReadHeldRowCarrierExists.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
+pub(crate) const HELD_WORLD_SHARED_COLUMN_CENSUS_V1: &str = "rtdb.owned.ReadHeldWorldSharedColumnCensus.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
@@ -352,19 +353,27 @@ pub(crate) const HELD_WORLD_OVERLAY_RANGE_AT_V1: &str = "rtdb.owned.ReadHeldWorl
 pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange, OverlayRangeAt, ParentRangeAt, ParentCountAt }
-pub(crate) const SEARCH_HELD_WORLD_AT_V2: &str = "rtdb.owned.SearchHeldWorldAt.v2";
-pub(crate) const SEARCH_HELD_WORLD_V3: &str = "rtdb.owned.SearchHeldWorld.v3";
-pub(crate) const SEARCH_HELD_OWNED_V6: &str = "rtdb.owned.SearchHeld.v6";
-pub(crate) const NEAREST_HELD_OWNED_V3: &str = "rtdb.owned.NearestHeld.v3";
+pub(crate) const SEARCH_HELD_WORLD_AT_V3: &str = "rtdb.owned.SearchHeldWorldAt.v3";
+pub(crate) const SEARCH_HELD_WORLD_V4: &str = "rtdb.owned.SearchHeldWorld.v4";
+pub(crate) const SEARCH_HELD_OWNED_V7: &str = "rtdb.owned.SearchHeld.v7";
+pub(crate) const NEAREST_HELD_OWNED_V4: &str = "rtdb.owned.NearestHeld.v4";
 pub(crate) const OWNED_NEAREST_APPROXIMATE: &str = "rtdb.owned.nearest_approximate";
 pub(crate) const DECLARE_OWNED_VECTOR_PATH_V1: &str = "rtdb.owned.DeclareVectorPath.v1";
-pub(crate) const HYBRID_HELD_OWNED_V3: &str = "rtdb.owned.HybridHeld.v3";
-pub(crate) const HYBRID_HELD_WORLD_V2: &str = "rtdb.owned.HybridHeldWorld.v2";
-pub(crate) const HYBRID_HELD_WORLD_AT_V2: &str = "rtdb.owned.HybridHeldWorldAt.v2";
-pub(crate) const HYBRID_HELD_WORLD_PARENT_AT_V2: &str = "rtdb.owned.HybridHeldWorldParentAt.v2";
-pub(crate) const NEAREST_HELD_WORLD_V2: &str = "rtdb.owned.NearestHeldWorld.v2";
-pub(crate) const NEAREST_HELD_WORLD_AT_V2: &str = "rtdb.owned.NearestHeldWorldAt.v2";
-pub(crate) const NEAREST_HELD_WORLD_PARENT_AT_V2: &str = "rtdb.owned.NearestHeldWorldParentAt.v2";
+pub(crate) const HYBRID_HELD_OWNED_V4: &str = "rtdb.owned.HybridHeld.v4";
+pub(crate) const HYBRID_HELD_WORLD_V3: &str = "rtdb.owned.HybridHeldWorld.v3";
+pub(crate) const HYBRID_HELD_WORLD_AT_V3: &str = "rtdb.owned.HybridHeldWorldAt.v3";
+pub(crate) const HYBRID_HELD_WORLD_PARENT_AT_V3: &str = "rtdb.owned.HybridHeldWorldParentAt.v3";
+pub(crate) const NEAREST_HELD_WORLD_V3: &str = "rtdb.owned.NearestHeldWorld.v3";
+pub(crate) const NEAREST_HELD_WORLD_AT_V3: &str = "rtdb.owned.NearestHeldWorldAt.v3";
+pub(crate) const NEAREST_HELD_WORLD_PARENT_AT_V3: &str = "rtdb.owned.NearestHeldWorldParentAt.v3";
+pub(crate) const ROOT_RANK_ACTIONS: [&str; 3] = [
+    SEARCH_HELD_OWNED_V7, NEAREST_HELD_OWNED_V4, HYBRID_HELD_OWNED_V4,
+];
+pub(crate) const WORLD_RANK_ACTIONS: [&str; 9] = [
+    SEARCH_HELD_WORLD_V4, SEARCH_HELD_WORLD_AT_V3, SEARCH_HELD_WORLD_PARENT_AT_V3,
+    NEAREST_HELD_WORLD_V3, NEAREST_HELD_WORLD_AT_V3, NEAREST_HELD_WORLD_PARENT_AT_V3,
+    HYBRID_HELD_WORLD_V3, HYBRID_HELD_WORLD_AT_V3, HYBRID_HELD_WORLD_PARENT_AT_V3,
+];
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -3993,8 +4002,8 @@ impl Service {
         Ok(overlay)
     }
 
-    /// `NearestHeldWorld.v2`, `NearestHeldWorldAt.v2` and `NearestHeldWorldParentAt.v2`:
-    /// the SearchHeldWorld prefixes followed by the NearestHeld.v3 frame.
+    /// `NearestHeldWorld.v3`, `NearestHeldWorldAt.v3` and `NearestHeldWorldParentAt.v3`:
+    /// the SearchHeldWorld prefixes followed by the NearestHeld.v4 frame.
     pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
@@ -4900,6 +4909,40 @@ impl Service {
         let reply = self.owned_action_reply(&schema, Some(&rows))?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn held_world_shared_column_census_action(
+        &self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none()
+            || !self.supports_hosted_upload(call)
+        {
+            return Err(unsupported());
+        }
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, body) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Shared field census has no held world"))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
+        let (valid, body) = body.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("Shared field census has no valid instant"))?;
+        let valid = Timestamp(i64::from_be_bytes(*valid));
+        let (length, body) = body.split_first_chunk::<2>()
+            .ok_or_else(|| invalid("Shared field census has no Root carrier scope"))?;
+        let (root, world) = body.split_at_checked(usize::from(u16::from_be_bytes(*length)))
+            .ok_or_else(|| invalid("Incomplete shared field census scope"))?;
+        let root = std::str::from_utf8(root).map_err(|_| invalid("Invalid Root carrier scope"))?;
+        let world = std::str::from_utf8(world).map_err(|_| invalid("Invalid world carrier scope"))?;
+        let (page, witness) = held.snapshot.shared_column_census(scope, valid, root, world).await.map_err(status)?;
+        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
+        let _copy = call.reserve(bytes)?;
+        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
+        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let nonce = held.remember(call, witness, false)?;
+        let schema = rows.schema_ref().as_ref().clone().with_metadata(
+            [(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string())].into()
+        );
+        self.owned_point_reply_in(self.memory(), &schema, Some(&rows), held.snapshot.present(), valid,
+            None, None, reply_format)
     }
 
     pub(crate) async fn held_world_identities_action(

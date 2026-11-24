@@ -160,6 +160,16 @@ All hex is lowercase, including the canonical AddressRef. The full selector fits
 RTDB checks the selector's family and member against the request. Root entries are deduplicated by relation and physical selector.
 A refused or interrupted reservation may retain its inventory entry. Its selector is disjoint from every ordinary Root projection at that address.
 A world slot can enrol multiple fresh stages for the same member across rewrites.
+A retained Root execution outcome may use a separately enrolled stage on the installed Root line.
+For that artifact the `world` field names the original installed Root line, the member is an active landing on that line, the relation is `bj_fact_root_admission`, and the key is a 64-character lowercase hex commitment to the receipt and its disclosure.
+The Root line is a sealing scope for this private artifact. A Root search projection uses its distinct physical selector and carries no stage.
+The existing family envelope actions and the derived-stage response hold bind the same receipt artifact slot.
+The retained outcome keeps its existing Root unit seal, and recall requires the original Root unit fence and the exact live family member.
+The installed Root line, family vault and receipt must remain reachable.
+The admitted output route covers a registered result with one exact landed Root point as its protected input.
+A successor archive copy needs a durable route authenticated to the Original deployment, incarnation, ordered journal position and current family authority.
+A frozen capture proves the historical assertion and bytes. Recall through a new deployment also needs access to the Original ordered marker and release owner through any source retirement.
+Successor replay of a family carrier refuses until that route is available.
 An exact retry succeeds and conflicting reuse of a stage or slot is refused.
 A family holds at most 2048 derived entries; the next registration is refused with `rtdb.multi/assertion-family-size`.
 
@@ -272,6 +282,11 @@ The journal belongs to the installed base relation underlying the search relatio
 The journal and carrier must share their publication, the derivative must have ordered at or after that publication, and the vault must authenticate the exact accepted binding, the registered physical selector, and the current original fence.
 The Root contributor uses the journal assertion ordinal.
 A decorated selector with a different carrier or with a visible raw alias refuses.
+Hosted protocol 223 advertises the binary ranked-reply actions via Flight `ListActions`.
+The Root actions are `SearchHeld.v7`, `NearestHeld.v4` and `HybridHeld.v4` in the `rtdb.owned.` namespace.
+World text uses `SearchHeldWorld.v4`, `SearchHeldWorldAt.v3` and `SearchHeldWorldParentAt.v3`.
+World vector and hybrid use `NearestHeldWorld.v3`, `NearestHeldWorldAt.v3`, `NearestHeldWorldParentAt.v3`, `HybridHeldWorld.v3`, `HybridHeldWorldAt.v3` and `HybridHeldWorldParentAt.v3`.
+The action request bodies and rank-scope digest domains are unchanged.
 Ranked replies require the `x-rtdb-owned-ipc: stream-v1` request header.
 The first Flight action result body carries the binary inventory as a big-endian u16 entry count followed by entries in strictly increasing byte order.
 Even a zero count has its own result body.
@@ -283,6 +298,20 @@ Missing custody evidence, unsupported carrier shapes, and excess inventory refus
 `FamilyResponseRelease.v2` adds exact world-derived input kind 2 and exact Root-derived input kind 3 to the existing response-part hold.
 The consumer retains the inventory in the invocation's original output custody even when it returns only counts, cursors or derived scores.
 Hybrid reads retain the combined text and vector dependencies under that same bound.
+
+### Shared column census
+
+Hosted protocol 224 advertises `rtdb.owned.ReadHeldWorldSharedColumnCensus.v1` through Flight `ListActions` to the installed writer.
+The request is the existing held world handle (16 bytes), signed big-endian valid instant (8 bytes), u16 byte length and lowercase hexadecimal Root BFCP2 prefix, then the ASCII world-column prefix.
+The valid instant must be the held data clock.
+The response has one Arrow `_id` Utf8 column in strictly increasing ID order and the original world range witness.
+One completion covers the installed Root carrier prefix at the direct archived parent and the opaque shared column prefix in the selected local overlay.
+Root selectors used for point reads sit outside the Root census and never count as overlay carriers.
+The response contains at most 512 identities.
+The witness binds the parent pin, original writer placement, Root purge frontier and selected overlay frontier, and the installer co-orders it with its exact carrier point and current Root unit condition.
+The scope is a writable direct child of Root in the same placement.
+There is no ancestor or restored-source scan in this action.
+The world carrier and Root point selector both use the scoped world-column key, with no fallback to an earlier key shape.
 
 ### Fence plan reply
 

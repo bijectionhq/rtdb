@@ -199,6 +199,9 @@ pub trait OwnedWorldRead: Send + Sync {
     fn measure<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
     ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>>;
+    fn shared_column_census<'a>(
+        &'a self, scope: rtdb_types::PlacedAttemptScope, valid: Timestamp, root_prefix: &'a str, world_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<(WorldIdentityPage, OwnedWorldWitness)>>;
     fn parent_identity_page_at<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
