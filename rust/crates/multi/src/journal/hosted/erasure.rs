@@ -35,8 +35,6 @@ pub use evidence::{
     DrainedWork, ErasureDeadline, ErasureTiming, drain_inventory,
 };
 
-const OPERATIONAL_TARGET_MS: u64 = 120_000;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqlErasureRequest {
