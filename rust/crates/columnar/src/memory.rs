@@ -1,8 +1,9 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
+use arrow_schema::DataType;
 use rtdb_types::{Anomaly, Result};
 
 pub use rtdb_types::{MemoryBudget, MemoryReservation};
@@ -217,6 +218,121 @@ fn collect_buffers(data: &ArrayData, buffers: &mut BTreeMap<usize, usize>) {
     for child in data.child_data() {
         collect_buffers(child, buffers);
     }
+}
+
+/// Returns a conservative count of distinct buffer bytes visible through the Arrow views.
+/// Unsupported payloads receive zero credit, and out-of-bounds ranges return `None`.
+pub fn visible_buffer_bytes(columns: &[ArrayRef]) -> Option<usize> {
+    let mut ranges = Vec::new();
+    for column in columns {
+        let data = column.to_data();
+        collect_visible_ranges(&data, 0..data.len(), &mut ranges)?;
+    }
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut end = 0;
+    let mut bytes = 0usize;
+    for range in ranges {
+        bytes = bytes.checked_add(range.end.saturating_sub(range.start.max(end)))?;
+        end = end.max(range.end);
+    }
+    Some(bytes)
+}
+
+fn collect_visible_ranges(
+    data: &ArrayData, rows: Range<usize>, ranges: &mut Vec<Range<usize>>,
+) -> Option<()> {
+    if rows.start > rows.end || rows.end > data.len() {
+        return None;
+    }
+    if rows.is_empty() {
+        return Some(());
+    }
+
+    let slots = offset_range(&rows, data.offset())?;
+    let nulls = if let Some(nulls) = data.nulls() {
+        if rows.end > nulls.len() {
+            return None;
+        }
+        let bits = offset_range(&rows, nulls.offset())?;
+        add_buffer_range(nulls.buffer(), bitmap_bytes(bits), ranges)?;
+        (nulls.null_count() != 0)
+            .then(|| nulls.slice(rows.start, rows.len()))
+            .filter(|nulls| nulls.null_count() != 0)
+    } else {
+        None
+    };
+
+    match data.data_type() {
+        DataType::Struct(_) => {
+            // Arrow's StructArray::to_data has already applied the parent offset to its children.
+            if data.offset() != 0 { return None; }
+            if nulls.is_none() {
+                for child in data.child_data() {
+                    collect_visible_ranges(child, rows.clone(), ranges)?;
+                }
+            }
+        }
+        DataType::FixedSizeList(_, width) => {
+            if nulls.is_none() {
+                let children = scale_range(slots, usize::try_from(*width).ok()?)?;
+                collect_visible_ranges(data.child_data().first()?, children, ranges)?;
+            }
+        }
+        DataType::List(_) | DataType::Binary | DataType::Utf8 => {
+            let offsets = data.buffers().first()?;
+            let positions = slots.start..slots.end.checked_add(1)?;
+            let offset_bytes = scale_range(positions.clone(), std::mem::size_of::<i32>())?;
+            add_buffer_range(offsets, offset_bytes, ranges)?;
+            let offsets = offsets.typed_data::<i32>().get(positions)?;
+            // Arrow permits null slots to enclose payload bytes or child rows.
+            if nulls.is_some_and(|nulls| offsets.windows(2).zip(nulls.iter()).any(|(pair, valid)| {
+                !valid && pair[0] != pair[1]
+            })) {
+                return Some(());
+            }
+            let start = usize::try_from(*offsets.first()?).ok()?;
+            let end = usize::try_from(*offsets.last()?).ok()?;
+            let values = start..end;
+            if matches!(data.data_type(), DataType::List(_)) {
+                collect_visible_ranges(data.child_data().first()?, values, ranges)?;
+            } else {
+                add_buffer_range(data.buffers().get(1)?, values, ranges)?;
+            }
+        }
+        DataType::Boolean => add_buffer_range(data.buffers().first()?, bitmap_bytes(slots), ranges)?,
+        DataType::FixedSizeBinary(width) => {
+            let values = scale_range(slots, usize::try_from(*width).ok()?)?;
+            add_buffer_range(data.buffers().first()?, values, ranges)?;
+        }
+        ty => {
+            if let Some(width) = ty.primitive_width() {
+                add_buffer_range(data.buffers().first()?, scale_range(slots, width)?, ranges)?;
+            }
+        }
+    }
+    Some(())
+}
+
+fn offset_range(range: &Range<usize>, offset: usize) -> Option<Range<usize>> {
+    Some(range.start.checked_add(offset)?..range.end.checked_add(offset)?)
+}
+
+fn scale_range(range: Range<usize>, width: usize) -> Option<Range<usize>> {
+    Some(range.start.checked_mul(width)?..range.end.checked_mul(width)?)
+}
+
+fn bitmap_bytes(bits: Range<usize>) -> Range<usize> {
+    bits.start / 8..bits.end.div_ceil(8)
+}
+
+fn add_buffer_range(buffer: &Buffer, bytes: Range<usize>, ranges: &mut Vec<Range<usize>>) -> Option<()> {
+    if bytes.start > bytes.end || bytes.end > buffer.len() {
+        return None;
+    }
+    if !bytes.is_empty() {
+        ranges.push(offset_range(&bytes, buffer.as_ptr() as usize)?);
+    }
+    Some(())
 }
 
 #[derive(Clone, Debug)]
