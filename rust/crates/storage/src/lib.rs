@@ -14,6 +14,7 @@ mod local_catalog;
 mod classic_catalog_drain;
 mod classic_retirement;
 mod repair_anchor_decision;
+mod remote_version_step;
 pub use local_catalog::LocalRepairAnchor;
 mod durability;
 pub use durability::{sync_directory, sync_file};
@@ -21,6 +22,7 @@ pub use durability::{sync_directory, sync_file};
 pub mod remote;
 
 pub use error::{Error, Result};
+pub use remote_version_step::valid_object_version;
 pub use io_region::{HeldView, IoRegion};
 pub use read_lease::ReadLease;
 pub use object_store::{LocalFile, LocalStore, MemoryStore, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, StoredObject, ObjectReadAllocation};

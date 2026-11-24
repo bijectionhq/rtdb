@@ -192,6 +192,8 @@ rule SearchJobRuns {
     -- The writer stores a search-pending intent with its staging owner before uploading the immutable body.
     -- A successful upload supplies the immutable publication for ordered adoption when the provider exposes it.
     -- An unsuccessful upload leaves the intent for collection under the same writer-drain rules.
+    -- A store that requires immutable provider evidence admits a new run only with a physical version or an enrolled terminal publication.
+    -- Native local Classic admits runs under the terminal-name contract of its recovery-locked store.
     -- A captured catalog routes each required term using the authenticated locator of each eligible run.
     -- A captured catalog can hold one complete term directory for each format 16 definition and analyzer generation.
     -- Each row binds a field, analyzed term and run digest to its document frequency, maximum term frequency, minimum stored length, maximum unit term score and window range.

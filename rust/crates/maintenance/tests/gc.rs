@@ -853,6 +853,10 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     let marker = ObjectKey::new(pending.pending_key(&entry.slug).unwrap()).unwrap();
     let body = ObjectKey::new(pending.object_key(&entry.slug).unwrap()).unwrap();
     let owner = writer.search_staging_owner().await.unwrap().unwrap();
+    let absent = SearchRun { digest: Some(vec![8; 32]), ..pending.clone() };
+    let absent_marker = ObjectKey::new(absent.pending_key(&entry.slug).unwrap()).unwrap();
+    let absent = rtdb_format::search_manifest::StagedSearchRun { run: absent, owner: Some(owner) };
+    writer.put(&absent_marker, absent.encode().unwrap().into()).await.unwrap();
     let staged = rtdb_format::search_manifest::StagedSearchRun { run: pending, owner: Some(owner) };
     writer.put(&marker, staged.encode().unwrap().into()).await.unwrap();
     let retirement = Arc::new(SearchPublisher { table: table.clone(), state: Arc::clone(&state), abandoned: AtomicBool::new(false) });
@@ -863,6 +867,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     let stop = CancellationToken::new();
     collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
     assert!(!retirement.abandoned.load(Ordering::Relaxed));
+    assert!(store.head(&absent_marker).await.is_ok());
     writer.put(&body, Bytes::from_static(b"body")).await.unwrap();
     collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
     assert!(!retirement.abandoned.load(Ordering::Relaxed));
@@ -871,6 +876,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
     assert!(retirement.abandoned.load(Ordering::Relaxed));
     assert!(store.head(&body).await.is_ok());
+    assert!(matches!(store.head(&absent_marker).await, Err(rtdb_storage::Error::MissingObject(_))));
     collector.collect_as_of(Timestamp(101), &stop).await.unwrap();
     assert!(store.head(&body).await.is_err());
     assert!(store.head(&marker).await.is_err());

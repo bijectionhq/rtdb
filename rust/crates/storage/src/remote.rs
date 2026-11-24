@@ -7,9 +7,7 @@ use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNames
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-#[path = "remote_version_step.rs"]
-mod version_step;
-pub use version_step::valid_object_version;
+pub use crate::{object_store::strong_entity_tag, valid_object_version};
 
 #[path = "remote_catalog.rs"]
 mod catalog;
@@ -249,6 +247,7 @@ impl ObjectStore for RemoteStore {
         crate::classic_retirement::retire(self, receipt, contents).await
     }
 
+    fn requires_search_publication(&self) -> bool { self.releases_exact_search_runs() }
     fn releases_exact_search_runs(&self) -> bool { self.catalog.is_some() && self.classic_versions.is_some() }
 
     async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
@@ -566,13 +565,6 @@ fn physical_version(namespace: Option<&S3ObjectNamespace>, path: &Path, version:
 }
 
 fn publication_attribute() -> Attribute { Attribute::Metadata("rtdb-publication".into()) }
-
-pub fn strong_entity_tag(tag: &str) -> bool {
-    tag.strip_prefix('"').and_then(|tag| tag.strip_suffix('"')).is_some_and(|value| {
-        !value.is_empty() && value != "*"
-            && value.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\' | b','))
-    })
-}
 
 struct ProviderPublication {
     version: Option<String>,

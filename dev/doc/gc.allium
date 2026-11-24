@@ -431,9 +431,11 @@ rule DeleteAndCommitChunkRule {
     --
     -- A completed pending search upload may be abandoned after its source cut is installed and the staging owner has drained.
     -- The collector uses a fresh observation to bind the completed body to its provider publication where the store requires one.
-    -- Once the writer has drained, a fresh absence observation permits removal of the intent.
+    -- Hosted drain requires a successor writer epoch and removal of the staged writer's storage region.
+    -- Native local drain requires acquiring the staged attachment's witness lock.
+    -- A fresh provider absence observed after drain settles an intent with no uploaded body.
     -- Ordered abandonment succeeds while the allocation is unadopted and fences later adoption at the same identity.
-    -- A hosted release uses the installed retirement, the catalog admission floor, and proof of the provider version or terminal publication.
+    -- A hosted release of an installed retirement requires the catalog admission floor and proof of the provider version or terminal publication.
     -- Checkpoint recovery retains the abandonment after physical release.
     -- Replay checkpoint copies and archives include every authenticated page reached by the recorded term directory roots.
     -- A serving receipt over a complete semantic entity directory omits the covered obsolete L0 pairs, logical posting runs, and term directory pages.

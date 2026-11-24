@@ -366,6 +366,7 @@ impl ObjectStore for DiskCachedStore {
     async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> rtdb_types::Result<bool> {
         self.remote.search_staging_drained(owner).await
     }
+    fn requires_search_publication(&self) -> bool { self.remote.requires_search_publication() }
     fn releases_exact_search_runs(&self) -> bool { self.remote.releases_exact_search_runs() }
     async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {

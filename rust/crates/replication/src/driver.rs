@@ -1570,7 +1570,8 @@ impl ReplicationDriver {
                 None
             }
             Some(SourceMessage::Protobuf(SourceBody::ArtefactsAdded(mut message))) => {
-                let rejected = accept_artefacts(&mut message, &durable, self.logs.storage_version.0, self.logs.storage_epoch.0);
+                let rejected = accept_artefacts(&mut message, &durable, self.logs.storage_version.0, self.logs.storage_epoch.0,
+                    self.resolve.storage.object_store().requires_search_publication());
                 message.source_msg_id = Some(position.0);
                 leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsAdded(message)), block, None, &self.resolve.memory)?;
                 leader.resolver_mut()?.advance_source(position)?;
@@ -1905,7 +1906,8 @@ pub(crate) fn additions(details: &[proto::TrieDetails]) -> Result<BTreeMap<Table
 /// Artefacts are advisory, so an entry that does not parse is dropped rather than faulting the log.
 /// An entry under another storage version or epoch is dropped without deleting: its key is computed here, under this node's storage root, and may name another builder's file.
 /// A group's object is deleted only when the catalog holds none of its members, since a member it still holds may take the same object later or be collected with it.
-fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::Snapshot, version: i32, epoch: i32) -> Vec<rtdb_storage::ObjectKey> {
+fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::Snapshot, version: i32, epoch: i32,
+    requires_search_publication: bool) -> Vec<rtdb_storage::ObjectKey> {
     let entries = std::mem::take(&mut message.entries);
     let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) else { return Vec::new() };
     if message.storage_version != Some(version) || message.storage_epoch.unwrap_or_default() != epoch { return Vec::new(); }
@@ -1919,7 +1921,10 @@ fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::S
             continue;
         }
         if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
-            if key.level() == 0 && catalog.accepts_search_run(&table, record) { message.entries.push(entry); }
+            if key.level() == 0 && (!requires_search_publication || search_publication_is_valid(record))
+                && catalog.accepts_search_run(&table, record) {
+                message.entries.push(entry);
+            }
             continue;
         }
         let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, record) else { continue };
@@ -1930,6 +1935,21 @@ fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::S
         }
     }
     rejected.into_iter().collect()
+}
+
+fn search_publication_is_valid(record: &proto::ArtefactRecord) -> bool {
+    use rtdb_storage::{object_store::strong_entity_tag, valid_object_version};
+
+    let Ok(change) = proto::SearchRunChange::from_artefact(record) else { return false; };
+    if change.retire_only() { return true; }
+    change.run.and_then(|run| run.publication).is_some_and(|publication| {
+        !publication.bucket().is_empty() && !publication.key().is_empty()
+            && if publication.terminal.is_some() {
+                publication.terminal_publication().is_some_and(|terminal| strong_entity_tag(&terminal.etag))
+            } else {
+                valid_object_version(publication.version().as_bytes())
+            }
+    })
 }
 
 /// The objects of collected tries this node may hold copies of: data, meta, and the artefacts their entries record.

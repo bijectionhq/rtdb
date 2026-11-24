@@ -312,6 +312,9 @@ impl SearchBuilder {
         if self.store.releases_exact_search_runs() && run.publication.is_none() {
             run.publication = self.store.retirement_publication(&key).await?.map(Into::into);
         }
+        if self.store.requires_search_publication() && run.publication.is_none() {
+            return Err(fault("Search upload returned no immutable provider publication"));
+        }
         Ok(run)
     }
 
@@ -823,6 +826,65 @@ fn normalized_revisions_preserve_order_and_frequency() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use rtdb_storage::{LocalStore, MemoryStore, ObjectStore, cache::BufferPool, object_store::StoredObject};
+    use rtdb_types::MemoryBudget;
+
+    #[derive(Default)]
+    struct PublicationRequired(MemoryStore);
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PublicationRequired {
+        fn requires_search_publication(&self) -> bool { true }
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.0.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.0.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.0.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.0.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, file: &Path) -> rtdb_storage::Result<()> { self.0.put_file(key, file).await }
+        async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.0.list(prefix).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.0.delete(key).await }
+    }
+
+    async fn upload_for_adoption(store: Arc<dyn ObjectStore>, index: &LogicalIndex, slug: &TableSlug) -> Result<SearchRun> {
+        let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let memory = MemoryBudget::new(64 << 20);
+        let builder = SearchBuilder::new("xtdb".into(), store, cache, memory.clone(), Arc::new(|| Timestamp(0).into()),
+            crate::SearchRuntime::with_logical_search(1 << 20));
+        let document = LogicalDocument { iid: Iid([1; 16]), sql_id: None, field: 0, revision: text_revision("body"),
+            tokens: rtdb_text::analyze("body"), position: (Timestamp(1), None, 1) };
+        let contents = RunContents { documents: vec![document], erases: Erases::new() };
+        builder.store_documents(index, &["body".into()], slug, vec![0], 0, 1, contents,
+            memory.reserve(32 << 20).unwrap(), &CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn adoption_fails_when_a_required_provider_publication_is_missing() {
+        use rtdb_format::search_manifest::{pending_prefix, run_prefix};
+        let store = Arc::new(PublicationRequired::default());
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "bodyf16".into(), version: 1 };
+        let slug = TableSlug::for_unrecorded_table(&index.table).unwrap();
+        assert_eq!(upload_for_adoption(store.clone(), &index, &slug).await.unwrap_err().message.as_deref(),
+            Some("Search upload returned no immutable provider publication"));
+        assert_eq!(store.list(Some(&ObjectKey::new(pending_prefix(&slug)).unwrap())).await.unwrap().len(), 1);
+        assert_eq!(store.list(Some(&ObjectKey::new(run_prefix(&slug)).unwrap())).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adoption_accepts_a_native_local_publication_without_a_provider_version() {
+        let files = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalStore::open(files.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "bodyf16".into(), version: 1 };
+        let slug = TableSlug::for_unrecorded_table(&index.table).unwrap();
+        let run = upload_for_adoption(store.clone(), &index, &slug).await.unwrap();
+        assert!(run.publication.is_none());
+        assert!(store.head(&ObjectKey::new(run.object_key(&slug).unwrap()).unwrap()).await.is_ok());
+
+        let record = SearchRunChange { run: Some(run.clone()), ..Default::default() }.to_artefact().unwrap();
+        let mut trie = rtdb_index::CatalogTrie::notification(TrieKey::l0(BlockIndex(0)).unwrap(), 1, None).unwrap();
+        trie.artefacts.push(record);
+        let catalog = rtdb_index::TrieCatalog::default().with_tries(index.table.clone(), [trie], Timestamp(1)).unwrap();
+        assert_eq!(catalog.search_runs(&index.table).next(), Some(&run));
+    }
 
     #[test]
     fn an_erase_scrubs_older_text_and_keeps_later_reuse_at_the_same_system_time() {

@@ -368,6 +368,7 @@ impl TrieCollector {
     async fn collect_pending_search(&self, entry: &TableEntry, catalog: &TrieCatalog, durable: Option<BlockIndex>,
         cancellation: &CancellationToken) -> Result<()> {
         use rtdb_format::search_manifest::{MAX_PENDING_BYTES, SearchStagingOwner, StagedSearchRun, pending_prefix};
+        use rtdb_storage::object_store::DrainedSearchUpload;
         let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
         let prefix = ObjectKey::new(pending_prefix(&entry.slug))?;
         let objects = self.store.list(Some(&prefix)).await?;
@@ -388,20 +389,18 @@ impl TrieCollector {
                 Err(error) => return Err(error.into()),
             };
             let Ok(StagedSearchRun { mut run, owner: Some(owner) }) = StagedSearchRun::decode(&bytes) else { continue; };
-            if !self.store.search_staging_drained(owner).await? { continue; }
             if run.pending_key(&entry.slug)? != intent.key.as_str()
                 || durable.is_none_or(|boundary| run.blocks.last().is_none_or(|last| *last > boundary.0)) {
                 continue;
             }
             let body = ObjectKey::new(run.object_key(&entry.slug)?)?;
-            match self.store.head_fresh(&body).await {
-                Ok(object) if object.size == run.file_size() as u64 => {}
-                Ok(_) => continue,
-                Err(rtdb_storage::Error::MissingObject(_)) => {
+            match self.store.head_drained_search_upload(&body, owner).await? {
+                Some(DrainedSearchUpload::Present(object)) if object.size == run.file_size() as u64 => {}
+                Some(DrainedSearchUpload::Absent) => {
                     self.store.delete(&intent.key).await?;
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                _ => continue,
             }
             run.publication = self.store.retirement_publication(&body).await?.map(Into::into);
             let local = matches!(owner, SearchStagingOwner::Local { .. }) && self.store.local_maintenance_store().is_some();

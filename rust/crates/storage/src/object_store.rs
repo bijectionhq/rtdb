@@ -42,6 +42,18 @@ pub struct StoredObject {
     pub size: u64,
 }
 
+pub enum DrainedSearchUpload {
+    Present(StoredObject),
+    Absent,
+}
+
+pub fn strong_entity_tag(tag: &str) -> bool {
+    tag.strip_prefix('"').and_then(|tag| tag.strip_suffix('"')).is_some_and(|value| {
+        !value.is_empty() && value != "*"
+            && value.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\' | b','))
+    })
+}
+
 /// Metadata or bytes and the physical version named by the same provider response.
 pub struct ObjectObservation<T> {
     pub value: T,
@@ -237,6 +249,17 @@ pub trait ObjectStore: Send + Sync {
     /// Checks that the staged writer was superseded and its provider work drained.
     async fn search_staging_drained(&self, _owner: rtdb_format::search_manifest::SearchStagingOwner)
         -> rtdb_types::Result<bool> { Ok(false) }
+    async fn head_drained_search_upload(&self, key: &ObjectKey, owner: rtdb_format::search_manifest::SearchStagingOwner)
+        -> rtdb_types::Result<Option<DrainedSearchUpload>> {
+        if !self.search_staging_drained(owner).await? { return Ok(None); }
+        let body = match self.head_fresh(key).await {
+            Ok(object) => DrainedSearchUpload::Present(object),
+            Err(Error::MissingObject(_)) => DrainedSearchUpload::Absent,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(body))
+    }
+    fn requires_search_publication(&self) -> bool { false }
     /// Whether installed search-run retirement uses the exact publication grant.
     fn releases_exact_search_runs(&self) -> bool { false }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,

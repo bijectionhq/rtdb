@@ -310,6 +310,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             }
             let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
             serving.index_pages = Some(pages);
+            serving.requires_search_publication = matches!(config.storage, CellStorage::S3 { .. });
             serving.catalog_readers = Some(CatalogReaders::new(
                 self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
@@ -1468,6 +1469,7 @@ pub struct GarbageStore {
     packing: Option<Arc<crate::packing::PackingStore>>,
     index_pages: Option<HostedIndexPages>,
     catalog_readers: Option<CatalogReaders>,
+    requires_search_publication: bool,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeMap<ObjectKey, Vec<PhysicalObjectVersion>>>,
     clock: Clock,
@@ -1479,7 +1481,8 @@ impl GarbageStore {
     pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self::new(inner, clock, None))) }
 
     fn new(inner: Arc<dyn ObjectStore>, clock: Clock, packing: Option<Arc<crate::packing::PackingStore>>) -> Self {
-        Self { inner, packing, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
+        Self { inner, packing, index_pages: None, catalog_readers: None, requires_search_publication: false,
+            loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
     }
 
     pub(crate) async fn physical_member(&self, member: &ObjectKey) -> rtdb_storage::Result<ObjectKey> {
@@ -1646,6 +1649,7 @@ impl ObjectStore for GarbageStore {
         let Some(readers) = &self.catalog_readers else { return Ok(false); };
         readers.search_staging_drained(owner).await
     }
+    fn requires_search_publication(&self) -> bool { self.requires_search_publication }
     fn releases_exact_search_runs(&self) -> bool { self.catalog_readers.is_some() }
     async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
@@ -1655,9 +1659,7 @@ impl ObjectStore for GarbageStore {
         let version = self.retirement_version(key).await?.filter(|version| published.is_some_and(|published| {
             *published == rtdb_format::log::proto::PublishedObjectVersion::from(version.clone())
         }));
-        if version.is_none() && terminal.is_none() {
-            return Ok(matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))));
-        }
+        if version.is_none() && terminal.is_none() { return Ok(false); }
         let path = rtdb_format::search_manifest::is_run_key(key.as_str()).then_some(key.as_str());
         let (floor, allowed) = readers.close_admission(cut, &[path]).await?;
         if !allowed[0] { return Ok(false); }
@@ -2403,6 +2405,44 @@ mod tests {
         let child_view = open_deployment_store(bucket, &format!("{}/v06", child.storage_prefix()),
             crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
         assert_eq!(child_view.get(&file).await.unwrap(), Bytes::from_static(b"original"));
+    }
+
+    #[tokio::test]
+    async fn search_release_refuses_head_only_absence_and_staged_absence_requires_drain() {
+        use rtdb_directory::{MemoryDirectory, StorageNamespaces};
+        use rtdb_format::{keys::CURRENT_STORAGE_VERSION, search_manifest::SearchStagingOwner};
+        use rtdb_storage::{MemoryStore, object_store::DrainedSearchUpload};
+        use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch};
+
+        let directory = MemoryDirectory::new();
+        let old_owner = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let epoch = StorageEpoch(0);
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, epoch).unwrap().key();
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 2;
+        record.holder = Some(MemberId::fresh());
+        record.storage_namespaces = Some(namespaces);
+        record.storage_regions.insert(owner, remote_storage_region(None, None));
+        record.storage_regions.insert(old_owner, remote_storage_region(None, None));
+        let record = directory.create_deployment(record).await.unwrap();
+        let mut store = GarbageStore::new(Arc::new(MemoryStore::default()), wall_clock(), None);
+        store.catalog_readers = Some(CatalogReaders::new(directory.clone(), TaskTracker::new(), &record,
+            root, namespaces, owner, Some(record.epoch)));
+        let run = key(&format!("tables/docs/search-runs/{}.f16.arrow", "ab".repeat(32)));
+        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
+        let staged = SearchStagingOwner::Directory { region: old_owner, writer_epoch: 1 };
+        assert!(matches!(store.head_fresh(&run).await, Err(Error::MissingObject(_))));
+        assert!(!store.release_search_run(&run, None, Some(cut)).await.unwrap());
+        assert!(store.head_drained_search_upload(&run, staged).await.unwrap().is_none());
+
+        crate::admin::update_installation(directory.as_ref(), &record.id, |current| {
+            current.storage_regions.remove(&old_owner);
+            Ok(())
+        }).await.unwrap();
+        assert!(matches!(store.head_drained_search_upload(&run, staged).await.unwrap(), Some(DrainedSearchUpload::Absent)));
+        assert!(!store.release_search_run(&run, None, Some(cut)).await.unwrap());
     }
 
     #[tokio::test]

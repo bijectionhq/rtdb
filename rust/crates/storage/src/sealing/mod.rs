@@ -405,6 +405,7 @@ impl ObjectStore for EncryptingStore {
     async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> rtdb_types::Result<bool> {
         self.inner.search_staging_drained(owner).await
     }
+    fn requires_search_publication(&self) -> bool { self.inner.requires_search_publication() }
     fn releases_exact_search_runs(&self) -> bool { self.inner.releases_exact_search_runs() }
     async fn release_search_run(
         &self,

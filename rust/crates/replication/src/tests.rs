@@ -2642,6 +2642,37 @@ async fn a_placed_holder_claims_without_an_election_wait_and_an_idle_term_append
 }
 
 #[test]
+fn search_adoption_requires_a_provider_version_or_terminal_publication_when_the_store_requires_it() {
+    let table = TableRef::new("public", "docs");
+    let tables = rtdb_index::TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let key = rtdb_format::keys::TrieKey::l0(BlockIndex(0)).unwrap();
+    let catalog = rtdb_index::TrieCatalog::default().with_tries(table.clone(),
+        [rtdb_index::CatalogTrie::notification(key.clone(), 1, None).unwrap()], Timestamp(1)).unwrap();
+    let snapshot = rtdb_index::PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap().snapshot();
+    let accepts = |publication, retire: bool, required| {
+        let run = proto::SearchRun { definition_id: Some("bodyf16".into()), definition_version: Some(1), blocks: vec![0],
+            digest: Some(vec![1; 32]), locator: Some(vec![1]), file_size: Some(1), source_rows: Some(1), publication,
+            allocation: Some(vec![1; 16]), ..Default::default() };
+        let change = proto::SearchRunChange { run: Some(run), retire_only: retire.then_some(true), ..Default::default() };
+        let mut message = proto::ArtefactsAdded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0),
+            table_name: Some(table.schema_and_table()), entries: vec![proto::ArtefactEntry { trie_key: Some(key.to_string()),
+                record: Some(change.to_artefact().unwrap()) }], ..Default::default() };
+        accept_artefacts(&mut message, &snapshot, CURRENT_STORAGE_VERSION.0, 0, required);
+        !message.entries.is_empty()
+    };
+    let address = proto::PublishedObjectVersion { bucket: Some("bucket".into()), key: Some("path".into()), ..Default::default() };
+    assert!(!accepts(None, false, true));
+    assert!(!accepts(Some(address.clone()), false, true));
+    assert!(!accepts(Some(proto::PublishedObjectVersion { version: Some("null".into()), ..address.clone() }), false, true));
+    assert!(accepts(Some(proto::PublishedObjectVersion { version: Some("provider-version".into()), ..address.clone() }), false, true));
+    assert!(accepts(Some(proto::PublishedObjectVersion { terminal: Some(proto::TerminalPublication {
+        allocation: Some(vec![1; 16]), etag: Some("\"verified-tag\"".into()),
+    }), ..address }), false, true));
+    assert!(accepts(None, false, false));
+    assert!(accepts(None, true, true));
+}
+
+#[test]
 fn a_group_objects_file_is_deleted_or_dropped_from_caches_only_with_the_groups_last_member() {
     use rtdb_format::keys::{ArtefactOwner, TrieKey};
     let table = TableRef::new("public", "docs");
@@ -2659,10 +2690,10 @@ fn a_group_objects_file_is_deleted_or_dropped_from_caches_only_with_the_groups_l
         entries: keys.iter().map(|key| proto::ArtefactEntry { trie_key: Some((*key).into()), record: Some(record.clone()) }).collect(), source_msg_id: None };
     let members = ["l02-rc-p0-b00", "l02-rc-p1-b00", "l02-rc-p2-b00", "l02-rc-p3-b00"];
     let mut partly_superseded = message(&members);
-    assert!(accept_artefacts(&mut partly_superseded, &value.snapshot(), CURRENT_STORAGE_VERSION.0, 0).is_empty(), "the superseded member's siblings still take the file");
+    assert!(accept_artefacts(&mut partly_superseded, &value.snapshot(), CURRENT_STORAGE_VERSION.0, 0, false).is_empty(), "the superseded member's siblings still take the file");
     assert_eq!(partly_superseded.entries.len(), 3);
     let mut unheld = message(&["l02-rc-p0-b05", "l02-rc-p1-b05"]);
-    assert_eq!(accept_artefacts(&mut unheld, &value.snapshot(), CURRENT_STORAGE_VERSION.0, 0), [object("l02-rc-p0-b05")], "a group the catalog holds no member of loses its file once");
+    assert_eq!(accept_artefacts(&mut unheld, &value.snapshot(), CURRENT_STORAGE_VERSION.0, 0, false), [object("l02-rc-p0-b05")], "a group the catalog holds no member of loses its file once");
     let one: BTreeSet<TrieKey> = ["l02-rc-p0-b00".parse().unwrap()].into();
     let recorded = rtdb_index::PartitionValue::loaded(value.trie_catalog().with_artefacts(&table, members.iter().map(|key| (key.parse().unwrap(), record.clone()))), value.table_catalog().as_ref().clone(), TrieConfig::default()).unwrap();
     assert!(!cached_objects(&recorded, &table, &one).contains(&object("l02-rc-p0-b00")));
