@@ -3064,7 +3064,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         } else {
                                             overlay
                                         };
-                                        let page = rtdb_node::nearest::owned_nearest_batch(scoped, &owner, &partitions, &query, Some(valid), overlay).await?;
+                                        let (page, _approximated) = rtdb_node::nearest::owned_nearest_batch(scoped, &owner, &partitions, &query, Some(valid), overlay).await?;
                                         guard()?;
                                         Ok(page)
                                     };
