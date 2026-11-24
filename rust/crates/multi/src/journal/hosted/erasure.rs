@@ -17,7 +17,9 @@ use crate::journal::{
 };
 use crate::keys::{JournalKey, KeyService};
 
+mod drain;
 mod evidence;
+pub use drain::{DrainRegistration, ErasureDrainJournal, SignedDrainJoin};
 use evidence::CustodyEvidence;
 pub use evidence::{
     CustodyDrain, CustodyWork, DeadlineReservation, DestructionEvidence, DrainParticipant,
@@ -273,6 +275,25 @@ impl<'a> ErasureCoordinator<'a> {
         coordinate(self, self.keys, custody, erasure, self.authority.as_ref()).await
     }
 
+    /// Retain the authoritative roster after the certified switch closes
+    /// admission. The returned journal can receive the registered workers'
+    /// authenticated observations without retaining their plaintext.
+    pub async fn record_closed_drain(
+        &self,
+        ready: &CleanRecoverySlots,
+        commit: ErasureCommit,
+        closed_at_ms: u64,
+        roster: Vec<DrainRegistration>,
+    ) -> Result<ErasureDrainJournal<'_>> {
+        validate_commit(ready.prepared(), commit, Some(ready.binding()), self.authority.as_ref())?;
+        ErasureDrainJournal::close(self.provider, commit, closed_at_ms, roster).await
+    }
+
+    pub async fn resume_drain(&self, commit: ErasureCommit) -> Result<Option<ErasureDrainJournal<'_>>> {
+        validate_commit(commit.prepared, commit, None, self.authority.as_ref())?;
+        ErasureDrainJournal::reopen(self.provider, commit).await
+    }
+
     pub async fn confirm_destruction(
         &self,
         custody: &dyn ErasureCustody,
@@ -287,11 +308,15 @@ impl<'a> ErasureCoordinator<'a> {
             .authority
             .as_ref()
             .ok_or_else(evidence::authority_unavailable)?;
-        validate_commit(commit.prepared, commit, None, Some(authority))?;
+        let Some(journal) = self.resume_drain(commit).await? else { return Ok(None); };
+        let Some(joined) = journal.joined().await? else { return Ok(None); };
         let Some(receipt) = custody.destruction(commit).await? else {
             return Ok(None);
         };
         authority.verify_destruction(commit, &receipt)?;
+        if receipt.drain.closed_at_ms != journal.closed_at_ms() || receipt.drain.joined != joined {
+            return Err(invalid("The destruction receipt differs from the durable drain observations"));
+        }
         Ok(Some(receipt))
     }
 }

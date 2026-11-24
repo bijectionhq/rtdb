@@ -5,6 +5,7 @@ use ring::{
     signature::{ED25519, UnparsedPublicKey},
 };
 use rtdb_types::{Anomaly, Result};
+use serde::{Deserialize, Serialize};
 
 use super::{ErasureCommit, PreparedErasure, invalid};
 
@@ -45,7 +46,7 @@ pub struct DeadlineReservation {
     pub signature: [u8; 64],
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[repr(u8)]
 pub enum CustodyWork {
     Plaintext = 1,
@@ -54,13 +55,13 @@ pub enum CustodyWork {
 }
 
 /// An authority registered one custody obligation under this identity.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct DrainParticipant {
     pub kind: CustodyWork,
     pub identity: [u8; 32],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct DrainedWork {
     pub participant: DrainParticipant,
     pub observed_at_ms: u64,

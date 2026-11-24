@@ -726,3 +726,61 @@ async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn drain_journal_reopens_exact_joined_observations() -> Result<()> {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::sync::Arc;
+
+    let fixture = Fixture::new().await?;
+    let mut commit = fixture.commit().await?;
+    let worker = Ed25519KeyPair::from_seed_unchecked(&[5; 32]).unwrap();
+    let other_worker = Ed25519KeyPair::from_seed_unchecked(&[6; 32]).unwrap();
+    let verification_key = worker.public_key().as_ref().try_into().unwrap();
+    let roster = [
+        DrainRegistration { kind: CustodyWork::Plaintext, duty: [8; 32], verification_key },
+        DrainRegistration { kind: CustodyWork::Copy, duty: [9; 32], verification_key },
+    ];
+    let participants = roster.map(|duty| duty.participant().unwrap());
+    commit.draining_inventory = drain_inventory(participants)?;
+    let closed = commit.committed_at_ms + 1;
+    let volume = tempfile::tempdir().unwrap();
+    let vault = tempfile::tempdir().unwrap();
+    let custody = || {
+        CheckpointCustody::new(
+            Arc::new(rtdb_storage::MemoryStore::default()),
+            rtdb_storage::ObjectKey::new("protected").unwrap(),
+            fixture.erasure.placement,
+            rtdb_types::StorageEpoch(0),
+            commit.prepared.checkpoint.custody.provider,
+            Arc::new(LocalKeyService::new(vault.path()).unwrap()),
+            IoRegion::new(),
+        ).on_local_volume(volume.path())
+    };
+    let provider = custody()?;
+    let journal = ErasureDrainJournal::close(&provider, commit, closed, roster.to_vec()).await?;
+    let work = participants.map(|participant| DrainedWork {
+        participant,
+        observed_at_ms: closed + 1,
+        observation: [10; 32],
+    });
+    let signed = |work, signer: &Ed25519KeyPair| SignedDrainJoin {
+        work,
+        signature: signer.sign(&SignedDrainJoin::signing_bytes(&commit, closed, work)).as_ref().to_vec(),
+    };
+    assert!(journal.record(&signed(work[0], &other_worker)).await.is_err());
+    journal.record(&signed(work[0], &worker)).await?;
+    assert!(journal.joined().await?.is_none());
+    drop(journal);
+    drop(provider);
+
+    let reopened = custody()?;
+    let journal = ErasureDrainJournal::reopen(&reopened, commit).await?.unwrap();
+    assert!(journal.joined().await?.is_none());
+    journal.record(&signed(work[1], &worker)).await?;
+    journal.record(&signed(work[1], &worker)).await?;
+    assert_eq!(journal.joined().await?, Some(work.to_vec()));
+    let other = DrainedWork { observation: [11; 32], ..work[1] };
+    assert!(journal.record(&signed(other, &worker)).await.is_err());
+    Ok(())
+}

@@ -680,6 +680,66 @@ impl CheckpointCustody {
     }
 }
 
+/// Evidence has its own lifetime. Advancing the readable checkpoint must
+/// not retire the witnesses for an outstanding destruction.
+pub(super) struct ErasureRecords<'a> {
+    provider: &'a CheckpointCustody,
+    scope: String,
+}
+
+impl CheckpointCustody {
+    pub(super) fn erasure_records(&self, placement: Placement, operation: Uuid) -> Result<ErasureRecords<'_>> {
+        if self.placement != placement || operation.is_nil() {
+            return Err(invalid("The erasure evidence belongs to another placement"));
+        }
+        Ok(ErasureRecords {
+            provider: self,
+            scope: format!("{}/{}/{}/erasure/{}/{operation}", self.prefix.as_str(), placement.deployment,
+                placement.incarnation, placement.generation),
+        })
+    }
+}
+
+impl ErasureRecords<'_> {
+    fn ledger(&self, io: Arc<IoRegion>) -> UnitLedger {
+        let scope = UnitScope::new(self.provider.placement, b"erasure-evidence", self.scope.as_bytes());
+        UnitLedger::new(Arc::clone(&self.provider.keys), scope, io)
+    }
+
+    fn key(&self, name: &str) -> rtdb_storage::Result<ObjectKey> {
+        ObjectKey::new(format!("{}/{name}", self.scope))
+    }
+
+    fn store(&self) -> EncryptingStore {
+        let ledger = self.ledger(Arc::clone(&self.provider.io));
+        EncryptingStore::with_units(Arc::clone(&self.provider.bucket), Arc::new(ledger))
+    }
+
+    pub(super) async fn get(&self, name: &str) -> Result<Option<Bytes>> {
+        let key = self.key(name)?;
+        let Some(local) = &self.provider.local else {
+            return CheckpointCustody::metadata(&self.store(), &key).await;
+        };
+        let allocation = local.acquire(&self.scope, false).await?;
+        let store = allocation.read_store(self.ledger(allocation.region()))?;
+        CheckpointCustody::metadata(store.as_ref(), &key).await
+    }
+
+    pub(super) async fn put(&self, name: &str, bytes: Bytes) -> Result<()> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(invalid("The erasure record exceeds the custody metadata bound"));
+        }
+        let key = self.key(name)?;
+        let Some(local) = &self.provider.local else {
+            self.store().put(&key, bytes).await?;
+            return Ok(());
+        };
+        let allocation = local.acquire(&self.scope, true).await?;
+        allocation.put(&self.ledger(allocation.region()), &key, bytes).await?;
+        Ok(())
+    }
+}
+
 struct ExactStore {
     bucket: Arc<dyn ObjectStore>,
     prefix: String,
