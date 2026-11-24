@@ -1563,6 +1563,17 @@ impl OwnedReadSession {
 
     pub fn query_time(&self) -> Result<Timestamp> { self.context.current_time.as_micros() }
 
+    /// Recover clock evidence only from an attempt assertion on this original Root cut.
+    pub async fn owned_attempt_observation(&self, key: TransactionKey) -> Result<Option<rtdb_tx::DecisionObservation>> {
+        self.require_unscoped_root()?;
+        self.admit_access().await?;
+        if self.historical.is_some() || self.applied_scope.is_some() || key.tx_id > self.present.tx_id {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        if self.node.factory.decision_clock.is_none() { return Ok(None); }
+        ordered_commit_observation(Arc::clone(&self.context), key).await
+    }
+
     /// Admit a placed restore only while the original writer and replay
     /// hold still own the destination and no release has sealed it.
     pub async fn replay_parent_hold(&self, binding: [u8; 32], before_replay: bool) -> Result<Vec<u8>> {
@@ -3638,31 +3649,11 @@ impl NativeSession {
     pub async fn owned_commit_observation(&self, key: TransactionKey) -> Result<Option<rtdb_tx::DecisionObservation>> {
         let node = &self.service.node;
         if node.factory.decision_clock.is_none() { return Ok(None); }
-        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/no-acceptance-observation",
-            "The original ordered receipt has no verified receiver clock observation");
         let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, resume_token: None,
             has_await_floor: false, snapshot_time: None, current_time: node.query_instant(), timezone: self.state.session_timezone().to_owned() };
         let context = node.query_context_in_placement(self.state.database(), &basis, self.service.identity.as_ref(),
             self.service.placement.as_ref(), CatalogReadCut::Current, self.state.cancellation()).await?;
-        let args = vec![Value::I64(key.tx_id.0), Value::Timestamp {
-            value: key.system_time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
-        }];
-        let options = rtdb_sql::PrepareOptions {
-            parameter_types: args.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
-            default_timezone: context.timezone.clone(),
-            ..Default::default()
-        };
-        let mut cursor = prepare_query(
-            "SELECT decision_clock FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ? AND committed",
-            &context, &options,
-        )?.execute(context, args).await?;
-        let batch = cursor.next_batch().await?.filter(|batch| batch.batch().num_rows() == 1).ok_or_else(unavailable)?;
-        if cursor.next_batch().await?.is_some() { return Err(unavailable()); }
-        let batch = batch.batch();
-        let Value::Binary(bytes) = read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)? else {
-            return Err(unavailable());
-        };
-        rtdb_tx::DecisionObservation::decode(&bytes).map(Some)
+        ordered_commit_observation(context, key).await
     }
 
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
@@ -3718,6 +3709,32 @@ pub(crate) struct NativeSessionService {
     placement: Option<Weak<Database>>,
     memory: Arc<MemoryBudget>,
     audience_storage: Option<Arc<BufferPool>>,
+}
+
+async fn ordered_commit_observation(
+    context: Arc<QueryContext>, key: TransactionKey,
+) -> Result<Option<rtdb_tx::DecisionObservation>> {
+    let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/no-acceptance-observation",
+        "The original ordered receipt has no verified receiver clock observation");
+    let args = vec![Value::I64(key.tx_id.0), Value::Timestamp {
+        value: key.system_time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+    }];
+    let options = rtdb_sql::PrepareOptions {
+        parameter_types: args.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
+        default_timezone: context.timezone.clone(),
+        ..Default::default()
+    };
+    let mut cursor = prepare_query(
+        "SELECT decision_clock FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ? AND committed",
+        &context, &options,
+    )?.execute(context, args).await?;
+    let batch = cursor.next_batch().await?.filter(|batch| batch.batch().num_rows() == 1).ok_or_else(unavailable)?;
+    if cursor.next_batch().await?.is_some() { return Err(unavailable()); }
+    let batch = batch.batch();
+    let Value::Binary(bytes) = read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)? else {
+        return Err(unavailable());
+    };
+    rtdb_tx::DecisionObservation::decode(&bytes).map(Some)
 }
 
 impl NativeSessionService {

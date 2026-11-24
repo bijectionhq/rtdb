@@ -19,7 +19,7 @@ use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{HeldSpatialNearest, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
-use rtdb_types::{EntityId, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -1937,7 +1937,7 @@ impl Service {
         let mut replies = Vec::with_capacity(2);
         for system in [before, group] {
             let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-            let reply = self.finish_owned_point_inner(call.memory(), system, valid, &id, cursor, None, Some(&columns), |_| Ok(None)).await?;
+            let reply = self.finish_owned_point_inner(call.memory(), system, valid, &id, cursor, None, Some(&columns), None, |_| Ok(None)).await?;
             replies.push(Ok(reply));
         }
         held.snapshot.check_relation(&relation).map_err(status)?;
@@ -4512,18 +4512,23 @@ impl Service {
             evidence.map(|evidence| held.remember(call, relation, evidence)).transpose()
         }).transpose().map(Option::flatten);
         let memory = origin.map_or(self.memory(), |(call, _)| call.memory());
-        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, witness).await?;
+        let attempt = (origin.is_some() && !snapshot.is_scoped_root()
+            && relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION
+            && origin.is_some_and(|(call, _)| call.session.audience_source().is_none()))
+            .then_some(snapshot);
+        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, attempt, witness).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
     async fn finish_owned_point(&self, call: &Call, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
-        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, |_| Ok(None)).await
+        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, None, |_| Ok(None)).await
     }
 
     async fn finish_owned_point_inner(
         &self, memory: &Arc<MemoryBudget>, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
         lifetime: Option<rtdb_types::OwnedLifetimeFloor>, path_columns: Option<&[String]>,
+        attempt: Option<&OwnedReadSession>,
         witness: impl FnOnce(Option<Timestamp>) -> Result<Option<Uuid>, Status>,
     ) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
@@ -4561,7 +4566,22 @@ impl Service {
                 Some(batch.batch().project(&fields).map_err(arrow)?)
             } else { None };
             let rows = projected.as_ref().unwrap_or_else(|| batch.batch());
-            let schema = with_point_witness(rows.schema_ref(), witness(until)?);
+            let mut schema = with_point_witness(rows.schema_ref(), witness(until)?);
+            if let Some(attempt) = attempt {
+                use std::fmt::Write;
+                let tx_id = rtdb_query::owned_receipt_transaction(rows, 0).map_err(status)?;
+                let key = TransactionKey { tx_id, system_time: revision };
+                let mut metadata = schema.metadata().clone();
+                metadata.insert("rtdb.owned.receipt_tx_id".into(), tx_id.0.to_string());
+                if let Some(observation) = attempt.owned_attempt_observation(key).await.map_err(status)? {
+                    let mut encoded = String::with_capacity(rtdb_tx::DecisionObservation::WIDTH as usize * 2);
+                    for byte in observation.encode() {
+                        write!(encoded, "{byte:02x}").expect("String writes are infallible");
+                    }
+                    metadata.insert("rtdb.owned.receipt_clock".into(), encoded);
+                }
+                schema = schema.with_metadata(metadata);
+            }
             let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
@@ -4602,7 +4622,7 @@ impl Service {
             }
         }
         let columns: Vec<_> = schema.fields().iter().enumerate()
-            .filter(|(_, field)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal"))
+            .filter(|(_, field)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal" | rtdb_types::HOSTED_RECEIPT_TX_ID))
             .map(|(index, _)| index).collect();
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))

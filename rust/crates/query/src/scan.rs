@@ -1793,6 +1793,16 @@ impl PartitionScan {
                     }).collect::<Result<Vec<_>>>()?;
                     return Ok(Some(crate::columnar::Column::Values(ordinals)));
                 }
+                if self.scan.columns[position].name == rtdb_types::HOSTED_RECEIPT_TX_ID
+                    && self.execution.context.catalog.owned_identity().is_some()
+                {
+                    let transactions = rows.iter().map(|row| {
+                        let (batch, index) = row.source;
+                        batches[batch as usize].header(index as usize)
+                            .map(|header| header.position.map_or(Value::Null, |position| Value::I64(position.transaction.0)))
+                    }).collect::<Result<Vec<_>>>()?;
+                    return Ok(Some(crate::columnar::Column::Values(transactions)));
+                }
                 if self.scan.columns[position].name == "user_metadata" && projected.is_some() {
                     return Ok(projected.take());
                 }
@@ -2253,6 +2263,32 @@ mod tests {
         }).await;
         values.sort_by_key(|value| match value { Value::I64(value) => *value, other => panic!("{other:?}") });
         assert_eq!(values, [Value::I64(2), Value::I64(3)]);
+    }
+
+    #[tokio::test]
+    async fn prepared_receipt_projects_the_assigned_position_after_a_gap() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let table = TableRef::new("public", rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE);
+        let id = EntityId::String("receipt".to_owned());
+        let key = |position| TransactionKey { tx_id: TxId(position), system_time: Timestamp(10) };
+        let mut prepare = TransactionBuffer::new(state.value().snapshot(), key(0), Arc::clone(&memory)).unwrap();
+        prepare.put(table.clone(), StructFields::from([("_id".into(), id.as_value())]), Interval::ALL).unwrap();
+        let prepared = prepare.stage().unwrap();
+        let mut ordered = TransactionBuffer::new(state.value().snapshot(), key(4), Arc::clone(&memory)).unwrap().stage().unwrap();
+        ordered.install_prepared_generation(prepared, &memory).unwrap();
+        state.apply(&ordered).unwrap();
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, memory, Timestamp(10), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let mut cursor = crate::owned_relation::open_owned_table_point(
+            context, table, id.iid(), Some(&id), Some(Interval::ALL),
+            Some(&[rtdb_types::HOSTED_RECEIPT_TX_ID]), false,
+        ).await.unwrap().unwrap();
+        let row = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(crate::owned_receipt_transaction(row.batch(), 0).unwrap(), TxId(4));
     }
 
     #[tokio::test]

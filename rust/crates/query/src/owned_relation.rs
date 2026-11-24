@@ -716,6 +716,11 @@ async fn open_owned_table_point_with_edges(
     if assertion && !fields.contains(&"_assertion_ordinal") {
         fields.push("_assertion_ordinal");
     }
+    if assertion && name.table.table.split_once('-')
+        .is_some_and(|(_, relation)| relation == rtdb_types::OWNED_ATTEMPT_RELATION)
+    {
+        fields.push(rtdb_types::HOSTED_RECEIPT_TX_ID);
+    }
     if edges {
         for required in ["_valid_from", "_valid_to"] {
             if !fields.contains(&required) { fields.push(required); }
@@ -794,6 +799,20 @@ pub fn owned_row_revision(
         Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Ok(Timestamp(value)),
         _ => Err(Anomaly::fault("rtdb.owned/row-revision", "Owned row revision is not a microsecond timestamp")),
     }
+}
+
+/// The source transaction of the winning assertion, read from the event header.
+pub fn owned_receipt_transaction(batch: &arrow_array::RecordBatch, row: usize) -> Result<rtdb_types::TxId> {
+    use arrow_array::{Array, Int64Array};
+
+    let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/receipt-position",
+        "The retained receipt has no original transaction position");
+    let array = batch.column_by_name(rtdb_types::HOSTED_RECEIPT_TX_ID)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .filter(|array| row < array.len() && array.is_valid(row)).ok_or_else(unavailable)?;
+    let position = array.value(row);
+    if position < 0 { return Err(unavailable()); }
+    Ok(rtdb_types::TxId(position))
 }
 
 pub fn owned_row_assertion_ordinal(batch: &arrow_array::RecordBatch, row: usize) -> Result<Option<NonZeroU32>> {
