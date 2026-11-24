@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+arrow-buffer.workspace = true
 rtdb-types.workspace = true
 rtdb-format.workspace = true
 rtdb-columnar.workspace = true
@@ -25,6 +26,9 @@ tokio-util.workspace = true
 uuid.workspace = true
 serde.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+arrow-array.workspace = true
 
 [lints]
 workspace = true
