@@ -195,7 +195,17 @@ impl NativeServingHandle {
             self.replication.serving_barrier(cancellation).await?;
             return self.replication.serving_validate(request, cancellation).await;
         }
-        request.check_source_admission()?;
+        if let Err(error) = request.check_source_admission() {
+            if !request.transaction.uses_erasure()
+                && let Some(fingerprint) = request.transaction.custody_request_digest
+            {
+                self.replication.serving_barrier(cancellation).await?;
+                return self.replication.serving_status(
+                    request.transaction.key, request.scope, Some(fingerprint), cancellation,
+                ).await.map_err(|status| if status.code == "rtdb/unknown-transaction" { error } else { status });
+            }
+            return Err(error);
+        }
         let scope = request.scope.clone();
         let bytes = cancellation.run_until_cancelled(self.source_authority.seal(request)).await
             .ok_or_else(interrupted)??;
@@ -223,7 +233,7 @@ impl NativeServingHandle {
 
     pub async fn tx_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
         self.replication.serving_barrier(cancellation).await?;
-        self.replication.serving_status(key, scope, cancellation).await
+        self.replication.serving_status(key, scope, None, cancellation).await
     }
 }
 
@@ -513,6 +523,17 @@ impl NativeServing {
         project_receipt(self.durable().index(), receipt, scope)
     }
 
+    pub(crate) fn recover_exact(&self, key: &[u8], scope: Option<&NativeServingScope>, fingerprint: [u8; 32]) -> Result<Receipt> {
+        if !self.view.borrow().compatible { return Err(incompatible()); }
+        let namespace = scope.map(|scope| scope.receipt_namespace);
+        if self.pipeline.as_ref().is_some_and(|pipeline| pipeline.is_deciding(key, namespace)) {
+            return self.status(key, scope);
+        }
+        let durable = self.durable();
+        let receipt = durable.recover_exact(key, namespace, fingerprint)?;
+        project_receipt(durable.index(), receipt, scope)
+    }
+
     pub(crate) fn withdraw(&mut self) {
         if let Some(pipeline) = self.pipeline.take() {
             self.fold = Some(pipeline.into_durable());
@@ -784,6 +805,7 @@ mod tests {
         let Op::Put { rows, .. } = &mut submission.ops[0] else { unreachable!() };
         rows[0].valid = Some(rtdb_types::Interval::ALL.into());
         rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![7])));
+        let fingerprint = submission.logical_sha256().unwrap();
         let request = NativeRequest { transaction: submission, claims: source::SourceClaims::default(), scope: Some(scope.clone()) };
         let message = serving.decide_source(SourcePosition(2), Timestamp(41), Ok(request)).unwrap();
         let receipt = serving.apply(&message, true).unwrap().unwrap().1.unwrap();
@@ -795,6 +817,9 @@ mod tests {
         let (reopened, _) = open(Some(&checkpoint.image));
         assert_eq!(reopened.status(&[2; 16], Some(&scope)).unwrap().basis, receipt.basis);
         assert_eq!(reopened.status(&[2; 16], None).unwrap_err().code, "rtdb/unknown-transaction");
+        assert_eq!(reopened.recover_exact(&[2; 16], Some(&scope), fingerprint).unwrap().basis, receipt.basis);
+        assert_eq!(reopened.recover_exact(&[2; 16], Some(&scope), [0; 32]).unwrap_err().code, "rtdb/idempotency-key");
+        assert_eq!(reopened.recover_exact(&[2; 16], None, fingerprint).unwrap_err().code, "rtdb/unknown-transaction");
     }
 
     #[tokio::test]

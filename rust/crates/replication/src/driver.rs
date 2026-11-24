@@ -161,9 +161,9 @@ impl ReplicationHandle {
             .ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
         cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::interrupted())?
     }
-    pub(crate) async fn serving_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<ServingReceipt> {
+    pub(crate) async fn serving_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, fingerprint: Option<[u8; 32]>, cancellation: &CancellationToken) -> Result<ServingReceipt> {
         let (completion, receipt) = oneshot::channel();
-        cancellation.run_until_cancelled(self.commands.send(Command::ServingStatus { key, scope, completion })).await
+        cancellation.run_until_cancelled(self.commands.send(Command::ServingStatus { key, scope, fingerprint, completion })).await
             .ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
         cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?
     }
@@ -301,7 +301,7 @@ impl ExternalReceipt {
 
 enum Command {
     ServingValidate { term: Term, request: NativeRequest, completion: serving::Completion },
-    ServingStatus { key: Vec<u8>, scope: Option<NativeServingScope>, completion: serving::Completion },
+    ServingStatus { key: Vec<u8>, scope: Option<NativeServingScope>, fingerprint: Option<[u8; 32]>, completion: serving::Completion },
     ResetCompactor { term: Term, primary: PublishedPrimaryReset, reservations: Arc<[Arc<MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
     Retire { term: Term, tables: Vec<TableRef>, as_of: Timestamp, completion: oneshot::Sender<Result<Applied>> },
@@ -2028,8 +2028,11 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
-        if let Command::ServingStatus { key, scope, completion } = command {
-            let status = self.serving.as_ref().ok_or_else(serving::unavailable).and_then(|serving| serving.status(&key, scope.as_ref()));
+        if let Command::ServingStatus { key, scope, fingerprint, completion } = command {
+            let status = self.serving.as_ref().ok_or_else(serving::unavailable).and_then(|serving| match fingerprint {
+                Some(fingerprint) => serving.recover_exact(&key, scope.as_ref(), fingerprint),
+                None => serving.status(&key, scope.as_ref()),
+            });
             let _ = completion.send(status);
             return Ok(());
         }

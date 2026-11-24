@@ -564,6 +564,16 @@ impl TransactState {
         self.tx_status_with_namespace(key, Some(authority.receipt_namespace))
     }
 
+    /// Compare a retry to an already applied admission without resolving it or recording a new write.
+    pub fn recover_exact(&self, key: &[u8], namespace: Option<[u8; 32]>, fingerprint: [u8; 32]) -> Result<Receipt> {
+        let receipt = self.tx_status_with_namespace(key, namespace)?;
+        let stored = self.receipts.get(&namespace).and_then(|namespace| namespace.get(key)).ok_or_else(invalid_record)?;
+        if stored.fingerprint != fingerprint {
+            return Err(conflicting_key());
+        }
+        Ok(receipt)
+    }
+
     fn tx_status_with_namespace(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<Receipt> {
         validate_key(key)?;
         if self.pending.as_ref().is_some_and(|pending| {
@@ -630,7 +640,7 @@ impl TransactState {
         };
         if let Some(stored) = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
             if stored.fingerprint != fingerprint {
-                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/idempotency-key", "The key belongs to a different transaction"));
+                return Err(conflicting_key());
             }
             return Ok((Resolution::Answer(replay(&stored.receipt)), None));
         }
@@ -857,6 +867,10 @@ impl TransactState {
 
 fn erasure_pending() -> Anomaly {
     Anomaly::new(AnomalyCategory::Busy, "rtdb/erasure-pending", "The erase receipt is waiting for durable key retirement")
+}
+
+fn conflicting_key() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb/idempotency-key", "The key belongs to a different transaction")
 }
 
 fn invalid_record() -> Anomaly {
