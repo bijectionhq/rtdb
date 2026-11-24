@@ -219,6 +219,23 @@ Original-authority marker reads use a current source barrier for both ordinary a
 A pending claim with no ordered marker leaves already-enrolled stages open under that current admission.
 The vault finalizes the first ordered marker and can replace an aborted claim only once the original source's durable history covers the failed attempt.
 
+### Original family response release holds
+
+The original family vault serializes exact response-part holds with the pending claim and fence finalization.
+An installed carrier-journal adapter must authenticate the linked original writer, installation, registry and full response part at a current source barrier.
+Its source installation and transport cell history are separate coordinates.
+This vault slice admits a carrier journal only on the original placed history.
+An unavailable, restored or separately placed registry refuses until its exact original adapter is available.
+
+Each hold binds the exact member and input, the transport part and its immutable cutoff.
+Only the authenticated live registration can stage or promote, and current marker admission applies before and after a hold mutation and at final release.
+Private cancellation consumes the exact attempt before a promotion can win.
+A promoted hold closes only after positive durable disposal from the original carrier journal.
+The original vault retains a terminal record before acknowledging disposal or removing a hold from the family roster.
+A deadline refuses further release but supplies no disposal evidence.
+A drain checks the current original marker and the exact inventory before declaring all family holds terminal.
+The hosted action and delivery wiring remain uninstalled.
+
 ### Fence plan reply
 
 Protocol 217 retires the former immediate fence action.

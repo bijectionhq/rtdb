@@ -9,7 +9,8 @@ use crate::keys::assertion::family::{AssertionVaultJournal, AssertionVaultRecord
 
 fn path(record: AssertionVaultRecord) -> String {
     let prefix = match record {
-        AssertionVaultRecord::Family(_) | AssertionVaultRecord::Denial(_) => "assertion-families",
+        AssertionVaultRecord::Family(_) | AssertionVaultRecord::Denial(_)
+        | AssertionVaultRecord::ReleaseTerminal { .. } => "assertion-families",
         AssertionVaultRecord::Issuer(_) => "assertion-issuers",
     };
     format!("{prefix}/{record}")

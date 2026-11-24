@@ -139,6 +139,22 @@ pub struct CurrentAssertionFamilyRead {
 }
 
 impl CurrentAssertionFamilyRead {
+    pub async fn assertion_family_fence(&self, family: Uuid) -> Result<Option<AssertionFamilyFenceMarker>> {
+        let unavailable = hosted_source_unavailable;
+        let selected = rtdb_query::read_hosted_control_point(
+            Arc::clone(&self.context),
+            TableRef::new("public", ASSERTION_FAMILY_FENCES),
+            &EntityId::String(family.simple().to_string()),
+            true,
+        ).await?;
+        self.context.check_cancelled()?;
+        selected.row.map(|(row, _)| {
+            let body = rtdb_columnar::ArrowCell::named(row.batch(), "body", 0)
+                .and_then(|cell| cell.binary()).ok_or_else(unavailable)?;
+            AssertionFamilyFenceMarker::decode(body).map_err(|_| unavailable())
+        }).transpose()
+    }
+
     pub async fn world_registration(&self, world: Iid) -> Result<Option<OwnedWorld>> {
         let registration = rtdb_query::read_owned_world(Arc::clone(&self.context), &self.owner, world).await?;
         self.context.check_cancelled()?;
@@ -164,6 +180,10 @@ pub enum AssertionFenceStatus {
 }
 
 impl OriginalAssertionFamilyReader {
+    pub fn history_fingerprint(&self) -> [u8; 32] {
+        self.scope.history_fingerprint()
+    }
+
     pub async fn current(&self, deployment: Uuid, cancellation: &CancellationToken) -> Result<CurrentAssertionFamilyRead> {
         let unavailable = hosted_source_unavailable;
         let receipt = self.node.await_durable_source(
@@ -198,19 +218,8 @@ impl OriginalAssertionFamilyReader {
             return Err(unavailable());
         }
         let current = self.current(deployment, cancellation).await?;
-        let selected = rtdb_query::read_hosted_control_point(
-            Arc::clone(&current.context),
-            TableRef::new("public", ASSERTION_FAMILY_FENCES),
-            &EntityId::String(family.simple().to_string()),
-            true,
-        ).await?;
-        current.context.check_cancelled()?;
-        if let Some((row, _)) = selected.row {
-            let body = rtdb_columnar::ArrowCell::named(row.batch(), "body", 0)
-                .and_then(|cell| cell.binary()).ok_or_else(unavailable)?;
-            if AssertionFamilyFenceMarker::decode(body).ok() != Some(marker) {
-                return Err(unavailable());
-            }
+        if let Some(ordered) = current.assertion_family_fence(family).await? {
+            if ordered != marker { return Err(unavailable()); }
             return Ok(AssertionFenceStatus::Ordered);
         }
         if current.applied_source.is_some_and(|key| key.tx_id.0 >= attempt.position().0) {

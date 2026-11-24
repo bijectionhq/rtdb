@@ -1,6 +1,9 @@
 //! Private current custody for a Proposal occurrence and its landed copies.
 
+mod release;
 mod root_landing;
+
+pub use release::{CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
 
 use std::{collections::BTreeSet, fmt, fs, io::ErrorKind, sync::Arc};
 
@@ -277,6 +280,10 @@ struct Family {
     derived: Vec<DerivedRow>,
     fenced: Option<Uuid>,
     pending_fence: Option<PendingFence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    release_holds: Vec<release::ReleaseHold>,
+    #[serde(default)]
+    release_sequence: u64,
 }
 
 impl Family {
@@ -356,12 +363,13 @@ pub(in crate::keys) enum AssertionVaultRecord {
     Family(Uuid),
     Denial(Position),
     Issuer(AssertionIssuerScope),
+    ReleaseTerminal { family: Uuid, attempt: [u8; 32] },
 }
 
 impl AssertionVaultRecord {
     fn local_prefix(self) -> &'static str {
         match self {
-            Self::Family(_) | Self::Denial(_) => LOCAL_PREFIX,
+            Self::Family(_) | Self::Denial(_) | Self::ReleaseTerminal { .. } => LOCAL_PREFIX,
             Self::Issuer(_) => LOCAL_ISSUER_PREFIX,
         }
     }
@@ -376,6 +384,8 @@ impl fmt::Display for AssertionVaultRecord {
                 write!(formatter, "denied-{address}")
             }
             Self::Issuer(scope) => formatter.write_str(&URL_SAFE_NO_PAD.encode(scope.address())),
+            Self::ReleaseTerminal { family, attempt } =>
+                write!(formatter, "release-{family}-{}", URL_SAFE_NO_PAD.encode(attempt)),
         }
     }
 }
@@ -393,6 +403,7 @@ pub struct AssertionFamilies<'a> {
     journal: &'a dyn AssertionVaultJournal,
     region: Arc<IoRegion>,
     original: Option<OriginalFenceRead<'a>>,
+    release_authority: Option<&'a dyn FamilyReleaseAuthority>,
 }
 
 struct OriginalFenceRead<'a> {
@@ -403,7 +414,7 @@ struct OriginalFenceRead<'a> {
 
 impl<'a> AssertionFamilies<'a> {
     pub(in crate::keys) fn new(journal: &'a dyn AssertionVaultJournal, region: Arc<IoRegion>) -> Self {
-        Self { journal, region, original: None }
+        Self { journal, region, original: None, release_authority: None }
     }
 
     pub fn with_original_reader(
@@ -422,7 +433,7 @@ impl<'a> AssertionFamilies<'a> {
             }
             let record = Family {
                 original, original_position: None, rewrites: Vec::new(),
-                landings: Vec::new(), derived: Vec::new(), fenced: None, pending_fence: None,
+                landings: Vec::new(), derived: Vec::new(), fenced: None, pending_fence: None, release_holds: Vec::new(), release_sequence: 0,
             };
             if self.write(family, None, &record).await? {
                 return Ok(());
@@ -747,6 +758,7 @@ impl<'a> AssertionFamilies<'a> {
                 return Ok(());
             }
             let record = decode_family(&bytes)?;
+            if !record.release_holds.is_empty() { return Err(conflict()); }
             let fence = record.fence_inventory(record.fenced.ok_or_else(conflict)?);
             deadline.require_settled_family(&fence, custody_key).await?;
             for position in fence.positions {
