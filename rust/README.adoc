@@ -28,6 +28,17 @@ Implementation status and evidence are tracked in link:implementation-status.jso
 The link:source-review.adoc[source review record] identifies concrete paths, source discrepancies, and missing production traces.
 The link:../dev/doc/rtdb-native-runtime.adoc[native runtime reference] connects the client, operational, packaging and comparison surfaces to their detailed documentation.
 
+== Local development
+
+Run `rtdb dev --data .rtdb` to start one development process with the normal native node, its local source and replica logs, and its filesystem object store.
+The data directory defaults to `.rtdb`.
+Restart with the same directory to reuse your data, or choose a fresh directory for an independent instance.
+
+Connect a Bijection Flight SQL client to `grpc://127.0.0.1:3000` or run `psql -h 127.0.0.1 -p 5432 -U xtdb -d xtdb`.
+The local `xtdb` user has no password, and both listeners bind to loopback.
+Use `--port` and `--flight-sql-port` to run alongside other instances, `0` to choose a free port, or `-1` to disable a listener.
+Startup prints the bound addresses.
+
 == Ownership
 
 Semantic types, event headers, temporal ceilings, schemas, immutable tries, metadata, and wire codecs are passive objects.

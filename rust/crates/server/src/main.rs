@@ -59,11 +59,21 @@ async fn run() -> Result<()> {
             let (handle, driver) = if options.mode == cli::NodeMode::Compactor {
                 ServerDriver::open_compactor_with_memory(config, options.allocation_limit_bytes, memory).await?
             } else { ServerDriver::open_with_memory(config, options.allocation_limit_bytes, memory).await? };
-            let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "RTDB listeners bound: {:?}", handle.addresses()));
-            if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
-            run_server(&handle, driver, shutdown_signal()).await
+            run_started(&handle, driver).await
+        }
+        Command::Dev(options) => {
+            let limit = options.allocation_limit_bytes;
+            let (config, memory, _configuration) = options.load_reserved()?.into_execution(limit)?;
+            let (handle, driver) = ServerDriver::open_with_memory(config, limit, memory).await?;
+            run_started(&handle, driver).await
         }
     }
+}
+
+async fn run_started(handle: &ServerHandle, driver: ServerDriver) -> Result<()> {
+    let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "RTDB listeners bound: {:?}", handle.addresses()));
+    if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
+    run_server(handle, driver, shutdown_signal()).await
 }
 
 async fn report_checkpoint_repair(
