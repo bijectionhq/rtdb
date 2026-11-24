@@ -358,7 +358,7 @@ impl Service {
             },
             |record, _, io| async move {
                 self.writer(history, epoch).await?;
-                let files = self.open(&record, io).await?;
+                let files = self.open_store(&record, io).await?;
                 let published = IoRegion::retaining(charge, files.put_with_publication(key, body)).await?;
                 let version = published.and_then(rtdb_types::PhysicalObjectPublication::into_version);
                 if version.is_none() && matches!(self.storage, CellStorage::S3 { .. }) {
@@ -430,14 +430,14 @@ impl Service {
         if reference.publication().is_none() && matches!(self.storage, CellStorage::S3 { .. }) {
             return Err(refused());
         }
-        let files = self.open(record, io).await?;
+        let files = self.open_store(record, io).await?;
         check_length(usize::try_from(files.head_fresh(reference.object()).await?.size).map_err(transport)?)?;
         let sealed_frame = ring::digest::digest(&ring::digest::SHA256, &page[0].payload)
             .as_ref().try_into().expect("SHA-256 width");
         Ok((reference.read_at(&files, memory).await?, sealed_frame))
     }
 
-    async fn open(&self, record: &DeploymentRecord, io: Arc<IoRegion>) -> Result<EncryptingStore> {
+    async fn open_store(&self, record: &DeploymentRecord, io: Arc<IoRegion>) -> Result<EncryptingStore> {
         let residence = residence(record);
         let bucket = self.storage.bucket(Arc::clone(&io)).await?;
         let files = Arc::new(PrefixedStore::new(bucket, &residence));

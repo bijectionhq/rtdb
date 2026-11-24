@@ -372,7 +372,7 @@ async fn observe_transfer_payload(
     let Some(relative) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? else {
         return Ok(None);
     };
-    replica_suffix::require_payload_digest(envelope)?;
+    crate::archive::replica_suffix::require_payload_digest(envelope)?;
     let body = artifact.read_payload(offset, chain, memory).await?;
     let resolved = envelope.unwrap_payload(&body.bytes)?;
     Ok(Some(DetachedTransferPayload { path: crate::reference::key(&relative)?, resolved, body }))
