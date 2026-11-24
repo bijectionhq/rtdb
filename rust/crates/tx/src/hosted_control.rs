@@ -9,6 +9,7 @@ use rtdb_types::{
 
 mod replay_worlds;
 mod world_readmission;
+mod authority_wire;
 pub(crate) use replay_worlds::ReplayWorlds;
 pub(crate) use world_readmission::{WorldReadmission, world_readmission_control};
 
@@ -749,10 +750,8 @@ impl HostedAuthority {
     pub const WIDTH: usize = 40;
 
     pub fn decode(bytes: &[u8; Self::WIDTH]) -> Result<Self> {
-        let (revision, rest) = bytes.split_first_chunk::<8>().expect("authority width");
-        let (incarnation, writer) = rest.split_first_chunk::<16>().expect("authority width");
-        Self::new(Timestamp(i64::from_be_bytes(*revision)), *incarnation,
-            writer.try_into().expect("authority width"))
+        let (revision, incarnation, writer) = authority_wire::split_fields(bytes);
+        Self::new(Timestamp(i64::from_be_bytes(revision)), incarnation, writer)
     }
 
     fn new(revision: Timestamp, incarnation: [u8; 16], writer: [u8; 16]) -> Result<Self> {
@@ -762,12 +761,12 @@ impl HostedAuthority {
         Ok(Self { revision, incarnation, writer })
     }
 
-    pub(crate) fn matches(self, incarnation: &[u8], writer: &str) -> bool {
-        self.incarnation.as_slice() == incarnation && writer.len() == 32
-            && self.writer.into_iter().zip(writer.as_bytes().chunks_exact(2)).all(|(byte, pair)| {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                pair == [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]]
-            })
+    pub(crate) fn matches(self, kind: &str, incarnation: &[u8], writer: &str) -> bool {
+        authority_wire::identity_matches(&self.incarnation, &self.writer, kind, incarnation, writer.as_bytes())
+    }
+
+    pub(crate) fn matches_revision(self, observed: Option<Timestamp>) -> bool {
+        authority_wire::revision_matches(observed.map(|stamp| stamp.0), self.revision.0)
     }
 
     fn from_control(revision: Option<Timestamp>, row: &StructFields<Value>) -> Result<Self> {
@@ -807,7 +806,7 @@ pub fn bind_installed_authority(
     controls: &mut [HostedControlWrite], proof: HostedAuthority,
 ) -> Result<()> {
     let (index, control) = installed_authority_control(controls.iter())?;
-    if control.expected() != Some(proof.revision) { return Err(authority_required()); }
+    if !proof.matches_revision(control.expected()) { return Err(authority_required()); }
     controls[index].document = HostedControlDocument::Row(StructFields::from([
         ("_id".into(), Value::Utf8(INSTALLATION_AUTHORITY_ID.into())),
         ("incarnation".into(), Value::Binary(proof.incarnation.to_vec())),
